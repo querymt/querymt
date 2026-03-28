@@ -166,34 +166,53 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
             // 2. Query each live peer for their sessions and include
             //    unattached ones so the UI can show "available" remote
             //    sessions after restart (Bug 2 fix).
+            //    Peers are queried in parallel to avoid accumulating the
+            //    2-second timeout for each peer serially.
             if state.agent.mesh().is_some() {
-                for (peer_label, node_id_str) in &node_id_by_label {
-                    // Query the peer's sessions with a short timeout.
-                    let sessions =
-                        match tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                            let nm_ref = state.agent.find_node_manager(node_id_str).await?;
-                            state.agent.list_remote_sessions(&nm_ref).await
-                        })
-                        .await
-                        {
-                            Ok(Ok(s)) => s,
-                            Ok(Err(e)) => {
-                                log::debug!(
-                                    "handle_list_sessions: failed to query sessions from {}: {}",
-                                    peer_label,
-                                    e.message
-                                );
-                                continue;
-                            }
-                            Err(_) => {
-                                log::debug!(
-                                    "handle_list_sessions: timeout querying sessions from {}",
-                                    peer_label
-                                );
-                                continue;
-                            }
-                        };
+                let peer_futures: Vec<_> = node_id_by_label
+                    .iter()
+                    .map(|(peer_label, node_id_str)| {
+                        let peer_label = peer_label.clone();
+                        let node_id_str = node_id_str.clone();
+                        let state = state.clone();
+                        async move {
+                            let sessions = match tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                async {
+                                    let nm_ref =
+                                        state.agent.find_node_manager(&node_id_str).await?;
+                                    state.agent.list_remote_sessions(&nm_ref).await
+                                },
+                            )
+                            .await
+                            {
+                                Ok(Ok(s)) => s,
+                                Ok(Err(e)) => {
+                                    log::debug!(
+                                        "handle_list_sessions: failed to query sessions from {}: {}",
+                                        peer_label,
+                                        e.message
+                                    );
+                                    return None;
+                                }
+                                Err(_) => {
+                                    log::debug!(
+                                        "handle_list_sessions: timeout querying sessions from {}",
+                                        peer_label
+                                    );
+                                    return None;
+                                }
+                            };
+                            Some((peer_label, node_id_str, sessions))
+                        }
+                    })
+                    .collect();
 
+                let peer_results =
+                    futures_util::future::join_all(peer_futures).await;
+
+                for result in peer_results.into_iter().flatten() {
+                    let (peer_label, node_id_str, sessions) = result;
                     for session_info in sessions {
                         // Skip sessions that are already attached.
                         if attached_sessions.contains(&session_info.session_id) {

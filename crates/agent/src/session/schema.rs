@@ -148,6 +148,8 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_intent_session ON intent_snapshots(session_id);
+        -- Composite index to make MIN(id) per session lookup O(1) during session list view
+        CREATE INDEX IF NOT EXISTS idx_intent_session_id ON intent_snapshots(session_id, id);
 
         -- Decisions - internal tracking
         CREATE TABLE IF NOT EXISTS decisions (

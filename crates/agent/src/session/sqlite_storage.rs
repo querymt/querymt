@@ -1670,111 +1670,229 @@ impl ViewStore for SqliteStorage {
         &self,
         filter: Option<SessionListFilter>,
     ) -> SessionResult<SessionListView> {
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashMap;
         use std::time::Instant;
 
         let started = Instant::now();
-        let session_repo = SqliteSessionRepository::new(self.conn.clone());
-        let intent_repo = SqliteIntentRepository::new(self.conn.clone());
 
-        // Get all sessions (list_sessions already returns sorted by updated_at DESC)
+        // ---------------------------------------------------------------------------
+        // Single query: fetch sessions with their initial intent title, recurring
+        // flag, and has_children flag — replacing the old N+1 per-session lookups.
+        // ---------------------------------------------------------------------------
         let list_sessions_started = Instant::now();
-        let mut sessions = session_repo.list_sessions().await?;
-        let list_sessions_ms = list_sessions_started.elapsed().as_millis() as u64;
-        let session_count_before_filter = sessions.len();
 
-        let filter_started = Instant::now();
-        // Apply filters if provided
-        if let Some(filter_spec) = filter {
-            if let Some(filter_expr) = filter_spec.filter {
-                sessions.retain(|s| evaluate_session_filter(s, &filter_expr));
-            }
-
-            // Apply limit if specified
-            if let Some(limit) = filter_spec.limit {
-                sessions.truncate(limit);
-            }
+        struct RawRow {
+            id: i64,
+            public_id: String,
+            name: Option<String>,
+            cwd: Option<String>,
+            created_at: Option<String>,
+            updated_at: Option<String>,
+            parent_session_id_internal: Option<i64>,
+            fork_origin: Option<String>,
+            session_kind: Option<String>,
+            initial_intent: Option<String>,
+            is_recurring: bool,
+            has_children: bool,
         }
-        let filter_ms = filter_started.elapsed().as_millis() as u64;
 
-        let total_count = sessions.len();
+        // Extract SQL-level limit from filter before moving into the closure.
+        // A limit without a filter expression can be pushed straight into SQL,
+        // avoiding deserializing rows we'll discard anyway.
+        let sql_limit: Option<usize> = filter
+            .as_ref()
+            .and_then(|f| if f.filter.is_none() { f.limit } else { None });
 
-        // Derive recurring sessions from task data so recurring task sessions are
-        // visible in the normal session list without extra plumbing.
-        let recurring_session_ids: HashSet<i64> = self
-            .run_blocking(|conn| {
-                let mut stmt =
-                    conn.prepare("SELECT DISTINCT session_id FROM tasks WHERE kind = 'recurring'")?;
-                let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
-                rows.collect::<Result<HashSet<_>, _>>()
+        let raw_rows: Vec<RawRow> = self
+            .run_blocking(move |conn| {
+                // Build query with optional LIMIT pushed into SQL when there is
+                // no predicate filter (predicates still require in-memory eval).
+                let sql = if let Some(limit) = sql_limit {
+                    format!(
+                        r#"
+                        SELECT
+                            s.id,
+                            s.public_id,
+                            s.name,
+                            s.cwd,
+                            s.created_at,
+                            s.updated_at,
+                            s.parent_session_id,
+                            s.fork_origin,
+                            s.session_kind,
+                            i.summary                                    AS initial_intent,
+                            EXISTS(
+                                SELECT 1 FROM tasks t
+                                WHERE t.session_id = s.id AND t.kind = 'recurring'
+                            )                                            AS is_recurring,
+                            EXISTS(
+                                SELECT 1 FROM sessions c
+                                WHERE c.parent_session_id = s.id
+                            )                                            AS has_children
+                        FROM sessions s
+                        LEFT JOIN intent_snapshots i
+                            ON i.id = (
+                                SELECT MIN(id) FROM intent_snapshots
+                                WHERE session_id = s.id
+                            )
+                        ORDER BY s.updated_at DESC
+                        LIMIT {limit}
+                        "#
+                    )
+                } else {
+                    r#"
+                    SELECT
+                        s.id,
+                        s.public_id,
+                        s.name,
+                        s.cwd,
+                        s.created_at,
+                        s.updated_at,
+                        s.parent_session_id,
+                        s.fork_origin,
+                        s.session_kind,
+                        i.summary                                    AS initial_intent,
+                        EXISTS(
+                            SELECT 1 FROM tasks t
+                            WHERE t.session_id = s.id AND t.kind = 'recurring'
+                        )                                            AS is_recurring,
+                        EXISTS(
+                            SELECT 1 FROM sessions c
+                            WHERE c.parent_session_id = s.id
+                        )                                            AS has_children
+                    FROM sessions s
+                    LEFT JOIN intent_snapshots i
+                        ON i.id = (
+                            SELECT MIN(id) FROM intent_snapshots
+                            WHERE session_id = s.id
+                        )
+                    ORDER BY s.updated_at DESC
+                    "#
+                    .to_string()
+                };
+
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map([], |row| {
+                    Ok(RawRow {
+                        id: row.get(0)?,
+                        public_id: row.get(1)?,
+                        name: row.get(2)?,
+                        cwd: row.get(3)?,
+                        created_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                        parent_session_id_internal: row.get(6)?,
+                        fork_origin: row.get(7)?,
+                        session_kind: row.get(8)?,
+                        initial_intent: row.get(9)?,
+                        is_recurring: row.get::<_, i64>(10)? != 0,
+                        has_children: row.get::<_, i64>(11)? != 0,
+                    })
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
             })
             .await?;
 
-        // Build a map of internal ID -> public ID for parent resolution
-        let mut id_to_public_id: HashMap<i64, String> = HashMap::new();
-        for session in &sessions {
-            id_to_public_id.insert(session.id, session.public_id.clone());
-        }
+        let list_sessions_ms = list_sessions_started.elapsed().as_millis() as u64;
+        let session_count_before_filter = raw_rows.len();
 
-        // Build a set of sessions that have children
-        let mut sessions_with_children: HashSet<String> = HashSet::new();
-        for session in &sessions {
-            if let Some(parent_id) = session.parent_session_id
-                && let Some(parent_public_id) = id_to_public_id.get(&parent_id)
-            {
-                sessions_with_children.insert(parent_public_id.clone());
+        // Build id→public_id map for parent resolution before filtering.
+        let id_to_public_id: HashMap<i64, String> = raw_rows
+            .iter()
+            .map(|r| (r.id, r.public_id.clone()))
+            .collect();
+
+        let filter_started = Instant::now();
+
+        // Apply in-memory filter/limit (filter_expr needs the full Session struct;
+        // convert only the subset we need to evaluate the predicate).
+        let mut raw_rows = raw_rows;
+        if let Some(filter_spec) = filter {
+            if let Some(filter_expr) = filter_spec.filter {
+                // Build minimal Session values for predicate evaluation.
+                // evaluate_session_filter only uses fields available in RawRow.
+                raw_rows.retain(|r| {
+                    // evaluate_session_filter only reads: public_id, name, cwd,
+                    // created_at, updated_at — so only those fields need values.
+                    let session = crate::session::store::Session {
+                        id: r.id,
+                        public_id: r.public_id.clone(),
+                        name: r.name.clone(),
+                        cwd: r.cwd.as_deref().map(std::path::PathBuf::from),
+                        created_at: r.created_at.as_deref().and_then(|s| {
+                            time::OffsetDateTime::parse(
+                                s,
+                                &time::format_description::well_known::Rfc3339,
+                            )
+                            .ok()
+                        }),
+                        updated_at: r.updated_at.as_deref().and_then(|s| {
+                            time::OffsetDateTime::parse(
+                                s,
+                                &time::format_description::well_known::Rfc3339,
+                            )
+                            .ok()
+                        }),
+                        current_intent_snapshot_id: None,
+                        active_task_id: None,
+                        llm_config_id: None,
+                        parent_session_id: r.parent_session_id_internal,
+                        fork_origin: r.fork_origin.as_deref().and_then(|s| s.parse().ok()),
+                        session_kind: r.session_kind.clone(),
+                        fork_point_type: None,
+                        fork_point_ref: None,
+                        fork_instructions: None,
+                    };
+                    evaluate_session_filter(&session, &filter_expr)
+                });
+            }
+            if let Some(limit) = filter_spec.limit {
+                raw_rows.truncate(limit);
             }
         }
 
-        // Build session list items with titles and hierarchy info
+        let filter_ms = filter_started.elapsed().as_millis() as u64;
+        let total_count = raw_rows.len();
+
+        // Build session list items
         let title_lookup_started = Instant::now();
-        let mut items = Vec::with_capacity(sessions.len());
+        let mut items = Vec::with_capacity(raw_rows.len());
 
-        for session in sessions {
-            // Keep session titles stable by using the initial objective snapshot.
-            let title = intent_repo
-                .get_initial_intent_snapshot(&session.public_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|intent| {
-                    // Truncate to reasonable display length (80 chars)
-                    if intent.summary.len() > 80 {
-                        format!("{}...", &intent.summary[..77])
-                    } else {
-                        intent.summary
-                    }
-                });
+        for row in raw_rows {
+            let title = row.initial_intent.map(|summary| {
+                if summary.len() > 80 {
+                    format!("{}...", &summary[..77])
+                } else {
+                    summary
+                }
+            });
 
-            // Resolve parent_session_id from internal ID to public ID
-            let parent_session_id = session
-                .parent_session_id
-                .and_then(|parent_id| id_to_public_id.get(&parent_id).cloned());
+            let parent_session_id = row
+                .parent_session_id_internal
+                .and_then(|pid| id_to_public_id.get(&pid).cloned());
 
-            // Check if this session has children
-            let has_children = sessions_with_children.contains(&session.public_id);
-
-            // Mark session kind for recurring task workflows.
-            let session_kind = if recurring_session_ids.contains(&session.id) {
+            let session_kind = if row.is_recurring {
                 Some("recurring".to_string())
             } else {
-                session.session_kind.clone()
+                row.session_kind
             };
 
-            // Convert fork_origin to string
-            let fork_origin = session.fork_origin.map(|fo| fo.to_string());
-
             items.push(SessionListItem {
-                session_id: session.public_id,
-                name: session.name,
-                cwd: session.cwd.map(|p| p.display().to_string()),
+                session_id: row.public_id,
+                name: row.name,
+                cwd: row.cwd,
                 title,
-                created_at: session.created_at,
-                updated_at: session.updated_at,
+                created_at: row.created_at.as_deref().and_then(|s| {
+                    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                        .ok()
+                }),
+                updated_at: row.updated_at.as_deref().and_then(|s| {
+                    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                        .ok()
+                }),
                 parent_session_id,
-                fork_origin,
+                fork_origin: row.fork_origin,
                 session_kind,
-                has_children,
+                has_children: row.has_children,
             });
         }
         let title_lookup_ms = title_lookup_started.elapsed().as_millis() as u64;
@@ -2326,6 +2444,10 @@ const MIGRATIONS: &[Migration] = &[
         version: "0006_add_knowledge_fts5",
         apply: migration_0006_add_knowledge_fts5,
     },
+    Migration {
+        version: "0007_intent_session_id_index",
+        apply: migration_0007_intent_session_id_index,
+    },
 ];
 
 fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -2535,6 +2657,15 @@ fn migration_0005_add_scheduler_and_knowledge_tables(
         "#,
     )?;
     Ok(())
+}
+
+fn migration_0007_intent_session_id_index(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    // Add composite index on intent_snapshots(session_id, id) so the correlated
+    // MIN(id) subquery in get_session_list_view resolves in O(1) per session
+    // instead of scanning all intents for that session.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_intent_session_id ON intent_snapshots(session_id, id);",
+    )
 }
 
 fn migration_0006_add_knowledge_fts5(conn: &mut Connection) -> Result<(), rusqlite::Error> {

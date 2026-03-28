@@ -21,55 +21,65 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
   
   // Build session hierarchy and filter by search text
   const filteredGroups = useMemo(() => {
-    // First, build the hierarchy
-    const groupsWithHierarchy = groups.map(group => {
-      
-      // Find top-level sessions (those without parent_session_id)
-      const topLevelSessions = group.sessions.filter(s => !s.parent_session_id);
-      
-      // Build hierarchy: attach children to parents
-      const buildHierarchy = (session: SessionSummary): SessionSummary & { children?: SessionSummary[] } => {
-        const children = group.sessions.filter(s => s.parent_session_id === session.session_id);
-        if (children.length > 0) {
-          return { ...session, children: children.map(buildHierarchy) };
-        }
-        return session;
-      };
-      
-      return {
-        ...group,
-        sessions: topLevelSessions.map(buildHierarchy),
-      };
-    });
-    
-    // Then apply filtering
-    if (!filterText.trim()) return groupsWithHierarchy;
-    
-    const query = filterText.toLowerCase();
+    const query = filterText.trim().toLowerCase();
+
     const matchesQuery = (s: SessionSummary) =>
       s.session_id.toLowerCase().includes(query) ||
       s.title?.toLowerCase().includes(query) ||
       s.name?.toLowerCase().includes(query);
-    
-    // Filter with hierarchy awareness
-    const filterWithHierarchy = (session: SessionSummary & { children?: SessionSummary[] }): (SessionSummary & { children?: SessionSummary[] }) | null => {
-      const sessionMatches = matchesQuery(session);
-      const childrenFiltered = session.children?.map(filterWithHierarchy).filter(c => c !== null) as (SessionSummary & { children?: SessionSummary[] })[] | undefined;
-      
-      // Include if session matches OR any children match
-      if (sessionMatches || (childrenFiltered && childrenFiltered.length > 0)) {
-        return {
-          ...session,
-          children: childrenFiltered && childrenFiltered.length > 0 ? childrenFiltered : undefined,
-        };
+
+    // Build hierarchy using a Map for O(1) child lookup instead of O(n) filter per parent.
+    const groupsWithHierarchy = groups.map(group => {
+      // Index children by parent id in one O(n) pass.
+      const childrenByParent = new Map<string, SessionSummary[]>();
+      for (const s of group.sessions) {
+        if (s.parent_session_id) {
+          let bucket = childrenByParent.get(s.parent_session_id);
+          if (!bucket) {
+            bucket = [];
+            childrenByParent.set(s.parent_session_id, bucket);
+          }
+          bucket.push(s);
+        }
+      }
+
+      const buildHierarchy = (session: SessionSummary): SessionSummary & { children?: SessionSummary[] } => {
+        const children = childrenByParent.get(session.session_id);
+        if (children && children.length > 0) {
+          return { ...session, children: children.map(buildHierarchy) };
+        }
+        return session;
+      };
+
+      const topLevel = group.sessions
+        .filter(s => !s.parent_session_id)
+        .map(buildHierarchy);
+
+      return { ...group, sessions: topLevel };
+    });
+
+    if (!query) return groupsWithHierarchy;
+
+    // Filter with hierarchy awareness: keep a node if it or any descendant matches.
+    const filterWithHierarchy = (
+      session: SessionSummary & { children?: SessionSummary[] }
+    ): (SessionSummary & { children?: SessionSummary[] }) | null => {
+      const childrenFiltered = session.children
+        ?.map(filterWithHierarchy)
+        .filter((c): c is SessionSummary & { children?: SessionSummary[] } => c !== null);
+
+      if (matchesQuery(session) || (childrenFiltered && childrenFiltered.length > 0)) {
+        return { ...session, children: childrenFiltered?.length ? childrenFiltered : undefined };
       }
       return null;
     };
-    
+
     return groupsWithHierarchy
       .map(group => ({
         ...group,
-        sessions: group.sessions.map(filterWithHierarchy).filter(s => s !== null) as SessionSummary[],
+        sessions: group.sessions
+          .map(filterWithHierarchy)
+          .filter((s): s is SessionSummary & { children?: SessionSummary[] } => s !== null),
       }))
       .filter(group => group.sessions.length > 0);
   }, [groups, filterText]);
