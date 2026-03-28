@@ -7,7 +7,7 @@ use crate::session::domain::{
 };
 use crate::session::error::SessionResult;
 use crate::session::store::{
-    CustomModel, LLMConfig, Session, SessionExecutionConfig, SessionStore,
+    CustomModel, LLMConfig, RemoteSessionBookmark, Session, SessionExecutionConfig, SessionStore,
 };
 use async_trait::async_trait;
 use mockall::mock;
@@ -180,6 +180,9 @@ mock! {
             session_id: &str,
             call_ids: &[String],
         ) -> SessionResult<usize>;
+        async fn save_remote_session_bookmark(&self, bookmark: &RemoteSessionBookmark) -> SessionResult<()>;
+        async fn list_remote_session_bookmarks(&self) -> SessionResult<Vec<RemoteSessionBookmark>>;
+        async fn remove_remote_session_bookmark(&self, session_id: &str) -> SessionResult<()>;
     }
 }
 

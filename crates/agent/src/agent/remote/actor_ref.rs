@@ -317,6 +317,30 @@ impl SessionActorRef {
         }
     }
 
+    /// Get the full durable event stream for this session.
+    ///
+    /// Returns all persisted `AgentEvent` entries, ordered by sequence number.
+    /// Used to replay remote session history on first attach.
+    #[tracing::instrument(
+        name = "remote.session_ref.get_event_stream",
+        skip(self),
+        fields(is_remote = self.is_remote(), peer_label = %self.node_label())
+    )]
+    pub async fn get_event_stream(&self) -> Result<Vec<crate::events::AgentEvent>, AcpError> {
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(messages::GetEventStream)
+                .await
+                .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
+
+            #[cfg(feature = "remote")]
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&messages::GetEventStream)
+                .await
+                .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
+        }
+    }
+
     /// Get current LLM config for this session.
     pub async fn get_llm_config(&self) -> Result<Option<LLMConfig>, AcpError> {
         match self {

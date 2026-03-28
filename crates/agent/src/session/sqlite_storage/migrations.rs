@@ -40,6 +40,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0007_intent_session_id_index",
         apply: migration_0007_intent_session_id_index,
     },
+    Migration {
+        version: "0008_remote_session_bookmarks",
+        apply: migration_0008_remote_session_bookmarks,
+    },
 ];
 
 pub(super) fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -333,5 +337,21 @@ fn migration_0006_add_knowledge_fts5(conn: &mut Connection) -> Result<(), rusqli
         "#,
     )?;
 
+    Ok(())
+}
+
+fn migration_0008_remote_session_bookmarks(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        r#"
+            CREATE TABLE IF NOT EXISTS remote_session_bookmarks (
+                session_id TEXT PRIMARY KEY,
+                node_id    TEXT NOT NULL,
+                peer_label TEXT NOT NULL,
+                cwd        TEXT,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                title      TEXT
+            );
+        "#,
+    )?;
     Ok(())
 }

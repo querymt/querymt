@@ -111,7 +111,9 @@ export function useSessionManager(): SessionManager {
     // (which does a DHT lookup and wires up the actor), not load_session (which
     // only queries the local database and would always fail with "Query returned
     // no rows" for sessions that live on a remote peer).
-    if (currentSession?.node_id && currentSession.attached === false) {
+    // If this is a remote session and it's not currently attached, attach first.
+    // Treat missing `attached` as unattached for backward compatibility.
+    if (currentSession?.node_id && currentSession.attached !== true) {
       console.log('[useSessionManager] Attaching remote session:', urlSessionId, 'on node', currentSession.node_id);
       attachRemoteSession(currentSession.node_id, urlSessionId, sessionLabel);
       return;
