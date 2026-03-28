@@ -12,7 +12,6 @@
 use super::super::ServerState;
 use super::super::connection::{send_error, send_message};
 use super::super::messages::{MeshInviteInfo, UiServerMessage};
-#[cfg(feature = "remote")]
 use super::session_ops::handle_list_sessions;
 #[cfg(feature = "remote")]
 use crate::agent::utils::u32_from_usize;
@@ -130,7 +129,12 @@ pub async fn handle_create_remote_session(
 
         match state
             .agent
-            .create_remote_session(&node_manager_ref, peer_label, cwd.map(|s| s.to_string()))
+            .create_remote_session(
+                &node_manager_ref,
+                node_id.to_string(),
+                peer_label,
+                cwd.map(|s| s.to_string()),
+            )
             .await
         {
             Ok((session_id, _session_actor_ref)) => {
@@ -267,7 +271,12 @@ pub async fn handle_attach_remote_session(
 
         let _session_actor_ref = state
             .agent
-            .attach_remote_session(session_id.to_string(), remote_ref, peer_label)
+            .attach_remote_session(
+                session_id.to_string(),
+                remote_ref,
+                peer_label,
+                Some(node_id.to_string()),
+            )
             .await;
 
         let agent_id = super::super::session::PRIMARY_AGENT_ID.to_string();
@@ -291,12 +300,67 @@ pub async fn handle_attach_remote_session(
             cwds.insert(session_id.to_string(), cwd_path);
         }
 
+        // Fetch remote event history so the UI can render the conversation.
+        let remote_events = {
+            let session_ref = {
+                let registry = state.agent.registry.lock().await;
+                registry.get(session_id).cloned()
+            };
+            if let Some(ref session_ref) = session_ref {
+                match session_ref.get_event_stream().await {
+                    Ok(events) => {
+                        log::info!(
+                            "handle_attach_remote_session: fetched {} events from remote session {}",
+                            events.len(),
+                            session_id
+                        );
+                        events
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "handle_attach_remote_session: failed to fetch remote event stream for {}: {}",
+                            session_id,
+                            e
+                        );
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            }
+        };
+
+        let cursor = super::super::cursor_from_events(&remote_events);
+        let audit = crate::session::projection::AuditView {
+            session_id: session_id.to_string(),
+            events: remote_events,
+            tasks: Vec::new(),
+            intent_snapshots: Vec::new(),
+            decisions: Vec::new(),
+            progress_entries: Vec::new(),
+            artifacts: Vec::new(),
+            delegations: Vec::new(),
+            generated_at: time::OffsetDateTime::now_utc(),
+        };
+
+        // Seed connection cursor so the event forwarder won't drop events
+        // that arrive while we're still sending the SessionLoaded payload.
+        {
+            let mut connections = state.connections.lock().await;
+            if let Some(conn) = connections.get_mut(conn_id) {
+                conn.session_cursors
+                    .insert(session_id.to_string(), cursor.clone());
+            }
+        }
+
         let _ = send_message(
             tx,
-            UiServerMessage::SessionCreated {
-                agent_id,
+            UiServerMessage::SessionLoaded {
                 session_id: session_id.to_string(),
-                request_id: None,
+                agent_id,
+                audit,
+                undo_stack: Vec::new(),
+                cursor,
             },
         )
         .await;
@@ -314,6 +378,9 @@ pub async fn handle_attach_remote_session(
             },
         )
         .await;
+
+        // Send updated state so the UI picks up the active session.
+        super::super::connection::send_state(state, conn_id, tx).await;
 
         handle_list_sessions(state, tx).await;
 
@@ -334,6 +401,39 @@ pub async fn handle_attach_remote_session(
         )
         .await;
     }
+}
+
+/// Dismiss (remove) a persisted remote session bookmark and detach if currently attached.
+pub async fn handle_dismiss_remote_session(
+    state: &ServerState,
+    session_id: &str,
+    tx: &mpsc::Sender<String>,
+) {
+    // 1. Detach if currently attached
+    #[cfg(feature = "remote")]
+    {
+        let mut registry = state.agent.registry.lock().await;
+        if registry.get(session_id).is_some_and(|r| r.is_remote()) {
+            registry.detach_remote_session(session_id).await;
+        }
+    }
+
+    // 2. Remove the bookmark (detach_remote_session already spawns this,
+    //    but call it explicitly in case the session wasn't in the registry).
+    if let Err(e) = state
+        .session_store
+        .remove_remote_session_bookmark(session_id)
+        .await
+    {
+        log::warn!(
+            "handle_dismiss_remote_session: failed to remove bookmark {}: {}",
+            session_id,
+            e
+        );
+    }
+
+    // 3. Refresh session list
+    handle_list_sessions(state, tx).await;
 }
 
 /// Create a mesh invite token on the local node.

@@ -1033,6 +1033,10 @@ export type UiClientMessage =
 	/** Session ID to attach */
 	session_id: string;
 }}
+	/** Remove a persisted remote session bookmark and detach if currently attached */
+	| { type: "dismiss_remote_session", data: {
+	session_id: string;
+}}
 	| { type: "add_custom_model_from_hf", data: {
 	provider: string;
 	repo: string;

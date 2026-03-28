@@ -14,6 +14,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
 
+/// A bookmark for a remote session — enough metadata to re-discover and
+/// re-attach it after a server restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSessionBookmark {
+    pub session_id: String,
+    /// PeerId string of the remote node that owns the session.
+    pub node_id: String,
+    /// Human-readable hostname of the remote node.
+    pub peer_label: String,
+    /// Working directory on the remote machine (if known).
+    pub cwd: Option<String>,
+    /// Unix timestamp when the bookmark was created.
+    pub created_at: i64,
+    /// Session title/name (if known).
+    pub title: Option<String>,
+}
+
 /// Represents the metadata for a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -438,6 +455,20 @@ pub trait SessionStore: Send + Sync {
         session_id: &str,
         call_ids: &[String],
     ) -> SessionResult<usize>;
+
+    // ── Remote session bookmarks ─────────────────────────────────────────
+
+    /// Persist (insert or update) a remote session bookmark.
+    async fn save_remote_session_bookmark(
+        &self,
+        bookmark: &RemoteSessionBookmark,
+    ) -> SessionResult<()>;
+
+    /// List all persisted remote session bookmarks.
+    async fn list_remote_session_bookmarks(&self) -> SessionResult<Vec<RemoteSessionBookmark>>;
+
+    /// Remove a remote session bookmark by session ID.
+    async fn remove_remote_session_bookmark(&self, session_id: &str) -> SessionResult<()>;
 }
 
 #[cfg(test)]

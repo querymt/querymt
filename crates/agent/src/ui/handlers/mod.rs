@@ -31,6 +31,7 @@ pub use plugins::handle_update_plugins;
 pub use remote::handle_attach_remote_session;
 pub use remote::handle_create_mesh_invite;
 pub use remote::handle_create_remote_session;
+pub use remote::handle_dismiss_remote_session;
 pub use remote::handle_list_mesh_invites;
 pub use remote::handle_list_remote_nodes;
 pub use remote::handle_list_remote_sessions;
@@ -273,6 +274,9 @@ pub async fn handle_ui_message(
             session_id,
         } => {
             handle_attach_remote_session(state, conn_id, &node_id, &session_id, tx).await;
+        }
+        UiClientMessage::DismissRemoteSession { session_id } => {
+            handle_dismiss_remote_session(state, &session_id, tx).await;
         }
         UiClientMessage::CreateMeshInvite {
             mesh_name,

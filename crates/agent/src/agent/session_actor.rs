@@ -961,6 +961,30 @@ impl Message<crate::agent::messages::GetHistory> for SessionActor {
     }
 }
 
+/// Return the full durable event stream for this session from the local journal.
+impl Message<crate::agent::messages::GetEventStream> for SessionActor {
+    type Reply = Result<Vec<crate::events::AgentEvent>, AgentError>;
+
+    async fn handle(
+        &mut self,
+        _msg: crate::agent::messages::GetEventStream,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.config
+            .event_sink
+            .journal()
+            .load_session_stream(&self.session_id, None, None)
+            .await
+            .map(|events| {
+                events
+                    .into_iter()
+                    .map(crate::events::AgentEvent::from)
+                    .collect()
+            })
+            .map_err(|e| AgentError::Internal(e.to_string()))
+    }
+}
+
 /// Subscribe a remote event relay to this session's events.
 ///
 /// When the kameo swarm is bootstrapped, this handler:

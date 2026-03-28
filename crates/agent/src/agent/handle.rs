@@ -1270,6 +1270,7 @@ impl LocalAgentHandle {
     pub async fn create_remote_session(
         &self,
         node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        remote_node_id: String,
         peer_label: String,
         cwd: Option<String>,
     ) -> Result<(String, crate::agent::remote::SessionActorRef), agent_client_protocol::Error> {
@@ -1314,6 +1315,8 @@ impl LocalAgentHandle {
             })?;
 
         // Attach to local registry (spawns EventRelayActor, sends SubscribeEvents)
+        // Persist the remote owner node id (not our local node id).
+        let node_id_str = remote_node_id;
         let mut registry = self.registry.lock().await;
         let session_actor_ref = registry
             .attach_remote_session(
@@ -1321,6 +1324,7 @@ impl LocalAgentHandle {
                 remote_session_ref,
                 peer_label,
                 Some(mesh),
+                Some(node_id_str),
             )
             .await;
 
@@ -1345,11 +1349,12 @@ impl LocalAgentHandle {
         session_id: String,
         remote_ref: kameo::actor::RemoteActorRef<crate::agent::session_actor::SessionActor>,
         peer_label: String,
+        remote_node_id: Option<String>,
     ) -> crate::agent::remote::SessionActorRef {
         let mesh = self.mesh();
         let mut registry = self.registry.lock().await;
         registry
-            .attach_remote_session(session_id, remote_ref, peer_label, mesh)
+            .attach_remote_session(session_id, remote_ref, peer_label, mesh, remote_node_id)
             .await
     }
 }
@@ -1362,6 +1367,51 @@ impl LocalAgentHandle {
     /// Delegates to `ModelRegistry::invalidate_all`.
     pub async fn invalidate_model_cache(&self) {
         self.model_registry.invalidate_all().await;
+    }
+
+    /// Attempt to re-attach a remote session from a persisted bookmark.
+    ///
+    /// Performs a DHT lookup for the session, and if found, attaches it to the
+    /// local registry (spawning an EventRelayActor and sending SubscribeEvents).
+    ///
+    /// Returns `Ok(session_ref)` on success, or an error if the mesh is not
+    /// active, the session is not found in the DHT, or the attach fails.
+    #[cfg(feature = "remote")]
+    pub async fn reattach_from_bookmark(
+        &self,
+        bookmark: &crate::session::store::RemoteSessionBookmark,
+    ) -> Result<crate::agent::remote::SessionActorRef, crate::error::AgentError> {
+        let mesh = self
+            .mesh()
+            .ok_or(crate::error::AgentError::MeshNotBootstrapped)?;
+
+        let dht_name = crate::agent::remote::dht_name::session(&bookmark.session_id);
+        let remote_ref = mesh
+            .lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name.clone())
+            .await
+            .map_err(|e| crate::error::AgentError::SwarmLookupFailed {
+                key: dht_name.clone(),
+                reason: e.to_string(),
+            })?
+            .ok_or_else(|| crate::error::AgentError::RemoteSessionNotFound {
+                details: format!(
+                    "bookmarked session {} not found in DHT",
+                    bookmark.session_id
+                ),
+            })?;
+
+        let mut registry = self.registry.lock().await;
+        let session_ref = registry
+            .attach_remote_session(
+                bookmark.session_id.clone(),
+                remote_ref,
+                bookmark.peer_label.clone(),
+                Some(mesh),
+                Some(bookmark.node_id.clone()),
+            )
+            .await;
+
+        Ok(session_ref)
     }
 }
 
