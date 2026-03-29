@@ -20,7 +20,7 @@ querymt = { path = "../querymt", default-features = false, features = ["extism_h
 querymt-utils = { path = "../querymt-utils", features = ["secret-store", "oauth", "providers"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-rustyline = "17"
+rustyline = "18"
 rustyline-derive = "0.11"
 colored = "3.0"
 spinners = "4.1"
