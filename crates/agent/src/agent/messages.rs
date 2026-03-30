@@ -208,6 +208,16 @@ pub struct Shutdown;
 #[derive(Serialize, Deserialize)]
 pub struct GetHistory;
 
+/// Retrieve the full durable event stream for this session.
+///
+/// Reply: `Result<Vec<AgentEvent>, Error>`
+///
+/// Returns all persisted `AgentEvent` entries from the event journal,
+/// ordered by sequence number. Used by remote peers to replay the session's
+/// event history on first attach.
+#[derive(Serialize, Deserialize)]
+pub struct GetEventStream;
+
 /// Subscribe a remote `EventRelayActor` to this session's events.
 ///
 /// Reply: `Result<(), Error>`

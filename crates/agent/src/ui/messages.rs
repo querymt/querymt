@@ -293,6 +293,10 @@ pub enum UiClientMessage {
         /// Session ID to attach
         session_id: String,
     },
+    /// Remove a persisted remote session bookmark and detach if currently attached
+    DismissRemoteSession {
+        session_id: String,
+    },
     AddCustomModelFromHf {
         provider: String,
         repo: String,

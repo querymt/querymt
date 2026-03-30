@@ -463,10 +463,27 @@ mod remote_impl {
             let session_ids = registry.session_ids();
 
             let hostname = get_hostname();
+            let store = self.config.provider.history_store();
 
             let mut infos = Vec::new();
             for sid in session_ids {
-                let (created_at, cwd) = self.session_meta.get(&sid).cloned().unwrap_or((0, None));
+                // Prefer metadata from session_meta (for remotely-created sessions),
+                // but fall back to querying the session store for locally-created sessions.
+                let (created_at, cwd, title) = if let Some((ts, meta_cwd)) =
+                    self.session_meta.get(&sid)
+                {
+                    (*ts, meta_cwd.clone(), None)
+                } else {
+                    match store.get_session(&sid).await {
+                        Ok(Some(session)) => {
+                            let ts = session.created_at.map(|t| t.unix_timestamp()).unwrap_or(0);
+                            let cwd = session.cwd.map(|p| p.display().to_string());
+                            let title = session.name.clone();
+                            (ts, cwd, title)
+                        }
+                        _ => (0, None, None),
+                    }
+                };
 
                 let actor_id = registry
                     .get(&sid)
@@ -484,7 +501,7 @@ mod remote_impl {
                     actor_id,
                     cwd,
                     created_at,
-                    title: None,
+                    title,
                     peer_label: hostname.clone(),
                 });
             }

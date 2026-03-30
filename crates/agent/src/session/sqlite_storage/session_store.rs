@@ -24,7 +24,7 @@ use crate::session::repository::{
     ProgressRepository, SessionRepository, TaskRepository,
 };
 use crate::session::store::{
-    CustomModel, LLMConfig, Session, SessionExecutionConfig, SessionStore,
+    CustomModel, LLMConfig, RemoteSessionBookmark, Session, SessionExecutionConfig, SessionStore,
     extract_llm_config_values,
 };
 
@@ -1317,6 +1317,68 @@ impl SessionStore for SqliteStorage {
 
             tx.commit()?;
             Ok(total_updated)
+        })
+        .await
+    }
+
+    // ── Remote session bookmarks ─────────────────────────────────────────
+
+    async fn save_remote_session_bookmark(
+        &self,
+        bookmark: &RemoteSessionBookmark,
+    ) -> SessionResult<()> {
+        let b = bookmark.clone();
+        self.run_blocking(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO remote_session_bookmarks
+                     (session_id, node_id, peer_label, cwd, created_at, title)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    b.session_id,
+                    b.node_id,
+                    b.peer_label,
+                    b.cwd,
+                    b.created_at,
+                    b.title,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_remote_session_bookmarks(&self) -> SessionResult<Vec<RemoteSessionBookmark>> {
+        self.run_blocking(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT session_id, node_id, peer_label, cwd, created_at, title
+                 FROM remote_session_bookmarks
+                 ORDER BY created_at DESC",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(RemoteSessionBookmark {
+                        session_id: row.get(0)?,
+                        node_id: row.get(1)?,
+                        peer_label: row.get(2)?,
+                        cwd: row.get(3)?,
+                        created_at: row.get(4)?,
+                        title: row.get(5)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    async fn remove_remote_session_bookmark(&self, session_id: &str) -> SessionResult<()> {
+        let sid = session_id.to_string();
+        self.run_blocking(move |conn| {
+            conn.execute(
+                "DELETE FROM remote_session_bookmarks WHERE session_id = ?1",
+                params![sid],
+            )?;
+            Ok(())
         })
         .await
     }

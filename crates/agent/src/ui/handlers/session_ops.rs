@@ -19,6 +19,7 @@ use querymt::chat::ReasoningEffort;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 use tracing::Instrument;
@@ -258,6 +259,119 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
     }
     let remote_merge_ms = remote_merge_started.elapsed().as_millis() as u64;
 
+    // Lazy reattach: load persisted remote session bookmarks and attempt to
+    // re-attach sessions that are not yet in the registry.  Bookmarked sessions
+    // that fail to reattach (peer offline) are shown as unattached so the user
+    // can dismiss them or wait for the peer to come back.
+    #[cfg(feature = "remote")]
+    {
+        if state.agent.mesh().is_some() {
+            match state.session_store.list_remote_session_bookmarks().await {
+                Ok(bookmarks) if !bookmarks.is_empty() => {
+                    let registry_ids: std::collections::HashSet<String> = {
+                        let registry = state.agent.registry.lock().await;
+                        registry.session_ids().into_iter().collect()
+                    };
+
+                    let mut bookmark_groups: std::collections::HashMap<
+                        String,
+                        Vec<SessionSummary>,
+                    > = std::collections::HashMap::new();
+
+                    for bookmark in bookmarks {
+                        if registry_ids.contains(&bookmark.session_id) {
+                            // Already attached (or local) — skip
+                            continue;
+                        }
+
+                        // Try to reattach with a short timeout
+                        let reattached = match tokio::time::timeout(
+                            std::time::Duration::from_secs(3),
+                            state.agent.reattach_from_bookmark(&bookmark),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => {
+                                log::info!(
+                                    "Reattached remote session {} from bookmark",
+                                    bookmark.session_id
+                                );
+                                true
+                            }
+                            Ok(Err(e)) => {
+                                log::debug!(
+                                    "Failed to reattach bookmarked session {}: {}",
+                                    bookmark.session_id,
+                                    e
+                                );
+                                false
+                            }
+                            Err(_) => {
+                                log::debug!(
+                                    "Reattach timed out for bookmarked session {}",
+                                    bookmark.session_id
+                                );
+                                false
+                            }
+                        };
+
+                        // Show the bookmarked session in the list regardless of reattach success
+                        bookmark_groups
+                            .entry(bookmark.peer_label.clone())
+                            .or_default()
+                            .push(SessionSummary {
+                                session_id: bookmark.session_id,
+                                name: None,
+                                cwd: bookmark.cwd,
+                                title: bookmark.title,
+                                created_at: None,
+                                updated_at: None,
+                                parent_session_id: None,
+                                fork_origin: None,
+                                session_kind: None,
+                                has_children: false,
+                                node: Some(bookmark.peer_label),
+                                node_id: Some(bookmark.node_id),
+                                attached: Some(reattached),
+                            });
+                    }
+
+                    for (node_label, sessions) in bookmark_groups {
+                        // Merge into existing remote group for this node, or create new one
+                        let group_cwd = format!("remote::{}", node_label);
+                        if let Some(existing) = groups
+                            .iter_mut()
+                            .find(|g| g.cwd.as_deref() == Some(group_cwd.as_str()))
+                        {
+                            let existing_ids: std::collections::HashSet<String> = existing
+                                .sessions
+                                .iter()
+                                .map(|s| s.session_id.clone())
+                                .collect();
+                            for s in sessions {
+                                if !existing_ids.contains(&s.session_id) {
+                                    existing.sessions.push(s);
+                                }
+                            }
+                        } else {
+                            remote_group_count += 1;
+                            remote_session_count += sessions.len();
+                            groups.push(SessionGroup {
+                                cwd: Some(group_cwd),
+                                sessions,
+                                latest_activity: None,
+                            });
+                        }
+                    }
+                }
+                Ok(_) => {} // no bookmarks
+                Err(e) => {
+                    log::warn!("Failed to load remote session bookmarks: {}", e);
+                }
+            }
+        }
+    }
+
     let total_group_count = groups.len();
     let total_session_count: usize = groups.iter().map(|g| g.sessions.len()).sum();
 
@@ -282,9 +396,59 @@ pub async fn handle_load_session(
     session_id: &str,
     tx: &mpsc::Sender<String>,
 ) {
-    // 1. Get audit view for this session only (child sessions loaded separately)
+    let is_remote_attached = {
+        let registry = state.agent.registry.lock().await;
+        registry.get(session_id).is_some_and(|r| r.is_remote())
+    };
+
+    // 1. Get audit view for this session only (child sessions loaded separately).
+    // Remote sessions may not have a local projection row yet; when attached,
+    // degrade to an empty audit payload instead of failing the load request.
     let audit = match state.view_store.get_audit_view(session_id, false).await {
         Ok(audit) => audit,
+        Err(e) if is_remote_attached => {
+            // Load relayed events directly from the event journal.
+            // get_audit_view fails because task/intent repos require a local
+            // `sessions` row which remote sessions don't have, but events
+            // relayed via EventRelayActor ARE persisted in the journal.
+            let events: Vec<crate::events::AgentEvent> = state
+                .agent
+                .config
+                .event_sink
+                .journal()
+                .load_session_stream(session_id, None, None)
+                .await
+                .unwrap_or_else(|je| {
+                    tracing::warn!(
+                        session_id,
+                        error = %je,
+                        "failed to load journal events for remote session"
+                    );
+                    Vec::new()
+                })
+                .into_iter()
+                .map(crate::events::AgentEvent::from)
+                .collect();
+
+            tracing::debug!(
+                session_id,
+                error = %e,
+                event_count = events.len(),
+                "remote session missing local audit projection; loaded {} events from journal",
+                events.len()
+            );
+            crate::session::projection::AuditView {
+                session_id: session_id.to_string(),
+                events,
+                tasks: Vec::new(),
+                intent_snapshots: Vec::new(),
+                decisions: Vec::new(),
+                progress_entries: Vec::new(),
+                artifacts: Vec::new(),
+                delegations: Vec::new(),
+                generated_at: OffsetDateTime::now_utc(),
+            }
+        }
         Err(e) => {
             let _ = send_error(tx, format!("Failed to load session: {}", e)).await;
             return;
@@ -300,7 +464,9 @@ pub async fn handle_load_session(
         cwds.insert(session_id.to_string(), cwd.clone());
         Some(cwd)
     } else {
-        None
+        // Remote sessions may have cwd cached from attach/list metadata.
+        let cwds = state.session_cwds.lock().await;
+        cwds.get(session_id).cloned()
     };
 
     // 2. Determine agent ID (default to primary)

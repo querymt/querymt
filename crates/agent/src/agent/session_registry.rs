@@ -105,8 +105,25 @@ impl SessionRegistry {
 
     /// Set the mesh handle so that `remove()` and `detach_remote_session()`
     /// can deregister actors from the re-registration map.
+    ///
+    /// When a mesh handle is provided, all existing **local** sessions in the
+    /// registry are registered in the DHT so that remote peers can discover
+    /// and attach to them.
     #[cfg(feature = "remote")]
     pub fn set_mesh(&mut self, mesh: Option<crate::agent::remote::MeshHandle>) {
+        // Register all existing local sessions in DHT so remote peers can attach.
+        if let Some(ref mesh) = mesh {
+            for (session_id, session_ref) in &self.sessions {
+                if let SessionActorRef::Local(ar) = session_ref {
+                    let dht_name = crate::agent::remote::dht_name::session(session_id);
+                    let mesh = mesh.clone();
+                    let ar = ar.clone();
+                    tokio::spawn(async move {
+                        mesh.register_actor(ar, dht_name).await;
+                    });
+                }
+            }
+        }
         self.mesh = mesh;
     }
 
@@ -222,6 +239,7 @@ impl SessionRegistry {
         remote_ref: kameo::actor::RemoteActorRef<SessionActor>,
         peer_label: String,
         mesh: Option<crate::agent::remote::MeshHandle>,
+        remote_node_id: Option<String>,
     ) -> SessionActorRef {
         log::debug!(
             "attach_remote_session: called for session_id={} peer='{}' \
@@ -283,6 +301,27 @@ impl SessionRegistry {
             .insert(session_id.clone(), session_ref.clone());
         self.relay_actor_ids
             .insert(session_id.clone(), (relay_id, relay_dht_name));
+
+        // Persist a bookmark so this remote session survives server restart.
+        if let Some(node_id) = remote_node_id {
+            let bookmark = crate::session::store::RemoteSessionBookmark {
+                session_id: session_id.clone(),
+                node_id,
+                peer_label: peer_label.clone(),
+                cwd: None,
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+                title: None,
+            };
+            let store = self.config.provider.history_store();
+            tokio::spawn(async move {
+                if let Err(e) = store.save_remote_session_bookmark(&bookmark).await {
+                    log::warn!("Failed to persist remote session bookmark: {}", e);
+                }
+            });
+        }
 
         log::info!(
             "Attached remote session {} from {} (relay_actor_id={}, event relay {})",
@@ -347,6 +386,15 @@ impl SessionRegistry {
                 mesh.deregister_actor(relay_name);
             }
         }
+
+        // Remove the persisted bookmark.
+        let store = self.config.provider.history_store();
+        let sid = session_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = store.remove_remote_session_bookmark(&sid).await {
+                log::warn!("Failed to remove remote session bookmark {}: {}", sid, e);
+            }
+        });
 
         self.relay_actor_ids.remove(session_id);
         self.sessions.remove(session_id)
@@ -415,7 +463,19 @@ impl SessionRegistry {
         // Spawn the session actor
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone());
         let actor_ref = SessionActor::spawn(actor);
-        self.sessions.insert(session_id.clone(), actor_ref.into());
+        self.sessions
+            .insert(session_id.clone(), actor_ref.clone().into());
+
+        // Register in DHT so remote peers can discover and attach to this session.
+        #[cfg(feature = "remote")]
+        if let Some(ref mesh) = self.mesh {
+            let dht_name = crate::agent::remote::dht_name::session(&session_id);
+            let mesh = mesh.clone();
+            let ar = actor_ref.clone();
+            tokio::spawn(async move {
+                mesh.register_actor(ar, dht_name).await;
+            });
+        }
 
         self.config
             .emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);
@@ -548,7 +608,19 @@ impl SessionRegistry {
 
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime);
         let actor_ref = SessionActor::spawn(actor);
-        self.sessions.insert(session_id.clone(), actor_ref.into());
+        self.sessions
+            .insert(session_id.clone(), actor_ref.clone().into());
+
+        // Register in DHT so remote peers can discover and attach to this session.
+        #[cfg(feature = "remote")]
+        if let Some(ref mesh) = self.mesh {
+            let dht_name = crate::agent::remote::dht_name::session(&session_id);
+            let mesh = mesh.clone();
+            let ar = actor_ref.clone();
+            tokio::spawn(async move {
+                mesh.register_actor(ar, dht_name).await;
+            });
+        }
 
         // Stream full history to client
         // TODO: Implement full-fidelity history streaming with SessionUpdate notifications
@@ -695,7 +767,19 @@ impl SessionRegistry {
 
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime);
         let actor_ref = SessionActor::spawn(actor);
-        self.sessions.insert(session_id.clone(), actor_ref.into());
+        self.sessions
+            .insert(session_id.clone(), actor_ref.clone().into());
+
+        // Register in DHT so remote peers can discover and attach to this session.
+        #[cfg(feature = "remote")]
+        if let Some(ref mesh) = self.mesh {
+            let dht_name = crate::agent::remote::dht_name::session(&session_id);
+            let mesh = mesh.clone();
+            let ar = actor_ref.clone();
+            tokio::spawn(async move {
+                mesh.register_actor(ar, dht_name).await;
+            });
+        }
 
         self.config
             .emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);

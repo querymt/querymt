@@ -695,6 +695,7 @@ mod event_relay_mesh_tests {
                 remote_session,
                 "test-peer".to_string(),
                 Some(mesh.clone()),
+                None,
             )
             .await;
 

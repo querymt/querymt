@@ -120,6 +120,11 @@ remote_msg_impl!(
 );
 remote_msg_impl!(messages::GetHistory, "querymt::GetHistory", REG_GET_HISTORY);
 remote_msg_impl!(
+    messages::GetEventStream,
+    "querymt::GetEventStream",
+    REG_GET_EVENT_STREAM
+);
+remote_msg_impl!(
     messages::GetLlmConfig,
     "querymt::GetLlmConfig",
     REG_GET_LLM_CONFIG
