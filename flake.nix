@@ -68,7 +68,7 @@
           pname = "querymt-agent-ui";
           version = workspaceCargoToml.workspace.package.version;
           src = ./crates/agent/ui;
-          npmDepsHash = "sha256-1K/k6jQXiBWacq1Ijkp6xbktQwgxXlFa07S9a5H26Gs=";
+          npmDepsHash = "sha256-8+LZvwg3X12eiENetvwl/8RKDLCobCNy6Ytu+3YLVww=";
           npmBuildScript = "build";
           installPhase = ''
             runHook preInstall
@@ -80,6 +80,7 @@
       in {
         packages = {
           agent-ui = agentUi;
+          default = self.packages.${system}.qmt;
 
           qmtcode = pkgs.rustPlatform.buildRustPackage {
             pname = "qmtcode";
