@@ -24,9 +24,8 @@ tools = [
   "create_task", "todowrite", "todoread",
   # User interaction
   "question",
-  # Code intelligence
-#  "semantic_edit",
-  "web_fetch",
+  # Web browsingCode intelligence
+  "browse",
 ]
 system = [
   { file = "../prompts/default_system.txt" },
