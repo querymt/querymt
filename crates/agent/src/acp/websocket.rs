@@ -98,7 +98,7 @@ pub async fn serve_websocket(
     // pending_permissions map, not for direct client communication like in stdio
     let (tx, _rx) = mpsc::channel(100);
     let bridge_sender = ClientBridgeSender::new(tx);
-    agent.set_bridge(bridge_sender);
+    agent.set_bridge(bridge_sender).await;
 
     let event_sources = collect_event_sources(&agent);
     let pending_permissions = Arc::new(Mutex::new(HashMap::new()));

@@ -238,10 +238,14 @@ impl LocalAgentHandle {
     }
 
     /// Sets the client bridge for ACP stdio communication.
-    pub fn set_bridge(&self, bridge: ClientBridgeSender) {
+    ///
+    /// Also propagates the bridge to the session registry so that newly
+    /// created sessions receive it via `SetBridge`.
+    pub async fn set_bridge(&self, bridge: ClientBridgeSender) {
         if let Ok(mut handle) = self.bridge.lock() {
-            *handle = Some(bridge);
+            *handle = Some(bridge.clone());
         }
+        self.registry.lock().await.set_bridge(bridge);
     }
 
     /// Emits an event for external observers.

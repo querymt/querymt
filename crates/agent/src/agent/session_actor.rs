@@ -1626,7 +1626,8 @@ async fn execute_prompt_detached(
     .with_cancellation_token(cancel_token.clone())
     .with_execution_origin(execution_origin)
     .with_knowledge_store(config.knowledge_store())
-    .with_event_sink(config.event_sink.clone());
+    .with_event_sink(config.event_sink.clone())
+    .with_workspace_query_bridge(bridge.clone());
 
     // 4. Store User Messages
     // Keep separate projections for user-visible events vs LLM replay context.

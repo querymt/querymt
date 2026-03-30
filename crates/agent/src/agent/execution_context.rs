@@ -1,5 +1,6 @@
 //! Execution context bundling all per-run state for agent execution
 
+use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::core::{SessionRuntime, ToolConfig};
 use crate::knowledge::KnowledgeStore;
 use crate::model::AgentMessage;
@@ -81,6 +82,12 @@ pub(crate) struct ExecutionContext {
     /// Optional event sink, propagated into tool contexts so tools can emit
     /// agent events (e.g. `KnowledgeIngested`, `KnowledgeConsolidated`).
     pub event_sink: Option<Arc<crate::event_sink::EventSink>>,
+
+    /// Optional workspace query bridge for VS Code language intelligence.
+    /// When set, the `language_query` tool can access diagnostics, references,
+    /// definitions, symbols, hover docs, and type definitions through the
+    /// editor's language server.
+    pub workspace_query_bridge: Option<ClientBridgeSender>,
 }
 
 impl ExecutionContext {
@@ -102,6 +109,7 @@ impl ExecutionContext {
             execution_origin: ExecutionOrigin::Interactive,
             knowledge_store: None,
             event_sink: None,
+            workspace_query_bridge: None,
         }
     }
 
@@ -126,6 +134,15 @@ impl ExecutionContext {
     /// Set the event sink for this context.
     pub fn with_event_sink(mut self, sink: Arc<crate::event_sink::EventSink>) -> Self {
         self.event_sink = Some(sink);
+        self
+    }
+
+    /// Set the workspace query bridge for language intelligence queries.
+    ///
+    /// When set, the `language_query` tool can access VS Code's language APIs
+    /// (diagnostics, references, definitions, etc.) through this bridge.
+    pub fn with_workspace_query_bridge(mut self, bridge: Option<ClientBridgeSender>) -> Self {
+        self.workspace_query_bridge = bridge;
         self
     }
 
@@ -173,6 +190,9 @@ impl ExecutionContext {
         }
         if let Some(ref sink) = self.event_sink {
             ctx.with_event_sink(sink.clone());
+        }
+        if let Some(ref bridge) = self.workspace_query_bridge {
+            ctx = ctx.with_workspace_query_bridge(bridge.clone());
         }
 
         ctx

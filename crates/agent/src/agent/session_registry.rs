@@ -89,6 +89,10 @@ pub struct SessionRegistry {
     /// are removed (Phase 4 of Bug 1 fix).
     #[cfg(feature = "remote")]
     mesh: Option<crate::agent::remote::MeshHandle>,
+    /// Client bridge for workspace queries and notifications. Set once the ACP
+    /// connection is established. Propagated to new session actors via `SetBridge`
+    /// so that tools like `language_query` can access the client's language server.
+    bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
 }
 
 impl SessionRegistry {
@@ -100,7 +104,17 @@ impl SessionRegistry {
             relay_actor_ids: HashMap::new(),
             #[cfg(feature = "remote")]
             mesh: None,
+            bridge: None,
         }
+    }
+
+    /// Set the client bridge for ACP communication.
+    ///
+    /// When set, newly created sessions will receive the bridge via `SetBridge`
+    /// so that session actors can send notifications and tools like
+    /// `language_query` can access the client's language server.
+    pub fn set_bridge(&mut self, bridge: crate::acp::client_bridge::ClientBridgeSender) {
+        self.bridge = Some(bridge);
     }
 
     /// Set the mesh handle so that `remove()` and `detach_remote_session()`
@@ -463,8 +477,21 @@ impl SessionRegistry {
         // Spawn the session actor
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone());
         let actor_ref = SessionActor::spawn(actor);
-        self.sessions
-            .insert(session_id.clone(), actor_ref.clone().into());
+        let session_ref: SessionActorRef = actor_ref.clone().into();
+
+        // Propagate client bridge so the session can send notifications and
+        // tools like `language_query` can access the client's language server.
+        if let Some(ref bridge) = self.bridge
+            && let Err(e) = session_ref.set_bridge(bridge.clone()).await
+        {
+            log::warn!(
+                "Session {}: failed to set bridge on new session actor: {}",
+                session_id,
+                e
+            );
+        }
+
+        self.sessions.insert(session_id.clone(), session_ref);
 
         // Register in DHT so remote peers can discover and attach to this session.
         #[cfg(feature = "remote")]
@@ -608,8 +635,20 @@ impl SessionRegistry {
 
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime);
         let actor_ref = SessionActor::spawn(actor);
-        self.sessions
-            .insert(session_id.clone(), actor_ref.clone().into());
+        let session_ref: SessionActorRef = actor_ref.clone().into();
+
+        // Propagate client bridge (same as new_session)
+        if let Some(ref bridge) = self.bridge
+            && let Err(e) = session_ref.set_bridge(bridge.clone()).await
+        {
+            log::warn!(
+                "Session {}: failed to set bridge on loaded session actor: {}",
+                session_id,
+                e
+            );
+        }
+
+        self.sessions.insert(session_id.clone(), session_ref);
 
         // Register in DHT so remote peers can discover and attach to this session.
         #[cfg(feature = "remote")]
@@ -767,8 +806,20 @@ impl SessionRegistry {
 
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime);
         let actor_ref = SessionActor::spawn(actor);
-        self.sessions
-            .insert(session_id.clone(), actor_ref.clone().into());
+        let session_ref: SessionActorRef = actor_ref.clone().into();
+
+        // Propagate client bridge (same as new_session)
+        if let Some(ref bridge) = self.bridge
+            && let Err(e) = session_ref.set_bridge(bridge.clone()).await
+        {
+            log::warn!(
+                "Session {}: failed to set bridge on resumed session actor: {}",
+                session_id,
+                e
+            );
+        }
+
+        self.sessions.insert(session_id.clone(), session_ref);
 
         // Register in DHT so remote peers can discover and attach to this session.
         #[cfg(feature = "remote")]

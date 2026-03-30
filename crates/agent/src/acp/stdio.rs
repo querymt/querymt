@@ -308,7 +308,7 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
             log::debug!("Created bridge channel");
 
             // 2. Set the bridge on the agent
-            agent.set_bridge(bridge_sender.clone());
+            agent.set_bridge(bridge_sender.clone()).await;
             log::debug!("Set bridge on agent");
 
             // 3. Collect EventFanouts from agent and delegates
