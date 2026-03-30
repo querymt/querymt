@@ -63,10 +63,10 @@ id = "researcher"
 provider = "anthropic"
 model = "claude-3-sonnet"
 description = "Research specialist for information gathering"
-capabilities = ["research", "web_search"]
+capabilities = ["research", "browse"]
 
 tools = [
-    "web_fetch",
+    "browse",
     "read_tool",
     "github.search_repos",  # Specific tool from github MCP
     "github.list_issues"

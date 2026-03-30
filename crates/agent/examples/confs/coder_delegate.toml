@@ -17,7 +17,7 @@ max_parallel_delegations = 1
 [planner]
 provider = "anthropic"
 model = "claude-opus-4-6"
-tools = ["delegate", "create_task", "todowrite", "todoread", "question", "search_text", "glob", "ls", "read_tool", "shell", "web_fetch"]
+tools = ["delegate", "create_task", "todowrite", "todoread", "question", "search_text", "glob", "ls", "read_tool", "shell", "browse"]
 system = [
   { file = "../prompts/default_system.txt" },
   { file = "../prompts/code_meta.jinja2" }
