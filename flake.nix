@@ -68,7 +68,10 @@
           pname = "querymt-agent-ui";
           version = workspaceCargoToml.workspace.package.version;
           src = ./crates/agent/ui;
-          npmDepsHash = "sha256-8+LZvwg3X12eiENetvwl/8RKDLCobCNy6Ytu+3YLVww=";
+          npmDeps = pkgs.importNpmLock {
+            npmRoot = ./crates/agent/ui;
+          };
+          npmConfigHook = pkgs.importNpmLock.npmConfigHook;
           npmBuildScript = "build";
           installPhase = ''
             runHook preInstall
@@ -96,7 +99,7 @@
               "--example"
               "qmtcode"
               "--features"
-              "dashboard,oauth,dbus-secret-service"
+              "dashboard,oauth,dbus-secret-service,remote-internet"
             ];
             nativeBuildInputs = [
               pkgs.pkg-config
