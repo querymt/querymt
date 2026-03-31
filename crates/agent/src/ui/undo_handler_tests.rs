@@ -564,10 +564,12 @@ async fn test_set_session_model_hydrates_persisted_session() -> Result<()> {
     }
 
     let (tx, mut rx) = mpsc::channel(16);
+    let (bin_tx, _bin_rx) = mpsc::channel::<Vec<u8>>(16);
     handle_ui_message(
         &f.state,
         "conn-model",
         &tx,
+        &bin_tx,
         UiClientMessage::SetSessionModel {
             session_id: session_id.clone(),
             model_id: "mock/new-model".to_string(),
@@ -630,10 +632,12 @@ async fn test_set_session_model_unknown_session_returns_not_found() -> Result<()
 
     let missing_id = "019c0000-0000-7000-8000-000000000001".to_string();
     let (tx, mut rx) = mpsc::channel(16);
+    let (bin_tx, _bin_rx) = mpsc::channel::<Vec<u8>>(16);
     handle_ui_message(
         &f.state,
         "conn-missing",
         &tx,
+        &bin_tx,
         UiClientMessage::SetSessionModel {
             session_id: missing_id.clone(),
             model_id: "mock/new-model".to_string(),

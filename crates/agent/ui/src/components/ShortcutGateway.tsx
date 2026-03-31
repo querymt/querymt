@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { Command } from 'cmdk';
-import { Bug, Clock, Keyboard, KeyRound, MessageSquare, Palette, Plus, RefreshCw, X } from 'lucide-react';
+import { Bug, Clock, Keyboard, KeyRound, MessageSquare, Mic, Palette, Plus, RefreshCw, Volume2, X } from 'lucide-react';
 import { useUiStore } from '../store/uiStore';
+import { useVoiceStore } from '../store/voiceStore';
+import { useUiClientConfig } from '../context/UiClientContext';
+import { VoiceModelPicker } from './VoiceModelPicker';
 import { isDebugLogEnabled, toggleDebugLog } from '../utils/debugLog';
 
 interface ShortcutGatewayProps {
@@ -28,7 +31,15 @@ export function ShortcutGateway({
   const [search, setSearch] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
   const { focusMainInput, followNewMessages, setFollowNewMessages } = useUiStore();
+  const { audioCapabilities } = useUiClientConfig();
+  const {
+    sttProvider, sttModel, ttsProvider, ttsModel, ttsVoice,
+    setSttConfig, setTtsConfig, autoTtsEnabled, setAutoTtsEnabled,
+  } = useVoiceStore();
+  const [sttPickerOpen, setSttPickerOpen] = useState(false);
+  const [ttsPickerOpen, setTtsPickerOpen] = useState(false);
   const shortcutGatewayPrefix = navigator.platform.includes('Mac') ? '⌘+X' : 'Ctrl+X';
+  const hasAudio = audioCapabilities.stt_models.length > 0 || audioCapabilities.tts_models.length > 0;
 
   const close = () => {
     onOpenChange(false);
@@ -40,15 +51,14 @@ export function ShortcutGateway({
       return;
     }
     setSearch('');
+    setSttPickerOpen(false);
+    setTtsPickerOpen(false);
     window.setTimeout(() => inputRef.current?.focus(), 0);
   }, [open]);
 
-  if (!open) {
-    return null;
-  }
-
   return (
     <>
+      {open && (<>
       <div
         data-testid="shortcut-gateway-backdrop"
         className="fixed inset-0 bg-surface-canvas/80 z-40 animate-fade-in"
@@ -235,9 +245,94 @@ export function ShortcutGateway({
                 </kbd>
               </Command.Item>
             </Command.Group>
+
+            {hasAudio && (
+              <Command.Group heading={<span className="text-[11px] font-medium text-ui-muted px-1 uppercase tracking-wider">Voice</span>} className="mt-2 mb-1">
+                {audioCapabilities.stt_models.length > 0 && (
+                  <Command.Item
+                    value="stt model voice"
+                    keywords={['stt', 'speech', 'transcribe', 'microphone', 'voice', 'asr']}
+                    onSelect={() => { onOpenChange(false); setSttPickerOpen(true); }}
+                    className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40"
+                  >
+                    <div className="w-7 h-7 rounded-md border border-accent-primary/35 bg-accent-primary/10 flex items-center justify-center">
+                      <Mic className="w-3.5 h-3.5 text-accent-primary" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm text-ui-primary">STT Model</div>
+                      <div className="text-xs text-ui-muted truncate">
+                        {sttProvider}/{sttModel}
+                      </div>
+                    </div>
+                  </Command.Item>
+                )}
+
+                {audioCapabilities.tts_models.length > 0 && (
+                  <Command.Item
+                    value="tts model voice"
+                    keywords={['tts', 'speech', 'speak', 'voice', 'synthesis']}
+                    onSelect={() => { onOpenChange(false); setTtsPickerOpen(true); }}
+                    className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40"
+                  >
+                    <div className="w-7 h-7 rounded-md border border-accent-primary/35 bg-accent-primary/10 flex items-center justify-center">
+                      <Volume2 className="w-3.5 h-3.5 text-accent-primary" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm text-ui-primary">TTS Model</div>
+                      <div className="text-xs text-ui-muted truncate">
+                        {ttsProvider}/{ttsModel}{ttsVoice ? ` (${ttsVoice})` : ''}
+                      </div>
+                    </div>
+                  </Command.Item>
+                )}
+
+                {audioCapabilities.tts_models.length > 0 && (
+                  <Command.Item
+                    value="auto tts voice"
+                    keywords={['auto', 'tts', 'speak', 'voice', 'auto-speak']}
+                    onSelect={() => setAutoTtsEnabled(!autoTtsEnabled)}
+                    className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40"
+                  >
+                    <div className="w-7 h-7 rounded-md border border-accent-primary/35 bg-accent-primary/10 flex items-center justify-center">
+                      <Volume2 className="w-3.5 h-3.5 text-accent-primary" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm text-ui-primary">Auto-TTS</div>
+                      <div className="text-xs text-ui-muted">
+                        {autoTtsEnabled ? 'Agent responses are spoken aloud' : 'Speak agent responses automatically'}
+                      </div>
+                    </div>
+                    <kbd className="px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-secondary">
+                      {autoTtsEnabled ? 'On' : 'Off'}
+                    </kbd>
+                  </Command.Item>
+                )}
+              </Command.Group>
+            )}
           </Command.List>
         </Command>
       </div>
+      </>)}
+
+      <VoiceModelPicker
+        open={sttPickerOpen}
+        onOpenChange={setSttPickerOpen}
+        mode="stt"
+        models={audioCapabilities.stt_models}
+        selectedProvider={sttProvider}
+        selectedModel={sttModel}
+        onSelect={setSttConfig}
+      />
+
+      <VoiceModelPicker
+        open={ttsPickerOpen}
+        onOpenChange={setTtsPickerOpen}
+        mode="tts"
+        models={audioCapabilities.tts_models}
+        selectedProvider={ttsProvider}
+        selectedModel={ttsModel}
+        onSelect={setTtsConfig}
+      />
     </>
   );
 }
