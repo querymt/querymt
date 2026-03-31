@@ -75,6 +75,7 @@ export type {
   ScheduleInfo,
   KnowledgeEntryInfo,
   ConsolidationInfo,
+  AudioModelInfo,
 } from './generated/types';
 
 // FileIndexEntry is now generated from Rust via typeshare — re-exported above.

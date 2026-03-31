@@ -11,6 +11,16 @@ use serde_json::Value;
 use std::collections::HashMap;
 use typeshare::typeshare;
 
+/// An audio-capable model entry returned in [`UiServerMessage::AudioCapabilities`].
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioModelInfo {
+    /// Provider name (e.g. "izwi")
+    pub provider: String,
+    /// Model name (e.g. "Qwen3-ASR-0.6B")
+    pub model: String,
+}
+
 /// A block of content in a UI prompt (text or resource reference).
 /// Typeshare-annotated: generated for TypeScript and Swift.
 #[typeshare]
@@ -421,6 +431,39 @@ pub enum UiClientMessage {
     #[serde(rename = "knowledge_stats")]
     KnowledgeStats {
         scope: String,
+    },
+    /// Transcribe audio to text (STT).
+    ///
+    /// Sent as a **binary WebSocket frame** with a length-prefixed JSON header
+    /// (this struct) followed by raw audio bytes. The JSON header is parsed
+    /// separately by `parse_binary_frame`; the audio payload is passed directly
+    /// to the handler.
+    Transcribe {
+        /// Provider name (e.g. "izwi")
+        provider: String,
+        /// Model name (e.g. "Qwen3-ASR-0.6B")
+        model: String,
+        /// MIME type of the audio payload (e.g. "audio/wav", "audio/webm").
+        #[serde(default)]
+        mime_type: Option<String>,
+    },
+    /// Synthesize speech from text (TTS).
+    ///
+    /// Sent as a normal JSON text frame. The response (`speech_result`) is a
+    /// binary frame containing a JSON header + raw audio bytes.
+    Speech {
+        /// Provider name (e.g. "izwi")
+        provider: String,
+        /// Model name (e.g. "Kokoro-82M")
+        model: String,
+        /// Text to synthesize
+        text: String,
+        /// Optional voice/speaker preset name
+        #[serde(default)]
+        voice: Option<String>,
+        /// Target audio format: "wav" (default)
+        #[serde(default)]
+        format: Option<String>,
     },
 }
 
@@ -908,6 +951,22 @@ pub enum UiServerMessage {
         latest_entry_at: Option<String>,
         latest_consolidation_at: Option<String>,
     },
+    /// STT transcription result (text frame)
+    #[serde(rename = "transcribe_result")]
+    TranscribeResult {
+        text: String,
+    },
+    /// Audio provider capabilities (sent during init)
+    #[serde(rename = "audio_capabilities")]
+    AudioCapabilities {
+        stt_models: Vec<AudioModelInfo>,
+        tts_models: Vec<AudioModelInfo>,
+    },
+    // NOTE: `speech_result` is sent as a **binary WebSocket frame**, not a JSON
+    // text frame. The binary envelope contains a length-prefixed JSON header
+    // `{"type":"speech_result","data":{"mime_type":"audio/wav"}}` followed by
+    // raw audio bytes. See `audio::send_binary_audio_response` for encoding
+    // and `parse_binary_frame` / `encode_binary_frame` for the envelope format.
 }
 
 impl UiServerMessage {
@@ -950,13 +1009,17 @@ impl UiServerMessage {
             Self::KnowledgeQueryResult { .. } => "knowledge_query_result",
             Self::KnowledgeListResult { .. } => "knowledge_list_result",
             Self::KnowledgeStatsResult { .. } => "knowledge_stats_result",
+            Self::TranscribeResult { .. } => "transcribe_result",
+            Self::AudioCapabilities { .. } => "audio_capabilities",
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{OAuthFlowKind, PluginUpdateResult, UiClientMessage, UiServerMessage};
+    use super::{
+        AudioModelInfo, OAuthFlowKind, PluginUpdateResult, UiClientMessage, UiServerMessage,
+    };
     use serde_json::json;
 
     // Note: All UiClientMessage and UiServerMessage tests use adjacently tagged serde format:
@@ -1543,5 +1606,141 @@ mod tests {
         assert_eq!(json["data"]["total_entries"], 42);
         assert_eq!(json["data"]["unconsolidated_entries"], 10);
         assert_eq!(json["data"]["total_consolidations"], 5);
+    }
+
+    // ── Audio message tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn deserializes_transcribe_with_all_fields() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "transcribe",
+            "data": {
+                "provider": "izwi",
+                "model": "Qwen3-ASR-0.6B",
+                "mime_type": "audio/wav"
+            }
+        }))
+        .expect("transcribe should deserialize");
+
+        match msg {
+            UiClientMessage::Transcribe {
+                provider,
+                model,
+                mime_type,
+            } => {
+                assert_eq!(provider, "izwi");
+                assert_eq!(model, "Qwen3-ASR-0.6B");
+                assert_eq!(mime_type.as_deref(), Some("audio/wav"));
+            }
+            _ => panic!("expected Transcribe variant"),
+        }
+    }
+
+    #[test]
+    fn deserializes_transcribe_without_optional_fields() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "transcribe",
+            "data": {
+                "provider": "izwi",
+                "model": "Qwen3-ASR-0.6B"
+            }
+        }))
+        .expect("transcribe should deserialize without mime_type");
+
+        match msg {
+            UiClientMessage::Transcribe { mime_type, .. } => {
+                assert!(mime_type.is_none());
+            }
+            _ => panic!("expected Transcribe variant"),
+        }
+    }
+
+    #[test]
+    fn deserializes_speech_with_all_fields() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "speech",
+            "data": {
+                "provider": "izwi",
+                "model": "Kokoro-82M",
+                "text": "Hello world",
+                "voice": "af_heart",
+                "format": "wav"
+            }
+        }))
+        .expect("speech should deserialize");
+
+        match msg {
+            UiClientMessage::Speech {
+                provider,
+                model,
+                text,
+                voice,
+                format,
+            } => {
+                assert_eq!(provider, "izwi");
+                assert_eq!(model, "Kokoro-82M");
+                assert_eq!(text, "Hello world");
+                assert_eq!(voice.as_deref(), Some("af_heart"));
+                assert_eq!(format.as_deref(), Some("wav"));
+            }
+            _ => panic!("expected Speech variant"),
+        }
+    }
+
+    #[test]
+    fn deserializes_speech_without_optional_fields() {
+        let msg: UiClientMessage = serde_json::from_value(json!({
+            "type": "speech",
+            "data": {
+                "provider": "izwi",
+                "model": "Kokoro-82M",
+                "text": "Hello"
+            }
+        }))
+        .expect("speech should deserialize without voice/format");
+
+        match msg {
+            UiClientMessage::Speech { voice, format, .. } => {
+                assert!(voice.is_none());
+                assert!(format.is_none());
+            }
+            _ => panic!("expected Speech variant"),
+        }
+    }
+
+    #[test]
+    fn transcribe_result_server_msg_serializes() {
+        let msg = UiServerMessage::TranscribeResult {
+            text: "hello world".to_string(),
+        };
+        let json = serde_json::to_value(&msg).expect("should serialize");
+        assert_eq!(json["type"], "transcribe_result");
+        assert_eq!(json["data"]["text"], "hello world");
+    }
+
+    #[test]
+    fn audio_capabilities_server_msg_serializes() {
+        let msg = UiServerMessage::AudioCapabilities {
+            stt_models: vec![AudioModelInfo {
+                provider: "izwi".to_string(),
+                model: "Qwen3-ASR-0.6B".to_string(),
+            }],
+            tts_models: vec![
+                AudioModelInfo {
+                    provider: "izwi".to_string(),
+                    model: "Kokoro-82M".to_string(),
+                },
+                AudioModelInfo {
+                    provider: "izwi".to_string(),
+                    model: "Qwen3-TTS-12Hz-0.6B-Base-4bit".to_string(),
+                },
+            ],
+        };
+        let json = serde_json::to_value(&msg).expect("should serialize");
+        assert_eq!(json["type"], "audio_capabilities");
+        assert_eq!(json["data"]["stt_models"].as_array().unwrap().len(), 1);
+        assert_eq!(json["data"]["tts_models"].as_array().unwrap().len(), 2);
+        assert_eq!(json["data"]["stt_models"][0]["provider"], "izwi");
+        assert_eq!(json["data"]["stt_models"][0]["model"], "Qwen3-ASR-0.6B");
     }
 }

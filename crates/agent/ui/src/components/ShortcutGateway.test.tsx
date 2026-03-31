@@ -4,6 +4,13 @@ import userEvent from '@testing-library/user-event';
 import { ShortcutGateway } from './ShortcutGateway';
 import { useUiStore } from '../store/uiStore';
 
+// Mock UiClientContext so ShortcutGateway can use useUiClientConfig without a provider.
+vi.mock('../context/UiClientContext', () => ({
+  useUiClientConfig: () => ({
+    audioCapabilities: { stt_models: [], tts_models: [] },
+  }),
+}));
+
 describe('ShortcutGateway', () => {
   const defaultProps = {
     open: true,
