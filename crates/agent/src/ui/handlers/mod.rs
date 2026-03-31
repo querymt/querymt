@@ -8,6 +8,7 @@
 //! - [`session_ops`] — session list/load/cancel/subscribe/undo/redo/elicitation/mode
 //! - [`remote`]      — remote node and session management
 
+mod audio;
 mod knowledge;
 mod models;
 mod oauth;
@@ -74,6 +75,7 @@ pub async fn handle_ui_message(
     state: &ServerState,
     conn_id: &str,
     tx: &mpsc::Sender<String>,
+    bin_tx: &mpsc::Sender<Vec<u8>>,
     msg: UiClientMessage,
 ) {
     match msg {
@@ -83,6 +85,7 @@ pub async fn handle_ui_message(
             let send_state_ms = started.elapsed().as_millis() as u64;
 
             handle_list_sessions(state, tx).await;
+            audio::handle_audio_capabilities(state, tx).await;
             tracing::info!(
                 target: "querymt_agent::ui::handlers",
                 operation = "ui.init",
@@ -383,6 +386,72 @@ pub async fn handle_ui_message(
         }
         UiClientMessage::KnowledgeStats { scope } => {
             knowledge::handle_knowledge_stats(state, &scope, tx).await;
+        }
+        UiClientMessage::Transcribe { .. } => {
+            // Transcribe arrives as a binary frame — handled by handle_binary_message.
+            // If it arrives as a text frame (no audio payload), return an error.
+            let _ = send_error(
+                tx,
+                "Transcribe must be sent as a binary WebSocket frame".to_string(),
+            )
+            .await;
+        }
+        UiClientMessage::Speech {
+            provider,
+            model,
+            text,
+            voice,
+            format,
+        } => {
+            audio::handle_speech(
+                state,
+                &audio::SpeechParams {
+                    provider_name: &provider,
+                    model: &model,
+                    text: &text,
+                    voice: voice.as_deref(),
+                    format: format.as_deref(),
+                },
+                tx,
+                bin_tx,
+            )
+            .await;
+        }
+    }
+}
+
+/// Dispatch handler for binary WebSocket frames.
+///
+/// The binary frame has already been parsed into a JSON header (`msg`) and a
+/// raw binary `payload`. Only audio messages are expected here; all other
+/// message types are rejected with an error.
+pub async fn handle_binary_message(
+    state: &ServerState,
+    _conn_id: &str,
+    tx: &mpsc::Sender<String>,
+    _bin_tx: &mpsc::Sender<Vec<u8>>,
+    msg: UiClientMessage,
+    payload: Vec<u8>,
+) {
+    match msg {
+        UiClientMessage::Transcribe {
+            provider,
+            model,
+            mime_type,
+        } => {
+            audio::handle_transcribe(state, &provider, &model, payload, mime_type.as_deref(), tx)
+                .await;
+        }
+        other => {
+            let type_name = match &other {
+                UiClientMessage::Speech { .. } => "speech",
+                _ => "unknown",
+            };
+            let _ = send_error(
+                tx,
+                format!("Message type '{type_name}' should not be sent as a binary frame"),
+            )
+            .await;
         }
     }
 }

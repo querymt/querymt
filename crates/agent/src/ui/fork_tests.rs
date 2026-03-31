@@ -129,6 +129,7 @@ async fn fork_session_from_selected_message_succeeds() -> Result<()> {
         .await?;
 
     let (tx, mut rx) = f.add_connection("conn-fork-ok").await;
+    let (bin_tx, _bin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
     {
         let mut connections = f.state.connections.lock().await;
         let conn = connections
@@ -142,6 +143,7 @@ async fn fork_session_from_selected_message_succeeds() -> Result<()> {
         &f.state,
         "conn-fork-ok",
         &tx,
+        &bin_tx,
         UiClientMessage::ForkSession {
             message_id: assistant_message_id.clone(),
         },
@@ -192,6 +194,7 @@ async fn fork_session_from_selected_message_succeeds() -> Result<()> {
         &f.state,
         "conn-fork-ok",
         &tx,
+        &bin_tx,
         UiClientMessage::LoadSession {
             session_id: forked_session_id.clone(),
         },
@@ -245,11 +248,13 @@ async fn fork_session_from_selected_message_succeeds() -> Result<()> {
 async fn fork_session_without_active_session_returns_error() -> Result<()> {
     let f = crate::test_utils::TestServerState::new().await;
     let (tx, mut rx) = f.add_connection("conn-fork-no-session").await;
+    let (bin_tx, _bin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
 
     handle_ui_message(
         &f.state,
         "conn-fork-no-session",
         &tx,
+        &bin_tx,
         UiClientMessage::ForkSession {
             message_id: "msg-does-not-matter".to_string(),
         },
@@ -270,6 +275,7 @@ async fn fork_session_invalid_message_id_returns_error() -> Result<()> {
     let f = crate::test_utils::TestServerState::new().await;
     let source_session_id = f.agent.create_session().await;
     let (tx, mut rx) = f.add_connection("conn-fork-bad-msg").await;
+    let (bin_tx, _bin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
 
     {
         let mut connections = f.state.connections.lock().await;
@@ -284,6 +290,7 @@ async fn fork_session_invalid_message_id_returns_error() -> Result<()> {
         &f.state,
         "conn-fork-bad-msg",
         &tx,
+        &bin_tx,
         UiClientMessage::ForkSession {
             message_id: "missing-message-id".to_string(),
         },

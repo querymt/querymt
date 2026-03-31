@@ -351,6 +351,14 @@ export interface Artifact {
 	created_at: string;
 }
 
+/** An audio-capable model entry returned in [`UiServerMessage::AudioCapabilities`]. */
+export interface AudioModelInfo {
+	/** Provider name (e.g. "izwi") */
+	provider: string;
+	/** Model name (e.g. "Qwen3-ASR-0.6B") */
+	model: string;
+}
+
 /** Task kind determines lifecycle and completion semantics */
 export enum TaskKind {
 	/** One-time task with clear completion */
@@ -1131,6 +1139,40 @@ export type UiClientMessage =
 	/** Get knowledge stats for a scope */
 	| { type: "knowledge_stats", data: {
 	scope: string;
+}}
+	/**
+	 * Transcribe audio to text (STT).
+	 * 
+	 * Sent as a **binary WebSocket frame** with a length-prefixed JSON header
+	 * (this struct) followed by raw audio bytes. The JSON header is parsed
+	 * separately by `parse_binary_frame`; the audio payload is passed directly
+	 * to the handler.
+	 */
+	| { type: "transcribe", data: {
+	/** Provider name (e.g. "izwi") */
+	provider: string;
+	/** Model name (e.g. "Qwen3-ASR-0.6B") */
+	model: string;
+	/** MIME type of the audio payload (e.g. "audio/wav", "audio/webm"). */
+	mime_type?: string;
+}}
+	/**
+	 * Synthesize speech from text (TTS).
+	 * 
+	 * Sent as a normal JSON text frame. The response (`speech_result`) is a
+	 * binary frame containing a JSON header + raw audio bytes.
+	 */
+	| { type: "speech", data: {
+	/** Provider name (e.g. "izwi") */
+	provider: string;
+	/** Model name (e.g. "Kokoro-82M") */
+	model: string;
+	/** Text to synthesize */
+	text: string;
+	/** Optional voice/speaker preset name */
+	voice?: string;
+	/** Target audio format: "wav" (default) */
+	format?: string;
 }};
 
 /**
@@ -1358,5 +1400,14 @@ export type UiServerMessage =
 	total_consolidations: number;
 	latest_entry_at?: string;
 	latest_consolidation_at?: string;
+}}
+	/** STT transcription result (text frame) */
+	| { type: "transcribe_result", data: {
+	text: string;
+}}
+	/** Audio provider capabilities (sent during init) */
+	| { type: "audio_capabilities", data: {
+	stt_models: AudioModelInfo[];
+	tts_models: AudioModelInfo[];
 }};
 

@@ -89,6 +89,12 @@ export interface UiClientActionsContextValue {
   listKnowledge: (scope: string, filter?: Record<string, unknown>) => void;
   getKnowledgeStats: (scope: string) => void;
   sessionCreatingRef: MutableRefObject<boolean>;
+  // Audio / voice
+  sendTranscribe: (provider: string, model: string, audio: ArrayBuffer | Uint8Array, mimeType?: string) => void;
+  sendSpeech: (provider: string, model: string, text: string, voice?: string, format?: string) => void;
+  setTranscribeCallback: (cb: ((text: string) => void) | null) => void;
+  setSpeechCallback: (cb: ((audio: ArrayBuffer, mimeType: string) => void) | null) => void;
+  setSpeechErrorCallback: (cb: ((error: string) => void) | null) => void;
 }
 
 const UiClientActionsContext = createContext<UiClientActionsContextValue | undefined>(undefined);
@@ -170,6 +176,7 @@ export interface UiClientConfigContextValue {
   isUpdatingPlugins: boolean;
   workspacePathDialogOpen: boolean;
   workspacePathDialogDefaultValue: string;
+  audioCapabilities: { stt_models: { provider: string; model: string }[]; tts_models: { provider: string; model: string }[] };
 }
 
 const UiClientConfigContext = createContext<UiClientConfigContextValue | undefined>(undefined);
@@ -254,6 +261,11 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     listKnowledge: uiClient.listKnowledge,
     getKnowledgeStats: uiClient.getKnowledgeStats,
     sessionCreatingRef: uiClient.sessionCreatingRef,
+    sendTranscribe: uiClient.sendTranscribe,
+    sendSpeech: uiClient.sendSpeech,
+    setTranscribeCallback: uiClient.setTranscribeCallback,
+    setSpeechCallback: uiClient.setSpeechCallback,
+    setSpeechErrorCallback: uiClient.setSpeechErrorCallback,
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }), []);
   // NOTE: empty deps is intentional — all callbacks are stable useCallback([])
@@ -344,6 +356,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     isUpdatingPlugins: uiClient.isUpdatingPlugins,
     workspacePathDialogOpen: uiClient.workspacePathDialogOpen,
     workspacePathDialogDefaultValue: uiClient.workspacePathDialogDefaultValue,
+    audioCapabilities: uiClient.audioCapabilities,
   }), [
     uiClient.allModels,
     uiClient.providerCapabilities,
@@ -361,6 +374,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     uiClient.isUpdatingPlugins,
     uiClient.workspacePathDialogOpen,
     uiClient.workspacePathDialogDefaultValue,
+    uiClient.audioCapabilities,
   ]);
 
   return (
