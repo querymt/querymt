@@ -2567,7 +2567,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab67060fc6b8ef687992d439ca0fa36e7ed17e9a0b16b25b601e8757df720de"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -10428,7 +10428,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -12898,9 +12898,12 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "similar"
-version = "2.7.0"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
+checksum = "26d0b06eba54f0ca0770f970a3e89823e766ca638dd940f8469fa0fa50c75396"
+dependencies = [
+ "bstr",
+]
 
 [[package]]
 name = "similarity-core"
@@ -13047,7 +13050,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
