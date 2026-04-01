@@ -169,6 +169,19 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
             //    sessions after restart (Bug 2 fix).
             //    Peers are queried in parallel to avoid accumulating the
             //    2-second timeout for each peer serially.
+            //
+            //    We also collect the set of session IDs confirmed to exist on
+            //    each peer so the bookmark reattach phase can skip DHT lookups
+            //    for sessions that the peer confirms no longer exist.
+
+            // peer_label -> set of session IDs confirmed on that peer.
+            // A peer that was queried successfully but returned no sessions
+            // will have an empty set (distinguishable from "not queried").
+            let mut confirmed_peer_sessions: std::collections::HashMap<
+                String,
+                std::collections::HashSet<String>,
+            > = std::collections::HashMap::new();
+
             if state.agent.mesh().is_some() {
                 let peer_futures: Vec<_> = node_id_by_label
                     .iter()
@@ -214,6 +227,12 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
 
                 for result in peer_results.into_iter().flatten() {
                     let (peer_label, node_id_str, sessions) = result;
+
+                    // Record which sessions this peer confirmed as existing.
+                    let confirmed_ids: std::collections::HashSet<String> =
+                        sessions.iter().map(|s| s.session_id.clone()).collect();
+                    confirmed_peer_sessions.insert(peer_label.clone(), confirmed_ids);
+
                     for session_info in sessions {
                         // Skip sessions that are already attached.
                         if attached_sessions.contains(&session_info.session_id) {
@@ -253,124 +272,192 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                     latest_activity: None,
                 });
             }
+
+            // ── Lazy bookmark reattach ────────────────────────────────────
+            //
+            // Load persisted remote session bookmarks and attempt to re-attach
+            // sessions that are not yet in the registry.
+            //
+            // Optimisations over the previous sequential approach:
+            //   1. If the bookmark's peer was successfully queried and the
+            //      session ID is NOT in that peer's list → the session was
+            //      deleted on the remote side.  Skip the DHT lookup entirely
+            //      and auto-prune the stale bookmark.
+            //   2. Remaining reattach attempts run concurrently (join_all)
+            //      instead of sequentially, so N bookmarks take ~O(1) wall
+            //      time instead of O(N * 1.75 s).
+            //   3. Uses `reattach_from_bookmark_quick` (single DHT lookup,
+            //      no retries) to avoid 1.75 s backoff per stale bookmark.
+
+            if state.agent.mesh().is_some() {
+                match state.session_store.list_remote_session_bookmarks().await {
+                    Ok(bookmarks) if !bookmarks.is_empty() => {
+                        let registry_ids: std::collections::HashSet<String> = {
+                            let registry = state.agent.registry.lock().await;
+                            registry.session_ids().into_iter().collect()
+                        };
+
+                        // Partition bookmarks into:
+                        //  - `stale`: peer is online and confirmed the session is gone
+                        //  - `to_reattach`: need a DHT lookup (peer offline or session
+                        //     might still exist)
+                        //  - already attached: skip
+                        let mut stale_ids: Vec<String> = Vec::new();
+                        let mut to_reattach: Vec<crate::session::store::RemoteSessionBookmark> =
+                            Vec::new();
+
+                        for bookmark in bookmarks {
+                            if registry_ids.contains(&bookmark.session_id) {
+                                continue; // already attached
+                            }
+
+                            // Check if we successfully queried this bookmark's peer
+                            // and the session is NOT in the returned list.
+                            if let Some(peer_sessions) =
+                                confirmed_peer_sessions.get(&bookmark.peer_label)
+                                && !peer_sessions.contains(&bookmark.session_id) {
+                                    // Peer is online, session confirmed gone → prune.
+                                    log::info!(
+                                        "Auto-pruning stale bookmark {}: peer '{}' is online \
+                                         but session no longer exists",
+                                        bookmark.session_id,
+                                        bookmark.peer_label,
+                                    );
+                                    stale_ids.push(bookmark.session_id.clone());
+                                    continue;
+                                }
+
+                            to_reattach.push(bookmark);
+                        }
+
+                        // Prune stale bookmarks in the background.
+                        if !stale_ids.is_empty() {
+                            let store = state.session_store.clone();
+                            tokio::spawn(async move {
+                                for sid in stale_ids {
+                                    if let Err(e) =
+                                        store.remove_remote_session_bookmark(&sid).await
+                                    {
+                                        log::warn!(
+                                            "Failed to remove stale bookmark {}: {}",
+                                            sid,
+                                            e
+                                        );
+                                    }
+                                }
+                            });
+                        }
+
+                        // Reattach remaining bookmarks concurrently.
+                        if !to_reattach.is_empty() {
+                            let reattach_futures: Vec<_> = to_reattach
+                                .into_iter()
+                                .map(|bookmark| {
+                                    let agent = state.agent.clone();
+                                    async move {
+                                        let reattached = match tokio::time::timeout(
+                                            std::time::Duration::from_secs(2),
+                                            agent.reattach_from_bookmark_quick(&bookmark),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(_)) => {
+                                                log::info!(
+                                                    "Reattached remote session {} from bookmark",
+                                                    bookmark.session_id
+                                                );
+                                                true
+                                            }
+                                            Ok(Err(e)) => {
+                                                log::debug!(
+                                                    "Failed to reattach bookmarked session {}: {}",
+                                                    bookmark.session_id,
+                                                    e
+                                                );
+                                                false
+                                            }
+                                            Err(_) => {
+                                                log::debug!(
+                                                    "Reattach timed out for bookmarked session {}",
+                                                    bookmark.session_id
+                                                );
+                                                false
+                                            }
+                                        };
+                                        (bookmark, reattached)
+                                    }
+                                })
+                                .collect();
+
+                            let results =
+                                futures_util::future::join_all(reattach_futures).await;
+
+                            let mut bookmark_groups: std::collections::HashMap<
+                                String,
+                                Vec<SessionSummary>,
+                            > = std::collections::HashMap::new();
+
+                            for (bookmark, reattached) in results {
+                                bookmark_groups
+                                    .entry(bookmark.peer_label.clone())
+                                    .or_default()
+                                    .push(SessionSummary {
+                                        session_id: bookmark.session_id,
+                                        name: None,
+                                        cwd: bookmark.cwd,
+                                        title: bookmark.title,
+                                        created_at: None,
+                                        updated_at: None,
+                                        parent_session_id: None,
+                                        fork_origin: None,
+                                        session_kind: None,
+                                        has_children: false,
+                                        node: Some(bookmark.peer_label),
+                                        node_id: Some(bookmark.node_id),
+                                        attached: Some(reattached),
+                                    });
+                            }
+
+                            for (node_label, sessions) in bookmark_groups {
+                                let group_cwd = format!("remote::{}", node_label);
+                                if let Some(existing) = groups
+                                    .iter_mut()
+                                    .find(|g| g.cwd.as_deref() == Some(group_cwd.as_str()))
+                                {
+                                    let existing_ids: std::collections::HashSet<String> =
+                                        existing
+                                            .sessions
+                                            .iter()
+                                            .map(|s| s.session_id.clone())
+                                            .collect();
+                                    for s in sessions {
+                                        if !existing_ids.contains(&s.session_id) {
+                                            existing.sessions.push(s);
+                                        }
+                                    }
+                                } else {
+                                    remote_group_count += 1;
+                                    remote_session_count += sessions.len();
+                                    groups.push(SessionGroup {
+                                        cwd: Some(group_cwd),
+                                        sessions,
+                                        latest_activity: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {} // no bookmarks
+                    Err(e) => {
+                        log::warn!("Failed to load remote session bookmarks: {}", e);
+                    }
+                }
+            }
         }
         .instrument(tracing::info_span!("ui.handle_list_sessions.remote_merge"))
         .await;
     }
     let remote_merge_ms = remote_merge_started.elapsed().as_millis() as u64;
-
-    // Lazy reattach: load persisted remote session bookmarks and attempt to
-    // re-attach sessions that are not yet in the registry.  Bookmarked sessions
-    // that fail to reattach (peer offline) are shown as unattached so the user
-    // can dismiss them or wait for the peer to come back.
-    #[cfg(feature = "remote")]
-    {
-        if state.agent.mesh().is_some() {
-            match state.session_store.list_remote_session_bookmarks().await {
-                Ok(bookmarks) if !bookmarks.is_empty() => {
-                    let registry_ids: std::collections::HashSet<String> = {
-                        let registry = state.agent.registry.lock().await;
-                        registry.session_ids().into_iter().collect()
-                    };
-
-                    let mut bookmark_groups: std::collections::HashMap<
-                        String,
-                        Vec<SessionSummary>,
-                    > = std::collections::HashMap::new();
-
-                    for bookmark in bookmarks {
-                        if registry_ids.contains(&bookmark.session_id) {
-                            // Already attached (or local) — skip
-                            continue;
-                        }
-
-                        // Try to reattach with a short timeout
-                        let reattached = match tokio::time::timeout(
-                            std::time::Duration::from_secs(3),
-                            state.agent.reattach_from_bookmark(&bookmark),
-                        )
-                        .await
-                        {
-                            Ok(Ok(_)) => {
-                                log::info!(
-                                    "Reattached remote session {} from bookmark",
-                                    bookmark.session_id
-                                );
-                                true
-                            }
-                            Ok(Err(e)) => {
-                                log::debug!(
-                                    "Failed to reattach bookmarked session {}: {}",
-                                    bookmark.session_id,
-                                    e
-                                );
-                                false
-                            }
-                            Err(_) => {
-                                log::debug!(
-                                    "Reattach timed out for bookmarked session {}",
-                                    bookmark.session_id
-                                );
-                                false
-                            }
-                        };
-
-                        // Show the bookmarked session in the list regardless of reattach success
-                        bookmark_groups
-                            .entry(bookmark.peer_label.clone())
-                            .or_default()
-                            .push(SessionSummary {
-                                session_id: bookmark.session_id,
-                                name: None,
-                                cwd: bookmark.cwd,
-                                title: bookmark.title,
-                                created_at: None,
-                                updated_at: None,
-                                parent_session_id: None,
-                                fork_origin: None,
-                                session_kind: None,
-                                has_children: false,
-                                node: Some(bookmark.peer_label),
-                                node_id: Some(bookmark.node_id),
-                                attached: Some(reattached),
-                            });
-                    }
-
-                    for (node_label, sessions) in bookmark_groups {
-                        // Merge into existing remote group for this node, or create new one
-                        let group_cwd = format!("remote::{}", node_label);
-                        if let Some(existing) = groups
-                            .iter_mut()
-                            .find(|g| g.cwd.as_deref() == Some(group_cwd.as_str()))
-                        {
-                            let existing_ids: std::collections::HashSet<String> = existing
-                                .sessions
-                                .iter()
-                                .map(|s| s.session_id.clone())
-                                .collect();
-                            for s in sessions {
-                                if !existing_ids.contains(&s.session_id) {
-                                    existing.sessions.push(s);
-                                }
-                            }
-                        } else {
-                            remote_group_count += 1;
-                            remote_session_count += sessions.len();
-                            groups.push(SessionGroup {
-                                cwd: Some(group_cwd),
-                                sessions,
-                                latest_activity: None,
-                            });
-                        }
-                    }
-                }
-                Ok(_) => {} // no bookmarks
-                Err(e) => {
-                    log::warn!("Failed to load remote session bookmarks: {}", e);
-                }
-            }
-        }
-    }
 
     let total_group_count = groups.len();
     let total_session_count: usize = groups.iter().map(|g| g.sessions.len()).sum();

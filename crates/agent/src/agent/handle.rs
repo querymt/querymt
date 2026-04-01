@@ -1417,6 +1417,49 @@ impl LocalAgentHandle {
 
         Ok(session_ref)
     }
+
+    /// Like [`reattach_from_bookmark`] but uses a single DHT lookup with **no
+    /// retries**.
+    ///
+    /// Intended for bulk bookmark reattach during session listing where we
+    /// prefer a fast failure over spending ~1.75 s per stale bookmark.
+    #[cfg(feature = "remote")]
+    pub async fn reattach_from_bookmark_quick(
+        &self,
+        bookmark: &crate::session::store::RemoteSessionBookmark,
+    ) -> Result<crate::agent::remote::SessionActorRef, crate::error::AgentError> {
+        let mesh = self
+            .mesh()
+            .ok_or(crate::error::AgentError::MeshNotBootstrapped)?;
+
+        let dht_name = crate::agent::remote::dht_name::session(&bookmark.session_id);
+        let remote_ref = mesh
+            .lookup_actor_no_retry::<crate::agent::session_actor::SessionActor>(dht_name.clone())
+            .await
+            .map_err(|e| crate::error::AgentError::SwarmLookupFailed {
+                key: dht_name.clone(),
+                reason: e.to_string(),
+            })?
+            .ok_or_else(|| crate::error::AgentError::RemoteSessionNotFound {
+                details: format!(
+                    "bookmarked session {} not found in DHT",
+                    bookmark.session_id
+                ),
+            })?;
+
+        let mut registry = self.registry.lock().await;
+        let session_ref = registry
+            .attach_remote_session(
+                bookmark.session_id.clone(),
+                remote_ref,
+                bookmark.peer_label.clone(),
+                Some(mesh),
+                Some(bookmark.node_id.clone()),
+            )
+            .await;
+
+        Ok(session_ref)
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════

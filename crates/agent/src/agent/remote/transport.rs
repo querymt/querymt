@@ -211,6 +211,17 @@ impl DynMeshTransport {
         self.inner.lookup_actor::<SessionActor>(name).await
     }
 
+    /// Look up a [`SessionActor`] by DHT name **without** retries.
+    ///
+    /// Intended for bulk background operations (bookmark reattach) where a
+    /// fast `None` is preferred over spending ~1.75 s on retry backoff.
+    pub async fn lookup_session_no_retry(
+        &self,
+        name: &str,
+    ) -> Result<Option<RemoteActorRef<SessionActor>>, kameo::error::RegistryError> {
+        self.inner.lookup_actor_no_retry::<SessionActor>(name).await
+    }
+
     /// Look up an [`EventRelayActor`] by DHT name.
     pub async fn lookup_event_relay(
         &self,

@@ -456,6 +456,22 @@ impl MeshHandle {
         Ok(None)
     }
 
+    /// Look up a single remote actor by its DHT name **without** retries.
+    ///
+    /// This is a cheaper variant of [`lookup_actor`] intended for bulk / background
+    /// operations (e.g. bookmark reattach during session listing) where the
+    /// caller prefers a fast `None` over spending ~1.75 s on retry backoff.
+    pub async fn lookup_actor_no_retry<A>(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<Option<kameo::actor::RemoteActorRef<A>>, kameo::error::RegistryError>
+    where
+        A: kameo::Actor + kameo::remote::RemoteActor,
+    {
+        let name: String = name.into();
+        kameo::actor::RemoteActorRef::<A>::lookup(name).await
+    }
+
     /// Stream all remote actors registered under `name` in the DHT.
     pub fn lookup_all_actors<A>(&self, name: impl Into<String>) -> kameo::remote::LookupStream<A>
     where
