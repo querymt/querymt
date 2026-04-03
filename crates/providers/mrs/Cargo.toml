@@ -30,7 +30,7 @@ serde_json.workspace = true
 url.workspace = true
 schemars.workspace = true
 futures.workspace = true
-mistralrs = "0.7"
+mistralrs = "0.8"
 async-trait.workspace = true
 tokio = { version = "1", features = ["full"] }
 image = "0.25"
