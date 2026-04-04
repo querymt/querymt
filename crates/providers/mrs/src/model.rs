@@ -5,11 +5,13 @@ use std::{
 };
 
 use hf_hub::{Cache, Repo, RepoType, api::sync::ApiBuilder};
-use mistralrs::core::{EmbeddingLoaderType, NormalLoaderType, PagedCacheType, VisionLoaderType};
+use mistralrs::core::{
+    EmbeddingLoaderType, MultimodalLoaderType, NormalLoaderType, PagedCacheType,
+};
 use mistralrs::{
     DeviceMapSetting, EmbeddingModelBuilder, EmbeddingRequestBuilder, GgufModelBuilder, IsqType,
-    MemoryGpuConfig, Model, ModelDType, PagedAttentionConfig, TextModelBuilder, TokenSource,
-    Topology, VisionModelBuilder, parse_isq_value,
+    MemoryGpuConfig, Model, ModelDType, MultimodalModelBuilder, PagedAttentionConfig,
+    TextModelBuilder, TokenSource, Topology, parse_isq_value,
 };
 use querymt::chat::Tool;
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
@@ -127,7 +129,7 @@ fn infer_model_kind(cfg: &MistralRSConfig) -> Result<MistralRSModelKind, LLMErro
     }
 
     if let Some(name) = auto_cfg.architectures.first() {
-        if VisionLoaderType::from_causal_lm_name(name).is_ok() {
+        if MultimodalLoaderType::from_causal_lm_name(name).is_ok() {
             return Ok(MistralRSModelKind::Vision);
         }
         if EmbeddingLoaderType::from_causal_lm_name(name).is_ok() {
@@ -286,10 +288,10 @@ fn text_loader_type(cfg: &MistralRSConfig) -> Result<Option<NormalLoaderType>, L
         .map_err(|e| LLMError::InvalidRequest(format!("invalid loader_type value: {e}")))
 }
 
-fn vision_loader_type(cfg: &MistralRSConfig) -> Result<Option<VisionLoaderType>, LLMError> {
+fn vision_loader_type(cfg: &MistralRSConfig) -> Result<Option<MultimodalLoaderType>, LLMError> {
     cfg.loader_type
         .as_deref()
-        .map(VisionLoaderType::from_str)
+        .map(MultimodalLoaderType::from_str)
         .transpose()
         .map_err(|e| LLMError::InvalidRequest(format!("invalid loader_type value: {e}")))
 }
@@ -405,7 +407,7 @@ async fn build_text_model(cfg: &MistralRSConfig) -> Result<Model, LLMError> {
         builder = builder.with_jinja_explicit(jinja_explicit.clone());
     }
     if let Some(hf_cache_path) = cfg.hf_cache_path.as_ref() {
-        builder = builder.from_hf_cache_pathf(PathBuf::from(hf_cache_path));
+        builder = builder.from_hf_cache_path(PathBuf::from(hf_cache_path));
     }
     if let Some(loader_type) = text_loader_type(cfg)? {
         builder = builder.with_loader_type(loader_type);
@@ -426,9 +428,7 @@ async fn build_text_model(cfg: &MistralRSConfig) -> Result<Model, LLMError> {
         builder = builder.with_calibration_file(PathBuf::from(calibration_file));
     }
     if let Some(paged_attn_cfg) = paged_attn_config(cfg)? {
-        builder = builder
-            .with_paged_attn(|| Ok(paged_attn_cfg))
-            .map_err(|e| LLMError::InvalidRequest(format!("invalid paged_attn config: {:#}", e)))?;
+        builder = builder.with_paged_attn(paged_attn_cfg);
     }
     if cfg.throughput_logging.unwrap_or(false) {
         builder = builder.with_throughput_logging();
@@ -456,7 +456,7 @@ async fn build_text_model(cfg: &MistralRSConfig) -> Result<Model, LLMError> {
 }
 
 async fn build_vision_model(cfg: &MistralRSConfig) -> Result<Model, LLMError> {
-    let mut builder = VisionModelBuilder::new(&cfg.model).with_logging();
+    let mut builder = MultimodalModelBuilder::new(&cfg.model).with_logging();
     if let Some(token_source) = token_source_override(cfg)? {
         builder = builder.with_token_source(token_source);
     }
@@ -473,7 +473,7 @@ async fn build_vision_model(cfg: &MistralRSConfig) -> Result<Model, LLMError> {
         builder = builder.with_jinja_explicit(jinja_explicit.clone());
     }
     if let Some(hf_cache_path) = cfg.hf_cache_path.as_ref() {
-        builder = builder.from_hf_cache_pathf(PathBuf::from(hf_cache_path));
+        builder = builder.from_hf_cache_path(PathBuf::from(hf_cache_path));
     }
     if let Some(loader_type) = vision_loader_type(cfg)? {
         builder = builder.with_loader_type(loader_type);
@@ -491,12 +491,10 @@ async fn build_vision_model(cfg: &MistralRSConfig) -> Result<Model, LLMError> {
         builder = builder.with_calibration_file(PathBuf::from(calibration_file));
     }
     if let Some(max_edge) = cfg.max_edge {
-        builder = builder.from_max_edge(max_edge);
+        builder = builder.with_max_edge(max_edge);
     }
     if let Some(paged_attn_cfg) = paged_attn_config(cfg)? {
-        builder = builder
-            .with_paged_attn(|| Ok(paged_attn_cfg))
-            .map_err(|e| LLMError::InvalidRequest(format!("invalid paged_attn config: {:#}", e)))?;
+        builder = builder.with_paged_attn(paged_attn_cfg);
     }
     if cfg.throughput_logging.unwrap_or(false) {
         builder = builder.with_throughput_logging();
@@ -594,9 +592,7 @@ async fn build_gguf_model(cfg: &MistralRSConfig, spec: GgufSpec) -> Result<Model
         builder = builder.with_topology(topology);
     }
     if let Some(paged_attn_cfg) = paged_attn_config(cfg)? {
-        builder = builder
-            .with_paged_attn(|| Ok(paged_attn_cfg))
-            .map_err(|e| LLMError::InvalidRequest(format!("invalid paged_attn config: {:#}", e)))?;
+        builder = builder.with_paged_attn(paged_attn_cfg);
     }
     if cfg.throughput_logging.unwrap_or(false) {
         builder = builder.with_throughput_logging();

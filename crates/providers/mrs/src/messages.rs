@@ -80,9 +80,7 @@ pub(crate) fn apply_message_to_request(
     }
 
     if !images.is_empty() {
-        req = req
-            .add_image_message(role, text.clone(), images, model)
-            .map_err(|e| LLMError::InvalidRequest(format!("{:#}", e)))?;
+        req = req.add_image_message(role, text.clone(), images);
     } else if !tool_uses.is_empty() {
         req = req.add_message_with_tool_call(role, text, tool_uses);
     } else if !text.is_empty() {
@@ -93,7 +91,10 @@ pub(crate) fn apply_message_to_request(
 }
 
 pub(crate) fn ensure_chat_model(model: &Model) -> Result<(), LLMError> {
-    let category = model.config().map_err(LLMError::ProviderError)?.category;
+    let category = model
+        .config()
+        .map_err(|e| LLMError::ProviderError(e.to_string()))?
+        .category;
     if matches!(category, ModelCategory::Embedding) {
         return Err(LLMError::InvalidRequest(
             "embedding models do not support chat requests".into(),
@@ -103,7 +104,10 @@ pub(crate) fn ensure_chat_model(model: &Model) -> Result<(), LLMError> {
 }
 
 pub(crate) fn ensure_embedding_model(model: &Model) -> Result<(), LLMError> {
-    let category = model.config().map_err(LLMError::ProviderError)?.category;
+    let category = model
+        .config()
+        .map_err(|e| LLMError::ProviderError(e.to_string()))?
+        .category;
     if matches!(category, ModelCategory::Embedding) {
         Ok(())
     } else {

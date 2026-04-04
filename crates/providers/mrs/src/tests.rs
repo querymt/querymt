@@ -1,7 +1,8 @@
 use querymt::LLMProvider;
-use querymt::chat::{ChatMessageBuilder, ChatProvider, ChatRole};
+use querymt::chat::{ChatMessageBuilder, ChatRole};
 use querymt::completion::CompletionRequest;
 use querymt::error::LLMError;
+use querymt::plugin::LLMProviderFactory;
 
 use crate::config::MistralRSConfig;
 use crate::factory::MistralRSFactory;
@@ -50,21 +51,21 @@ async fn mrs_chat_integration_test() {
     let provider = get_provider();
     let messages = vec![
         ChatMessageBuilder::new(ChatRole::User)
-            .content("Hello?")
+            .text("Hello?")
             .build(),
     ];
 
     let _resp = provider.chat(&messages).await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn embedding_provider_requires_embedding_model() {
     let provider = get_provider();
     let err = provider.embed(vec!["foo".into()]).await.unwrap_err();
     assert!(matches!(err, LLMError::InvalidRequest(_)));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn completion_provider_is_currently_unimplemented() {
     let provider = get_provider();
     let dummy_req = CompletionRequest {
