@@ -235,7 +235,7 @@ jobs:
 
       - name: Install Oras CLI
         if: matrix.crate != 'noop' && matrix.provider_type == 'wasm'
-        uses: oras-project/setup-oras@v1
+        uses: oras-project/setup-oras@v2
 
       - name: Create Wasm OCI config file
         if: matrix.crate != 'noop' && matrix.provider_type == 'wasm'

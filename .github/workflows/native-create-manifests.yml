@@ -33,7 +33,7 @@ jobs:
           echo "Wait complete"
 
       - name: Install ORAS CLI
-        uses: oras-project/setup-oras@v1
+        uses: oras-project/setup-oras@v2
 
       - name: Log in to GHCR
         run: |
