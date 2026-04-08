@@ -1680,15 +1680,15 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#fine-tuning-workflow" class="md-nav__link">
+  <a href="#fine-tuning-with-exported-data" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Fine-Tuning Workflow
+        Fine-Tuning with Exported Data
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Fine-Tuning Workflow">
+    <nav class="md-nav" aria-label="Fine-Tuning with Exported Data">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -2138,10 +2138,11 @@
 <li>Normalizing paths for consistent model behavior</li>
 </ul>
 <hr />
-<h2 id="fine-tuning-workflow">Fine-Tuning Workflow</h2>
-<p>A typical workflow for fine-tuning a local model on your session data:</p>
+<h2 id="fine-tuning-with-exported-data">Fine-Tuning with Exported Data</h2>
+<p>The primary use case for the SFT export is <strong>distillation</strong> — training a smaller or local model on recorded outputs from a stronger model. For example, training a local Qwen 35B model on your Claude Opus session trajectories.</p>
+<p>The exported data contains real, verified agent trajectories: multi-step reasoning, tool calls with arguments, tool results, and final responses that produced correct outcomes. This teaches the student model your specific tool-use patterns, coding style, and the agent's operational conventions.</p>
 <h3 id="1-export-training-data">1. Export training data</h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="c1"># Export Claude Opus sessions (distillation into a smaller model)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="c1"># Export Claude Opus sessions for distilling into a local model</span>
 <a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>export_sft<span class="w"> </span>--<span class="w"> </span><span class="se">\</span>
 <a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">  </span>--models<span class="w"> </span>claude-opus-4-6<span class="w"> </span><span class="se">\</span>
 <a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="w">  </span>--min-turns<span class="w"> </span><span class="m">3</span><span class="w"> </span><span class="se">\</span>
