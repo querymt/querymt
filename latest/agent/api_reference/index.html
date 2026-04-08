@@ -11,7 +11,7 @@
         <link rel="canonical" href="https://docs.query.mt/latest/agent/api_reference/">
       
       
-        <link rel="prev" href="../mesh/">
+        <link rel="prev" href="../export/">
       
       
         <link rel="next" href="../examples/">
@@ -1445,6 +1445,34 @@
                 
   
   
+  
+  
+    <li class="md-nav__item">
+      <a href="../export/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Export & Fine-Tuning
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
     
   
   
@@ -2269,10 +2297,14 @@
 <a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>│   ── handle       # AgentHandle trait
 <a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>── acp              # Agent Client Protocol
 <a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>── delegation       # Multi-agent delegation
-<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>── middleware       # Middleware system
-<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>── session          # Session management
-<a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>── tools            # Tool registry
-<a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>── events           # Event system
+<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>── export           # Session data export
+<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>│   ├── turns        # Shared turn materialization
+<a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>│   ├── atif         # ATIF trajectory export
+<a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>│   ── sft          # SFT training data export
+<a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>── middleware       # Middleware system
+<a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>── session          # Session management
+<a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a>── tools            # Tool registry
+<a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a>── events           # Event system
 </code></pre></div>
 <h2 id="prelude">Prelude</h2>
 <p>The <code>prelude</code> module re-exports the most commonly used types:</p>
