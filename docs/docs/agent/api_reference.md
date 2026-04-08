@@ -17,6 +17,10 @@ querymt_agent
 │   ── handle       # AgentHandle trait
 ── acp              # Agent Client Protocol
 ── delegation       # Multi-agent delegation
+── export           # Session data export
+│   ├── turns        # Shared turn materialization
+│   ├── atif         # ATIF trajectory export
+│   ── sft          # SFT training data export
 ── middleware       # Middleware system
 ── session          # Session management
 ── tools            # Tool registry

@@ -87,6 +87,7 @@ nav:
     - Middleware: agent/middleware.md
     - Delegation: agent/delegation.md
     - Mesh Networking: agent/mesh.md
+    - Export & Fine-Tuning: agent/export.md
     - API Reference: agent/api_reference.md
     - Examples: agent/examples.md
   - CLI: 'cli/index.md'
