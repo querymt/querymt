@@ -10880,6 +10880,7 @@ dependencies = [
  "futures",
  "hf-hub 0.5.0",
  "image",
+ "log",
  "mistralrs",
  "querymt",
  "querymt-provider-common",

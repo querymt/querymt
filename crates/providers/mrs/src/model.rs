@@ -6,16 +6,19 @@ use std::{
 
 use hf_hub::{Cache, Repo, RepoType, api::sync::ApiBuilder};
 use mistralrs::core::{
-    EmbeddingLoaderType, MultimodalLoaderType, NormalLoaderType, PagedCacheType,
+    EmbeddingLoaderType, MultimodalLoaderType, NormalLoaderType, PagedCacheType, SpeechLoaderType,
 };
 use mistralrs::{
-    DeviceMapSetting, EmbeddingModelBuilder, EmbeddingRequestBuilder, GgufModelBuilder, IsqType,
-    MemoryGpuConfig, Model, ModelDType, MultimodalModelBuilder, PagedAttentionConfig,
-    TextModelBuilder, TokenSource, Topology, parse_isq_value,
+    AudioInput, DeviceMapSetting, EmbeddingModelBuilder, EmbeddingRequestBuilder, GgufModelBuilder,
+    IsqType, MemoryGpuConfig, Model, ModelDType, MultimodalModelBuilder, PagedAttentionConfig,
+    RequestBuilder, SpeechModelBuilder, TextMessageRole, TextModelBuilder, TokenSource, Topology,
+    parse_isq_value, speech_utils,
 };
 use querymt::chat::Tool;
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
+use querymt::stt::{SttRequest, SttResponse};
+use querymt::tts::{TtsRequest, TtsResponse};
 use querymt::{LLMProvider, error::LLMError};
 use querymt_provider_common::{ModelRef, parse_model_ref};
 use serde::Deserialize;
@@ -25,12 +28,85 @@ use crate::config::{
 };
 use crate::messages::ensure_embedding_model;
 
+/// Cache key for model loading — only params that affect the loaded `Model`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelCacheKey {
+    pub model: String,
+    pub model_kind: Option<MistralRSModelKind>,
+    pub dtype: Option<String>,
+    pub force_cpu: bool,
+}
+
+/// A cached model, shared across provider instances via `Arc`.
+pub(crate) struct CachedModel {
+    pub key: ModelCacheKey,
+    pub model: std::sync::Arc<Model>,
+}
+
 pub struct MistralRS {
     pub config: MistralRSConfig,
     pub mrs_model: std::sync::Arc<Model>,
 }
 
 impl MistralRS {
+    /// Build a provider, reusing a cached model if the cache key matches.
+    ///
+    /// Model loading is the expensive operation (downloads + GPU init).
+    /// The cache stores the loaded `Arc<Model>`. Each call returns a cheap
+    /// provider wrapper that shares the cached model but carries its own
+    /// per-request config (tools, system prompt, etc.).
+    pub(crate) fn new_with_cache(
+        cfg: MistralRSConfig,
+        cache: &std::sync::Mutex<Option<CachedModel>>,
+    ) -> Result<Self, LLMError> {
+        let key = ModelCacheKey {
+            model: cfg.model.clone(),
+            model_kind: cfg.model_kind,
+            dtype: cfg.dtype.clone(),
+            force_cpu: cfg.force_cpu.unwrap_or(false),
+        };
+
+        // Fast path: check cache under lock, return immediately on hit.
+        {
+            let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref cached) = *guard {
+                if cached.key == key {
+                    log::debug!("MistralRS model cache hit: {}", key.model);
+                    return Ok(Self {
+                        config: cfg,
+                        mrs_model: std::sync::Arc::clone(&cached.model),
+                    });
+                }
+                log::info!(
+                    "MistralRS model cache evict: {} -> {}",
+                    cached.key.model,
+                    key.model
+                );
+            }
+        }
+        // Lock released — expensive model load happens outside the lock.
+
+        let provider = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(MistralRS::new(cfg)))?,
+            Err(_) => {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))?;
+                runtime.block_on(MistralRS::new(cfg))?
+            }
+        };
+
+        // Store in cache.
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(CachedModel {
+            key,
+            model: std::sync::Arc::clone(&provider.mrs_model),
+        });
+
+        Ok(provider)
+    }
+
     pub async fn new(cfg: MistralRSConfig) -> Result<Self, LLMError> {
         let gguf_spec = gguf_spec_from_config(&cfg)?;
         let model_kind = match cfg.model_kind {
@@ -54,8 +130,11 @@ impl MistralRS {
             },
             None => match model_kind {
                 MistralRSModelKind::Text => build_text_model(&cfg).await?,
-                MistralRSModelKind::Vision => build_vision_model(&cfg).await?,
+                MistralRSModelKind::Vision | MistralRSModelKind::Audio => {
+                    build_vision_model(&cfg).await?
+                }
                 MistralRSModelKind::Embedding => build_embedding_model(&cfg).await?,
+                MistralRSModelKind::Speech => build_speech_model(&cfg).await?,
             },
         };
 
@@ -88,9 +167,66 @@ impl CompletionProvider for MistralRS {
     }
 }
 
+#[async_trait::async_trait]
 impl LLMProvider for MistralRS {
     fn tools(&self) -> Option<&[Tool]> {
         self.config.tools.as_deref()
+    }
+
+    async fn speech(&self, req: &TtsRequest) -> Result<TtsResponse, LLMError> {
+        let kind = self.config.model_kind.unwrap_or_default();
+        if !matches!(kind, MistralRSModelKind::Speech) {
+            return Err(LLMError::NotImplemented(
+                "TTS requires model_kind = \"speech\"".into(),
+            ));
+        }
+
+        let (pcm, rate, channels) = self
+            .mrs_model
+            .generate_speech(&req.text)
+            .await
+            .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))?;
+
+        let mut wav_buf = Vec::new();
+        speech_utils::write_pcm_as_wav(&mut wav_buf, &pcm, rate as u32, channels as u16)
+            .map_err(|e| LLMError::ProviderError(format!("WAV encoding failed: {e}")))?;
+
+        Ok(TtsResponse {
+            audio: wav_buf,
+            mime_type: Some("audio/wav".into()),
+        })
+    }
+
+    async fn transcribe(&self, req: &SttRequest) -> Result<SttResponse, LLMError> {
+        let kind = self.config.model_kind.unwrap_or_default();
+        if !matches!(kind, MistralRSModelKind::Audio | MistralRSModelKind::Vision) {
+            return Err(LLMError::NotImplemented(
+                "STT requires model_kind = \"audio\" or \"vision\" (multimodal model)".into(),
+            ));
+        }
+
+        let audio = AudioInput::from_bytes(&req.audio)
+            .map_err(|e| LLMError::InvalidRequest(format!("invalid audio data: {e}")))?;
+
+        let request = RequestBuilder::new().add_audio_message(
+            TextMessageRole::User,
+            "Transcribe this audio.",
+            vec![audio],
+        );
+
+        let response = self
+            .mrs_model
+            .send_chat_request(request)
+            .await
+            .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))?;
+
+        let text = response
+            .choices
+            .first()
+            .and_then(|c| c.message.content.clone())
+            .unwrap_or_default();
+
+        Ok(SttResponse { text })
     }
 }
 
@@ -126,6 +262,10 @@ fn infer_model_kind(cfg: &MistralRSConfig) -> Result<MistralRSModelKind, LLMErro
 
     if artifacts.sentence_transformers_present {
         return Ok(MistralRSModelKind::Embedding);
+    }
+
+    if SpeechLoaderType::auto_detect_from_config(&artifacts.contents).is_some() {
+        return Ok(MistralRSModelKind::Speech);
     }
 
     if let Some(name) = auto_cfg.architectures.first() {
@@ -234,7 +374,7 @@ fn device_map_setting(cfg: &MistralRSConfig, kind: MistralRSModelKind) -> Option
         Some(MistralRSDeviceMap::Single) => Some(DeviceMapSetting::dummy()),
         Some(MistralRSDeviceMap::Auto) => None,
         None => {
-            if matches!(kind, MistralRSModelKind::Vision)
+            if matches!(kind, MistralRSModelKind::Vision | MistralRSModelKind::Audio)
                 && cfg!(feature = "metal")
                 && !cfg.force_cpu.unwrap_or(false)
             {
@@ -302,6 +442,16 @@ fn embedding_loader_type(cfg: &MistralRSConfig) -> Result<Option<EmbeddingLoader
         .map(EmbeddingLoaderType::from_str)
         .transpose()
         .map_err(|e| LLMError::InvalidRequest(format!("invalid loader_type value: {e}")))
+}
+
+fn speech_loader_type(cfg: &MistralRSConfig) -> Result<SpeechLoaderType, LLMError> {
+    let s = cfg.speech_loader_type.as_deref().ok_or_else(|| {
+        LLMError::InvalidRequest(
+            "speech_loader_type is required for speech models (e.g. \"dia\")".into(),
+        )
+    })?;
+    SpeechLoaderType::from_str(s)
+        .map_err(|e| LLMError::InvalidRequest(format!("invalid speech_loader_type: {e}")))
 }
 
 fn paged_cache_type_from_config(cache_type: MistralRSPagedCacheType) -> PagedCacheType {
@@ -611,6 +761,34 @@ async fn build_gguf_model(cfg: &MistralRSConfig, spec: GgufSpec) -> Result<Model
     }
     if let Some(device_map) = device_map_setting(cfg, MistralRSModelKind::Text) {
         builder = builder.with_device_mapping(device_map);
+    }
+
+    builder
+        .build()
+        .await
+        .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))
+}
+
+async fn build_speech_model(cfg: &MistralRSConfig) -> Result<Model, LLMError> {
+    let loader_type = speech_loader_type(cfg)?;
+    let mut builder = SpeechModelBuilder::new(&cfg.model, loader_type).with_logging();
+    if let Some(token_source) = token_source_override(cfg)? {
+        builder = builder.with_token_source(token_source);
+    }
+    if let Some(revision) = cfg.hf_revision.as_ref() {
+        builder = builder.with_hf_revision(revision);
+    }
+    if let Some(dac_model_id) = cfg.speech_dac_model_id.as_ref() {
+        builder = builder.with_dac_model_id(dac_model_id.clone());
+    }
+    if let Some(dtype) = dtype_from_config(cfg)? {
+        builder = builder.with_dtype(dtype);
+    }
+    if cfg.force_cpu.unwrap_or(false) {
+        builder = builder.with_force_cpu();
+    }
+    if let Some(max_num_seqs) = cfg.max_num_seqs {
+        builder = builder.with_max_num_seqs(max_num_seqs);
     }
 
     builder

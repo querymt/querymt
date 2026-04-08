@@ -35,4 +35,5 @@ async-trait.workspace = true
 tokio = { version = "1", features = ["full"] }
 image = "0.25"
 hf-hub.workspace = true
+log.workspace = true
 querymt-provider-common = { path = "../../provider-common" }

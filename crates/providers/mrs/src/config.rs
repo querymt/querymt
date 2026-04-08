@@ -35,16 +35,24 @@ pub struct MistralRSConfig {
     pub paged_attn_gpu_mem_usage: Option<f32>,
     pub paged_attn_context_len: Option<usize>,
     pub paged_attn_cache_type: Option<MistralRSPagedCacheType>,
+    /// Loader type for speech models (e.g. "dia"). Required when `model_kind = "speech"`.
+    pub speech_loader_type: Option<String>,
+    /// Optional DAC model ID override for speech models.
+    pub speech_dac_model_id: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum MistralRSModelKind {
     #[default]
     Text,
     Vision,
+    /// Multimodal model with audio input support (ASR/STT). Uses `MultimodalModelBuilder`.
+    Audio,
     Embedding,
+    /// Dedicated TTS model (e.g. Dia). Uses `SpeechModelBuilder`.
+    Speech,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize)]

@@ -40,6 +40,8 @@ fn get_provider() -> Box<dyn LLMProvider> {
         paged_attn_gpu_mem_usage: None,
         paged_attn_context_len: None,
         paged_attn_cache_type: None,
+        speech_loader_type: None,
+        speech_dac_model_id: None,
     };
 
     let json_cfg = serde_json::to_string(&cfg).unwrap();

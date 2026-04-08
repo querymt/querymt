@@ -26,10 +26,27 @@ async fn build_provider(
         .await
         .ok_or_else(|| format!("Unknown audio provider: {provider_name}"))?;
 
-    // Build a config JSON with just the model field.
-    // Provider-specific configs (e.g. IzwiConfig) use `#[serde(default)]` so
-    // unrecognised fields are fine and missing fields get defaults.
-    let config_json = serde_json::json!({}).to_string();
+    // Build a config JSON from the static provider config (providers.toml
+    // `[providers.config]` section) merged with the model field.
+    // This is necessary for providers like mistralrs that require a model path
+    // at construction time, unlike izwi which has self-contained defaults.
+    let mut config_json = serde_json::json!({ "model": model });
+    if let Some(provider_cfg) = registry
+        .config
+        .providers
+        .iter()
+        .find(|p| p.name == provider_name)
+        && let Some(ref static_config) = provider_cfg.config
+    {
+        for (key, value) in static_config {
+            if config_json.get(key).is_none_or(|v| v.is_null())
+                && let Ok(json_val) = serde_json::to_value(value)
+            {
+                config_json[key] = json_val;
+            }
+        }
+    }
+    let config_json = config_json.to_string();
 
     let provider: Arc<dyn LLMProvider> = Arc::from(
         factory
@@ -53,7 +70,7 @@ async fn build_provider(
 fn classify_audio_model(model: &str) -> (bool, bool) {
     let m = model.to_ascii_lowercase();
     let is_stt = m.contains("asr") || m.contains("parakeet") || m.contains("whisper");
-    let is_tts = m.contains("tts") || m.contains("kokoro");
+    let is_tts = m.contains("tts") || m.contains("kokoro") || m.contains("dia");
     let is_multi = m.contains("voxtral") || m.contains("audio");
     (is_stt || is_multi, is_tts || is_multi)
 }
@@ -70,9 +87,20 @@ pub async fn handle_audio_capabilities(state: &ServerState, tx: &mpsc::Sender<St
 
     // Probe known audio providers.
     // Future: iterate all factories and probe for audio capability.
-    for provider_name in &["izwi"] {
+    for provider_name in &["izwi", "mistralrs"] {
         if let Some(factory) = registry.get(provider_name).await {
-            match factory.list_models("{}").await {
+            // Build the config JSON from the static provider config so that
+            // providers like mistralrs can report their configured model(s).
+            let cfg_json = registry
+                .config
+                .providers
+                .iter()
+                .find(|p| p.name == *provider_name)
+                .and_then(|p| p.config.as_ref())
+                .and_then(|c| serde_json::to_value(c).ok())
+                .unwrap_or_else(|| serde_json::json!({}))
+                .to_string();
+            match factory.list_models(&cfg_json).await {
                 Ok(models) => {
                     for model in models {
                         let (is_stt, is_tts) = classify_audio_model(&model);

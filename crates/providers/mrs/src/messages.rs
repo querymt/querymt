@@ -1,5 +1,5 @@
 use image::load_from_memory;
-use mistralrs::{Model, ModelCategory, RequestBuilder, TextMessageRole};
+use mistralrs::{AudioInput, Model, ModelCategory, RequestBuilder, TextMessageRole};
 use querymt::chat::{ChatMessage, ChatRole, Content};
 use querymt::error::LLMError;
 
@@ -27,6 +27,7 @@ pub(crate) fn apply_message_to_request(
 
     let mut tool_uses = Vec::new();
     let mut images = Vec::new();
+    let mut audios: Vec<AudioInput> = Vec::new();
 
     for block in &msg.content {
         match block {
@@ -69,18 +70,22 @@ pub(crate) fn apply_message_to_request(
                     .map_err(|e| LLMError::InvalidRequest(format!("invalid image payload: {e}")))?;
                 images.push(image);
             }
-            Content::Pdf { .. } | Content::ImageUrl { .. } | Content::Audio { .. } => {
+            Content::Audio { data, .. } => {
+                let audio = AudioInput::from_bytes(data)
+                    .map_err(|e| LLMError::InvalidRequest(format!("invalid audio payload: {e}")))?;
+                audios.push(audio);
+            }
+            Content::Pdf { .. } | Content::ImageUrl { .. } => {
                 return Err(LLMError::InvalidRequest(
-                    "mistralrs provider only supports inline image bytes for vision messages"
-                        .into(),
+                    "mistralrs provider does not support PDF or image URL content".into(),
                 ));
             }
             _ => {}
         }
     }
 
-    if !images.is_empty() {
-        req = req.add_image_message(role, text.clone(), images);
+    if !images.is_empty() || !audios.is_empty() {
+        req = req.add_multimodal_message(role, text.clone(), images, audios, vec![]);
     } else if !tool_uses.is_empty() {
         req = req.add_message_with_tool_call(role, text, tool_uses);
     } else if !text.is_empty() {
