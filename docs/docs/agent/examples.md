@@ -16,6 +16,7 @@ This document covers the example programs provided in `crates/agent/examples/`.
 | `web_dashboard` | Standalone web dashboard | `dashboard` |
 | `event_stream` | Subscribe to agent events | none |
 | `export_atif` | Export session to ATIF format | none |
+| `export_sft` | Export sessions as SFT training data | none |
 
 ---
 
@@ -314,6 +315,35 @@ cargo run --example export_atif -- <session-id> output.atif
 - Loading session history
 - Exporting to ATIF format
 - Session serialization
+
+---
+
+## export_sft
+
+Exports session data as JSONL training data for fine-tuning LLMs via SFT (Supervised Fine-Tuning). Supports OpenAI chat and ShareGPT formats.
+
+```bash
+# Show export stats
+cargo run --example export_sft -- --stats
+
+# Export all sessions as OpenAI chat format
+cargo run --example export_sft -- -o training.jsonl
+
+# Export only Claude Opus sessions as ShareGPT format for unsloth
+cargo run --example export_sft -- -f sharegpt --models claude-opus-4-6 --scrub-paths -o training.jsonl
+
+# Export with quality filters
+cargo run --example export_sft -- --min-turns 5 --exclude-errored --max-tool-error-rate 0.1 -o training.jsonl
+```
+
+**What it demonstrates:**
+- Batch export from session database
+- Turn materialization from event streams
+- Session quality filtering (model, error rate, turn count)
+- Path scrubbing for privacy
+- Context windowing for long sessions
+
+See the [Export documentation](export.md) for the full guide including fine-tuning workflows and the HTTP API.
 
 ---
 
