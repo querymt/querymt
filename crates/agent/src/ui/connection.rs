@@ -2,6 +2,18 @@
 //!
 //! Manages WebSocket lifecycle, message send/receive loops, and forwarding
 //! agent events to connected clients.
+//!
+//! ## Binary frame envelope
+//!
+//! Audio messages use binary WebSocket frames with a self-contained envelope:
+//!
+//! ```text
+//! [4 bytes LE: JSON header length]
+//! [N bytes:    JSON header — same {type, data} adjacently-tagged schema]
+//! [remaining:  raw binary payload (audio bytes), may be empty]
+//! ```
+//!
+//! All other messages use JSON text frames as before.
 
 use crate::agent::core::AgentMode;
 #[cfg(feature = "remote")]
@@ -16,11 +28,48 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+// ── Binary frame helpers ───────────────────────────────────────────────────────
+
+/// Parse a binary WebSocket frame into a JSON header string and a binary payload.
+///
+/// Layout: `[4 bytes LE: header_len][header_len bytes: JSON][remaining: payload]`
+pub fn parse_binary_frame(data: &[u8]) -> Result<(&str, &[u8]), String> {
+    if data.len() < 4 {
+        return Err("Binary frame too short (need at least 4 bytes for header length)".into());
+    }
+    let header_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if data.len() < 4 + header_len {
+        return Err(format!(
+            "Binary frame truncated: header_len={header_len} but only {} bytes remain",
+            data.len() - 4
+        ));
+    }
+    let header_bytes = &data[4..4 + header_len];
+    let header = std::str::from_utf8(header_bytes)
+        .map_err(|e| format!("Binary frame header is not valid UTF-8: {e}"))?;
+    let payload = &data[4 + header_len..];
+    Ok((header, payload))
+}
+
+/// Encode a JSON header and binary payload into a binary WebSocket frame.
+pub fn encode_binary_frame(header_json: &str, payload: &[u8]) -> Vec<u8> {
+    let header_bytes = header_json.as_bytes();
+    let header_len = header_bytes.len() as u32;
+    let mut buf = Vec::with_capacity(4 + header_bytes.len() + payload.len());
+    buf.extend_from_slice(&header_len.to_le_bytes());
+    buf.extend_from_slice(header_bytes);
+    buf.extend_from_slice(payload);
+    buf
+}
+
 /// Handle a new WebSocket connection.
 pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) {
     let conn_id = Uuid::new_v4().to_string();
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (tx, mut rx) = mpsc::channel::<String>(100);
+    // Parallel channel for binary frames (audio responses).
+    // Keeps all existing `mpsc::Sender<String>` signatures untouched.
+    let (bin_tx, mut bin_rx) = mpsc::channel::<Vec<u8>>(16);
 
     {
         let mut connections = state.connections.lock().await;
@@ -44,9 +93,24 @@ pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) 
     send_state(&state, &conn_id, &tx).await;
 
     let send_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if ws_sender.send(Message::Text(msg.into())).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(json) => {
+                        if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                msg = bin_rx.recv() => match msg {
+                    Some(bytes) => {
+                        if ws_sender.send(Message::Binary(bytes.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
             }
         }
     });
@@ -54,6 +118,7 @@ pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) 
     let state_for_receive = state.clone();
     let conn_id_for_receive = conn_id.clone();
     let tx_for_receive = tx.clone();
+    let bin_tx_for_receive = bin_tx.clone();
     let receive_task = tokio::spawn(async move {
         while let Some(result) = FuturesStreamExt::next(&mut ws_receiver).await {
             match result {
@@ -70,7 +135,39 @@ pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) 
                         &state_for_receive,
                         &conn_id_for_receive,
                         &tx_for_receive,
+                        &bin_tx_for_receive,
                         msg,
+                    )
+                    .await;
+                }
+                Ok(Message::Binary(data)) => {
+                    let (header, payload) = match parse_binary_frame(&data) {
+                        Ok(parsed) => parsed,
+                        Err(e) => {
+                            let _ =
+                                send_error(&tx_for_receive, format!("Invalid binary frame: {e}"))
+                                    .await;
+                            continue;
+                        }
+                    };
+                    let msg = match serde_json::from_str::<UiClientMessage>(header) {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            let _ = send_error(
+                                &tx_for_receive,
+                                format!("Invalid binary frame header: {e}"),
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
+                    super::handlers::handle_binary_message(
+                        &state_for_receive,
+                        &conn_id_for_receive,
+                        &tx_for_receive,
+                        &bin_tx_for_receive,
+                        msg,
+                        payload.to_vec(),
                     )
                     .await;
                 }
@@ -226,6 +323,22 @@ pub async fn send_message(
 pub async fn send_error(tx: &mpsc::Sender<String>, message: String) -> Result<(), String> {
     log::debug!("send_error: sending error message: {}", message);
     send_message(tx, UiServerMessage::Error { message }).await
+}
+
+/// Send a binary frame to the client via the binary channel.
+///
+/// `header_json` is the JSON header (same `{type, data}` schema as text messages).
+/// `payload` is the raw binary data (e.g. audio bytes).
+pub async fn send_binary(
+    bin_tx: &mpsc::Sender<Vec<u8>>,
+    header_json: &str,
+    payload: &[u8],
+) -> Result<(), String> {
+    let frame = encode_binary_frame(header_json, payload);
+    bin_tx
+        .send(frame)
+        .await
+        .map_err(|e| format!("Failed to send binary frame: {e}"))
 }
 
 /// Spawn event forwarders for all event sources.
@@ -884,5 +997,119 @@ pub async fn subscribe_to_file_index(
                 log::debug!("Sent initial file index to connection {}", conn_id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Binary frame envelope tests ─────────────────────────────────────────
+
+    #[test]
+    fn binary_frame_round_trip() {
+        let header = r#"{"type":"transcribe","data":{"provider":"izwi","model":"Qwen3-ASR-0.6B"}}"#;
+        let payload = b"fake audio bytes";
+
+        let encoded = encode_binary_frame(header, payload);
+        let (decoded_header, decoded_payload) = parse_binary_frame(&encoded).expect("should parse");
+
+        assert_eq!(decoded_header, header);
+        assert_eq!(decoded_payload, payload);
+    }
+
+    #[test]
+    fn binary_frame_round_trip_empty_payload() {
+        let header =
+            r#"{"type":"speech","data":{"provider":"izwi","model":"Kokoro-82M","text":"hi"}}"#;
+        let payload: &[u8] = b"";
+
+        let encoded = encode_binary_frame(header, payload);
+        let (decoded_header, decoded_payload) = parse_binary_frame(&encoded).expect("should parse");
+
+        assert_eq!(decoded_header, header);
+        assert!(decoded_payload.is_empty());
+    }
+
+    #[test]
+    fn binary_frame_round_trip_large_payload() {
+        let header = r#"{"type":"transcribe","data":{"provider":"izwi","model":"Qwen3-ASR-0.6B"}}"#;
+        // Simulate a ~320KB audio clip (10s @ 16kHz mono 16-bit)
+        let payload = vec![0xABu8; 320_000];
+
+        let encoded = encode_binary_frame(header, &payload);
+        let (decoded_header, decoded_payload) = parse_binary_frame(&encoded).expect("should parse");
+
+        assert_eq!(decoded_header, header);
+        assert_eq!(decoded_payload.len(), 320_000);
+        assert_eq!(decoded_payload[0], 0xAB);
+    }
+
+    #[test]
+    fn parse_binary_frame_rejects_too_short() {
+        let result = parse_binary_frame(&[0, 1, 2]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too short"));
+    }
+
+    #[test]
+    fn parse_binary_frame_rejects_truncated_header() {
+        // header_len says 100 bytes but only 4 bytes of actual data follow
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&100u32.to_le_bytes());
+        buf.extend_from_slice(b"tiny");
+        let result = parse_binary_frame(&buf);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("truncated"));
+    }
+
+    #[test]
+    fn parse_binary_frame_rejects_invalid_utf8_header() {
+        let bad_header: &[u8] = &[0xFF, 0xFE, 0xFD];
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(bad_header.len() as u32).to_le_bytes());
+        buf.extend_from_slice(bad_header);
+        let result = parse_binary_frame(&buf);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("UTF-8"));
+    }
+
+    #[test]
+    fn binary_frame_header_deserializes_as_transcribe() {
+        let header = r#"{"type":"transcribe","data":{"provider":"izwi","model":"Qwen3-ASR-0.6B","mime_type":"audio/wav"}}"#;
+        let payload = b"wav-bytes";
+        let encoded = encode_binary_frame(header, payload);
+        let (decoded_header, _) = parse_binary_frame(&encoded).expect("should parse");
+
+        let msg: UiClientMessage =
+            serde_json::from_str(decoded_header).expect("should deserialize header");
+
+        match msg {
+            UiClientMessage::Transcribe {
+                provider,
+                model,
+                mime_type,
+            } => {
+                assert_eq!(provider, "izwi");
+                assert_eq!(model, "Qwen3-ASR-0.6B");
+                assert_eq!(mime_type.as_deref(), Some("audio/wav"));
+            }
+            _ => panic!("expected Transcribe variant"),
+        }
+    }
+
+    #[test]
+    fn encode_binary_frame_layout() {
+        let header = "hello";
+        let payload = b"world";
+
+        let encoded = encode_binary_frame(header, payload);
+
+        // First 4 bytes: header length as u32 LE
+        assert_eq!(&encoded[0..4], &5u32.to_le_bytes());
+        // Next 5 bytes: header
+        assert_eq!(&encoded[4..9], b"hello");
+        // Remaining: payload
+        assert_eq!(&encoded[9..], b"world");
     }
 }

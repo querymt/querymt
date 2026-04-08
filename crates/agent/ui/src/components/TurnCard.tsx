@@ -12,7 +12,7 @@ import { CompactionCard, CompactingIndicator } from './CompactionCard';
 import { getAgentShortName } from '../utils/agentNames';
 import { colorWithAlpha, getAgentColor } from '../utils/agentColors';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
-import { Undo2, Redo2, Copy, Check, GitBranchPlus, Loader } from 'lucide-react';
+import { Undo2, Redo2, Copy, Check, GitBranchPlus, Loader, Volume2 as Volume2Icon } from 'lucide-react';
 
 export interface TurnCardProps {
   turn: Turn;
@@ -34,6 +34,8 @@ export interface TurnCardProps {
   canUndo?: boolean; // Whether undo button should be shown
   isCompacting?: boolean; // Compaction is currently running after this turn
   compactingTokenEstimate?: number; // Estimated tokens being compacted (for live indicator)
+  /** Called to speak an agent turn via TTS. Omit to hide the speaker button. */
+  onSpeakTurn?: (text: string) => void;
 }
 
 // Interleaved event item types
@@ -145,6 +147,7 @@ export const TurnCard = memo(function TurnCard({
   canUndo = false,
   isCompacting = false,
   compactingTokenEstimate,
+  onSpeakTurn,
 }: TurnCardProps) {
   const agentName = turn.agentId ? getAgentShortName(turn.agentId, agents) : 'Agent';
   const agentColor = turn.agentId ? getAgentColor(turn.agentId) : undefined;
@@ -286,6 +289,20 @@ export const TurnCard = memo(function TurnCard({
                 <Copy className="w-3.5 h-3.5 text-ui-secondary hover:text-accent-primary" />
               )}
             </button>
+            {/* Speak agent turn button (TTS) */}
+            {onSpeakTurn && (
+              <button
+                onClick={() => {
+                  const agentContent = turn.agentMessages.map(m => m.content).join('\n\n');
+                  console.log('[TTS] TurnCard click, content length:', agentContent.length);
+                  onSpeakTurn(agentContent);
+                }}
+                className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-surface-canvas/50"
+                title="Speak response"
+              >
+                <Volume2Icon className="w-3.5 h-3.5 text-ui-secondary hover:text-accent-primary" />
+              </button>
+            )}
           </div>
           {/* Right: model label */}
           {showModelLabel && turn.modelLabel && turn.modelConfigId && requestLlmConfig ? (

@@ -13,8 +13,10 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { ChevronDown } from 'lucide-react';
-import { useUiClientActions, useUiClientEvents, useUiClientSession } from '../context/UiClientContext';
+import { useUiClientActions, useUiClientEvents, useUiClientSession, useUiClientConfig } from '../context/UiClientContext';
 import { useUiStore } from '../store/uiStore';
+import { useVoiceOutput } from '../hooks/useVoiceOutput';
+import { useVoiceStore } from '../store/voiceStore';
 import { useSessionManager } from '../hooks/useSessionManager';
 import { useFileMention } from '../hooks/useFileMention';
 import { useTodoState } from '../hooks/useTodoState';
@@ -118,6 +120,21 @@ export function ChatView() {
   } = useUiStore();
 
   const isMobile = useIsMobile();
+  const { audioCapabilities } = useUiClientConfig();
+  const { ttsProvider, ttsModel, ttsVoice } = useVoiceStore();
+
+  const { speak: speakTts } = useVoiceOutput({
+    provider: ttsProvider,
+    model: ttsModel,
+    voice: ttsVoice || undefined,
+  });
+
+  const handleSpeakTurn = useCallback((text: string) => {
+    speakTts(text);
+  }, [speakTts]);
+
+  // Only pass onSpeakTurn if TTS is available
+  const onSpeakTurn = audioCapabilities.tts_models.length > 0 ? handleSpeakTurn : undefined;
 
   // Fetch schedules when session changes
   useEffect(() => {
@@ -789,6 +806,7 @@ export function ChatView() {
         onRedo={handleRedo}
         isCompacting={isLastTurn && !!compactingState}
         compactingTokenEstimate={isLastTurn ? compactingState?.tokenEstimate : undefined}
+        onSpeakTurn={onSpeakTurn}
       />
     );
   }, [
@@ -805,6 +823,7 @@ export function ChatView() {
     handleForkTurn,
     handleRedo,
     compactingState,
+    onSpeakTurn,
   ]);
 
   return (

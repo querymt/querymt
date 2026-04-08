@@ -212,6 +212,12 @@ export function useUiClient() {
   const workspacePathDialogResolverRef = useRef<((value: { cwd: string; node: string | null } | null) => void) | null>(null);
   const sessionCreatingRef = useRef(false);
 
+  // Audio / voice state
+  const [audioCapabilities, setAudioCapabilities] = useState<{ stt_models: { provider: string; model: string }[]; tts_models: { provider: string; model: string }[] }>({ stt_models: [], tts_models: [] });
+  const transcribeCallbackRef = useRef<((text: string) => void) | null>(null);
+  const speechCallbackRef = useRef<((audio: ArrayBuffer, mimeType: string) => void) | null>(null);
+  const speechErrorCallbackRef = useRef<((error: string) => void) | null>(null);
+
   // Derive main session events for backward compatibility
   const events = useMemo(
     () => (mainSessionId ? eventsBySession.get(mainSessionId) ?? [] : []),
@@ -250,8 +256,29 @@ export function useUiClient() {
       setConnected(false);
     };
 
+    socket.binaryType = 'arraybuffer';
     socket.onmessage = (event) => {
       if (!mounted) return;
+      if (event.data instanceof ArrayBuffer) {
+        // Binary frame: parse envelope [4-byte LE header_len][JSON header][payload]
+        try {
+          const view = new DataView(event.data);
+          if (event.data.byteLength < 4) return;
+          const headerLen = view.getUint32(0, true);
+          if (event.data.byteLength < 4 + headerLen) return;
+          const headerBytes = new Uint8Array(event.data, 4, headerLen);
+          const headerJson = new TextDecoder().decode(headerBytes);
+          const header = JSON.parse(headerJson);
+          const payload = event.data.slice(4 + headerLen);
+          if (header.type === 'speech_result') {
+            const mimeType = header.data?.mime_type ?? 'audio/wav';
+            speechCallbackRef.current?.(payload, mimeType);
+          }
+        } catch (err) {
+          console.error('Failed to parse binary frame:', err);
+        }
+        return;
+      }
       try {
         const msg = JSON.parse(event.data) as UiServerMessage;
         handleServerMessageRef.current(msg);
@@ -1111,6 +1138,14 @@ export function useUiClient() {
         });
         break;
       }
+      case 'transcribe_result': {
+        transcribeCallbackRef.current?.(msg.data.text);
+        break;
+      }
+      case 'audio_capabilities': {
+        setAudioCapabilities(msg.data);
+        break;
+      }
       default:
         break;
     }
@@ -1127,10 +1162,71 @@ export function useUiClient() {
   const sendMessage = (message: UiClientMessage) => {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
+      debugLog('[WS] sendMessage: socket not open, dropping', () => ({ type: message.type, readyState: socket?.readyState }));
       return;
     }
     socket.send(JSON.stringify(message));
   };
+
+  /** Send a binary WebSocket frame with a JSON header + raw payload. */
+  const sendBinaryFrame = useCallback((headerJson: string, payload: ArrayBuffer | Uint8Array) => {
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    const headerBytes = new TextEncoder().encode(headerJson);
+    const headerLen = headerBytes.length;
+    const buf = new ArrayBuffer(4 + headerLen + payload.byteLength);
+    const view = new DataView(buf);
+    view.setUint32(0, headerLen, true); // LE
+    new Uint8Array(buf, 4, headerLen).set(headerBytes);
+    new Uint8Array(buf, 4 + headerLen).set(
+      payload instanceof Uint8Array ? payload : new Uint8Array(payload)
+    );
+    socket.send(buf);
+  }, []);
+
+  /** Send audio for STT transcription (binary frame). */
+  const sendTranscribe = useCallback((
+    provider: string,
+    model: string,
+    audio: ArrayBuffer | Uint8Array,
+    mimeType?: string,
+  ) => {
+    const header = JSON.stringify({
+      type: 'transcribe',
+      data: { provider, model, mime_type: mimeType },
+    });
+    sendBinaryFrame(header, audio);
+  }, [sendBinaryFrame]);
+
+  /** Request TTS speech synthesis (text frame). Response arrives as binary frame. */
+  const sendSpeech = useCallback((
+    provider: string,
+    model: string,
+    text: string,
+    voice?: string,
+    format?: string,
+  ) => {
+    debugLog('[TTS] sendSpeech', () => ({ provider, model, textLen: text.length }));
+    sendMessage({
+      type: 'speech',
+      data: { provider, model, text, voice, format },
+    });
+  }, []);
+
+  /** Register a callback for STT transcription results. */
+  const setTranscribeCallback = useCallback((cb: ((text: string) => void) | null) => {
+    transcribeCallbackRef.current = cb;
+  }, []);
+
+  /** Register a callback for TTS speech audio results. */
+  const setSpeechCallback = useCallback((cb: ((audio: ArrayBuffer, mimeType: string) => void) | null) => {
+    speechCallbackRef.current = cb;
+  }, []);
+
+  /** Register a callback for speech errors. */
+  const setSpeechErrorCallback = useCallback((cb: ((error: string) => void) | null) => {
+    speechErrorCallbackRef.current = cb;
+  }, []);
 
   const requestWorkspacePath = useCallback((defaultValue: string) => {
     setWorkspacePathDialogDefaultValue(defaultValue);
@@ -1647,6 +1743,13 @@ export function useUiClient() {
     queryKnowledge,
     listKnowledge,
     getKnowledgeStats,
+    // Audio / voice
+    audioCapabilities,
+    sendTranscribe,
+    sendSpeech,
+    setTranscribeCallback,
+    setSpeechCallback,
+    setSpeechErrorCallback,
   };
 }
 
