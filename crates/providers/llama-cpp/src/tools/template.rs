@@ -123,9 +123,8 @@ pub(crate) fn apply_template_for_thinking(
         .map_err(|e| LLMError::ProviderError(format!("Failed to apply chat template: {}", e)))?;
 
     log::debug!(
-        "Template applied (thinking): prompt_len={}, thinking_forced_open={}",
+        "Template applied (thinking): prompt_len={}",
         result.prompt.len(),
-        result.thinking_forced_open,
     );
 
     Ok(result)
