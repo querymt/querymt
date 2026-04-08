@@ -136,6 +136,16 @@ jobs:
             feature_tag: default
             needs_cuda: "false"
 
+          - os: windows
+            arch: amd64
+            target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            features: "cuda flash-attn"
+            feature_tag: cuda12.8-sm80
+            needs_cuda: "true"
+            cuda_version: "12.8"
+            extra_env: '{"CUDA_COMPUTE_CAP":"80"}'
+
     steps:
       - name: Check out code
         uses: actions/checkout@v6
