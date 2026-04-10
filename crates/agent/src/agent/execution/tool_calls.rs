@@ -94,7 +94,10 @@ pub(super) async fn execute_tool_call(
         SnapshotState::None
     };
 
-    let progress_entry = exec_ctx
+    // Progress recording is observational — a failure here must not abort the
+    // tool call itself, otherwise the tool_use block ends up without a matching
+    // tool_result and the session becomes permanently broken.
+    match exec_ctx
         .state
         .record_progress(
             crate::session::domain::ProgressKind::ToolCall,
@@ -102,12 +105,22 @@ pub(super) async fn execute_tool_call(
             Some(serde_json::from_str(&call.function.arguments).unwrap_or_default()),
         )
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to record progress: {}", e))?;
-
-    config.emit_event(
-        &exec_ctx.session_id,
-        AgentEventKind::ProgressRecorded { progress_entry },
-    );
+    {
+        Ok(progress_entry) => {
+            config.emit_event(
+                &exec_ctx.session_id,
+                AgentEventKind::ProgressRecorded { progress_entry },
+            );
+        }
+        Err(e) => {
+            log::warn!(
+                "Failed to record progress for tool {} (session {}): {}",
+                call.function.name,
+                exec_ctx.session_id,
+                e
+            );
+        }
+    }
 
     let args: serde_json::Value =
         serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| serde_json::json!({}));

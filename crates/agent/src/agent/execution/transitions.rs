@@ -859,8 +859,27 @@ pub(super) async fn transition_processing_tool_calls(
     let was_cancelled = already_cancelled || exec_ctx.cancellation_token.is_cancelled();
 
     let mut all_results = (**results).to_vec();
-    for result in tool_results {
-        all_results.push(result?);
+    for (result, call) in tool_results.into_iter().zip(remaining_calls.iter()) {
+        match result {
+            Ok(tool_result) => all_results.push(tool_result),
+            Err(e) => {
+                warn!(
+                    "Tool call {} ({}) failed with infrastructure error: {}. \
+                     Synthesizing error result to maintain tool_use/tool_result invariant.",
+                    call.id, call.function.name, e
+                );
+                all_results.push(ToolResult::new(
+                    call.id.clone(),
+                    vec![querymt::chat::Content::text(format!(
+                        "Error: internal tool execution failed: {}",
+                        e
+                    ))],
+                    true,
+                    Some(call.function.name.clone()),
+                    Some(call.function.arguments.clone()),
+                ));
+            }
+        }
     }
 
     debug!(
