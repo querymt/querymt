@@ -882,20 +882,20 @@ pub struct AgentSettings {
     /// Built-in tool names to enable, or MCP tool patterns.
     /// When empty, all built-in tools are available.
     ///
-    /// Built-in tools: `read_tool`, `edit`, `write_file`, `delete_file`, `shell`,
-    /// `glob`, `search_text`, `ls`, `web_fetch`, `browse`, `mdq`, `question`,
-    /// `delegate`, `create_task`, `todowrite`, `todoread`, `semantic_edit`,
-    /// `multiedit`, `apply_patch`, `knowledge_consolidate`, `knowledge_ingest`,
-    /// `knowledge_list_unconsolidated`, `knowledge_query`, `knowledge_stats`,
-    /// `language_query`.
+    /// Built-in tools: `read_tool`, `index`, `edit`, `write_file`, `delete_file`,
+    /// `shell`, `glob`, `search_text`, `ls`, `web_fetch`, `browse`, `mdq`,
+    /// `question`, `delegate`, `create_task`, `todowrite`, `todoread`,
+    /// `semantic_edit`, `multiedit`, `apply_patch`, `knowledge_consolidate`,
+    /// `knowledge_ingest`, `knowledge_list_unconsolidated`, `knowledge_query`,
+    /// `knowledge_stats`, `language_query`.
     ///
     /// MCP patterns: `"server_name.*"` (all tools from server),
     /// `"server_name.tool_name"` (specific tool).
     #[serde(default)]
     #[schemars(extend("examples" = [
-        ["read_tool", "edit", "write_file", "shell", "glob", "search_text"],
-        ["read_tool", "edit", "write_file", "shell", "glob", "search_text", "ls", "web_fetch", "question", "create_task", "todowrite", "todoread"],
-        ["read_tool", "glob", "search_text", "filesystem.*"]
+        ["read_tool", "index", "edit", "write_file", "shell", "glob", "search_text"],
+        ["read_tool", "index", "edit", "write_file", "shell", "glob", "search_text", "ls", "web_fetch", "question", "create_task", "todowrite", "todoread"],
+        ["read_tool", "index", "glob", "search_text", "filesystem.*"]
     ]))]
     pub tools: Vec<String>,
 

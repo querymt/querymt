@@ -114,6 +114,20 @@ similarity-core = { git = "https://github.com/querymt/similarity.git", branch = 
 similarity-rs = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
 similarity-py = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
 
+# Tree-sitter grammars for the `index` tool (outline extraction).
+# These crates are already compiled transitively via similarity-*; listing them
+# here lets outline_index use the raw tree-sitter API directly.
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-ruby = "0.23"
+
 # Rust AST parsing for rich structural fingerprinting during function indexing
 syn = { version = "2", features = ["full", "visit"] }
 

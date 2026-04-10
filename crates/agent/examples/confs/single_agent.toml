@@ -18,6 +18,7 @@ model = "${MODEL:-gpt-4}"
 # - "github.search_repos" - specific tool from github MCP server
 tools = [
     "read_tool",
+    "index",
     "edit", 
     "shell",
     "glob",

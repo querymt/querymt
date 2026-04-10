@@ -17,7 +17,7 @@ tools = [
   # File operations
   "edit", "read_tool", "write_file",
   # Search & navigation
-  "glob", "search_text", "ls",
+  "glob", "search_text", "ls", "index",
   # Execution
   "shell",
   # Task management

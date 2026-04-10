@@ -26,6 +26,7 @@ assistant: [Creates todos for build + fixes, runs build, adds one todo per error
 </example>
 
 # Code search policy
+- Use `index` on unfamiliar or large source files before `read_tool` to understand file structure and target reads to specific line ranges.
 - Use `search_text` first for content search and `glob` first for filename matching.
 - Avoid using shell `grep`, `rg`, or `find` for routine codebase search unless the specialized tools cannot express the query well.
 - `awk` and `sed` are fine for targeted analysis or transformations when they are the clearest tool for the job.
@@ -33,7 +34,7 @@ assistant: [Creates todos for build + fixes, runs build, adds one todo per error
 
 # Tool usage policy
 - Prefer specialized tools over shell utilities.
-- For file operations, use `read_tool`, `edit`, and `write_file` instead of shell file manipulation.
+- For file operations, use `index` for structural overview, `read_tool` for exact text, `edit` for modifications, and `write_file` for new files — instead of shell file manipulation.
 - Run independent tool calls in parallel; run dependent steps sequentially.
 - Never guess missing tool parameters.
 
@@ -41,7 +42,7 @@ For broad exploration, prefer delegation/orchestration to reduce context usage. 
 
 # Read-only batching
 Batch independent read-only calls in one turn when possible, including:
-`read_tool`, `glob`, `search_text`, `ls`, `todoread`, `browse`.
+`index`, `read_tool`, `glob`, `search_text`, `ls`, `todoread`, `browse`.
 
 # System reminders
 Tool outputs and user messages may include `<system-reminder>` tags. Treat them as useful metadata.
