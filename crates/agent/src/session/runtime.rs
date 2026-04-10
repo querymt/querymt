@@ -50,6 +50,21 @@ impl RuntimeContext {
         self.active_task.as_ref().map(|task| task.id)
     }
 
+    /// Return the cached session internal ID if available, otherwise fetch from
+    /// the database.  `load_working_context()` is called before every execution
+    /// cycle so the cached value is almost always present — the fallback exists
+    /// only as a safety net.
+    async fn resolve_session_internal_id(&self) -> SessionResult<i64> {
+        if let Some(id) = self.session_internal_id {
+            return Ok(id);
+        }
+        self.store
+            .get_session(&self.session_id)
+            .await?
+            .map(|s| s.id)
+            .ok_or_else(|| SessionError::SessionNotFound(self.session_id.clone()))
+    }
+
     async fn load_task_by_internal_id(&self, task_internal_id: i64) -> SessionResult<Option<Task>> {
         let tasks = self.store.list_tasks(&self.session_id).await?;
         Ok(tasks.into_iter().find(|task| task.id == task_internal_id))
@@ -161,12 +176,7 @@ impl RuntimeContext {
         rationale: Option<String>,
         status: DecisionStatus,
     ) -> SessionResult<Decision> {
-        let session_internal_id = self
-            .store
-            .get_session(&self.session_id)
-            .await?
-            .ok_or_else(|| SessionError::SessionNotFound(self.session_id.clone()))?
-            .id;
+        let session_internal_id = self.resolve_session_internal_id().await?;
 
         let decision = Decision {
             id: 0,
@@ -188,12 +198,7 @@ impl RuntimeContext {
         description: String,
         status: AlternativeStatus,
     ) -> SessionResult<Alternative> {
-        let session_internal_id = self
-            .store
-            .get_session(&self.session_id)
-            .await?
-            .ok_or_else(|| SessionError::SessionNotFound(self.session_id.clone()))?
-            .id;
+        let session_internal_id = self.resolve_session_internal_id().await?;
 
         let alternative = Alternative {
             id: 0,
@@ -215,12 +220,7 @@ impl RuntimeContext {
         content: String,
         metadata: Option<Value>,
     ) -> SessionResult<ProgressEntry> {
-        let session_internal_id = self
-            .store
-            .get_session(&self.session_id)
-            .await?
-            .ok_or_else(|| SessionError::SessionNotFound(self.session_id.clone()))?
-            .id;
+        let session_internal_id = self.resolve_session_internal_id().await?;
 
         let entry = ProgressEntry {
             id: 0,
@@ -244,12 +244,7 @@ impl RuntimeContext {
         path: Option<String>,
         summary: Option<String>,
     ) -> SessionResult<Artifact> {
-        let session_internal_id = self
-            .store
-            .get_session(&self.session_id)
-            .await?
-            .ok_or_else(|| SessionError::SessionNotFound(self.session_id.clone()))?
-            .id;
+        let session_internal_id = self.resolve_session_internal_id().await?;
 
         let artifact = Artifact {
             id: 0,
@@ -275,12 +270,7 @@ impl RuntimeContext {
         constraints: Option<String>,
         expected_output: Option<String>,
     ) -> SessionResult<Delegation> {
-        let session_internal_id = self
-            .store
-            .get_session(&self.session_id)
-            .await?
-            .ok_or_else(|| SessionError::SessionNotFound(self.session_id.clone()))?
-            .id;
+        let session_internal_id = self.resolve_session_internal_id().await?;
 
         let objective_hash = crate::hash::RapidHash::new(objective.as_bytes());
         let retry_count = self
