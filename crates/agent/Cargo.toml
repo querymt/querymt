@@ -116,7 +116,7 @@ similarity-py = { git = "https://github.com/querymt/similarity.git", branch = "t
 # Tree-sitter grammars for the `index` tool (outline extraction).
 # These crates are already compiled transitively via similarity-*; listing them
 # here lets outline_index use the raw tree-sitter API directly.
-tree-sitter = "0.25"
+tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"
 tree-sitter-typescript = "0.23"
