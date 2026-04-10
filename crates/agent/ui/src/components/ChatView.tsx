@@ -79,6 +79,7 @@ export function ChatView() {
   const {
     sessionId,
     connected,
+    reconnecting,
     agents,
     sessionGroups,
     thinkingBySession,
@@ -978,6 +979,14 @@ export function ChatView() {
             remainingSecs={rateLimitState.remainingSecs}
             onCancel={handleCancelRateLimit}
           />
+        </div>
+      )}
+
+      {/* Reconnection banner */}
+      {!connected && reconnecting && (
+        <div className="mx-4 mb-2 px-4 py-2 rounded-lg border border-status-warning/40 bg-surface-elevated text-xs text-status-warning flex items-center gap-2 animate-fade-in">
+          <span className="w-1.5 h-1.5 rounded-full bg-status-warning animate-pulse flex-shrink-0" />
+          Connection lost. Reconnecting...
         </div>
       )}
 
