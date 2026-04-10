@@ -1,6 +1,7 @@
 pub mod file_index;
 pub mod function_index;
 pub mod merkle;
+pub mod outline_index;
 pub mod search;
 pub mod workspace_actor;
 pub mod workspace_manager_actor;

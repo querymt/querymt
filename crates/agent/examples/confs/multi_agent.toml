@@ -27,6 +27,7 @@ tools = [
     "delegate",
     "create_task",
     "read_tool",
+    "index",
     "search_text",
     "github.*"  # All tools from github MCP
 ]
@@ -45,6 +46,7 @@ tools = [
     "edit",
     "shell",
     "read_tool",
+    "index",
     "write_file",
     "glob",
     "search_text"

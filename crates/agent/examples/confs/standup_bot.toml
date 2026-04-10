@@ -37,7 +37,7 @@ mutating_tools = []
 
 tools = [
   # Git & codebase analysis (read-only)
-  "read_tool", "glob", "search_text", "ls", "shell",
+  "read_tool", "index", "glob", "search_text", "ls", "shell",
 
   # Knowledge lifecycle
   "knowledge_ingest",

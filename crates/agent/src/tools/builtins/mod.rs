@@ -6,6 +6,7 @@ pub mod delete_file;
 pub mod edit;
 pub mod glob;
 pub mod helpers;
+pub mod index;
 pub mod knowledge_consolidate;
 pub mod knowledge_ingest;
 pub mod knowledge_list;
@@ -40,6 +41,7 @@ pub use delegate::DelegateTool;
 pub use delete_file::DeleteFileTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;
+pub use index::IndexTool;
 pub use knowledge_consolidate::KnowledgeConsolidateTool;
 pub use knowledge_ingest::KnowledgeIngestTool;
 pub use knowledge_list::KnowledgeListTool;
@@ -75,6 +77,7 @@ pub fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(DeleteFileTool::new()),
         Arc::new(EditTool::new()),
         Arc::new(GlobTool::new()),
+        Arc::new(IndexTool::new()),
         Arc::new(LanguageQueryTool::new()),
         Arc::new(KnowledgeConsolidateTool::new()),
         Arc::new(KnowledgeIngestTool::new()),

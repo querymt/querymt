@@ -54,7 +54,7 @@ tools = [
   "knowledge_stats",
 
   # Planning & exploration (read-only)
-  "read_tool", "search_text", "glob", "ls",
+  "read_tool", "index", "search_text", "glob", "ls",
 
   # Task management
   "create_task", "todowrite", "todoread",
@@ -108,7 +108,7 @@ model = "claude-sonnet-4-5-20250929"
 description = "Implementation specialist for code writing, editing, and execution. Has full read/write access to the codebase."
 capabilities = ["rust", "python", "typescript", "shell"]
 tools = [
-  "edit", "write_file", "read_tool",
+  "edit", "write_file", "read_tool", "index",
   "glob", "search_text", "ls",
   "shell",
   "todowrite", "todoread",

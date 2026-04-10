@@ -9,9 +9,10 @@ Implement features, fix bugs, and write clean, maintainable code.
 ## Critical Guidelines
 
 ### Before Making Changes
-1. Use `read_tool` to examine file content if you don't already have it
-2. Note EXACT line content and line numbers
-3. Verify what you're changing actually exists
+1. Use `index` on unfamiliar or large files to get a structural overview with line ranges
+2. Use `read_tool` with targeted offset/limit to examine the specific sections you need
+3. Note EXACT line content and line numbers
+4. Verify what you're changing actually exists
 
 ### Using the edit Tool
 4. Provide enough context lines to uniquely identify the location (2-3 lines before/after)
