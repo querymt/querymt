@@ -85,18 +85,17 @@ jobs:
         run: |
           gh release delete nightly --yes --cleanup-tag || true
 
-      # This step creates a fresh "Nightly" pre-release.
       - name: Create Nightly Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: nightly
-          name: Nightly Build
-          body: |
-            **This is a pre-release build from the `main` branch.**
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create nightly \
+            --title "Nightly Build" \
+            --notes "**This is a pre-release build from the \`main\` branch.**
 
-            It is not intended for production use.
+          It is not intended for production use.
 
-            Commit: `${{ github.sha }}`
-          prerelease: true
-          draft: false
-          files: artifacts/*
+          Commit: \`${{ github.sha }}\`" \
+            --prerelease \
+            --target "${{ github.sha }}" \
+            artifacts/*
