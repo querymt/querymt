@@ -82,7 +82,6 @@ toml.workspace = true
 minijinja = { version = "2", default-features = false, features = ["serde"] }
 iana-time-zone = "0.1"
 regex.workspace = true
-srgn = "0.14"
 tokio-util = { version = "0.7", features = ["compat"] }
 base64.workspace = true
 hex = "0.4"

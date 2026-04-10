@@ -298,12 +298,6 @@ mod tests {
             );
         }
 
-        // Specifically verify semantic_edit is registered
-        assert!(
-            config.tool_registry.find("semantic_edit").is_some(),
-            "semantic_edit tool should be registered"
-        );
-
         // Experimental tools may be registered outside all_builtin_tools().
         assert!(
             registered_names.len() >= all_tools.len(),
