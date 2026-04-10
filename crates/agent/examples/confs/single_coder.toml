@@ -36,9 +36,13 @@ system = [
 backend = "git"
 
 # Compaction: tool output truncation (Layer 1)
-[agent.execution.tool_output]
-max_lines = 2000
-max_bytes = 51200
+#[agent.execution.tool_output]
+#max_lines = 2000
+#max_bytes = 51200
+
+[agent.execution.tool_output.strategy]
+kind = "squeez"
+model = "mradermacher/squeez-2b-GGUF:squeez-2b.Q4_K_M.gguf"
 
 # Compaction: pruning after every turn (Layer 2)
 [agent.execution.pruning]

@@ -19,7 +19,7 @@ pub fn create_provider(
     Ok(Box::new(LlamaCppProvider::new(cfg)?))
 }
 
-use provider::CachedModel;
+use provider::ModelCache;
 use querymt::LLMProvider;
 use querymt::error::LLMError;
 use querymt::plugin::{Fut, LLMProviderFactory};
@@ -31,19 +31,19 @@ use schemars::schema_for;
 /// crates directly instead of loading them as runtime plugins.
 pub fn create_factory() -> std::sync::Arc<dyn LLMProviderFactory> {
     std::sync::Arc::new(LlamaCppFactory {
-        model_cache: std::sync::Mutex::new(None),
+        model_cache: std::sync::Mutex::new(Vec::new()),
     })
 }
 
 struct LlamaCppFactory {
-    /// Single-slot model cache. Stores the most recently loaded model
-    /// (`Arc<LlamaModel>` + `Arc<MultimodalContext>`) keyed on hardware
-    /// params (model path, n_gpu_layers).
+    /// Multi-slot LRU model cache. Stores up to `MODEL_CACHE_CAPACITY`
+    /// loaded models (`Arc<LlamaModel>` + `Arc<MultimodalContext>`),
+    /// keyed on hardware params (model path, n_gpu_layers).
     ///
-    /// Capacity = 1 matches the common case: one model on the peer,
-    /// multiple delegates sharing it with different system prompts.
-    /// If a request arrives for a different model, the old one is evicted.
-    model_cache: std::sync::Mutex<Option<CachedModel>>,
+    /// Two slots allow a main agent model and an auxiliary model (e.g.
+    /// squeez-2b for tool output compression) to coexist without
+    /// expensive reloads every turn.
+    model_cache: ModelCache,
 }
 
 impl LLMProviderFactory for LlamaCppFactory {
@@ -89,7 +89,7 @@ impl LLMProviderFactory for LlamaCppFactory {
 #[allow(improper_ctypes_definitions)]
 pub extern "C" fn plugin_factory() -> *mut dyn LLMProviderFactory {
     Box::into_raw(Box::new(LlamaCppFactory {
-        model_cache: std::sync::Mutex::new(None),
+        model_cache: std::sync::Mutex::new(Vec::new()),
     })) as *mut _
 }
 

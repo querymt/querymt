@@ -1,4 +1,7 @@
 pub mod builtins;
+pub mod compressor;
+pub mod compressor_squeez;
+pub mod compressor_truncation;
 pub mod context;
 pub mod context_impl;
 pub mod registry;

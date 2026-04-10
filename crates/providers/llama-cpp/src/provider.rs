@@ -39,12 +39,26 @@ pub(crate) struct ModelCacheKey {
     pub n_gpu_layers: Option<u32>,
 }
 
+/// Maximum number of models kept in the cache simultaneously.
+///
+/// 2 slots covers the common case: one main agent model + one auxiliary model
+/// (e.g. squeez for tool output compression). Raising this further increases
+/// memory pressure without significant benefit.
+pub(crate) const MODEL_CACHE_CAPACITY: usize = 2;
+
 /// A cached model + multimodal context, shared across provider instances.
 pub(crate) struct CachedModel {
     pub key: ModelCacheKey,
     pub model: Arc<LlamaModel>,
     pub multimodal: Option<Arc<MultimodalContext>>,
 }
+
+/// Multi-slot LRU model cache.
+///
+/// Stores up to [`MODEL_CACHE_CAPACITY`] loaded models. On a cache miss the
+/// oldest entry is evicted. This allows a main agent model and an auxiliary
+/// model (e.g. squeez-2b) to coexist without expensive reloads every turn.
+pub(crate) type ModelCache = std::sync::Mutex<Vec<CachedModel>>;
 
 /// The main llama.cpp provider.
 pub(crate) struct LlamaCppProvider {
@@ -151,7 +165,7 @@ impl LlamaCppProvider {
     /// but carries its own per-request config (system, temperature, etc.).
     pub(crate) fn new_with_cache(
         cfg: LlamaCppConfig,
-        cache: &std::sync::Mutex<Option<CachedModel>>,
+        cache: &ModelCache,
     ) -> Result<Self, LLMError> {
         install_abort_callback();
 
@@ -170,33 +184,25 @@ impl LlamaCppProvider {
             n_gpu_layers: cfg.n_gpu_layers,
         };
 
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-
-        if let Some(cached) = guard.as_ref() {
-            if cached.key == key {
-                // Cache hit — reuse model, attach new config
+        // ── Cache lookup (LRU: move hit to back) ──────────────────────────
+        {
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(pos) = guard.iter().position(|c| c.key == key) {
                 log::debug!("LlamaCpp model cache hit: {}", key.model_path);
+                // Move to back (most-recently-used).
+                let cached = guard.remove(pos);
                 let provider = Self {
                     model: Arc::clone(&cached.model),
                     cfg,
                     multimodal: cached.multimodal.as_ref().map(Arc::clone),
                 };
+                guard.push(cached);
                 return Ok(provider);
             }
-            // Cache miss — different model, evict old one
-            log::info!(
-                "LlamaCpp model cache evict: {} -> {}",
-                cached.key.model_path,
-                key.model_path
-            );
+            // Guard is dropped here before expensive model loading.
         }
 
-        // Drop the guard before expensive model loading to avoid holding the
-        // mutex for a long time (model loading can take seconds).
-        // We'll re-acquire to store the result.
-        drop(guard);
-
-        // Load new model
+        // ── Cache miss — load new model ───────────────────────────────────
         let model_path = Path::new(&key.model_path);
         if !model_path.exists() {
             return Err(LLMError::InvalidRequest(format!(
@@ -234,13 +240,23 @@ impl LlamaCppProvider {
             log::debug!("Multimodal support not available for this model");
         }
 
-        // Store in cache
-        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(CachedModel {
-            key,
-            model: Arc::clone(&model),
-            multimodal: multimodal.as_ref().map(Arc::clone),
-        });
+        // ── Store in cache, evicting oldest if at capacity ────────────────
+        {
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.len() >= MODEL_CACHE_CAPACITY {
+                let evicted = guard.remove(0); // oldest = front
+                log::info!(
+                    "LlamaCpp model cache evict: {} (capacity={})",
+                    evicted.key.model_path,
+                    MODEL_CACHE_CAPACITY
+                );
+            }
+            guard.push(CachedModel {
+                key,
+                model: Arc::clone(&model),
+                multimodal: multimodal.as_ref().map(Arc::clone),
+            });
+        }
 
         let provider = Self {
             model,

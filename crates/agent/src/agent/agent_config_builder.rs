@@ -11,8 +11,10 @@ use crate::agent::core::{
 };
 use crate::config::{
     CompactionConfig, DelegationWaitPolicy, McpServerConfig, PruningConfig, RateLimitConfig,
-    RuntimeExecutionPolicy, ToolOutputConfig,
+    RuntimeExecutionPolicy, ToolOutputConfig, ToolOutputStrategy,
 };
+use crate::tools::compressor::ToolOutputCompressor;
+use crate::tools::compressor_truncation::TruncationCompressor;
 use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
 use crate::event_fanout::EventFanout;
 use crate::event_sink::EventSink;
@@ -69,6 +71,7 @@ pub struct AgentConfigBuilder {
     mcp_servers: Vec<McpServerConfig>,
     schedule_repository: Option<Arc<dyn crate::session::repo_schedule::ScheduleRepository>>,
     knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
+    tool_output_compressor: Option<Arc<dyn ToolOutputCompressor>>,
 }
 
 impl AgentConfigBuilder {
@@ -123,6 +126,7 @@ impl AgentConfigBuilder {
             mcp_servers: Vec::new(),
             schedule_repository: None,
             knowledge_store: None,
+            tool_output_compressor: None,
         }
     }
 
@@ -170,6 +174,7 @@ impl AgentConfigBuilder {
             mcp_servers: Vec::new(),
             schedule_repository: None,
             knowledge_store: None,
+            tool_output_compressor: None,
         }
     }
 
@@ -179,6 +184,14 @@ impl AgentConfigBuilder {
             self.event_journal.clone(),
             self.event_fanout.clone(),
         ));
+
+        // Build the Layer 1 tool output compressor from config strategy.
+        // An explicit override (via `with_tool_output_compressor`) takes
+        // precedence over the config-driven default.
+        let tool_output_compressor: Arc<dyn ToolOutputCompressor> = self
+            .tool_output_compressor
+            .unwrap_or_else(|| Self::compressor_from_strategy(&self.execution_policy));
+
         AgentConfig {
             provider: self.provider,
             event_sink,
@@ -200,6 +213,7 @@ impl AgentConfigBuilder {
             delegation_wait_timeout_secs: self.delegation_wait_timeout_secs,
             delegation_cancel_grace_secs: self.delegation_cancel_grace_secs,
             execution_policy: self.execution_policy,
+            tool_output_compressor,
             compaction: self.compaction,
             snapshot_backend: self.snapshot_backend,
             snapshot_gc_config: self.snapshot_gc_config,
@@ -509,6 +523,15 @@ impl AgentConfigBuilder {
         self
     }
 
+    /// Overrides the Layer 1 tool output compressor directly.
+    ///
+    /// When set, the config-driven [`ToolOutputStrategy`] is ignored and this
+    /// compressor is used instead.
+    pub fn with_tool_output_compressor(mut self, compressor: Arc<dyn ToolOutputCompressor>) -> Self {
+        self.tool_output_compressor = Some(compressor);
+        self
+    }
+
     /// Sets the pruning configuration (Layer 2).
     pub fn with_pruning_config(mut self, config: PruningConfig) -> Self {
         self.execution_policy.pruning = config;
@@ -617,6 +640,33 @@ impl AgentConfigBuilder {
             other => {
                 log::warn!("Unknown snapshot backend '{}', ignoring", other);
                 self
+            }
+        }
+    }
+
+    // ── Private helpers ────────────────────────────────────────────────────
+
+    /// Build a [`ToolOutputCompressor`] from the config-driven strategy.
+    ///
+    /// For `Truncation` this is trivial. For `Squeez` we log a warning and
+    /// fall back to truncation here because constructing the squeez provider
+    /// requires the plugin registry which lives at a higher layer
+    /// (see `Agent::builder_from_config`). The `squeez` strategy is fully
+    /// wired in `api/agent.rs` via `with_tool_output_compressor`.
+    fn compressor_from_strategy(policy: &RuntimeExecutionPolicy) -> Arc<dyn ToolOutputCompressor> {
+        match &policy.tool_output.strategy {
+            ToolOutputStrategy::Truncation => {
+                Arc::new(TruncationCompressor::new(policy.tool_output.clone()))
+            }
+            ToolOutputStrategy::Squeez(_) => {
+                // Squeez requires a ChatProvider that must be built externally
+                // (via plugin registry). If we reach here the caller forgot to
+                // call `with_tool_output_compressor`. Fall back gracefully.
+                log::warn!(
+                    "Squeez strategy configured but no compressor provided; \
+                     falling back to truncation"
+                );
+                Arc::new(TruncationCompressor::new(policy.tool_output.clone()))
             }
         }
     }

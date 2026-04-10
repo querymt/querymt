@@ -12,6 +12,7 @@ use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::{SnapshotPolicy, ToolPolicy};
 use crate::config::{
     ExecutionPolicy, McpServerConfig, MiddlewareEntry, SingleAgentConfig, SkillsConfig,
+    ToolOutputStrategy,
 };
 use crate::middleware::{MIDDLEWARE_REGISTRY, MiddlewareDriver};
 use crate::runner::{ChatRunner, ChatSession};
@@ -314,7 +315,7 @@ impl AgentBuilder {
         };
 
         let mut builder = AgentConfigBuilder::new(
-            plugin_registry,
+            plugin_registry.clone(),
             backend.session_store(),
             backend.event_journal(),
             llm_config,
@@ -436,6 +437,76 @@ impl AgentBuilder {
 
         if let Some(ref exec) = self.execution {
             builder = builder.with_snapshot_from_execution(exec);
+        }
+
+        // Wire squeez compressor if configured.
+        //
+        // This requires async access to the plugin registry to load the squeez
+        // model, which is why it lives here in `AgentBuilder::build()` (async)
+        // rather than in `AgentConfigBuilder::compressor_from_strategy()` (sync).
+        if let Some(ref exec) = self.execution {
+            if let ToolOutputStrategy::Squeez(ref squeez_cfg) = exec.tool_output.strategy {
+                let factory = plugin_registry
+                    .get(&squeez_cfg.provider)
+                    .await
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Squeez strategy requires provider '{}' but it is not \
+                             available in the plugin registry",
+                            squeez_cfg.provider,
+                        )
+                    })?;
+
+                let provider_config = serde_json::json!({
+                    "model": squeez_cfg.model,
+                    "system": [crate::tools::compressor_squeez::SQUEEZ_SYSTEM_PROMPT],
+                    "max_tokens": 1024,
+                    "n_ctx": 8192,
+                    "n_gpu_layers": 99,
+                    "temperature": 0.1,
+                    "enable_thinking": false,
+                    "log": "off",
+                });
+
+                let llm_provider: Arc<dyn querymt::LLMProvider> = Arc::from(
+                    factory
+                        .from_config(&provider_config.to_string())
+                        .map_err(|e| {
+                            anyhow!(
+                                "Failed to load squeez model '{}' via provider '{}': {e}",
+                                squeez_cfg.model,
+                                squeez_cfg.provider,
+                            )
+                        })?,
+                );
+                let chat_provider: Arc<dyn querymt::chat::ChatProvider> = llm_provider;
+
+                let fallback = Arc::new(
+                    crate::tools::compressor_truncation::TruncationCompressor::new(
+                        exec.tool_output.clone(),
+                    ),
+                );
+
+                let compressor_config = crate::tools::compressor_squeez::SqueezCompressorConfig {
+                    min_lines: squeez_cfg.min_lines,
+                    min_bytes: squeez_cfg.min_bytes,
+                    max_input_chars: squeez_cfg.max_input_chars,
+                };
+
+                let compressor = Arc::new(crate::tools::compressor_squeez::SqueezCompressor::new(
+                    chat_provider,
+                    fallback,
+                    compressor_config,
+                ));
+
+                builder = builder.with_tool_output_compressor(compressor);
+
+                log::info!(
+                    "Squeez compressor active (model={}, provider={})",
+                    squeez_cfg.model,
+                    squeez_cfg.provider,
+                );
+            }
         }
 
         // Build initial config for middleware factories (temporary handle)

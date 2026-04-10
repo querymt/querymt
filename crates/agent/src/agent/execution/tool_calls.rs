@@ -258,13 +258,9 @@ pub(super) async fn execute_tool_call(
     span.record("tool_source", tool_source);
     span.record("is_error", is_error);
 
-    // Apply Layer 1 truncation to text content blocks.
+    // Apply Layer 1 compression to text content blocks.
     let result_blocks = if !is_error {
-        use crate::tools::builtins::helpers::{
-            TruncationDirection, format_truncation_message_with_overflow, save_overflow_output,
-            truncate_output,
-        };
-        let tc = &config.execution_policy.tool_output;
+        use crate::tools::compressor::CompressionContext;
 
         let raw_text: String = raw_result_blocks
             .iter()
@@ -272,42 +268,30 @@ pub(super) async fn execute_tool_call(
             .collect::<Vec<_>>()
             .join("\n");
 
-        let truncation = truncate_output(
-            &raw_text,
-            tc.max_lines,
-            tc.max_bytes,
-            TruncationDirection::Head,
-        );
+        let tool_hint = config
+            .tool_registry
+            .find(&call.function.name)
+            .and_then(|t| t.truncation_hint());
 
-        if truncation.was_truncated {
-            let overflow = save_overflow_output(
-                &raw_text,
-                &tc.overflow_storage,
-                &exec_ctx.session_id,
-                &call.id,
-                None,
-            );
+        let ctx = CompressionContext {
+            tool_name: &call.function.name,
+            tool_arguments: &call.function.arguments,
+            tool_call_id: &call.id,
+            session_id: &exec_ctx.session_id,
+            tool_hint,
+        };
 
-            let tool_hint = config
-                .tool_registry
-                .find(&call.function.name)
-                .and_then(|t| t.truncation_hint());
+        let compression = config
+            .tool_output_compressor
+            .compress(&raw_text, &ctx)
+            .await;
 
-            let suffix = format_truncation_message_with_overflow(
-                &truncation,
-                TruncationDirection::Head,
-                Some(&overflow),
-                tool_hint,
-            );
-
+        if compression.was_compressed {
             let mut blocks: Vec<Content> = raw_result_blocks
                 .into_iter()
                 .filter(|b| b.as_text().is_none())
                 .collect();
-            blocks.insert(
-                0,
-                Content::text(format!("{}{}", truncation.content, suffix)),
-            );
+            blocks.extend(compression.blocks);
             blocks
         } else {
             raw_result_blocks

@@ -103,6 +103,13 @@ pub struct ToolOutputConfig {
     /// Where to save full output when truncated
     #[serde(default)]
     pub overflow_storage: OverflowStorage,
+
+    /// Compression strategy for tool output.
+    ///
+    /// - `truncation` (default): blind head/tail truncation.
+    /// - `squeez`: LLM-powered intelligent extraction via a squeez model.
+    #[serde(default)]
+    pub strategy: ToolOutputStrategy,
 }
 
 impl Default for ToolOutputConfig {
@@ -111,8 +118,89 @@ impl Default for ToolOutputConfig {
             max_lines: DEFAULT_MAX_LINES,
             max_bytes: DEFAULT_MAX_BYTES,
             overflow_storage: OverflowStorage::default(),
+            strategy: ToolOutputStrategy::default(),
         }
     }
+}
+
+/// Which compression strategy to use for Layer 1 tool output processing.
+///
+/// ```toml
+/// # Default — blind truncation:
+/// [agent.execution.tool_output]
+/// max_lines = 2000
+///
+/// # Intelligent extraction via squeez:
+/// [agent.execution.tool_output]
+/// max_lines = 2000
+///
+/// [agent.execution.tool_output.strategy]
+/// kind = "squeez"
+/// model = "/path/to/squeez-2b-Q4_K_M.gguf"
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolOutputStrategy {
+    /// Blind head/tail truncation (current default behaviour).
+    Truncation,
+    /// LLM-powered intelligent extraction using a squeez model.
+    Squeez(SqueezConfig),
+}
+
+impl Default for ToolOutputStrategy {
+    fn default() -> Self {
+        Self::Truncation
+    }
+}
+
+/// Configuration for the squeez compression strategy.
+///
+/// The squeez model is loaded via the provider specified in `provider`
+/// (default: `llama_cpp`). Its system prompt is set automatically.
+///
+/// ```toml
+/// [agent.execution.tool_output.strategy]
+/// kind = "squeez"
+/// model = "mradermacher/squeez-2b-GGUF:Q4_K_M"
+/// # provider = "llama_cpp"
+/// # min_lines = 100
+/// # min_bytes = 4096
+/// # max_input_chars = 60000
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SqueezConfig {
+    /// Model path or Hugging Face reference.
+    pub model: String,
+
+    /// Provider to use for the squeez model (default: `"llama_cpp"`).
+    #[serde(default = "default_squeez_provider")]
+    pub provider: String,
+
+    /// Minimum output lines before squeez kicks in (default: 100).
+    #[serde(default = "default_squeez_min_lines")]
+    pub min_lines: usize,
+
+    /// Minimum output bytes before squeez kicks in (default: 4096).
+    #[serde(default = "default_squeez_min_bytes")]
+    pub min_bytes: usize,
+
+    /// Maximum input characters sent to the squeez model (default: 60 000).
+    #[serde(default = "default_squeez_max_input_chars")]
+    pub max_input_chars: usize,
+}
+
+fn default_squeez_provider() -> String {
+    "llama_cpp".to_string()
+}
+fn default_squeez_min_lines() -> usize {
+    100
+}
+fn default_squeez_min_bytes() -> usize {
+    4096
+}
+fn default_squeez_max_input_chars() -> usize {
+    60_000
 }
 
 /// Configuration for pruning (Layer 2) - runs after every turn

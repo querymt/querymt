@@ -14,6 +14,7 @@ use crate::events::{AgentEventKind, DurableEvent};
 use crate::index::WorkspaceIndexManagerActor;
 use crate::middleware::{CompositeDriver, MiddlewareDriver};
 use crate::session::compaction::SessionCompaction;
+use crate::tools::compressor::ToolOutputCompressor;
 
 use crate::session::provider::SessionProvider;
 use crate::session::store::SessionExecutionConfig;
@@ -69,6 +70,8 @@ pub struct AgentConfig {
     pub delegation_cancel_grace_secs: u64,
     /// Grouped execution policy: tool output, pruning, compaction, rate limit.
     pub execution_policy: RuntimeExecutionPolicy,
+    /// Layer 1 tool output compressor (truncation or squeez, selected via config).
+    pub tool_output_compressor: Arc<dyn ToolOutputCompressor>,
     pub compaction: SessionCompaction,
     pub snapshot_backend: Option<Arc<dyn crate::snapshot::SnapshotBackend>>,
     pub snapshot_gc_config: crate::snapshot::GcConfig,
