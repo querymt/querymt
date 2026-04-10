@@ -5182,54 +5182,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "grep"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "309217bc53e2c691c314389c7fa91f9cd1a998cda19e25544ea47d94103880c3"
-dependencies = [
- "grep-cli",
- "grep-matcher",
- "grep-printer",
- "grep-regex",
- "grep-searcher",
-]
-
-[[package]]
-name = "grep-cli"
-version = "0.1.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf32d263c5d5cc2a23ce587097f5ddafdb188492ba2e6fb638eaccdc22453631"
-dependencies = [
- "bstr",
- "globset",
- "libc",
- "log",
- "termcolor",
- "winapi-util",
-]
-
-[[package]]
 name = "grep-matcher"
 version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36d7b71093325ab22d780b40d7df3066ae4aebb518ba719d38c697a8228a8023"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "grep-printer"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd76035e87871f51c1ee5b793e32122b3ccf9c692662d9622ef1686ff5321acb"
-dependencies = [
- "bstr",
- "grep-matcher",
- "grep-searcher",
- "log",
- "serde",
- "serde_json",
- "termcolor",
 ]
 
 [[package]]
@@ -11016,7 +10974,6 @@ dependencies = [
  "gix",
  "glob",
  "gray_matter",
- "grep",
  "grep-regex",
  "grep-searcher",
  "hex",
@@ -11039,7 +10996,6 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "patchkit",
- "pathdiff",
  "qrcode",
  "querymt",
  "querymt-provider-common",
@@ -11055,7 +11011,6 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
- "similar",
  "similarity-core",
  "similarity-py",
  "similarity-rs",
@@ -13023,15 +12978,6 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
-
-[[package]]
-name = "similar"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26d0b06eba54f0ca0770f970a3e89823e766ca638dd940f8469fa0fa50c75396"
-dependencies = [
- "bstr",
-]
 
 [[package]]
 name = "similarity-core"
