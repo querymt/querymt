@@ -5,16 +5,10 @@ $QmtuiRepo = "querymt/qmtui"
 $Channel = if ($env:QMT_CHANNEL -eq "nightly") { "nightly" } else { "latest" }
 $InstallDir = if ($env:QMT_INSTALL_DIR) { $env:QMT_INSTALL_DIR } else { Join-Path $env:USERPROFILE ".local\bin" }
 
-# Try .NET RuntimeInformation first (PowerShell 7+), fall back to
-# PROCESSOR_ARCHITECTURE env var (PowerShell 5.1 / .NET Framework).
-try {
-    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
-} catch {
-    $arch = $env:PROCESSOR_ARCHITECTURE
-}
+$arch = $env:PROCESSOR_ARCHITECTURE
 switch ($arch) {
-    { $_ -in "X64", "AMD64" }   { $Target = "x86_64-pc-windows-msvc" }
-    { $_ -in "Arm64", "ARM64" } { $Target = "aarch64-pc-windows-msvc" }
+    "AMD64" { $Target = "x86_64-pc-windows-msvc" }
+    "ARM64" { $Target = "aarch64-pc-windows-msvc" }
     default { throw "Unsupported Windows architecture: $arch" }
 }
 
