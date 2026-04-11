@@ -203,10 +203,12 @@ impl ClientHandler for McpClientHandler {
                 Ok(response) => Ok(CreateElicitationResult {
                     action: response.action.into(),
                     content: response.content,
+                    meta: None,
                 }),
                 Err(_) => Ok(CreateElicitationResult {
                     action: rmcp::model::ElicitationAction::Cancel,
                     content: None,
+                    meta: None,
                 }),
             }
         }
