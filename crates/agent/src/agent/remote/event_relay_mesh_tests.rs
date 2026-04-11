@@ -139,12 +139,12 @@ mod event_relay_mesh_tests {
             "s-f2".to_string(),
         );
 
-        for i in 1u64..=5 {
+        for i in 1i64..=5 {
             source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
                 event_id: format!("e-f2-{}", i),
                 stream_seq: i,
                 session_id: "s-f2".into(),
-                timestamp: i as i64 * 100,
+                timestamp: i * 100,
                 origin: EventOrigin::Local,
                 source_node: None,
                 kind: AgentEventKind::SessionCreated,
@@ -188,7 +188,7 @@ mod event_relay_mesh_tests {
         let mut rx = event_sink.fanout().subscribe();
 
         // Send 3 events directly to the relay's local actor ref (no DHT needed).
-        for i in 1u64..=3 {
+        for i in 1i64..=3 {
             _relay_ref
                 .tell(RelayedEvent {
                     event: AgentEvent {
@@ -287,7 +287,7 @@ mod event_relay_mesh_tests {
             f.config.event_sink.fanout().publish(EventEnvelope::Durable(
                 crate::events::DurableEvent {
                     event_id: format!("e-f4-{attempt}"),
-                    stream_seq: attempt as u64,
+                    stream_seq: attempt as i64,
                     session_id: session_id.clone(),
                     timestamp: 100,
                     origin: EventOrigin::Local,

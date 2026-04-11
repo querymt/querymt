@@ -460,7 +460,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
     async fn stats(&self, scope: &str) -> Result<KnowledgeStats, KnowledgeError> {
         let scope = scope.to_string();
         self.run_blocking(move |conn| {
-            let total_entries: u64 = conn
+            let total_entries: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM knowledge_entries WHERE scope = ?",
                     params![scope],
@@ -468,7 +468,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                 )
                 .map_err(KnowledgeError::from)?;
 
-            let unconsolidated_entries: u64 = conn
+            let unconsolidated_entries: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM knowledge_entries \
                      WHERE scope = ? AND consolidated_at IS NULL",
@@ -477,7 +477,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                 )
                 .map_err(KnowledgeError::from)?;
 
-            let total_consolidations: u64 = conn
+            let total_consolidations: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM knowledge_consolidations WHERE scope = ?",
                     params![scope],
@@ -522,8 +522,8 @@ impl KnowledgeStore for SqliteKnowledgeStore {
 
         self.run_blocking(move |conn| {
             let tx = conn.transaction().map_err(KnowledgeError::from)?;
-            let mut archived: u64 = 0;
-            let mut deleted: u64 = 0;
+            let mut archived: i64 = 0;
+            let mut deleted: i64 = 0;
 
             // Age-based retention
             if let Some(max_age_days) = policy.max_age_days {
@@ -539,7 +539,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                             params![scope, cutoff_str],
                         )
                         .map_err(KnowledgeError::from)?;
-                    archived += count as u64;
+                    archived += count as i64;
                 } else {
                     // Hard delete old entries
                     let count = tx
@@ -549,13 +549,13 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                             params![scope, cutoff_str],
                         )
                         .map_err(KnowledgeError::from)?;
-                    deleted += count as u64;
+                    deleted += count as i64;
                 }
             }
 
             // Count-based retention
             if let Some(max_entries) = policy.max_entries {
-                let current_count: u64 = tx
+                let current_count: i64 = tx
                     .query_row(
                         "SELECT COUNT(*) FROM knowledge_entries WHERE scope = ?",
                         params![scope],
@@ -577,10 +577,10 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                                      WHERE scope = ? \
                                      ORDER BY created_at ASC LIMIT ?
                                  )",
-                                params![scope, scope, excess as i64],
+                                params![scope, scope, excess],
                             )
                             .map_err(KnowledgeError::from)?;
-                        archived += count as u64;
+                        archived += count as i64;
                     } else {
                         // Hard delete the oldest entries
                         let count = tx
@@ -591,10 +591,10 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                                      WHERE scope = ? \
                                      ORDER BY created_at ASC LIMIT ?
                                  )",
-                                params![scope, scope, excess as i64],
+                                params![scope, scope, excess],
                             )
                             .map_err(KnowledgeError::from)?;
-                        deleted += count as u64;
+                        deleted += count as i64;
                     }
                 }
             }

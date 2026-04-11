@@ -117,14 +117,14 @@ pub trait EventJournal: Send + Sync {
     async fn load_session_stream(
         &self,
         session_id: &str,
-        after_seq: Option<u64>,
+        after_seq: Option<i64>,
         limit: Option<usize>,
     ) -> SessionResult<Vec<DurableEvent>>;
 
     /// Load events across all sessions (global stream), after a given sequence.
     async fn load_global_stream(
         &self,
-        after_seq: Option<u64>,
+        after_seq: Option<i64>,
         limit: Option<usize>,
     ) -> SessionResult<Vec<DurableEvent>>;
 
@@ -137,7 +137,7 @@ pub trait EventJournal: Send + Sync {
     async fn delete_session_events_from(
         &self,
         session_id: &str,
-        from_seq: u64,
+        from_seq: i64,
     ) -> SessionResult<usize>;
 }
 

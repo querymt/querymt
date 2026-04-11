@@ -116,7 +116,7 @@ impl<'de> Deserialize<'de> for EventOrigin {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
     #[typeshare(serialized_as = "number")]
-    pub seq: u64,
+    pub seq: i64,
     #[typeshare(serialized_as = "number")]
     pub timestamp: i64,
     pub session_id: String,
@@ -493,7 +493,7 @@ pub enum Durability {
 pub struct DurableEvent {
     pub event_id: String,
     #[typeshare(serialized_as = "number")]
-    pub stream_seq: u64,
+    pub stream_seq: i64,
     pub session_id: String,
     #[typeshare(serialized_as = "number")]
     pub timestamp: i64,
@@ -600,7 +600,7 @@ impl EventEnvelope {
     }
 
     /// Sequence number: `stream_seq` for durable events, `0` for ephemeral.
-    pub fn seq(&self) -> u64 {
+    pub fn seq(&self) -> i64 {
         match self {
             EventEnvelope::Durable(e) => e.stream_seq,
             EventEnvelope::Ephemeral(_) => 0,

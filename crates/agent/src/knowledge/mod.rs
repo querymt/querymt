@@ -128,9 +128,9 @@ pub struct KnowledgeQueryResult {
 /// Statistics for a knowledge scope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnowledgeStats {
-    pub total_entries: u64,
-    pub unconsolidated_entries: u64,
-    pub total_consolidations: u64,
+    pub total_entries: i64,
+    pub unconsolidated_entries: i64,
+    pub total_consolidations: i64,
     #[serde(
         default,
         with = "time::serde::rfc3339::option",
@@ -226,7 +226,7 @@ pub struct RetentionPolicy {
     /// Delete entries older than this many days.
     pub max_age_days: Option<u32>,
     /// Keep at most this many entries per scope.
-    pub max_entries: Option<u64>,
+    pub max_entries: Option<i64>,
     /// If true, archive raw_text (set to NULL) instead of deleting entries.
     #[serde(default)]
     pub archive_raw_text: bool,
@@ -236,9 +236,9 @@ pub struct RetentionPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetentionResult {
     /// Number of entries archived (raw_text set to NULL).
-    pub archived: u64,
+    pub archived: i64,
     /// Number of entries deleted.
-    pub deleted: u64,
+    pub deleted: i64,
 }
 
 // ─── KnowledgeStore Trait ────────────────────────────────────────────────────

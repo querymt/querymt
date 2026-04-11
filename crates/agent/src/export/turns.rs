@@ -274,7 +274,7 @@ mod tests {
     use super::*;
     use crate::events::{EventOrigin, ExecutionMetrics};
 
-    fn make_event(seq: u64, ts: i64, kind: AgentEventKind) -> AgentEvent {
+    fn make_event(seq: i64, ts: i64, kind: AgentEventKind) -> AgentEvent {
         AgentEvent {
             seq,
             timestamp: ts,

@@ -35,7 +35,7 @@ impl EventJournal for SqliteStorage {
             let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
 
             // Atomically allocate the next stream_seq and insert the event.
-            let stream_seq: u64 = conn.query_row(
+            let stream_seq: i64 = conn.query_row(
                 "UPDATE event_journal_seq SET next_seq = next_seq + 1 WHERE id = 1 RETURNING next_seq - 1",
                 [],
                 |row| row.get(0),
@@ -73,7 +73,7 @@ impl EventJournal for SqliteStorage {
     async fn load_session_stream(
         &self,
         session_id: &str,
-        after_seq: Option<u64>,
+        after_seq: Option<i64>,
         limit: Option<usize>,
     ) -> SessionResult<Vec<DurableEvent>> {
         let session_id = session_id.to_string();
@@ -105,7 +105,7 @@ impl EventJournal for SqliteStorage {
 
     async fn load_global_stream(
         &self,
-        after_seq: Option<u64>,
+        after_seq: Option<i64>,
         limit: Option<usize>,
     ) -> SessionResult<Vec<DurableEvent>> {
         let conn_arc = self.conn.clone();
@@ -137,7 +137,7 @@ impl EventJournal for SqliteStorage {
     async fn delete_session_events_from(
         &self,
         session_id: &str,
-        from_seq: u64,
+        from_seq: i64,
     ) -> SessionResult<usize> {
         let session_id = session_id.to_string();
         let conn_arc = self.conn.clone();
@@ -158,7 +158,7 @@ impl EventJournal for SqliteStorage {
 
 fn parse_journal_row(row: &rusqlite::Row) -> Result<DurableEvent, rusqlite::Error> {
     let event_id: String = row.get(0)?;
-    let stream_seq: u64 = row.get(1)?;
+    let stream_seq: i64 = row.get(1)?;
     let session_id: String = row.get(2)?;
     let timestamp: i64 = row.get(3)?;
     let origin_str: String = row.get(4)?;

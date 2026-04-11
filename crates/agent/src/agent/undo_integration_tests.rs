@@ -508,7 +508,7 @@ async fn append_prompt_event(
     journal: &dyn EventJournal,
     session_id: &str,
     message_id: &str,
-) -> u64 {
+) -> i64 {
     journal
         .append_durable(&NewDurableEvent {
             session_id: session_id.to_string(),
@@ -525,7 +525,7 @@ async fn append_prompt_event(
 }
 
 /// Helper: append a generic non-prompt event and return its stream_seq.
-async fn append_generic_event(journal: &dyn EventJournal, session_id: &str) -> u64 {
+async fn append_generic_event(journal: &dyn EventJournal, session_id: &str) -> i64 {
     journal
         .append_durable(&NewDurableEvent {
             session_id: session_id.to_string(),
