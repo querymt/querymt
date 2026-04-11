@@ -439,7 +439,7 @@ impl SessionStore for SqliteStorage {
             // UI telemetry before the fork point is intentionally partial.
             for (_event_id, timestamp, origin, source_node, kind, payload_json) in conversational_events_to_copy {
                 let new_event_id = Uuid::now_v7().to_string();
-                let stream_seq: u64 = tx.query_row(
+                let stream_seq: i64 = tx.query_row(
                     "UPDATE event_journal_seq SET next_seq = next_seq + 1 WHERE id = 1 RETURNING next_seq - 1",
                     [],
                     |row| row.get(0),

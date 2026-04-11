@@ -392,7 +392,7 @@ mod tests {
             async fn load_session_stream(
                 &self,
                 _session_id: &str,
-                _after_seq: Option<u64>,
+                _after_seq: Option<i64>,
                 _limit: Option<usize>,
             ) -> SessionResult<Vec<DurableEvent>> {
                 Ok(vec![])
@@ -400,7 +400,7 @@ mod tests {
 
             async fn load_global_stream(
                 &self,
-                _after_seq: Option<u64>,
+                _after_seq: Option<i64>,
                 _limit: Option<usize>,
             ) -> SessionResult<Vec<DurableEvent>> {
                 Ok(vec![])
@@ -409,7 +409,7 @@ mod tests {
             async fn delete_session_events_from(
                 &self,
                 _session_id: &str,
-                _from_seq: u64,
+                _from_seq: i64,
             ) -> SessionResult<usize> {
                 Ok(0)
             }

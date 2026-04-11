@@ -63,12 +63,12 @@ async fn load_session_includes_cursor_seq_from_audit_tail() -> Result<()> {
         .expect("audit.events should be an array");
     let replay_tail = events
         .iter()
-        .filter_map(|e| e["seq"].as_u64())
+        .filter_map(|e| e["seq"].as_i64())
         .max()
         .expect("expected replayed events with seq");
 
     // session_loaded exposes cursor.local_seq at replay tail.
-    assert_eq!(data["cursor"]["local_seq"].as_u64(), Some(replay_tail));
+    assert_eq!(data["cursor"]["local_seq"].as_i64(), Some(replay_tail));
 
     Ok(())
 }
@@ -102,12 +102,12 @@ async fn subscribe_session_includes_cursor_seq_from_replay_tail() -> Result<()> 
     // EventEnvelope is adjacently tagged: durable events have stream_seq under ["data"]["stream_seq"]
     let replay_tail = events
         .iter()
-        .filter_map(|e| e["data"]["stream_seq"].as_u64())
+        .filter_map(|e| e["data"]["stream_seq"].as_i64())
         .max()
         .unwrap_or(0);
 
     // session_events exposes cursor.local_seq at replay tail.
-    assert_eq!(data["cursor"]["local_seq"].as_u64(), Some(replay_tail));
+    assert_eq!(data["cursor"]["local_seq"].as_i64(), Some(replay_tail));
 
     Ok(())
 }
@@ -221,7 +221,7 @@ async fn forwarder_drops_event_when_seq_is_at_or_below_cursor() -> Result<()> {
     assert_eq!(forwarded_msg["data"]["session_id"], session_id);
     // EventEnvelope is adjacently tagged: durable event fields are under ["data"]["event"]["data"]
     assert_eq!(
-        forwarded_msg["data"]["event"]["data"]["stream_seq"].as_u64(),
+        forwarded_msg["data"]["event"]["data"]["stream_seq"].as_i64(),
         Some(11)
     );
 

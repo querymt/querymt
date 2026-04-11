@@ -538,10 +538,10 @@ pub struct ConsolidationInfo {
 pub struct StreamCursor {
     #[serde(default)]
     #[typeshare(serialized_as = "number")]
-    pub local_seq: u64,
+    pub local_seq: i64,
     #[serde(default)]
     #[typeshare(serialized_as = "Record<string, number>")]
-    pub remote_seq_by_source: HashMap<String, u64>,
+    pub remote_seq_by_source: HashMap<String, i64>,
 }
 
 /// Mesh invite DTO for the UI.
@@ -943,11 +943,11 @@ pub enum UiServerMessage {
     #[serde(rename = "knowledge_stats_result")]
     KnowledgeStatsResult {
         #[typeshare(serialized_as = "number")]
-        total_entries: u64,
+        total_entries: i64,
         #[typeshare(serialized_as = "number")]
-        unconsolidated_entries: u64,
+        unconsolidated_entries: i64,
         #[typeshare(serialized_as = "number")]
-        total_consolidations: u64,
+        total_consolidations: i64,
         latest_entry_at: Option<String>,
         latest_consolidation_at: Option<String>,
     },
