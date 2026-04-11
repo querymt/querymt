@@ -51,7 +51,7 @@ serde_json.workspace = true
 schemars.workspace = true
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "gzip", "brotli", "deflate"] }
-rusqlite = { version = "0.37", features = ["bundled", "uuid", "time"] }
+rusqlite = { version = "0.39", features = ["bundled", "uuid", "time"] }
 time = { version = "0.3", features = ["serde", "formatting", "macros", "local-offset"] }
 uuid = { version = "1.18", features = ["v4", "v7"] }
 rapidhash = "4.2"
