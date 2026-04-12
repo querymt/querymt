@@ -115,11 +115,37 @@ repo_for_binary() {
     esac
 }
 
+# Cache release metadata per repo to avoid redundant API calls (rate-limit friendly).
+# We use temp files because fetch_release is called inside $() subshells,
+# where variable assignments would be lost.
+RELEASE_CACHE_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t qmt-release-cache)"
+
+fetch_release() {
+    repo="$1"
+    api_url="$(release_api_url "$repo")"
+    cache_file="$RELEASE_CACHE_DIR/$(printf '%s' "$repo" | tr '/' '_')"
+
+    # Return cached response if we already fetched this repo.
+    if [ -s "$cache_file" ]; then
+        cat "$cache_file"
+        return
+    fi
+
+    echo "Fetching release metadata from $repo ($CHANNEL)..." >&2
+    json="$(fetch_text "$api_url")" || {
+        echo "Failed to fetch release from $api_url" >&2
+        exit 1
+    }
+
+    printf '%s' "$json" > "$cache_file"
+    printf '%s' "$json"
+}
+
 asset_url_for() {
     binary="$1"
     repo="$(repo_for_binary "$binary")"
 
-    json="$(fetch_text "$(release_api_url "$repo")")"
+    json="$(fetch_release "$repo")"
     urls="$(printf '%s' "$json" | grep -o '"browser_download_url":[[:space:]]*"[^"]*"' | sed 's/^"browser_download_url":[[:space:]]*"//; s/"$//')"
 
     if [ "$CHANNEL" = "nightly" ]; then
@@ -138,7 +164,7 @@ asset_url_for() {
 }
 
 TMP_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t qmt-install)"
-trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
+trap 'rm -rf "$TMP_DIR" "$RELEASE_CACHE_DIR"' EXIT INT TERM
 
 mkdir -p "$INSTALL_DIR"
 

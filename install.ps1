@@ -28,9 +28,25 @@ function Get-ReleaseApiUrl([string]$Repo) {
     return "https://api.github.com/repos/$Repo/releases/latest"
 }
 
+# Cache release metadata per repo to avoid redundant API calls (rate-limit friendly).
+$script:ReleaseCache = @{}
+
+function Get-Release([string]$Repo) {
+    if (-not $script:ReleaseCache.ContainsKey($Repo)) {
+        $apiUrl = Get-ReleaseApiUrl -Repo $Repo
+        Write-Host "Fetching release metadata from $Repo ($Channel)..."
+        try {
+            $script:ReleaseCache[$Repo] = Invoke-RestMethod -Uri $apiUrl
+        } catch {
+            throw "Failed to fetch release from $apiUrl -- $($_.Exception.Message)"
+        }
+    }
+    return $script:ReleaseCache[$Repo]
+}
+
 function Get-AssetUrl([string]$Binary) {
     $repo = Get-RepoForBinary -Binary $Binary
-    $release = Invoke-RestMethod -Uri (Get-ReleaseApiUrl -Repo $repo)
+    $release = Get-Release -Repo $repo
     if ($Channel -eq "nightly") {
         $regex = "^$Binary-nightly-.*-$Target\.zip$"
     } else {
