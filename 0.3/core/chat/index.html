@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="zensical-0.0.32">
     
     
       
@@ -29,10 +29,15 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      <link rel="stylesheet" href="../../assets/stylesheets/modern/main.53a7feaf.min.css">
+      
+        
+          
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/modern/palette.dfe2e883.min.css">
       
       
 
@@ -46,12 +51,12 @@
         
         
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
-        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,500,500i,700,700i%7CJetBrains+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Inter";--md-code-font:"JetBrains Mono"}</style>
       
     
     
-    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,t)=>(e<<5)-e+t.charCodeAt(0)),0),__md_get=(e,t=localStorage,a=__md_scope)=>JSON.parse(t.getItem(a.pathname+"."+e)),__md_set=(e,t,a=localStorage,_=__md_scope)=>{try{a.setItem(_.pathname+"."+e,JSON.stringify(t))}catch(e){}},document.documentElement.setAttribute("data-platform",navigator.platform)</script>
     
       
 
@@ -72,7 +77,7 @@
     
     <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
     <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
-    <label class="md-overlay" for="__drawer"></label>
+    <label class="md-overlay" for="__drawer" aria-label="Navigation"></label>
     <div data-md-component="skip">
       
         
@@ -97,12 +102,12 @@
     <a href="../.." title="QueryMate" class="md-header__button md-logo" aria-label="QueryMate" data-md-component="logo">
       
   
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-book-open" viewBox="0 0 24 24"><path d="M12 7v14M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/></svg>
 
     </a>
-    <label class="md-header__button md-icon" for="__drawer">
+    <label class="md-header__button md-icon" for="__drawer" aria-label="Navigation">
       
-      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-menu" viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h16"/></svg>
     </label>
     <div class="md-header__title" data-md-component="header-title">
       <div class="md-header__ellipsis">
@@ -164,59 +169,30 @@
     
       
       
-        <label class="md-header__button md-icon" for="__search">
+        <label class="md-header__button md-icon" for="__search" aria-label="Search">
           
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-search" viewBox="0 0 24 24"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></svg>
         </label>
-        <div class="md-search" data-md-component="search" role="dialog">
-  <label class="md-search__overlay" for="__search"></label>
-  <div class="md-search__inner" role="search">
-    <form class="md-search__form" name="search">
-      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
-      <label class="md-search__icon md-icon" for="__search">
-        
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
-        
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
-      </label>
-      <nav class="md-search__options" aria-label="Search">
-        
-        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
-          
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
-        </button>
-      </nav>
-      
-        <div class="md-search__suggest" data-md-component="search-suggest"></div>
-      
-    </form>
-    <div class="md-search__output">
-      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
-        <div class="md-search-result" data-md-component="search-result">
-          <div class="md-search-result__meta">
-            Initializing search
-          </div>
-          <ol class="md-search-result__list" role="presentation"></ol>
-        </div>
-      </div>
-    </div>
-  </div>
+        <div class="md-search" data-md-component="search" role="dialog" aria-label="Search">
+  <button type="button" class="md-search__button">
+    Search
+  </button>
 </div>
       
     
-    
-      <div class="md-header__source">
+    <div class="md-header__source">
+      
         <a href="https://github.com/querymt/querymt" title="Go to repository" class="md-source" data-md-component="source">
   <div class="md-source__icon md-icon">
     
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2026 Fonticons, Inc.--><path fill="currentColor" d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
   </div>
   <div class="md-source__repository">
     GitHub
   </div>
 </a>
-      </div>
-    
+      
+    </div>
   </nav>
   
 </header>
@@ -240,9 +216,6 @@
       <a href="../.." class="md-tabs__link">
         
   
-  
-    
-  
   Home
 
       </a>
@@ -259,9 +232,6 @@
       <a href="../../architecture/" class="md-tabs__link">
         
   
-  
-    
-  
   Architecture
 
       </a>
@@ -277,9 +247,6 @@
     <li class="md-tabs__item">
       <a href="../../telemetry/" class="md-tabs__link">
         
-  
-  
-    
   
   Telemetry
 
@@ -301,7 +268,6 @@
         <a href="../" class="md-tabs__link">
           
   
-  
   Core Concepts
 
         </a>
@@ -321,7 +287,6 @@
         <a href="../../plugins/" class="md-tabs__link">
           
   
-  
   Plugins
 
         </a>
@@ -338,9 +303,6 @@
     <li class="md-tabs__item">
       <a href="../../mcp/" class="md-tabs__link">
         
-  
-  
-    
   
   MCP Integration
 
@@ -360,7 +322,6 @@
         <a href="../../agent/" class="md-tabs__link">
           
   
-  
   Agent
 
         </a>
@@ -378,9 +339,6 @@
       <a href="../../cli/" class="md-tabs__link">
         
   
-  
-    
-  
   CLI
 
       </a>
@@ -396,9 +354,6 @@
     <li class="md-tabs__item">
       <a href="https://log.query.mt" class="md-tabs__link">
         
-  
-  
-    
   
   Blog
 
@@ -434,7 +389,7 @@
     <a href="../.." title="QueryMate" class="md-nav__button md-logo" aria-label="QueryMate" data-md-component="logo">
       
   
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-book-open" viewBox="0 0 24 24"><path d="M12 7v14M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/></svg>
 
     </a>
     QueryMate
@@ -444,7 +399,7 @@
       <a href="https://github.com/querymt/querymt" title="Go to repository" class="md-source" data-md-component="source">
   <div class="md-source__icon md-icon">
     
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2026 Fonticons, Inc.--><path fill="currentColor" d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
   </div>
   <div class="md-source__repository">
     GitHub
@@ -686,7 +641,7 @@
   
     <li class="md-nav__item md-nav__item--active">
       
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
       
       
         
@@ -710,7 +665,7 @@
           <span class="md-nav__icon md-icon"></span>
         </label>
       
-      <a href="./" class="md-nav__link md-nav__link--active">
+      <a href="././" class="md-nav__link md-nav__link--active">
         
   
   
@@ -729,7 +684,8 @@
       
         
 
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+
+<nav class="md-nav md-nav--secondary" aria-label="On this page">
   
   
   
@@ -738,7 +694,7 @@
   
     <label class="md-nav__title" for="__toc">
       <span class="md-nav__icon md-icon"></span>
-      Table of contents
+      On this page
     </label>
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
@@ -1528,6 +1484,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../agent/export/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Export & Fine-Tuning
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../agent/api_reference/" class="md-nav__link">
         
   
@@ -1652,8 +1636,6 @@
               <article class="md-content__inner md-typeset">
                 
                   
-
-
   
   
 
@@ -1714,76 +1696,145 @@
 </li>
 </ol>
 <h2 id="example-flow-conceptual">Example Flow (Conceptual)</h2>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt</span><span class="p">::</span><span class="n">chat</span><span class="p">::{</span><span class="n">ChatMessage</span><span class="p">,</span><span class="w"> </span><span class="n">ChatMessageBuilder</span><span class="p">,</span><span class="w"> </span><span class="n">ChatResponse</span><span class="p">,</span><span class="w"> </span><span class="n">MessageType</span><span class="p">,</span><span class="w"> </span><span class="n">Tool</span><span class="p">,</span><span class="w"> </span><span class="n">ToolCall</span><span class="p">};</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt</span><span class="p">::</span><span class="n">LLMProvider</span><span class="p">;</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="k">use</span><span class="w"> </span><span class="n">serde_json</span><span class="p">::</span><span class="n">Value</span><span class="p">;</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="c1">// Assuming &#39;llm_provider&#39; is an instance of Box&lt;dyn LLMProvider&gt; that has tools registered</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="c1">// and &#39;my_tools&#39; is a Vec&lt;Tool&gt; describing them.</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">handle_tool_calling_loop</span><span class="p">(</span>
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">    </span><span class="n">llm_provider</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nb">Box</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">LLMProvider</span><span class="o">&gt;</span><span class="p">,</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="w">    </span><span class="n">initial_messages</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">ChatMessage</span><span class="o">&gt;</span><span class="p">,</span>
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">    </span><span class="n">my_tools</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="p">[</span><span class="n">Tool</span><span class="p">],</span>
-<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">anyhow</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">messages</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">initial_messages</span><span class="p">;</span>
-<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>
-<a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="w">    </span><span class="k">loop</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">response</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">llm_provider</span><span class="p">.</span><span class="n">chat_with_tools</span><span class="p">(</span><span class="o">&amp;</span><span class="n">messages</span><span class="p">,</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">my_tools</span><span class="p">)).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>
-<a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a><span class="w">            </span><span class="c1">// Add the assistant&#39;s response to the history. It might contain text and/or tool calls.</span>
-<a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a><span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">msg_builder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ChatMessage</span><span class="p">::</span><span class="n">assistant</span><span class="p">().</span><span class="n">text</span><span class="p">(</span><span class="n">response</span><span class="p">.</span><span class="n">text</span><span class="p">().</span><span class="n">unwrap_or_default</span><span class="p">());</span>
-<a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a><span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">tool_calls</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">response</span><span class="p">.</span><span class="n">tool_calls</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a><span class="w">                </span><span class="k">for</span><span class="w"> </span><span class="n">tc</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">tool_calls</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a><span class="w">                    </span><span class="kd">let</span><span class="w"> </span><span class="n">args</span><span class="p">:</span><span class="w"> </span><span class="nc">serde_json</span><span class="p">::</span><span class="n">Value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">serde_json</span><span class="p">::</span><span class="n">from_str</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tc</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">arguments</span><span class="p">).</span><span class="n">unwrap_or_default</span><span class="p">();</span>
-<a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a><span class="w">                    </span><span class="n">msg_builder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">msg_builder</span><span class="p">.</span><span class="n">tool_use</span><span class="p">(</span><span class="n">tc</span><span class="p">.</span><span class="n">id</span><span class="p">.</span><span class="n">clone</span><span class="p">(),</span><span class="w"> </span><span class="n">tc</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">name</span><span class="p">.</span><span class="n">clone</span><span class="p">(),</span><span class="w"> </span><span class="n">args</span><span class="p">);</span>
-<a id="__codelineno-0-24" name="__codelineno-0-24" href="#__codelineno-0-24"></a><span class="w">                </span><span class="p">}</span>
-<a id="__codelineno-0-25" name="__codelineno-0-25" href="#__codelineno-0-25"></a><span class="w">            </span><span class="p">}</span>
-<a id="__codelineno-0-26" name="__codelineno-0-26" href="#__codelineno-0-26"></a><span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">thinking</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">response</span><span class="p">.</span><span class="n">thinking</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-27" name="__codelineno-0-27" href="#__codelineno-0-27"></a><span class="w">                </span><span class="n">msg_builder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">msg_builder</span><span class="p">.</span><span class="n">thinking</span><span class="p">(</span><span class="n">thinking</span><span class="p">);</span>
-<a id="__codelineno-0-28" name="__codelineno-0-28" href="#__codelineno-0-28"></a><span class="w">            </span><span class="p">}</span>
-<a id="__codelineno-0-29" name="__codelineno-0-29" href="#__codelineno-0-29"></a><span class="w">            </span><span class="n">messages</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="n">msg_builder</span><span class="p">.</span><span class="n">build</span><span class="p">());</span>
-<a id="__codelineno-0-30" name="__codelineno-0-30" href="#__codelineno-0-30"></a>
-<a id="__codelineno-0-31" name="__codelineno-0-31" href="#__codelineno-0-31"></a><span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">tool_calls</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">response</span><span class="p">.</span><span class="n">tool_calls</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-32" name="__codelineno-0-32" href="#__codelineno-0-32"></a><span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="n">tool_calls</span><span class="p">.</span><span class="n">is_empty</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-33" name="__codelineno-0-33" href="#__codelineno-0-33"></a><span class="w">                </span><span class="c1">// No tool calls, so the text response is the final answer.</span>
-<a id="__codelineno-0-34" name="__codelineno-0-34" href="#__codelineno-0-34"></a><span class="w">                </span><span class="k">return</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(</span><span class="n">response</span><span class="p">.</span><span class="n">text</span><span class="p">().</span><span class="n">unwrap_or_default</span><span class="p">());</span>
-<a id="__codelineno-0-35" name="__codelineno-0-35" href="#__codelineno-0-35"></a><span class="w">            </span><span class="p">}</span>
-<a id="__codelineno-0-36" name="__codelineno-0-36" href="#__codelineno-0-36"></a>
-<a id="__codelineno-0-37" name="__codelineno-0-37" href="#__codelineno-0-37"></a><span class="w">            </span><span class="c1">// The model wants to call one or more tools.</span>
-<a id="__codelineno-0-38" name="__codelineno-0-38" href="#__codelineno-0-38"></a><span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">tool_results</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Vec</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
-<a id="__codelineno-0-39" name="__codelineno-0-39" href="#__codelineno-0-39"></a><span class="w">            </span><span class="k">for</span><span class="w"> </span><span class="n">call</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">tool_calls</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-40" name="__codelineno-0-40" href="#__codelineno-0-40"></a><span class="w">                </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;LLM wants to call tool: {} with args: {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">arguments</span><span class="p">);</span>
-<a id="__codelineno-0-41" name="__codelineno-0-41" href="#__codelineno-0-41"></a>
-<a id="__codelineno-0-42" name="__codelineno-0-42" href="#__codelineno-0-42"></a><span class="w">                </span><span class="c1">// In a real app, you would dispatch to your tool execution logic here.</span>
-<a id="__codelineno-0-43" name="__codelineno-0-43" href="#__codelineno-0-43"></a><span class="w">                </span><span class="c1">// The `LLMProvider` trait has a `call_tool` helper for this.</span>
-<a id="__codelineno-0-44" name="__codelineno-0-44" href="#__codelineno-0-44"></a><span class="w">                </span><span class="kd">let</span><span class="w"> </span><span class="n">args</span><span class="p">:</span><span class="w"> </span><span class="nc">Value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">serde_json</span><span class="p">::</span><span class="n">from_str</span><span class="p">(</span><span class="o">&amp;</span><span class="n">call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">arguments</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-0-45" name="__codelineno-0-45" href="#__codelineno-0-45"></a><span class="w">                </span><span class="kd">let</span><span class="w"> </span><span class="n">result_str</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">llm_provider</span><span class="p">.</span><span class="n">call_tool</span><span class="p">(</span><span class="o">&amp;</span><span class="n">call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">args</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-0-46" name="__codelineno-0-46" href="#__codelineno-0-46"></a>
-<a id="__codelineno-0-47" name="__codelineno-0-47" href="#__codelineno-0-47"></a><span class="w">                </span><span class="c1">// Create a ToolCall struct containing the result.</span>
-<a id="__codelineno-0-48" name="__codelineno-0-48" href="#__codelineno-0-48"></a><span class="w">                </span><span class="c1">// Note: The result is placed in the `arguments` field for transport.</span>
-<a id="__codelineno-0-49" name="__codelineno-0-49" href="#__codelineno-0-49"></a><span class="w">                </span><span class="kd">let</span><span class="w"> </span><span class="n">result_call</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ToolCall</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-50" name="__codelineno-0-50" href="#__codelineno-0-50"></a><span class="w">                    </span><span class="n">id</span><span class="p">:</span><span class="w"> </span><span class="nc">call</span><span class="p">.</span><span class="n">id</span><span class="p">,</span>
-<a id="__codelineno-0-51" name="__codelineno-0-51" href="#__codelineno-0-51"></a><span class="w">                    </span><span class="n">call_type</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;function&quot;</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
-<a id="__codelineno-0-52" name="__codelineno-0-52" href="#__codelineno-0-52"></a><span class="w">                    </span><span class="n">function</span><span class="p">:</span><span class="w"> </span><span class="nc">querymt</span><span class="p">::</span><span class="n">FunctionCall</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-53" name="__codelineno-0-53" href="#__codelineno-0-53"></a><span class="w">                        </span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="nc">call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">name</span><span class="p">,</span>
-<a id="__codelineno-0-54" name="__codelineno-0-54" href="#__codelineno-0-54"></a><span class="w">                        </span><span class="n">arguments</span><span class="p">:</span><span class="w"> </span><span class="nc">result_str</span><span class="p">,</span>
-<a id="__codelineno-0-55" name="__codelineno-0-55" href="#__codelineno-0-55"></a><span class="w">                    </span><span class="p">},</span>
-<a id="__codelineno-0-56" name="__codelineno-0-56" href="#__codelineno-0-56"></a><span class="w">                </span><span class="p">};</span>
-<a id="__codelineno-0-57" name="__codelineno-0-57" href="#__codelineno-0-57"></a><span class="w">                </span><span class="n">tool_results</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="n">result_call</span><span class="p">);</span>
-<a id="__codelineno-0-58" name="__codelineno-0-58" href="#__codelineno-0-58"></a><span class="w">            </span><span class="p">}</span>
-<a id="__codelineno-0-59" name="__codelineno-0-59" href="#__codelineno-0-59"></a>
-<a id="__codelineno-0-60" name="__codelineno-0-60" href="#__codelineno-0-60"></a><span class="w">            </span><span class="c1">// Add the tool results back to the conversation history.</span>
-<a id="__codelineno-0-61" name="__codelineno-0-61" href="#__codelineno-0-61"></a><span class="w">            </span><span class="n">messages</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="n">ChatMessage</span><span class="p">::</span><span class="n">user</span><span class="p">().</span><span class="n">tool_result</span><span class="p">(</span><span class="n">tool_results</span><span class="p">).</span><span class="n">build</span><span class="p">());</span>
-<a id="__codelineno-0-62" name="__codelineno-0-62" href="#__codelineno-0-62"></a><span class="w">            </span><span class="c1">// Loop again to let the model process the tool results.</span>
-<a id="__codelineno-0-63" name="__codelineno-0-63" href="#__codelineno-0-63"></a><span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-64" name="__codelineno-0-64" href="#__codelineno-0-64"></a><span class="w">            </span><span class="c1">// No tool calls in the response, so the text is the final answer.</span>
-<a id="__codelineno-0-65" name="__codelineno-0-65" href="#__codelineno-0-65"></a><span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(</span><span class="n">response</span><span class="p">.</span><span class="n">text</span><span class="p">().</span><span class="n">unwrap_or_default</span><span class="p">());</span>
-<a id="__codelineno-0-66" name="__codelineno-0-66" href="#__codelineno-0-66"></a><span class="w">        </span><span class="p">}</span>
-<a id="__codelineno-0-67" name="__codelineno-0-67" href="#__codelineno-0-67"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-0-68" name="__codelineno-0-68" href="#__codelineno-0-68"></a><span class="p">}</span>
-</code></pre></div>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-0-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-0-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-0-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-0-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-0-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-0-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-0-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-0-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-0-10">10</a></span>
+<span class="normal"><a href="#__codelineno-0-11">11</a></span>
+<span class="normal"><a href="#__codelineno-0-12">12</a></span>
+<span class="normal"><a href="#__codelineno-0-13">13</a></span>
+<span class="normal"><a href="#__codelineno-0-14">14</a></span>
+<span class="normal"><a href="#__codelineno-0-15">15</a></span>
+<span class="normal"><a href="#__codelineno-0-16">16</a></span>
+<span class="normal"><a href="#__codelineno-0-17">17</a></span>
+<span class="normal"><a href="#__codelineno-0-18">18</a></span>
+<span class="normal"><a href="#__codelineno-0-19">19</a></span>
+<span class="normal"><a href="#__codelineno-0-20">20</a></span>
+<span class="normal"><a href="#__codelineno-0-21">21</a></span>
+<span class="normal"><a href="#__codelineno-0-22">22</a></span>
+<span class="normal"><a href="#__codelineno-0-23">23</a></span>
+<span class="normal"><a href="#__codelineno-0-24">24</a></span>
+<span class="normal"><a href="#__codelineno-0-25">25</a></span>
+<span class="normal"><a href="#__codelineno-0-26">26</a></span>
+<span class="normal"><a href="#__codelineno-0-27">27</a></span>
+<span class="normal"><a href="#__codelineno-0-28">28</a></span>
+<span class="normal"><a href="#__codelineno-0-29">29</a></span>
+<span class="normal"><a href="#__codelineno-0-30">30</a></span>
+<span class="normal"><a href="#__codelineno-0-31">31</a></span>
+<span class="normal"><a href="#__codelineno-0-32">32</a></span>
+<span class="normal"><a href="#__codelineno-0-33">33</a></span>
+<span class="normal"><a href="#__codelineno-0-34">34</a></span>
+<span class="normal"><a href="#__codelineno-0-35">35</a></span>
+<span class="normal"><a href="#__codelineno-0-36">36</a></span>
+<span class="normal"><a href="#__codelineno-0-37">37</a></span>
+<span class="normal"><a href="#__codelineno-0-38">38</a></span>
+<span class="normal"><a href="#__codelineno-0-39">39</a></span>
+<span class="normal"><a href="#__codelineno-0-40">40</a></span>
+<span class="normal"><a href="#__codelineno-0-41">41</a></span>
+<span class="normal"><a href="#__codelineno-0-42">42</a></span>
+<span class="normal"><a href="#__codelineno-0-43">43</a></span>
+<span class="normal"><a href="#__codelineno-0-44">44</a></span>
+<span class="normal"><a href="#__codelineno-0-45">45</a></span>
+<span class="normal"><a href="#__codelineno-0-46">46</a></span>
+<span class="normal"><a href="#__codelineno-0-47">47</a></span>
+<span class="normal"><a href="#__codelineno-0-48">48</a></span>
+<span class="normal"><a href="#__codelineno-0-49">49</a></span>
+<span class="normal"><a href="#__codelineno-0-50">50</a></span>
+<span class="normal"><a href="#__codelineno-0-51">51</a></span>
+<span class="normal"><a href="#__codelineno-0-52">52</a></span>
+<span class="normal"><a href="#__codelineno-0-53">53</a></span>
+<span class="normal"><a href="#__codelineno-0-54">54</a></span>
+<span class="normal"><a href="#__codelineno-0-55">55</a></span>
+<span class="normal"><a href="#__codelineno-0-56">56</a></span>
+<span class="normal"><a href="#__codelineno-0-57">57</a></span>
+<span class="normal"><a href="#__codelineno-0-58">58</a></span>
+<span class="normal"><a href="#__codelineno-0-59">59</a></span>
+<span class="normal"><a href="#__codelineno-0-60">60</a></span>
+<span class="normal"><a href="#__codelineno-0-61">61</a></span>
+<span class="normal"><a href="#__codelineno-0-62">62</a></span>
+<span class="normal"><a href="#__codelineno-0-63">63</a></span>
+<span class="normal"><a href="#__codelineno-0-64">64</a></span>
+<span class="normal"><a href="#__codelineno-0-65">65</a></span>
+<span class="normal"><a href="#__codelineno-0-66">66</a></span>
+<span class="normal"><a href="#__codelineno-0-67">67</a></span>
+<span class="normal"><a href="#__codelineno-0-68">68</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt</span><span class="p">::</span><span class="n">chat</span><span class="p">::{</span><span class="n">ChatMessage</span><span class="p">,</span><span class="w"> </span><span class="n">ChatMessageBuilder</span><span class="p">,</span><span class="w"> </span><span class="n">ChatResponse</span><span class="p">,</span><span class="w"> </span><span class="n">MessageType</span><span class="p">,</span><span class="w"> </span><span class="n">Tool</span><span class="p">,</span><span class="w"> </span><span class="n">ToolCall</span><span class="p">};</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt</span><span class="p">::</span><span class="n">LLMProvider</span><span class="p">;</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3"></a><span class="k">use</span><span class="w"> </span><span class="n">serde_json</span><span class="p">::</span><span class="n">Value</span><span class="p">;</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4"></a>
+<a id="__codelineno-0-5" name="__codelineno-0-5"></a><span class="c1">// Assuming &#39;llm_provider&#39; is an instance of Box&lt;dyn LLMProvider&gt; that has tools registered</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6"></a><span class="c1">// and &#39;my_tools&#39; is a Vec&lt;Tool&gt; describing them.</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7"></a>
+<a id="__codelineno-0-8" name="__codelineno-0-8"></a><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">handle_tool_calling_loop</span><span class="p">(</span>
+<a id="__codelineno-0-9" name="__codelineno-0-9"></a><span class="w">    </span><span class="n">llm_provider</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nb">Box</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">LLMProvider</span><span class="o">&gt;</span><span class="p">,</span>
+<a id="__codelineno-0-10" name="__codelineno-0-10"></a><span class="w">    </span><span class="n">initial_messages</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">ChatMessage</span><span class="o">&gt;</span><span class="p">,</span>
+<a id="__codelineno-0-11" name="__codelineno-0-11"></a><span class="w">    </span><span class="n">my_tools</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="p">[</span><span class="n">Tool</span><span class="p">],</span>
+<a id="__codelineno-0-12" name="__codelineno-0-12"></a><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">anyhow</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-0-13" name="__codelineno-0-13"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">messages</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">initial_messages</span><span class="p">;</span>
+<a id="__codelineno-0-14" name="__codelineno-0-14"></a>
+<a id="__codelineno-0-15" name="__codelineno-0-15"></a><span class="w">    </span><span class="k">loop</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-0-16" name="__codelineno-0-16"></a><span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">response</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">llm_provider</span><span class="p">.</span><span class="n">chat_with_tools</span><span class="p">(</span><span class="o">&amp;</span><span class="n">messages</span><span class="p">,</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">my_tools</span><span class="p">)).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-0-17" name="__codelineno-0-17"></a>
+<a id="__codelineno-0-18" name="__codelineno-0-18"></a><span class="w">            </span><span class="c1">// Add the assistant&#39;s response to the history. It might contain text and/or tool calls.</span>
+<a id="__codelineno-0-19" name="__codelineno-0-19"></a><span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">msg_builder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ChatMessage</span><span class="p">::</span><span class="n">assistant</span><span class="p">().</span><span class="n">text</span><span class="p">(</span><span class="n">response</span><span class="p">.</span><span class="n">text</span><span class="p">().</span><span class="n">unwrap_or_default</span><span class="p">());</span>
+<a id="__codelineno-0-20" name="__codelineno-0-20"></a><span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">tool_calls</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">response</span><span class="p">.</span><span class="n">tool_calls</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-0-21" name="__codelineno-0-21"></a><span class="w">                </span><span class="k">for</span><span class="w"> </span><span class="n">tc</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">tool_calls</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-0-22" name="__codelineno-0-22"></a><span class="w">                    </span><span class="kd">let</span><span class="w"> </span><span class="n">args</span><span class="p">:</span><span class="w"> </span><span class="nc">serde_json</span><span class="p">::</span><span class="n">Value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">serde_json</span><span class="p">::</span><span class="n">from_str</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tc</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">arguments</span><span class="p">).</span><span class="n">unwrap_or_default</span><span class="p">();</span>
+<a id="__codelineno-0-23" name="__codelineno-0-23"></a><span class="w">                    </span><span class="n">msg_builder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">msg_builder</span><span class="p">.</span><span class="n">tool_use</span><span class="p">(</span><span class="n">tc</span><span class="p">.</span><span class="n">id</span><span class="p">.</span><span class="n">clone</span><span class="p">(),</span><span class="w"> </span><span class="n">tc</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">name</span><span class="p">.</span><span class="n">clone</span><span class="p">(),</span><span class="w"> </span><span class="n">args</span><span class="p">);</span>
+<a id="__codelineno-0-24" name="__codelineno-0-24"></a><span class="w">                </span><span class="p">}</span>
+<a id="__codelineno-0-25" name="__codelineno-0-25"></a><span class="w">            </span><span class="p">}</span>
+<a id="__codelineno-0-26" name="__codelineno-0-26"></a><span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">thinking</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">response</span><span class="p">.</span><span class="n">thinking</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-0-27" name="__codelineno-0-27"></a><span class="w">                </span><span class="n">msg_builder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">msg_builder</span><span class="p">.</span><span class="n">thinking</span><span class="p">(</span><span class="n">thinking</span><span class="p">);</span>
+<a id="__codelineno-0-28" name="__codelineno-0-28"></a><span class="w">            </span><span class="p">}</span>
+<a id="__codelineno-0-29" name="__codelineno-0-29"></a><span class="w">            </span><span class="n">messages</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="n">msg_builder</span><span class="p">.</span><span class="n">build</span><span class="p">());</span>
+<a id="__codelineno-0-30" name="__codelineno-0-30"></a>
+<a id="__codelineno-0-31" name="__codelineno-0-31"></a><span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">tool_calls</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">response</span><span class="p">.</span><span class="n">tool_calls</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-0-32" name="__codelineno-0-32"></a><span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="n">tool_calls</span><span class="p">.</span><span class="n">is_empty</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-0-33" name="__codelineno-0-33"></a><span class="w">                </span><span class="c1">// No tool calls, so the text response is the final answer.</span>
+<a id="__codelineno-0-34" name="__codelineno-0-34"></a><span class="w">                </span><span class="k">return</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(</span><span class="n">response</span><span class="p">.</span><span class="n">text</span><span class="p">().</span><span class="n">unwrap_or_default</span><span class="p">());</span>
+<a id="__codelineno-0-35" name="__codelineno-0-35"></a><span class="w">            </span><span class="p">}</span>
+<a id="__codelineno-0-36" name="__codelineno-0-36"></a>
+<a id="__codelineno-0-37" name="__codelineno-0-37"></a><span class="w">            </span><span class="c1">// The model wants to call one or more tools.</span>
+<a id="__codelineno-0-38" name="__codelineno-0-38"></a><span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">tool_results</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Vec</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<a id="__codelineno-0-39" name="__codelineno-0-39"></a><span class="w">            </span><span class="k">for</span><span class="w"> </span><span class="n">call</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">tool_calls</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-0-40" name="__codelineno-0-40"></a><span class="w">                </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;LLM wants to call tool: {} with args: {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">arguments</span><span class="p">);</span>
+<a id="__codelineno-0-41" name="__codelineno-0-41"></a>
+<a id="__codelineno-0-42" name="__codelineno-0-42"></a><span class="w">                </span><span class="c1">// In a real app, you would dispatch to your tool execution logic here.</span>
+<a id="__codelineno-0-43" name="__codelineno-0-43"></a><span class="w">                </span><span class="c1">// The `LLMProvider` trait has a `call_tool` helper for this.</span>
+<a id="__codelineno-0-44" name="__codelineno-0-44"></a><span class="w">                </span><span class="kd">let</span><span class="w"> </span><span class="n">args</span><span class="p">:</span><span class="w"> </span><span class="nc">Value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">serde_json</span><span class="p">::</span><span class="n">from_str</span><span class="p">(</span><span class="o">&amp;</span><span class="n">call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">arguments</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-0-45" name="__codelineno-0-45"></a><span class="w">                </span><span class="kd">let</span><span class="w"> </span><span class="n">result_str</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">llm_provider</span><span class="p">.</span><span class="n">call_tool</span><span class="p">(</span><span class="o">&amp;</span><span class="n">call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">args</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-0-46" name="__codelineno-0-46"></a>
+<a id="__codelineno-0-47" name="__codelineno-0-47"></a><span class="w">                </span><span class="c1">// Create a ToolCall struct containing the result.</span>
+<a id="__codelineno-0-48" name="__codelineno-0-48"></a><span class="w">                </span><span class="c1">// Note: The result is placed in the `arguments` field for transport.</span>
+<a id="__codelineno-0-49" name="__codelineno-0-49"></a><span class="w">                </span><span class="kd">let</span><span class="w"> </span><span class="n">result_call</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ToolCall</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-0-50" name="__codelineno-0-50"></a><span class="w">                    </span><span class="n">id</span><span class="p">:</span><span class="w"> </span><span class="nc">call</span><span class="p">.</span><span class="n">id</span><span class="p">,</span>
+<a id="__codelineno-0-51" name="__codelineno-0-51"></a><span class="w">                    </span><span class="n">call_type</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;function&quot;</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
+<a id="__codelineno-0-52" name="__codelineno-0-52"></a><span class="w">                    </span><span class="n">function</span><span class="p">:</span><span class="w"> </span><span class="nc">querymt</span><span class="p">::</span><span class="n">FunctionCall</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-0-53" name="__codelineno-0-53"></a><span class="w">                        </span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="nc">call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">name</span><span class="p">,</span>
+<a id="__codelineno-0-54" name="__codelineno-0-54"></a><span class="w">                        </span><span class="n">arguments</span><span class="p">:</span><span class="w"> </span><span class="nc">result_str</span><span class="p">,</span>
+<a id="__codelineno-0-55" name="__codelineno-0-55"></a><span class="w">                    </span><span class="p">},</span>
+<a id="__codelineno-0-56" name="__codelineno-0-56"></a><span class="w">                </span><span class="p">};</span>
+<a id="__codelineno-0-57" name="__codelineno-0-57"></a><span class="w">                </span><span class="n">tool_results</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="n">result_call</span><span class="p">);</span>
+<a id="__codelineno-0-58" name="__codelineno-0-58"></a><span class="w">            </span><span class="p">}</span>
+<a id="__codelineno-0-59" name="__codelineno-0-59"></a>
+<a id="__codelineno-0-60" name="__codelineno-0-60"></a><span class="w">            </span><span class="c1">// Add the tool results back to the conversation history.</span>
+<a id="__codelineno-0-61" name="__codelineno-0-61"></a><span class="w">            </span><span class="n">messages</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="n">ChatMessage</span><span class="p">::</span><span class="n">user</span><span class="p">().</span><span class="n">tool_result</span><span class="p">(</span><span class="n">tool_results</span><span class="p">).</span><span class="n">build</span><span class="p">());</span>
+<a id="__codelineno-0-62" name="__codelineno-0-62"></a><span class="w">            </span><span class="c1">// Loop again to let the model process the tool results.</span>
+<a id="__codelineno-0-63" name="__codelineno-0-63"></a><span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-0-64" name="__codelineno-0-64"></a><span class="w">            </span><span class="c1">// No tool calls in the response, so the text is the final answer.</span>
+<a id="__codelineno-0-65" name="__codelineno-0-65"></a><span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(</span><span class="n">response</span><span class="p">.</span><span class="n">text</span><span class="p">().</span><span class="n">unwrap_or_default</span><span class="p">());</span>
+<a id="__codelineno-0-66" name="__codelineno-0-66"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-0-67" name="__codelineno-0-67"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-0-68" name="__codelineno-0-68"></a><span class="p">}</span>
+</code></pre></div></td></tr></table></div>
 <p>QueryMT's chat system is designed to be flexible, supporting simple Q&amp;A, complex multi-turn dialogues, and sophisticated interactions involving external tools. The <code>Tool</code> and <code>ToolChoice</code> mechanisms provide fine-grained control over how LLMs can utilize functions.</p>
+
+
 
 
 
@@ -1808,7 +1859,7 @@
         
           <button type="button" class="md-top md-icon" data-md-component="top" hidden>
   
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-circle-arrow-up" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m16 12-4-4-4 4M12 16V8"/></svg>
   Back to top
 </button>
         
@@ -1822,8 +1873,8 @@
   
   
     Made with
-    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
-      Material for MkDocs
+    <a href="https://zensical.org/" target="_blank" rel="noopener">
+      Zensical
     </a>
   
 </div>
@@ -1838,13 +1889,73 @@
     </div>
     
     
+      <div class="md-consent" data-md-component="consent" id="__consent" hidden>
+        <div class="md-consent__overlay"></div>
+        <aside class="md-consent__inner">
+          <form class="md-consent__form md-grid md-typeset" name="consent">
+            
+
+
+  
+
+
+<h4>Cookie consent</h4>
+<p>We use cookies to recognize your repeated visits and preferences, as well as to measure the effectiveness of our documentation and whether users find what they're searching for. With your consent, you're helping us to make our documentation better.</p>
+<input class="md-toggle" type="checkbox" id="__settings" >
+<div class="md-consent__settings">
+  <ul class="task-list">
+    
+    
+      
+    
+    
+      
+        
+  
+  
+    
+    
+  
+  <li class="task-list-item">
+    <label class="task-list-control">
+      <input type="checkbox" name="github" checked>
+      <span class="task-list-indicator"></span>
+      GitHub
+    </label>
+  </li>
+
+      
+    
+    
+  </ul>
+</div>
+<div class="md-consent__controls">
+  
+    
+      <button class="md-button md-button--primary">Accept</button>
+    
+    
+    
+  
+    
+    
+    
+      <label class="md-button" for="__settings">Manage settings</label>
+    
+  
+</div>
+          </form>
+        </aside>
+      </div>
+      <script>var consent=__md_get("__consent");if(consent)for(var input of document.forms.consent.elements)input.name&&(input.checked=consent[input.name]||!1);else"file:"!==location.protocol&&setTimeout((function(){document.querySelector("[data-md-component=consent]").hidden=!1}),250);var form=document.forms.consent;for(var action of["submit","reset"])form.addEventListener(action,(function(e){if(e.preventDefault(),"reset"===e.type)for(var n of document.forms.consent.elements)n.name&&(n.checked=!1);__md_set("__consent",Object.fromEntries(Array.from(new FormData(form).keys()).map((function(e){return[e,!0]})))),location.hash="",location.reload()}))</script>
+    
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.sections", "navigation.tracking", "toc.integrate", "navigation.top", "search.suggest", "search.highlight", "content.tabs.link", "content.code.annotation", "content.code.copy"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"default": "stable", "provider": "mike"}}</script>
+      <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"search":"../../assets/javascripts/workers/search.e2d2d235.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../../assets/javascripts/bundle.91a19a9e.min.js"></script>
       
     
   </body>

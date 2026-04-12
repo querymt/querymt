@@ -21,18 +21,23 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="zensical-0.0.32">
     
     
       
-        <title>Agent Modes - QueryMate</title>
+        <title>QueryMT Agent - Agent Modes - QueryMate</title>
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
       
         
-        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      <link rel="stylesheet" href="../../assets/stylesheets/modern/main.53a7feaf.min.css">
+      
+        
+          
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/modern/palette.dfe2e883.min.css">
       
       
 
@@ -46,12 +51,12 @@
         
         
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
-        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,500,500i,700,700i%7CJetBrains+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Inter";--md-code-font:"JetBrains Mono"}</style>
       
     
     
-    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,t)=>(e<<5)-e+t.charCodeAt(0)),0),__md_get=(e,t=localStorage,a=__md_scope)=>JSON.parse(t.getItem(a.pathname+"."+e)),__md_set=(e,t,a=localStorage,_=__md_scope)=>{try{a.setItem(_.pathname+"."+e,JSON.stringify(t))}catch(e){}},document.documentElement.setAttribute("data-platform",navigator.platform)</script>
     
       
 
@@ -72,7 +77,7 @@
     
     <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
     <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
-    <label class="md-overlay" for="__drawer"></label>
+    <label class="md-overlay" for="__drawer" aria-label="Navigation"></label>
     <div data-md-component="skip">
       
         
@@ -97,12 +102,12 @@
     <a href="../.." title="QueryMate" class="md-header__button md-logo" aria-label="QueryMate" data-md-component="logo">
       
   
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-book-open" viewBox="0 0 24 24"><path d="M12 7v14M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/></svg>
 
     </a>
-    <label class="md-header__button md-icon" for="__drawer">
+    <label class="md-header__button md-icon" for="__drawer" aria-label="Navigation">
       
-      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-menu" viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h16"/></svg>
     </label>
     <div class="md-header__title" data-md-component="header-title">
       <div class="md-header__ellipsis">
@@ -114,7 +119,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Agent Modes
+              QueryMT Agent - Agent Modes
             
           </span>
         </div>
@@ -164,59 +169,30 @@
     
       
       
-        <label class="md-header__button md-icon" for="__search">
+        <label class="md-header__button md-icon" for="__search" aria-label="Search">
           
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-search" viewBox="0 0 24 24"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></svg>
         </label>
-        <div class="md-search" data-md-component="search" role="dialog">
-  <label class="md-search__overlay" for="__search"></label>
-  <div class="md-search__inner" role="search">
-    <form class="md-search__form" name="search">
-      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
-      <label class="md-search__icon md-icon" for="__search">
-        
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
-        
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
-      </label>
-      <nav class="md-search__options" aria-label="Search">
-        
-        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
-          
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
-        </button>
-      </nav>
-      
-        <div class="md-search__suggest" data-md-component="search-suggest"></div>
-      
-    </form>
-    <div class="md-search__output">
-      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
-        <div class="md-search-result" data-md-component="search-result">
-          <div class="md-search-result__meta">
-            Initializing search
-          </div>
-          <ol class="md-search-result__list" role="presentation"></ol>
-        </div>
-      </div>
-    </div>
-  </div>
+        <div class="md-search" data-md-component="search" role="dialog" aria-label="Search">
+  <button type="button" class="md-search__button">
+    Search
+  </button>
 </div>
       
     
-    
-      <div class="md-header__source">
+    <div class="md-header__source">
+      
         <a href="https://github.com/querymt/querymt" title="Go to repository" class="md-source" data-md-component="source">
   <div class="md-source__icon md-icon">
     
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2026 Fonticons, Inc.--><path fill="currentColor" d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
   </div>
   <div class="md-source__repository">
     GitHub
   </div>
 </a>
-      </div>
-    
+      
+    </div>
   </nav>
   
 </header>
@@ -240,9 +216,6 @@
       <a href="../.." class="md-tabs__link">
         
   
-  
-    
-  
   Home
 
       </a>
@@ -259,9 +232,6 @@
       <a href="../../architecture/" class="md-tabs__link">
         
   
-  
-    
-  
   Architecture
 
       </a>
@@ -277,9 +247,6 @@
     <li class="md-tabs__item">
       <a href="../../telemetry/" class="md-tabs__link">
         
-  
-  
-    
   
   Telemetry
 
@@ -298,7 +265,6 @@
       <li class="md-tabs__item">
         <a href="../../core/" class="md-tabs__link">
           
-  
   
   Core Concepts
 
@@ -319,7 +285,6 @@
         <a href="../../plugins/" class="md-tabs__link">
           
   
-  
   Plugins
 
         </a>
@@ -336,9 +301,6 @@
     <li class="md-tabs__item">
       <a href="../../mcp/" class="md-tabs__link">
         
-  
-  
-    
   
   MCP Integration
 
@@ -360,7 +322,6 @@
         <a href="../" class="md-tabs__link">
           
   
-  
   Agent
 
         </a>
@@ -378,9 +339,6 @@
       <a href="../../cli/" class="md-tabs__link">
         
   
-  
-    
-  
   CLI
 
       </a>
@@ -396,9 +354,6 @@
     <li class="md-tabs__item">
       <a href="https://log.query.mt" class="md-tabs__link">
         
-  
-  
-    
   
   Blog
 
@@ -434,7 +389,7 @@
     <a href="../.." title="QueryMate" class="md-nav__button md-logo" aria-label="QueryMate" data-md-component="logo">
       
   
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-book-open" viewBox="0 0 24 24"><path d="M12 7v14M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/></svg>
 
     </a>
     QueryMate
@@ -444,7 +399,7 @@
       <a href="https://github.com/querymt/querymt" title="Go to repository" class="md-source" data-md-component="source">
   <div class="md-source__icon md-icon">
     
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2026 Fonticons, Inc.--><path fill="currentColor" d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
   </div>
   <div class="md-source__repository">
     GitHub
@@ -1339,7 +1294,7 @@
   
     <li class="md-nav__item md-nav__item--active">
       
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
       
       
         
@@ -1363,7 +1318,7 @@
           <span class="md-nav__icon md-icon"></span>
         </label>
       
-      <a href="./" class="md-nav__link md-nav__link--active">
+      <a href="././" class="md-nav__link md-nav__link--active">
         
   
   
@@ -1382,7 +1337,8 @@
       
         
 
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+
+<nav class="md-nav md-nav--secondary" aria-label="On this page">
   
   
   
@@ -1391,7 +1347,7 @@
   
     <label class="md-nav__title" for="__toc">
       <span class="md-nav__icon md-icon"></span>
-      Table of contents
+      On this page
     </label>
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
@@ -1889,6 +1845,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../export/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Export & Fine-Tuning
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../api_reference/" class="md-nav__link">
         
   
@@ -2013,8 +1997,6 @@
               <article class="md-content__inner md-typeset">
                 
                   
-
-
   
   
 
@@ -2063,13 +2045,18 @@
 - Making code changes
 - Any task requiring modifications</p>
 <p><strong>Example:</strong>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>User: &quot;Add a new API endpoint for user registration&quot;
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>Agent: [In Build mode]
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>  - Reads existing routes
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>  - Creates new controller file
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>  - Updates database schema
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>  - Writes tests
-</code></pre></div></p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-1">1</a></span>
+<span class="normal"><a href="#__codelineno-0-2">2</a></span>
+<span class="normal"><a href="#__codelineno-0-3">3</a></span>
+<span class="normal"><a href="#__codelineno-0-4">4</a></span>
+<span class="normal"><a href="#__codelineno-0-5">5</a></span>
+<span class="normal"><a href="#__codelineno-0-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a>User: &quot;Add a new API endpoint for user registration&quot;
+<a id="__codelineno-0-2" name="__codelineno-0-2"></a>Agent: [In Build mode]
+<a id="__codelineno-0-3" name="__codelineno-0-3"></a>  - Reads existing routes
+<a id="__codelineno-0-4" name="__codelineno-0-4"></a>  - Creates new controller file
+<a id="__codelineno-0-5" name="__codelineno-0-5"></a>  - Updates database schema
+<a id="__codelineno-0-6" name="__codelineno-0-6"></a>  - Writes tests
+</code></pre></div></td></tr></table></div></p>
 <h3 id="plan-mode">Plan Mode</h3>
 <p><strong>Read-only mode</strong> - Agent can observe and analyze but cannot make changes.</p>
 <p><strong>Capabilities:</strong>
@@ -2085,29 +2072,50 @@
 -  Cannot delete files
 -  Cannot run mutating shell commands (<code>sed</code>, <code>tee</code>, <code>echo &gt;</code>, <code>rm</code>, <code>cargo build</code>, etc.)</p>
 <p><strong>System Reminder:</strong>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a># Plan Mode
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>You are in **plan mode**. You may only observe, analyze, and plan.
-<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>
-<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>## What You CAN Do
-<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>- Read files, search code, list directories
-<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>- Analyze architecture and patterns
-<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>- Create todo lists and task breakdowns
-<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>- Ask the user clarifying questions
-<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>- Run read-only shell commands (git log, grep, find, etc.)
-<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a>
-<a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a>## What You MUST NOT Do
-<a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a>- Do NOT edit, create, or delete files
-<a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a>- Do NOT run mutating shell commands (no sed, tee, echo &gt;, rm, cargo build, etc.)
-<a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a>- Do NOT write code — only plan what code should be written
-<a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a>
-<a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a>## Your Goal
-<a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a>Produce a clear, actionable implementation plan. Break work into small, concrete
-<a id="__codelineno-1-19" name="__codelineno-1-19" href="#__codelineno-1-19"></a>steps. Identify risks and tradeoffs. When the user is ready to implement, they
-<a id="__codelineno-1-20" name="__codelineno-1-20" href="#__codelineno-1-20"></a>will switch to Build mode.
-<a id="__codelineno-1-21" name="__codelineno-1-21" href="#__codelineno-1-21"></a>
-<a id="__codelineno-1-22" name="__codelineno-1-22" href="#__codelineno-1-22"></a>Ask the user clarifying questions or for their opinion when weighing tradeoffs.
-</code></pre></div></p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-1-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-1-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-1-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-1-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-1-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-1-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-1-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-1-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-1-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-1-10">10</a></span>
+<span class="normal"><a href="#__codelineno-1-11">11</a></span>
+<span class="normal"><a href="#__codelineno-1-12">12</a></span>
+<span class="normal"><a href="#__codelineno-1-13">13</a></span>
+<span class="normal"><a href="#__codelineno-1-14">14</a></span>
+<span class="normal"><a href="#__codelineno-1-15">15</a></span>
+<span class="normal"><a href="#__codelineno-1-16">16</a></span>
+<span class="normal"><a href="#__codelineno-1-17">17</a></span>
+<span class="normal"><a href="#__codelineno-1-18">18</a></span>
+<span class="normal"><a href="#__codelineno-1-19">19</a></span>
+<span class="normal"><a href="#__codelineno-1-20">20</a></span>
+<span class="normal"><a href="#__codelineno-1-21">21</a></span>
+<span class="normal"><a href="#__codelineno-1-22">22</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1"></a># Plan Mode
+<a id="__codelineno-1-2" name="__codelineno-1-2"></a>
+<a id="__codelineno-1-3" name="__codelineno-1-3"></a>You are in **plan mode**. You may only observe, analyze, and plan.
+<a id="__codelineno-1-4" name="__codelineno-1-4"></a>
+<a id="__codelineno-1-5" name="__codelineno-1-5"></a>## What You CAN Do
+<a id="__codelineno-1-6" name="__codelineno-1-6"></a>- Read files, search code, list directories
+<a id="__codelineno-1-7" name="__codelineno-1-7"></a>- Analyze architecture and patterns
+<a id="__codelineno-1-8" name="__codelineno-1-8"></a>- Create todo lists and task breakdowns
+<a id="__codelineno-1-9" name="__codelineno-1-9"></a>- Ask the user clarifying questions
+<a id="__codelineno-1-10" name="__codelineno-1-10"></a>- Run read-only shell commands (git log, grep, find, etc.)
+<a id="__codelineno-1-11" name="__codelineno-1-11"></a>
+<a id="__codelineno-1-12" name="__codelineno-1-12"></a>## What You MUST NOT Do
+<a id="__codelineno-1-13" name="__codelineno-1-13"></a>- Do NOT edit, create, or delete files
+<a id="__codelineno-1-14" name="__codelineno-1-14"></a>- Do NOT run mutating shell commands (no sed, tee, echo &gt;, rm, cargo build, etc.)
+<a id="__codelineno-1-15" name="__codelineno-1-15"></a>- Do NOT write code — only plan what code should be written
+<a id="__codelineno-1-16" name="__codelineno-1-16"></a>
+<a id="__codelineno-1-17" name="__codelineno-1-17"></a>## Your Goal
+<a id="__codelineno-1-18" name="__codelineno-1-18"></a>Produce a clear, actionable implementation plan. Break work into small, concrete
+<a id="__codelineno-1-19" name="__codelineno-1-19"></a>steps. Identify risks and tradeoffs. When the user is ready to implement, they
+<a id="__codelineno-1-20" name="__codelineno-1-20"></a>will switch to Build mode.
+<a id="__codelineno-1-21" name="__codelineno-1-21"></a>
+<a id="__codelineno-1-22" name="__codelineno-1-22"></a>Ask the user clarifying questions or for their opinion when weighing tradeoffs.
+</code></pre></div></td></tr></table></div></p>
 <p><strong>When to use:</strong>
 - Before implementing complex changes
 - Understanding existing codebase
@@ -2115,14 +2123,20 @@
 - Risk assessment
 - Architecture analysis</p>
 <p><strong>Example:</strong>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>User: &quot;I want to add user registration&quot;
-<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>Agent: [In Plan mode]
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>  - Reads existing user models
-<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>  - Analyzes authentication flow
-<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>  - Creates implementation plan
-<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>  - Lists required changes
-<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>  - Asks about preferred approach
-</code></pre></div></p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-2-1">1</a></span>
+<span class="normal"><a href="#__codelineno-2-2">2</a></span>
+<span class="normal"><a href="#__codelineno-2-3">3</a></span>
+<span class="normal"><a href="#__codelineno-2-4">4</a></span>
+<span class="normal"><a href="#__codelineno-2-5">5</a></span>
+<span class="normal"><a href="#__codelineno-2-6">6</a></span>
+<span class="normal"><a href="#__codelineno-2-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1"></a>User: &quot;I want to add user registration&quot;
+<a id="__codelineno-2-2" name="__codelineno-2-2"></a>Agent: [In Plan mode]
+<a id="__codelineno-2-3" name="__codelineno-2-3"></a>  - Reads existing user models
+<a id="__codelineno-2-4" name="__codelineno-2-4"></a>  - Analyzes authentication flow
+<a id="__codelineno-2-5" name="__codelineno-2-5"></a>  - Creates implementation plan
+<a id="__codelineno-2-6" name="__codelineno-2-6"></a>  - Lists required changes
+<a id="__codelineno-2-7" name="__codelineno-2-7"></a>  - Asks about preferred approach
+</code></pre></div></td></tr></table></div></p>
 <h3 id="review-mode">Review Mode</h3>
 <p><strong>Read-only mode</strong> - Agent acts as a code reviewer providing feedback.</p>
 <p><strong>Capabilities:</strong>
@@ -2137,32 +2151,56 @@
 -  Cannot delete files
 -  Cannot run mutating shell commands</p>
 <p><strong>System Reminder:</strong>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a># Review Mode
-<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>
-<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>You are in **review mode**. You are a code reviewer providing constructive feedback.
-<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>
-<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>## What You CAN Do
-<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>- Read files and search code to understand context
-<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>- Analyze code quality, correctness, and style
-<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>- Identify bugs, performance issues, and security concerns
-<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>- Suggest improvements and alternative approaches
-<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a>- Check adherence to best practices and project conventions
-<a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a>- Run read-only commands (tests with --dry-run, linting, etc.)
-<a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a>
-<a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a>## What You MUST NOT Do
-<a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a>- Do NOT edit, create, or delete files
-<a id="__codelineno-3-15" name="__codelineno-3-15" href="#__codelineno-3-15"></a>- Do NOT run mutating shell commands
-<a id="__codelineno-3-16" name="__codelineno-3-16" href="#__codelineno-3-16"></a>- Do NOT implement fixes — only describe what should be fixed
-<a id="__codelineno-3-17" name="__codelineno-3-17" href="#__codelineno-3-17"></a>
-<a id="__codelineno-3-18" name="__codelineno-3-18" href="#__codelineno-3-18"></a>## Your Goal
-<a id="__codelineno-3-19" name="__codelineno-3-19" href="#__codelineno-3-19"></a>Provide thorough, constructive code review feedback. Be specific about issues
-<a id="__codelineno-3-20" name="__codelineno-3-20" href="#__codelineno-3-20"></a>and suggest concrete fixes. Prioritize findings by severity. Focus on:
-<a id="__codelineno-3-21" name="__codelineno-3-21" href="#__codelineno-3-21"></a>1. Correctness — bugs, logic errors, edge cases
-<a id="__codelineno-3-22" name="__codelineno-3-22" href="#__codelineno-3-22"></a>2. Security — vulnerabilities, unsafe patterns
-<a id="__codelineno-3-23" name="__codelineno-3-23" href="#__codelineno-3-23"></a>3. Performance — bottlenecks, unnecessary allocations
-<a id="__codelineno-3-24" name="__codelineno-3-24" href="#__codelineno-3-24"></a>4. Maintainability — readability, naming, documentation
-<a id="__codelineno-3-25" name="__codelineno-3-25" href="#__codelineno-3-25"></a>5. Architecture — design patterns, coupling, cohesion
-</code></pre></div></p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-3-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-3-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-3-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-3-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-3-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-3-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-3-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-3-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-3-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-3-10">10</a></span>
+<span class="normal"><a href="#__codelineno-3-11">11</a></span>
+<span class="normal"><a href="#__codelineno-3-12">12</a></span>
+<span class="normal"><a href="#__codelineno-3-13">13</a></span>
+<span class="normal"><a href="#__codelineno-3-14">14</a></span>
+<span class="normal"><a href="#__codelineno-3-15">15</a></span>
+<span class="normal"><a href="#__codelineno-3-16">16</a></span>
+<span class="normal"><a href="#__codelineno-3-17">17</a></span>
+<span class="normal"><a href="#__codelineno-3-18">18</a></span>
+<span class="normal"><a href="#__codelineno-3-19">19</a></span>
+<span class="normal"><a href="#__codelineno-3-20">20</a></span>
+<span class="normal"><a href="#__codelineno-3-21">21</a></span>
+<span class="normal"><a href="#__codelineno-3-22">22</a></span>
+<span class="normal"><a href="#__codelineno-3-23">23</a></span>
+<span class="normal"><a href="#__codelineno-3-24">24</a></span>
+<span class="normal"><a href="#__codelineno-3-25">25</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a># Review Mode
+<a id="__codelineno-3-2" name="__codelineno-3-2"></a>
+<a id="__codelineno-3-3" name="__codelineno-3-3"></a>You are in **review mode**. You are a code reviewer providing constructive feedback.
+<a id="__codelineno-3-4" name="__codelineno-3-4"></a>
+<a id="__codelineno-3-5" name="__codelineno-3-5"></a>## What You CAN Do
+<a id="__codelineno-3-6" name="__codelineno-3-6"></a>- Read files and search code to understand context
+<a id="__codelineno-3-7" name="__codelineno-3-7"></a>- Analyze code quality, correctness, and style
+<a id="__codelineno-3-8" name="__codelineno-3-8"></a>- Identify bugs, performance issues, and security concerns
+<a id="__codelineno-3-9" name="__codelineno-3-9"></a>- Suggest improvements and alternative approaches
+<a id="__codelineno-3-10" name="__codelineno-3-10"></a>- Check adherence to best practices and project conventions
+<a id="__codelineno-3-11" name="__codelineno-3-11"></a>- Run read-only commands (tests with --dry-run, linting, etc.)
+<a id="__codelineno-3-12" name="__codelineno-3-12"></a>
+<a id="__codelineno-3-13" name="__codelineno-3-13"></a>## What You MUST NOT Do
+<a id="__codelineno-3-14" name="__codelineno-3-14"></a>- Do NOT edit, create, or delete files
+<a id="__codelineno-3-15" name="__codelineno-3-15"></a>- Do NOT run mutating shell commands
+<a id="__codelineno-3-16" name="__codelineno-3-16"></a>- Do NOT implement fixes — only describe what should be fixed
+<a id="__codelineno-3-17" name="__codelineno-3-17"></a>
+<a id="__codelineno-3-18" name="__codelineno-3-18"></a>## Your Goal
+<a id="__codelineno-3-19" name="__codelineno-3-19"></a>Provide thorough, constructive code review feedback. Be specific about issues
+<a id="__codelineno-3-20" name="__codelineno-3-20"></a>and suggest concrete fixes. Prioritize findings by severity. Focus on:
+<a id="__codelineno-3-21" name="__codelineno-3-21"></a>1. Correctness — bugs, logic errors, edge cases
+<a id="__codelineno-3-22" name="__codelineno-3-22"></a>2. Security — vulnerabilities, unsafe patterns
+<a id="__codelineno-3-23" name="__codelineno-3-23"></a>3. Performance — bottlenecks, unnecessary allocations
+<a id="__codelineno-3-24" name="__codelineno-3-24"></a>4. Maintainability — readability, naming, documentation
+<a id="__codelineno-3-25" name="__codelineno-3-25"></a>5. Architecture — design patterns, coupling, cohesion
+</code></pre></div></td></tr></table></div></p>
 <p><strong>When to use:</strong>
 - Reviewing PRs
 - Code quality checks
@@ -2170,13 +2208,18 @@
 - Performance reviews
 - Architecture validation</p>
 <p><strong>Example:</strong>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>User: &quot;Review this authentication implementation&quot;
-<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>Agent: [In Review mode]
-<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>  - Reads authentication code
-<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>  - Identifies security issues
-<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>  - Suggests improvements
-<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>  - Provides specific fix recommendations
-</code></pre></div></p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-4-1">1</a></span>
+<span class="normal"><a href="#__codelineno-4-2">2</a></span>
+<span class="normal"><a href="#__codelineno-4-3">3</a></span>
+<span class="normal"><a href="#__codelineno-4-4">4</a></span>
+<span class="normal"><a href="#__codelineno-4-5">5</a></span>
+<span class="normal"><a href="#__codelineno-4-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a>User: &quot;Review this authentication implementation&quot;
+<a id="__codelineno-4-2" name="__codelineno-4-2"></a>Agent: [In Review mode]
+<a id="__codelineno-4-3" name="__codelineno-4-3"></a>  - Reads authentication code
+<a id="__codelineno-4-4" name="__codelineno-4-4"></a>  - Identifies security issues
+<a id="__codelineno-4-5" name="__codelineno-4-5"></a>  - Suggests improvements
+<a id="__codelineno-4-6" name="__codelineno-4-6"></a>  - Provides specific fix recommendations
+</code></pre></div></td></tr></table></div></p>
 <h2 id="switching-modes">Switching Modes</h2>
 <h3 id="via-dashboard-interactive">Via Dashboard (Interactive)</h3>
 <p>In the web dashboard, press:
@@ -2184,33 +2227,51 @@
 - <strong>Cmd+M</strong> (macOS)</p>
 <p>The mode indicator in the header shows the current mode.</p>
 <h3 id="via-api">Via API</h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
-<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>
-<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="c1">// Create session</span>
-<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">session</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">new_session</span><span class="p">().</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>
-<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="c1">// Switch to plan mode</span>
-<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="n">session</span><span class="p">.</span><span class="n">set_mode</span><span class="p">(</span><span class="n">AgentMode</span><span class="p">::</span><span class="n">Plan</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>
-<a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="c1">// Switch to review mode</span>
-<a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="n">session</span><span class="p">.</span><span class="n">set_mode</span><span class="p">(</span><span class="n">AgentMode</span><span class="p">::</span><span class="n">Review</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>
-<a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a><span class="c1">// Switch back to build mode</span>
-<a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a><span class="n">session</span><span class="p">.</span><span class="n">set_mode</span><span class="p">(</span><span class="n">AgentMode</span><span class="p">::</span><span class="n">Build</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
-</code></pre></div>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-5-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-5-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-5-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-5-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-5-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-5-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-5-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-5-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-5-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-5-10">10</a></span>
+<span class="normal"><a href="#__codelineno-5-11">11</a></span>
+<span class="normal"><a href="#__codelineno-5-12">12</a></span>
+<span class="normal"><a href="#__codelineno-5-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2"></a>
+<a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="c1">// Create session</span>
+<a id="__codelineno-5-4" name="__codelineno-5-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">session</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">new_session</span><span class="p">().</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-5-5" name="__codelineno-5-5"></a>
+<a id="__codelineno-5-6" name="__codelineno-5-6"></a><span class="c1">// Switch to plan mode</span>
+<a id="__codelineno-5-7" name="__codelineno-5-7"></a><span class="n">session</span><span class="p">.</span><span class="n">set_mode</span><span class="p">(</span><span class="n">AgentMode</span><span class="p">::</span><span class="n">Plan</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-5-8" name="__codelineno-5-8"></a>
+<a id="__codelineno-5-9" name="__codelineno-5-9"></a><span class="c1">// Switch to review mode</span>
+<a id="__codelineno-5-10" name="__codelineno-5-10"></a><span class="n">session</span><span class="p">.</span><span class="n">set_mode</span><span class="p">(</span><span class="n">AgentMode</span><span class="p">::</span><span class="n">Review</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-5-11" name="__codelineno-5-11"></a>
+<a id="__codelineno-5-12" name="__codelineno-5-12"></a><span class="c1">// Switch back to build mode</span>
+<a id="__codelineno-5-13" name="__codelineno-5-13"></a><span class="n">session</span><span class="p">.</span><span class="n">set_mode</span><span class="p">(</span><span class="n">AgentMode</span><span class="p">::</span><span class="n">Build</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+</code></pre></div></td></tr></table></div>
 <h3 id="via-acp">Via ACP</h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="c1">// Send notification to change mode</span>
-<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="n">agent</span><span class="p">.</span><span class="n">notify_session</span><span class="p">(</span><span class="n">SessionNotification</span><span class="p">::</span><span class="n">SetAgentMode</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">    </span><span class="n">session_id</span><span class="p">:</span><span class="w"> </span><span class="nc">session_id</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
-<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="w">    </span><span class="n">mode</span><span class="p">:</span><span class="w"> </span><span class="nc">AgentMode</span><span class="p">::</span><span class="n">Plan</span><span class="p">,</span>
-<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="p">})</span><span class="o">?</span><span class="p">;</span>
-</code></pre></div>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-6-1">1</a></span>
+<span class="normal"><a href="#__codelineno-6-2">2</a></span>
+<span class="normal"><a href="#__codelineno-6-3">3</a></span>
+<span class="normal"><a href="#__codelineno-6-4">4</a></span>
+<span class="normal"><a href="#__codelineno-6-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1"></a><span class="c1">// Send notification to change mode</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2"></a><span class="n">agent</span><span class="p">.</span><span class="n">notify_session</span><span class="p">(</span><span class="n">SessionNotification</span><span class="p">::</span><span class="n">SetAgentMode</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3"></a><span class="w">    </span><span class="n">session_id</span><span class="p">:</span><span class="w"> </span><span class="nc">session_id</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4"></a><span class="w">    </span><span class="n">mode</span><span class="p">:</span><span class="w"> </span><span class="nc">AgentMode</span><span class="p">::</span><span class="n">Plan</span><span class="p">,</span>
+<a id="__codelineno-6-5" name="__codelineno-6-5"></a><span class="p">})</span><span class="o">?</span><span class="p">;</span>
+</code></pre></div></td></tr></table></div>
 <h3 id="via-configuration">Via Configuration</h3>
 <p>Set default mode in configuration:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;agent_mode&quot;</span>
-<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;plan&quot;</span><span class="w">  </span><span class="c1"># &quot;build&quot;, &quot;plan&quot;, or &quot;review&quot;</span>
-</code></pre></div>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-7-1">1</a></span>
+<span class="normal"><a href="#__codelineno-7-2">2</a></span>
+<span class="normal"><a href="#__codelineno-7-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="k">[[middleware]]</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;agent_mode&quot;</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;plan&quot;</span><span class="w">  </span><span class="c1"># &quot;build&quot;, &quot;plan&quot;, or &quot;review&quot;</span>
+</code></pre></div></td></tr></table></div>
 <h2 id="mode-transition-flow">Mode Transition Flow</h2>
 <pre class="mermaid"><code>flowchart LR
     B["Build Mode&lt;br/&gt;(default)"]
@@ -2382,27 +2443,42 @@
 <h2 id="configuration">Configuration</h2>
 <h3 id="custom-mode-reminders">Custom Mode Reminders</h3>
 <p>Customize the system reminders for Plan and Review modes:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;agent_mode&quot;</span>
-<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;build&quot;</span>
-<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="n">reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;&quot;&quot;&lt;system-reminder&gt;</span>
-<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="s2">Custom plan mode reminder here.</span>
-<a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a><span class="s2">&lt;/system-reminder&gt;&quot;&quot;&quot;</span>
-<a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a><span class="n">review_reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;&quot;&quot;&lt;system-reminder&gt;</span>
-<a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a><span class="s2">Custom review mode reminder here.</span>
-<a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a><span class="s2">&lt;/system-reminder&gt;&quot;&quot;&quot;</span>
-</code></pre></div>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-8-1">1</a></span>
+<span class="normal"><a href="#__codelineno-8-2">2</a></span>
+<span class="normal"><a href="#__codelineno-8-3">3</a></span>
+<span class="normal"><a href="#__codelineno-8-4">4</a></span>
+<span class="normal"><a href="#__codelineno-8-5">5</a></span>
+<span class="normal"><a href="#__codelineno-8-6">6</a></span>
+<span class="normal"><a href="#__codelineno-8-7">7</a></span>
+<span class="normal"><a href="#__codelineno-8-8">8</a></span>
+<span class="normal"><a href="#__codelineno-8-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1"></a><span class="k">[[middleware]]</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;agent_mode&quot;</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;build&quot;</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4"></a><span class="n">reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;&quot;&quot;&lt;system-reminder&gt;</span>
+<a id="__codelineno-8-5" name="__codelineno-8-5"></a><span class="s2">Custom plan mode reminder here.</span>
+<a id="__codelineno-8-6" name="__codelineno-8-6"></a><span class="s2">&lt;/system-reminder&gt;&quot;&quot;&quot;</span>
+<a id="__codelineno-8-7" name="__codelineno-8-7"></a><span class="n">review_reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;&quot;&quot;&lt;system-reminder&gt;</span>
+<a id="__codelineno-8-8" name="__codelineno-8-8"></a><span class="s2">Custom review mode reminder here.</span>
+<a id="__codelineno-8-9" name="__codelineno-8-9"></a><span class="s2">&lt;/system-reminder&gt;&quot;&quot;&quot;</span>
+</code></pre></div></td></tr></table></div>
 <h3 id="mode-specific-tools">Mode-Specific Tools</h3>
 <p>Configure different tools per mode:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="c1"># Build mode tools (default)</span>
-<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">]</span>
-<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>
-<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="c1"># Plan mode tools (automatically filtered)</span>
-<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a><span class="c1"># Only read-only tools are available</span>
-<a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a>
-<a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a><span class="c1"># Review mode tools (automatically filtered)</span>
-<a id="__codelineno-9-8" name="__codelineno-9-8" href="#__codelineno-9-8"></a><span class="c1"># Only read-only tools are available</span>
-</code></pre></div>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1">1</a></span>
+<span class="normal"><a href="#__codelineno-9-2">2</a></span>
+<span class="normal"><a href="#__codelineno-9-3">3</a></span>
+<span class="normal"><a href="#__codelineno-9-4">4</a></span>
+<span class="normal"><a href="#__codelineno-9-5">5</a></span>
+<span class="normal"><a href="#__codelineno-9-6">6</a></span>
+<span class="normal"><a href="#__codelineno-9-7">7</a></span>
+<span class="normal"><a href="#__codelineno-9-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a><span class="c1"># Build mode tools (default)</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">]</span>
+<a id="__codelineno-9-3" name="__codelineno-9-3"></a>
+<a id="__codelineno-9-4" name="__codelineno-9-4"></a><span class="c1"># Plan mode tools (automatically filtered)</span>
+<a id="__codelineno-9-5" name="__codelineno-9-5"></a><span class="c1"># Only read-only tools are available</span>
+<a id="__codelineno-9-6" name="__codelineno-9-6"></a>
+<a id="__codelineno-9-7" name="__codelineno-9-7"></a><span class="c1"># Review mode tools (automatically filtered)</span>
+<a id="__codelineno-9-8" name="__codelineno-9-8"></a><span class="c1"># Only read-only tools are available</span>
+</code></pre></div></td></tr></table></div>
 <h2 id="best-practices">Best Practices</h2>
 <h3 id="when-to-use-each-mode">When to Use Each Mode</h3>
 <p><strong>Use Plan Mode when:</strong>
@@ -2474,6 +2550,8 @@
 
 
 
+
+
                 
               </article>
             </div>
@@ -2486,7 +2564,7 @@
         
           <button type="button" class="md-top md-icon" data-md-component="top" hidden>
   
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-circle-arrow-up" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m16 12-4-4-4 4M12 16V8"/></svg>
   Back to top
 </button>
         
@@ -2500,8 +2578,8 @@
   
   
     Made with
-    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
-      Material for MkDocs
+    <a href="https://zensical.org/" target="_blank" rel="noopener">
+      Zensical
     </a>
   
 </div>
@@ -2516,13 +2594,73 @@
     </div>
     
     
+      <div class="md-consent" data-md-component="consent" id="__consent" hidden>
+        <div class="md-consent__overlay"></div>
+        <aside class="md-consent__inner">
+          <form class="md-consent__form md-grid md-typeset" name="consent">
+            
+
+
+  
+
+
+<h4>Cookie consent</h4>
+<p>We use cookies to recognize your repeated visits and preferences, as well as to measure the effectiveness of our documentation and whether users find what they're searching for. With your consent, you're helping us to make our documentation better.</p>
+<input class="md-toggle" type="checkbox" id="__settings" >
+<div class="md-consent__settings">
+  <ul class="task-list">
+    
+    
+      
+    
+    
+      
+        
+  
+  
+    
+    
+  
+  <li class="task-list-item">
+    <label class="task-list-control">
+      <input type="checkbox" name="github" checked>
+      <span class="task-list-indicator"></span>
+      GitHub
+    </label>
+  </li>
+
+      
+    
+    
+  </ul>
+</div>
+<div class="md-consent__controls">
+  
+    
+      <button class="md-button md-button--primary">Accept</button>
+    
+    
+    
+  
+    
+    
+    
+      <label class="md-button" for="__settings">Manage settings</label>
+    
+  
+</div>
+          </form>
+        </aside>
+      </div>
+      <script>var consent=__md_get("__consent");if(consent)for(var input of document.forms.consent.elements)input.name&&(input.checked=consent[input.name]||!1);else"file:"!==location.protocol&&setTimeout((function(){document.querySelector("[data-md-component=consent]").hidden=!1}),250);var form=document.forms.consent;for(var action of["submit","reset"])form.addEventListener(action,(function(e){if(e.preventDefault(),"reset"===e.type)for(var n of document.forms.consent.elements)n.name&&(n.checked=!1);__md_set("__consent",Object.fromEntries(Array.from(new FormData(form).keys()).map((function(e){return[e,!0]})))),location.hash="",location.reload()}))</script>
+    
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.sections", "navigation.tracking", "toc.integrate", "navigation.top", "search.suggest", "search.highlight", "content.tabs.link", "content.code.annotation", "content.code.copy"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"default": "stable", "provider": "mike"}}</script>
+      <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"search":"../../assets/javascripts/workers/search.e2d2d235.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../../assets/javascripts/bundle.91a19a9e.min.js"></script>
       
     
   </body>
