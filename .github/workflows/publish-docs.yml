@@ -1,5 +1,3 @@
-# .github/workflows/deploy.yml
-
 name: Deploy Versioned Documentation
 
 on:
@@ -8,7 +6,7 @@ on:
       - main
     tags:
       - 'v*'
-  workflow_dispatch: # Allows manual runs from the Actions tab
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -21,7 +19,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          # Fetch all history for all branches and tags
           fetch-depth: 0
 
       - name: Set up Python 3.11
@@ -32,7 +29,6 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
-        # Assumes your requirements.txt is in the /docs folder
         working-directory: ./docs
 
       - name: Configure Git User
@@ -41,7 +37,6 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Deploy documentation for main branch
-        # This step runs ONLY on a push to the main branch
         if: github.ref == 'refs/heads/main'
         run: |
           mike deploy --push --update-aliases latest
@@ -49,16 +44,9 @@ jobs:
         working-directory: ./docs
 
       - name: Deploy documentation for tagged release
-        # This step runs ONLY when you push a tag like 'v1.2.0'
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          # Extracts the major.minor version from the tag (e.g., v1.2.3 -> 1.2)
-          # This groups patch releases under the same version number in the docs
           VERSION=$(echo $GITHUB_REF_NAME | sed -e 's/^v//' | sed -E 's/^([0-9]+\.[0-9]+).*/\1/')
-
-          # Deploy the numbered version and update the 'stable' alias to point to it
           mike deploy --push --update-aliases $VERSION stable
-
-          # Set this new stable version as the site's default page
           mike set-default --push stable
         working-directory: ./docs
