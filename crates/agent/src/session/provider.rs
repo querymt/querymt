@@ -586,6 +586,17 @@ impl SessionProvider {
 
             let api_key = if let Some(key) = api_key_override {
                 Some(key.to_string())
+            } else if let Some(serde_json::Value::String(key)) = builder_config
+                .get("api_key")
+                .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+            {
+                // API key already present in builder_config from params or
+                // static provider config — use it directly.
+                log::debug!(
+                    "Using inline API key from config for provider '{}'",
+                    provider_name
+                );
+                Some(key.clone())
             } else {
                 let preferred_method = preferred_auth_method(provider_name);
 
