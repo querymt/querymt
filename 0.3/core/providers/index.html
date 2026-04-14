@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.0.32">
+      <meta name="generator" content="zensical-0.0.33">
     
     
       
@@ -51,7 +51,7 @@
         
         
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,500,500i,700,700i%7CJetBrains+Mono:400,400i,700,700i&display=fallback">
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,500,500i,700,700i%7CJetBrains+Mono:400,400i,700,700i&amp;display=fallback">
         <style>:root{--md-text-font:"Inter";--md-code-font:"JetBrains Mono"}</style>
       
     
@@ -669,6 +669,17 @@
     <span class="md-ellipsis">
       
         Instantiation and Configuration
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#zai-provider-notes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Z.AI Provider Notes
       
     </span>
   </a>
@@ -1671,6 +1682,48 @@
 <li><strong>Plugin System</strong>: For providers not built directly into QueryMT, a plugin system allows new providers to be added dynamically. Plugins implement <code>LLMProviderFactory</code> or <code>HTTPLLMProviderFactory</code> which are then used by the <code>LLMBuilder</code> to create provider instances.</li>
 </ol>
 <p>This separation of concerns—the core provider traits, HTTP-specific handling, builder for configuration, and a plugin system for extensibility—makes QueryMT a flexible framework for working with a diverse range of LLMs.</p>
+<h2 id="zai-provider-notes">Z.AI Provider Notes</h2>
+<p>QueryMT includes a <code>zai</code> HTTP provider (OpenAI-compatible request/response flow).</p>
+<ul>
+<li>Configure <code>base_url</code> in your provider config to select the Z.AI endpoint.</li>
+<li>Default endpoint is the general API: <code>https://api.z.ai/api/paas/v4/</code>.</li>
+<li>For GLM Coding Plan scenarios, use the coding endpoint instead: <code>https://api.z.ai/api/coding/paas/v4/</code>.</li>
+<li>Model listing is dynamic and uses the configured <code>base_url</code>.</li>
+</ul>
+<p>Example provider config:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-1">1</a></span>
+<span class="normal"><a href="#__codelineno-0-2">2</a></span>
+<span class="normal"><a href="#__codelineno-0-3">3</a></span>
+<span class="normal"><a href="#__codelineno-0-4">4</a></span>
+<span class="normal"><a href="#__codelineno-0-5">5</a></span>
+<span class="normal"><a href="#__codelineno-0-6">6</a></span>
+<span class="normal"><a href="#__codelineno-0-7">7</a></span>
+<span class="normal"><a href="#__codelineno-0-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a><span class="k">[[providers]]</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;zai&quot;</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;oci://ghcr.io/querymt/zai:latest&quot;</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4"></a>
+<a id="__codelineno-0-5" name="__codelineno-0-5"></a><span class="k">[providers.config]</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6"></a><span class="n">api_key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${ZAI_API_KEY}&quot;</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;glm-5.1&quot;</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8"></a><span class="n">base_url</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;https://api.z.ai/api/paas/v4/&quot;</span>
+</code></pre></div></td></tr></table></div>
+<p>Coding endpoint variant:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-1-1">1</a></span>
+<span class="normal"><a href="#__codelineno-1-2">2</a></span>
+<span class="normal"><a href="#__codelineno-1-3">3</a></span>
+<span class="normal"><a href="#__codelineno-1-4">4</a></span>
+<span class="normal"><a href="#__codelineno-1-5">5</a></span>
+<span class="normal"><a href="#__codelineno-1-6">6</a></span>
+<span class="normal"><a href="#__codelineno-1-7">7</a></span>
+<span class="normal"><a href="#__codelineno-1-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1"></a><span class="k">[[providers]]</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;zai-coding&quot;</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3"></a><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;oci://ghcr.io/querymt/zai:latest&quot;</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4"></a>
+<a id="__codelineno-1-5" name="__codelineno-1-5"></a><span class="k">[providers.config]</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6"></a><span class="n">api_key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${ZAI_API_KEY}&quot;</span>
+<a id="__codelineno-1-7" name="__codelineno-1-7"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;glm-5.1&quot;</span>
+<a id="__codelineno-1-8" name="__codelineno-1-8"></a><span class="n">base_url</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;https://api.z.ai/api/coding/paas/v4/&quot;</span>
+</code></pre></div></td></tr></table></div>
 
 
 
@@ -1793,7 +1846,7 @@
       <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"search":"../../assets/javascripts/workers/search.e2d2d235.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.91a19a9e.min.js"></script>
+      <script src="../../assets/javascripts/bundle.63456bd9.min.js"></script>
       
     
   </body>
