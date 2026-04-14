@@ -1173,14 +1173,16 @@ impl HTTPChatProvider for Anthropic {
                         }
                     }
                     "message_delta" => {
+                        // Emit Usage before Done so consumers that break on
+                        // Done still capture the output_tokens update.
+                        if let Some(usage) = stream_resp.usage {
+                            chunks.push(querymt::chat::StreamChunk::Usage(usage));
+                        }
+
                         if let Some(delta) = stream_resp.delta
                             && let Some(stop_reason) = delta.stop_reason
                         {
                             chunks.push(querymt::chat::StreamChunk::Done { stop_reason });
-                        }
-
-                        if let Some(usage) = stream_resp.usage {
-                            chunks.push(querymt::chat::StreamChunk::Usage(usage));
                         }
                     }
                     _ => {}

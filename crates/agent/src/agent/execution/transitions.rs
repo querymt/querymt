@@ -360,6 +360,24 @@ pub(super) async fn transition_call_llm(
                             "stream chunk: session={} message_id={} type=done",
                             session_id, message_id
                         );
+                        // Some providers emit Usage AFTER Done in the same SSE
+                        // batch. Drain remaining items to capture any trailing
+                        // Usage events before exiting the loop.
+                        while let Some(remaining) = stream.next().await {
+                            match remaining {
+                                Ok(StreamChunk::Usage(u)) => {
+                                    trace!(
+                                        "stream chunk: session={} message_id={} type=usage (post-done drain) input={} output={}",
+                                        session_id, message_id, u.input_tokens, u.output_tokens
+                                    );
+                                    usage = Some(match usage {
+                                        Some(prev) => prev.merge_max(u),
+                                        None => u,
+                                    });
+                                }
+                                Err(_) | Ok(_) => break,
+                            }
+                        }
                         break;
                     }
                     _ => {}

@@ -105,6 +105,15 @@ pub(crate) fn parse_mistral_stream_chunk(
         }
 
         if let Some(finish_reason) = &choice.finish_reason {
+            // Emit usage BEFORE Done so consumers that break on Done
+            // still capture the token counts.
+            if let Some(usage) = &chunk.usage
+                && !*usage_emitted
+            {
+                chunks.push(StreamChunk::Usage(usage_from_mistral(usage)));
+                *usage_emitted = true;
+            }
+
             flush_tool_states(tool_states, &mut chunks);
             chunks.push(StreamChunk::Done {
                 stop_reason: map_finish_reason(finish_reason),
@@ -113,6 +122,7 @@ pub(crate) fn parse_mistral_stream_chunk(
         }
     }
 
+    // Emit usage if it wasn't already emitted inside the finish_reason block.
     if let Some(usage) = &chunk.usage
         && !*usage_emitted
     {
@@ -131,6 +141,12 @@ pub(crate) fn parse_mistral_done_response(
 ) -> Vec<StreamChunk> {
     let mut chunks = Vec::new();
 
+    // Emit usage BEFORE Done so consumers that break on Done still capture it.
+    if !*usage_emitted {
+        chunks.push(StreamChunk::Usage(usage_from_mistral(&response.usage)));
+        *usage_emitted = true;
+    }
+
     if let Some(choice) = response.choices.first() {
         if let Some(tool_calls) = &choice.message.tool_calls {
             for call in tool_calls {
@@ -146,11 +162,6 @@ pub(crate) fn parse_mistral_done_response(
             });
             *done_emitted = true;
         }
-    }
-
-    if !*usage_emitted {
-        chunks.push(StreamChunk::Usage(usage_from_mistral(&response.usage)));
-        *usage_emitted = true;
     }
 
     chunks

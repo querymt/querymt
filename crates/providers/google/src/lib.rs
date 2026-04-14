@@ -1239,23 +1239,19 @@ fn extract_google_stream_chunks(response: GoogleChatResponse) -> Vec<querymt::ch
             }
         }
 
+        // Emit usage BEFORE Done so consumers that break on Done still
+        // capture Usage.  Google includes usage only in the final response
+        // alongside finish_reason.
+        if let Some(usage) = response.usage {
+            chunks.push(querymt::chat::StreamChunk::Usage(usage));
+        }
+
         // Check for finish reason (only in final chunk)
         if let Some(finish_reason) = &candidate.finish_reason {
             chunks.push(querymt::chat::StreamChunk::Done {
                 stop_reason: finish_reason.clone(),
             });
         }
-    }
-
-    // Extract usage metadata - only emit with finish_reason (final chunk)
-    if let Some(usage) = response.usage
-        && response
-            .candidates
-            .first()
-            .and_then(|c| c.finish_reason.as_ref())
-            .is_some()
-    {
-        chunks.push(querymt::chat::StreamChunk::Usage(usage));
     }
 
     chunks

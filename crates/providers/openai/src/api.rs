@@ -1220,11 +1220,18 @@ pub fn parse_openai_sse_chunk(
         }
 
         // Parse JSON chunk
-        let stream_chunk: OpenAIStreamChunk =
+        let mut stream_chunk: OpenAIStreamChunk =
             serde_json::from_str(data).map_err(|e| LLMError::ResponseFormatError {
                 message: format!("Failed to parse OpenAI stream chunk: {}", e),
                 raw_response: data.to_string(),
             })?;
+
+        // Emit usage metadata BEFORE Done so consumers that break on Done
+        // still see Usage.  Many OpenAI-compatible APIs (Z.AI, DeepSeek, etc.)
+        // include usage in the same SSE line as finish_reason.
+        if let Some(usage) = stream_chunk.usage.take() {
+            results.push(StreamChunk::Usage(usage.into_usage()));
+        }
 
         // Process each choice
         for choice in &stream_chunk.choices {
@@ -1309,11 +1316,6 @@ pub fn parse_openai_sse_chunk(
                 });
                 done_emitted = true;
             }
-        }
-
-        // Handle usage metadata (typically in final chunk)
-        if let Some(usage) = stream_chunk.usage {
-            results.push(StreamChunk::Usage(usage.into_usage()));
         }
     }
 
