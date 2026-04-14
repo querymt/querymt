@@ -36,3 +36,38 @@ You don't usually interact with these traits directly to create provider instanc
 
 This separation of concerns—the core provider traits, HTTP-specific handling, builder for configuration, and a plugin system for extensibility—makes QueryMT a flexible framework for working with a diverse range of LLMs.
 
+## Z.AI Provider Notes
+
+QueryMT includes a `zai` HTTP provider (OpenAI-compatible request/response flow).
+
+- Configure `base_url` in your provider config to select the Z.AI endpoint.
+- Default endpoint is the general API: `https://api.z.ai/api/paas/v4/`.
+- For GLM Coding Plan scenarios, use the coding endpoint instead: `https://api.z.ai/api/coding/paas/v4/`.
+- Model listing is dynamic and uses the configured `base_url`.
+
+Example provider config:
+
+```toml
+[[providers]]
+name = "zai"
+path = "oci://ghcr.io/querymt/zai:latest"
+
+[providers.config]
+api_key = "${ZAI_API_KEY}"
+model = "glm-5.1"
+base_url = "https://api.z.ai/api/paas/v4/"
+```
+
+Coding endpoint variant:
+
+```toml
+[[providers]]
+name = "zai-coding"
+path = "oci://ghcr.io/querymt/zai:latest"
+
+[providers.config]
+api_key = "${ZAI_API_KEY}"
+model = "glm-5.1"
+base_url = "https://api.z.ai/api/coding/paas/v4/"
+```
+

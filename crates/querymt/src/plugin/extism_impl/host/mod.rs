@@ -127,6 +127,7 @@ impl ExtismFactory {
     pub fn load(
         wasm_content: Vec<u8>,
         config: &Option<HashMap<String, toml::Value>>,
+        config_name: Option<&str>,
     ) -> Result<Self, LLMError> {
         let mut env_map: HashMap<_, _> = std::env::vars().collect();
 
@@ -166,8 +167,20 @@ impl ExtismFactory {
             );
         }
 
-        let name = call_plugin_str(init_plugin.clone(), "name", &Value::Null)
+        let plugin_name = call_plugin_str(init_plugin.clone(), "name", &Value::Null)
             .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
+        let name = if let Some(cfg_name) = config_name {
+            if cfg_name != plugin_name {
+                log::warn!(
+                    "Plugin name mismatch: config name is '{}', but plugin reports '{}'. Using config name.",
+                    cfg_name,
+                    plugin_name
+                );
+            }
+            cfg_name.to_string()
+        } else {
+            plugin_name
+        };
         if let Some(base_url) = call_plugin_str(init_plugin.clone(), "base_url", &Value::Null)
             .ok()
             .and_then(|v| Url::parse(&v).ok())

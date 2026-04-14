@@ -10908,6 +10908,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "qmt-zai"
+version = "0.3.2"
+dependencies = [
+ "extism-pdk",
+ "http 1.4.0",
+ "qmt-openai",
+ "querymt",
+ "querymt-extism-macros",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "qoi"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

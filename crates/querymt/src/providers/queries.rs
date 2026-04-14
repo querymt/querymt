@@ -27,6 +27,24 @@ impl ProvidersRegistry {
                 .and_then(|provider| provider.models.get(model));
         }
 
+        // General fallback: progressively strip the last `-suffix` segment from
+        // the provider name to find a parent entry.  This lets user-configured
+        // aliases like "zai-coding" resolve model info from "zai" (or
+        // "zai-coding-plan" from "zai-coding" -> "zai"), without needing
+        // per-provider hardcoded rules.
+        if result.is_none() {
+            let mut candidate = provider;
+            while let Some(pos) = candidate.rfind('-') {
+                candidate = &candidate[..pos];
+                if let Some(info) = self.providers.get(candidate)
+                    && let Some(m) = info.models.get(model)
+                {
+                    result = Some(m);
+                    break;
+                }
+            }
+        }
+
         result
     }
 
@@ -197,6 +215,126 @@ mod tests {
         let model = registry.get_model("kimi-code", "kimi-k2");
         assert!(model.is_some());
         assert_eq!(model.unwrap().id, "kimi-k2");
+    }
+
+    #[test]
+    fn test_get_model_prefix_fallback_strips_suffix() {
+        let mut registry = create_test_registry();
+
+        // Add a "zai" provider with a model
+        let mut zai_models = HashMap::new();
+        zai_models.insert(
+            "glm-5.1".to_string(),
+            ModelInfo {
+                id: "glm-5.1".to_string(),
+                name: "GLM-5.1".to_string(),
+                ..Default::default()
+            },
+        );
+        registry.providers.insert(
+            "zai".to_string(),
+            ProviderInfo {
+                id: "zai".to_string(),
+                name: "Z.AI".to_string(),
+                models: zai_models,
+                ..Default::default()
+            },
+        );
+
+        // "zai-coding" is not in registry, should fall back to "zai"
+        let model = registry.get_model("zai-coding", "glm-5.1");
+        assert!(model.is_some());
+        assert_eq!(model.unwrap().id, "glm-5.1");
+    }
+
+    #[test]
+    fn test_get_model_prefix_fallback_multi_level() {
+        let mut registry = create_test_registry();
+
+        let mut models = HashMap::new();
+        models.insert(
+            "model-a".to_string(),
+            ModelInfo {
+                id: "model-a".to_string(),
+                name: "Model A".to_string(),
+                ..Default::default()
+            },
+        );
+        registry.providers.insert(
+            "alibaba".to_string(),
+            ProviderInfo {
+                id: "alibaba".to_string(),
+                name: "Alibaba".to_string(),
+                models,
+                ..Default::default()
+            },
+        );
+
+        // "alibaba-coding-plan-cn" -> "alibaba-coding-plan" -> "alibaba-coding" -> "alibaba"
+        let model = registry.get_model("alibaba-coding-plan-cn", "model-a");
+        assert!(model.is_some());
+        assert_eq!(model.unwrap().id, "model-a");
+    }
+
+    #[test]
+    fn test_get_model_prefix_fallback_no_match() {
+        let registry = create_test_registry();
+
+        // "unknown-provider-xyz" should not match anything
+        assert!(
+            registry
+                .get_model("unknown-provider-xyz", "gpt-4")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_get_model_prefix_fallback_prefers_direct() {
+        let mut registry = create_test_registry();
+
+        // Add both "zai" and "zai-coding" with different models
+        let mut zai_models = HashMap::new();
+        zai_models.insert(
+            "glm-5.1".to_string(),
+            ModelInfo {
+                id: "glm-5.1".to_string(),
+                name: "GLM-5.1 General".to_string(),
+                ..Default::default()
+            },
+        );
+        registry.providers.insert(
+            "zai".to_string(),
+            ProviderInfo {
+                id: "zai".to_string(),
+                name: "Z.AI".to_string(),
+                models: zai_models,
+                ..Default::default()
+            },
+        );
+
+        let mut coding_models = HashMap::new();
+        coding_models.insert(
+            "glm-5.1".to_string(),
+            ModelInfo {
+                id: "glm-5.1".to_string(),
+                name: "GLM-5.1 Coding".to_string(),
+                ..Default::default()
+            },
+        );
+        registry.providers.insert(
+            "zai-coding".to_string(),
+            ProviderInfo {
+                id: "zai-coding".to_string(),
+                name: "Z.AI Coding".to_string(),
+                models: coding_models,
+                ..Default::default()
+            },
+        );
+
+        // Direct lookup should win over fallback
+        let model = registry.get_model("zai-coding", "glm-5.1");
+        assert!(model.is_some());
+        assert_eq!(model.unwrap().name, "GLM-5.1 Coding");
     }
 
     #[test]

@@ -286,6 +286,13 @@ fn default_provider_options(provider: &str, model: &str) -> HashMap<String, Valu
         }
     }
 
+    if provider.to_lowercase().contains("zai") || id.contains("glm-5") {
+        opts.insert(
+            "extra_body".into(),
+            json!({"thinking": {"type": "enabled","clear_thinking": false}}),
+        );
+    }
+
     opts
 }
 
@@ -317,9 +324,9 @@ mod tests {
 
     #[test]
     fn test_glm_temperature() {
-        let d = ModelDefaults::for_model("zhipuai", "glm-4.6");
+        let d = ModelDefaults::for_model("zai", "glm-4.6");
         assert_eq!(d.temperature, Some(1.0));
-        let d = ModelDefaults::for_model("zhipuai", "glm-4.7");
+        let d = ModelDefaults::for_model("zai", "glm-4.7");
         assert_eq!(d.temperature, Some(1.0));
     }
 
@@ -482,13 +489,12 @@ mod tests {
         );
     }
 
-    // TODO: enable once zhipuai provider is added
     #[test]
-    #[ignore]
-    fn test_zhipuai_thinking() {
-        let d = ModelDefaults::for_model("zhipuai", "glm-4.6");
+    fn test_zai_thinking() {
+        let d = ModelDefaults::for_model("zai", "glm-4.6");
+        let extra = d.provider_options.get("extra_body").unwrap();
         assert_eq!(
-            d.provider_options.get("thinking"),
+            extra.get("thinking"),
             Some(&json!({"type": "enabled", "clear_thinking": false}))
         );
     }
