@@ -22,6 +22,7 @@ interface AppHeaderProps {
   isMobile: boolean;
   sessionId: string | null;
   connected: boolean;
+  reconnecting: boolean;
   isSessionActive: boolean;
   isConversationComplete: boolean;
   agentMode: string;
@@ -71,6 +72,7 @@ export function AppHeader(props: AppHeaderProps) {
     isMobile,
     sessionId,
     connected,
+    reconnecting,
     isSessionActive,
     isConversationComplete,
     agentMode,
@@ -119,7 +121,9 @@ export function AppHeader(props: AppHeaderProps) {
             >
               <span
                 className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-                  !connected
+                  reconnecting
+                    ? 'bg-status-warning animate-pulse'
+                    : !connected
                     ? 'bg-status-warning'
                     : isSessionActive
                     ? 'bg-accent-primary animate-pulse'
@@ -128,7 +132,9 @@ export function AppHeader(props: AppHeaderProps) {
                     : 'bg-status-success'
                 }`}
                 title={
-                  !connected
+                  reconnecting
+                    ? 'Reconnecting...'
+                    : !connected
                     ? 'Disconnected'
                     : isSessionActive
                     ? 'Thinking'

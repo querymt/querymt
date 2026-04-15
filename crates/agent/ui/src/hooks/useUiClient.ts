@@ -138,6 +138,11 @@ export function useUiClient() {
   const [activeAgentId, setActiveAgentId] = useState<string>('primary');
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
+  const reconnectAttemptRef = useRef(0);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sessionIdRef = useRef<string | null>(null);
+  sessionIdRef.current = sessionId;
   const [agentMode, setAgentModeState] = useState<string>('build');
   const agentModeRef = useRef(agentMode);
   agentModeRef.current = agentMode;
@@ -231,64 +236,129 @@ export function useUiClient() {
 
   useEffect(() => {
     let mounted = true;
+    const MAX_RECONNECT_DELAY = 30_000; // 30 seconds cap
+
     // Dynamically construct WebSocket URL from current page location
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const socket = new WebSocket(`${wsProtocol}//${window.location.host}/ui/ws`);
-    socketRef.current = socket;
+    const wsUrl = `${wsProtocol}//${window.location.host}/ui/ws`;
 
-    socket.onopen = () => {
-      if (!mounted) return;
-      setConnected(true);
-      sendMessage({ type: 'init' });
-      sendMessage({ type: 'list_all_models', data: { refresh: false } });
-      sendMessage({ type: 'get_recent_models', data: { limit_per_workspace: 10 } });
-      sendMessage({ type: 'list_remote_nodes' });
-      sendMessage({ type: 'list_mesh_invites' } as UiClientMessage);
-    };
+    /**
+     * Helper: send a JSON message on the given socket if it is open.
+     * Used inside `connect()` so we can fire init messages on a freshly
+     * opened socket before `socketRef` is necessarily updated.
+     */
+    function sendOnSocket(sock: WebSocket, message: UiClientMessage) {
+      if (sock.readyState === WebSocket.OPEN) {
+        sock.send(JSON.stringify(message));
+      }
+    }
 
-    socket.onclose = () => {
+    function connect() {
       if (!mounted) return;
-      setConnected(false);
-    };
 
-    socket.onerror = () => {
-      if (!mounted) return;
-      setConnected(false);
-    };
+      const socket = new WebSocket(wsUrl);
+      socketRef.current = socket;
 
-    socket.binaryType = 'arraybuffer';
-    socket.onmessage = (event) => {
-      if (!mounted) return;
-      if (event.data instanceof ArrayBuffer) {
-        // Binary frame: parse envelope [4-byte LE header_len][JSON header][payload]
-        try {
-          const view = new DataView(event.data);
-          if (event.data.byteLength < 4) return;
-          const headerLen = view.getUint32(0, true);
-          if (event.data.byteLength < 4 + headerLen) return;
-          const headerBytes = new Uint8Array(event.data, 4, headerLen);
-          const headerJson = new TextDecoder().decode(headerBytes);
-          const header = JSON.parse(headerJson);
-          const payload = event.data.slice(4 + headerLen);
-          if (header.type === 'speech_result') {
-            const mimeType = header.data?.mime_type ?? 'audio/wav';
-            speechCallbackRef.current?.(payload, mimeType);
-          }
-        } catch (err) {
-          console.error('Failed to parse binary frame:', err);
+      socket.onopen = () => {
+        if (!mounted) return;
+        debugLog('[WS] Connected', () => ({ attempt: reconnectAttemptRef.current }));
+        reconnectAttemptRef.current = 0;
+        setConnected(true);
+        setReconnecting(false);
+
+        // (Re-)initialise: fetch full state from backend
+        sendOnSocket(socket, { type: 'init' });
+        sendOnSocket(socket, { type: 'list_all_models', data: { refresh: false } });
+        sendOnSocket(socket, { type: 'get_recent_models', data: { limit_per_workspace: 10 } });
+        sendOnSocket(socket, { type: 'list_remote_nodes' });
+        sendOnSocket(socket, { type: 'list_mesh_invites' } as UiClientMessage);
+
+        // If we had an active session before disconnect, re-subscribe so
+        // we resume receiving events (and the backend replays anything we
+        // missed via the init/state handshake).
+        const prevSession = sessionIdRef.current;
+        if (prevSession) {
+          sendOnSocket(socket, {
+            type: 'subscribe_session',
+            data: { session_id: prevSession },
+          } as any);
         }
-        return;
-      }
-      try {
-        const msg = JSON.parse(event.data) as UiServerMessage;
-        handleServerMessageRef.current(msg);
-      } catch (err) {
-        console.error('Failed to parse UI message:', err);
-      }
-    };
+      };
+
+      socket.onclose = () => {
+        if (!mounted) return;
+        setConnected(false);
+        scheduleReconnect();
+      };
+
+      socket.onerror = () => {
+        if (!mounted) return;
+        setConnected(false);
+        // The 'error' event is always followed by a 'close' event which
+        // triggers `scheduleReconnect`, so we don't need to call it here.
+      };
+
+      socket.binaryType = 'arraybuffer';
+      socket.onmessage = (event) => {
+        if (!mounted) return;
+        if (event.data instanceof ArrayBuffer) {
+          // Binary frame: parse envelope [4-byte LE header_len][JSON header][payload]
+          try {
+            const view = new DataView(event.data);
+            if (event.data.byteLength < 4) return;
+            const headerLen = view.getUint32(0, true);
+            if (event.data.byteLength < 4 + headerLen) return;
+            const headerBytes = new Uint8Array(event.data, 4, headerLen);
+            const headerJson = new TextDecoder().decode(headerBytes);
+            const header = JSON.parse(headerJson);
+            const payload = event.data.slice(4 + headerLen);
+            if (header.type === 'speech_result') {
+              const mimeType = header.data?.mime_type ?? 'audio/wav';
+              speechCallbackRef.current?.(payload, mimeType);
+            }
+          } catch (err) {
+            console.error('Failed to parse binary frame:', err);
+          }
+          return;
+        }
+        try {
+          const msg = JSON.parse(event.data) as UiServerMessage;
+          handleServerMessageRef.current(msg);
+        } catch (err) {
+          console.error('Failed to parse UI message:', err);
+        }
+      };
+    }
+
+    function scheduleReconnect() {
+      if (!mounted) return;
+      // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (cap)
+      const delay = Math.min(
+        1000 * Math.pow(2, reconnectAttemptRef.current),
+        MAX_RECONNECT_DELAY,
+      );
+      reconnectAttemptRef.current += 1;
+      setReconnecting(true);
+      debugLog('[WS] Scheduling reconnect', () => ({ delayMs: delay, attempt: reconnectAttemptRef.current }));
+
+      reconnectTimerRef.current = setTimeout(() => {
+        reconnectTimerRef.current = null;
+        connect();
+      }, delay);
+    }
+
+    // --- Initial connection ---
+    connect();
 
     return () => {
       mounted = false;
+
+      // Cancel any pending reconnect timer
+      if (reconnectTimerRef.current !== null) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+
       const resolver = workspacePathDialogResolverRef.current;
       workspacePathDialogResolverRef.current = null;
       if (resolver) {
@@ -302,6 +372,7 @@ export function useUiClient() {
       }
       if (socketRef.current) {
         socketRef.current.close();
+        socketRef.current = null;
       }
     };
   }, []);
@@ -1645,6 +1716,7 @@ export function useUiClient() {
     mainSessionId,
     sessionId,
     connected,
+    reconnecting,
     newSession,
     sendPrompt,
     cancelSession,

@@ -118,6 +118,7 @@ const UiClientEventsContext = createContext<UiClientEventsContextValue | undefin
 export interface UiClientSessionContextValue {
   sessionId: string | null;
   connected: boolean;
+  reconnecting: boolean;
   agents: UiAgentInfo[];
   routingMode: RoutingMode;
   activeAgentId: string;
@@ -281,6 +282,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
   const sessionCtx = useMemo<UiClientSessionContextValue>(() => ({
     sessionId: uiClient.sessionId,
     connected: uiClient.connected,
+    reconnecting: uiClient.reconnecting,
     agents: uiClient.agents,
     routingMode: uiClient.routingMode,
     activeAgentId: uiClient.activeAgentId,
@@ -310,6 +312,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
   }), [
     uiClient.sessionId,
     uiClient.connected,
+    uiClient.reconnecting,
     uiClient.agents,
     uiClient.routingMode,
     uiClient.activeAgentId,

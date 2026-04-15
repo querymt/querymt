@@ -56,6 +56,7 @@ export function AppShell() {
 
   const {
     connected,
+    reconnecting,
     thinkingAgentId,
     thinkingAgentIds,
     sessionId,
@@ -258,6 +259,7 @@ export function AppShell() {
         isMobile={isMobile}
         sessionId={sessionId}
         connected={connected}
+        reconnecting={reconnecting}
         isSessionActive={isSessionActive}
         isConversationComplete={isConversationComplete}
         agentMode={agentMode}
