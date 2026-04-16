@@ -117,10 +117,8 @@ pub fn materialize_turns(events: &[AgentEvent]) -> (Vec<Turn>, SessionMeta) {
                 meta.system_prompts.push(message.clone());
             }
 
-            AgentEventKind::ToolsAvailable { tools, .. } => {
-                if meta.tool_definitions.is_none() {
-                    meta.tool_definitions = Some(tools.clone());
-                }
+            AgentEventKind::ToolsAvailable { tools, .. } if meta.tool_definitions.is_none() => {
+                meta.tool_definitions = Some(tools.clone());
             }
 
             // ── User messages ──────────────────────────────────────────

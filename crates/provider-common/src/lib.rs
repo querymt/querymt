@@ -267,7 +267,7 @@ pub fn list_cached_hf_gguf_models() -> Result<Vec<CachedGgufModel>, ModelRefErro
     }
 
     let mut models: Vec<CachedGgufModel> = deduped.into_values().collect();
-    models.sort_by(|a, b| b.modified.cmp(&a.modified));
+    models.sort_by_key(|b| std::cmp::Reverse(b.modified));
     Ok(models)
 }
 

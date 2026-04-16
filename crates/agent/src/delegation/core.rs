@@ -997,10 +997,10 @@ pub fn extract_session_summary_from_history(history: &[AgentMessage]) -> String 
                 MessagePart::Patch { files, diff, .. } => {
                     patches.push(format!("Files: {}\n\n{}", files.join(", "), diff));
                 }
-                MessagePart::Text { content } if message.role == ChatRole::Assistant => {
-                    if !content.trim().is_empty() {
-                        agent_responses.push(content.clone());
-                    }
+                MessagePart::Text { content }
+                    if message.role == ChatRole::Assistant && !content.trim().is_empty() =>
+                {
+                    agent_responses.push(content.clone());
                 }
                 _ => {}
             }

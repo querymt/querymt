@@ -222,13 +222,11 @@ impl AgentMessage {
                         content: inner,
                     });
                 }
-                MessagePart::Snapshot { changed_paths, .. } => {
-                    if !changed_paths.is_empty() {
-                        blocks.push(Content::text(format!(
-                            "\n[System: File changes: {}]",
-                            changed_paths.summary()
-                        )));
-                    }
+                MessagePart::Snapshot { changed_paths, .. } if !changed_paths.is_empty() => {
+                    blocks.push(Content::text(format!(
+                        "\n[System: File changes: {}]",
+                        changed_paths.summary()
+                    )));
                 }
                 MessagePart::Compaction { summary, .. } => {
                     blocks.push(Content::text(summary));
