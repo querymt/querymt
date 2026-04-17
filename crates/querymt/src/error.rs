@@ -56,7 +56,7 @@ pub enum LLMError {
     NotImplemented(String),
 
     /// Handles JSON serialization and deserialization errors.
-    #[error("JSON Error")]
+    #[error("JSON Error: {0}")]
     JsonError(#[from] serde_json::Error),
 
     /// Handles errors from parsing URLs.

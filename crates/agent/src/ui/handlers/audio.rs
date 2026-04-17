@@ -8,8 +8,29 @@ use super::super::ServerState;
 use super::super::connection::{send_binary, send_error, send_message};
 use super::super::messages::{AudioModelInfo, UiServerMessage};
 use querymt::LLMProvider;
+use serde_json::{Map, Value};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+fn prune_config_by_schema(cfg: &Value, schema: &Value) -> Value {
+    match (cfg, schema.get("properties")) {
+        (Value::Object(cfg_map), Some(Value::Object(props))) => {
+            let mut out = Map::with_capacity(cfg_map.len());
+            for (k, v) in cfg_map {
+                if let Some(prop_schema) = props.get(k) {
+                    let pruned_val = if prop_schema.get("properties").is_some() {
+                        prune_config_by_schema(v, prop_schema)
+                    } else {
+                        v.clone()
+                    };
+                    out.insert(k.clone(), pruned_val);
+                }
+            }
+            Value::Object(out)
+        }
+        _ => cfg.clone(),
+    }
+}
 
 // ── Provider resolution ────────────────────────────────────────────────────────
 
@@ -46,7 +67,9 @@ async fn build_provider(
             }
         }
     }
-    let config_json = config_json.to_string();
+    let schema: Value = serde_json::from_str(&factory.config_schema())
+        .map_err(|e| format!("Failed to parse provider schema for '{provider_name}': {e}"))?;
+    let config_json = prune_config_by_schema(&config_json, &schema).to_string();
 
     let provider: Arc<dyn LLMProvider> = Arc::from(
         factory
