@@ -93,6 +93,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         top_p: None,
         min_p: None,
         top_k: None,
+        repeat_penalty: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        penalty_last_n: None,
         system: vec![],
         n_batch: None,
         n_threads: None,
@@ -111,6 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mmproj_use_gpu: None,
         n_ubatch: None,
         text_only: None,
+        json_schema: None,
     };
 
     println!("Loading model: {}", args.model);

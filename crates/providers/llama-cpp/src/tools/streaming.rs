@@ -2,7 +2,7 @@ use crate::config::LlamaCppConfig;
 use crate::multimodal::MultimodalContext;
 use crate::tools::generation::parse_tool_response;
 use crate::tools::prefill::prefill_for_tool_generation;
-use crate::tools::sampler::build_tool_sampler;
+use crate::tools::sampler::{SamplingParams, build_tool_sampler};
 use futures::channel::mpsc;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::{AddBos, ChatTemplateResult, LlamaModel};
@@ -65,16 +65,8 @@ pub(crate) fn generate_streaming_with_tools(
         .streaming_state_oaicompat()
         .map_err(|e| LLMError::ProviderError(format!("Failed to init streaming state: {}", e)))?;
 
-    let seed = cfg.seed.unwrap_or(1234);
-    let mut sampler = build_tool_sampler(
-        model,
-        result,
-        temperature,
-        seed,
-        cfg.top_p,
-        cfg.top_k,
-        cfg.min_p,
-    );
+    let params = SamplingParams::from_config(cfg, temperature);
+    let mut sampler = build_tool_sampler(model, result, &params);
     let mut output_tokens = 0u32;
     let mut generated_text = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();

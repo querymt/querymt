@@ -25,6 +25,19 @@ pub struct LlamaCppConfig {
     pub min_p: Option<f32>,
     /// Top-k sampling.
     pub top_k: Option<u32>,
+    /// Repeat penalty. Penalizes tokens that have already appeared in the context.
+    /// 1.0 = disabled. Typical range: 1.0–1.5.
+    pub repeat_penalty: Option<f32>,
+    /// Presence penalty. Increases the likelihood of new tokens appearing.
+    /// 0.0 = disabled. Typical range: 0.0–2.0.
+    pub presence_penalty: Option<f32>,
+    /// Frequency penalty. Penalizes tokens proportional to how often they have appeared.
+    /// 0.0 = disabled. Typical range: 0.0–2.0.
+    pub frequency_penalty: Option<f32>,
+    /// Number of last tokens to consider for repeat/presence/frequency penalties.
+    /// -1 = full context, 0 = disabled. Defaults to 64 when any penalty is set
+    /// but this is not explicitly configured.
+    pub penalty_last_n: Option<i32>,
     /// System prompt to prepend to chat requests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system: Vec<String>,

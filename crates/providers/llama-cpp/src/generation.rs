@@ -7,7 +7,7 @@ use crate::context::{
 use crate::messages;
 use crate::multimodal::MultimodalContext;
 use crate::response::GeneratedText;
-use crate::tools::sampler::{build_fallback_sampler, build_standard_sampler};
+use crate::tools::sampler::{SamplingParams, build_fallback_sampler, build_standard_sampler};
 use futures::channel::mpsc;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -330,13 +330,9 @@ pub(crate) fn generate(
 
     // UNIFIED GENERATION PHASE (identical for both paths)
 
-    let seed = cfg.seed.unwrap_or(1234);
-    let mut sampler = build_standard_sampler(temperature, seed, cfg.top_p, cfg.top_k, cfg.min_p);
-    let allow_fallback = temperature.is_none()
-        && cfg.temperature.is_none()
-        && cfg.top_p.is_none()
-        && cfg.top_k.is_none()
-        && cfg.min_p.is_none();
+    let params = SamplingParams::from_config(cfg, temperature);
+    let mut sampler = build_standard_sampler(&params);
+    let allow_fallback = !params.is_explicit();
     let mut fallback_used = false;
 
     let mut n_cur = n_past;
@@ -349,7 +345,7 @@ pub(crate) fn generate(
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         if model.is_eog_token(token) {
             if output_tokens == 0 && allow_fallback && !fallback_used {
-                sampler = build_fallback_sampler(seed);
+                sampler = build_fallback_sampler(params.seed);
                 fallback_used = true;
                 continue;
             }
@@ -594,13 +590,9 @@ pub(crate) fn generate_streaming(
     };
 
     // UNIFIED GENERATION PHASE (identical for both paths)
-    let seed = cfg.seed.unwrap_or(1234);
-    let mut sampler = build_standard_sampler(temperature, seed, cfg.top_p, cfg.top_k, cfg.min_p);
-    let allow_fallback = temperature.is_none()
-        && cfg.temperature.is_none()
-        && cfg.top_p.is_none()
-        && cfg.top_k.is_none()
-        && cfg.min_p.is_none();
+    let params = SamplingParams::from_config(cfg, temperature);
+    let mut sampler = build_standard_sampler(&params);
+    let allow_fallback = !params.is_explicit();
     let mut fallback_used = false;
 
     let mut n_cur = n_past;
@@ -612,7 +604,7 @@ pub(crate) fn generate_streaming(
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         if model.is_eog_token(token) {
             if output_tokens == 0 && allow_fallback && !fallback_used {
-                sampler = build_fallback_sampler(seed);
+                sampler = build_fallback_sampler(params.seed);
                 fallback_used = true;
                 continue;
             }
@@ -867,13 +859,9 @@ pub(crate) fn generate_streaming_with_thinking(
         .streaming_state_oaicompat()
         .map_err(|e| LLMError::ProviderError(format!("Failed to init streaming state: {}", e)))?;
 
-    let seed = cfg.seed.unwrap_or(1234);
-    let mut sampler = build_standard_sampler(temperature, seed, cfg.top_p, cfg.top_k, cfg.min_p);
-    let allow_fallback = temperature.is_none()
-        && cfg.temperature.is_none()
-        && cfg.top_p.is_none()
-        && cfg.top_k.is_none()
-        && cfg.min_p.is_none();
+    let params = SamplingParams::from_config(cfg, temperature);
+    let mut sampler = build_standard_sampler(&params);
+    let allow_fallback = !params.is_explicit();
     let mut fallback_used = false;
 
     let mut n_cur = n_past;
@@ -885,7 +873,7 @@ pub(crate) fn generate_streaming_with_thinking(
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         if model.is_eog_token(token) {
             if output_tokens == 0 && allow_fallback && !fallback_used {
-                sampler = build_fallback_sampler(seed);
+                sampler = build_fallback_sampler(params.seed);
                 fallback_used = true;
                 continue;
             }
