@@ -424,7 +424,20 @@ async fn execute_delegation(
     }
 
     // 1. Create session via AgentHandle trait
-    let cwd_string = ctx.config.cwd.as_ref().map(|p| p.display().to_string());
+    // Prefer parent session's cwd over orchestrator default
+    let parent_cwd = match ctx.store.get_session(&parent_session_id).await {
+        Ok(Some(session)) => session.cwd,
+        Ok(None) => {
+            warn!("Parent session not found for cwd lookup, using orchestrator default");
+            None
+        }
+        Err(e) => {
+            warn!("Failed to lookup parent session cwd: {e}, using orchestrator default");
+            None
+        }
+    };
+    let effective_cwd = parent_cwd.or(ctx.config.cwd.clone());
+    let cwd_string = effective_cwd.as_ref().map(|p| p.display().to_string());
     let (child_session_id, session_ref) = match async {
         target
             .create_delegation_session(cwd_string, parent_session_id.clone())
