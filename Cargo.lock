@@ -101,9 +101,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-schema"
-version = "0.12.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49bae57dad1c28a362fbdcf7bab0583316a02b45a70792109fced55780a3b63c"
+checksum = "a124d7628de03b8576a070967f9470135af5b8e4a7ba650f62188dc9e2c2daa7"
 dependencies = [
  "anyhow",
  "derive_more",
@@ -5846,7 +5846,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -11003,7 +11003,7 @@ name = "querymt-agent"
 version = "0.3.3"
 dependencies = [
  "agent-client-protocol",
- "agent-client-protocol-schema 0.12.0",
+ "agent-client-protocol-schema 0.12.1",
  "anyhow",
  "arc-swap",
  "async-trait",
@@ -16841,7 +16841,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "windows 0.62.2",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
