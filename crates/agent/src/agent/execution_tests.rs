@@ -12,7 +12,7 @@ use crate::test_utils::{
     TestProviderFactory, mock_llm_config, mock_plugin_registry, mock_querymt_tool_call,
     mock_session,
 };
-use agent_client_protocol::StopReason;
+use agent_client_protocol::schema::StopReason;
 use mockall::Sequence;
 use querymt::LLMParams;
 use querymt::chat::{Content, FunctionTool, Tool};

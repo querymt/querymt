@@ -20,7 +20,7 @@ use crate::send_agent::SendAgent;
 use crate::server::AgentServer;
 use crate::session::backend::{StorageBackend, default_agent_db_path};
 use crate::session::sqlite_storage::SqliteStorage;
-use agent_client_protocol::{ContentBlock, NewSessionRequest, PromptRequest, TextContent};
+use agent_client_protocol::schema::{ContentBlock, NewSessionRequest, PromptRequest, TextContent};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use querymt::LLMParams;

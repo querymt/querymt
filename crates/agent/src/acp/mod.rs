@@ -20,7 +20,7 @@ use crate::acp::shared::{
     handle_rpc_message, is_event_owned, translate_event_to_notification,
 };
 use crate::event_fanout::EventFanout;
-use agent_client_protocol::{Error, RequestPermissionRequest, RequestPermissionResponse};
+
 use axum::{
     Router,
     extract::{
@@ -34,7 +34,7 @@ use futures_util::{sink::SinkExt, stream::StreamExt as FuturesStreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
 pub struct AcpServer {
@@ -60,12 +60,6 @@ impl AcpServer {
         let pending_permissions = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations = agent.pending_elicitations();
         let session_owners = Arc::new(Mutex::new(HashMap::new()));
-
-        let client = WebClientBridge {
-            pending_permissions: pending_permissions.clone(),
-            pending_elicitations: pending_elicitations.clone(),
-        };
-        agent.set_client(Arc::new(client));
 
         Self {
             agent,
@@ -149,40 +143,6 @@ impl AcpServer {
         send_task.abort();
 
         Ok(())
-    }
-}
-
-struct WebClientBridge {
-    pending_permissions: PermissionMap,
-    #[allow(dead_code)]
-    pending_elicitations: PendingElicitationMap,
-}
-
-#[async_trait::async_trait(?Send)]
-impl agent_client_protocol::Client for WebClientBridge {
-    async fn session_notification(
-        &self,
-        _notif: agent_client_protocol::SessionNotification,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
-
-    async fn request_permission(
-        &self,
-        req: RequestPermissionRequest,
-    ) -> Result<RequestPermissionResponse, Error> {
-        let (tx, rx) = oneshot::channel();
-        let tool_call_id = req.tool_call.tool_call_id.0.clone();
-
-        {
-            let mut pending = self.pending_permissions.lock().await;
-            pending.insert(tool_call_id.to_string(), tx);
-        }
-
-        match rx.await {
-            Ok(outcome) => Ok(RequestPermissionResponse::new(outcome)),
-            Err(_) => Err(Error::from(crate::error::AgentError::PermissionCancelled)),
-        }
     }
 }
 

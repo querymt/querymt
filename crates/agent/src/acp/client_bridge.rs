@@ -43,7 +43,7 @@
 //! }
 //! ```
 
-use agent_client_protocol::{
+use agent_client_protocol::schema::{
     Error, RequestPermissionRequest, RequestPermissionResponse, SessionNotification,
 };
 use tokio::sync::{mpsc, oneshot};

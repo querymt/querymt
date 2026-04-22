@@ -24,7 +24,7 @@ use crate::session::{SqliteStorage, StorageBackend};
 use crate::snapshot::GitSnapshotBackend;
 use crate::tools::CapabilityRequirement;
 use crate::tools::builtins::all_builtin_tools;
-use agent_client_protocol::{ContentBlock, PromptRequest, TextContent};
+use agent_client_protocol::schema::{ContentBlock, PromptRequest, TextContent};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::Value;

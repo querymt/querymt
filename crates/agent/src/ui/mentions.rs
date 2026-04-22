@@ -10,7 +10,7 @@ use crate::index::{
     FileIndex, FileIndexEntry, GetOrCreate, WorkspaceIndexManagerActor, resolve_workspace_root,
 };
 use crate::tools::builtins::read_shared::{DEFAULT_READ_LIMIT, render_read_output};
-use agent_client_protocol::{ContentBlock, ImageContent, TextContent};
+use agent_client_protocol::schema::{ContentBlock, ImageContent, TextContent};
 use base64::Engine;
 use kameo::actor::ActorRef;
 use std::collections::{HashMap, HashSet};

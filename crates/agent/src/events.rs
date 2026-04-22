@@ -1,4 +1,4 @@
-use agent_client_protocol::StopReason;
+use agent_client_protocol::schema::StopReason;
 use querymt::Usage;
 use querymt::chat::FinishReason;
 use serde::{Deserialize, Serialize};

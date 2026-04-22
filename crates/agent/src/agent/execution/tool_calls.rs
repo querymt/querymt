@@ -430,7 +430,7 @@ pub(super) async fn ensure_tool_permission(
     bridge: Option<&ClientBridgeSender>,
 ) -> Result<bool, agent_client_protocol::Error> {
     use crate::agent::utils::{extract_locations, tool_kind_for_tool};
-    use agent_client_protocol::{
+    use agent_client_protocol::schema::{
         PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
         RequestPermissionRequest, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
     };

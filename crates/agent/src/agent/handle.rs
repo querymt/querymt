@@ -19,8 +19,8 @@ use crate::middleware::CompositeDriver;
 use crate::send_agent::SendAgent;
 use crate::session::store::LLMConfig;
 use crate::tools::ToolRegistry;
-use agent_client_protocol::{
-    AuthenticateRequest, AuthenticateResponse, CancelNotification, Client, Error, ExtNotification,
+use agent_client_protocol::schema::{
+    AuthenticateRequest, AuthenticateResponse, CancelNotification, Error, ExtNotification,
     ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
     LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
@@ -139,7 +139,6 @@ pub struct LocalAgentHandle {
 
     // Connection-level mutable state
     pub client_state: Arc<StdMutex<Option<ClientState>>>,
-    pub client: Arc<StdMutex<Option<Arc<dyn Client + Send + Sync>>>>,
     pub bridge: Arc<StdMutex<Option<ClientBridgeSender>>>,
 
     // Mutable default mode (UI "set agent mode" → affects new sessions)
@@ -190,7 +189,6 @@ impl LocalAgentHandle {
             config,
             registry,
             client_state: Arc::new(StdMutex::new(None)),
-            client: Arc::new(StdMutex::new(None)),
             bridge: Arc::new(StdMutex::new(None)),
             default_mode: StdMutex::new(crate::agent::core::AgentMode::Build),
             default_reasoning_effort: ArcSwap::from_pointee(None),
@@ -228,13 +226,6 @@ impl LocalAgentHandle {
     /// Access the workspace manager actor ref.
     pub fn workspace_manager_actor(&self) -> ActorRef<WorkspaceIndexManagerActor> {
         self.config.workspace_manager_actor()
-    }
-
-    /// Sets the client for protocol communication.
-    pub fn set_client(&self, client: Arc<dyn Client + Send + Sync>) {
-        if let Ok(mut handle) = self.client.lock() {
-            *handle = Some(client);
-        }
     }
 
     /// Sets the client bridge for ACP stdio communication.
@@ -1539,7 +1530,7 @@ impl AgentHandle for LocalAgentHandle {
 impl SendAgent for LocalAgentHandle {
     #[tracing::instrument(name = "acp.initialize", skip_all)]
     async fn initialize(&self, req: InitializeRequest) -> Result<InitializeResponse, Error> {
-        use agent_client_protocol::{
+        use agent_client_protocol::schema::{
             AgentCapabilities, Implementation, McpCapabilities, PromptCapabilities, ProtocolVersion,
         };
 
@@ -1705,8 +1696,8 @@ impl SendAgent for LocalAgentHandle {
     #[tracing::instrument(name = "acp.set_session_mode", skip_all, fields(session_id = %req.session_id))]
     async fn set_session_mode(
         &self,
-        req: agent_client_protocol::SetSessionModeRequest,
-    ) -> Result<agent_client_protocol::SetSessionModeResponse, Error> {
+        req: agent_client_protocol::schema::SetSessionModeRequest,
+    ) -> Result<agent_client_protocol::schema::SetSessionModeResponse, Error> {
         let mode = req
             .mode_id
             .0
@@ -1725,16 +1716,16 @@ impl SendAgent for LocalAgentHandle {
         };
 
         session_ref.set_mode(mode).await.map_err(Error::from)?;
-        Ok(agent_client_protocol::SetSessionModeResponse::new())
+        Ok(agent_client_protocol::schema::SetSessionModeResponse::new())
     }
 
     #[tracing::instrument(name = "acp.set_session_config_option", skip_all, fields(session_id = %req.session_id))]
     async fn set_session_config_option(
         &self,
-        req: agent_client_protocol::SetSessionConfigOptionRequest,
-    ) -> Result<agent_client_protocol::SetSessionConfigOptionResponse, Error> {
+        req: agent_client_protocol::schema::SetSessionConfigOptionRequest,
+    ) -> Result<agent_client_protocol::schema::SetSessionConfigOptionResponse, Error> {
         use crate::agent::session_registry::config_options;
-        use agent_client_protocol::SessionConfigOptionValue;
+        use agent_client_protocol::schema::SessionConfigOptionValue;
 
         let config_id = req.config_id.0.as_ref();
 
@@ -1765,9 +1756,11 @@ impl SendAgent for LocalAgentHandle {
                 session_ref.set_mode(mode).await.map_err(Error::from)?;
 
                 let effort = session_ref.get_reasoning_effort().await.ok().flatten();
-                Ok(agent_client_protocol::SetSessionConfigOptionResponse::new(
-                    config_options(mode, effort),
-                ))
+                Ok(
+                    agent_client_protocol::schema::SetSessionConfigOptionResponse::new(
+                        config_options(mode, effort),
+                    ),
+                )
             }
             "reasoning_effort" => {
                 let effort_str = value_id.0.as_ref();
@@ -1803,9 +1796,11 @@ impl SendAgent for LocalAgentHandle {
 
                 let mode = session_ref.get_mode().await.unwrap_or(AgentMode::Build);
 
-                Ok(agent_client_protocol::SetSessionConfigOptionResponse::new(
-                    config_options(mode, effort),
-                ))
+                Ok(
+                    agent_client_protocol::schema::SetSessionConfigOptionResponse::new(
+                        config_options(mode, effort),
+                    ),
+                )
             }
             _ => Err(Error::invalid_params().data(serde_json::json!({
                 "error": format!("Unsupported configId: {}", config_id),
@@ -2201,7 +2196,7 @@ mod tests {
         MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
         mock_plugin_registry, mock_session,
     };
-    use agent_client_protocol::{
+    use agent_client_protocol::schema::{
         CancelNotification, InitializeRequest, ListSessionsRequest, ProtocolVersion, SessionId,
     };
     use querymt::LLMParams;
@@ -2332,7 +2327,7 @@ mod tests {
     #[tokio::test]
     async fn test_prompt_unknown_session_returns_error() {
         let f = HandleFixture::new().await;
-        let req = agent_client_protocol::PromptRequest::new(
+        let req = agent_client_protocol::schema::PromptRequest::new(
             SessionId::from("no-such-session".to_string()),
             vec![],
         );
@@ -2346,7 +2341,7 @@ mod tests {
         let null_params = std::sync::Arc::from(
             serde_json::value::RawValue::from_string("null".to_string()).unwrap(),
         );
-        let req = agent_client_protocol::ExtRequest::new("my_method", null_params);
+        let req = agent_client_protocol::schema::ExtRequest::new("my_method", null_params);
         let resp = f.handle.ext_method(req).await.expect("ext_method");
         assert_eq!(resp.0.get(), "null");
     }
@@ -2357,7 +2352,7 @@ mod tests {
         let null_params = std::sync::Arc::from(
             serde_json::value::RawValue::from_string("null".to_string()).unwrap(),
         );
-        let notif = agent_client_protocol::ExtNotification::new("my_event", null_params);
+        let notif = agent_client_protocol::schema::ExtNotification::new("my_event", null_params);
         f.handle
             .ext_notification(notif)
             .await
@@ -2573,9 +2568,9 @@ mod tests {
     #[tokio::test]
     async fn test_set_session_model_unknown_session_fails() {
         let f = HandleFixture::new().await;
-        let req = agent_client_protocol::SetSessionModelRequest::new(
+        let req = agent_client_protocol::schema::SetSessionModelRequest::new(
             SessionId::from("no-session".to_string()),
-            agent_client_protocol::ModelId::from("anthropic/claude-3-5-sonnet".to_string()),
+            agent_client_protocol::schema::ModelId::from("anthropic/claude-3-5-sonnet".to_string()),
         );
         let result = f.handle.set_session_model(req).await;
         assert!(result.is_err());
@@ -2591,7 +2586,7 @@ mod tests {
             .await
             .unwrap();
 
-        let req = agent_client_protocol::AuthenticateRequest::new("any-method".to_string());
+        let req = agent_client_protocol::schema::AuthenticateRequest::new("any-method".to_string());
         // With no auth_methods configured, any method id is accepted
         let result = f.handle.authenticate(req).await;
         assert!(result.is_ok());

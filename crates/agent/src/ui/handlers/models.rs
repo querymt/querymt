@@ -515,7 +515,7 @@ pub async fn handle_set_session_model(
     #[cfg(not(feature = "remote"))]
     let effective_node_id: Option<crate::agent::remote::NodeId> = None;
 
-    let req = agent_client_protocol::SetSessionModelRequest::new(
+    let req = agent_client_protocol::schema::SetSessionModelRequest::new(
         session_id.to_string(),
         model_id.to_string(),
     );

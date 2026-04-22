@@ -18,7 +18,7 @@ use crate::middleware::{
 };
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::{TaskKind, TaskStatus};
-use agent_client_protocol::{ContentBlock, ContentChunk, SessionUpdate, TextContent};
+use agent_client_protocol::schema::{ContentBlock, ContentChunk, SessionUpdate, TextContent};
 use anyhow::Context as _;
 use futures_util::StreamExt;
 use futures_util::future::join_all;

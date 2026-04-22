@@ -1,6 +1,6 @@
 use crate::agent::utils::render_prompt_for_llm;
 use crate::index::merkle::DiffPaths;
-use agent_client_protocol::ContentBlock;
+use agent_client_protocol::schema::ContentBlock;
 use querymt::{
     ToolCall,
     chat::{ChatMessage, ChatRole, Content},
@@ -257,7 +257,7 @@ impl AgentMessage {
 #[cfg(test)]
 mod tests {
     use super::{AgentMessage, MessagePart};
-    use agent_client_protocol::{ContentBlock, TextContent};
+    use agent_client_protocol::schema::{ContentBlock, TextContent};
     use querymt::chat::{ChatRole, Content};
 
     #[test]

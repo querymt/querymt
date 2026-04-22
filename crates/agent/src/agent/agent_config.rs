@@ -18,7 +18,7 @@ use crate::session::compaction::SessionCompaction;
 use crate::session::provider::SessionProvider;
 use crate::session::store::SessionExecutionConfig;
 use crate::tools::ToolRegistry;
-use agent_client_protocol::AuthMethod;
+use agent_client_protocol::schema::AuthMethod;
 use arc_swap::ArcSwap;
 use kameo::actor::ActorRef;
 use querymt::chat::ReasoningEffort;
@@ -148,9 +148,9 @@ impl AgentConfig {
         self.mutating_tools.contains(tool_name)
             || matches!(
                 crate::agent::utils::tool_kind_for_tool(tool_name),
-                agent_client_protocol::ToolKind::Edit
-                    | agent_client_protocol::ToolKind::Delete
-                    | agent_client_protocol::ToolKind::Execute
+                agent_client_protocol::schema::ToolKind::Edit
+                    | agent_client_protocol::schema::ToolKind::Delete
+                    | agent_client_protocol::schema::ToolKind::Execute
             )
     }
 

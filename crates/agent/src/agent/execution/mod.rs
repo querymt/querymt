@@ -23,7 +23,7 @@ use crate::agent::execution_context::ExecutionContext;
 use crate::agent::utils::u32_from_usize;
 use crate::events::{AgentEventKind, ExecutionMetrics, StopType};
 use crate::middleware::ExecutionState;
-use agent_client_protocol::StopReason;
+use agent_client_protocol::schema::StopReason;
 use log::{debug, info, trace, warn};
 use querymt::chat::ChatRole;
 use std::sync::Arc;

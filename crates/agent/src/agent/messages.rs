@@ -13,7 +13,7 @@
 use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::core::AgentMode;
 use crate::agent::remote::NodeId;
-use agent_client_protocol::{
+use agent_client_protocol::schema::{
     ExtNotification as AcpExtNotification, ExtRequest, PromptRequest, SetSessionModelRequest,
 };
 use querymt::LLMParams;
