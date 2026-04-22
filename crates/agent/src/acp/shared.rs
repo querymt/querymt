@@ -9,7 +9,7 @@ use crate::event_fanout::EventFanout;
 use crate::events::{AgentEventKind, EventEnvelope};
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
-use agent_client_protocol::{
+use agent_client_protocol::schema::{
     Content, ContentBlock, ContentChunk, Error, Plan, PlanEntry, PlanEntryPriority,
     PlanEntryStatus, RequestPermissionOutcome, SessionUpdate, TextContent, ToolCall,
     ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
@@ -524,7 +524,7 @@ pub async fn handle_rpc_message<S: SendAgent>(
                 serde_json::value::RawValue::from_string("null".to_string()).unwrap()
             });
             let ext_req =
-                agent_client_protocol::ExtRequest::new(m, std::sync::Arc::from(raw_params));
+                agent_client_protocol::schema::ExtRequest::new(m, std::sync::Arc::from(raw_params));
             agent
                 .ext_method(ext_req)
                 .await
@@ -683,14 +683,14 @@ mod tests {
 
     #[test]
     fn mode_config_option_contains_expected_shape() {
-        use agent_client_protocol::SessionConfigOptionCategory;
+        use agent_client_protocol::schema::SessionConfigOptionCategory;
         let options = session_config_options(AgentMode::Plan, None);
         assert_eq!(options.len(), 2);
         assert_eq!(options[0].id.0.as_ref(), "mode");
         assert_eq!(options[0].category, Some(SessionConfigOptionCategory::Mode));
 
         let select = match &options[0].kind {
-            agent_client_protocol::SessionConfigKind::Select(select) => select,
+            agent_client_protocol::schema::SessionConfigKind::Select(select) => select,
             _ => panic!("expected select config option"),
         };
         assert_eq!(select.current_value.0.as_ref(), "plan");
@@ -698,7 +698,7 @@ mod tests {
 
     #[test]
     fn reasoning_effort_config_option_contains_expected_shape() {
-        use agent_client_protocol::SessionConfigOptionCategory;
+        use agent_client_protocol::schema::SessionConfigOptionCategory;
         let options =
             session_config_options(AgentMode::Build, Some(querymt::chat::ReasoningEffort::High));
         assert_eq!(options.len(), 2);
@@ -709,7 +709,7 @@ mod tests {
         );
 
         let select = match &options[1].kind {
-            agent_client_protocol::SessionConfigKind::Select(select) => select,
+            agent_client_protocol::schema::SessionConfigKind::Select(select) => select,
             _ => panic!("expected select config option"),
         };
         assert_eq!(select.current_value.0.as_ref(), "high");
@@ -719,7 +719,7 @@ mod tests {
     fn reasoning_effort_config_option_auto_when_none() {
         let options = session_config_options(AgentMode::Build, None);
         let select = match &options[1].kind {
-            agent_client_protocol::SessionConfigKind::Select(select) => select,
+            agent_client_protocol::schema::SessionConfigKind::Select(select) => select,
             _ => panic!("expected select config option"),
         };
         assert_eq!(select.current_value.0.as_ref(), "auto");
@@ -741,73 +741,73 @@ mod tests {
         impl SendAgent for Dummy {
             async fn initialize(
                 &self,
-                _: agent_client_protocol::InitializeRequest,
-            ) -> Result<agent_client_protocol::InitializeResponse, Error> {
+                _: agent_client_protocol::schema::InitializeRequest,
+            ) -> Result<agent_client_protocol::schema::InitializeResponse, Error> {
                 unreachable!()
             }
             async fn authenticate(
                 &self,
-                _: agent_client_protocol::AuthenticateRequest,
-            ) -> Result<agent_client_protocol::AuthenticateResponse, Error> {
+                _: agent_client_protocol::schema::AuthenticateRequest,
+            ) -> Result<agent_client_protocol::schema::AuthenticateResponse, Error> {
                 unreachable!()
             }
             async fn new_session(
                 &self,
-                _: agent_client_protocol::NewSessionRequest,
-            ) -> Result<agent_client_protocol::NewSessionResponse, Error> {
+                _: agent_client_protocol::schema::NewSessionRequest,
+            ) -> Result<agent_client_protocol::schema::NewSessionResponse, Error> {
                 unreachable!()
             }
             async fn prompt(
                 &self,
-                _: agent_client_protocol::PromptRequest,
-            ) -> Result<agent_client_protocol::PromptResponse, Error> {
+                _: agent_client_protocol::schema::PromptRequest,
+            ) -> Result<agent_client_protocol::schema::PromptResponse, Error> {
                 unreachable!()
             }
             async fn cancel(
                 &self,
-                _: agent_client_protocol::CancelNotification,
+                _: agent_client_protocol::schema::CancelNotification,
             ) -> Result<(), Error> {
                 unreachable!()
             }
             async fn load_session(
                 &self,
-                _: agent_client_protocol::LoadSessionRequest,
-            ) -> Result<agent_client_protocol::LoadSessionResponse, Error> {
+                _: agent_client_protocol::schema::LoadSessionRequest,
+            ) -> Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
                 unreachable!()
             }
             async fn list_sessions(
                 &self,
-                _: agent_client_protocol::ListSessionsRequest,
-            ) -> Result<agent_client_protocol::ListSessionsResponse, Error> {
+                _: agent_client_protocol::schema::ListSessionsRequest,
+            ) -> Result<agent_client_protocol::schema::ListSessionsResponse, Error> {
                 unreachable!()
             }
             async fn fork_session(
                 &self,
-                _: agent_client_protocol::ForkSessionRequest,
-            ) -> Result<agent_client_protocol::ForkSessionResponse, Error> {
+                _: agent_client_protocol::schema::ForkSessionRequest,
+            ) -> Result<agent_client_protocol::schema::ForkSessionResponse, Error> {
                 unreachable!()
             }
             async fn resume_session(
                 &self,
-                _: agent_client_protocol::ResumeSessionRequest,
-            ) -> Result<agent_client_protocol::ResumeSessionResponse, Error> {
+                _: agent_client_protocol::schema::ResumeSessionRequest,
+            ) -> Result<agent_client_protocol::schema::ResumeSessionResponse, Error> {
                 unreachable!()
             }
             async fn set_session_model(
                 &self,
-                _: agent_client_protocol::SetSessionModelRequest,
-            ) -> Result<agent_client_protocol::SetSessionModelResponse, Error> {
+                _: agent_client_protocol::schema::SetSessionModelRequest,
+            ) -> Result<agent_client_protocol::schema::SetSessionModelResponse, Error> {
                 unreachable!()
             }
             async fn ext_method(
                 &self,
-                _: agent_client_protocol::ExtRequest,
-            ) -> Result<agent_client_protocol::ExtResponse, Error> {
+                _: agent_client_protocol::schema::ExtRequest,
+            ) -> Result<agent_client_protocol::schema::ExtResponse, Error> {
                 unreachable!()
             }
             async fn ext_notification(
                 &self,
-                _: agent_client_protocol::ExtNotification,
+                _: agent_client_protocol::schema::ExtNotification,
             ) -> Result<(), Error> {
                 unreachable!()
             }

@@ -9,7 +9,7 @@ use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::handle::AgentHandle as AgentHandleTrait;
 use crate::events::EventEnvelope;
 use crate::index::{normalize_cwd, resolve_workspace_root};
-use agent_client_protocol::{ContentBlock, NewSessionRequest, PromptRequest};
+use agent_client_protocol::schema::{ContentBlock, NewSessionRequest, PromptRequest};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;

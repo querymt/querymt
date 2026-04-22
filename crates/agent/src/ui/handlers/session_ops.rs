@@ -14,7 +14,7 @@ use crate::events::EventEnvelope;
 use crate::index::resolve_workspace_root;
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
-use agent_client_protocol::{CancelNotification, LoadSessionRequest, SessionId};
+use agent_client_protocol::schema::{CancelNotification, LoadSessionRequest, SessionId};
 use querymt::chat::ReasoningEffort;
 use std::path::PathBuf;
 use std::sync::Arc;

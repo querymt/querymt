@@ -26,7 +26,7 @@ use crate::session::projection::EventJournal;
 use crate::session::provider::SessionProvider;
 use crate::session::store::SessionStore;
 use crate::tools::ToolRegistry;
-use agent_client_protocol::AuthMethod;
+use agent_client_protocol::schema::AuthMethod;
 use arc_swap::ArcSwap;
 use querymt::LLMParams;
 use querymt::plugin::host::PluginRegistry;

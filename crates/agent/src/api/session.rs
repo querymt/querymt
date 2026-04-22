@@ -5,7 +5,7 @@ use super::utils::latest_assistant_message;
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::runner::ChatSession;
 use crate::send_agent::SendAgent;
-use agent_client_protocol::{ContentBlock, PromptRequest, TextContent};
+use agent_client_protocol::schema::{ContentBlock, PromptRequest, TextContent};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use querymt::LLMParams;

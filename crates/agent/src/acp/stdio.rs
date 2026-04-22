@@ -38,11 +38,14 @@
 use crate::acp::client_bridge::{ClientBridgeMessage, ClientBridgeSender};
 use crate::acp::shutdown;
 use crate::event_fanout::EventFanout;
-use crate::send_agent::ApcAgentAdapter;
-use agent_client_protocol::{
-    AgentSideConnection, Client, ExtRequest, SessionId, SessionNotification,
+use crate::send_agent::SendAgent;
+use agent_client_protocol::schema::{
+    AuthenticateRequest, CancelNotification, ExtRequest, ForkSessionRequest, InitializeRequest,
+    ListSessionsRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
+    ResumeSessionRequest, SessionId, SessionNotification, SetSessionConfigOptionRequest,
+    SetSessionModeRequest, SetSessionModelRequest,
 };
-use std::rc::Rc;
+use agent_client_protocol::{self as acp, ByteStreams, ConnectionTo};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -59,7 +62,7 @@ use tracing::info_span;
 /// - **RequestPermission**: Request-response, send result back via oneshot channel
 async fn run_bridge_task(
     mut rx: mpsc::Receiver<ClientBridgeMessage>,
-    _connection: Rc<AgentSideConnection>,
+    connection: ConnectionTo<acp::Client>,
 ) {
     log::info!("Client bridge task started");
 
@@ -68,7 +71,7 @@ async fn run_bridge_task(
             ClientBridgeMessage::Notification(notif) => {
                 let _span = info_span!("acp.notification").entered();
                 log::debug!("Bridge: forwarding session notification");
-                if let Err(e) = _connection.session_notification(notif).await {
+                if let Err(e) = connection.send_notification(notif) {
                     log::error!("Bridge: session_notification failed: {:?}", e);
                 }
             }
@@ -78,7 +81,7 @@ async fn run_bridge_task(
             } => {
                 let _span = info_span!("acp.permission_request").entered();
                 log::debug!("Bridge: forwarding permission request");
-                let result = _connection.request_permission(request).await;
+                let result = connection.send_request(request).block_task().await;
 
                 if response_tx.send(result).is_err() {
                     log::error!("Bridge: failed to send permission response (receiver dropped)");
@@ -108,12 +111,11 @@ async fn run_bridge_task(
                 let raw_value = serde_json::value::RawValue::from_string(params_json)
                     .expect("valid JSON from serde_json::to_string");
 
-                let ext_req = agent_client_protocol::ExtRequest::new(
-                    "querymt/elicit",
-                    std::sync::Arc::from(raw_value),
-                );
-
-                let result = _connection.ext_method(ext_req).await;
+                let ext_req = ExtRequest::new("querymt/elicit", std::sync::Arc::from(raw_value));
+                let result = match acp::UntypedMessage::new(&ext_req.method, &ext_req.params) {
+                    Ok(outbound) => connection.send_request(outbound).block_task().await,
+                    Err(err) => Err(err),
+                };
 
                 let parsed = match result {
                     Ok(ext_resp) => {
@@ -122,7 +124,7 @@ async fn run_bridge_task(
                             action: String,
                             content: Option<serde_json::Value>,
                         }
-                        match serde_json::from_str::<ElicitResponse>(ext_resp.0.get()) {
+                        match serde_json::from_value::<ElicitResponse>(ext_resp) {
                             Ok(resp) => {
                                 let action = match resp.action.as_str() {
                                     "accept" => crate::elicitation::ElicitationAction::Accept,
@@ -167,17 +169,17 @@ async fn run_bridge_task(
 
                 let ext_req = ExtRequest::new("workspace/query", Arc::from(raw_value));
 
-                // Send via connection.ext_method() which becomes "_workspace/query" on the wire
-                let result = _connection.ext_method(ext_req).await;
+                // Send via ext request which becomes "_workspace/query" on the wire
+                let result = match acp::UntypedMessage::new(&ext_req.method, &ext_req.params) {
+                    Ok(outbound) => connection.send_request(outbound).block_task().await,
+                    Err(err) => Err(err),
+                };
 
                 let parsed = match result {
-                    Ok(ext_resp) => {
-                        // Parse the raw JSON response into WorkspaceQueryResponse
-                        serde_json::from_str(ext_resp.0.get()).map_err(|e| {
-                            agent_client_protocol::Error::internal_error()
-                                .data(format!("Failed to parse workspace query response: {}", e))
-                        })
-                    }
+                    Ok(ext_resp) => serde_json::from_value(ext_resp).map_err(|e| {
+                        acp::Error::internal_error()
+                            .data(format!("Failed to parse workspace query response: {}", e))
+                    }),
                     Err(e) => Err(e),
                 };
 
@@ -296,130 +298,264 @@ fn spawn_event_bridge_forwarder(
 /// The server handles SIGTERM and SIGINT (Ctrl+C) for graceful shutdown.
 /// Current operations are allowed to complete before exit.
 pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::Result<()> {
-    let local = tokio::task::LocalSet::new();
+    log::info!("Starting ACP stdio server for QueryMTAgent");
 
-    local
-        .run_until(async move {
-            log::info!("Starting ACP stdio server for QueryMTAgent");
+    // 1. Create the channel for agent→client communication
+    let (tx, rx) = mpsc::channel::<ClientBridgeMessage>(100);
+    let bridge_sender = ClientBridgeSender::new(tx);
+    log::debug!("Created bridge channel");
 
-            // 1. Create the channel for agent→client communication
-            let (tx, rx) = mpsc::channel::<ClientBridgeMessage>(100);
-            let bridge_sender = ClientBridgeSender::new(tx);
-            log::debug!("Created bridge channel");
+    // 2. Set the bridge on the agent
+    agent.set_bridge(bridge_sender.clone()).await;
+    log::debug!("Set bridge on agent");
 
-            // 2. Set the bridge on the agent
-            agent.set_bridge(bridge_sender.clone()).await;
-            log::debug!("Set bridge on agent");
+    // 3. Collect EventFanouts from agent and delegates
+    let event_sources = crate::acp::shared::collect_event_sources(&agent);
+    log::debug!(
+        "Collected {} event source(s) for forwarding",
+        event_sources.len()
+    );
 
-            // 3. Collect EventFanouts from agent and delegates
-            let event_sources = crate::acp::shared::collect_event_sources(&agent);
-            log::debug!("Collected {} event source(s) for forwarding", event_sources.len());
+    // 4. Create shutdown coordination channel
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(event_sources.len());
 
-            // 4. Create shutdown coordination channel
-            // Used by forwarders to signal when they've stopped
-            let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(event_sources.len());
+    // 5. Spawn event bridge forwarders (one per EventFanout)
+    let mut forwarder_handles = Vec::new();
+    for (idx, event_fanout) in event_sources.into_iter().enumerate() {
+        let handle =
+            spawn_event_bridge_forwarder(event_fanout, bridge_sender.clone(), shutdown_tx.clone());
+        forwarder_handles.push(handle);
+        log::debug!("Spawned event forwarder #{}", idx);
+    }
+    log::info!("Spawned {} event forwarder(s)", forwarder_handles.len());
 
-            // 5. Spawn event bridge forwarders (one per EventFanout)
-            let mut forwarder_handles = Vec::new();
-            for (idx, event_fanout) in event_sources.into_iter().enumerate() {
-                let handle = spawn_event_bridge_forwarder(
-                    event_fanout,
-                    bridge_sender.clone(),
-                    shutdown_tx.clone(),
-                );
-                forwarder_handles.push(handle);
-                log::debug!("Spawned event forwarder #{}", idx);
-            }
-            log::info!("Spawned {} event forwarder(s)", forwarder_handles.len());
+    drop(shutdown_tx);
 
-            // Drop the shutdown_tx so the channel closes when all forwarders stop
-            drop(shutdown_tx);
+    // 6. Set up stdio streams and connect ACP agent role.
+    let stdin = tokio::io::stdin().compat();
+    let stdout = tokio::io::stdout().compat_write();
 
-            // 6. Create adapter for SDK Agent trait (clone Arc so we can use agent later for shutdown)
-            let adapter = ApcAgentAdapter::new(agent.clone());
-
-            // 7. Set up stdio streams
-            let stdin = tokio::io::stdin().compat();
-            let stdout = tokio::io::stdout().compat_write();
-
-            // 8. Create the SDK connection
-            let (connection, io_task) = AgentSideConnection::new(adapter, stdout, stdin, |fut| {
-                tokio::task::spawn_local(fut);
-            });
-            log::debug!("Created AgentSideConnection");
-
-            // 9. Wrap connection in Rc for LocalSet sharing
-            let connection = Rc::new(connection);
-
-            // 10. Spawn bridge task
-            let bridge_task = tokio::task::spawn_local(run_bridge_task(rx, connection.clone()));
-            log::info!("Bridge task spawned");
-
-            // 11. Spawn IO task
-            let mut io_handle = tokio::task::spawn_local(io_task);
-            log::info!("ACP stdio server ready, listening on stdin...");
-
-            // 12. Wait for completion or shutdown signal
-            let shutdown_triggered = tokio::select! {
-                result = &mut io_handle => {
-                    match result {
-                        Ok(Ok(())) => log::info!("IO task completed successfully (likely due to stdin close)"),
-                        Ok(Err(e)) => log::error!("IO task error: {}", e),
-                        Err(e) => log::error!("IO task panicked: {}", e),
-                    }
-                    // Treat IO task completion as shutdown too (stdin closed)
-                    true
+    let serve_fut = acp::Agent
+        .builder()
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: InitializeRequest, responder, _cx| {
+                    responder.respond_with_result(agent.initialize(req).await)
                 }
-                _ = shutdown::signal() => {
-                    log::info!("Shutdown signal received, stopping server...");
-                    true
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: AuthenticateRequest, responder, _cx| {
+                    responder.respond_with_result(agent.authenticate(req).await)
                 }
-            };
-
-            // 13. Clean up - graceful shutdown sequence
-            if shutdown_triggered {
-                log::info!("Initiating graceful shutdown...");
-
-                // Step 1: Shutdown agent (stops event emission)
-                log::info!("Shutting down agent...");
-                agent.shutdown().await;
-                log::info!("Agent shutdown complete");
-
-                // Step 2: Wait for forwarders to finish processing remaining events
-                log::info!("Waiting for event forwarders to stop...");
-                let forwarder_wait = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    async {
-                        // Wait for all forwarders to signal completion
-                        while shutdown_rx.recv().await.is_some() {
-                            log::debug!("Event forwarder stopped");
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: NewSessionRequest, responder, _cx| {
+                    responder.respond_with_result(agent.new_session(req).await)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: PromptRequest, responder, _cx| {
+                    responder.respond_with_result(agent.prompt(req).await)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_notification(
+            {
+                let agent = agent.clone();
+                async move |notif: CancelNotification, _cx| agent.cancel(notif).await
+            },
+            acp::on_receive_notification!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: LoadSessionRequest, responder, _cx| {
+                    responder.respond_with_result(agent.load_session(req).await)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: ListSessionsRequest, responder, _cx| {
+                    responder.respond_with_result(agent.list_sessions(req).await)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: ForkSessionRequest, responder, _cx| {
+                    responder.respond_with_result(agent.fork_session(req).await)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: ResumeSessionRequest, responder, _cx| {
+                    responder.respond_with_result(agent.resume_session(req).await)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: SetSessionModelRequest, responder, _cx| {
+                    responder.respond_with_result(agent.set_session_model(req).await)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: SetSessionModeRequest, responder, _cx| {
+                    responder.respond_with_result(agent.set_session_mode(req).await)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: SetSessionConfigOptionRequest, responder, _cx| {
+                    responder.respond_with_result(agent.set_session_config_option(req).await)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            {
+                let agent = agent.clone();
+                async move |dispatch: acp::Dispatch<acp::UntypedMessage, acp::UntypedMessage>,
+                            _cx| {
+                    let dispatch = match dispatch.into_request::<acp::UntypedMessage>() {
+                        Ok(Ok((request, responder))) => {
+                            if request.method.starts_with("_querymt/")
+                                || request.method.starts_with("querymt/")
+                            {
+                                let params_json = serde_json::to_string(&request.params)
+                                    .unwrap_or_else(|_| "null".to_string());
+                                let raw = serde_json::value::RawValue::from_string(params_json)
+                                    .unwrap_or_else(|_| {
+                                        serde_json::value::RawValue::from_string("null".to_string())
+                                            .unwrap()
+                                    });
+                                let ext_req =
+                                    ExtRequest::new(request.method, std::sync::Arc::from(raw));
+                                let ext_resp = agent.ext_method(ext_req).await;
+                                let ext_value = ext_resp.and_then(|resp| {
+                                    serde_json::from_str(resp.0.get()).map_err(|e| {
+                                        acp::Error::internal_error().data(e.to_string())
+                                    })
+                                });
+                                responder.respond_with_result(ext_value)?;
+                                return Ok(acp::Handled::Yes);
+                            }
+                            acp::Dispatch::Request(request, responder)
                         }
-                    }
-                );
+                        Ok(Err(dispatch)) => dispatch,
+                        Err(err) => return Err(err),
+                    };
 
-                match forwarder_wait.await {
-                    Ok(_) => log::info!("All event forwarders stopped gracefully"),
-                    Err(_) => {
-                        log::warn!("Event forwarders did not stop within 5s, aborting...");
-                        for (idx, handle) in forwarder_handles.iter().enumerate() {
-                            handle.abort();
-                            log::debug!("Aborted event forwarder #{}", idx);
+                    let dispatch = match dispatch.into_notification::<acp::UntypedMessage>() {
+                        Ok(Ok(notification)) => {
+                            if notification.method.starts_with("_querymt/")
+                                || notification.method.starts_with("querymt/")
+                            {
+                                let params_json = serde_json::to_string(&notification.params)
+                                    .unwrap_or_else(|_| "null".to_string());
+                                let raw = serde_json::value::RawValue::from_string(params_json)
+                                    .unwrap_or_else(|_| {
+                                        serde_json::value::RawValue::from_string("null".to_string())
+                                            .unwrap()
+                                    });
+                                let ext_notif = agent_client_protocol::schema::ExtNotification::new(
+                                    notification.method,
+                                    std::sync::Arc::from(raw),
+                                );
+                                agent.ext_notification(ext_notif).await?;
+                                return Ok(acp::Handled::Yes);
+                            }
+                            acp::Dispatch::Notification(notification)
                         }
-                    }
+                        Ok(Err(dispatch)) => dispatch,
+                        Err(err) => return Err(err),
+                    };
+
+                    Ok(acp::Handled::No {
+                        message: dispatch,
+                        retry: false,
+                    })
                 }
-
-                // Step 3: Abort IO task
-                log::info!("Aborting I/O task...");
-                io_handle.abort();
-            }
-
-            // Step 4: Abort bridge task (always, even if not shutdown_triggered)
-            log::info!("Aborting bridge task...");
-            bridge_task.abort();
-            log::info!("Bridge task aborted");
-            log::info!("ACP stdio server shutdown complete");
-            log::info!("Exiting LocalSet...");
+            },
+            acp::on_receive_dispatch!(),
+        )
+        .connect_with(ByteStreams::new(stdout, stdin), async move |cx| {
+            run_bridge_task(rx, cx).await;
             Ok(())
-        })
-        .await
+        });
+
+    log::info!("ACP stdio server ready, listening on stdin...");
+
+    let shutdown_triggered = tokio::select! {
+        result = serve_fut => {
+            match result {
+                Ok(()) => log::info!("ACP stdio connection finished (likely due to stdin close)"),
+                Err(e) => log::error!("ACP stdio connection error: {}", e),
+            }
+            true
+        }
+        _ = shutdown::signal() => {
+            log::info!("Shutdown signal received, stopping server...");
+            true
+        }
+    };
+
+    if shutdown_triggered {
+        log::info!("Initiating graceful shutdown...");
+        log::info!("Shutting down agent...");
+        agent.shutdown().await;
+        log::info!("Agent shutdown complete");
+
+        log::info!("Waiting for event forwarders to stop...");
+        let forwarder_wait = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while shutdown_rx.recv().await.is_some() {
+                log::debug!("Event forwarder stopped");
+            }
+        });
+
+        match forwarder_wait.await {
+            Ok(_) => log::info!("All event forwarders stopped gracefully"),
+            Err(_) => {
+                log::warn!("Event forwarders did not stop within 5s, aborting...");
+                for (idx, handle) in forwarder_handles.iter().enumerate() {
+                    handle.abort();
+                    log::debug!("Aborted event forwarder #{}", idx);
+                }
+            }
+        }
+    }
+
+    log::info!("ACP stdio server shutdown complete");
+    Ok(())
 }

@@ -3,7 +3,7 @@
 //! This module provides utilities for sending session updates to the client via the bridge.
 
 use crate::acp::client_bridge::ClientBridgeSender;
-use agent_client_protocol::SessionUpdate;
+use agent_client_protocol::schema::SessionUpdate;
 use tokio_util::sync::CancellationToken;
 
 /// Send a session update notification to the client via the bridge.
@@ -18,8 +18,8 @@ pub(super) async fn send_session_update(
     cancel_token: Option<&CancellationToken>,
 ) {
     if let Some(bridge) = bridge {
-        let notification = agent_client_protocol::SessionNotification::new(
-            agent_client_protocol::SessionId::from(session_id.to_string()),
+        let notification = agent_client_protocol::schema::SessionNotification::new(
+            agent_client_protocol::schema::SessionId::from(session_id.to_string()),
             update,
         );
 
@@ -47,7 +47,7 @@ pub(super) async fn send_session_update(
 mod tests {
     use super::*;
     use crate::acp::client_bridge::{ClientBridgeMessage, ClientBridgeSender};
-    use agent_client_protocol::{ContentBlock, SessionUpdate, TextContent};
+    use agent_client_protocol::schema::{ContentBlock, SessionUpdate, TextContent};
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -58,7 +58,7 @@ mod tests {
         send_session_update(
             Some(&sender),
             "sess-1",
-            SessionUpdate::AgentMessageChunk(agent_client_protocol::ContentChunk::new(
+            SessionUpdate::AgentMessageChunk(agent_client_protocol::schema::ContentChunk::new(
                 ContentBlock::Text(TextContent::new("hi".to_string())),
             )),
             None,
@@ -79,7 +79,7 @@ mod tests {
         send_session_update(
             Some(&sender),
             "sess-1",
-            SessionUpdate::AgentMessageChunk(agent_client_protocol::ContentChunk::new(
+            SessionUpdate::AgentMessageChunk(agent_client_protocol::schema::ContentChunk::new(
                 ContentBlock::Text(TextContent::new("hi".to_string())),
             )),
             Some(&token),

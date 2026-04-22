@@ -7,7 +7,7 @@ use crate::session::store::SessionStore;
 use crate::tools::ToolRegistry;
 use crate::verification::VerificationSpec;
 use crate::verification::service::{VerificationContext, VerificationService};
-use agent_client_protocol::{ContentBlock, PromptRequest, StopReason, TextContent};
+use agent_client_protocol::schema::{ContentBlock, PromptRequest, StopReason, TextContent};
 use log::{debug, error, warn};
 use querymt::chat::ChatRole;
 use serde::{Deserialize, Serialize};
@@ -1145,7 +1145,7 @@ mod tests {
     use crate::agent::remote::SessionActorRef;
     use crate::event_fanout::EventFanout;
     use crate::events::EventEnvelope;
-    use agent_client_protocol::{
+    use agent_client_protocol::schema::{
         CancelNotification, Error, NewSessionRequest, NewSessionResponse, PromptRequest,
         PromptResponse,
     };
@@ -1178,7 +1178,7 @@ mod tests {
 
         async fn prompt(&self, _req: PromptRequest) -> std::result::Result<PromptResponse, Error> {
             Ok(PromptResponse::new(
-                agent_client_protocol::StopReason::EndTurn,
+                agent_client_protocol::schema::StopReason::EndTurn,
             ))
         }
 

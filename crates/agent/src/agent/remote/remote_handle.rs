@@ -10,7 +10,7 @@ use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
 use crate::event_fanout::EventFanout;
 use crate::events::{AgentEventKind, EphemeralEvent, EventEnvelope, EventOrigin};
 
-use agent_client_protocol::{
+use agent_client_protocol::schema::{
     CancelNotification, Error, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
 };
 use async_trait::async_trait;

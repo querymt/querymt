@@ -12,7 +12,7 @@ mod remote_agent_stub_tests {
     use crate::agent::handle::AgentHandle;
     use crate::agent::remote::remote_handle::RemoteAgentHandle;
     use crate::agent::remote::test_helpers::fixtures::{MeshNodeManagerFixture, get_test_mesh};
-    use agent_client_protocol::{CancelNotification, NewSessionRequest, SessionId};
+    use agent_client_protocol::schema::{CancelNotification, NewSessionRequest, SessionId};
     use std::path::PathBuf;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -51,9 +51,9 @@ mod remote_agent_stub_tests {
         let test_id = Uuid::now_v7().to_string();
         let handle = make_handle(&format!("dead-peer-{}", test_id), mesh);
 
-        let req = agent_client_protocol::PromptRequest::new(
+        let req = agent_client_protocol::schema::PromptRequest::new(
             SessionId::from("s-c2".to_string()),
-            vec![agent_client_protocol::ContentBlock::from("hello")],
+            vec![agent_client_protocol::schema::ContentBlock::from("hello")],
         );
         let result = handle.prompt(req).await;
         assert!(

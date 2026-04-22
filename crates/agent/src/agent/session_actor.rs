@@ -17,7 +17,7 @@ use crate::events::{AgentEventKind, SessionLimits};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::LLMConfig;
-use agent_client_protocol::{
+use agent_client_protocol::schema::{
     ContentChunk, ExtResponse, PromptResponse, SessionUpdate, SetSessionModelResponse, StopReason,
 };
 use kameo::Actor;
@@ -382,8 +382,8 @@ impl SessionActor {
     #[allow(dead_code)]
     pub(crate) async fn send_session_update(&self, session_id: &str, update: SessionUpdate) {
         if let Some(ref bridge) = self.bridge {
-            let notification = agent_client_protocol::SessionNotification::new(
-                agent_client_protocol::SessionId::from(session_id.to_string()),
+            let notification = agent_client_protocol::schema::SessionNotification::new(
+                agent_client_protocol::schema::SessionId::from(session_id.to_string()),
                 update,
             );
             if let Err(e) = bridge.notify(notification).await {
@@ -650,7 +650,7 @@ impl Message<SetSessionModel> for SessionActor {
         msg: SetSessionModel,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        use agent_client_protocol::SetSessionModelResponse;
+        use agent_client_protocol::schema::SetSessionModelResponse;
 
         let session_id = msg.req.session_id.to_string();
         let _session = self
@@ -1429,10 +1429,10 @@ impl Message<ScheduledPrompt> for SessionActor {
         }
 
         // Build a PromptRequest from the schedule's prompt text
-        let prompt_request = agent_client_protocol::PromptRequest::new(
-            agent_client_protocol::SessionId::from(self.session_id.clone()),
-            vec![agent_client_protocol::ContentBlock::Text(
-                agent_client_protocol::TextContent::new(msg.prompt_text),
+        let prompt_request = agent_client_protocol::schema::PromptRequest::new(
+            agent_client_protocol::schema::SessionId::from(self.session_id.clone()),
+            vec![agent_client_protocol::schema::ContentBlock::Text(
+                agent_client_protocol::schema::TextContent::new(msg.prompt_text),
             )],
         );
 
@@ -1508,7 +1508,7 @@ impl Message<ScheduledPrompt> for SessionActor {
 /// This function gathers all needed state upfront and runs the full execution cycle.
 /// It does NOT access the actor — everything is passed as parameters.
 struct DetachedPromptExecution {
-    req: agent_client_protocol::PromptRequest,
+    req: agent_client_protocol::schema::PromptRequest,
     session_id: String,
     runtime: Arc<SessionRuntime>,
     config: Arc<AgentConfig>,
@@ -1641,8 +1641,8 @@ async fn execute_prompt_detached(
             break;
         }
         if let Some(ref bridge) = bridge {
-            let notification = agent_client_protocol::SessionNotification::new(
-                agent_client_protocol::SessionId::from(session_id.clone()),
+            let notification = agent_client_protocol::schema::SessionNotification::new(
+                agent_client_protocol::schema::SessionId::from(session_id.clone()),
                 SessionUpdate::UserMessageChunk(ContentChunk::new(block.clone())),
             );
             tokio::select! {
@@ -2184,7 +2184,7 @@ mod tests {
         let result = f
             .actor_ref
             .ask(ExtMethod {
-                req: agent_client_protocol::ExtRequest::new("custom_method", null_params),
+                req: agent_client_protocol::schema::ExtRequest::new("custom_method", null_params),
             })
             .await
             .expect("ask ExtMethod");
@@ -2200,7 +2200,10 @@ mod tests {
         );
         f.actor_ref
             .ask(ExtNotification {
-                notif: agent_client_protocol::ExtNotification::new("my_notification", null_params),
+                notif: agent_client_protocol::schema::ExtNotification::new(
+                    "my_notification",
+                    null_params,
+                ),
             })
             .await
             .expect("ask ExtNotification");

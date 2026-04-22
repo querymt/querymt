@@ -14,7 +14,7 @@ use crate::error::AgentError;
 use crate::events::SessionLimits;
 use crate::model::AgentMessage;
 use crate::session::store::LLMConfig;
-use agent_client_protocol::{
+use agent_client_protocol::schema::{
     Error as AcpError, PromptRequest, PromptResponse, SetSessionModelResponse,
 };
 use kameo::actor::ActorRef;
@@ -265,7 +265,7 @@ impl SessionActorRef {
     /// Set session model via ACP protocol.
     pub async fn set_session_model(
         &self,
-        req: agent_client_protocol::SetSessionModelRequest,
+        req: agent_client_protocol::schema::SetSessionModelRequest,
     ) -> Result<SetSessionModelResponse, AcpError> {
         self.set_session_model_with_node(messages::SetSessionModel {
             req,
