@@ -260,6 +260,8 @@ jobs:
       - name: Install Cosign
         if: matrix.crate != 'noop' && matrix.provider_type == 'wasm'
         uses: sigstore/cosign-installer@v4.1.1
+        with:
+          cosign-release: v2.6.0
 
       - name: Sign WASM artifact with Cosign (keyless)
         if: matrix.crate != 'noop' && matrix.provider_type == 'wasm'
