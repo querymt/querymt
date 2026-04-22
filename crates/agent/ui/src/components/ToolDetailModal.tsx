@@ -3,6 +3,7 @@
  */
 
 
+import { Component, ErrorInfo, ReactNode } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import { X, Clock, CheckCircle, XCircle, Loader, Copy, Check } from 'lucide-react';
 import { PatchDiff } from '@pierre/diffs/react';
@@ -286,6 +287,48 @@ function JsonView({ data }: { data: unknown }) {
   );
 }
 
+type DiffRenderGuardProps = {
+  children: ReactNode;
+};
+
+type DiffRenderGuardState = {
+  hasError: boolean;
+};
+
+class DiffRenderGuard extends Component<DiffRenderGuardProps, DiffRenderGuardState> {
+  state: DiffRenderGuardState = { hasError: false };
+
+  static getDerivedStateFromError(): DiffRenderGuardState {
+    return { hasError: true };
+  }
+
+  componentDidCatch(_error: Error, _errorInfo: ErrorInfo) {
+    // Keep tool modal resilient if diff payloads are malformed.
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="px-3 py-2 text-xs text-status-warning font-mono">
+          Unable to render diff preview. Use raw event data below.
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function renderSafePatchDiff(
+  patch: string,
+  options: React.ComponentProps<typeof PatchDiff>['options'],
+): ReactNode {
+  return (
+    <DiffRenderGuard>
+      <PatchDiff patch={patch} options={options} />
+    </DiffRenderGuard>
+  );
+}
+
 // Diff viewer for edit/patch tools
 function DiffView({
   toolKind,
@@ -301,10 +344,22 @@ function DiffView({
   diffThemeType: 'dark' | 'light';
 }) {
   const isMobile = useIsMobile();
-  const preferredDiffStyle = isMobile ? 'unified' : 'split' as const;
+  const preferredDiffStyle: 'unified' | 'split' = isMobile ? 'unified' : 'split';
   const diffContainerClass = `event-diff-container${isMobile ? ' diff-mobile' : ''}`;
   const normalizedToolKind = normalizeToolName(toolKind);
   const input = rawInput as Record<string, unknown>;
+
+  const standardDiffOptions: React.ComponentProps<typeof PatchDiff>['options'] = {
+    theme: diffTheme,
+    themeType: diffThemeType,
+    diffStyle: preferredDiffStyle,
+    diffIndicators: 'bars' as const,
+    lineDiffType: 'word-alt' as const,
+    overflow: 'wrap' as const,
+    disableLineNumbers: false,
+    useCSSClasses: true,
+    disableBackground: true,
+  };
   
   // Handle write tool - show as diff with empty left side
   if (normalizedToolKind === 'write' || normalizedToolKind === 'write_file') {
@@ -330,20 +385,7 @@ function DiffView({
             Writing to: <span className="text-accent-primary">{filePath as string}</span>
           </div>
           <div className={diffContainerClass}>
-            <PatchDiff
-              patch={patch}
-              options={{
-                theme: diffTheme,
-                themeType: diffThemeType,
-                diffStyle: preferredDiffStyle,
-                diffIndicators: 'bars',
-                lineDiffType: 'word-alt',
-                overflow: 'wrap',
-                disableLineNumbers: false,
-                useCSSClasses: true,
-                disableBackground: true,
-              }}
-            />
+            {renderSafePatchDiff(patch, standardDiffOptions)}
           </div>
         </div>
       );
@@ -358,20 +400,7 @@ function DiffView({
       const patch = buildEditPatch(editInput);
       return (
         <div className={diffContainerClass}>
-          <PatchDiff
-            patch={patch}
-            options={{
-              theme: diffTheme,
-              themeType: diffThemeType,
-              diffStyle: preferredDiffStyle,
-              diffIndicators: 'bars',
-              lineDiffType: 'word-alt',
-              overflow: 'wrap',
-              disableLineNumbers: false,
-              useCSSClasses: true,
-              disableBackground: true,
-            }}
-          />
+          {renderSafePatchDiff(patch, standardDiffOptions)}
         </div>
       );
     }
@@ -380,20 +409,25 @@ function DiffView({
   // Handle apply_patch tool
   const patchValue = extractPatchValue(input);
   if (patchValue) {
+    if (!isLikelyRenderablePatch(patchValue)) {
+      return (
+        <div className="px-3 py-2 text-xs text-status-warning font-mono">
+          Patch payload is malformed. Use raw event data below.
+        </div>
+      );
+    }
+
     return (
       <div className={diffContainerClass}>
-        <PatchDiff
-          patch={patchValue}
-          options={{
-            theme: diffTheme,
-            themeType: diffThemeType,
-            diffStyle: 'unified',
-            diffIndicators: 'bars',
-            overflow: 'wrap',
-            useCSSClasses: true,
-            disableBackground: true,
-          }}
-        />
+        {renderSafePatchDiff(patchValue, {
+          theme: diffTheme,
+          themeType: diffThemeType,
+          diffStyle: 'unified',
+          diffIndicators: 'bars',
+          overflow: 'wrap',
+          useCSSClasses: true,
+          disableBackground: true,
+        })}
       </div>
     );
   }
@@ -638,19 +672,26 @@ function buildEditPatch(editInput: EditInput): string {
 }
 
 function extractPatchValue(rawInput: unknown): string | undefined {
-  if (!rawInput) return undefined;
-  if (typeof rawInput === 'object' && rawInput !== null) {
-    const direct = (rawInput as { patch?: unknown }).patch;
-    if (typeof direct === 'string') return direct;
-    const args = (rawInput as { arguments?: unknown }).arguments;
-    if (typeof args === 'string') {
-      const parsed = parseJsonMaybe(args);
-      if (typeof parsed?.patch === 'string') return parsed.patch;
-    }
-    if (typeof args === 'object' && args !== null) {
-      const argPatch = (args as { patch?: unknown }).patch;
-      if (typeof argPatch === 'string') return argPatch;
-    }
+  if (!rawInput || typeof rawInput !== 'object') return undefined;
+
+  const direct = (rawInput as { patch?: unknown }).patch;
+  if (typeof direct === 'string') {
+    return direct;
   }
+
+  const args = (rawInput as { arguments?: unknown }).arguments;
+  const parsedArgs = parseJsonMaybe(args);
+  if (typeof parsedArgs?.patch === 'string') {
+    return parsedArgs.patch;
+  }
+
   return undefined;
+}
+
+function isLikelyRenderablePatch(patch: string): boolean {
+  const trimmed = patch.trim();
+  if (trimmed.length === 0) {
+    return false;
+  }
+  return /diff --git\s+.+\s+.+/.test(trimmed) && /@@\s+-\d/.test(trimmed);
 }

@@ -96,13 +96,6 @@ pub struct StreamChunkRelay {
     pub chunk: Result<StreamChunk, String>,
 }
 
-/// How long `StreamReceiverActor` waits for the next chunk before closing
-/// the stream with a timeout error.
-///
-/// This prevents stalled streams from keeping the ephemeral actor alive
-/// indefinitely when a remote node goes down mid-stream.
-pub const STREAM_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
 // ── Message types ─────────────────────────────────────────────────────────────
 
 /// Non-streaming provider call message (use `ask()`).

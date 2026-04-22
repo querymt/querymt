@@ -94,6 +94,8 @@ pub(crate) mod fixtures {
                             bootstrap_peers: vec![],
                             directory: crate::agent::remote::mesh::DirectoryMode::default(),
                             request_timeout: std::time::Duration::from_secs(300),
+                            stream_first_chunk_timeout: std::time::Duration::from_secs(600),
+                            stream_idle_chunk_timeout: std::time::Duration::from_secs(60),
                             transport: Default::default(),
                             identity_file: Some(identity_path),
                             invite: None,

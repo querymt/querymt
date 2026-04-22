@@ -69,7 +69,17 @@ pub async fn prompt_for_mode(
                 session_ref.as_ref(),
             )
             .await;
-            send_prompt(agent, session_id, prompt_blocks).await?;
+            let prompt_target = session_ref
+                .as_ref()
+                .map(|sr| {
+                    if sr.is_remote() {
+                        format!("remote node '{}'", sr.node_label())
+                    } else {
+                        "local session".to_string()
+                    }
+                })
+                .unwrap_or_else(|| "unresolved session".to_string());
+            send_prompt(agent, session_id, prompt_blocks, &prompt_target).await?;
         }
         RoutingMode::Broadcast => {
             let agent_ids = list_agent_ids(state);
@@ -89,7 +99,17 @@ pub async fn prompt_for_mode(
                     session_ref.as_ref(),
                 )
                 .await;
-                send_prompt(agent, session_id, prompt_blocks).await?;
+                let prompt_target = session_ref
+                    .as_ref()
+                    .map(|sr| {
+                        if sr.is_remote() {
+                            format!("remote node '{}'", sr.node_label())
+                        } else {
+                            "local session".to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "unresolved session".to_string());
+                send_prompt(agent, session_id, prompt_blocks, &prompt_target).await?;
             }
         }
     }
@@ -101,13 +121,21 @@ async fn send_prompt(
     agent: Arc<dyn AgentHandleTrait>,
     session_id: String,
     prompt: Vec<ContentBlock>,
+    prompt_target: &str,
 ) -> Result<(), String> {
-    let request = PromptRequest::new(session_id, prompt);
+    let request = PromptRequest::new(session_id.clone(), prompt);
     agent
         .prompt(request)
         .await
-        .map_err(|err| err.message)
-        .map(|_| ())
+        .map_err(|err| format_prompt_error(&session_id, prompt_target, &err.message))?;
+    Ok(())
+}
+
+fn format_prompt_error(session_id: &str, prompt_target: &str, message: &str) -> String {
+    format!(
+        "Failed to prompt session '{}' ({prompt_target}): {}",
+        session_id, message
+    )
 }
 
 /// Ensure a session exists for the given agent, creating one if needed.
@@ -330,4 +358,24 @@ pub fn collect_event_sources(
 ) -> Vec<Arc<crate::event_fanout::EventFanout>> {
     // Delegate to the shared implementation in acp/shared.rs
     crate::acp::shared::collect_event_sources(agent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_prompt_error;
+
+    #[test]
+    fn format_prompt_error_includes_session_and_target() {
+        let msg = format_prompt_error("sess-123", "remote node 'gpu-box'", "timeout");
+        assert!(msg.contains("sess-123"));
+        assert!(msg.contains("remote node 'gpu-box'"));
+        assert!(msg.contains("timeout"));
+    }
+
+    #[test]
+    fn format_prompt_error_preserves_backend_message() {
+        let raw = "session not found";
+        let msg = format_prompt_error("sess-9", "local session", raw);
+        assert!(msg.ends_with(raw));
+    }
 }

@@ -227,6 +227,8 @@ pub async fn handle_attach_remote_session(
 ) {
     #[cfg(feature = "remote")]
     {
+        use std::time::Duration;
+
         use crate::agent::session_actor::SessionActor;
 
         let mesh = match state.agent.mesh() {
@@ -239,25 +241,70 @@ pub async fn handle_attach_remote_session(
         };
 
         let dht_name = crate::agent::remote::dht_name::session(session_id);
-        let remote_ref = match mesh.lookup_actor::<SessionActor>(dht_name.clone()).await {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                let _ = send_error(
-                    tx,
-                    format!(
-                        "Session '{}' not found in DHT under '{}'. \
-                         The remote node may not have registered it.",
-                        session_id, dht_name
-                    ),
-                )
-                .await;
-                return;
+        let lookup_backoff_ms: [u64; 4] = [0, 120, 300, 700];
+        let mut remote_ref = None;
+        let mut last_lookup_error = None;
+
+        for (attempt_idx, delay_ms) in lookup_backoff_ms.iter().enumerate() {
+            if *delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
             }
-            Err(e) => {
-                let _ =
-                    send_error(tx, format!("DHT lookup failed for '{}': {}", dht_name, e)).await;
-                return;
+
+            match mesh
+                .lookup_actor_no_retry::<SessionActor>(dht_name.clone())
+                .await
+            {
+                Ok(Some(r)) => {
+                    remote_ref = Some(r);
+                    if attempt_idx > 0 {
+                        log::info!(
+                            "handle_attach_remote_session: DHT lookup for {} succeeded on retry {}",
+                            session_id,
+                            attempt_idx + 1
+                        );
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    log::debug!(
+                        "handle_attach_remote_session: DHT lookup miss for {} under '{}' (attempt {}/{})",
+                        session_id,
+                        dht_name,
+                        attempt_idx + 1,
+                        lookup_backoff_ms.len()
+                    );
+                }
+                Err(e) => {
+                    last_lookup_error = Some(e.to_string());
+                    log::warn!(
+                        "handle_attach_remote_session: DHT lookup error for {} under '{}' (attempt {}/{}): {}",
+                        session_id,
+                        dht_name,
+                        attempt_idx + 1,
+                        lookup_backoff_ms.len(),
+                        e
+                    );
+                }
             }
+        }
+
+        let Some(remote_ref) = remote_ref else {
+            let detail = last_lookup_error
+                .map(|e| format!("last error: {e}"))
+                .unwrap_or_else(|| "session was not visible in DHT yet".to_string());
+            let _ = send_error(
+                tx,
+                format!(
+                    "Session '{}' not attachable from node '{}': looked up '{}' {} times, {}",
+                    session_id,
+                    node_id,
+                    dht_name,
+                    lookup_backoff_ms.len(),
+                    detail
+                ),
+            )
+            .await;
+            return;
         };
 
         let peer_label = state
@@ -278,6 +325,35 @@ pub async fn handle_attach_remote_session(
                 Some(node_id.to_string()),
             )
             .await;
+
+        // Health-check the attached session before publishing SessionLoaded.
+        // This avoids rendering a session that cannot accept prompts.
+        let attached_session_ref = {
+            let registry = state.agent.registry.lock().await;
+            registry.get(session_id).cloned()
+        };
+        let Some(attached_session_ref) = attached_session_ref else {
+            let _ = send_error(
+                tx,
+                format!(
+                    "Attached remote session '{}' but it is missing from local registry",
+                    session_id
+                ),
+            )
+            .await;
+            return;
+        };
+        if let Err(e) = attached_session_ref.get_mode().await {
+            let _ = send_error(
+                tx,
+                format!(
+                    "Remote session '{}' attached but failed health check on node '{}': {}",
+                    session_id, node_id, e
+                ),
+            )
+            .await;
+            return;
+        }
 
         let agent_id = super::super::session::PRIMARY_AGENT_ID.to_string();
 

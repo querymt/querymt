@@ -407,6 +407,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bootstrap_peers: vec![],
             directory: querymt_agent::agent::remote::mesh::DirectoryMode::default(),
             request_timeout: std::time::Duration::from_secs(300),
+            stream_first_chunk_timeout: std::time::Duration::from_secs(600),
+            stream_idle_chunk_timeout: std::time::Duration::from_secs(60),
             transport,
             identity_file: None,
             invite: None,

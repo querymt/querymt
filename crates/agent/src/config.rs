@@ -603,6 +603,14 @@ fn default_mesh_request_timeout_secs() -> u64 {
     300
 }
 
+fn default_mesh_stream_first_chunk_timeout_secs() -> u64 {
+    600
+}
+
+fn default_mesh_stream_idle_chunk_timeout_secs() -> u64 {
+    60
+}
+
 /// Configuration for the kameo libp2p mesh.
 ///
 /// In TOML:
@@ -654,6 +662,17 @@ pub struct MeshTomlConfig {
     #[serde(default = "default_mesh_request_timeout_secs")]
     pub request_timeout_secs: u64,
 
+    /// Timeout in seconds to wait for the first chunk of a streaming mesh call.
+    ///
+    /// Large prompts can spend significant time in prefill before the first token,
+    /// so this is intentionally more generous than `stream_idle_chunk_timeout_secs`.
+    #[serde(default = "default_mesh_stream_first_chunk_timeout_secs")]
+    pub stream_first_chunk_timeout_secs: u64,
+
+    /// Timeout in seconds for idle gaps between streaming chunks after streaming starts.
+    #[serde(default = "default_mesh_stream_idle_chunk_timeout_secs")]
+    pub stream_idle_chunk_timeout_secs: u64,
+
     /// Path to the persistent ed25519 identity file.
     ///
     /// When absent, defaults to `~/.qmt/mesh_identity.key`.  The node's
@@ -689,6 +708,8 @@ impl Default for MeshTomlConfig {
             auto_fallback: false,
             peers: Vec::new(),
             request_timeout_secs: default_mesh_request_timeout_secs(),
+            stream_first_chunk_timeout_secs: default_mesh_stream_first_chunk_timeout_secs(),
+            stream_idle_chunk_timeout_secs: default_mesh_stream_idle_chunk_timeout_secs(),
             identity_file: None,
             invite: None,
         }

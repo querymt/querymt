@@ -17,6 +17,9 @@
 //!     bootstrap_peers: vec![],
 //!     directory: DirectoryMode::default(),
 //!     request_timeout: std::time::Duration::from_secs(300),
+//!     stream_first_chunk_timeout: std::time::Duration::from_secs(600),
+//!     stream_idle_chunk_timeout: std::time::Duration::from_secs(60),
+//!     ..Default::default()
 //! };
 //! let mesh = bootstrap_mesh(&config).await?;
 //! println!("Mesh peer ID: {}", mesh.peer_id());
@@ -150,6 +153,16 @@ pub struct MeshConfig {
     /// Defaults to 300 seconds (5 minutes).
     pub request_timeout: std::time::Duration,
 
+    /// Maximum wait for the first chunk of a streaming mesh response.
+    ///
+    /// Large prompts can spend a long time in model prefill before any tokens
+    /// are emitted, so this timeout is more generous than the steady-state
+    /// idle chunk timeout.
+    pub stream_first_chunk_timeout: std::time::Duration,
+
+    /// Maximum idle gap between streaming chunks after the first chunk arrives.
+    pub stream_idle_chunk_timeout: std::time::Duration,
+
     /// Transport layer to use.
     ///
     /// `Lan` (default) uses the traditional TCP + QUIC + Noise + Yamux stack
@@ -181,6 +194,8 @@ impl Default for MeshConfig {
             bootstrap_peers: vec![],
             directory: DirectoryMode::default(),
             request_timeout: std::time::Duration::from_secs(300),
+            stream_first_chunk_timeout: std::time::Duration::from_secs(600),
+            stream_idle_chunk_timeout: std::time::Duration::from_secs(60),
             transport: MeshTransportMode::default(),
             identity_file: None,
             invite: None,
@@ -274,6 +289,10 @@ pub struct MeshHandle {
     /// only connect to the inviter by default (star topology).  The event
     /// loop polls the receiver and executes each `SwarmCommand`.
     swarm_cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
+    /// Streaming timeout for receiving the first chunk of a response.
+    stream_first_chunk_timeout: std::time::Duration,
+    /// Streaming timeout for idle gaps between chunks after streaming starts.
+    stream_idle_chunk_timeout: std::time::Duration,
 }
 
 impl std::fmt::Debug for MeshHandle {
@@ -302,6 +321,8 @@ impl MeshHandle {
         membership_store: Option<Arc<RwLock<super::invite::MembershipStore>>>,
         transport_mode: MeshTransportMode,
         swarm_cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
+        stream_first_chunk_timeout: std::time::Duration,
+        stream_idle_chunk_timeout: std::time::Duration,
     ) -> Self {
         Self {
             peer_id,
@@ -314,6 +335,8 @@ impl MeshHandle {
             membership_store,
             transport_mode,
             swarm_cmd_tx,
+            stream_first_chunk_timeout,
+            stream_idle_chunk_timeout,
         }
     }
 
@@ -330,6 +353,16 @@ impl MeshHandle {
     /// Check whether a peer is currently known to be alive (discovered and not expired).
     pub fn is_peer_alive(&self, peer_id: &PeerId) -> bool {
         self.known_peers.read().contains_key(peer_id)
+    }
+
+    /// Timeout used while waiting for the first chunk of a streaming response.
+    pub fn stream_first_chunk_timeout(&self) -> std::time::Duration {
+        self.stream_first_chunk_timeout
+    }
+
+    /// Timeout used for idle gaps between chunks after streaming has started.
+    pub fn stream_idle_chunk_timeout(&self) -> std::time::Duration {
+        self.stream_idle_chunk_timeout
     }
 
     /// Inject a peer directly into the `known_peers` map, bypassing mDNS.
@@ -893,6 +926,8 @@ fn finalize_bootstrap(
     listen_label: &str,
     transport_mode: MeshTransportMode,
     swarm_cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
+    stream_first_chunk_timeout: std::time::Duration,
+    stream_idle_chunk_timeout: std::time::Duration,
 ) -> MeshHandle {
     log::info!(
         "Kameo mesh bootstrapped: peer_id={}, listen={}",
@@ -945,6 +980,8 @@ fn finalize_bootstrap(
         membership_store,
         transport_mode,
         swarm_cmd_tx,
+        stream_first_chunk_timeout,
+        stream_idle_chunk_timeout,
     )
 }
 
@@ -1071,7 +1108,7 @@ async fn bootstrap_lan_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
                     // in-flight LLM stream disruption: the re-registration of all
                     // ephemeral stream_rx::* actors mid-stream caused kameo to
                     // invalidate in-flight request routing, dropping chunks and
-                    // triggering the 60 s STREAM_CHUNK_TIMEOUT.
+                    // triggering stream idle timeout errors.
                     //
                     // Collect addresses per peer first so we can check atomically.
                     let mut addrs_by_peer: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
@@ -1230,6 +1267,8 @@ async fn bootstrap_lan_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
         listen_addr,
         MeshTransportMode::Lan,
         swarm_cmd_tx_lan,
+        config.stream_first_chunk_timeout,
+        config.stream_idle_chunk_timeout,
     ))
 }
 
@@ -1583,6 +1622,8 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
         "iroh-relay",
         MeshTransportMode::Iroh,
         swarm_cmd_tx_iroh,
+        config.stream_first_chunk_timeout,
+        config.stream_idle_chunk_timeout,
     ))
 }
 
@@ -1669,6 +1710,8 @@ pub async fn join_mesh_via_invite(
         bootstrap_peers,
         directory: DirectoryMode::default(),
         request_timeout: std::time::Duration::from_secs(300),
+        stream_first_chunk_timeout: std::time::Duration::from_secs(600),
+        stream_idle_chunk_timeout: std::time::Duration::from_secs(60),
         transport: MeshTransportMode::Iroh,
         identity_file,
         // Always include the invite so the swarm dials the inviter first.

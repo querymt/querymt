@@ -2,12 +2,44 @@
  * Compact tool card component - shows summary with inline preview for key tools
  */
 
-import { memo, useState, useMemo, useRef, useEffect } from 'react';
+import { memo, useState, useMemo, useRef, useEffect, Component, ErrorInfo, ReactNode } from 'react';
 import { Loader, CheckCircle, XCircle, ChevronRight, ChevronDown, Eye, Pause } from 'lucide-react';
 import { PatchDiff } from '@pierre/diffs/react';
 import { generateToolSummary, normalizeToolName } from '../utils/toolSummary';
 import { EventItem } from '../types';
 import { getDashboardThemeVariant, getDiffThemeForDashboard } from '../utils/dashboardThemes';
+
+type DiffRenderGuardProps = {
+  children: ReactNode;
+  fallback?: ReactNode;
+};
+
+type DiffRenderGuardState = {
+  hasError: boolean;
+};
+
+class DiffRenderGuard extends Component<DiffRenderGuardProps, DiffRenderGuardState> {
+  state: DiffRenderGuardState = { hasError: false };
+
+  static getDerivedStateFromError(): DiffRenderGuardState {
+    return { hasError: true };
+  }
+
+  componentDidCatch(_error: Error, _errorInfo: ErrorInfo) {
+    // Keep this local to avoid blanking the whole chat if a single diff is malformed.
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return this.props.fallback ?? (
+        <div className="px-3 py-2 text-[10px] text-status-warning">
+          Unable to render diff preview. Open details to inspect raw content.
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 /**
  * Defers rendering of the expensive PatchDiff component until the container
@@ -38,7 +70,11 @@ function LazyPatchDiff(props: React.ComponentProps<typeof PatchDiff> & { classNa
 
   return (
     <div ref={containerRef} className={className}>
-      {visible ? <PatchDiff {...diffProps} /> : (
+      {visible ? (
+        <DiffRenderGuard>
+          <PatchDiff {...diffProps} />
+        </DiffRenderGuard>
+      ) : (
         <div className="h-16 flex items-center justify-center text-[10px] text-ui-muted">
           Loading diff...
         </div>
@@ -250,6 +286,11 @@ export const ToolSummary = memo(function ToolSummary({
               }}
             />
           )}
+          {previewData.type === 'diff' && !previewData.patch && (
+            <div className="px-3 py-2 text-[10px] text-status-warning font-mono">
+              {previewData.fallbackText ?? 'Diff preview unavailable.'}
+            </div>
+          )}
           {previewData.type === 'shell' && (
             <div className="px-3 py-2 font-mono text-[11px] max-h-64 overflow-auto">
               {previewData.stdout && (
@@ -274,7 +315,7 @@ export const ToolSummary = memo(function ToolSummary({
 });
 
 // Build diff preview data for edit/patch tools
-type DiffPreviewData = { type: 'diff'; patch: string | null };
+type DiffPreviewData = { type: 'diff'; patch: string | null; fallbackText?: string };
 type ShellPreviewData = { type: 'shell'; stdout?: string; stderr?: string; exitCode?: number };
 type PreviewData = DiffPreviewData | ShellPreviewData;
 
@@ -312,7 +353,7 @@ function buildDiffPreview(
       return { type: 'diff', patch };
     }
   }
-  
+
   if (normalized === 'write' || normalized === 'write_file') {
     const filePath = (input.filePath || input.file_path || input.path || 'file') as string;
     const content = input.content;
@@ -331,18 +372,40 @@ function buildDiffPreview(
       return { type: 'diff', patch };
     }
   }
-  
+
   if (normalized === 'apply_patch') {
-    const patch = typeof input.patch === 'string' ? input.patch : null;
-    // Also check nested arguments
-    if (!patch && input.arguments) {
-      const args = parseJsonMaybe(input.arguments);
-      if (args?.patch) return { type: 'diff', patch: args.patch };
+    const rawPatch = extractPatchString(input);
+    if (!rawPatch) {
+      return { type: 'diff', patch: null, fallbackText: 'No patch payload available.' };
     }
-    return { type: 'diff', patch };
+    if (!isLikelyRenderablePatch(rawPatch)) {
+      return { type: 'diff', patch: null, fallbackText: 'Patch payload is malformed. Open details to inspect raw content.' };
+    }
+    return { type: 'diff', patch: rawPatch };
   }
-  
+
   return null;
+}
+
+function extractPatchString(input: Record<string, unknown>): string | null {
+  if (typeof input.patch === 'string') {
+    return input.patch;
+  }
+
+  const args = parseJsonMaybe(input.arguments);
+  if (typeof args?.patch === 'string') {
+    return args.patch;
+  }
+
+  return null;
+}
+
+function isLikelyRenderablePatch(patch: string): boolean {
+  const trimmed = patch.trim();
+  if (trimmed.length === 0) {
+    return false;
+  }
+  return /diff --git\s+.+\s+.+/.test(trimmed) && /@@\s+-\d/.test(trimmed);
 }
 
 // Build shell output preview

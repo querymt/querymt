@@ -367,22 +367,12 @@ mod provider_routing_integration_tests {
         );
     }
 
-    // ── H.10 — StreamReceiverActor timeout ────────────────────────────────────
+    // ── H.10 — StreamReceiverActor channel close handling ─────────────────────
 
     #[tokio::test]
-    async fn test_stream_receiver_actor_timeout() {
-        use crate::agent::remote::provider_host::STREAM_CHUNK_TIMEOUT;
-
-        // This test documents the timeout mechanism but doesn't wait 60s.
-        // We just verify the constant is defined and > 0.
-        assert!(
-            STREAM_CHUNK_TIMEOUT.as_secs() > 0,
-            "STREAM_CHUNK_TIMEOUT must be positive"
-        );
-
-        // To actually test timeout behaviour in a reasonable time,
-        // a `STREAM_CHUNK_TIMEOUT` that can be overridden in tests would be
-        // needed. Document for now.
+    async fn test_stream_receiver_actor_channel_close_handling() {
+        // Timeout behavior now lives in MeshChatProvider (first chunk vs idle).
+        // Keep this test focused on StreamReceiverActor channel semantics.
         let (_tx, mut rx) = mpsc::channel::<Result<querymt::chat::StreamChunk, String>>(1);
         // Drop the sender immediately so the receiver yields None quickly.
         drop(_tx);

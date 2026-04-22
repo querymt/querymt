@@ -114,6 +114,29 @@ describe('ToolDetailModal diff style', () => {
     const lastCall = patchDiffSpy.mock.calls[patchDiffSpy.mock.calls.length - 1][0];
     expect(lastCall.options.diffStyle).toBe('unified');
   });
+
+  it('shows malformed patch warning and skips PatchDiff for invalid apply_patch input', () => {
+    const malformedPatchEvent = {
+      id: 'e3',
+      type: 'tool_call' as const,
+      content: '',
+      timestamp: 1002,
+      agentId: 'agent-0',
+      toolCall: {
+        kind: 'apply_patch',
+        tool_call_id: 'apply_patch:1',
+        raw_input: {
+          patch: 'definitely not a unified diff',
+        },
+        status: 'completed',
+      },
+    } as any;
+
+    render(<ToolDetailModal event={malformedPatchEvent} onClose={vi.fn()} />);
+
+    expect(screen.getByText('Patch payload is malformed. Use raw event data below.')).toBeInTheDocument();
+    expect(patchDiffSpy).not.toHaveBeenCalled();
+  });
 });
 
 describe('ToolDetailModal mobile header layout', () => {

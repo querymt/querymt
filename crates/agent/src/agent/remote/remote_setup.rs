@@ -118,6 +118,12 @@ pub async fn setup_mesh_from_config(
         },
         directory: crate::agent::remote::mesh::DirectoryMode::default(),
         request_timeout: std::time::Duration::from_secs(mesh_cfg.request_timeout_secs),
+        stream_first_chunk_timeout: std::time::Duration::from_secs(
+            mesh_cfg.stream_first_chunk_timeout_secs,
+        ),
+        stream_idle_chunk_timeout: std::time::Duration::from_secs(
+            mesh_cfg.stream_idle_chunk_timeout_secs,
+        ),
         transport,
         identity_file: mesh_cfg
             .identity_file
