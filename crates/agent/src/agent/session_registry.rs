@@ -454,17 +454,12 @@ impl SessionRegistry {
         session_ref
     }
 
-    /// Detach a remote session: send `UnsubscribeEvents` to stop the remote
-    /// `EventForwarder`, then remove the session from the registry.
-    ///
-    /// This is the counterpart to [`attach_remote_session`](Self::attach_remote_session).
-    /// Call this instead of bare `remove()` for remote sessions so the
-    /// forwarder task on the remote node is properly cleaned up.
-    ///
-    /// For local sessions (or if the session is not in the registry) this
-    /// falls back to a plain `remove()`.
     #[cfg(feature = "remote")]
-    pub async fn detach_remote_session(&mut self, session_id: &str) -> Option<SessionActorRef> {
+    async fn detach_remote_session_inner(
+        &mut self,
+        session_id: &str,
+        preserve_bookmark: bool,
+    ) -> Option<SessionActorRef> {
         // Send UnsubscribeEvents before removing so the remote forwarder is aborted.
         if let (Some(session_ref), Some((relay_id, relay_dht_name))) = (
             self.sessions.get(session_id),
@@ -503,18 +498,43 @@ impl SessionRegistry {
             }
         }
 
-        // Remove the persisted bookmark.
-        let store = self.config.provider.history_store();
-        let sid = session_id.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = store.remove_remote_session_bookmark(&sid).await {
-                log::warn!("Failed to remove remote session bookmark {}: {}", sid, e);
-            }
-        });
+        if !preserve_bookmark {
+            let store = self.config.provider.history_store();
+            let sid = session_id.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = store.remove_remote_session_bookmark(&sid).await {
+                    log::warn!("Failed to remove remote session bookmark {}: {}", sid, e);
+                }
+            });
+        }
 
         self.relay_actor_ids.remove(session_id);
         self.local_actor_refs.remove(session_id);
         self.sessions.remove(session_id)
+    }
+
+    /// Detach a remote session: send `UnsubscribeEvents` to stop the remote
+    /// `EventForwarder`, then remove the session from the registry.
+    ///
+    /// This is the counterpart to [`attach_remote_session`](Self::attach_remote_session).
+    /// Call this instead of bare `remove()` for remote sessions so the
+    /// forwarder task on the remote node is properly cleaned up.
+    ///
+    /// For local sessions (or if the session is not in the registry) this
+    /// falls back to a plain `remove()`.
+    #[cfg(feature = "remote")]
+    pub async fn detach_remote_session(&mut self, session_id: &str) -> Option<SessionActorRef> {
+        self.detach_remote_session_inner(session_id, false).await
+    }
+
+    /// Remove a remote session runtime from local tracking but keep its bookmark
+    /// so the stopped session remains visible and resumable.
+    #[cfg(feature = "remote")]
+    pub async fn detach_remote_session_preserve_bookmark(
+        &mut self,
+        session_id: &str,
+    ) -> Option<SessionActorRef> {
+        self.detach_remote_session_inner(session_id, true).await
     }
 
     /// Create a new session: build runtime, spawn SessionActor, return session_id.

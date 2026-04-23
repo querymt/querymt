@@ -1311,6 +1311,105 @@ impl LocalAgentHandle {
             .attach_remote_session(session_id, remote_ref, peer_label, mesh, remote_node_id)
             .await
     }
+
+    #[cfg(feature = "remote")]
+    pub async fn resume_remote_session(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        session_id: String,
+    ) -> Result<crate::agent::remote::CreateRemoteSessionResponse, agent_client_protocol::Error>
+    {
+        use crate::agent::remote::ResumeRemoteSession;
+        use crate::error::AgentError;
+
+        node_manager_ref
+            .ask(&ResumeRemoteSession { session_id })
+            .await
+            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+    }
+
+    pub async fn stop_session(&self, session_id: &str) -> Result<(), Error> {
+        use crate::agent::messages::SessionRuntimeStatus;
+
+        const STOP_ESCALATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+        let session_ref = {
+            let registry = self.registry.lock().await;
+            registry.get(session_id).cloned()
+        };
+
+        let Some(session_ref) = session_ref else {
+            log::warn!(
+                "Stop requested for session {} but not found in registry",
+                session_id
+            );
+            return Ok(());
+        };
+
+        self.config
+            .emit_event(session_id, AgentEventKind::SessionStopRequested);
+        let _ = session_ref.cancel().await;
+
+        tokio::time::sleep(STOP_ESCALATION_TIMEOUT).await;
+
+        let status = session_ref
+            .get_runtime_status()
+            .await
+            .unwrap_or(SessionRuntimeStatus::Running);
+        if matches!(status, SessionRuntimeStatus::Idle) {
+            return Ok(());
+        }
+
+        self.config.emit_event(
+            session_id,
+            AgentEventKind::SessionForceStopped {
+                escalated_after_ms: STOP_ESCALATION_TIMEOUT.as_millis() as u64,
+                reason: "graceful cancellation timeout elapsed".to_string(),
+            },
+        );
+
+        if session_ref.is_remote() {
+            #[cfg(feature = "remote")]
+            {
+                let bookmark = self
+                    .config
+                    .provider
+                    .history_store()
+                    .list_remote_session_bookmarks()
+                    .await
+                    .map_err(|e| Error::internal_error().data(e.to_string()))?
+                    .into_iter()
+                    .find(|b| b.session_id == session_id);
+
+                if let Some(bookmark) = bookmark {
+                    let nm_ref = self.find_node_manager(&bookmark.node_id).await?;
+                    nm_ref
+                        .ask(&crate::agent::remote::DestroyRemoteSession {
+                            session_id: session_id.to_string(),
+                        })
+                        .await
+                        .map_err(|e| {
+                            Error::from(crate::error::AgentError::RemoteActor(e.to_string()))
+                        })?;
+                }
+
+                let mut registry = self.registry.lock().await;
+                registry
+                    .detach_remote_session_preserve_bookmark(session_id)
+                    .await;
+            }
+        } else {
+            let removed = {
+                let mut registry = self.registry.lock().await;
+                registry.remove(session_id)
+            };
+            if let Some(session_ref) = removed {
+                let _ = session_ref.shutdown().await;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // ── Model registry convenience ────────────────────────────────────────────
@@ -1585,21 +1684,7 @@ impl SendAgent for LocalAgentHandle {
     #[tracing::instrument(name = "acp.cancel", skip_all, fields(session_id = %notif.session_id))]
     async fn cancel(&self, notif: CancelNotification) -> Result<(), Error> {
         let session_id = notif.session_id.to_string();
-
-        let session_ref = {
-            let registry = self.registry.lock().await;
-            registry.get(&session_id).cloned()
-        };
-
-        if let Some(session_ref) = session_ref {
-            let _ = session_ref.cancel().await;
-        } else {
-            log::warn!(
-                "Cancel requested for session {} but not found in registry",
-                session_id
-            );
-        }
-        Ok(())
+        self.stop_session(&session_id).await
     }
 
     #[tracing::instrument(name = "acp.load_session", skip_all, fields(session_id = %req.session_id))]
@@ -2278,7 +2363,7 @@ mod tests {
     async fn test_cancel_unknown_session_is_noop() {
         let f = HandleFixture::new().await;
         let notif = CancelNotification::new(SessionId::from("no-such-session".to_string()));
-        // Should not return an error — cancel for unknown sessions is a no-op
+        // Should not return an error — stop for unknown sessions is a no-op
         let result = SendAgent::cancel(&f.handle, notif).await;
         assert!(result.is_ok());
     }

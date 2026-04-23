@@ -820,6 +820,25 @@ impl Message<GetSessionLimits> for SessionActor {
     }
 }
 
+impl Message<GetRuntimeStatus> for SessionActor {
+    type Reply = Result<SessionRuntimeStatus, kameo::error::Infallible>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetRuntimeStatus,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let status = if !self.prompt_running {
+            SessionRuntimeStatus::Idle
+        } else if self.turn_state.token.is_cancelled() {
+            SessionRuntimeStatus::CancelRequested
+        } else {
+            SessionRuntimeStatus::Running
+        };
+        Ok(status)
+    }
+}
+
 impl Message<GetLlmConfig> for SessionActor {
     type Reply = Result<Option<LLMConfig>, AgentError>;
 
@@ -2089,6 +2108,34 @@ mod tests {
             }
         }
         assert!(found_cancel, "Expected Cancelled event on event fanout");
+    }
+
+    #[tokio::test]
+    async fn test_get_runtime_status_idle_when_not_running() {
+        let f = ActorFixture::new().await;
+
+        let status = f
+            .actor_ref
+            .ask(GetRuntimeStatus)
+            .await
+            .expect("ask GetRuntimeStatus");
+
+        assert_eq!(status, SessionRuntimeStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn test_get_runtime_status_remains_idle_after_cancel_without_running_prompt() {
+        let f = ActorFixture::new().await;
+
+        f.actor_ref.tell(Cancel).await.expect("tell Cancel");
+
+        let status = f
+            .actor_ref
+            .ask(GetRuntimeStatus)
+            .await
+            .expect("ask GetRuntimeStatus");
+
+        assert_eq!(status, SessionRuntimeStatus::Idle);
     }
 
     #[tokio::test]

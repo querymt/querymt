@@ -506,7 +506,7 @@ mod node_manager_tests {
     use crate::agent::messages::GetMode;
     use crate::agent::remote::node_manager::{
         CreateRemoteSession, DestroyRemoteSession, ForkRemoteSession, GetNodeInfo,
-        ListRemoteSessions, RemoteNodeManager, SessionHandoff,
+        ListRemoteSessions, RemoteNodeManager, ResumeRemoteSession, SessionHandoff,
     };
     use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
     use crate::model::{AgentMessage, MessagePart};
@@ -680,7 +680,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_destroy_session() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
+        let (nm_ref, config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let resp = nm_ref
             .ask(CreateRemoteSession { cwd: None })
@@ -696,6 +696,16 @@ mod node_manager_tests {
 
         let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
         assert!(sessions.is_empty());
+        assert!(
+            config
+                .provider
+                .history_store()
+                .get_session(&resp.session_id)
+                .await
+                .expect("session lookup")
+                .is_some(),
+            "destroy should remove only the runtime, not persisted history"
+        );
     }
 
     #[tokio::test]
@@ -812,6 +822,36 @@ mod node_manager_tests {
         let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, resp2.session_id);
+    }
+
+    #[tokio::test]
+    async fn test_resume_destroyed_session() {
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
+
+        let resp = nm_ref
+            .ask(CreateRemoteSession { cwd: None })
+            .await
+            .expect("create");
+
+        nm_ref
+            .ask(DestroyRemoteSession {
+                session_id: resp.session_id.clone(),
+            })
+            .await
+            .expect("destroy");
+
+        let resumed = nm_ref
+            .ask(ResumeRemoteSession {
+                session_id: resp.session_id.clone(),
+            })
+            .await
+            .expect("resume");
+
+        assert_eq!(resumed.session_id, resp.session_id);
+
+        let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, resp.session_id);
     }
 
     #[tokio::test]

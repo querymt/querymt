@@ -438,7 +438,7 @@ pub(crate) async fn attach_remote_session_via_lookup(
     session_id: &str,
     tx: &mpsc::Sender<String>,
 ) -> Result<(), String> {
-    finalize_remote_session_attach(
+    match finalize_remote_session_attach(
         state,
         conn_id,
         node_id,
@@ -448,6 +448,33 @@ pub(crate) async fn attach_remote_session_via_lookup(
         tx,
     )
     .await
+    {
+        Ok(()) => Ok(()),
+        Err(lookup_err) => {
+            let nm_ref = state
+                .agent
+                .find_node_manager(node_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let resumed = state
+                .agent
+                .resume_remote_session(&nm_ref, session_id.to_string())
+                .await
+                .map_err(|e| e.to_string())?;
+
+            finalize_remote_session_attach(
+                state,
+                conn_id,
+                node_id,
+                session_id,
+                resumed.handoff,
+                resumed.cwd.map(PathBuf::from),
+                tx,
+            )
+            .await
+            .map_err(|resume_err| format!("{lookup_err}; resume failed: {resume_err}"))
+        }
+    }
 }
 
 /// Attach an existing remote session to the local registry.

@@ -135,6 +135,11 @@ remote_msg_impl!(
     REG_GET_SESSION_LIMITS
 );
 remote_msg_impl!(
+    messages::GetRuntimeStatus,
+    "querymt::GetRuntimeStatus",
+    REG_GET_RUNTIME_STATUS
+);
+remote_msg_impl!(
     messages::SetProvider,
     "querymt::SetProvider",
     REG_SET_PROVIDER

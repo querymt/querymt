@@ -391,6 +391,22 @@ impl SessionActorRef {
         }
     }
 
+    /// Query current runtime status for stop orchestration.
+    pub async fn get_runtime_status(&self) -> Result<messages::SessionRuntimeStatus, AgentError> {
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(messages::GetRuntimeStatus)
+                .await
+                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+
+            #[cfg(feature = "remote")]
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&messages::GetRuntimeStatus)
+                .await
+                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+        }
+    }
+
     /// Set the client bridge for SessionUpdate notifications (local only).
     ///
     /// This is a no-op for remote sessions — the bridge is a local channel

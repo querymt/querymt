@@ -30,6 +30,8 @@ pub struct RemoteSessionInfo {
     pub title: Option<String>,
     /// Human-readable label of the peer that owns this session
     pub peer_label: String,
+    /// High-level runtime lifecycle state for UI summaries.
+    pub runtime_state: Option<String>,
 }
 
 /// Metadata about a remote node.
@@ -58,7 +60,8 @@ pub struct AvailableModel {
 pub use remote_impl::{
     AdmissionRequest, AdmissionResponse, CreateRemoteSession, CreateRemoteSessionResponse,
     DestroyRemoteSession, ForkRemoteSession, ForkRemoteSessionResponse, GetNodeInfo,
-    ListAvailableModels, ListRemoteSessions, RemoteNodeManager, SessionHandoff,
+    ListAvailableModels, ListRemoteSessions, RemoteNodeManager, ResumeRemoteSession,
+    SessionHandoff,
 };
 
 #[cfg(feature = "remote")]
@@ -161,6 +164,12 @@ mod remote_impl {
     /// Destroy (shutdown) a session on this node.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct DestroyRemoteSession {
+        pub session_id: String,
+    }
+
+    /// Re-materialize a persisted session on this node.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ResumeRemoteSession {
         pub session_id: String,
     }
 
@@ -649,6 +658,7 @@ mod remote_impl {
                     created_at,
                     title,
                     peer_label: hostname.clone(),
+                    runtime_state: Some("active".to_string()),
                 });
             }
 
@@ -706,8 +716,10 @@ mod remote_impl {
                     mesh.deregister_actor(&dht_name);
                 }
 
-                self.session_meta.remove(&msg.session_id);
-                log::info!("RemoteNodeManager: destroyed session {}", msg.session_id);
+                log::info!(
+                    "RemoteNodeManager: destroyed runtime for session {}",
+                    msg.session_id
+                );
                 Ok(())
             } else {
                 tracing::Span::current().record("found", false);
@@ -715,6 +727,63 @@ mod remote_impl {
                     session_id: msg.session_id.clone(),
                 })
             }
+        }
+    }
+
+    impl Message<ResumeRemoteSession> for RemoteNodeManager {
+        type Reply = Result<CreateRemoteSessionResponse, AgentError>;
+
+        #[tracing::instrument(
+            name = "remote.node_manager.resume_session",
+            skip(self, _ctx),
+            fields(session_id = %msg.session_id)
+        )]
+        async fn handle(
+            &mut self,
+            msg: ResumeRemoteSession,
+            _ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let session = self
+                .config
+                .provider
+                .history_store()
+                .get_session(&msg.session_id)
+                .await
+                .map_err(|e| AgentError::Internal(e.to_string()))?
+                .ok_or_else(|| AgentError::SessionNotFound {
+                    session_id: msg.session_id.clone(),
+                })?;
+
+            let cwd_path = session.cwd.clone();
+            let cwd = cwd_path.as_ref().map(|p| p.display().to_string());
+            let title = session.name.clone();
+            let created_at = session
+                .created_at
+                .map(|ts| ts.unix_timestamp())
+                .unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0)
+                });
+
+            let handoff = self
+                .materialize_remote_session(
+                    msg.session_id.clone(),
+                    cwd_path,
+                    cwd.clone(),
+                    title.clone(),
+                    created_at,
+                )
+                .await?;
+
+            Ok(CreateRemoteSessionResponse {
+                session_id: msg.session_id,
+                handoff,
+                cwd,
+                title,
+                created_at,
+            })
         }
     }
 
@@ -1020,6 +1089,11 @@ mod remote_impl {
         DestroyRemoteSession,
         "querymt::DestroyRemoteSession",
         REG_DESTROY_REMOTE_SESSION
+    );
+    remote_node_msg_impl!(
+        ResumeRemoteSession,
+        "querymt::ResumeRemoteSession",
+        REG_RESUME_REMOTE_SESSION
     );
     remote_node_msg_impl!(GetNodeInfo, "querymt::GetNodeInfo", REG_GET_NODE_INFO);
     remote_node_msg_impl!(

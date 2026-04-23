@@ -294,48 +294,16 @@ pub(crate) fn qmt_http_stream_open(
                 res = reqwest_req.send() => res,
             };
 
-            let resp = send_res.map_err(|e| {
-                (
-                    crate::error::LLMError::ProviderError(format!("Request failed: {}", e)),
-                    0u16,
-                )
-            })?;
+            let resp = send_res.map_err(|e| (crate::error::LLMError::from(e), 0u16))?;
             if !resp.status().is_success() {
                 let status_code = resp.status().as_u16();
-
-                // Extract retry-after header before consuming the response body
-                let retry_after_secs = crate::plugin::http::parse_retry_after(resp.headers());
-
+                let headers = resp.headers().clone();
                 let body = resp
-                    .text()
+                    .bytes()
                     .await
-                    .unwrap_or_else(|_| "could not read body".to_string());
-
-                // Parse JSON for clean message (same logic as handle_http_error! macro)
-                let clean_message = serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|json| {
-                        json.pointer("/error/message")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .unwrap_or_else(|| format!("HTTP {}: {}", status_code, body));
-
-                // Create structured LLMError based on status code
-                use crate::error::LLMError;
-                let llm_error = match status_code {
-                    401 | 403 => LLMError::AuthError(clean_message),
-                    429 => LLMError::RateLimited {
-                        message: clean_message,
-                        retry_after_secs,
-                    },
-                    400 => LLMError::InvalidRequest(clean_message),
-                    499 => LLMError::Cancelled,
-                    500 | 529 => {
-                        LLMError::ProviderError(format!("Server error: {}", clean_message))
-                    }
-                    _ => LLMError::ProviderError(clean_message),
-                };
+                    .unwrap_or_else(|_| bytes::Bytes::from_static(b"could not read body"));
+                let llm_error =
+                    crate::error::classify_http_status(status_code, &headers, body.as_ref());
 
                 return Err((llm_error, status_code));
             }

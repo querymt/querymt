@@ -120,27 +120,14 @@ pub struct SessionSummary {
     pub title: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
-    /// Public ID of the parent session (if this is a child session)
     pub parent_session_id: Option<String>,
-    /// Fork origin: "user" or "delegation"
     pub fork_origin: Option<String>,
-    /// Session kind for specialized workflows (e.g. "recurring")
     pub session_kind: Option<String>,
-    /// Whether this session has child sessions
     pub has_children: bool,
-    /// Node label where this session lives. "local" for local sessions,
-    /// peer hostname/label for remote sessions (display only).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
-    /// Stable PeerId of the remote node. Required by the frontend to send
-    /// `attach_remote_session`. Only set for remote sessions.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
-    /// Whether this remote session is currently attached (has a live actor ref).
-    /// `Some(true)` = attached, `Some(false)` = discovered but not attached,
-    /// `None` = local session (not applicable).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub attached: Option<bool>,
+    pub runtime_state: Option<String>,
 }
 
 /// Information about a remote node discovered in the kameo mesh.
