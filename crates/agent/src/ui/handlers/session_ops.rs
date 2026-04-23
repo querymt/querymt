@@ -6,14 +6,17 @@
 
 use super::super::ServerState;
 use super::super::connection::{send_error, send_message, send_state, subscribe_to_file_index};
-use super::super::mentions::{filter_index_for_cwd, filter_index_for_cwd_entries};
 use super::super::messages::{SessionGroup, SessionSummary, UiServerMessage};
+#[cfg(feature = "remote")]
+use super::attach_remote_session_via_lookup;
+
 use super::super::{cursor_from_events, session::PRIMARY_AGENT_ID};
 use crate::agent::core::AgentMode;
 use crate::events::EventEnvelope;
 use crate::index::resolve_workspace_root;
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
+use crate::ui::mentions::{filter_index_for_cwd, filter_index_for_cwd_entries};
 use agent_client_protocol::schema::{CancelNotification, LoadSessionRequest, SessionId};
 use querymt::chat::ReasoningEffort;
 use std::path::PathBuf;
@@ -1010,6 +1013,25 @@ pub async fn handle_fork_session(
         let registry = state.agent.registry.lock().await;
         registry.get(&source_session_id).cloned()
     };
+    #[cfg(feature = "remote")]
+    let source_remote_node_id = if source_session_ref
+        .as_ref()
+        .is_some_and(|session_ref| session_ref.is_remote())
+    {
+        state
+            .session_store
+            .list_remote_session_bookmarks()
+            .await
+            .ok()
+            .and_then(|bookmarks| {
+                bookmarks
+                    .into_iter()
+                    .find(|bookmark| bookmark.session_id == source_session_id)
+                    .map(|bookmark| bookmark.node_id)
+            })
+    } else {
+        None
+    };
 
     let fork_result = if let Some(session_ref) = source_session_ref {
         session_ref
@@ -1026,6 +1048,45 @@ pub async fn handle_fork_session(
 
     match fork_result {
         Ok(forked_session_id) => {
+            #[cfg(feature = "remote")]
+            if let Some(node_id) = source_remote_node_id.clone() {
+                if let Err(err) = attach_remote_session_via_lookup(
+                    state,
+                    conn_id,
+                    &node_id,
+                    &forked_session_id,
+                    tx,
+                )
+                .await
+                {
+                    let _ = send_message(
+                        tx,
+                        UiServerMessage::ForkResult {
+                            success: false,
+                            source_session_id: Some(source_session_id),
+                            forked_session_id: Some(forked_session_id),
+                            message: Some(format!(
+                                "Fork created but failed to attach remote child: {err}"
+                            )),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+
+                let _ = send_message(
+                    tx,
+                    UiServerMessage::ForkResult {
+                        success: true,
+                        source_session_id: Some(source_session_id),
+                        forked_session_id: Some(forked_session_id),
+                        message: None,
+                    },
+                )
+                .await;
+                return;
+            }
+
             if let Ok(Some(forked_session)) =
                 state.session_store.get_session(&forked_session_id).await
                 && let Some(cwd) = forked_session.cwd

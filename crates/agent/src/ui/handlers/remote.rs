@@ -15,6 +15,8 @@ use super::super::messages::{MeshInviteInfo, UiServerMessage};
 use super::session_ops::handle_list_sessions;
 #[cfg(feature = "remote")]
 use crate::agent::utils::u32_from_usize;
+#[cfg(feature = "remote")]
+use kameo::actor::RemoteActorRef;
 use tokio::sync::mpsc;
 
 /// List remote nodes discovered in the kameo mesh.
@@ -217,6 +219,247 @@ pub async fn handle_create_remote_session(
     }
 }
 
+#[cfg(feature = "remote")]
+async fn finalize_remote_session_attach(
+    state: &ServerState,
+    conn_id: &str,
+    node_id: &str,
+    session_id: &str,
+    remote_ref: RemoteActorRef<crate::agent::session_actor::SessionActor>,
+    tx: &mpsc::Sender<String>,
+) -> Result<(), String> {
+    let peer_label = state
+        .agent
+        .list_remote_nodes()
+        .await
+        .into_iter()
+        .find(|n| n.node_id.to_string() == node_id)
+        .map(|n| n.hostname)
+        .unwrap_or_else(|| node_id.to_string());
+
+    let _session_actor_ref = state
+        .agent
+        .attach_remote_session(
+            session_id.to_string(),
+            remote_ref,
+            peer_label,
+            Some(node_id.to_string()),
+        )
+        .await;
+
+    // Health-check the attached session before publishing SessionLoaded.
+    // This avoids rendering a session that cannot accept prompts.
+    let attached_session_ref = {
+        let registry = state.agent.registry.lock().await;
+        registry.get(session_id).cloned()
+    };
+    let Some(attached_session_ref) = attached_session_ref else {
+        return Err(format!(
+            "Attached remote session '{}' but it is missing from local registry",
+            session_id
+        ));
+    };
+    if let Err(e) = attached_session_ref.get_mode().await {
+        return Err(format!(
+            "Remote session '{}' attached but failed health check on node '{}': {}",
+            session_id, node_id, e
+        ));
+    }
+
+    let agent_id = super::super::session::PRIMARY_AGENT_ID.to_string();
+
+    {
+        let mut connections = state.connections.lock().await;
+        if let Some(conn) = connections.get_mut(conn_id) {
+            conn.sessions
+                .insert(agent_id.clone(), session_id.to_string());
+            conn.subscribed_sessions.insert(session_id.to_string());
+        }
+    }
+
+    {
+        let mut agents = state.session_agents.lock().await;
+        agents.insert(session_id.to_string(), agent_id.clone());
+    }
+
+    if let Some(cwd_path) = state.default_cwd.clone() {
+        let mut cwds = state.session_cwds.lock().await;
+        cwds.insert(session_id.to_string(), cwd_path);
+    }
+
+    // Fetch remote event history so the UI can render the conversation.
+    let remote_events = {
+        let session_ref = {
+            let registry = state.agent.registry.lock().await;
+            registry.get(session_id).cloned()
+        };
+        if let Some(ref session_ref) = session_ref {
+            match session_ref.get_event_stream().await {
+                Ok(events) => {
+                    log::info!(
+                        "handle_attach_remote_session: fetched {} events from remote session {}",
+                        events.len(),
+                        session_id
+                    );
+                    events
+                }
+                Err(e) => {
+                    log::warn!(
+                        "handle_attach_remote_session: failed to fetch remote event stream for {}: {}",
+                        session_id,
+                        e
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        }
+    };
+
+    let cursor = super::super::cursor_from_events(&remote_events);
+    let audit = crate::session::projection::AuditView {
+        session_id: session_id.to_string(),
+        events: remote_events,
+        tasks: Vec::new(),
+        intent_snapshots: Vec::new(),
+        decisions: Vec::new(),
+        progress_entries: Vec::new(),
+        artifacts: Vec::new(),
+        delegations: Vec::new(),
+        generated_at: time::OffsetDateTime::now_utc(),
+    };
+
+    // Seed connection cursor so the event forwarder won't drop events
+    // that arrive while we're still sending the SessionLoaded payload.
+    {
+        let mut connections = state.connections.lock().await;
+        if let Some(conn) = connections.get_mut(conn_id) {
+            conn.session_cursors
+                .insert(session_id.to_string(), cursor.clone());
+        }
+    }
+
+    let _ = send_message(
+        tx,
+        UiServerMessage::SessionLoaded {
+            session_id: session_id.to_string(),
+            agent_id,
+            audit,
+            undo_stack: Vec::new(),
+            cursor,
+        },
+    )
+    .await;
+
+    let _ = send_message(
+        tx,
+        UiServerMessage::WorkspaceIndexStatus {
+            session_id: session_id.to_string(),
+            status: "building".to_string(),
+            message: None,
+        },
+    )
+    .await;
+
+    super::super::connection::send_state(state, conn_id, tx).await;
+    handle_list_sessions(state, tx).await;
+
+    log::info!(
+        "handle_attach_remote_session: attached session {} from node_id '{}'",
+        session_id,
+        node_id
+    );
+
+    Ok(())
+}
+
+#[cfg(feature = "remote")]
+async fn lookup_remote_session_actor(
+    state: &ServerState,
+    node_id: &str,
+    session_id: &str,
+) -> Result<RemoteActorRef<crate::agent::session_actor::SessionActor>, String> {
+    use std::time::Duration;
+
+    use crate::agent::session_actor::SessionActor;
+
+    let mesh = state
+        .agent
+        .mesh()
+        .ok_or_else(|| "mesh not bootstrapped — start with --mesh".to_string())?;
+
+    let dht_name = crate::agent::remote::dht_name::session(session_id);
+    let lookup_backoff_ms: [u64; 4] = [0, 120, 300, 700];
+    let mut last_lookup_error = None;
+
+    for (attempt_idx, delay_ms) in lookup_backoff_ms.iter().enumerate() {
+        if *delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+        }
+
+        match mesh
+            .lookup_actor_no_retry::<SessionActor>(dht_name.clone())
+            .await
+        {
+            Ok(Some(r)) => {
+                if attempt_idx > 0 {
+                    log::info!(
+                        "handle_attach_remote_session: DHT lookup for {} succeeded on retry {}",
+                        session_id,
+                        attempt_idx + 1
+                    );
+                }
+                return Ok(r);
+            }
+            Ok(None) => {
+                log::debug!(
+                    "handle_attach_remote_session: DHT lookup miss for {} under '{}' (attempt {}/{})",
+                    session_id,
+                    dht_name,
+                    attempt_idx + 1,
+                    lookup_backoff_ms.len()
+                );
+            }
+            Err(e) => {
+                last_lookup_error = Some(e.to_string());
+                log::warn!(
+                    "handle_attach_remote_session: DHT lookup error for {} under '{}' (attempt {}/{}): {}",
+                    session_id,
+                    dht_name,
+                    attempt_idx + 1,
+                    lookup_backoff_ms.len(),
+                    e
+                );
+            }
+        }
+    }
+
+    let detail = last_lookup_error
+        .map(|e| format!("last error: {e}"))
+        .unwrap_or_else(|| "session was not visible in DHT yet".to_string());
+    Err(format!(
+        "Session '{}' not attachable from node '{}': looked up '{}' {} times, {}",
+        session_id,
+        node_id,
+        dht_name,
+        lookup_backoff_ms.len(),
+        detail
+    ))
+}
+
+#[cfg(feature = "remote")]
+pub(crate) async fn attach_remote_session_via_lookup(
+    state: &ServerState,
+    conn_id: &str,
+    node_id: &str,
+    session_id: &str,
+    tx: &mpsc::Sender<String>,
+) -> Result<(), String> {
+    let remote_ref = lookup_remote_session_actor(state, node_id, session_id).await?;
+    finalize_remote_session_attach(state, conn_id, node_id, session_id, remote_ref, tx).await
+}
+
 /// Attach an existing remote session to the local registry.
 pub async fn handle_attach_remote_session(
     state: &ServerState,
@@ -227,244 +470,11 @@ pub async fn handle_attach_remote_session(
 ) {
     #[cfg(feature = "remote")]
     {
-        use std::time::Duration;
-
-        use crate::agent::session_actor::SessionActor;
-
-        let mesh = match state.agent.mesh() {
-            Some(m) => m,
-            None => {
-                let _ =
-                    send_error(tx, "mesh not bootstrapped — start with --mesh".to_string()).await;
-                return;
-            }
-        };
-
-        let dht_name = crate::agent::remote::dht_name::session(session_id);
-        let lookup_backoff_ms: [u64; 4] = [0, 120, 300, 700];
-        let mut remote_ref = None;
-        let mut last_lookup_error = None;
-
-        for (attempt_idx, delay_ms) in lookup_backoff_ms.iter().enumerate() {
-            if *delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
-            }
-
-            match mesh
-                .lookup_actor_no_retry::<SessionActor>(dht_name.clone())
-                .await
-            {
-                Ok(Some(r)) => {
-                    remote_ref = Some(r);
-                    if attempt_idx > 0 {
-                        log::info!(
-                            "handle_attach_remote_session: DHT lookup for {} succeeded on retry {}",
-                            session_id,
-                            attempt_idx + 1
-                        );
-                    }
-                    break;
-                }
-                Ok(None) => {
-                    log::debug!(
-                        "handle_attach_remote_session: DHT lookup miss for {} under '{}' (attempt {}/{})",
-                        session_id,
-                        dht_name,
-                        attempt_idx + 1,
-                        lookup_backoff_ms.len()
-                    );
-                }
-                Err(e) => {
-                    last_lookup_error = Some(e.to_string());
-                    log::warn!(
-                        "handle_attach_remote_session: DHT lookup error for {} under '{}' (attempt {}/{}): {}",
-                        session_id,
-                        dht_name,
-                        attempt_idx + 1,
-                        lookup_backoff_ms.len(),
-                        e
-                    );
-                }
-            }
-        }
-
-        let Some(remote_ref) = remote_ref else {
-            let detail = last_lookup_error
-                .map(|e| format!("last error: {e}"))
-                .unwrap_or_else(|| "session was not visible in DHT yet".to_string());
-            let _ = send_error(
-                tx,
-                format!(
-                    "Session '{}' not attachable from node '{}': looked up '{}' {} times, {}",
-                    session_id,
-                    node_id,
-                    dht_name,
-                    lookup_backoff_ms.len(),
-                    detail
-                ),
-            )
-            .await;
-            return;
-        };
-
-        let peer_label = state
-            .agent
-            .list_remote_nodes()
-            .await
-            .into_iter()
-            .find(|n| n.node_id.to_string() == node_id)
-            .map(|n| n.hostname)
-            .unwrap_or_else(|| node_id.to_string());
-
-        let _session_actor_ref = state
-            .agent
-            .attach_remote_session(
-                session_id.to_string(),
-                remote_ref,
-                peer_label,
-                Some(node_id.to_string()),
-            )
-            .await;
-
-        // Health-check the attached session before publishing SessionLoaded.
-        // This avoids rendering a session that cannot accept prompts.
-        let attached_session_ref = {
-            let registry = state.agent.registry.lock().await;
-            registry.get(session_id).cloned()
-        };
-        let Some(attached_session_ref) = attached_session_ref else {
-            let _ = send_error(
-                tx,
-                format!(
-                    "Attached remote session '{}' but it is missing from local registry",
-                    session_id
-                ),
-            )
-            .await;
-            return;
-        };
-        if let Err(e) = attached_session_ref.get_mode().await {
-            let _ = send_error(
-                tx,
-                format!(
-                    "Remote session '{}' attached but failed health check on node '{}': {}",
-                    session_id, node_id, e
-                ),
-            )
-            .await;
-            return;
-        }
-
-        let agent_id = super::super::session::PRIMARY_AGENT_ID.to_string();
-
+        if let Err(err) =
+            attach_remote_session_via_lookup(state, conn_id, node_id, session_id, tx).await
         {
-            let mut connections = state.connections.lock().await;
-            if let Some(conn) = connections.get_mut(conn_id) {
-                conn.sessions
-                    .insert(agent_id.clone(), session_id.to_string());
-                conn.subscribed_sessions.insert(session_id.to_string());
-            }
+            let _ = send_error(tx, err).await;
         }
-
-        {
-            let mut agents = state.session_agents.lock().await;
-            agents.insert(session_id.to_string(), agent_id.clone());
-        }
-
-        if let Some(cwd_path) = state.default_cwd.clone() {
-            let mut cwds = state.session_cwds.lock().await;
-            cwds.insert(session_id.to_string(), cwd_path);
-        }
-
-        // Fetch remote event history so the UI can render the conversation.
-        let remote_events = {
-            let session_ref = {
-                let registry = state.agent.registry.lock().await;
-                registry.get(session_id).cloned()
-            };
-            if let Some(ref session_ref) = session_ref {
-                match session_ref.get_event_stream().await {
-                    Ok(events) => {
-                        log::info!(
-                            "handle_attach_remote_session: fetched {} events from remote session {}",
-                            events.len(),
-                            session_id
-                        );
-                        events
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "handle_attach_remote_session: failed to fetch remote event stream for {}: {}",
-                            session_id,
-                            e
-                        );
-                        Vec::new()
-                    }
-                }
-            } else {
-                Vec::new()
-            }
-        };
-
-        let cursor = super::super::cursor_from_events(&remote_events);
-        let audit = crate::session::projection::AuditView {
-            session_id: session_id.to_string(),
-            events: remote_events,
-            tasks: Vec::new(),
-            intent_snapshots: Vec::new(),
-            decisions: Vec::new(),
-            progress_entries: Vec::new(),
-            artifacts: Vec::new(),
-            delegations: Vec::new(),
-            generated_at: time::OffsetDateTime::now_utc(),
-        };
-
-        // Seed connection cursor so the event forwarder won't drop events
-        // that arrive while we're still sending the SessionLoaded payload.
-        {
-            let mut connections = state.connections.lock().await;
-            if let Some(conn) = connections.get_mut(conn_id) {
-                conn.session_cursors
-                    .insert(session_id.to_string(), cursor.clone());
-            }
-        }
-
-        let _ = send_message(
-            tx,
-            UiServerMessage::SessionLoaded {
-                session_id: session_id.to_string(),
-                agent_id,
-                audit,
-                undo_stack: Vec::new(),
-                cursor,
-            },
-        )
-        .await;
-
-        // Signal the UI that the workspace index may still be building on the
-        // remote node.  WorkspaceIndexReady (emitted by the remote node via its
-        // event bus) will flow through the EventForwarder → EventRelayActor →
-        // local EventBus chain and trigger a FileIndex push reactively.
-        let _ = send_message(
-            tx,
-            UiServerMessage::WorkspaceIndexStatus {
-                session_id: session_id.to_string(),
-                status: "building".to_string(),
-                message: None,
-            },
-        )
-        .await;
-
-        // Send updated state so the UI picks up the active session.
-        super::super::connection::send_state(state, conn_id, tx).await;
-
-        handle_list_sessions(state, tx).await;
-
-        log::info!(
-            "handle_attach_remote_session: attached session {} from node_id '{}'",
-            session_id,
-            node_id
-        );
     }
     #[cfg(not(feature = "remote"))]
     {
