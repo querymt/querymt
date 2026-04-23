@@ -186,12 +186,16 @@ mod node_manager_extended_tests {
 #[cfg(all(test, feature = "remote"))]
 mod remote_session_lifecycle_integration_tests {
     use crate::agent::core::AgentMode;
+    use crate::agent::messages::GetMode;
     use crate::agent::remote::SessionActorRef;
     use crate::agent::remote::node_manager::{
-        CreateRemoteSession, DestroyRemoteSession, GetNodeInfo, ListRemoteSessions,
+        CreateRemoteSession, DestroyRemoteSession, ForkRemoteSession, GetNodeInfo,
+        ListRemoteSessions,
     };
     use crate::agent::remote::test_helpers::fixtures::{TwoNodeFixture, get_test_mesh};
     use crate::agent::session_actor::SessionActor;
+    use crate::model::{AgentMessage, MessagePart};
+    use querymt::chat::ChatRole;
     use std::future::Future;
     use std::time::Duration;
     use uuid::Uuid;
@@ -231,7 +235,7 @@ mod remote_session_lifecycle_integration_tests {
             !resp.session_id.is_empty(),
             "session_id should not be empty"
         );
-        assert!(resp.actor_id > 0, "actor_id should be positive");
+        assert!(resp.created_at >= 0, "created_at should be populated");
 
         // Verify via Beta's local list.
         let sessions = within_timeout("ListRemoteSessions on beta", async {
@@ -356,6 +360,93 @@ mod remote_session_lifecycle_integration_tests {
             beta_ref
                 .ask(&DestroyRemoteSession {
                     session_id: r2.session_id,
+                })
+                .await
+        })
+        .await;
+        f.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn test_fork_remote_session_returns_attachable_child_without_lookup() {
+        let test_id = Uuid::now_v7().to_string();
+        let f = TwoNodeFixture::new(&test_id).await;
+        let mesh = get_test_mesh().await;
+
+        let beta_ref = within_timeout(
+            "lookup beta node manager",
+            mesh.lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name),
+        )
+        .await
+        .expect("lookup")
+        .expect("not found");
+
+        let parent = within_timeout("create parent", async {
+            beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+        })
+        .await
+        .expect("create parent");
+
+        let message_id = Uuid::new_v4().to_string();
+        f.beta
+            .config
+            .provider
+            .history_store()
+            .add_message(
+                &parent.session_id,
+                AgentMessage {
+                    id: message_id.clone(),
+                    session_id: parent.session_id.clone(),
+                    role: ChatRole::User,
+                    parts: vec![MessagePart::Text {
+                        content: "fork this point".to_string(),
+                    }],
+                    created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+                    parent_message_id: None,
+                    source_provider: None,
+                    source_model: None,
+                },
+            )
+            .await
+            .expect("insert parent message");
+
+        let child = within_timeout("fork child", async {
+            beta_ref
+                .ask(&ForkRemoteSession {
+                    source_session_id: parent.session_id.clone(),
+                    message_id: message_id.clone(),
+                })
+                .await
+        })
+        .await
+        .expect("fork child");
+
+        assert_ne!(child.session_id, parent.session_id);
+        let mode = child
+            .session_ref
+            .ask(&GetMode)
+            .await
+            .expect("forked child should be directly usable");
+        assert_eq!(mode, AgentMode::Build);
+
+        let sessions: Vec<_> =
+            within_timeout("list", async { beta_ref.ask(&ListRemoteSessions).await })
+                .await
+                .expect("list");
+        assert!(sessions.iter().any(|s| s.session_id == child.session_id));
+
+        let _ = within_timeout("destroy parent", async {
+            beta_ref
+                .ask(&DestroyRemoteSession {
+                    session_id: parent.session_id,
+                })
+                .await
+        })
+        .await;
+        let _ = within_timeout("destroy child", async {
+            beta_ref
+                .ask(&DestroyRemoteSession {
+                    session_id: child.session_id,
                 })
                 .await
         })

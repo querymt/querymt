@@ -8,7 +8,7 @@ use super::super::ServerState;
 use super::super::connection::{send_error, send_message, send_state, subscribe_to_file_index};
 use super::super::messages::{SessionGroup, SessionSummary, UiServerMessage};
 #[cfg(feature = "remote")]
-use super::attach_remote_session_via_lookup;
+use super::remote::finalize_remote_session_attach;
 
 use super::super::{cursor_from_events, session::PRIMARY_AGENT_ID};
 use crate::agent::core::AgentMode;
@@ -1013,12 +1013,11 @@ pub async fn handle_fork_session(
         let registry = state.agent.registry.lock().await;
         registry.get(&source_session_id).cloned()
     };
+
     #[cfg(feature = "remote")]
-    let source_remote_node_id = if source_session_ref
-        .as_ref()
-        .is_some_and(|session_ref| session_ref.is_remote())
+    if let Some(crate::agent::remote::SessionActorRef::Remote { .. }) = source_session_ref.as_ref()
     {
-        state
+        let source_remote_node_id = state
             .session_store
             .list_remote_session_bookmarks()
             .await
@@ -1028,33 +1027,63 @@ pub async fn handle_fork_session(
                     .into_iter()
                     .find(|bookmark| bookmark.session_id == source_session_id)
                     .map(|bookmark| bookmark.node_id)
-            })
-    } else {
-        None
-    };
+            });
 
-    let fork_result = if let Some(session_ref) = source_session_ref {
-        session_ref
-            .fork_at_message(message_id.to_string())
-            .await
-            .map_err(|err| err.to_string())
-    } else {
-        state
-            .session_store
-            .fork_session(&source_session_id, message_id, ForkOrigin::User)
-            .await
-            .map_err(|err| err.to_string())
-    };
+        let Some(node_id) = source_remote_node_id else {
+            let _ = send_message(
+                tx,
+                UiServerMessage::ForkResult {
+                    success: false,
+                    source_session_id: Some(source_session_id),
+                    forked_session_id: None,
+                    message: Some(
+                        "Remote source session is missing owner node metadata".to_string(),
+                    ),
+                },
+            )
+            .await;
+            return;
+        };
 
-    match fork_result {
-        Ok(forked_session_id) => {
-            #[cfg(feature = "remote")]
-            if let Some(node_id) = source_remote_node_id.clone() {
-                if let Err(err) = attach_remote_session_via_lookup(
+        let node_manager_ref = match state.agent.find_node_manager(&node_id).await {
+            Ok(r) => r,
+            Err(err) => {
+                let _ = send_message(
+                    tx,
+                    UiServerMessage::ForkResult {
+                        success: false,
+                        source_session_id: Some(source_session_id),
+                        forked_session_id: None,
+                        message: Some(format!(
+                            "Failed to resolve remote node manager: {}",
+                            err.message
+                        )),
+                    },
+                )
+                .await;
+                return;
+            }
+        };
+
+        match state
+            .agent
+            .fork_remote_session(
+                &node_manager_ref,
+                source_session_id.clone(),
+                message_id.to_string(),
+            )
+            .await
+        {
+            Ok(resp) => {
+                let forked_session_id = resp.session_id.clone();
+                let cwd = resp.cwd.as_ref().map(PathBuf::from);
+                if let Err(err) = finalize_remote_session_attach(
                     state,
                     conn_id,
                     &node_id,
                     &forked_session_id,
+                    resp.session_ref,
+                    cwd,
                     tx,
                 )
                 .await
@@ -1086,7 +1115,37 @@ pub async fn handle_fork_session(
                 .await;
                 return;
             }
+            Err(err) => {
+                let _ = send_message(
+                    tx,
+                    UiServerMessage::ForkResult {
+                        success: false,
+                        source_session_id: Some(source_session_id),
+                        forked_session_id: None,
+                        message: Some(format!("Failed to fork remote session: {}", err.message)),
+                    },
+                )
+                .await;
+                return;
+            }
+        }
+    }
 
+    let fork_result = if let Some(session_ref) = source_session_ref {
+        session_ref
+            .fork_at_message(message_id.to_string())
+            .await
+            .map_err(|err| err.to_string())
+    } else {
+        state
+            .session_store
+            .fork_session(&source_session_id, message_id, ForkOrigin::User)
+            .await
+            .map_err(|err| err.to_string())
+    };
+
+    match fork_result {
+        Ok(forked_session_id) => {
             if let Ok(Some(forked_session)) =
                 state.session_store.get_session(&forked_session_id).await
                 && let Some(cwd) = forked_session.cwd
@@ -1143,6 +1202,7 @@ pub async fn handle_fork_session(
             )
             .await;
         }
+
         Err(err) => {
             let _ = send_message(
                 tx,
