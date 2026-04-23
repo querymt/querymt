@@ -10,6 +10,7 @@
 #[allow(clippy::module_inception)]
 mod remote_agent_stub_tests {
     use crate::agent::handle::AgentHandle;
+    use crate::agent::remote::node_manager::SessionHandoff;
     use crate::agent::remote::remote_handle::RemoteAgentHandle;
     use crate::agent::remote::test_helpers::fixtures::{MeshNodeManagerFixture, get_test_mesh};
     use agent_client_protocol::schema::{CancelNotification, NewSessionRequest, SessionId};
@@ -59,14 +60,23 @@ mod remote_agent_stub_tests {
             .await
             .expect("direct create_remote_session RPC should succeed");
 
-        let mode = response
-            .session_ref
+        let session_ref = match response.handoff.clone() {
+            SessionHandoff::DirectRemote { session_ref } => session_ref,
+            SessionHandoff::LookupOnly => {
+                panic!("expected direct handoff in direct-ref test")
+            }
+            SessionHandoff::NoAttachPath => {
+                panic!("expected attachable handoff in direct-ref test")
+            }
+        };
+
+        let mode = session_ref
             .ask(&crate::agent::messages::GetMode)
             .await
             .expect("directly handed off remote ref should be immediately usable");
 
         let wrapped = crate::agent::remote::SessionActorRef::remote(
-            response.session_ref.clone(),
+            session_ref,
             format!("direct-ref-{test_id}"),
         );
         handle

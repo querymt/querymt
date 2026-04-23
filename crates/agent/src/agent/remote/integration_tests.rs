@@ -188,6 +188,7 @@ mod remote_session_lifecycle_integration_tests {
     use crate::agent::core::AgentMode;
     use crate::agent::messages::GetMode;
     use crate::agent::remote::SessionActorRef;
+    use crate::agent::remote::node_manager::SessionHandoff;
     use crate::agent::remote::node_manager::{
         CreateRemoteSession, DestroyRemoteSession, ForkRemoteSession, GetNodeInfo,
         ListRemoteSessions,
@@ -422,8 +423,16 @@ mod remote_session_lifecycle_integration_tests {
         .expect("fork child");
 
         assert_ne!(child.session_id, parent.session_id);
-        let mode = child
-            .session_ref
+        let session_ref = match child.handoff {
+            SessionHandoff::DirectRemote { session_ref } => session_ref,
+            SessionHandoff::LookupOnly => {
+                panic!("expected direct handoff in integration mesh test")
+            }
+            SessionHandoff::NoAttachPath => {
+                panic!("expected attachable handoff in integration mesh test")
+            }
+        };
+        let mode = session_ref
             .ask(&GetMode)
             .await
             .expect("forked child should be directly usable");

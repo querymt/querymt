@@ -20,6 +20,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, broadcast};
 
 use super::mesh::MeshHandle;
+use super::node_manager::SessionHandoff;
 
 /// A handle for interacting with a remote agent via the kameo mesh.
 ///
@@ -110,7 +111,63 @@ impl RemoteAgentHandle {
         let session_id = resp.session_id.clone();
         span.record("session_id", session_id.as_str());
 
-        let session_ref = SessionActorRef::remote(resp.session_ref, self.peer_label.clone());
+        let session_ref = match resp.handoff {
+            SessionHandoff::DirectRemote { session_ref } => {
+                SessionActorRef::remote(session_ref, self.peer_label.clone())
+            }
+            SessionHandoff::LookupOnly => {
+                let dht_name = crate::agent::remote::dht_name::session(&session_id);
+                let lookup_backoff_ms: [u64; 4] = [0, 120, 300, 700];
+                let mut remote_ref = None;
+                let mut last_error = None;
+
+                for delay_ms in lookup_backoff_ms {
+                    if delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+
+                    match self
+                        .mesh
+                        .lookup_actor_no_retry::<crate::agent::session_actor::SessionActor>(
+                            dht_name.clone(),
+                        )
+                        .await
+                    {
+                        Ok(Some(found)) => {
+                            remote_ref = Some(found);
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(e) => last_error = Some(e.to_string()),
+                    }
+                }
+
+                let remote_ref = remote_ref.ok_or_else(|| {
+                    if let Some(reason) = last_error {
+                        Error::from(AgentError::SwarmLookupFailed {
+                            key: dht_name.clone(),
+                            reason,
+                        })
+                    } else {
+                        Error::from(AgentError::RemoteSessionNotFound {
+                            details: format!(
+                                "remote session {} created but not yet discoverable via lookup",
+                                session_id
+                            ),
+                        })
+                    }
+                })?;
+                SessionActorRef::remote(remote_ref, self.peer_label.clone())
+            }
+            SessionHandoff::NoAttachPath => {
+                return Err(Error::from(AgentError::RemoteSessionNotFound {
+                    details: format!(
+                        "remote session {} was created but the remote node cannot provide a direct or lookup attach path",
+                        session_id
+                    ),
+                }));
+            }
+        };
 
         // Store the session ref for future prompt/cancel calls.
         self.sessions

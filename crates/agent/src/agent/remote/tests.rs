@@ -506,7 +506,7 @@ mod node_manager_tests {
     use crate::agent::messages::GetMode;
     use crate::agent::remote::node_manager::{
         CreateRemoteSession, DestroyRemoteSession, ForkRemoteSession, GetNodeInfo,
-        ListRemoteSessions, RemoteNodeManager,
+        ListRemoteSessions, RemoteNodeManager, SessionHandoff,
     };
     use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
     use crate::model::{AgentMessage, MessagePart};
@@ -551,6 +551,28 @@ mod node_manager_tests {
             "session_id should not be empty"
         );
         assert!(resp.created_at >= 0, "created_at should be populated");
+        assert!(matches!(resp.handoff, SessionHandoff::DirectRemote { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_create_session_no_mesh_never_claims_lookup_fallback() {
+        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
+
+        let resp = nm_ref
+            .ask(CreateRemoteSession { cwd: None })
+            .await
+            .expect("create session without mesh should succeed");
+
+        assert!(
+            matches!(
+                resp.handoff,
+                SessionHandoff::DirectRemote { .. } | SessionHandoff::NoAttachPath
+            ),
+            "no-mesh environments must not advertise lookup-only handoff"
+        );
+
+        let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
+        assert!(sessions.iter().any(|s| s.session_id == resp.session_id));
     }
 
     #[tokio::test]
@@ -832,7 +854,12 @@ mod node_manager_tests {
             .expect("fork child");
 
         assert_ne!(resp.session_id, parent.session_id);
-        assert!(resp.session_ref.ask(&GetMode).await.is_ok());
+        let session_ref = match resp.handoff {
+            SessionHandoff::DirectRemote { session_ref } => session_ref,
+            SessionHandoff::LookupOnly => panic!("expected direct handoff in mesh test"),
+            SessionHandoff::NoAttachPath => panic!("expected attachable handoff in mesh test"),
+        };
+        assert!(session_ref.ask(&GetMode).await.is_ok());
 
         let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
         assert!(sessions.iter().any(|s| s.session_id == resp.session_id));
