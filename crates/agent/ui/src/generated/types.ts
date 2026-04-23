@@ -43,6 +43,16 @@ export type AgentEventKind =
 	content: string;
 	message_id: string;
 }}
+	/** Ephemeral transport signal for remote streaming over mesh. */
+	| { type: "remote_stream_disconnected", data: {
+	message: string;
+	message_id?: string;
+}}
+	/** Ephemeral signal emitted when a remote stream resumes after reconnect. */
+	| { type: "remote_stream_reconnected", data: {
+	message: string;
+	message_id?: string;
+}}
 	| { type: "llm_request_start", data: {
 	message_count: number;
 }}
