@@ -345,6 +345,21 @@ pub(crate) fn params_for_remote_provider(params: &querymt::LLMParams) -> Option<
     })
 }
 
+fn sanitized_request_params(request: &serde_json::Value) -> Option<serde_json::Value> {
+    let mut sanitized = request.clone();
+    if let Some(obj) = sanitized.as_object_mut() {
+        // Credentials and transport metadata must not reach provider factories.
+        obj.remove("api_key");
+        obj.remove("_remote_session_id");
+    }
+
+    if sanitized.as_object().is_some_and(|o| o.is_empty()) {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
 /// Merge per-request params (from the requesting node's delegate config)
 /// with host defaults (from this node's `initial_params`).
 ///
@@ -352,37 +367,24 @@ pub(crate) fn params_for_remote_provider(params: &querymt::LLMParams) -> Option<
 ///   `kv_cache_type_k/v`, model path, etc.).
 /// - Overlay request params on top (overrides `system`, `temperature`, `top_p`,
 ///   etc. with the delegate's per-session values).
-/// - `api_key` is always stripped from request params (security: keys never
-///   leave the owning node).
+/// - `api_key` and transport-only metadata are always stripped from request
+///   params so they never reach provider factories on the host node.
 ///
 /// Returns `None` if neither host defaults nor request params have any fields.
 pub(crate) fn merge_params(
     request_params: Option<&serde_json::Value>,
     host_defaults: Option<&serde_json::Value>,
 ) -> Option<serde_json::Value> {
-    match (host_defaults, request_params) {
+    let request_params = request_params.and_then(sanitized_request_params);
+
+    match (host_defaults, request_params.as_ref()) {
         (None, None) => None,
         (Some(defaults), None) => Some(defaults.clone()),
-        (None, Some(request)) => {
-            // Strip api_key from request params
-            let mut merged = request.clone();
-            if let Some(obj) = merged.as_object_mut() {
-                obj.remove("api_key");
-            }
-            if merged.as_object().is_some_and(|o| o.is_empty()) {
-                None
-            } else {
-                Some(merged)
-            }
-        }
+        (None, Some(request)) => Some(request.clone()),
         (Some(defaults), Some(request)) => {
             let mut merged = defaults.clone();
             if let (Some(base), Some(overlay)) = (merged.as_object_mut(), request.as_object()) {
                 for (key, value) in overlay {
-                    // api_key never leaves the owning node
-                    if key == "api_key" {
-                        continue;
-                    }
                     base.insert(key.clone(), value.clone());
                 }
             }

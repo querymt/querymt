@@ -732,6 +732,25 @@ mod provider_host_tests {
     }
 
     #[test]
+    fn test_merge_params_strips_remote_transport_metadata_from_request() {
+        use crate::agent::remote::provider_host::merge_params;
+
+        let request = serde_json::json!({
+            "_remote_session_id": "session-123",
+            "temperature": 0.2
+        });
+
+        let merged = merge_params(Some(&request), None).expect("should merge");
+        let obj = merged.as_object().expect("should be object");
+
+        assert!(
+            !obj.contains_key("_remote_session_id"),
+            "transport-only metadata must be stripped from request params"
+        );
+        assert_eq!(obj.get("temperature").and_then(|v| v.as_f64()), Some(0.2));
+    }
+
+    #[test]
     fn test_merge_params_both_none_returns_none() {
         use crate::agent::remote::provider_host::merge_params;
         assert!(merge_params(None, None).is_none());

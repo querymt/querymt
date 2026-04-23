@@ -594,17 +594,28 @@ impl SessionActor {
             .as_ref()
             .ok_or(AgentError::ProviderRequired)?;
 
-        if self
+        let is_known_local_provider = self
             .config
             .provider
             .plugin_registry()
             .get(provider_name)
             .await
-            .is_none()
-        {
-            return Err(AgentError::UnknownProvider {
-                name: provider_name.clone(),
-            });
+            .is_some();
+
+        if !is_known_local_provider {
+            let provider_node_id = self
+                .config
+                .provider
+                .history_store()
+                .get_session_provider_node_id(&self.session_id)
+                .await
+                .map_err(|e| AgentError::Internal(e.to_string()))?;
+
+            if provider_node_id.is_none() {
+                return Err(AgentError::UnknownProvider {
+                    name: provider_name.clone(),
+                });
+            }
         }
 
         let llm_config = self
@@ -2173,6 +2184,119 @@ mod tests {
         // The mock store returns a config — None is fine (mock may not set it)
         // Just verify no error occurred (already asserted by .expect above)
         drop(result);
+    }
+
+    #[tokio::test]
+    async fn test_set_reasoning_effort_allows_remote_only_provider() {
+        let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
+        let shared = SharedLlmProvider {
+            inner: provider,
+            tools: vec![].into_boxed_slice(),
+        };
+        let factory = Arc::new(TestProviderFactory { provider: shared });
+        let (plugin_registry, _temp_dir) = mock_plugin_registry(factory).expect("plugin registry");
+
+        let session = mock_session("remote-session");
+        let remote_config = crate::session::store::LLMConfig {
+            id: 42,
+            name: None,
+            provider: "codex".to_string(),
+            model: "gpt-5.4".to_string(),
+            params: Some(serde_json::json!({
+                "reasoning_effort": "medium"
+            })),
+            created_at: Some(time::OffsetDateTime::now_utc()),
+            updated_at: Some(time::OffsetDateTime::now_utc()),
+            provider_node_id: Some("12D3KooWRemoteNode".to_string()),
+        };
+
+        let mut store = MockSessionStore::new();
+        let session_clone = session.clone();
+        store
+            .expect_get_session()
+            .returning(move |_| Ok(Some(session_clone.clone())))
+            .times(0..);
+        let remote_config_for_get = remote_config.clone();
+        store
+            .expect_get_session_llm_config()
+            .returning(move |_| Ok(Some(remote_config_for_get.clone())))
+            .times(1..);
+        let remote_config_for_id = remote_config.clone();
+        store
+            .expect_get_llm_config()
+            .returning(move |_| Ok(Some(remote_config_for_id.clone())))
+            .times(0..);
+        store
+            .expect_get_session_provider_node_id()
+            .withf(|session_id| session_id == "remote-session")
+            .returning(|_| Ok(Some("12D3KooWRemoteNode".to_string())))
+            .times(1..);
+        store
+            .expect_create_or_get_llm_config()
+            .withf(|config| {
+                config.provider.as_deref() == Some("codex")
+                    && config.model.as_deref() == Some("gpt-5.4")
+                    && config.reasoning_effort == Some(ReasoningEffort::High)
+            })
+            .returning(|_| {
+                Ok(crate::session::store::LLMConfig {
+                    id: 43,
+                    name: None,
+                    provider: "codex".to_string(),
+                    model: "gpt-5.4".to_string(),
+                    params: Some(serde_json::json!({"reasoning_effort": "high"})),
+                    created_at: Some(time::OffsetDateTime::now_utc()),
+                    updated_at: Some(time::OffsetDateTime::now_utc()),
+                    provider_node_id: Some("12D3KooWRemoteNode".to_string()),
+                })
+            })
+            .times(1);
+        store
+            .expect_set_session_llm_config()
+            .withf(|session_id, config_id| session_id == "remote-session" && *config_id == 43)
+            .returning(|_, _| Ok(()))
+            .times(1);
+        store
+            .expect_set_session_provider_node_id()
+            .returning(|_, _| Ok(()))
+            .times(0..);
+        store
+            .expect_list_sessions()
+            .returning(|| Ok(vec![]))
+            .times(0..);
+
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("create event store"),
+        );
+
+        let config = Arc::new(
+            AgentConfigBuilder::new(
+                Arc::new(plugin_registry),
+                store,
+                storage.event_journal(),
+                LLMParams::new().provider("mock").model("mock-model"),
+            )
+            .with_tool_policy(ToolPolicy::ProviderOnly)
+            .build(),
+        );
+
+        let runtime = crate::agent::core::SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let actor = SessionActor::new(config, "remote-session".to_string(), runtime);
+        let actor_ref = SessionActor::spawn(actor);
+
+        actor_ref
+            .ask(SetReasoningEffort {
+                effort: Some(ReasoningEffort::High),
+            })
+            .await
+            .expect("remote session should accept reasoning effort update");
     }
 
     #[tokio::test]
