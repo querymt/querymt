@@ -14,6 +14,8 @@ use super::super::connection::{send_error, send_message};
 use super::super::messages::{MeshInviteInfo, UiServerMessage};
 use super::session_ops::handle_list_sessions;
 #[cfg(feature = "remote")]
+use crate::agent::remote::node_manager::SessionHandoff;
+#[cfg(feature = "remote")]
 use crate::agent::utils::u32_from_usize;
 #[cfg(feature = "remote")]
 use kameo::actor::RemoteActorRef;
@@ -135,7 +137,7 @@ pub async fn handle_create_remote_session(
                     conn_id,
                     node_id,
                     &session_id,
-                    resp.session_ref,
+                    resp.handoff,
                     cwd_path,
                     tx,
                 )
@@ -196,7 +198,7 @@ pub(crate) async fn finalize_remote_session_attach(
     conn_id: &str,
     node_id: &str,
     session_id: &str,
-    remote_ref: RemoteActorRef<crate::agent::session_actor::SessionActor>,
+    handoff: SessionHandoff,
     cwd: Option<PathBuf>,
     tx: &mpsc::Sender<String>,
 ) -> Result<(), String> {
@@ -208,6 +210,19 @@ pub(crate) async fn finalize_remote_session_attach(
         .find(|n| n.node_id.to_string() == node_id)
         .map(|n| n.hostname)
         .unwrap_or_else(|| node_id.to_string());
+
+    let remote_ref = match handoff {
+        SessionHandoff::DirectRemote { session_ref } => session_ref,
+        SessionHandoff::LookupOnly => {
+            lookup_remote_session_actor(state, node_id, session_id).await?
+        }
+        SessionHandoff::NoAttachPath => {
+            return Err(format!(
+                "Remote session '{}' was created on node '{}' but that node cannot provide a direct or lookup attach path",
+                session_id, node_id
+            ));
+        }
+    };
 
     let _session_actor_ref = state
         .agent
@@ -423,8 +438,16 @@ pub(crate) async fn attach_remote_session_via_lookup(
     session_id: &str,
     tx: &mpsc::Sender<String>,
 ) -> Result<(), String> {
-    let remote_ref = lookup_remote_session_actor(state, node_id, session_id).await?;
-    finalize_remote_session_attach(state, conn_id, node_id, session_id, remote_ref, None, tx).await
+    finalize_remote_session_attach(
+        state,
+        conn_id,
+        node_id,
+        session_id,
+        SessionHandoff::LookupOnly,
+        None,
+        tx,
+    )
+    .await
 }
 
 /// Attach an existing remote session to the local registry.

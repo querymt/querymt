@@ -58,21 +58,20 @@ pub struct AvailableModel {
 pub use remote_impl::{
     AdmissionRequest, AdmissionResponse, CreateRemoteSession, CreateRemoteSessionResponse,
     DestroyRemoteSession, ForkRemoteSession, ForkRemoteSessionResponse, GetNodeInfo,
-    ListAvailableModels, ListRemoteSessions, RemoteNodeManager,
+    ListAvailableModels, ListRemoteSessions, RemoteNodeManager, SessionHandoff,
 };
 
 #[cfg(feature = "remote")]
 mod remote_impl {
     use super::{AvailableModel, NodeInfo, RemoteSessionInfo};
     use crate::agent::agent_config::AgentConfig;
-    use crate::agent::core::SessionRuntime;
     use crate::agent::remote::NodeId;
     use crate::agent::remote::mesh::MeshHandle;
     use crate::agent::session_actor::SessionActor;
-    use crate::agent::session_registry::SessionRegistry;
+    use crate::agent::session_registry::{SessionMaterializationOptions, SessionRegistry};
     use crate::error::AgentError;
+    use futures_util::FutureExt;
     use kameo::Actor;
-    use kameo::actor::Spawn;
     use kameo::message::{Context, Message};
     use kameo::remote::_internal;
     use serde::{Deserialize, Serialize};
@@ -92,13 +91,40 @@ mod remote_impl {
         pub cwd: Option<String>,
     }
 
+    /// Wire-safe handoff returned from remote create/fork lifecycle RPCs.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub enum SessionHandoff {
+        /// Immediate direct capability for the newly materialized session.
+        DirectRemote {
+            session_ref: kameo::actor::RemoteActorRef<SessionActor>,
+        },
+        /// No direct capability was available, but the caller can attach via lookup.
+        LookupOnly,
+        /// The session was created, but this environment cannot provide any remote attach path.
+        NoAttachPath,
+    }
+
+    impl SessionHandoff {
+        pub fn direct(session_ref: kameo::actor::RemoteActorRef<SessionActor>) -> Self {
+            Self::DirectRemote { session_ref }
+        }
+
+        pub fn lookup_only() -> Self {
+            Self::LookupOnly
+        }
+
+        pub fn no_attach_path() -> Self {
+            Self::NoAttachPath
+        }
+    }
+
     /// Response from `CreateRemoteSession`.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct CreateRemoteSessionResponse {
         /// The new session's public ID.
         pub session_id: String,
-        /// Direct reference to the spawned remote session actor.
-        pub session_ref: kameo::actor::RemoteActorRef<SessionActor>,
+        /// Wire-safe handoff for immediate attach or lookup fallback.
+        pub handoff: SessionHandoff,
         /// Working directory on the remote machine, if known.
         pub cwd: Option<String>,
         /// Session title/name, if known.
@@ -118,7 +144,7 @@ mod remote_impl {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ForkRemoteSessionResponse {
         pub session_id: String,
-        pub session_ref: kameo::actor::RemoteActorRef<SessionActor>,
+        pub handoff: SessionHandoff,
         pub cwd: Option<String>,
         pub title: Option<String>,
         pub created_at: i64,
@@ -247,60 +273,31 @@ mod remote_impl {
             cwd: Option<String>,
             title: Option<String>,
             created_at: i64,
-        ) -> Result<kameo::actor::RemoteActorRef<SessionActor>, AgentError> {
-            // Remote lifecycle RPCs return a live capability directly; DHT registration
-            // remains best-effort background discoverability for later reconnects.
-            let runtime = SessionRuntime::new(
-                cwd_path.clone(),
-                HashMap::new(),
-                crate::agent::core::McpToolState::empty(),
-            );
-
-            let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone())
-                .with_mesh(self.mesh.clone());
-            let actor_ref = SessionActor::spawn(actor);
+        ) -> Result<SessionHandoff, AgentError> {
+            let materialization = {
+                let mut registry = self.registry.lock().await;
+                registry.set_mesh(self.mesh.clone());
+                registry
+                    .materialize_session_actor(
+                        session_id.clone(),
+                        cwd_path.clone(),
+                        &[],
+                        false,
+                        SessionMaterializationOptions {
+                            attach_mesh_handle: true,
+                            register_in_dht: true,
+                        },
+                    )
+                    .await
+                    .map_err(|e| AgentError::Internal(e.to_string()))?
+            };
+            let actor_ref = materialization.actor_ref;
+            let runtime = materialization.runtime;
             let actor_id_raw = actor_ref.id().sequence_id();
 
             tracing::Span::current()
                 .record("session_id", &session_id)
                 .record("actor_id", actor_id_raw);
-
-            if let Some(ref mesh) = self.mesh {
-                let dht_name = crate::agent::remote::dht_name::session(&session_id);
-                let reg_span = tracing::info_span!(
-                    "remote.node_manager.dht_register_session",
-                    session_id = %session_id,
-                    dht_name = %dht_name,
-                );
-                let reg_timeout = std::time::Duration::from_secs(2);
-                match tokio::time::timeout(
-                    reg_timeout,
-                    mesh.register_actor(actor_ref.clone(), dht_name.clone())
-                        .instrument(reg_span),
-                )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(_) => {
-                        log::warn!(
-                            "RemoteNodeManager: timed out registering session {} as '{}' in DHT after {:?}; continuing with direct ref handoff",
-                            session_id,
-                            dht_name,
-                            reg_timeout
-                        );
-                    }
-                }
-            } else {
-                log::debug!(
-                    "RemoteNodeManager: no mesh, skipping DHT registration for session {}",
-                    session_id
-                );
-            }
-
-            {
-                let mut registry = self.registry.lock().await;
-                registry.insert(session_id.clone(), actor_ref.clone());
-            }
 
             self.session_meta
                 .insert(session_id.clone(), (created_at, cwd.clone()));
@@ -382,6 +379,29 @@ mod remote_impl {
                 }
             }
 
+            let handoff = match std::panic::AssertUnwindSafe(async {
+                actor_ref.into_remote_ref().await
+            })
+            .catch_unwind()
+            .await
+            {
+                Ok(remote_ref) => SessionHandoff::direct(remote_ref),
+                Err(_) if self.mesh.is_some() => {
+                    log::warn!(
+                        "RemoteNodeManager: direct remote export unavailable for session {}; returning lookup-only handoff",
+                        session_id
+                    );
+                    SessionHandoff::lookup_only()
+                }
+                Err(_) => {
+                    log::warn!(
+                        "RemoteNodeManager: direct remote export unavailable for session {} and no mesh is active; returning no-attach-path handoff",
+                        session_id
+                    );
+                    SessionHandoff::no_attach_path()
+                }
+            };
+
             log::info!(
                 "RemoteNodeManager: materialized session {} (actor_id={}, title={:?})",
                 session_id,
@@ -389,7 +409,7 @@ mod remote_impl {
                 title
             );
 
-            Ok(actor_ref.into_remote_ref().await)
+            Ok(handoff)
         }
     }
 
@@ -467,7 +487,7 @@ mod remote_impl {
                         .unwrap_or(0)
                 });
 
-            let session_ref = self
+            let handoff = self
                 .materialize_remote_session(
                     session_id.clone(),
                     cwd_path,
@@ -479,7 +499,7 @@ mod remote_impl {
 
             Ok(CreateRemoteSessionResponse {
                 session_id,
-                session_ref,
+                handoff,
                 cwd: msg.cwd,
                 title,
                 created_at,
@@ -552,7 +572,7 @@ mod remote_impl {
                         .unwrap_or(0)
                 });
 
-            let session_ref = self
+            let handoff = self
                 .materialize_remote_session(
                     forked_session_id.clone(),
                     cwd_path,
@@ -564,7 +584,7 @@ mod remote_impl {
 
             Ok(ForkRemoteSessionResponse {
                 session_id: forked_session_id,
-                session_ref,
+                handoff,
                 cwd,
                 title,
                 created_at,

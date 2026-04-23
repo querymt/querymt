@@ -1082,7 +1082,7 @@ pub async fn handle_fork_session(
                     conn_id,
                     &node_id,
                     &forked_session_id,
-                    resp.session_ref,
+                    resp.handoff,
                     cwd,
                     tx,
                 )
