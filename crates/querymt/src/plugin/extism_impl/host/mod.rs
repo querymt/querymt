@@ -48,9 +48,7 @@ fn decode_plugin_error(e: extism::Error, code: i32) -> LLMError {
     PluginError::decode(code, &raw)
 }
 
-fn decode_stream_item(
-    item: Result<Vec<u8>, LLMError>,
-) -> Result<StreamChunk, LLMError> {
+fn decode_stream_item(item: Result<Vec<u8>, LLMError>) -> Result<StreamChunk, LLMError> {
     match item {
         Ok(bytes) => serde_json::from_slice::<crate::plugin::extism_impl::ExtismChatChunk>(&bytes)
             .map(|c| c.chunk)
