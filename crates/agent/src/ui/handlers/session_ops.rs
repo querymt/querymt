@@ -120,6 +120,14 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
             // Collect per-node groups: node_label -> Vec<SessionSummary>
             let mut by_node: std::collections::HashMap<String, Vec<SessionSummary>> =
                 std::collections::HashMap::new();
+            let bookmark_titles: std::collections::HashMap<String, String> = state
+                .session_store
+                .list_remote_session_bookmarks()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|bookmark| bookmark.title.map(|title| (bookmark.session_id, title)))
+                .collect();
 
             // Build a peer_label -> node_id_str map from live remote nodes so we
             // can populate SessionSummary::node_id for both attached and discovered
@@ -143,14 +151,15 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                 for (session_id, peer_label) in remote {
                     let cwd = cwds.get(&session_id).map(|p| p.display().to_string());
                     let node_id = node_id_by_label.get(&peer_label).cloned();
+                    let title = bookmark_titles.get(&session_id).cloned();
                     by_node
                         .entry(peer_label.clone())
                         .or_default()
                         .push(SessionSummary {
                             session_id,
-                            name: None,
+                            name: title.clone(),
                             cwd: cwd.clone(),
-                            title: None,
+                            title,
                             created_at: None,
                             updated_at: None,
                             parent_session_id: None,
@@ -244,9 +253,9 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                             .or_default()
                             .push(SessionSummary {
                                 session_id: session_info.session_id,
-                                name: None,
+                                name: session_info.title.clone(),
                                 cwd: session_info.cwd,
-                                title: None,
+                                title: session_info.title,
                                 created_at: None,
                                 updated_at: None,
                                 parent_session_id: None,
@@ -997,11 +1006,25 @@ pub async fn handle_fork_session(
         return;
     };
 
-    match state
-        .session_store
-        .fork_session(&source_session_id, message_id, ForkOrigin::User)
-        .await
-    {
+    let source_session_ref = {
+        let registry = state.agent.registry.lock().await;
+        registry.get(&source_session_id).cloned()
+    };
+
+    let fork_result = if let Some(session_ref) = source_session_ref {
+        session_ref
+            .fork_at_message(message_id.to_string())
+            .await
+            .map_err(|err| err.to_string())
+    } else {
+        state
+            .session_store
+            .fork_session(&source_session_id, message_id, ForkOrigin::User)
+            .await
+            .map_err(|err| err.to_string())
+    };
+
+    match fork_result {
         Ok(forked_session_id) => {
             if let Ok(Some(forked_session)) =
                 state.session_store.get_session(&forked_session_id).await

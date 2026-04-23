@@ -262,6 +262,22 @@ impl SessionActorRef {
         }
     }
 
+    /// Fork this session at a specific message boundary.
+    pub async fn fork_at_message(&self, message_id: String) -> Result<String, AgentError> {
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(messages::ForkAtMessage { message_id })
+                .await
+                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+
+            #[cfg(feature = "remote")]
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&messages::ForkAtMessage { message_id })
+                .await
+                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+        }
+    }
+
     /// Set session model via ACP protocol.
     pub async fn set_session_model(
         &self,

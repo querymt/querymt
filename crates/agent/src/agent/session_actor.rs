@@ -895,7 +895,26 @@ impl Message<Redo> for SessionActor {
     }
 }
 
-// ── Extensions ───────────────────────────────────────────────────────────
+impl Message<ForkAtMessage> for SessionActor {
+    type Reply = Result<String, AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: ForkAtMessage,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.config
+            .provider
+            .history_store()
+            .fork_session(
+                &self.session_id,
+                &msg.message_id,
+                crate::session::domain::ForkOrigin::User,
+            )
+            .await
+            .map_err(|e| AgentError::Internal(e.to_string()))
+    }
+}
 
 impl Message<ExtMethod> for SessionActor {
     type Reply = Result<ExtResponse, AgentError>;
@@ -907,7 +926,7 @@ impl Message<ExtMethod> for SessionActor {
     ) -> Self::Reply {
         let raw_value = serde_json::value::RawValue::from_string("null".to_string())
             .map_err(|e| AgentError::Serialization(e.to_string()))?;
-        Ok(ExtResponse::new(Arc::from(raw_value)))
+        Ok(ExtResponse::new(std::sync::Arc::from(raw_value)))
     }
 }
 
@@ -922,8 +941,6 @@ impl Message<ExtNotification> for SessionActor {
         Ok(())
     }
 }
-
-// ── Lifecycle ────────────────────────────────────────────────────────────
 
 impl Message<SetBridge> for SessionActor {
     type Reply = ();

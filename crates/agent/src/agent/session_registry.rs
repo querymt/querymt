@@ -318,6 +318,15 @@ impl SessionRegistry {
 
         // Persist a bookmark so this remote session survives server restart.
         if let Some(node_id) = remote_node_id {
+            let title = self
+                .config
+                .provider
+                .history_store()
+                .get_session(&session_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|session| session.name);
             let bookmark = crate::session::store::RemoteSessionBookmark {
                 session_id: session_id.clone(),
                 node_id,
@@ -327,7 +336,7 @@ impl SessionRegistry {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0),
-                title: None,
+                title,
             };
             let store = self.config.provider.history_store();
             tokio::spawn(async move {
