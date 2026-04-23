@@ -458,6 +458,18 @@ impl SessionProvider {
                 model,
                 node_id
             );
+            let remote_params = params
+                .cloned()
+                .map(|mut p| {
+                    if let Some(obj) = p.as_object_mut() {
+                        obj.insert(
+                            "_remote_session_id".to_string(),
+                            serde_json::Value::String(session_id.to_string()),
+                        );
+                    }
+                    p
+                })
+                .or_else(|| Some(serde_json::json!({"_remote_session_id": session_id})));
             return Ok(Arc::new(
                 crate::agent::remote::mesh_provider::MeshChatProvider::from_node_id(
                     mesh,
@@ -465,7 +477,7 @@ impl SessionProvider {
                     provider_name,
                     model,
                 )
-                .with_params(params.cloned()),
+                .with_params(remote_params),
             ));
         }
 
@@ -506,6 +518,20 @@ impl SessionProvider {
                             provider_name,
                             node_id
                         );
+                        let remote_params = params
+                            .cloned()
+                            .map(|mut p| {
+                                if let Some(obj) = p.as_object_mut() {
+                                    obj.insert(
+                                        "_remote_session_id".to_string(),
+                                        serde_json::Value::String(session_id.to_string()),
+                                    );
+                                }
+                                p
+                            })
+                            .or_else(|| {
+                                Some(serde_json::json!({"_remote_session_id": session_id}))
+                            });
                         return Ok(Arc::new(
                             crate::agent::remote::mesh_provider::MeshChatProvider::from_node_id(
                                 mesh,
@@ -513,7 +539,7 @@ impl SessionProvider {
                                 provider_name,
                                 model,
                             )
-                            .with_params(params.cloned()),
+                            .with_params(remote_params),
                         ));
                     }
                 }

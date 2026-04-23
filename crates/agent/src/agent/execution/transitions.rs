@@ -25,6 +25,7 @@ use futures_util::future::join_all;
 use log::{debug, trace, warn};
 use querymt::ToolCall;
 use querymt::chat::{CacheHint, ChatMessage, ChatRole, FinishReason, StreamChunk};
+use querymt::error::LLMError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{Instrument, info_span, instrument};
@@ -295,7 +296,33 @@ pub(super) async fn transition_call_llm(
                     return Ok(ExecutionState::Cancelled);
                 }
 
-                match item.map_err(|e| anyhow::anyhow!("LLM streaming error: {}", e))? {
+                let chunk = match item {
+                    Ok(chunk) => chunk,
+                    Err(LLMError::RemoteStreamDisconnected { message }) => {
+                        flush_buffers!(true);
+                        config.emit_event(
+                            session_id,
+                            AgentEventKind::RemoteStreamDisconnected {
+                                message,
+                                message_id: Some(message_id.clone()),
+                            },
+                        );
+                        continue;
+                    }
+                    Err(LLMError::RemoteStreamReconnected { message }) => {
+                        config.emit_event(
+                            session_id,
+                            AgentEventKind::RemoteStreamReconnected {
+                                message,
+                                message_id: Some(message_id.clone()),
+                            },
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(anyhow::anyhow!("LLM streaming error: {}", e)),
+                };
+
+                match chunk {
                     StreamChunk::Text(delta) => {
                         trace!(
                             "stream chunk: session={} message_id={} type=text len={}",

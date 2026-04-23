@@ -167,6 +167,18 @@ pub enum AgentEventKind {
         content: String,
         message_id: String,
     },
+    /// Ephemeral transport signal for remote streaming over mesh.
+    RemoteStreamDisconnected {
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
+    /// Ephemeral signal emitted when a remote stream resumes after reconnect.
+    RemoteStreamReconnected {
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
     LlmRequestStart {
         message_count: u32,
     },
@@ -633,6 +645,8 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         // AssistantMessageStored which IS durable.
         AgentEventKind::AssistantContentDelta { .. } => Durability::Ephemeral,
         AgentEventKind::AssistantThinkingDelta { .. } => Durability::Ephemeral,
+        AgentEventKind::RemoteStreamDisconnected { .. } => Durability::Ephemeral,
+        AgentEventKind::RemoteStreamReconnected { .. } => Durability::Ephemeral,
 
         // Everything else is durable by default.
         _ => Durability::Durable,

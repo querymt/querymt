@@ -336,8 +336,10 @@ mod provider_routing_integration_tests {
         let mesh = get_test_mesh().await;
 
         let (tx, _rx) = mpsc::channel(16);
+        let session_id = format!("session-h9-{}", test_id);
+        let request_id = format!("h9-{}", test_id);
         let stream_rx_name =
-            crate::agent::remote::dht_name::stream_receiver(&format!("h9-{}", test_id));
+            crate::agent::remote::dht_name::stream_receiver(&session_id, &request_id);
         let receiver_actor = StreamReceiverActor::new(tx, stream_rx_name.clone(), None);
         let receiver_ref = StreamReceiverActor::spawn(receiver_actor);
         mesh.register_actor(receiver_ref.clone(), stream_rx_name.clone())
@@ -351,7 +353,10 @@ mod provider_routing_integration_tests {
             model: "test".to_string(),
             messages: vec![],
             tools: None,
+            session_id,
+            request_id,
             stream_receiver_name: stream_rx_name,
+            reconnect_grace_secs: 120,
             params: None,
         };
 

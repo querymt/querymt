@@ -17,8 +17,7 @@
 //!     bootstrap_peers: vec![],
 //!     directory: DirectoryMode::default(),
 //!     request_timeout: std::time::Duration::from_secs(300),
-//!     stream_first_chunk_timeout: std::time::Duration::from_secs(600),
-//!     stream_idle_chunk_timeout: std::time::Duration::from_secs(60),
+//!     stream_reconnect_grace: std::time::Duration::from_secs(120),
 //!     ..Default::default()
 //! };
 //! let mesh = bootstrap_mesh(&config).await?;
@@ -153,15 +152,9 @@ pub struct MeshConfig {
     /// Defaults to 300 seconds (5 minutes).
     pub request_timeout: std::time::Duration,
 
-    /// Maximum wait for the first chunk of a streaming mesh response.
-    ///
-    /// Large prompts can spend a long time in model prefill before any tokens
-    /// are emitted, so this timeout is more generous than the steady-state
-    /// idle chunk timeout.
-    pub stream_first_chunk_timeout: std::time::Duration,
-
-    /// Maximum idle gap between streaming chunks after the first chunk arrives.
-    pub stream_idle_chunk_timeout: std::time::Duration,
+    /// Grace period to tolerate transport disconnects while waiting for stream
+    /// delivery to resume.
+    pub stream_reconnect_grace: std::time::Duration,
 
     /// Transport layer to use.
     ///
@@ -194,8 +187,7 @@ impl Default for MeshConfig {
             bootstrap_peers: vec![],
             directory: DirectoryMode::default(),
             request_timeout: std::time::Duration::from_secs(300),
-            stream_first_chunk_timeout: std::time::Duration::from_secs(600),
-            stream_idle_chunk_timeout: std::time::Duration::from_secs(60),
+            stream_reconnect_grace: std::time::Duration::from_secs(120),
             transport: MeshTransportMode::default(),
             identity_file: None,
             invite: None,
@@ -289,10 +281,8 @@ pub struct MeshHandle {
     /// only connect to the inviter by default (star topology).  The event
     /// loop polls the receiver and executes each `SwarmCommand`.
     swarm_cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
-    /// Streaming timeout for receiving the first chunk of a response.
-    stream_first_chunk_timeout: std::time::Duration,
-    /// Streaming timeout for idle gaps between chunks after streaming starts.
-    stream_idle_chunk_timeout: std::time::Duration,
+    /// Grace period to tolerate temporary disconnections during streaming.
+    stream_reconnect_grace: std::time::Duration,
 }
 
 impl std::fmt::Debug for MeshHandle {
@@ -321,8 +311,7 @@ impl MeshHandle {
         membership_store: Option<Arc<RwLock<super::invite::MembershipStore>>>,
         transport_mode: MeshTransportMode,
         swarm_cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
-        stream_first_chunk_timeout: std::time::Duration,
-        stream_idle_chunk_timeout: std::time::Duration,
+        stream_reconnect_grace: std::time::Duration,
     ) -> Self {
         Self {
             peer_id,
@@ -335,8 +324,7 @@ impl MeshHandle {
             membership_store,
             transport_mode,
             swarm_cmd_tx,
-            stream_first_chunk_timeout,
-            stream_idle_chunk_timeout,
+            stream_reconnect_grace,
         }
     }
 
@@ -355,14 +343,9 @@ impl MeshHandle {
         self.known_peers.read().contains_key(peer_id)
     }
 
-    /// Timeout used while waiting for the first chunk of a streaming response.
-    pub fn stream_first_chunk_timeout(&self) -> std::time::Duration {
-        self.stream_first_chunk_timeout
-    }
-
-    /// Timeout used for idle gaps between chunks after streaming has started.
-    pub fn stream_idle_chunk_timeout(&self) -> std::time::Duration {
-        self.stream_idle_chunk_timeout
+    /// Grace period used while waiting for a disconnected stream to reconnect.
+    pub fn stream_reconnect_grace(&self) -> std::time::Duration {
+        self.stream_reconnect_grace
     }
 
     /// Inject a peer directly into the `known_peers` map, bypassing mDNS.
@@ -926,8 +909,7 @@ fn finalize_bootstrap(
     listen_label: &str,
     transport_mode: MeshTransportMode,
     swarm_cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
-    stream_first_chunk_timeout: std::time::Duration,
-    stream_idle_chunk_timeout: std::time::Duration,
+    stream_reconnect_grace: std::time::Duration,
 ) -> MeshHandle {
     log::info!(
         "Kameo mesh bootstrapped: peer_id={}, listen={}",
@@ -980,8 +962,7 @@ fn finalize_bootstrap(
         membership_store,
         transport_mode,
         swarm_cmd_tx,
-        stream_first_chunk_timeout,
-        stream_idle_chunk_timeout,
+        stream_reconnect_grace,
     )
 }
 
@@ -1267,8 +1248,7 @@ async fn bootstrap_lan_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
         listen_addr,
         MeshTransportMode::Lan,
         swarm_cmd_tx_lan,
-        config.stream_first_chunk_timeout,
-        config.stream_idle_chunk_timeout,
+        config.stream_reconnect_grace,
     ))
 }
 
@@ -1622,8 +1602,7 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
         "iroh-relay",
         MeshTransportMode::Iroh,
         swarm_cmd_tx_iroh,
-        config.stream_first_chunk_timeout,
-        config.stream_idle_chunk_timeout,
+        config.stream_reconnect_grace,
     ))
 }
 
@@ -1710,8 +1689,7 @@ pub async fn join_mesh_via_invite(
         bootstrap_peers,
         directory: DirectoryMode::default(),
         request_timeout: std::time::Duration::from_secs(300),
-        stream_first_chunk_timeout: std::time::Duration::from_secs(600),
-        stream_idle_chunk_timeout: std::time::Duration::from_secs(60),
+        stream_reconnect_grace: std::time::Duration::from_secs(120),
         transport: MeshTransportMode::Iroh,
         identity_file,
         // Always include the invite so the swarm dials the inviter first.

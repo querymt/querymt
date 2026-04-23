@@ -20,8 +20,10 @@ use querymt::ToolCall;
 use querymt::Usage;
 use querymt::chat::{ChatMessage, ChatResponse, FinishReason, StreamChunk, Tool};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::Instrument;
 
@@ -84,16 +86,27 @@ impl ChatResponse for ProviderChatResponse {
     }
 }
 
-/// Thin wrapper around `StreamChunk` used for the streaming relay path.
-///
-/// Each chunk produced by `chat_stream_with_tools` on the owning node is
-/// sent to the `StreamReceiverActor` on the requesting node as a
-/// `StreamChunkRelay`. Errors are serialized as `String` since `LLMError`
-/// is not `Serialize`.
+/// Stream relay/control payload sent from `ProviderHostActor` to the
+/// `StreamReceiverActor` on the requesting node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum StreamRelayMessage {
+    /// Normal streamed chunk from the upstream provider.
+    Chunk(StreamChunk),
+    /// Provider/model error produced by the upstream stream.
+    ProviderError { message: String },
+    /// The transport path to the requesting node disappeared but may recover.
+    TransportDisconnected { reason: String },
+    /// Delivery has resumed after a temporary transport disconnect.
+    TransportReconnected { buffered_chunks: usize },
+    /// The stream failed permanently because reconnect grace expired.
+    TransportFailed { reason: String },
+}
+
+/// Thin wrapper around a stream relay/control payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamChunkRelay {
-    /// `Ok(chunk)` for normal chunks, `Err(message)` for errors.
-    pub chunk: Result<StreamChunk, String>,
+    pub message: StreamRelayMessage,
 }
 
 // ── Message types ─────────────────────────────────────────────────────────────
@@ -136,9 +149,15 @@ pub struct ProviderStreamRequest {
     pub messages: Vec<ChatMessage>,
     /// Tool definitions, if any.
     pub tools: Option<Vec<Tool>>,
+    /// Stable session id that owns this request.
+    pub session_id: String,
+    /// Unique request id within the session.
+    pub request_id: String,
     /// DHT name of the `StreamReceiverActor` on the requesting node.
-    /// Format: `"stream_rx::{request_id}"`.
+    /// Format: `"stream_rx::{session_id}::{request_id}"`.
     pub stream_receiver_name: String,
+    /// Grace period in seconds to wait for stream reconnection before failing.
+    pub reconnect_grace_secs: u64,
     /// Per-session LLM parameters forwarded from the requesting node.
     /// See [`ProviderChatRequest::params`] for details.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,7 +177,7 @@ pub struct ProviderStreamRequest {
 /// On stop, it deregisters itself from the Kademlia DHT so the name entry
 /// does not linger after the stream is complete.
 pub struct StreamReceiverActor {
-    tx: mpsc::Sender<Result<StreamChunk, String>>,
+    tx: mpsc::Sender<StreamRelayMessage>,
     /// The name this actor is registered under in the Kademlia DHT.
     /// Used to deregister on stop so the entry doesn't linger.
     dht_name: String,
@@ -207,7 +226,7 @@ impl kameo::Actor for StreamReceiverActor {
 
 impl StreamReceiverActor {
     pub fn new(
-        tx: mpsc::Sender<Result<StreamChunk, String>>,
+        tx: mpsc::Sender<StreamRelayMessage>,
         dht_name: String,
         mesh: Option<super::mesh::MeshHandle>,
     ) -> Self {
@@ -223,10 +242,15 @@ impl Message<StreamChunkRelay> for StreamReceiverActor {
         msg: StreamChunkRelay,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let is_terminal = matches!(&msg.chunk, Ok(StreamChunk::Done { .. }) | Err(_));
+        let is_terminal = matches!(
+            &msg.message,
+            StreamRelayMessage::Chunk(StreamChunk::Done { .. })
+                | StreamRelayMessage::ProviderError { .. }
+                | StreamRelayMessage::TransportFailed { .. }
+        );
 
         // Forward to channel (ignore send errors — receiver may have dropped).
-        let _ = self.tx.send(msg.chunk).await;
+        let _ = self.tx.send(msg.message).await;
 
         if is_terminal {
             ctx.actor_ref().kill();
@@ -505,51 +529,115 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
         let provider_name = msg.provider.clone();
         let model = msg.model.clone();
         let receiver_name = msg.stream_receiver_name.clone();
+        let request_id = msg.request_id.clone();
+        let reconnect_grace = Duration::from_secs(msg.reconnect_grace_secs.max(1));
 
         // Relay chunks asynchronously so this handler returns promptly.
-        // Propagate the current span into the spawned task so chunk-level
-        // trace events appear as children of this handler span.
         let relay_span = tracing::info_span!(
             "remote.provider_host.stream.relay",
             provider = %provider_name,
             model = %model,
             receiver_name = %receiver_name,
+            request_id = %request_id,
             chunk_count = tracing::field::Empty,
         );
         tokio::spawn(
             async move {
+                let mut receiver_ref = receiver_ref;
                 let mut chunk_count = 0usize;
                 let relay_start = std::time::Instant::now();
+                let mut buffered: VecDeque<StreamRelayMessage> = VecDeque::new();
+                let mut disconnected_since: Option<tokio::time::Instant> = None;
 
-                while let Some(chunk_result) = stream.next().await {
-                    let relay = StreamChunkRelay {
-                        chunk: chunk_result.map_err(|e| e.to_string()),
+                'outer: while let Some(chunk_result) = stream.next().await {
+                    let message = match chunk_result {
+                        Ok(chunk) => StreamRelayMessage::Chunk(chunk),
+                        Err(e) => StreamRelayMessage::ProviderError {
+                            message: e.to_string(),
+                        },
                     };
+                    let is_done = matches!(message, StreamRelayMessage::Chunk(StreamChunk::Done { .. }))
+                        || matches!(message, StreamRelayMessage::ProviderError { .. });
+                    buffered.push_back(message);
 
-                    let is_done =
-                        matches!(relay.chunk, Ok(StreamChunk::Done { .. })) || relay.chunk.is_err();
+                    loop {
+                        if disconnected_since.is_some() {
+                            match kameo::actor::RemoteActorRef::<StreamReceiverActor>::lookup(
+                                receiver_name.clone(),
+                            )
+                            .await
+                            {
+                                Ok(Some(found)) => {
+                                    receiver_ref = found;
+                                    let replay_count = buffered.len();
+                                    let _ = receiver_ref
+                                        .tell(&StreamChunkRelay {
+                                            message: StreamRelayMessage::TransportReconnected {
+                                                buffered_chunks: replay_count,
+                                            },
+                                        })
+                                        .send();
+                                    disconnected_since = None;
+                                }
+                                Ok(None) | Err(_) => {
+                                    let since = disconnected_since
+                                        .get_or_insert_with(tokio::time::Instant::now);
+                                    if since.elapsed() >= reconnect_grace {
+                                        let _ = receiver_ref
+                                            .tell(&StreamChunkRelay {
+                                                message: StreamRelayMessage::TransportFailed {
+                                                    reason: format!(
+                                                        "reconnect grace expired after {:?}",
+                                                        reconnect_grace,
+                                                    ),
+                                                },
+                                            })
+                                            .send();
+                                        break 'outer;
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(250)).await;
+                                    continue;
+                                }
+                            }
+                        }
 
-                    if let Err(e) = receiver_ref.tell(&relay).send() {
-                        log::warn!(
-                            "ProviderHostActor: failed to relay chunk to '{}': {}",
-                            receiver_name,
-                            e
+                        let Some(front) = buffered.front().cloned() else {
+                            break;
+                        };
+                        let relay = StreamChunkRelay { message: front };
+                        if let Err(e) = receiver_ref.tell(&relay).send() {
+                            log::warn!(
+                                "ProviderHostActor: failed to relay chunk to '{}': {}",
+                                receiver_name,
+                                e
+                            );
+                            if disconnected_since.is_none() {
+                                disconnected_since = Some(tokio::time::Instant::now());
+                                let _ = receiver_ref
+                                    .tell(&StreamChunkRelay {
+                                        message: StreamRelayMessage::TransportDisconnected {
+                                            reason: e.to_string(),
+                                        },
+                                    })
+                                    .send();
+                            }
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            continue;
+                        }
+
+                        buffered.pop_front();
+                        chunk_count += 1;
+                        let elapsed_ms = relay_start.elapsed().as_millis();
+                        tracing::trace!(
+                            target: "remote::provider_host::stream",
+                            chunk_index = chunk_count,
+                            elapsed_ms,
+                            is_done,
+                            "chunk relayed"
                         );
-                        break;
-                    }
-
-                    chunk_count += 1;
-                    let elapsed_ms = relay_start.elapsed().as_millis();
-                    tracing::trace!(
-                        target: "remote::provider_host::stream",
-                        chunk_index = chunk_count,
-                        elapsed_ms,
-                        is_done,
-                        "chunk relayed"
-                    );
-
-                    if is_done {
-                        break;
+                        if is_done {
+                            break 'outer;
+                        }
                     }
                 }
 

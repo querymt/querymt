@@ -51,6 +51,14 @@ pub enum LLMError {
     #[error("Cancelled")]
     Cancelled,
 
+    /// Remote stream transport disconnected but may reconnect.
+    #[error("Remote stream disconnected: {message}")]
+    RemoteStreamDisconnected { message: String },
+
+    /// Remote stream transport reconnected and delivery resumed.
+    #[error("Remote stream reconnected: {message}")]
+    RemoteStreamReconnected { message: String },
+
     /// Feature or functionality not implemented by this provider.
     #[error("Not Implemented: {0}")]
     NotImplemented(String),

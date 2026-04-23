@@ -166,6 +166,7 @@ mod provider_host_tests {
     }
     use crate::agent::remote::provider_host::{
         ProviderChatRequest, ProviderChatResponse, StreamChunkRelay, StreamReceiverActor,
+        StreamRelayMessage,
     };
     use crate::agent::remote::test_helpers::fixtures::ProviderHostFixture;
     use kameo::actor::Spawn;
@@ -304,12 +305,12 @@ mod provider_host_tests {
     #[test]
     fn test_stream_chunk_relay_ok_roundtrip() {
         let relay = StreamChunkRelay {
-            chunk: Ok(StreamChunk::Text("delta text".to_string())),
+            message: StreamRelayMessage::Chunk(StreamChunk::Text("delta text".to_string())),
         };
         let json = serde_json::to_string(&relay).expect("serialize");
         let back: StreamChunkRelay = serde_json::from_str(&json).expect("deserialize");
-        match back.chunk {
-            Ok(StreamChunk::Text(t)) => {
+        match back.message {
+            StreamRelayMessage::Chunk(StreamChunk::Text(t)) => {
                 assert_eq!(t, "delta text");
             }
             other => panic!("expected Text chunk, got {:?}", other),
@@ -321,12 +322,16 @@ mod provider_host_tests {
     #[test]
     fn test_stream_chunk_relay_err_roundtrip() {
         let relay = StreamChunkRelay {
-            chunk: Err("oops".to_string()),
+            message: StreamRelayMessage::ProviderError {
+                message: "oops".to_string(),
+            },
         };
         let json = serde_json::to_string(&relay).expect("serialize");
         let back: StreamChunkRelay = serde_json::from_str(&json).expect("deserialize");
-        assert!(back.chunk.is_err());
-        assert_eq!(back.chunk.unwrap_err(), "oops");
+        match back.message {
+            StreamRelayMessage::ProviderError { message } => assert_eq!(message, "oops"),
+            other => panic!("expected ProviderError, got {:?}", other),
+        }
     }
 
     // ── A.8 ──────────────────────────────────────────────────────────────────
@@ -398,7 +403,7 @@ mod provider_host_tests {
         let actor_ref = StreamReceiverActor::spawn(actor);
 
         let done_relay = StreamChunkRelay {
-            chunk: Ok(StreamChunk::Done {
+            message: StreamRelayMessage::Chunk(StreamChunk::Done {
                 stop_reason: "end_turn".to_string(),
             }),
         };
@@ -413,11 +418,18 @@ mod provider_host_tests {
 
         // The channel should have received the Done chunk.
         let received = rx.try_recv().expect("should have received Done chunk");
-        assert!(received.is_ok(), "expected Ok chunk, got {:?}", received);
+        assert!(
+            matches!(
+                received,
+                StreamRelayMessage::Chunk(StreamChunk::Done { .. })
+            ),
+            "expected Done chunk, got {:?}",
+            received
+        );
 
         // The actor should have killed itself — subsequent tells return an error.
         let extra = StreamChunkRelay {
-            chunk: Ok(StreamChunk::Text("should be dropped".to_string())),
+            message: StreamRelayMessage::Chunk(StreamChunk::Text("should be dropped".to_string())),
         };
         let send_result = actor_ref.tell(extra).await;
         assert!(
@@ -435,7 +447,9 @@ mod provider_host_tests {
         let actor_ref = StreamReceiverActor::spawn(actor);
 
         let error_relay = StreamChunkRelay {
-            chunk: Err("boom".to_string()),
+            message: StreamRelayMessage::ProviderError {
+                message: "boom".to_string(),
+            },
         };
 
         actor_ref
@@ -446,12 +460,14 @@ mod provider_host_tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let received = rx.try_recv().expect("should have received error chunk");
-        assert!(received.is_err());
-        assert_eq!(received.unwrap_err(), "boom");
+        match received {
+            StreamRelayMessage::ProviderError { message } => assert_eq!(message, "boom"),
+            other => panic!("expected ProviderError, got {:?}", other),
+        }
 
         // Actor should be dead.
         let extra = StreamChunkRelay {
-            chunk: Ok(StreamChunk::Text("should be dropped".to_string())),
+            message: StreamRelayMessage::Chunk(StreamChunk::Text("should be dropped".to_string())),
         };
         assert!(actor_ref.tell(extra).await.is_err());
     }
@@ -607,7 +623,10 @@ mod provider_host_tests {
             model: "test-model".to_string(),
             messages: vec![],
             tools: None,
-            stream_receiver_name: "stream_rx::test".to_string(),
+            session_id: "session-test".to_string(),
+            request_id: "request-test".to_string(),
+            stream_receiver_name: "stream_rx::session-test::request-test".to_string(),
+            reconnect_grace_secs: 120,
             params: Some(serde_json::json!({"system": ["prompt"]})),
         };
         let json = serde_json::to_string(&stream_req).expect("serialize");
