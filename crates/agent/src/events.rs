@@ -253,6 +253,7 @@ pub enum AgentEventKind {
     },
     SessionStopRequested,
     SessionForceStopped {
+        #[typeshare(serialized_as = "number")]
         escalated_after_ms: u64,
         reason: String,
     },
