@@ -29,7 +29,6 @@ pub use oauth::handle_disconnect_oauth;
 pub use oauth::handle_start_oauth_login;
 pub(crate) use oauth::stop_oauth_callback_listener_for_connection;
 pub use plugins::handle_update_plugins;
-pub(crate) use remote::attach_remote_session_via_lookup;
 pub use remote::handle_attach_remote_session;
 pub use remote::handle_create_mesh_invite;
 pub use remote::handle_create_remote_session;

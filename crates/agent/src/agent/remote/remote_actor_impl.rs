@@ -114,11 +114,6 @@ remote_msg_impl!(messages::GetMode, "querymt::GetMode", REG_GET_MODE);
 remote_msg_impl!(messages::Undo, "querymt::Undo", REG_UNDO);
 remote_msg_impl!(messages::Redo, "querymt::Redo", REG_REDO);
 remote_msg_impl!(
-    messages::ForkAtMessage,
-    "querymt::ForkAtMessage",
-    REG_FORK_AT_MESSAGE
-);
-remote_msg_impl!(
     messages::SetSessionModel,
     "querymt::SetSessionModel",
     REG_SET_SESSION_MODEL

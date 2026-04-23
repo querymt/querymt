@@ -45,11 +45,19 @@ impl RemoteAgentHandle {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn cache_session_for_test(
+        &self,
+        session_id: String,
+        session_ref: SessionActorRef,
+    ) {
+        self.sessions.lock().await.insert(session_id, session_ref);
+    }
+
     /// Create a remote session and return `(session_id, SessionActorRef)`.
     ///
     /// Looks up the remote `RemoteNodeManager` via DHT, sends
-    /// `CreateRemoteSession`, and resolves the `SessionActorRef` by
-    /// DHT name lookup.
+    /// `CreateRemoteSession`, and uses the returned direct session ref.
     #[tracing::instrument(
         name = "delegation.remote.create_session",
         skip(self, cwd),
@@ -66,7 +74,6 @@ impl RemoteAgentHandle {
         cwd: Option<String>,
     ) -> Result<(String, SessionActorRef), Error> {
         use crate::agent::remote::{CreateRemoteSession, RemoteNodeManager};
-        use crate::agent::session_actor::SessionActor;
         use crate::error::AgentError;
 
         let span = tracing::Span::current();
@@ -102,30 +109,8 @@ impl RemoteAgentHandle {
 
         let session_id = resp.session_id.clone();
         span.record("session_id", session_id.as_str());
-        let dht_name = crate::agent::remote::dht_name::session(&session_id);
 
-        let t2 = std::time::Instant::now();
-        let remote_session_ref = self
-            .mesh
-            .lookup_actor::<SessionActor>(dht_name.clone())
-            .await
-            .map_err(|e| {
-                Error::from(AgentError::SwarmLookupFailed {
-                    key: dht_name.clone(),
-                    reason: e.to_string(),
-                })
-            })?
-            .ok_or_else(|| {
-                Error::from(AgentError::RemoteSessionNotFound {
-                    details: format!(
-                        "session {} (actor_id={}) not found in DHT under '{}'",
-                        session_id, resp.actor_id, dht_name
-                    ),
-                })
-            })?;
-        span.record("dht_lookup_session_ms", t2.elapsed().as_millis() as u64);
-
-        let session_ref = SessionActorRef::remote(remote_session_ref, self.peer_label.clone());
+        let session_ref = SessionActorRef::remote(resp.session_ref, self.peer_label.clone());
 
         // Store the session ref for future prompt/cancel calls.
         self.sessions

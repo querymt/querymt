@@ -43,6 +43,49 @@ mod remote_agent_stub_tests {
         // No panic is the key assertion — both Ok and Err are acceptable outcomes.
     }
 
+    #[tokio::test]
+    async fn test_handle_new_session_returns_live_session_via_direct_ref_handoff() {
+        let test_id = Uuid::now_v7().to_string();
+        let _nm = MeshNodeManagerFixture::new("direct-ref", &test_id).await;
+
+        let mesh = get_test_mesh().await;
+        let handle = make_handle(&format!("direct-ref-{test_id}"), mesh);
+
+        let response = _nm
+            .actor_ref
+            .ask(crate::agent::remote::CreateRemoteSession {
+                cwd: Some("/tmp".to_string()),
+            })
+            .await
+            .expect("direct create_remote_session RPC should succeed");
+
+        let mode = response
+            .session_ref
+            .ask(&crate::agent::messages::GetMode)
+            .await
+            .expect("directly handed off remote ref should be immediately usable");
+
+        let wrapped = crate::agent::remote::SessionActorRef::remote(
+            response.session_ref.clone(),
+            format!("direct-ref-{test_id}"),
+        );
+        handle
+            .cache_session_for_test(response.session_id.clone(), wrapped)
+            .await;
+
+        let cancel_result = handle
+            .cancel(CancelNotification::new(response.session_id.clone()))
+            .await;
+
+        assert_eq!(response.session_id.len(), 36);
+        let _ = mode;
+        assert!(
+            cancel_result.is_ok(),
+            "session returned via direct ref handoff should support handle operations: {:?}",
+            cancel_result.err()
+        );
+    }
+
     // ── C.2 — prompt errors without a live peer ──────────────────────────────
 
     #[tokio::test]
