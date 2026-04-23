@@ -17,7 +17,7 @@ use crate::index::resolve_workspace_root;
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
 use crate::ui::mentions::{filter_index_for_cwd, filter_index_for_cwd_entries};
-use agent_client_protocol::schema::{CancelNotification, LoadSessionRequest, SessionId};
+use agent_client_protocol::schema::{LoadSessionRequest, SessionId};
 use querymt::chat::ReasoningEffort;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -91,6 +91,7 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                     node: None,     // local sessions have no node label
                     node_id: None,  // not applicable for local sessions
                     attached: None, // not applicable for local sessions
+                    runtime_state: None,
                 })
                 .collect(),
         })
@@ -172,6 +173,7 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                             node: Some(peer_label),
                             node_id,
                             attached: Some(true), // in-memory remote sessions are attached
+                            runtime_state: Some("active".to_string()),
                         });
                 }
             }
@@ -268,6 +270,7 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                                 node: Some(peer_label.clone()),
                                 node_id: Some(node_id_str.clone()),
                                 attached: Some(false), // discovered but not attached
+                                runtime_state: session_info.runtime_state,
                             });
                     }
                 }
@@ -427,6 +430,11 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                                         node: Some(bookmark.peer_label),
                                         node_id: Some(bookmark.node_id),
                                         attached: Some(reattached),
+                                        runtime_state: Some(if reattached {
+                                            "active".to_string()
+                                        } else {
+                                            "stopped".to_string()
+                                        }),
                                     });
                             }
 
@@ -791,17 +799,8 @@ pub async fn handle_cancel_session(state: &ServerState, conn_id: &str, tx: &mpsc
         return;
     };
 
-    let agent_id = {
-        let agents = state.session_agents.lock().await;
-        agents.get(&session_id).cloned()
-    };
-    let agent = agent_id
-        .and_then(|id| super::super::session::agent_for_id(state, &id))
-        .unwrap_or_else(|| state.agent.clone() as Arc<dyn crate::agent::handle::AgentHandle>);
-
-    let notif = CancelNotification::new(session_id);
-    if let Err(e) = agent.cancel(notif).await {
-        let _ = send_error(tx, format!("Failed to cancel session: {}", e)).await;
+    if let Err(e) = state.agent.stop_session(&session_id).await {
+        let _ = send_error(tx, format!("Failed to stop session: {}", e)).await;
     }
 }
 

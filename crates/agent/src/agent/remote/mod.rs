@@ -101,7 +101,7 @@ pub use node_manager::{AvailableModel, NodeInfo, RemoteSessionInfo};
 pub use node_manager::{
     CreateRemoteSession, CreateRemoteSessionResponse, DestroyRemoteSession, ForkRemoteSession,
     ForkRemoteSessionResponse, GetNodeInfo, ListAvailableModels, ListRemoteSessions,
-    RemoteNodeManager,
+    RemoteNodeManager, ResumeRemoteSession,
 };
 #[cfg(feature = "remote")]
 pub use provider_host::{

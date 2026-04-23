@@ -110,9 +110,21 @@ where
                     );
 
                     continue;
+                } else if is_transient_error(&e) && attempt < max_retries {
+                    Span::current().record("rate_limited", false);
+                    let wait_secs =
+                        calculate_rate_limit_wait(config, e.retry_after_secs(), attempt);
+                    debug!(
+                        "Session {} transient setup error on attempt {}, retrying in {}s: {}",
+                        session_id, attempt, wait_secs, e
+                    );
+                    let cancelled = wait_with_cancellation(wait_secs, cancel_token).await;
+                    if cancelled {
+                        return Err(anyhow::anyhow!("Cancelled during retry wait"));
+                    }
+                    continue;
                 } else {
                     Span::current().record("rate_limited", false);
-                    // Convert non-rate-limit errors to anyhow::Error
                     return Err(anyhow::Error::from(e));
                 }
             }
@@ -160,6 +172,11 @@ fn extract_rate_limit_info(error: &LLMError) -> Option<(String, Option<u64>)> {
             message,
             retry_after_secs,
         } => Some((message.clone(), *retry_after_secs)),
+        LLMError::HttpStatus {
+            status_code,
+            message,
+            retry_after_secs,
+        } if *status_code == 429 => Some((message.clone(), *retry_after_secs)),
         _ => None,
     }
 }
@@ -248,14 +265,13 @@ where
 
                     continue;
                 } else if is_transient_error(&e) && attempt < max_retries {
-                    // Transient errors get exponential backoff
-                    let delay_secs = config.execution_policy.rate_limit.default_wait_secs
-                        * 2u64.saturating_pow(attempt as u32 - 1);
+                    let wait_secs =
+                        calculate_rate_limit_wait(config, e.retry_after_secs(), attempt);
                     debug!(
                         "Session {} transient stream error on attempt {}, retrying in {}s: {}",
-                        session_id, attempt, delay_secs, e
+                        session_id, attempt, wait_secs, e
                     );
-                    let cancelled = wait_with_cancellation(delay_secs, cancel_token).await;
+                    let cancelled = wait_with_cancellation(wait_secs, cancel_token).await;
                     if cancelled {
                         return Err(anyhow::anyhow!("Cancelled during retry wait"));
                     }
@@ -268,9 +284,9 @@ where
     }
 }
 
-/// Returns true for errors that are worth retrying (connection-level failures).
+/// Returns true for setup errors that are worth retrying.
 fn is_transient_error(e: &LLMError) -> bool {
-    matches!(e, LLMError::HttpError(_))
+    e.is_retryable_setup_failure()
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -411,7 +427,20 @@ mod tests {
 
     #[test]
     fn test_is_transient_error_http_error() {
-        let err = LLMError::HttpError("connection reset".to_string());
+        let err = LLMError::Transport {
+            kind: querymt::error::TransportErrorKind::ConnectionReset,
+            message: "connection reset".to_string(),
+        };
+        assert!(is_transient_error(&err));
+    }
+
+    #[test]
+    fn test_is_transient_error_http_status_503() {
+        let err = LLMError::HttpStatus {
+            status_code: 503,
+            message: "upstream unavailable".to_string(),
+            retry_after_secs: None,
+        };
         assert!(is_transient_error(&err));
     }
 
@@ -420,10 +449,6 @@ mod tests {
         assert!(!is_transient_error(&LLMError::GenericError(
             "oops".to_string()
         )));
-        assert!(!is_transient_error(&LLMError::RateLimited {
-            message: "rate".to_string(),
-            retry_after_secs: None,
-        }));
     }
 
     // ── wait_with_cancellation tests ─────────────────────────────────────────
@@ -496,6 +521,36 @@ mod tests {
 
         // Non-rate-limit errors should fail immediately without retrying
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_call_llm_with_retry_retries_transient_setup_errors() {
+        let (config, _temp) = make_config().await;
+        let token = CancellationToken::new();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count2 = call_count.clone();
+
+        let result = call_llm_with_retry(&config, "test-session", &token, || {
+            let count = call_count2.clone();
+            async move {
+                let attempt = count.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    Err::<Box<dyn ChatResponse>, _>(LLMError::HttpStatus {
+                        status_code: 503,
+                        message: "upstream connect error".to_string(),
+                        retry_after_secs: Some(0),
+                    })
+                } else {
+                    Ok::<Box<dyn ChatResponse>, _>(Box::new(
+                        crate::test_utils::MockChatResponse::text_only("ok"),
+                    ) as Box<dyn ChatResponse>)
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

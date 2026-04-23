@@ -251,6 +251,11 @@ pub enum AgentEventKind {
         /// Reason for queueing (e.g., "waiting for previous operation to complete")
         reason: String,
     },
+    SessionStopRequested,
+    SessionForceStopped {
+        escalated_after_ms: u64,
+        reason: String,
+    },
     Cancelled,
     Error {
         message: String,
@@ -930,6 +935,21 @@ mod tests {
     fn classify_cancelled_is_durable() {
         assert_eq!(
             classify_durability(&AgentEventKind::Cancelled),
+            Durability::Durable
+        );
+    }
+
+    #[test]
+    fn classify_stop_events_are_durable() {
+        assert_eq!(
+            classify_durability(&AgentEventKind::SessionStopRequested),
+            Durability::Durable
+        );
+        assert_eq!(
+            classify_durability(&AgentEventKind::SessionForceStopped {
+                escalated_after_ms: 3000,
+                reason: "timeout".into(),
+            }),
             Durability::Durable
         );
     }

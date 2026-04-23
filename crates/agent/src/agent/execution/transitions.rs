@@ -209,7 +209,7 @@ pub(super) async fn transition_call_llm(
         let provider = session_handle
             .provider()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to build provider: {}", e))?;
+            .map_err(|e| anyhow::Error::from(e).context("Failed to build provider"))?;
 
         if provider.supports_streaming() {
             // === STREAMING PATH (all capable providers) ===
@@ -319,7 +319,7 @@ pub(super) async fn transition_call_llm(
                         );
                         continue;
                     }
-                    Err(e) => return Err(anyhow::anyhow!("LLM streaming error: {}", e)),
+                    Err(e) => return Err(anyhow::Error::from(e).context("LLM streaming error")),
                 };
 
                 match chunk {

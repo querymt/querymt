@@ -1,42 +1,6 @@
 use crate::{HTTPLLMProvider, error::LLMError};
 use http::{Request, Response};
 
-/// Parse retry-after duration from HTTP headers.
-///
-/// Checks both `retry-after` (standard) and `x-ratelimit-reset-requests` (custom format).
-/// Supports formats:
-/// - `retry-after`: integer seconds (e.g., "60")
-/// - `x-ratelimit-reset-requests`: duration strings like "6m0s" or "1s"
-///
-/// Returns the duration in seconds if found, otherwise `None`.
-pub fn parse_retry_after(headers: &http::HeaderMap) -> Option<u64> {
-    headers
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .or_else(|| {
-            // Fallback: try parsing x-ratelimit-reset-requests as duration
-            headers
-                .get("x-ratelimit-reset-requests")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| {
-                    // Parse formats like "6m0s" or "1s"
-                    if s.ends_with('s') {
-                        let num_part = s.trim_end_matches('s');
-                        if let Some(m_pos) = num_part.find('m') {
-                            // Format: "6m0s" -> extract minutes
-                            num_part[..m_pos].parse::<u64>().ok().map(|m| m * 60)
-                        } else {
-                            // Format: "1s"
-                            num_part.parse::<u64>().ok()
-                        }
-                    } else {
-                        None
-                    }
-                })
-        })
-}
-
 pub trait HTTPLLMProviderFactory: Send + Sync {
     fn name(&self) -> &str;
 
@@ -72,47 +36,13 @@ macro_rules! handle_http_error {
     ($resp:expr) => {{
         if !$resp.status().is_success() {
             let status_code = $resp.status().as_u16();
-
-            if status_code == 499 {
-                return Err(LLMError::Cancelled);
-            }
-
-            // Extract retry-after header for rate limit errors
-            let retry_after_secs = if status_code == 429 {
-                $crate::plugin::http::parse_retry_after($resp.headers())
-            } else {
-                None
-            };
-
+            let headers = $resp.headers().clone();
             let error_body = $resp.into_body();
-
-            // Try to parse JSON and extract error.message for a clean message
-            let clean_message = serde_json::from_slice::<serde_json::Value>(&error_body)
-                .ok()
-                .and_then(|json| {
-                    json.pointer("/error/message")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| {
-                    format!(
-                        "HTTP {}: {}",
-                        status_code,
-                        String::from_utf8_lossy(&error_body)
-                    )
-                });
-
-            // Route to appropriate error variant based on status code
-            return Err(match status_code {
-                401 | 403 => LLMError::AuthError(clean_message),
-                429 => LLMError::RateLimited {
-                    message: clean_message,
-                    retry_after_secs,
-                },
-                400 => LLMError::InvalidRequest(clean_message),
-                500 | 529 => LLMError::ProviderError(format!("Server error: {}", clean_message)),
-                _ => LLMError::ProviderError(clean_message),
-            });
+            return Err($crate::error::classify_http_status(
+                status_code,
+                &headers,
+                &error_body,
+            ));
         }
     }};
 }
