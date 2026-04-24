@@ -136,14 +136,18 @@ impl OpenAIProviderConfig for Deepseek {
     }
 
     fn extra_body(&self) -> Option<serde_json::Map<String, Value>> {
-        // DeepSeek requires {"thinking": {"type": "enabled"}} in the request body
-        // when reasoning_effort is set. Merge it with any user-supplied extra_body.
+        // DeepSeek defaults thinking mode to enabled. We always explicitly set
+        // the toggle so the user has full control:
+        //   - reasoning_effort set  → {"thinking": {"type": "enabled"}}
+        //   - reasoning_effort None → {"thinking": {"type": "disabled"}}
         let mut map = self.extra_body.clone();
-        if self.reasoning_effort.is_some() {
-            let thinking = serde_json::json!({"type": "enabled"});
-            map.get_or_insert_with(serde_json::Map::default)
-                .insert("thinking".to_string(), thinking);
-        }
+        let thinking = if self.reasoning_effort.is_some() {
+            serde_json::json!({"type": "enabled"})
+        } else {
+            serde_json::json!({"type": "disabled"})
+        };
+        map.get_or_insert_with(serde_json::Map::default)
+            .insert("thinking".to_string(), thinking);
         map
     }
 }

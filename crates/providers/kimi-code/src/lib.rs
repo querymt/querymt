@@ -11,8 +11,8 @@ use querymt::{
     HTTPLLMProvider,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, Content, StreamChunk, StructuredOutputFormat, Tool,
-        ToolChoice, http::HTTPChatProvider,
+        ChatMessage, ChatResponse, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
+        http::HTTPChatProvider,
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -159,7 +159,6 @@ impl HTTPChatProvider for KimiCode {
         resolved.api_key = self.resolved_api_key();
         let profile = self.profile();
         let mut request = openai_chat_request(&resolved, messages, tools)?;
-        KimiCode::inject_tool_call_reasoning_content(&mut request, messages)?;
         KimiCode::apply_kimi_agent_headers(&mut request, &profile)?;
         Ok(request)
     }
@@ -231,87 +230,6 @@ impl KimiCode {
         self.kimi_profile
             .clone()
             .unwrap_or_else(kimi_cli_oauth_config)
-    }
-
-    fn inject_tool_call_reasoning_content(
-        request: &mut Request<Vec<u8>>,
-        source_messages: &[ChatMessage],
-    ) -> Result<(), LLMError> {
-        let mut body: Value = serde_json::from_slice(request.body()).map_err(|e| {
-            LLMError::InvalidRequest(format!("failed to decode kimi request JSON body: {e}"))
-        })?;
-
-        let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
-            return Ok(());
-        };
-
-        let mut reasoning_by_tool_id: HashMap<&str, &str> = HashMap::new();
-        for msg in source_messages {
-            if msg.role == ChatRole::Assistant {
-                let thinking = msg.thinking().unwrap_or_default();
-                for block in &msg.content {
-                    if let Content::ToolUse { id, .. } = block {
-                        reasoning_by_tool_id.insert(id.as_str(), thinking);
-                    }
-                }
-            }
-        }
-
-        for msg in messages {
-            let Some(obj) = msg.as_object_mut() else {
-                continue;
-            };
-            if obj.get("role").and_then(Value::as_str) != Some("assistant")
-                || !obj.get("tool_calls").is_some_and(|v| !v.is_null())
-            {
-                continue;
-            }
-
-            if !KimiCode::is_reasoning_content_missing(obj.get("reasoning_content")) {
-                continue;
-            }
-
-            let from_source = obj
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .and_then(|calls| {
-                    calls.iter().find_map(|tc| {
-                        let id = tc.get("id").and_then(Value::as_str)?;
-                        let r = *reasoning_by_tool_id.get(id)?;
-                        if r.trim().is_empty() { None } else { Some(r) }
-                    })
-                });
-
-            let content_fallback = obj
-                .get("content")
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_default();
-
-            let value = from_source.unwrap_or(content_fallback);
-            let reasoning_content = if value.trim().is_empty() {
-                "Tool call reasoning unavailable."
-            } else {
-                value
-            };
-            obj.insert(
-                "reasoning_content".into(),
-                Value::String(reasoning_content.into()),
-            );
-        }
-
-        *request.body_mut() = serde_json::to_vec(&body).map_err(|e| {
-            LLMError::InvalidRequest(format!("failed to encode kimi request JSON body: {e}"))
-        })?;
-        Ok(())
-    }
-
-    fn is_reasoning_content_missing(value: Option<&Value>) -> bool {
-        match value {
-            None | Some(Value::Null) => true,
-            Some(Value::String(s)) => s.trim().is_empty(),
-            Some(_) => false,
-        }
     }
 
     fn apply_kimi_agent_headers(
@@ -496,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_request_injects_non_empty_reasoning_content_when_missing() {
+    fn chat_request_omits_reasoning_content_when_no_thinking() {
         let provider = test_provider();
         let messages = vec![
             ChatMessage::user().text("run tool").build(),
@@ -520,11 +438,13 @@ mod tests {
             })
             .expect("assistant tool call message should be present");
 
-        assert_eq!(
+        // With the model-layer implementation, reasoning_content is omitted
+        // when there is no thinking content — no longer injected via JSON hack.
+        assert!(
             assistant_tool_msg
                 .get("reasoning_content")
-                .and_then(Value::as_str),
-            Some("Tool call reasoning unavailable.")
+                .and_then(Value::as_str)
+                .is_none()
         );
     }
 
@@ -751,27 +671,6 @@ mod tests {
             }
             other => panic!("expected Done chunk, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn is_reasoning_content_missing_edge_cases() {
-        assert!(KimiCode::is_reasoning_content_missing(None));
-        assert!(KimiCode::is_reasoning_content_missing(Some(&Value::Null)));
-        assert!(KimiCode::is_reasoning_content_missing(Some(
-            &Value::String("".into())
-        )));
-        assert!(KimiCode::is_reasoning_content_missing(Some(
-            &Value::String("   ".into())
-        )));
-        assert!(!KimiCode::is_reasoning_content_missing(Some(
-            &Value::String("thinking".into())
-        )));
-        assert!(!KimiCode::is_reasoning_content_missing(Some(&Value::Bool(
-            false
-        ))));
-        assert!(!KimiCode::is_reasoning_content_missing(Some(
-            &serde_json::json!(42)
-        )));
     }
 }
 

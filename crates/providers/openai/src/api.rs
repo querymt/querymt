@@ -92,6 +92,8 @@ struct OpenAIChatMessage<'a> {
     tool_calls: Option<Vec<OpenAIFunctionCall<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<Cow<'a, str>>,
 }
 
 #[derive(Serialize, Debug)]
@@ -802,6 +804,7 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
                     }])),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
             );
         }
@@ -880,6 +883,11 @@ pub fn openai_parse_chat<C: OpenAIProviderConfig>(
     }
 }
 
+/// Extract the thinking/reasoning content from a ChatMessage, if any.
+fn extract_reasoning_content<'a>(msg: &'a ChatMessage) -> Option<Cow<'a, str>> {
+    msg.thinking().map(Cow::Borrowed)
+}
+
 /// Convert a ChatMessage with Vec<Content> blocks into one or more OpenAI API messages.
 ///
 /// Most messages map 1:1, but ToolResult blocks each become a separate `role: "tool"` message.
@@ -913,6 +921,7 @@ fn convert_chat_message_to_openai<'a>(
                     tool_call_id: Some(Cow::Borrowed(id.as_str())),
                     tool_calls: None,
                     content: Some(Right(Cow::Owned(text))),
+                    reasoning_content: None,
                 });
             }
         }
@@ -934,6 +943,7 @@ fn convert_chat_message_to_openai<'a>(
                     tool_call_id: None,
                     tool_calls: None,
                     content: Some(Right(Cow::Owned(text))),
+                    reasoning_content: extract_reasoning_content(chat_msg),
                 });
             }
         }
@@ -984,6 +994,7 @@ fn convert_chat_message_to_openai<'a>(
                 Some(tool_calls)
             },
             content: content_val,
+            reasoning_content: extract_reasoning_content(chat_msg),
         });
         return;
     }
@@ -1025,6 +1036,7 @@ fn convert_chat_message_to_openai<'a>(
             tool_call_id: None,
             tool_calls: None,
             content: Some(Left(content_blocks)),
+            reasoning_content: extract_reasoning_content(chat_msg),
         });
     } else {
         // Simple text-only message
@@ -1034,6 +1046,7 @@ fn convert_chat_message_to_openai<'a>(
             tool_call_id: None,
             tool_calls: None,
             content: Some(Right(Cow::Owned(text))),
+            reasoning_content: extract_reasoning_content(chat_msg),
         });
     }
 }
