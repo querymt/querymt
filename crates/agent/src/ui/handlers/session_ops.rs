@@ -70,60 +70,101 @@ pub(crate) fn refresh_attached_remote_summary(
         total_ms = tracing::field::Empty
     )
 )]
-pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>) {
+pub async fn handle_list_sessions(
+    state: &ServerState,
+    tx: &mpsc::Sender<String>,
+    mode: Option<String>,
+    cursor: Option<String>,
+    limit: Option<u32>,
+    cwd: Option<String>,
+    query: Option<String>,
+) {
     let started = Instant::now();
-    let view_started = Instant::now();
+    let page_limit = limit.unwrap_or(20).clamp(1, 200) as usize;
+    let mode = mode.unwrap_or_else(|| "browse".to_string());
+    let is_browse_first_page = mode == "browse" && cursor.is_none();
 
-    let view = match state
-        .view_store
-        .get_session_list_view(None)
-        .instrument(tracing::info_span!(
-            "ui.handle_list_sessions.get_session_list_view"
-        ))
-        .await
-    {
-        Ok(view) => view,
+    let to_ui_group = |g: crate::session::projection::SessionGroup| SessionGroup {
+        cwd: g.cwd,
+        latest_activity: g.latest_activity.and_then(|t| t.format(&Rfc3339).ok()),
+        total_count: Some(g.total_count.unwrap_or(g.sessions.len()) as u64),
+        next_cursor: g.next_cursor,
+        sessions: g
+            .sessions
+            .into_iter()
+            .map(|s| SessionSummary {
+                session_id: s.session_id,
+                name: s.name,
+                cwd: s.cwd,
+                title: s.title,
+                created_at: s.created_at.and_then(|t| t.format(&Rfc3339).ok()),
+                updated_at: s.updated_at.and_then(|t| t.format(&Rfc3339).ok()),
+                parent_session_id: s.parent_session_id,
+                fork_origin: s.fork_origin,
+                session_kind: s.session_kind,
+                has_children: s.has_children,
+                node: None,
+                node_id: None,
+                attached: None,
+                runtime_state: None,
+            })
+            .collect(),
+    };
+
+    let result = match mode.as_str() {
+        "group" => {
+            let cwd_value = match cwd.as_deref() {
+                Some("__none__") => None,
+                _ => cwd,
+            };
+            state
+                .view_store
+                .list_group_sessions(cwd_value, cursor, page_limit)
+                .await
+                .map(|(group, total)| {
+                    let next_cursor = group.next_cursor.clone();
+                    (vec![to_ui_group(group)], next_cursor, total)
+                })
+        }
+        "search" => {
+            let q = query.unwrap_or_default();
+            state
+                .view_store
+                .search_sessions(q, cursor, page_limit)
+                .await
+                .map(|(groups, next_cursor, total)| {
+                    (
+                        groups.into_iter().map(to_ui_group).collect(),
+                        next_cursor,
+                        total,
+                    )
+                })
+        }
+        _ => state
+            .view_store
+            .browse_session_groups(cursor, page_limit, 10)
+            .await
+            .map(|(groups, next_cursor, total)| {
+                (
+                    groups.into_iter().map(to_ui_group).collect(),
+                    next_cursor,
+                    total,
+                )
+            }),
+    };
+
+    let (mut groups, next_cursor, total_count) = match result {
+        Ok(v) => v,
         Err(e) => {
             let _ = send_error(tx, format!("Failed to list sessions: {}", e)).await;
             return;
         }
     };
 
-    let view_fetch_ms = view_started.elapsed().as_millis() as u64;
-    let local_group_count = view.groups.len();
-    let local_session_count: usize = view.groups.iter().map(|g| g.sessions.len()).sum();
+    let local_group_count = groups.len();
+    let local_session_count: usize = groups.iter().map(|g| g.sessions.len()).sum();
 
-    let mut groups: Vec<SessionGroup> = view
-        .groups
-        .into_iter()
-        .map(|g| SessionGroup {
-            cwd: g.cwd,
-            latest_activity: g.latest_activity.and_then(|t| t.format(&Rfc3339).ok()),
-            sessions: g
-                .sessions
-                .into_iter()
-                .map(|s| SessionSummary {
-                    session_id: s.session_id,
-                    name: s.name,
-                    cwd: s.cwd,
-                    title: s.title,
-                    created_at: s.created_at.and_then(|t| t.format(&Rfc3339).ok()),
-                    updated_at: s.updated_at.and_then(|t| t.format(&Rfc3339).ok()),
-                    parent_session_id: s.parent_session_id,
-                    fork_origin: s.fork_origin,
-                    session_kind: s.session_kind,
-                    has_children: s.has_children,
-                    node: None,     // local sessions have no node label
-                    node_id: None,  // not applicable for local sessions
-                    attached: None, // not applicable for local sessions
-                    runtime_state: None,
-                })
-                .collect(),
-        })
-        .collect();
-
-    // Append in-memory remote sessions (not persisted to the local view store).
-    // Group them by peer_label so each remote node gets its own collapsible group.
+    // Append in-memory remote sessions for browse first page only.
     #[cfg(feature = "remote")]
     let mut remote_group_count = 0usize;
     #[cfg(feature = "remote")]
@@ -135,7 +176,7 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
 
     let remote_merge_started = Instant::now();
     #[cfg(feature = "remote")]
-    {
+    if is_browse_first_page {
         async {
             // 1. Collect already-attached remote sessions from the registry.
             let attached_sessions: std::collections::HashSet<String>;
@@ -146,7 +187,6 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                 sessions
             };
 
-            // Collect per-node groups: node_label -> Vec<SessionSummary>
             let mut by_node: std::collections::HashMap<String, Vec<SessionSummary>> =
                 std::collections::HashMap::new();
             let bookmark_titles: std::collections::HashMap<String, String> = state
@@ -158,9 +198,6 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                 .filter_map(|bookmark| bookmark.title.map(|title| (bookmark.session_id, title)))
                 .collect();
 
-            // Build a peer_label -> node_id_str map from live remote nodes so we
-            // can populate SessionSummary::node_id for both attached and discovered
-            // sessions.  The frontend needs node_id to send attach_remote_session.
             let node_id_by_label: std::collections::HashMap<String, String> =
                 if state.agent.mesh().is_some() {
                     state
@@ -197,31 +234,19 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                             has_children: false,
                             node: Some(peer_label),
                             node_id,
-                            attached: Some(true), // in-memory remote sessions are attached
+                            attached: Some(true),
                             runtime_state: Some("active".to_string()),
                         });
                 }
             }
 
-            // 2. Query each live peer for their sessions and include
-            //    unattached ones so the UI can show "available" remote
-            //    sessions after restart (Bug 2 fix).
-            //    Peers are queried in parallel to avoid accumulating the
-            //    2-second timeout for each peer serially.
-            //
-            //    We also collect the set of session IDs confirmed to exist on
-            //    each peer so the bookmark reattach phase can skip DHT lookups
-            //    for sessions that the peer confirms no longer exist.
-
-            // peer_label -> set of session IDs confirmed on that peer.
-            // A peer that was queried successfully but returned no sessions
-            // will have an empty set (distinguishable from "not queried").
+            // 2. Query each live peer for their sessions and refresh metadata.
             let mut confirmed_peer_sessions: std::collections::HashMap<
                 String,
                 std::collections::HashSet<String>,
             > = std::collections::HashMap::new();
 
-            if state.agent.mesh().is_some() {
+            if state.agent.mesh().is_some() && !node_id_by_label.is_empty() {
                 let peer_futures: Vec<_> = node_id_by_label
                     .iter()
                     .map(|(peer_label, node_id_str)| {
@@ -240,42 +265,25 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                             .await
                             {
                                 Ok(Ok(s)) => s,
-                                Ok(Err(e)) => {
-                                    log::debug!(
-                                        "handle_list_sessions: failed to query sessions from {}: {}",
-                                        peer_label,
-                                        e.message
-                                    );
-                                    return None;
-                                }
-                                Err(_) => {
-                                    log::debug!(
-                                        "handle_list_sessions: timeout querying sessions from {}",
-                                        peer_label
-                                    );
-                                    return None;
-                                }
+                                Ok(Err(_)) | Err(_) => return None,
                             };
                             Some((peer_label, node_id_str, sessions))
                         }
                     })
                     .collect();
 
-                let peer_results =
-                    futures_util::future::join_all(peer_futures).await;
+                let peer_results = futures_util::future::join_all(peer_futures).await;
 
                 for result in peer_results.into_iter().flatten() {
                     let (peer_label, node_id_str, sessions) = result;
 
-                    // Record which sessions this peer confirmed as existing.
                     let confirmed_ids: std::collections::HashSet<String> =
                         sessions.iter().map(|s| s.session_id.clone()).collect();
-                    confirmed_peer_sessions.insert(peer_label.clone(), confirmed_ids);
+                    confirmed_peer_sessions
+                        .insert(peer_label.clone(), confirmed_ids);
 
                     for session_info in sessions {
                         if attached_sessions.contains(&session_info.session_id) {
-                            // Keep attached sessions in-place, but refresh metadata from the
-                            // authoritative remote node response when available.
                             let _ = refresh_attached_remote_summary(
                                 &mut by_node,
                                 &peer_label,
@@ -301,7 +309,7 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                                 has_children: false,
                                 node: Some(peer_label.clone()),
                                 node_id: Some(node_id_str.clone()),
-                                attached: Some(false), // discovered but not attached
+                                attached: Some(false),
                                 runtime_state: session_info.runtime_state,
                             });
                     }
@@ -311,31 +319,16 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
             for (node_label, sessions) in by_node {
                 remote_group_count += 1;
                 remote_session_count += sessions.len();
-                // Use a synthetic cwd like "remote::<node>" so the group header
-                // is recognisable without requiring a real path.
                 groups.push(SessionGroup {
                     cwd: Some(format!("remote::{}", node_label)),
                     sessions,
                     latest_activity: None,
+                    total_count: None,
+                    next_cursor: None,
                 });
             }
 
-            // ── Lazy bookmark reattach ────────────────────────────────────
-            //
-            // Load persisted remote session bookmarks and attempt to re-attach
-            // sessions that are not yet in the registry.
-            //
-            // Optimisations over the previous sequential approach:
-            //   1. If the bookmark's peer was successfully queried and the
-            //      session ID is NOT in that peer's list → the session was
-            //      deleted on the remote side.  Skip the DHT lookup entirely
-            //      and auto-prune the stale bookmark.
-            //   2. Remaining reattach attempts run concurrently (join_all)
-            //      instead of sequentially, so N bookmarks take ~O(1) wall
-            //      time instead of O(N * 1.75 s).
-            //   3. Uses `reattach_from_bookmark_quick` (single DHT lookup,
-            //      no retries) to avoid 1.75 s backoff per stale bookmark.
-
+            // 3. Lazy bookmark reattach.
             if state.agent.mesh().is_some() {
                 match state.session_store.list_remote_session_bookmarks().await {
                     Ok(bookmarks) if !bookmarks.is_empty() => {
@@ -344,29 +337,20 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                             registry.session_ids().into_iter().collect()
                         };
 
-                        // Partition bookmarks into:
-                        //  - `stale`: peer is online and confirmed the session is gone
-                        //  - `to_reattach`: need a DHT lookup (peer offline or session
-                        //     might still exist)
-                        //  - already attached: skip
                         let mut stale_ids: Vec<String> = Vec::new();
                         let mut to_reattach: Vec<crate::session::store::RemoteSessionBookmark> =
                             Vec::new();
 
                         for bookmark in bookmarks {
                             if registry_ids.contains(&bookmark.session_id) {
-                                continue; // already attached
+                                continue;
                             }
 
-                            // Check if we successfully queried this bookmark's peer
-                            // and the session is NOT in the returned list.
                             if let Some(peer_sessions) =
                                 confirmed_peer_sessions.get(&bookmark.peer_label)
                                 && !peer_sessions.contains(&bookmark.session_id) {
-                                    // Peer is online, session confirmed gone → prune.
                                     log::info!(
-                                        "Auto-pruning stale bookmark {}: peer '{}' is online \
-                                         but session no longer exists",
+                                        "Auto-pruning stale bookmark {}: peer '{}' online but session gone",
                                         bookmark.session_id,
                                         bookmark.peer_label,
                                     );
@@ -377,7 +361,6 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                             to_reattach.push(bookmark);
                         }
 
-                        // Prune stale bookmarks in the background.
                         if !stale_ids.is_empty() {
                             let store = state.session_store.clone();
                             tokio::spawn(async move {
@@ -385,17 +368,12 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                                     if let Err(e) =
                                         store.remove_remote_session_bookmark(&sid).await
                                     {
-                                        log::warn!(
-                                            "Failed to remove stale bookmark {}: {}",
-                                            sid,
-                                            e
-                                        );
+                                        log::warn!("Failed to remove stale bookmark {}: {}", sid, e);
                                     }
                                 }
                             });
                         }
 
-                        // Reattach remaining bookmarks concurrently.
                         if !to_reattach.is_empty() {
                             let reattach_futures: Vec<_> = to_reattach
                                 .into_iter()
@@ -408,36 +386,22 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                                         )
                                         .await
                                         {
-                                            Ok(Ok(_)) => {
-                                                log::info!(
-                                                    "Reattached remote session {} from bookmark",
-                                                    bookmark.session_id
-                                                );
-                                                true
-                                            }
+                                            Ok(Ok(_)) => true,
                                             Ok(Err(e)) => {
                                                 log::debug!(
-                                                    "Failed to reattach bookmarked session {}: {}",
-                                                    bookmark.session_id,
-                                                    e
+                                                    "Failed to reattach bookmark {}: {}",
+                                                    bookmark.session_id, e
                                                 );
                                                 false
                                             }
-                                            Err(_) => {
-                                                log::debug!(
-                                                    "Reattach timed out for bookmarked session {}",
-                                                    bookmark.session_id
-                                                );
-                                                false
-                                            }
+                                            Err(_) => false,
                                         };
                                         (bookmark, reattached)
                                     }
                                 })
                                 .collect();
 
-                            let results =
-                                futures_util::future::join_all(reattach_futures).await;
+                            let results = futures_util::future::join_all(reattach_futures).await;
 
                             let mut bookmark_groups: std::collections::HashMap<
                                 String,
@@ -477,11 +441,7 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                                     .find(|g| g.cwd.as_deref() == Some(group_cwd.as_str()))
                                 {
                                     let existing_ids: std::collections::HashSet<String> =
-                                        existing
-                                            .sessions
-                                            .iter()
-                                            .map(|s| s.session_id.clone())
-                                            .collect();
+                                        existing.sessions.iter().map(|s| s.session_id.clone()).collect();
                                     for s in sessions {
                                         if !existing_ids.contains(&s.session_id) {
                                             existing.sessions.push(s);
@@ -494,12 +454,14 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                                         cwd: Some(group_cwd),
                                         sessions,
                                         latest_activity: None,
+                                        total_count: None,
+                                        next_cursor: None,
                                     });
                                 }
                             }
                         }
                     }
-                    Ok(_) => {} // no bookmarks
+                    Ok(_) => {}
                     Err(e) => {
                         log::warn!("Failed to load remote session bookmarks: {}", e);
                     }
@@ -510,6 +472,8 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
         .await;
     }
     let remote_merge_ms = remote_merge_started.elapsed().as_millis() as u64;
+    #[cfg(not(feature = "remote"))]
+    let remote_merge_ms = 0u64;
 
     let total_group_count = groups.len();
     let total_session_count: usize = groups.iter().map(|g| g.sessions.len()).sum();
@@ -521,11 +485,19 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
     span.record("remote_session_count", remote_session_count);
     span.record("total_group_count", total_group_count);
     span.record("total_session_count", total_session_count);
-    span.record("view_fetch_ms", view_fetch_ms);
+    span.record("view_fetch_ms", started.elapsed().as_millis() as u64);
     span.record("remote_merge_ms", remote_merge_ms);
     span.record("total_ms", started.elapsed().as_millis() as u64);
 
-    let _ = send_message(tx, UiServerMessage::SessionList { groups }).await;
+    let _ = send_message(
+        tx,
+        UiServerMessage::SessionList {
+            groups,
+            next_cursor,
+            total_count: total_count as u64,
+        },
+    )
+    .await;
 }
 
 /// Handle session loading request.
@@ -713,7 +685,7 @@ pub async fn handle_delete_session(
     }
 
     send_state(state, conn_id, tx).await;
-    handle_list_sessions(state, tx).await;
+    handle_list_sessions(state, tx, None, None, None, None, None).await;
 }
 
 pub(super) async fn ensure_session_loaded(
@@ -1220,7 +1192,7 @@ pub async fn handle_fork_session(
             }
 
             send_state(state, conn_id, tx).await;
-            handle_list_sessions(state, tx).await;
+            handle_list_sessions(state, tx, None, None, None, None, None).await;
 
             let _ = send_message(
                 tx,

@@ -175,6 +175,30 @@ pub trait ViewStore: Send + Sync {
         filter: Option<SessionListFilter>,
     ) -> SessionResult<SessionListView>;
 
+    /// Browse workspace groups with preview sessions.
+    async fn browse_session_groups(
+        &self,
+        cursor: Option<String>,
+        group_limit: usize,
+        session_limit_per_group: usize,
+    ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)>;
+
+    /// Page sessions for one workspace group.
+    async fn list_group_sessions(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> SessionResult<(SessionGroup, usize)>;
+
+    /// Search all sessions via FTS5 (DB-wide, not limited to loaded pages).
+    async fn search_sessions(
+        &self,
+        query: String,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)>;
+
     /// Export session as ATIF (Agent Trajectory Interchange Format)
     async fn get_atif(
         &self,
@@ -326,6 +350,8 @@ pub struct SessionGroup {
     pub sessions: Vec<SessionListItem>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub latest_activity: Option<OffsetDateTime>,
+    pub total_count: Option<usize>,
+    pub next_cursor: Option<String>,
 }
 
 /// Session list view with grouping
@@ -335,6 +361,14 @@ pub struct SessionListView {
     pub total_count: usize,
     #[serde(with = "time::serde::rfc3339")]
     pub generated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionGroupTotal {
+    pub cwd: Option<String>,
+    pub total_count: usize,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub latest_activity: Option<OffsetDateTime>,
 }
 
 /// Recent model usage entry from event history

@@ -772,6 +772,8 @@ export interface SessionGroup {
 	cwd?: string;
 	sessions: SessionSummary[];
 	latest_activity?: string;
+	total_count: number;
+	next_cursor?: string;
 }
 
 /**
@@ -939,7 +941,18 @@ export type UiClientMessage =
 	| { type: "prompt", data: {
 	prompt: UiPromptBlock[];
 }}
-	| { type: "list_sessions", data?: undefined }
+	| { type: "list_sessions", data: {
+	/** Query mode: browse (default), group, or search. */
+	mode?: string;
+	/** Opaque pagination cursor (offset as string for now). */
+	cursor?: string;
+	/** Max number of sessions to return. */
+	limit?: number;
+	/** Group key for mode=group (cwd path or null-group marker). */
+	cwd?: string;
+	/** Search query for mode=search. */
+	query?: string;
+}}
 	| { type: "load_session", data: {
 	session_id: string;
 }}
@@ -1226,6 +1239,8 @@ export type UiServerMessage =
 }}
 	| { type: "session_list", data: {
 	groups: SessionGroup[];
+	next_cursor?: string;
+	total_count: number;
 }}
 	| { type: "session_loaded", data: {
 	session_id: string;

@@ -92,6 +92,24 @@ impl IntentRepository for SqliteIntentRepository {
                 "INSERT INTO intent_snapshots (session_id, task_id, summary, constraints, next_step_hint, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 params![session_id, task_id, summary, constraints, next_step_hint, created_at_str],
             )?;
+
+            // Refresh the session's FTS row so the title (derived from the
+            // earliest intent_snapshot summary) stays searchable. We only
+            // need to do this when this is the first snapshot for the session,
+            // but checking is more expensive than just always refreshing.
+            conn.execute(
+                r#"INSERT INTO sessions_fts(sessions_fts, rowid) VALUES ('delete', ?1)"#,
+                params![session_id],
+            ).ok(); // ignore — FTS table may not exist yet during early migrations
+
+            conn.execute(
+                r#"INSERT INTO sessions_fts(rowid, public_id, name, cwd, title)
+                   SELECT s.id, s.public_id, COALESCE(s.name, ''), COALESCE(s.cwd, ''),
+                          COALESCE((SELECT i.summary FROM intent_snapshots i WHERE i.session_id = s.id ORDER BY i.id ASC LIMIT 1), '')
+                   FROM sessions s WHERE s.id = ?1"#,
+                params![session_id],
+            ).ok();
+
             Ok(())
         })
         .await

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { Loader } from 'lucide-react';
 import { useSessionManager } from '../hooks/useSessionManager';
 import { useUiClientActions, useUiClientSession } from '../context/UiClientContext';
@@ -15,16 +15,32 @@ import { WelcomeScreen } from './WelcomeScreen';
 export function HomePage() {
   const { selectSession, createSession, goHome } = useSessionManager();
   
-  const { deleteSession } = useUiClientActions();
-  const { 
-    connected, 
-    sessionGroups, 
+  const { deleteSession, loadMoreSessions, loadMoreGroupSessions, searchSessions } = useUiClientActions();
+  const {
+    connected,
+    sessionGroups,
     sessionId,
     thinkingBySession,
     sessionParentMap,
+    sessionNextCursor,
+    sessionTotalCount,
+    sessionPageLoading,
+    sessionsEverLoaded,
   } = useUiClientSession();
   
   const [loading, setLoading] = useState(false);
+
+  const handleLoadMoreSessions = useCallback(() => {
+    loadMoreSessions(20);
+  }, [loadMoreSessions]);
+
+  const handleLoadMoreGroupSessions = useCallback((cwd: string | null) => {
+    loadMoreGroupSessions(cwd, 20);
+  }, [loadMoreGroupSessions]);
+
+  const handleSearchSessions = useCallback((q: string) => {
+    searchSessions(q, 30);
+  }, [searchSessions]);
 
   const handleNewSession = async () => {
     setLoading(true);
@@ -58,7 +74,7 @@ export function HomePage() {
     );
   }
 
-  if (sessionGroups.length > 0) {
+  if (sessionsEverLoaded || sessionGroups.length > 0) {
     return (
       <div className="flex items-center justify-center h-full">
         <SessionPicker
@@ -66,10 +82,15 @@ export function HomePage() {
           onSelectSession={handleSelectSession}
           onDeleteSession={handleDeleteSession}
           onNewSession={handleNewSession}
+          onLoadMoreSessions={handleLoadMoreSessions}
+          onLoadMoreGroupSessions={handleLoadMoreGroupSessions}
+          onSearchSessions={handleSearchSessions}
           disabled={loading}
           activeSessionId={sessionId}
           thinkingBySession={thinkingBySession}
           sessionParentMap={sessionParentMap}
+          hasMoreSessions={!!sessionNextCursor || sessionGroups.reduce((n, g) => n + g.sessions.length, 0) < sessionTotalCount}
+          sessionPageLoading={sessionPageLoading}
         />
       </div>
     );

@@ -1356,7 +1356,15 @@ impl LocalAgentHandle {
             .get_runtime_status()
             .await
             .unwrap_or(SessionRuntimeStatus::Running);
-        if matches!(status, SessionRuntimeStatus::Idle) {
+        if matches!(
+            status,
+            SessionRuntimeStatus::Idle | SessionRuntimeStatus::CancelRequested
+        ) {
+            tracing::debug!(
+                "Session {} stop: status={:?}, graceful shutdown — returning without force-stop",
+                session_id,
+                status
+            );
             return Ok(());
         }
 
