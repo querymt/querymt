@@ -10748,6 +10748,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "qmt-deepseek"
+version = "0.3.3"
+dependencies = [
+ "extism-pdk",
+ "http 1.4.0",
+ "qmt-openai",
+ "querymt",
+ "querymt-extism-macros",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "qmt-google"
 version = "0.3.3"
 dependencies = [

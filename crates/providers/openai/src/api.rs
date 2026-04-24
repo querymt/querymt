@@ -1099,7 +1099,7 @@ pub fn openai_parse_list_models(response: &Response<Vec<u8>>) -> Result<Vec<Stri
 
 /// Streaming response chunk from OpenAI's API
 #[derive(Deserialize, Debug)]
-pub struct OpenAIStreamChunk {
+struct OpenAIStreamChunk {
     pub choices: Vec<OpenAIStreamChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<OpenAIRawUsage>,

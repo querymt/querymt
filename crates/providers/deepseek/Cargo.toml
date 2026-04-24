@@ -1,0 +1,28 @@
+[package]
+name = "qmt-deepseek"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[package.metadata.qmt]
+type = "wasm"
+
+[features]
+default = ["extism"]
+api = ["querymt"]
+native = ["api"]
+extism = ["extism-pdk", "api", "querymt-extism-macros"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+querymt = { path = "../../querymt", default-features = false, optional = true }
+querymt-extism-macros = { path = "../../querymt-extism-macros", optional = true }
+qmt-openai = { path = "../openai", default-features = false, features = ["api"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+schemars = { workspace = true }
+http = { workspace = true }
+extism-pdk = { workspace = true, optional = true }
