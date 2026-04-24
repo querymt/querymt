@@ -153,8 +153,24 @@ pub async fn ensure_session(
             .get(conn_id)
             .and_then(|conn| conn.sessions.get(agent_id).cloned())
     };
-    if let Some(session_id) = existing {
-        return Ok(session_id);
+    if let Some(session_id) = &existing {
+        // Verify the session still exists in the registry.
+        // After a force-stop the session is removed, making the binding stale.
+        let still_alive = {
+            let registry = state.agent.registry.lock().await;
+            registry.get(session_id).is_some()
+        };
+        if still_alive {
+            return Ok(session_id.clone());
+        }
+        // Session was destroyed (force-stopped) — clear the stale binding
+        // so the code below creates a fresh session.
+        {
+            let mut connections = state.connections.lock().await;
+            if let Some(conn) = connections.get_mut(conn_id) {
+                conn.sessions.remove(agent_id);
+            }
+        }
     }
 
     let agent =

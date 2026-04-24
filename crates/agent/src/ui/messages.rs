@@ -151,6 +151,11 @@ pub struct SessionGroup {
     pub cwd: Option<String>,
     pub sessions: Vec<SessionSummary>,
     pub latest_activity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[typeshare(serialized_as = "number")]
+    pub total_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Messages from UI client to server.
@@ -174,7 +179,23 @@ pub enum UiClientMessage {
     Prompt {
         prompt: Vec<UiPromptBlock>,
     },
-    ListSessions,
+    ListSessions {
+        /// Query mode: browse (default), group, or search.
+        #[serde(default)]
+        mode: Option<String>,
+        /// Opaque pagination cursor (offset as string for now).
+        #[serde(default)]
+        cursor: Option<String>,
+        /// Max number of sessions to return.
+        #[serde(default)]
+        limit: Option<u32>,
+        /// Group key for mode=group (cwd path or null-group marker).
+        #[serde(default)]
+        cwd: Option<String>,
+        /// Search query for mode=search.
+        #[serde(default)]
+        query: Option<String>,
+    },
     LoadSession {
         session_id: String,
     },
@@ -735,6 +756,10 @@ pub enum UiServerMessage {
     },
     SessionList {
         groups: Vec<SessionGroup>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<String>,
+        #[typeshare(serialized_as = "number")]
+        total_count: u64,
     },
     SessionLoaded {
         session_id: String,

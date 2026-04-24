@@ -22,6 +22,7 @@ use crate::session::repository::{
     ProgressRepository, SessionRepository, TaskRepository,
 };
 use crate::session::store::Session;
+use rusqlite::params;
 
 use super::SqliteStorage;
 
@@ -250,9 +251,13 @@ impl ViewStore for SqliteStorage {
         // Extract SQL-level limit from filter before moving into the closure.
         // A limit without a filter expression can be pushed straight into SQL,
         // avoiding deserializing rows we'll discard anyway.
-        let sql_limit: Option<usize> = filter
-            .as_ref()
-            .and_then(|f| if f.filter.is_none() { f.limit } else { None });
+        let sql_limit: Option<usize> = filter.as_ref().and_then(|f| {
+            if f.filter.is_none() && f.offset.unwrap_or(0) == 0 {
+                f.limit
+            } else {
+                None
+            }
+        });
 
         let raw_rows: Vec<RawRow> = self
             .run_blocking(move |conn| {
@@ -357,6 +362,7 @@ impl ViewStore for SqliteStorage {
         // Apply in-memory filter/limit (filter_expr needs the full Session struct;
         // convert only the subset we need to evaluate the predicate).
         let mut raw_rows = raw_rows;
+        let mut total_count = session_count_before_filter;
         if let Some(filter_spec) = filter {
             if let Some(filter_expr) = filter_spec.filter {
                 // Build minimal Session values for predicate evaluation.
@@ -396,13 +402,17 @@ impl ViewStore for SqliteStorage {
                     evaluate_session_filter(&session, &filter_expr)
                 });
             }
+            total_count = raw_rows.len();
+            let offset = filter_spec.offset.unwrap_or(0);
+            if offset > 0 {
+                raw_rows = raw_rows.into_iter().skip(offset).collect();
+            }
             if let Some(limit) = filter_spec.limit {
                 raw_rows.truncate(limit);
             }
         }
 
         let filter_ms = filter_started.elapsed().as_millis() as u64;
-        let total_count = raw_rows.len();
 
         // Build session list items
         let title_lookup_started = Instant::now();
@@ -514,6 +524,8 @@ impl ViewStore for SqliteStorage {
                     cwd,
                     sessions,
                     latest_activity,
+                    total_count: None,
+                    next_cursor: None,
                 }
             })
             .collect();
@@ -555,6 +567,537 @@ impl ViewStore for SqliteStorage {
             total_count,
             generated_at: OffsetDateTime::now_utc(),
         })
+    }
+
+    async fn browse_session_groups(
+        &self,
+        cursor: Option<String>,
+        group_limit: usize,
+        session_limit_per_group: usize,
+    ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
+        let group_offset = cursor
+            .as_deref()
+            .and_then(|c| c.parse::<usize>().ok())
+            .unwrap_or(0);
+        let group_limit = group_limit.clamp(1, 100);
+        let preview_limit = session_limit_per_group.clamp(1, 100);
+
+        self.run_blocking(move |conn| {
+            let total_sessions: usize =
+                conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                    row.get::<_, i64>(0).map(|v| v as usize)
+                })?;
+
+            let mut summary_stmt = conn.prepare(
+                r#"
+                SELECT
+                    cwd,
+                    COUNT(*) as total_count,
+                    MAX(updated_at) as latest_activity
+                FROM sessions
+                GROUP BY cwd
+                ORDER BY (cwd IS NOT NULL), MAX(updated_at) DESC
+                LIMIT ?1 OFFSET ?2
+                "#,
+            )?;
+
+            let summaries = summary_stmt
+                .query_map(params![group_limit as i64, group_offset as i64], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, i64>(1)? as usize,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let total_groups: usize = conn.query_row(
+                "SELECT COUNT(DISTINCT COALESCE(cwd, '__none__')) FROM sessions",
+                [],
+                |row| row.get::<_, i64>(0).map(|v| v as usize),
+            )?;
+
+            let mut groups = Vec::with_capacity(summaries.len());
+            for (cwd, total_count, latest_raw) in summaries {
+                let latest_activity = latest_raw.and_then(|v| {
+                    time::OffsetDateTime::parse(&v, &time::format_description::well_known::Rfc3339)
+                        .ok()
+                });
+
+                let mut session_stmt = if cwd.is_some() {
+                    conn.prepare(
+                        r#"
+                        SELECT
+                            s.public_id,
+                            s.name,
+                            s.cwd,
+                            s.created_at,
+                            s.updated_at,
+                            p.public_id,
+                            s.fork_origin,
+                            s.session_kind,
+                            EXISTS(SELECT 1 FROM sessions c WHERE c.parent_session_id = s.id),
+                            i.summary
+                        FROM sessions s
+                        LEFT JOIN sessions p ON p.id = s.parent_session_id
+                        LEFT JOIN intent_snapshots i
+                            ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
+                        WHERE s.cwd = ?1
+                        ORDER BY s.updated_at DESC
+                        LIMIT ?2
+                        "#,
+                    )?
+                } else {
+                    conn.prepare(
+                        r#"
+                        SELECT
+                            s.public_id,
+                            s.name,
+                            s.cwd,
+                            s.created_at,
+                            s.updated_at,
+                            p.public_id,
+                            s.fork_origin,
+                            s.session_kind,
+                            EXISTS(SELECT 1 FROM sessions c WHERE c.parent_session_id = s.id),
+                            i.summary
+                        FROM sessions s
+                        LEFT JOIN sessions p ON p.id = s.parent_session_id
+                        LEFT JOIN intent_snapshots i
+                            ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
+                        WHERE s.cwd IS NULL
+                        ORDER BY s.updated_at DESC
+                        LIMIT ?1
+                        "#,
+                    )?
+                };
+
+                let sessions = if let Some(ref cwd_value) = cwd {
+                    session_stmt
+                        .query_map(params![cwd_value, preview_limit as i64], |row| {
+                            Ok(SessionListItem {
+                                session_id: row.get(0)?,
+                                name: row.get(1)?,
+                                cwd: row.get(2)?,
+                                title: row.get::<_, Option<String>>(9)?.map(|summary| {
+                                    if summary.len() > 80 {
+                                        format!("{}...", &summary[..77])
+                                    } else {
+                                        summary
+                                    }
+                                }),
+                                created_at: row.get::<_, Option<String>>(3)?.and_then(|s| {
+                                    time::OffsetDateTime::parse(
+                                        &s,
+                                        &time::format_description::well_known::Rfc3339,
+                                    )
+                                    .ok()
+                                }),
+                                updated_at: row.get::<_, Option<String>>(4)?.and_then(|s| {
+                                    time::OffsetDateTime::parse(
+                                        &s,
+                                        &time::format_description::well_known::Rfc3339,
+                                    )
+                                    .ok()
+                                }),
+                                parent_session_id: row.get(5)?,
+                                fork_origin: row.get(6)?,
+                                session_kind: row.get(7)?,
+                                has_children: row.get::<_, i64>(8)? != 0,
+                            })
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    session_stmt
+                        .query_map(params![preview_limit as i64], |row| {
+                            Ok(SessionListItem {
+                                session_id: row.get(0)?,
+                                name: row.get(1)?,
+                                cwd: row.get(2)?,
+                                title: row.get::<_, Option<String>>(9)?.map(|summary| {
+                                    if summary.len() > 80 {
+                                        format!("{}...", &summary[..77])
+                                    } else {
+                                        summary
+                                    }
+                                }),
+                                created_at: row.get::<_, Option<String>>(3)?.and_then(|s| {
+                                    time::OffsetDateTime::parse(
+                                        &s,
+                                        &time::format_description::well_known::Rfc3339,
+                                    )
+                                    .ok()
+                                }),
+                                updated_at: row.get::<_, Option<String>>(4)?.and_then(|s| {
+                                    time::OffsetDateTime::parse(
+                                        &s,
+                                        &time::format_description::well_known::Rfc3339,
+                                    )
+                                    .ok()
+                                }),
+                                parent_session_id: row.get(5)?,
+                                fork_origin: row.get(6)?,
+                                session_kind: row.get(7)?,
+                                has_children: row.get::<_, i64>(8)? != 0,
+                            })
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+
+                let next_cursor = if sessions.len() < total_count {
+                    Some(sessions.len().to_string())
+                } else {
+                    None
+                };
+
+                groups.push(SessionGroup {
+                    cwd,
+                    sessions,
+                    latest_activity,
+                    total_count: Some(total_count),
+                    next_cursor,
+                });
+            }
+
+            let next_group_cursor = if group_offset + groups.len() < total_groups {
+                Some((group_offset + groups.len()).to_string())
+            } else {
+                None
+            };
+
+            Ok((groups, next_group_cursor, total_sessions))
+        })
+        .await
+    }
+
+    async fn list_group_sessions(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> SessionResult<(SessionGroup, usize)> {
+        let offset = cursor
+            .as_deref()
+            .and_then(|c| c.parse::<usize>().ok())
+            .unwrap_or(0);
+        let limit = limit.clamp(1, 200);
+
+        self.run_blocking(move |conn| {
+            let total_count: usize = if let Some(ref cwd_value) = cwd {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE cwd = ?1",
+                    params![cwd_value],
+                    |row| row.get::<_, i64>(0).map(|v| v as usize),
+                )?
+            } else {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE cwd IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0).map(|v| v as usize),
+                )?
+            };
+
+            let latest_raw: Option<String> = if let Some(ref cwd_value) = cwd {
+                conn.query_row(
+                    "SELECT MAX(updated_at) FROM sessions WHERE cwd = ?1",
+                    params![cwd_value],
+                    |row| row.get(0),
+                )?
+            } else {
+                conn.query_row(
+                    "SELECT MAX(updated_at) FROM sessions WHERE cwd IS NULL",
+                    [],
+                    |row| row.get(0),
+                )?
+            };
+
+            let latest_activity = latest_raw.and_then(|v| {
+                time::OffsetDateTime::parse(&v, &time::format_description::well_known::Rfc3339).ok()
+            });
+
+            let mut session_stmt = if cwd.is_some() {
+                conn.prepare(
+                    r#"
+                    SELECT
+                        s.public_id,
+                        s.name,
+                        s.cwd,
+                        s.created_at,
+                        s.updated_at,
+                        p.public_id,
+                        s.fork_origin,
+                        s.session_kind,
+                        EXISTS(SELECT 1 FROM sessions c WHERE c.parent_session_id = s.id),
+                        i.summary
+                    FROM sessions s
+                    LEFT JOIN sessions p ON p.id = s.parent_session_id
+                    LEFT JOIN intent_snapshots i
+                        ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
+                    WHERE s.cwd = ?1
+                    ORDER BY s.updated_at DESC
+                    LIMIT ?2 OFFSET ?3
+                    "#,
+                )?
+            } else {
+                conn.prepare(
+                    r#"
+                    SELECT
+                        s.public_id,
+                        s.name,
+                        s.cwd,
+                        s.created_at,
+                        s.updated_at,
+                        p.public_id,
+                        s.fork_origin,
+                        s.session_kind,
+                        EXISTS(SELECT 1 FROM sessions c WHERE c.parent_session_id = s.id),
+                        i.summary
+                    FROM sessions s
+                    LEFT JOIN sessions p ON p.id = s.parent_session_id
+                    LEFT JOIN intent_snapshots i
+                        ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
+                    WHERE s.cwd IS NULL
+                    ORDER BY s.updated_at DESC
+                    LIMIT ?1 OFFSET ?2
+                    "#,
+                )?
+            };
+
+            let sessions = if let Some(ref cwd_value) = cwd {
+                session_stmt
+                    .query_map(params![cwd_value, limit as i64, offset as i64], |row| {
+                        Ok(SessionListItem {
+                            session_id: row.get(0)?,
+                            name: row.get(1)?,
+                            cwd: row.get(2)?,
+                            title: row.get::<_, Option<String>>(9)?.map(|summary| {
+                                if summary.len() > 80 {
+                                    format!("{}...", &summary[..77])
+                                } else {
+                                    summary
+                                }
+                            }),
+                            created_at: row.get::<_, Option<String>>(3)?.and_then(|s| {
+                                time::OffsetDateTime::parse(
+                                    &s,
+                                    &time::format_description::well_known::Rfc3339,
+                                )
+                                .ok()
+                            }),
+                            updated_at: row.get::<_, Option<String>>(4)?.and_then(|s| {
+                                time::OffsetDateTime::parse(
+                                    &s,
+                                    &time::format_description::well_known::Rfc3339,
+                                )
+                                .ok()
+                            }),
+                            parent_session_id: row.get(5)?,
+                            fork_origin: row.get(6)?,
+                            session_kind: row.get(7)?,
+                            has_children: row.get::<_, i64>(8)? != 0,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                session_stmt
+                    .query_map(params![limit as i64, offset as i64], |row| {
+                        Ok(SessionListItem {
+                            session_id: row.get(0)?,
+                            name: row.get(1)?,
+                            cwd: row.get(2)?,
+                            title: row.get::<_, Option<String>>(9)?.map(|summary| {
+                                if summary.len() > 80 {
+                                    format!("{}...", &summary[..77])
+                                } else {
+                                    summary
+                                }
+                            }),
+                            created_at: row.get::<_, Option<String>>(3)?.and_then(|s| {
+                                time::OffsetDateTime::parse(
+                                    &s,
+                                    &time::format_description::well_known::Rfc3339,
+                                )
+                                .ok()
+                            }),
+                            updated_at: row.get::<_, Option<String>>(4)?.and_then(|s| {
+                                time::OffsetDateTime::parse(
+                                    &s,
+                                    &time::format_description::well_known::Rfc3339,
+                                )
+                                .ok()
+                            }),
+                            parent_session_id: row.get(5)?,
+                            fork_origin: row.get(6)?,
+                            session_kind: row.get(7)?,
+                            has_children: row.get::<_, i64>(8)? != 0,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+
+            let next_cursor = if offset + sessions.len() < total_count {
+                Some((offset + sessions.len()).to_string())
+            } else {
+                None
+            };
+
+            Ok((
+                SessionGroup {
+                    cwd,
+                    sessions,
+                    latest_activity,
+                    total_count: Some(total_count),
+                    next_cursor,
+                },
+                total_count,
+            ))
+        })
+        .await
+    }
+
+    async fn search_sessions(
+        &self,
+        query: String,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
+        let offset = cursor
+            .as_deref()
+            .and_then(|c| c.parse::<usize>().ok())
+            .unwrap_or(0);
+        let limit = limit.clamp(1, 200);
+        let fts_query = build_session_fts_query(&query);
+        if fts_query.is_empty() {
+            return Ok((Vec::new(), None, 0));
+        }
+
+        self.run_blocking(move |conn| {
+            let total_count: usize = match conn.query_row(
+                "SELECT COUNT(*) FROM sessions_fts WHERE sessions_fts MATCH ?1",
+                params![fts_query.clone()],
+                |row| row.get::<_, i64>(0).map(|v| v as usize),
+            ) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok((Vec::new(), None, 0));
+                }
+            };
+
+            let mut group_counts_stmt = conn.prepare(
+                r#"
+                SELECT s.cwd, COUNT(*)
+                FROM sessions_fts f
+                JOIN sessions s ON s.id = f.rowid
+                WHERE sessions_fts MATCH ?1
+                GROUP BY s.cwd
+                "#,
+            )?;
+            let group_counts = group_counts_stmt
+                .query_map(params![fts_query.clone()], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, i64>(1)? as usize,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let group_counts_map: std::collections::HashMap<Option<String>, usize> =
+                group_counts.into_iter().collect();
+
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT
+                    s.public_id,
+                    s.name,
+                    s.cwd,
+                    s.created_at,
+                    s.updated_at,
+                    p.public_id,
+                    s.fork_origin,
+                    s.session_kind,
+                    EXISTS(SELECT 1 FROM sessions c WHERE c.parent_session_id = s.id),
+                    i.summary
+                FROM sessions_fts f
+                JOIN sessions s ON s.id = f.rowid
+                LEFT JOIN sessions p ON p.id = s.parent_session_id
+                LEFT JOIN intent_snapshots i
+                    ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
+                WHERE sessions_fts MATCH ?1
+                ORDER BY bm25(sessions_fts), s.updated_at DESC
+                LIMIT ?2 OFFSET ?3
+                "#,
+            )?;
+
+            let items = stmt
+                .query_map(params![fts_query, limit as i64, offset as i64], |row| {
+                    Ok(SessionListItem {
+                        session_id: row.get(0)?,
+                        name: row.get(1)?,
+                        cwd: row.get(2)?,
+                        title: row.get::<_, Option<String>>(9)?.map(|summary| {
+                            if summary.len() > 80 {
+                                format!("{}...", &summary[..77])
+                            } else {
+                                summary
+                            }
+                        }),
+                        created_at: row.get::<_, Option<String>>(3)?.and_then(|s| {
+                            time::OffsetDateTime::parse(
+                                &s,
+                                &time::format_description::well_known::Rfc3339,
+                            )
+                            .ok()
+                        }),
+                        updated_at: row.get::<_, Option<String>>(4)?.and_then(|s| {
+                            time::OffsetDateTime::parse(
+                                &s,
+                                &time::format_description::well_known::Rfc3339,
+                            )
+                            .ok()
+                        }),
+                        parent_session_id: row.get(5)?,
+                        fork_origin: row.get(6)?,
+                        session_kind: row.get(7)?,
+                        has_children: row.get::<_, i64>(8)? != 0,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut by_cwd: std::collections::HashMap<Option<String>, Vec<SessionListItem>> =
+                std::collections::HashMap::new();
+            for item in items {
+                by_cwd.entry(item.cwd.clone()).or_default().push(item);
+            }
+
+            let mut groups: Vec<SessionGroup> = by_cwd
+                .into_iter()
+                .map(|(cwd, sessions)| {
+                    let latest_activity = sessions.iter().filter_map(|s| s.updated_at).max();
+                    SessionGroup {
+                        total_count: Some(*group_counts_map.get(&cwd).unwrap_or(&sessions.len())),
+                        next_cursor: None,
+                        cwd,
+                        sessions,
+                        latest_activity,
+                    }
+                })
+                .collect();
+
+            groups.sort_by(|a, b| match (&a.cwd, &b.cwd) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(_), Some(_)) => b.latest_activity.cmp(&a.latest_activity),
+            });
+
+            let next_cursor = if offset + limit < total_count {
+                Some((offset + limit).to_string())
+            } else {
+                None
+            };
+
+            Ok((groups, next_cursor, total_count))
+        })
+        .await
     }
 
     async fn get_atif(
@@ -664,6 +1207,16 @@ impl ViewStore for SqliteStorage {
 // ============================================================================
 
 /// Evaluate a filter expression against a session
+fn build_session_fts_query(input: &str) -> String {
+    let terms: Vec<String> = input
+        .split_whitespace()
+        .map(|t| t.replace('"', ""))
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{}\"*", t))
+        .collect();
+    terms.join(" AND ")
+}
+
 fn evaluate_session_filter(session: &Session, expr: &FilterExpr) -> bool {
     match expr {
         FilterExpr::Predicate(pred) => evaluate_predicate(session, pred),

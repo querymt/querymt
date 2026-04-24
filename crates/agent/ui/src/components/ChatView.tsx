@@ -56,6 +56,9 @@ export function ChatView() {
     sendPrompt,
     cancelSession,
     deleteSession,
+    loadMoreSessions,
+    loadMoreGroupSessions,
+    searchSessions,
     setFileIndexCallback,
     setFileIndexErrorCallback,
     requestFileIndex,
@@ -84,6 +87,9 @@ export function ChatView() {
     sessionGroups,
     thinkingBySession,
     sessionParentMap,
+    sessionNextCursor,
+    sessionTotalCount,
+    sessionPageLoading,
     workspaceIndexStatus,
     llmConfigCache,
     undoState,
@@ -876,10 +882,15 @@ export function ChatView() {
                     onSelectSession={handleSelectSession}
                     onDeleteSession={handleDeleteSession}
                     onNewSession={handleNewSession}
+                    onLoadMoreSessions={() => loadMoreSessions(20)}
+                    onLoadMoreGroupSessions={(cwd) => loadMoreGroupSessions(cwd, 20)}
+                    onSearchSessions={(q) => searchSessions(q, 30)}
                     disabled={!connected || loading}
                     activeSessionId={sessionId}
                     thinkingBySession={thinkingBySession}
                     sessionParentMap={sessionParentMap}
+                    hasMoreSessions={!!sessionNextCursor || sessionGroups.reduce((n, g) => n + g.sessions.length, 0) < sessionTotalCount}
+                    sessionPageLoading={sessionPageLoading}
                   />
                 )
               ) : (

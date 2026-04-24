@@ -152,6 +152,22 @@ export function useUiClient() {
   // @ts-expect-error - setAvailableModes reserved for future backend integration
   const [availableModes, setAvailableModes] = useState<string[]>(['build', 'plan']);
   const [sessionGroups, setSessionGroups] = useState<SessionGroup[]>([]);
+  const [sessionNextCursor, setSessionNextCursor] = useState<string | null>(null);
+  const [sessionTotalCount, setSessionTotalCount] = useState<number>(0);
+  const [sessionPageLoading, setSessionPageLoading] = useState(false);
+  const [sessionGroupNextCursorByCwd, setSessionGroupNextCursorByCwd] = useState<Record<string, string | null>>({});
+  const [sessionsEverLoaded, setSessionsEverLoaded] = useState(false);
+  const sessionNextCursorRef = useRef<string | null>(null);
+  sessionNextCursorRef.current = sessionNextCursor;
+  const sessionPageLoadingRef = useRef(false);
+  sessionPageLoadingRef.current = sessionPageLoading;
+  const sessionGroupNextCursorByCwdRef = useRef<Record<string, string | null>>({});
+  sessionGroupNextCursorByCwdRef.current = sessionGroupNextCursorByCwd;
+  const pendingGroupLoadRef = useRef<string | null>(null);
+  const pendingBrowseCursorRef = useRef<string | null>(null);
+  const sessionGroupsLoadedRef = useRef(false);
+  // Mark as loaded whenever we receive a non-empty session list
+  if (sessionGroups.length > 0) sessionGroupsLoadedRef.current = true;
   const [allModels, setAllModels] = useState<ModelEntry[]>([]);
   const [providerCapabilities, setProviderCapabilities] = useState<Record<string, ProviderCapabilityEntry>>({});
   const [recentModelsByWorkspace, setRecentModelsByWorkspace] = useState<Record<string, RecentModelEntry[]>>({});
@@ -272,6 +288,10 @@ export function useUiClient() {
         sendOnSocket(socket, { type: 'get_recent_models', data: { limit_per_workspace: 10 } });
         sendOnSocket(socket, { type: 'list_remote_nodes' });
         sendOnSocket(socket, { type: 'list_mesh_invites' } as UiClientMessage);
+        sendOnSocket(socket, {
+          type: 'list_sessions',
+          data: { mode: 'browse', limit: 20 },
+        } as UiClientMessage);
 
         // If we had an active session before disconnect, re-subscribe so
         // we resume receiving events (and the backend replays anything we
@@ -784,7 +804,9 @@ export function useUiClient() {
         if (isDeleteError) {
           pendingDeleteLabelsRef.current.clear();
           pushSessionActionNotice('error', d.message);
-          sendMessage({ type: 'list_sessions' } as UiClientMessage);
+          pendingGroupLoadRef.current = null;
+          sendMessage({ type: 'list_sessions', data: { mode: 'browse' } } as UiClientMessage);
+          setSessionPageLoading(false);
         }
 
         if (isLoadError) {
@@ -800,7 +822,8 @@ export function useUiClient() {
           if (failedSessionId) {
             setLastLoadErrorSessionId(failedSessionId);
           }
-          sendMessage({ type: 'list_sessions' } as UiClientMessage);
+          pendingGroupLoadRef.current = null;
+          sendMessage({ type: 'list_sessions', data: { mode: 'browse' } } as UiClientMessage);
         }
 
         // Connection-level errors have no session_id. Do not inject them into the
@@ -828,9 +851,64 @@ export function useUiClient() {
       }
       case 'session_list': {
         const d = msg.data;
-        setSessionGroups(d.groups);
+        const isGroupPagingResponse = pendingGroupLoadRef.current !== null;
+        const isBrowsePagingResponse = pendingBrowseCursorRef.current !== null;
+        pendingGroupLoadRef.current = null;
+        pendingBrowseCursorRef.current = null;
 
-        if (pendingDeleteLabelsRef.current.size > 0) {
+        setSessionNextCursor(d.next_cursor ?? null);
+        setSessionTotalCount(d.total_count ?? 0);
+        setSessionPageLoading(false);
+
+        const nextByCwd: Record<string, string | null> = {};
+        for (const g of d.groups) {
+          nextByCwd[g.cwd ?? '__none__'] = g.next_cursor ?? null;
+        }
+        setSessionGroupNextCursorByCwd((prev) => ({ ...prev, ...nextByCwd }));
+
+        if (!isGroupPagingResponse && !isBrowsePagingResponse) {
+          setSessionGroups(d.groups);
+        } else {
+          setSessionGroups((prev) => {
+            const byCwd = new Map<string, SessionGroup>();
+            for (const group of prev) {
+              byCwd.set(group.cwd ?? '__none__', {
+                cwd: group.cwd,
+                latest_activity: group.latest_activity,
+                sessions: [...group.sessions],
+                total_count: group.total_count,
+                next_cursor: group.next_cursor,
+              });
+            }
+            for (const group of d.groups) {
+              const key = group.cwd ?? '__none__';
+              const existing = byCwd.get(key);
+              if (!existing) {
+                byCwd.set(key, {
+                  cwd: group.cwd,
+                  latest_activity: group.latest_activity,
+                  sessions: [...group.sessions],
+                  total_count: group.total_count,
+                  next_cursor: group.next_cursor,
+                });
+                continue;
+              }
+              const seen = new Set(existing.sessions.map((s) => s.session_id));
+              for (const s of group.sessions) {
+                if (!seen.has(s.session_id)) {
+                  existing.sessions.push(s);
+                }
+              }
+              existing.total_count = group.total_count;
+              existing.next_cursor = group.next_cursor;
+              existing.latest_activity = existing.latest_activity ?? group.latest_activity;
+              byCwd.set(key, existing);
+            }
+            return Array.from(byCwd.values());
+          });
+        }
+
+        if (!isGroupPagingResponse && pendingDeleteLabelsRef.current.size > 0) {
           const remainingSessionIds = new Set(
             d.groups.flatMap((group: any) => group.sessions.map((session: any) => session.session_id))
           );
@@ -1230,6 +1308,13 @@ export function useUiClient() {
     undoStateRef.current = undoState;
   }, [undoState]);
 
+  // Track whether sessions have ever been loaded (persists across search/browse/delete).
+  useEffect(() => {
+    if (sessionGroups.length > 0) {
+      setSessionsEverLoaded(true);
+    }
+  }, [sessionGroups]);
+
   const sendMessage = (message: UiClientMessage) => {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
@@ -1434,6 +1519,49 @@ export function useUiClient() {
 
   const fetchRecentModels = useCallback(() => {
     sendMessage({ type: 'get_recent_models', data: { limit_per_workspace: 10 } });
+  }, []);
+
+  const loadMoreSessions = useCallback((limit: number = 50) => {
+    const cursor = sessionNextCursorRef.current;
+    if (sessionPageLoadingRef.current || !cursor) {
+      return;
+    }
+    pendingBrowseCursorRef.current = cursor;
+    setSessionPageLoading(true);
+    sendMessage({
+      type: 'list_sessions',
+      data: { mode: 'browse', cursor, limit },
+    } as UiClientMessage);
+  }, []);
+
+  const loadMoreGroupSessions = useCallback((cwd: string | null, limit: number = 20) => {
+    const key = cwd ?? '__none__';
+    const cursor = sessionGroupNextCursorByCwdRef.current[key] ?? null;
+    if (sessionPageLoadingRef.current || !cursor) {
+      return;
+    }
+    pendingGroupLoadRef.current = key;
+    setSessionPageLoading(true);
+    sendMessage({
+      type: 'list_sessions',
+      data: { mode: 'group', cwd: cwd ?? '__none__', cursor, limit },
+    } as UiClientMessage);
+  }, []);
+
+  const searchSessions = useCallback((query: string, limit: number = 30) => {
+    pendingGroupLoadRef.current = null;
+    pendingBrowseCursorRef.current = null;
+    if (!query.trim()) {
+      // When search is cleared, reload the full browse list so sessions reappear.
+      setSessionPageLoading(true);
+      sendMessage({ type: 'list_sessions', data: { mode: 'browse', limit: 20 } } as UiClientMessage);
+      return;
+    }
+    setSessionPageLoading(true);
+    sendMessage({
+      type: 'list_sessions',
+      data: { mode: 'search', query, limit },
+    } as UiClientMessage);
   }, []);
 
   const requestAuthProviders = useCallback(() => {
@@ -1727,6 +1855,10 @@ export function useUiClient() {
     setActiveAgent: selectAgent,
     setRoutingMode: selectRoutingMode,
     sessionGroups,
+    sessionNextCursor,
+    sessionTotalCount,
+    sessionPageLoading,
+    sessionsEverLoaded,
     allModels,
     providerCapabilities,
     modelDownloads,
@@ -1740,6 +1872,9 @@ export function useUiClient() {
     attachRemoteSession,
     refreshAllModels,
     fetchRecentModels,
+    loadMoreSessions,
+    loadMoreGroupSessions,
+    searchSessions,
     requestAuthProviders,
     startOAuthLogin,
     completeOAuthLogin,
