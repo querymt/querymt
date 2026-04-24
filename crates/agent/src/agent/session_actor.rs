@@ -1593,12 +1593,15 @@ async fn execute_prompt_detached(
     );
 
     // Acquire execution permit (blocking with timeout)
-    let _permit = match tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        runtime.execution_permit.acquire(),
-    )
-    .await
-    {
+    let _permit = match tokio::select! {
+        permit = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            runtime.execution_permit.acquire(),
+        ) => permit,
+        _ = cancel_token.cancelled() => {
+            return Ok(PromptResponse::new(StopReason::Cancelled));
+        }
+    } {
         Ok(Ok(permit)) => permit,
         Ok(Err(_)) => return Err(AgentError::SessionSemaphoreClosed),
         Err(_) => {
@@ -1613,7 +1616,12 @@ async fn execute_prompt_detached(
                 },
             );
             let timeout_duration = std::time::Duration::from_secs(config.execution_timeout_secs);
-            match tokio::time::timeout(timeout_duration, runtime.execution_permit.acquire()).await {
+            match tokio::select! {
+                permit = tokio::time::timeout(timeout_duration, runtime.execution_permit.acquire()) => permit,
+                _ = cancel_token.cancelled() => {
+                    return Ok(PromptResponse::new(StopReason::Cancelled));
+                }
+            } {
                 Ok(Ok(permit)) => permit,
                 Ok(Err(_)) => return Err(AgentError::SessionSemaphoreClosed),
                 Err(_) => {

@@ -614,6 +614,8 @@ mod remote_impl {
             _msg: ListRemoteSessions,
             _ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
+            use crate::agent::messages::SessionRuntimeStatus;
+
             let registry = self.registry.lock().await;
             let session_ids = registry.session_ids();
 
@@ -653,16 +655,37 @@ mod remote_impl {
                     _ => session_name,
                 };
 
-                let actor_id = registry
-                    .get(&sid)
-                    .and_then(|r| match r {
-                        crate::agent::remote::SessionActorRef::Local(ar) => {
-                            Some(ar.id().sequence_id())
+                let session_ref = registry.get(&sid).cloned();
+                let actor_id = match session_ref.as_ref() {
+                    Some(crate::agent::remote::SessionActorRef::Local(ar)) => ar.id().sequence_id(),
+                    #[cfg(feature = "remote")]
+                    Some(crate::agent::remote::SessionActorRef::Remote { .. }) | None => 0,
+                    #[cfg(not(feature = "remote"))]
+                    None => 0,
+                };
+                let runtime_state = match session_ref {
+                    Some(session_ref) => match tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        session_ref.get_runtime_status(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(SessionRuntimeStatus::Idle)) => Some("idle".to_string()),
+                        Ok(Ok(
+                            SessionRuntimeStatus::Running | SessionRuntimeStatus::CancelRequested,
+                        )) => Some("busy".to_string()),
+                        Ok(Err(e)) => {
+                            log::debug!(
+                                "RemoteNodeManager: failed to query runtime status for {}: {}",
+                                sid,
+                                e
+                            );
+                            Some("active".to_string())
                         }
-                        #[cfg(feature = "remote")]
-                        crate::agent::remote::SessionActorRef::Remote { .. } => None,
-                    })
-                    .unwrap_or(0);
+                        Err(_) => Some("active".to_string()),
+                    },
+                    None => Some("active".to_string()),
+                };
 
                 infos.push(RemoteSessionInfo {
                     session_id: sid,
@@ -671,7 +694,7 @@ mod remote_impl {
                     created_at,
                     title,
                     peer_label: hostname.clone(),
-                    runtime_state: Some("active".to_string()),
+                    runtime_state,
                 });
             }
 
