@@ -510,6 +510,7 @@ mod node_manager_tests {
     };
     use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
     use crate::model::{AgentMessage, MessagePart};
+    use crate::session::domain::IntentSnapshot;
     use kameo::actor::{ActorRef, Spawn};
     use kameo::error::SendError;
     use querymt::chat::ChatRole;
@@ -653,6 +654,47 @@ mod node_manager_tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, resp.session_id);
         assert!(!sessions[0].peer_label.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_uses_initial_intent_snapshot_as_title() {
+        let (nm_ref, config, _td) = spawn_test_node_manager_with_mesh().await;
+
+        let resp = nm_ref
+            .ask(CreateRemoteSession { cwd: None })
+            .await
+            .expect("create");
+
+        let session = config
+            .provider
+            .history_store()
+            .get_session(&resp.session_id)
+            .await
+            .expect("session lookup")
+            .expect("created session should exist");
+
+        config
+            .provider
+            .history_store()
+            .create_intent_snapshot(IntentSnapshot {
+                id: 0,
+                session_id: session.id,
+                task_id: None,
+                summary: "Remote title from snapshot".to_string(),
+                constraints: None,
+                next_step_hint: None,
+                created_at: time::OffsetDateTime::now_utc(),
+            })
+            .await
+            .expect("create intent snapshot");
+
+        let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
+        let listed = sessions
+            .iter()
+            .find(|s| s.session_id == resp.session_id)
+            .expect("created session should be listed");
+
+        assert_eq!(listed.title.as_deref(), Some("Remote title from snapshot"));
     }
 
     #[tokio::test]

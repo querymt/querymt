@@ -59,6 +59,8 @@ pub use session_ops::handle_set_reasoning_effort;
 pub use session_ops::handle_subscribe_session;
 pub use session_ops::handle_undo;
 pub use session_ops::handle_unsubscribe_session;
+#[cfg(all(test, feature = "remote"))]
+pub(crate) use session_ops::refresh_attached_remote_summary;
 
 use super::ServerState;
 use super::connection::{send_error, send_state};

@@ -21,6 +21,8 @@ pub use messages::{RoutingMode, UiAgentInfo};
 
 #[cfg(test)]
 mod fork_tests;
+#[cfg(all(feature = "api", feature = "remote"))]
+mod session_ops_remote_title_tests;
 #[cfg(test)]
 mod session_stream_tests;
 #[cfg(test)]
