@@ -27,6 +27,31 @@ use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 use tracing::Instrument;
 
+#[cfg(feature = "remote")]
+pub(crate) fn refresh_attached_remote_summary(
+    by_node: &mut std::collections::HashMap<String, Vec<SessionSummary>>,
+    peer_label: &str,
+    node_id: &str,
+    session_info: &crate::agent::remote::RemoteSessionInfo,
+) -> bool {
+    let Some(existing) = by_node.get_mut(peer_label).and_then(|sessions| {
+        sessions
+            .iter_mut()
+            .find(|s| s.session_id == session_info.session_id)
+    }) else {
+        return false;
+    };
+
+    if session_info.title.is_some() {
+        existing.title = session_info.title.clone();
+        existing.name = session_info.title.clone();
+    }
+
+    existing.node_id = Some(node_id.to_string());
+    existing.runtime_state = session_info.runtime_state.clone();
+    true
+}
+
 // ── Session list / load ───────────────────────────────────────────────────────
 
 /// Handle session listing request.
@@ -248,8 +273,15 @@ pub async fn handle_list_sessions(state: &ServerState, tx: &mpsc::Sender<String>
                     confirmed_peer_sessions.insert(peer_label.clone(), confirmed_ids);
 
                     for session_info in sessions {
-                        // Skip sessions that are already attached.
                         if attached_sessions.contains(&session_info.session_id) {
+                            // Keep attached sessions in-place, but refresh metadata from the
+                            // authoritative remote node response when available.
+                            let _ = refresh_attached_remote_summary(
+                                &mut by_node,
+                                &peer_label,
+                                &node_id_str,
+                                &session_info,
+                            );
                             continue;
                         }
 

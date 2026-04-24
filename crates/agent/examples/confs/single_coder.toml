@@ -122,7 +122,7 @@ max_turns = 50
 type = "context"
 warn_at_percent = 80
 compact_at_percent = 90
-fallback_max_tokens = 128000
+fallback_max_tokens = 150000
 
 # Detect when code is similar to existing code
 [[middleware]]

@@ -624,7 +624,7 @@ mod remote_impl {
             for sid in session_ids {
                 // Prefer metadata from session_meta (for remotely-created sessions),
                 // but fall back to querying the session store for locally-created sessions.
-                let (created_at, cwd, title) = if let Some((ts, meta_cwd)) =
+                let (created_at, cwd, session_name) = if let Some((ts, meta_cwd)) =
                     self.session_meta.get(&sid)
                 {
                     (*ts, meta_cwd.clone(), None)
@@ -633,11 +633,24 @@ mod remote_impl {
                         Ok(Some(session)) => {
                             let ts = session.created_at.map(|t| t.unix_timestamp()).unwrap_or(0);
                             let cwd = session.cwd.map(|p| p.display().to_string());
-                            let title = session.name.clone();
-                            (ts, cwd, title)
+                            let session_name = session.name.clone();
+                            (ts, cwd, session_name)
                         }
                         _ => (0, None, None),
                     }
+                };
+
+                // Match local session-list title behavior: use the initial intent summary
+                // (truncated) as the display title, then fall back to session.name.
+                let title = match store.get_initial_intent_snapshot(&sid).await {
+                    Ok(Some(snapshot)) => {
+                        if snapshot.summary.len() > 80 {
+                            Some(format!("{}...", &snapshot.summary[..77]))
+                        } else {
+                            Some(snapshot.summary)
+                        }
+                    }
+                    _ => session_name,
                 };
 
                 let actor_id = registry
