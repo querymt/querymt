@@ -291,10 +291,17 @@ pub(super) async fn transition_call_llm(
                 };
             }
 
-            while let Some(item) = stream.next().await {
-                if exec_ctx.cancellation_token.is_cancelled() {
-                    return Ok(ExecutionState::Cancelled);
-                }
+            loop {
+                let item = tokio::select! {
+                    item = stream.next() => item,
+                    _ = exec_ctx.cancellation_token.cancelled() => {
+                        return Ok(ExecutionState::Cancelled);
+                    }
+                };
+
+                let Some(item) = item else {
+                    break;
+                };
 
                 let chunk = match item {
                     Ok(chunk) => chunk,
@@ -390,7 +397,16 @@ pub(super) async fn transition_call_llm(
                         // Some providers emit Usage AFTER Done in the same SSE
                         // batch. Drain remaining items to capture any trailing
                         // Usage events before exiting the loop.
-                        while let Some(remaining) = stream.next().await {
+                        loop {
+                            let remaining = tokio::select! {
+                                remaining = stream.next() => remaining,
+                                _ = exec_ctx.cancellation_token.cancelled() => {
+                                    return Ok(ExecutionState::Cancelled);
+                                }
+                            };
+                            let Some(remaining) = remaining else {
+                                break;
+                            };
                             match remaining {
                                 Ok(StreamChunk::Usage(u)) => {
                                     trace!(

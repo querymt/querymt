@@ -235,7 +235,7 @@ pub async fn handle_list_sessions(
                             node: Some(peer_label),
                             node_id,
                             attached: Some(true),
-                            runtime_state: Some("active".to_string()),
+                            runtime_state: None,
                         });
                 }
             }
