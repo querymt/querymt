@@ -53,6 +53,19 @@ export type AgentEventKind =
 	message: string;
 	message_id?: string;
 }}
+	/**
+	 * Ephemeral signal emitted when mid-stream transport error is detected.
+	 * Accumulated text is discarded and a new stream is being created.
+	 */
+	| { type: "stream_recovering", data: {
+	/** Human-readable error message that triggered the retry */
+	message: string;
+	/** Current attempt (1-indexed) */
+	attempt: number;
+	/** Maximum attempts */
+	max_attempts: number;
+	message_id?: string;
+}}
 	| { type: "llm_request_start", data: {
 	message_count: number;
 }}

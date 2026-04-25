@@ -179,6 +179,20 @@ pub enum AgentEventKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
     },
+    /// Ephemeral signal emitted when mid-stream transport error is detected.
+    /// Accumulated text is discarded and a new stream is being created.
+    StreamRecovering {
+        /// Human-readable error message that triggered the retry
+        message: String,
+        /// Current attempt (1-indexed)
+        #[typeshare(serialized_as = "number")]
+        attempt: u32,
+        /// Maximum attempts
+        #[typeshare(serialized_as = "number")]
+        max_attempts: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
     LlmRequestStart {
         message_count: u32,
     },
@@ -653,6 +667,7 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         AgentEventKind::AssistantThinkingDelta { .. } => Durability::Ephemeral,
         AgentEventKind::RemoteStreamDisconnected { .. } => Durability::Ephemeral,
         AgentEventKind::RemoteStreamReconnected { .. } => Durability::Ephemeral,
+        AgentEventKind::StreamRecovering { .. } => Durability::Ephemeral,
 
         // Everything else is durable by default.
         _ => Durability::Durable,

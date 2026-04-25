@@ -301,11 +301,42 @@ impl LLMError {
     }
 
     pub fn is_retryable_setup_failure(&self) -> bool {
+        self.is_retryable()
+    }
+
+    /// Whether this error is worth retrying (transient infrastructure error).
+    ///
+    /// Strategy: most transport/infrastructure errors are transient and succeed
+    /// on a second attempt. Only semantic/auth/validation errors are not retryable.
+    /// The mesh-specific `RemoteStreamDisconnected`/`RemoteStreamReconnected` events
+    /// are excluded — they have their own handling in the streaming loop.
+    pub fn is_retryable(&self) -> bool {
         match self {
-            Self::RateLimited { .. } | Self::Transport { .. } => true,
-            Self::HttpStatus { status_code, .. } => matches!(status_code, 502 | 503 | 504 | 529),
-            Self::HttpError(message) => classify_transport_message(message).is_some(),
-            _ => false,
+            // Always retry: transient infrastructure
+            Self::Transport { .. } => true,
+            Self::HttpError(_) => true, // unclassified HTTP transport error — could be transient
+            Self::RateLimited { .. } => true,
+            Self::HttpStatus { status_code, .. } => {
+                matches!(status_code, 429 | 502 | 503 | 504 | 529)
+            }
+            Self::PluginError(_) => true, // may be a transient WASM/HTTP issue
+            Self::IoError { .. } => true,
+
+            // Never retry: semantic errors
+            Self::AuthError(_) => false,
+            Self::InvalidRequest(_) => false,
+            Self::ProviderError(_) => false,
+            Self::ToolConfigError(_) => false,
+            Self::ResponseFormatError { .. } => false,
+            Self::GenericError(_) => false,
+            Self::Cancelled => false,
+            Self::JsonError { .. } => false,
+            Self::InvalidUrl { .. } => false,
+            Self::NotImplemented(_) => false,
+
+            // Mesh transport events — handled by the existing continue logic
+            Self::RemoteStreamDisconnected { .. } => false,
+            Self::RemoteStreamReconnected { .. } => false,
         }
     }
 }
@@ -377,32 +408,6 @@ pub fn classify_http_status(status_code: u16, headers: &http::HeaderMap, body: &
     }
 }
 
-pub fn classify_transport_message(message: &str) -> Option<TransportErrorKind> {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("connection refused") {
-        Some(TransportErrorKind::ConnectionRefused)
-    } else if lower.contains("connection reset") || lower.contains("reset before headers") {
-        Some(TransportErrorKind::ConnectionReset)
-    } else if lower.contains("timed out")
-        || lower.contains("timeout")
-        || lower.contains("delayed connect error")
-    {
-        Some(TransportErrorKind::Timeout)
-    } else if lower.contains("connection closed") || lower.contains("eof") {
-        Some(TransportErrorKind::ConnectionClosed)
-    } else if lower.contains("dns")
-        || lower.contains("name or service not known")
-        || lower.contains("failed to lookup address")
-    {
-        Some(TransportErrorKind::Dns)
-    } else if lower.contains("tls") || lower.contains("certificate") || lower.contains("handshake")
-    {
-        Some(TransportErrorKind::Tls)
-    } else {
-        None
-    }
-}
-
 pub fn transport_error(kind: TransportErrorKind, message: impl Into<String>) -> LLMError {
     LLMError::Transport {
         kind,
@@ -417,10 +422,13 @@ impl From<reqwest::Error> for LLMError {
             return transport_error(TransportErrorKind::Timeout, err.to_string());
         }
         if err.is_connect() {
-            if let Some(kind) = classify_transport_message(&err.to_string()) {
-                return transport_error(kind, err.to_string());
-            }
             return transport_error(TransportErrorKind::ConnectionRefused, err.to_string());
+        }
+        if err.is_body() {
+            return transport_error(TransportErrorKind::Other, err.to_string());
+        }
+        if err.is_decode() {
+            return transport_error(TransportErrorKind::Other, err.to_string());
         }
         if let Some(status) = err.status() {
             return LLMError::HttpStatus {
@@ -428,9 +436,6 @@ impl From<reqwest::Error> for LLMError {
                 message: err.to_string(),
                 retry_after_secs: None,
             };
-        }
-        if let Some(kind) = classify_transport_message(&err.to_string()) {
-            return transport_error(kind, err.to_string());
         }
         LLMError::HttpError(err.to_string())
     }

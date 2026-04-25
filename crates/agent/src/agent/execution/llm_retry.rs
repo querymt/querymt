@@ -286,7 +286,7 @@ where
 
 /// Returns true for setup errors that are worth retrying.
 fn is_transient_error(e: &LLMError) -> bool {
-    e.is_retryable_setup_failure()
+    e.is_retryable()
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -430,6 +430,29 @@ mod tests {
         let err = LLMError::Transport {
             kind: querymt::error::TransportErrorKind::ConnectionReset,
             message: "connection reset".to_string(),
+        };
+        assert!(is_transient_error(&err));
+    }
+
+    #[test]
+    fn test_is_transient_error_http_error_generic() {
+        // HttpError (previously "error decoding response body" fell through here)
+        let err = LLMError::HttpError("error decoding response body".to_string());
+        assert!(is_transient_error(&err));
+    }
+
+    #[test]
+    fn test_is_transient_error_plugin_error() {
+        let err = LLMError::PluginError("wasm stream failed".to_string());
+        assert!(is_transient_error(&err));
+    }
+
+    #[test]
+    fn test_is_transient_error_transport_body() {
+        // The new typed path for reqwest is_body() errors
+        let err = LLMError::Transport {
+            kind: querymt::error::TransportErrorKind::Other,
+            message: "error decoding response body".to_string(),
         };
         assert!(is_transient_error(&err));
     }

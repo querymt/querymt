@@ -320,11 +320,10 @@ impl SessionCompaction {
 /// with the previous request.  Retrying just queues additional inference work,
 /// wasting compute and potentially causing cascading timeouts.
 ///
-/// Detection relies on the string representation produced by
-/// `MeshChatProvider::chat_with_tools` when kameo's `RemoteSendError` is
-/// formatted:
-///   - `"network timeout"` — clean `OutboundFailure::Timeout`
-///   - `"Eof {"` — CBOR decode truncation when the timeout fires mid-read
+/// Detection matches on the typed `LLMError::Transport { kind: Timeout, .. }`
+/// variant which is produced by `MeshChatProvider::chat_with_tools` when
+/// kameo's `RemoteSendError::Timeout` fires, or when a mesh stream's
+/// reconnect grace period expires.
 fn is_mesh_timeout_error(e: &querymt::error::LLMError) -> bool {
     matches!(
         e,
