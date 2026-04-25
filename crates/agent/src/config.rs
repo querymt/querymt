@@ -223,6 +223,9 @@ pub const DEFAULT_RATE_LIMIT_WAIT_SECS: u64 = 60;
 /// Default backoff multiplier for rate limiting
 pub const DEFAULT_RATE_LIMIT_BACKOFF_MULTIPLIER: f64 = 2.0;
 
+/// Default max retries for mid-stream transport failures
+pub const DEFAULT_STREAM_MAX_RETRIES: usize = 1;
+
 fn default_rate_limit_max_retries() -> usize {
     DEFAULT_RATE_LIMIT_MAX_RETRIES
 }
@@ -233,6 +236,10 @@ fn default_rate_limit_wait_secs() -> u64 {
 
 fn default_rate_limit_backoff_multiplier() -> f64 {
     DEFAULT_RATE_LIMIT_BACKOFF_MULTIPLIER
+}
+
+fn default_stream_max_retries() -> usize {
+    DEFAULT_STREAM_MAX_RETRIES
 }
 
 /// Configuration for rate limit retry behavior
@@ -251,6 +258,11 @@ pub struct RateLimitConfig {
     /// Wait time increases exponentially: default_wait_secs * multiplier^(attempt-1)
     #[serde(default = "default_rate_limit_backoff_multiplier")]
     pub backoff_multiplier: f64,
+
+    /// Max retries for mid-stream transport failures (default: 1).
+    /// On each retry, accumulated text is discarded and the stream is re-created.
+    #[serde(default = "default_stream_max_retries")]
+    pub max_stream_retries: usize,
 }
 
 impl Default for RateLimitConfig {
@@ -259,6 +271,7 @@ impl Default for RateLimitConfig {
             max_retries: DEFAULT_RATE_LIMIT_MAX_RETRIES,
             default_wait_secs: DEFAULT_RATE_LIMIT_WAIT_SECS,
             backoff_multiplier: DEFAULT_RATE_LIMIT_BACKOFF_MULTIPLIER,
+            max_stream_retries: DEFAULT_STREAM_MAX_RETRIES,
         }
     }
 }
