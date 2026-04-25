@@ -28,10 +28,14 @@ async fn download_and_cache_providers(file_path: &Path) -> Result<ProvidersRegis
     let response = client.get(API_URL).send().await?;
 
     if !response.status().is_success() {
-        return Err(LLMError::ProviderError(format!(
-            "HTTP Error: {}",
-            response.status()
-        )));
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.bytes().await?.to_vec();
+        return Err(crate::error::classify_http_status(
+            status.as_u16(),
+            &headers,
+            &body,
+        ));
     }
 
     // API returns a top-level map of providers, convert into ProvidersRegistry

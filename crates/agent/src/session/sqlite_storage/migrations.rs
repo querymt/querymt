@@ -44,6 +44,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0008_remote_session_bookmarks",
         apply: migration_0008_remote_session_bookmarks,
     },
+    Migration {
+        version: "0009_sessions_browse_and_search_indexes",
+        apply: migration_0009_sessions_browse_and_search_indexes,
+    },
 ];
 
 pub(super) fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -353,5 +357,62 @@ fn migration_0008_remote_session_bookmarks(conn: &mut Connection) -> Result<(), 
             );
         "#,
     )?;
+    Ok(())
+}
+
+fn migration_0009_sessions_browse_and_search_indexes(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        r#"
+            CREATE INDEX IF NOT EXISTS idx_sessions_cwd_updated ON sessions(cwd, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
+
+            DROP TRIGGER IF EXISTS sessions_ai;
+            DROP TRIGGER IF EXISTS sessions_au;
+            DROP TRIGGER IF EXISTS sessions_ad;
+            DROP TABLE IF EXISTS sessions_fts;
+
+            CREATE VIRTUAL TABLE sessions_fts USING fts5(
+                public_id,
+                name,
+                cwd,
+                title,
+                content='',
+                tokenize='porter unicode61'
+            );
+
+            CREATE TRIGGER sessions_ai AFTER INSERT ON sessions BEGIN
+                INSERT INTO sessions_fts(rowid, public_id, name, cwd, title)
+                VALUES (
+                    new.id,
+                    new.public_id,
+                    COALESCE(new.name, ''),
+                    COALESCE(new.cwd, ''),
+                    COALESCE((SELECT i.summary FROM intent_snapshots i WHERE i.session_id = new.id ORDER BY i.id ASC LIMIT 1), '')
+                );
+            END;
+
+            CREATE TRIGGER sessions_au AFTER UPDATE ON sessions BEGIN
+                INSERT INTO sessions_fts(sessions_fts, rowid) VALUES ('delete', old.id);
+                INSERT INTO sessions_fts(rowid, public_id, name, cwd, title)
+                VALUES (
+                    new.id, new.public_id, COALESCE(new.name, ''), COALESCE(new.cwd, ''),
+                    COALESCE((SELECT i.summary FROM intent_snapshots i WHERE i.session_id = new.id ORDER BY i.id ASC LIMIT 1), '')
+                );
+            END;
+
+            CREATE TRIGGER sessions_ad AFTER DELETE ON sessions BEGIN
+                INSERT INTO sessions_fts(sessions_fts, rowid) VALUES ('delete', old.id);
+            END;
+
+            INSERT INTO sessions_fts(rowid, public_id, name, cwd, title)
+            SELECT s.id, s.public_id, COALESCE(s.name, ''), COALESCE(s.cwd, ''),
+                   COALESCE((SELECT i.summary FROM intent_snapshots i
+                             WHERE i.session_id = s.id ORDER BY i.id ASC LIMIT 1), '')
+            FROM sessions s;
+        "#,
+    )?;
+
     Ok(())
 }

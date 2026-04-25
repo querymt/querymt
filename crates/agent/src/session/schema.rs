@@ -41,6 +41,46 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_public_id ON sessions(public_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_cwd_updated ON sessions(cwd, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
+
+        -- Full-text session search index (all sessions, not just loaded pages).
+        -- The 'title' column is populated from intent_snapshots.summary so that
+        -- session titles are searchable even though the title is derived data.
+        -- Standalone FTS5 table — contentless, so delete/rebuild commands work
+        -- without requiring a content table with matching columns.
+        CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+            public_id,
+            name,
+            cwd,
+            title,
+            content='',
+            tokenize='porter unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS sessions_ai AFTER INSERT ON sessions BEGIN
+            INSERT INTO sessions_fts(rowid, public_id, name, cwd, title)
+            VALUES (
+                new.id,
+                new.public_id,
+                COALESCE(new.name, ''),
+                COALESCE(new.cwd, ''),
+                COALESCE((SELECT i.summary FROM intent_snapshots i WHERE i.session_id = new.id ORDER BY i.id ASC LIMIT 1), '')
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS sessions_au AFTER UPDATE ON sessions BEGIN
+            INSERT INTO sessions_fts(sessions_fts, rowid) VALUES ('delete', old.id);
+            INSERT INTO sessions_fts(rowid, public_id, name, cwd, title)
+            VALUES (
+                new.id, new.public_id, COALESCE(new.name, ''), COALESCE(new.cwd, ''),
+                COALESCE((SELECT i.summary FROM intent_snapshots i WHERE i.session_id = new.id ORDER BY i.id ASC LIMIT 1), '')
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
+            INSERT INTO sessions_fts(sessions_fts, rowid) VALUES ('delete', old.id);
+        END;
 
         -- Tasks - referenced externally in UIs/APIs
         CREATE TABLE IF NOT EXISTS tasks (

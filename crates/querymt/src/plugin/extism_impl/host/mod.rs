@@ -21,7 +21,7 @@ use crate::{
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use extism::{Manifest, Plugin, PluginBuilder, Wasm, convert::Json};
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
@@ -46,6 +46,15 @@ use super::{ExtismCompleteRequest, PluginError};
 fn decode_plugin_error(e: extism::Error, code: i32) -> LLMError {
     let raw = format!("{:#}", e);
     PluginError::decode(code, &raw)
+}
+
+fn decode_stream_item(item: Result<Vec<u8>, LLMError>) -> Result<StreamChunk, LLMError> {
+    match item {
+        Ok(bytes) => serde_json::from_slice::<crate::plugin::extism_impl::ExtismChatChunk>(&bytes)
+            .map(|c| c.chunk)
+            .map_err(|e| LLMError::PluginError(format!("Failed to deserialize chunk: {}", e))),
+        Err(llm_err) => Err(llm_err),
+    }
 }
 
 macro_rules! with_host_functions {
@@ -543,8 +552,7 @@ impl ChatProvider for ExtismProvider {
             ));
         }
 
-        use crate::plugin::extism_impl::ExtismChatChunk;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         if let Some(user_data) = &self.user_data {
             let state = user_data
@@ -674,28 +682,29 @@ impl ChatProvider for ExtismProvider {
             }
         }
 
-        let guard = StreamCancelGuard {
-            user_data: self.user_data.clone().unwrap(),
-        };
+        let first_item = rx.recv().await.ok_or_else(|| {
+            LLMError::PluginError("Extism streaming ended before the first chunk".into())
+        })?;
 
-        let stream = futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| {
-                let chunk_res: Result<StreamChunk, LLMError> = match item {
-                    Ok(bytes) => serde_json::from_slice::<ExtismChatChunk>(&bytes)
-                        .map(|c| c.chunk)
-                        .map_err(|e| {
-                            LLMError::PluginError(format!("Failed to deserialize chunk: {}", e))
-                        }),
-                    Err(llm_err) => Err(llm_err),
+        match decode_stream_item(first_item) {
+            Ok(first_chunk) => {
+                let guard = StreamCancelGuard {
+                    user_data: self.user_data.clone().unwrap(),
                 };
-                (chunk_res, rx)
-            })
-        });
 
-        Ok(Box::pin(GuardedStream {
-            inner: Box::pin(stream),
-            _guard: guard,
-        }))
+                let stream = futures::stream::once(async move { Ok(first_chunk) }).chain(
+                    futures::stream::unfold(rx, |mut rx| async move {
+                        rx.recv().await.map(|item| (decode_stream_item(item), rx))
+                    }),
+                );
+
+                Ok(Box::pin(GuardedStream {
+                    inner: Box::pin(stream),
+                    _guard: guard,
+                }))
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -935,5 +944,40 @@ impl HTTPEmbeddingProvider for ExtismProvider {
 impl HTTPLLMProvider for ExtismProvider {
     fn tools(&self) -> Option<&[Tool]> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::StreamChunk;
+
+    #[test]
+    fn decode_stream_item_returns_chunk_for_valid_payload() {
+        let bytes = serde_json::to_vec(&crate::plugin::extism_impl::ExtismChatChunk {
+            chunk: StreamChunk::Text("hello".into()),
+            usage: None,
+        })
+        .expect("serialize chunk");
+
+        let chunk = decode_stream_item(Ok(bytes)).expect("chunk should decode");
+        assert!(matches!(chunk, StreamChunk::Text(text) if text == "hello"));
+    }
+
+    #[test]
+    fn decode_stream_item_preserves_llm_error() {
+        let decoded = decode_stream_item(Err(LLMError::HttpStatus {
+            status_code: 503,
+            message: "upstream connect error".into(),
+            retry_after_secs: None,
+        }))
+        .expect_err("error should propagate");
+        assert!(matches!(
+            decoded,
+            LLMError::HttpStatus {
+                status_code: 503,
+                ..
+            }
+        ));
     }
 }

@@ -53,9 +53,7 @@ impl LLMProviderFactory for HTTPFactoryAdapter {
         async move {
             let req: Request<Vec<u8>> = inner.list_models_request(&cloned_cfg)?;
 
-            let resp: Response<Vec<u8>> = call_outbound(req)
-                .await
-                .map_err(|e| LLMError::HttpError(format!("{:#}", e)))?;
+            let resp: Response<Vec<u8>> = call_outbound(req).await?;
 
             inner
                 .parse_list_models(resp)

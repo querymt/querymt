@@ -37,6 +37,14 @@ pub struct Prompt {
 #[derive(Serialize, Deserialize)]
 pub struct Cancel;
 
+/// High-level runtime state for stop/resume orchestration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionRuntimeStatus {
+    Idle,
+    Running,
+    CancelRequested,
+}
+
 /// Internal message sent by the spawned prompt task when it finishes.
 ///
 /// Carries the prompt generation that completed so the actor can ignore stale
@@ -144,6 +152,10 @@ pub struct ClearDeniedTools;
 /// Get session limits from configured middleware.
 #[derive(Serialize, Deserialize)]
 pub struct GetSessionLimits;
+
+/// Query the current runtime status for stop/resume orchestration.
+#[derive(Serialize, Deserialize)]
+pub struct GetRuntimeStatus;
 
 /// Get current LLM config for this session.
 #[derive(Serialize, Deserialize)]

@@ -179,6 +179,20 @@ pub enum AgentEventKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
     },
+    /// Ephemeral signal emitted when mid-stream transport error is detected.
+    /// Accumulated text is discarded and a new stream is being created.
+    StreamRecovering {
+        /// Human-readable error message that triggered the retry
+        message: String,
+        /// Current attempt (1-indexed)
+        #[typeshare(serialized_as = "number")]
+        attempt: u32,
+        /// Maximum attempts
+        #[typeshare(serialized_as = "number")]
+        max_attempts: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
     LlmRequestStart {
         message_count: u32,
     },
@@ -249,6 +263,12 @@ pub enum AgentEventKind {
     /// Emitted when a prompt is queued because another operation is executing
     SessionQueued {
         /// Reason for queueing (e.g., "waiting for previous operation to complete")
+        reason: String,
+    },
+    SessionStopRequested,
+    SessionForceStopped {
+        #[typeshare(serialized_as = "number")]
+        escalated_after_ms: u64,
         reason: String,
     },
     Cancelled,
@@ -647,6 +667,7 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         AgentEventKind::AssistantThinkingDelta { .. } => Durability::Ephemeral,
         AgentEventKind::RemoteStreamDisconnected { .. } => Durability::Ephemeral,
         AgentEventKind::RemoteStreamReconnected { .. } => Durability::Ephemeral,
+        AgentEventKind::StreamRecovering { .. } => Durability::Ephemeral,
 
         // Everything else is durable by default.
         _ => Durability::Durable,
@@ -930,6 +951,21 @@ mod tests {
     fn classify_cancelled_is_durable() {
         assert_eq!(
             classify_durability(&AgentEventKind::Cancelled),
+            Durability::Durable
+        );
+    }
+
+    #[test]
+    fn classify_stop_events_are_durable() {
+        assert_eq!(
+            classify_durability(&AgentEventKind::SessionStopRequested),
+            Durability::Durable
+        );
+        assert_eq!(
+            classify_durability(&AgentEventKind::SessionForceStopped {
+                escalated_after_ms: 3000,
+                reason: "timeout".into(),
+            }),
             Durability::Durable
         );
     }

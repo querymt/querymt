@@ -120,27 +120,14 @@ pub struct SessionSummary {
     pub title: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
-    /// Public ID of the parent session (if this is a child session)
     pub parent_session_id: Option<String>,
-    /// Fork origin: "user" or "delegation"
     pub fork_origin: Option<String>,
-    /// Session kind for specialized workflows (e.g. "recurring")
     pub session_kind: Option<String>,
-    /// Whether this session has child sessions
     pub has_children: bool,
-    /// Node label where this session lives. "local" for local sessions,
-    /// peer hostname/label for remote sessions (display only).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
-    /// Stable PeerId of the remote node. Required by the frontend to send
-    /// `attach_remote_session`. Only set for remote sessions.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
-    /// Whether this remote session is currently attached (has a live actor ref).
-    /// `Some(true)` = attached, `Some(false)` = discovered but not attached,
-    /// `None` = local session (not applicable).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub attached: Option<bool>,
+    pub runtime_state: Option<String>,
 }
 
 /// Information about a remote node discovered in the kameo mesh.
@@ -164,6 +151,11 @@ pub struct SessionGroup {
     pub cwd: Option<String>,
     pub sessions: Vec<SessionSummary>,
     pub latest_activity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[typeshare(serialized_as = "number")]
+    pub total_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Messages from UI client to server.
@@ -187,7 +179,23 @@ pub enum UiClientMessage {
     Prompt {
         prompt: Vec<UiPromptBlock>,
     },
-    ListSessions,
+    ListSessions {
+        /// Query mode: browse (default), group, or search.
+        #[serde(default)]
+        mode: Option<String>,
+        /// Opaque pagination cursor (offset as string for now).
+        #[serde(default)]
+        cursor: Option<String>,
+        /// Max number of sessions to return.
+        #[serde(default)]
+        limit: Option<u32>,
+        /// Group key for mode=group (cwd path or null-group marker).
+        #[serde(default)]
+        cwd: Option<String>,
+        /// Search query for mode=search.
+        #[serde(default)]
+        query: Option<String>,
+    },
     LoadSession {
         session_id: String,
     },
@@ -748,6 +756,10 @@ pub enum UiServerMessage {
     },
     SessionList {
         groups: Vec<SessionGroup>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<String>,
+        #[typeshare(serialized_as = "number")]
+        total_count: u64,
     },
     SessionLoaded {
         session_id: String,

@@ -47,9 +47,7 @@ impl LLMProviderFromHTTP {
             .chat_request(messages, tools)
             .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))?;
 
-        let resp = call_outbound(req)
-            .await
-            .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))?;
+        let resp = call_outbound(req).await?;
 
         self.inner.parse_chat(resp)
     }
@@ -96,15 +94,11 @@ impl ChatProvider for LLMProviderFromHTTP {
             .chat_request(messages, tools)
             .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))?;
 
-        let stream = call_outbound_stream(req)
-            .await
-            .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))?;
+        let stream = call_outbound_stream(req).await?;
 
         let inner = self.inner.clone();
         let s = stream
-            .map(move |res: reqwest::Result<bytes::Bytes>| {
-                res.map_err(|e: reqwest::Error| LLMError::HttpError(e.to_string()))
-            })
+            .map(move |res: reqwest::Result<bytes::Bytes>| res.map_err(LLMError::from))
             .chain(futures::stream::once(futures::future::ready(Ok(
                 bytes::Bytes::from_static(b"\n"),
             ))))
