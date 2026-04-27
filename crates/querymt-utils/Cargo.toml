@@ -26,7 +26,7 @@ opentelemetry-appender-tracing = { version = "0.31", features = ["log"] }
 opentelemetry-semantic-conventions = "0.31"
 
 # Secret store dependencies (optional, behind secret-store feature)
-keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native", "crypto-rust"], optional = true }
+keyring = { version = "4.0", features = ["apple-native", "windows-native", "linux-native", "crypto-rust"], optional = true }
 serde_json = { workspace = true, optional = true }
 
 # OAuth dependencies (optional, behind oauth feature)
