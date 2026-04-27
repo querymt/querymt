@@ -1248,9 +1248,29 @@ fn extract_google_stream_chunks(response: GoogleChatResponse) -> Vec<querymt::ch
 
         // Check for finish reason (only in final chunk)
         if let Some(finish_reason) = &candidate.finish_reason {
-            chunks.push(querymt::chat::StreamChunk::Done {
-                stop_reason: finish_reason.clone(),
-            });
+            let has_tool_calls = candidate
+                .content
+                .function_calls
+                .as_ref()
+                .is_some_and(|fcs| !fcs.is_empty());
+            let finish_reason = if has_tool_calls {
+                FinishReason::ToolCalls
+            } else {
+                match finish_reason.as_str() {
+                    "STOP" => FinishReason::Stop,
+                    "MAX_TOKENS" => FinishReason::Length,
+                    "SAFETY"
+                    | "IMAGE_SAFETY"
+                    | "IMAGE_PROHIBITED_CONTENT"
+                    | "BLOCKLIST"
+                    | "SPII"
+                    | "PROHIBITED_CONTENT" => FinishReason::ContentFilter,
+                    "OTHER" | "IMAGE_OTHER" => FinishReason::Other,
+                    "MALFORMED_FUNCTION_CALL" => FinishReason::Error,
+                    _ => FinishReason::Unknown,
+                }
+            };
+            chunks.push(querymt::chat::StreamChunk::Done { finish_reason });
         }
     }
 

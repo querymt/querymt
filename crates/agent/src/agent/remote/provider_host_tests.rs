@@ -409,7 +409,7 @@ mod provider_host_tests {
 
         let done_relay = StreamChunkRelay {
             message: StreamRelayMessage::Chunk(StreamChunk::Done {
-                stop_reason: "end_turn".to_string(),
+                finish_reason: querymt::chat::FinishReason::Stop,
             }),
         };
 

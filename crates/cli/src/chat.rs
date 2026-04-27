@@ -164,8 +164,8 @@ pub async fn handle_any_response(
                                         usage.output_tokens
                                     );
                                 }
-                                StreamChunk::Done { stop_reason } => {
-                                    log::debug!("Stream done: stop_reason={}", stop_reason);
+                                StreamChunk::Done { finish_reason } => {
+                                    log::debug!("Stream done: finish_reason={:?}", finish_reason);
                                     println!();
                                     break;
                                 }

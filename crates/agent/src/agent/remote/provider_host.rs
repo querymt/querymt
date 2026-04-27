@@ -559,9 +559,25 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                             error: e.to_payload(),
                         },
                     };
-                    let is_done = matches!(message, StreamRelayMessage::Chunk(StreamChunk::Done { .. }))
+                    let finish_reason = match &message {
+                        StreamRelayMessage::Chunk(StreamChunk::Done { finish_reason }) => Some(*finish_reason),
+                        _ => None,
+                    };
+                    let is_done = finish_reason.is_some()
                         || matches!(message, StreamRelayMessage::ProviderError { .. });
                     buffered.push_back(message);
+
+                    if let Some(reason) = finish_reason {
+                        tracing::debug!(
+                            target: "remote::provider_host::stream",
+                            provider = %provider_name,
+                            model = %model,
+                            receiver_name = %receiver_name,
+                            finish_reason = ?reason,
+                            chunk_index = chunk_count,
+                            "stream done from upstream provider"
+                        );
+                    }
 
                     loop {
                         if disconnected_since.is_some() {

@@ -231,6 +231,8 @@ pub(super) async fn transition_call_llm(
             let mut tool_call_ids = std::collections::HashSet::new();
             #[allow(unused_assignments)]
             let mut usage: Option<querymt::Usage> = None;
+            #[allow(unused_assignments)]
+            let mut stream_finish_reason: Option<FinishReason> = None;
 
             // Batching buffers — we flush at most every 50ms or 256 chars to
             // avoid per-token React state updates on fast local models.
@@ -298,6 +300,7 @@ pub(super) async fn transition_call_llm(
                 stream_tool_calls.clear();
                 tool_call_ids.clear();
                 usage = None;
+                stream_finish_reason = None;
                 text_buffer.clear();
                 thinking_buffer.clear();
                 last_flush = Instant::now();
@@ -443,10 +446,11 @@ pub(super) async fn transition_call_llm(
                                 None => u,
                             });
                         }
-                        StreamChunk::Done { .. } => {
+                        StreamChunk::Done { finish_reason } => {
+                            stream_finish_reason = Some(finish_reason);
                             trace!(
-                                "stream chunk: session={} message_id={} type=done",
-                                session_id, message_id
+                                "stream chunk: session={} message_id={} type=done finish_reason={:?}",
+                                session_id, message_id, finish_reason
                             );
                             // Some providers emit Usage AFTER Done in the same SSE
                             // batch. Drain remaining items to capture any trailing
@@ -509,11 +513,16 @@ pub(super) async fn transition_call_llm(
                 return Ok(ExecutionState::Cancelled);
             }
 
-            let finish_reason = if stream_tool_calls.is_empty() {
-                Some(FinishReason::Stop)
-            } else {
-                Some(FinishReason::ToolCalls)
-            };
+            // Use the provider-mapped finish_reason from the Done chunk.
+            // Fall back to a tool-call heuristic when the stream ended
+            // without a Done chunk (e.g. unexpected EOF).
+            let finish_reason = stream_finish_reason.or({
+                if stream_tool_calls.is_empty() {
+                    Some(FinishReason::Stop)
+                } else {
+                    Some(FinishReason::ToolCalls)
+                }
+            });
 
             // Stash message_id in response so transition_after_llm reuses it
             // (see LlmResponse::with_message_id)

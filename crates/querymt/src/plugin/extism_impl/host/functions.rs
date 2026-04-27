@@ -226,7 +226,7 @@ pub(crate) fn qmt_http_stream_open(
         // If we return an `extism::Error` here during cancellation, Wasmtime will treat it like a
         // failed host call and emit a WASM backtrace. Instead, we represent cancellation as
         // a *sentinel stream id* (0). The WASM-side stream wrapper interprets EOF-without-Done as
-        // cancellation and emits a clean `StreamChunk::Done { stop_reason: "cancelled" }`.
+        // cancellation and emits a clean `StreamChunk::Done { finish_reason: FinishReason::Stop }`.
         use crate::plugin::extism_impl::SerializableHttpRequest;
 
         let req_json: Vec<u8> = plugin.memory_get_val(&inputs[0])?;

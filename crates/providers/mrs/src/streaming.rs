@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use mistralrs::{ChatCompletionChunkResponse, ChatCompletionResponse, ToolCallResponse};
-use querymt::chat::StreamChunk;
+use querymt::chat::{FinishReason, StreamChunk};
 use querymt::{FunctionCall, ToolCall, Usage};
 
 #[derive(Default, Debug)]
@@ -20,12 +20,12 @@ fn usage_from_mistral(usage: &mistralrs::Usage) -> Usage {
     }
 }
 
-fn map_finish_reason(reason: &str) -> String {
+fn map_finish_reason(reason: &str) -> FinishReason {
     match reason {
-        "tool_calls" => "tool_use".to_string(),
-        "stop" => "end_turn".to_string(),
-        "length" => "max_tokens".to_string(),
-        other => other.to_string(),
+        "tool_calls" => FinishReason::ToolCalls,
+        "stop" => FinishReason::Stop,
+        "length" => FinishReason::Length,
+        _ => FinishReason::Other,
     }
 }
 
@@ -116,7 +116,7 @@ pub(crate) fn parse_mistral_stream_chunk(
 
             flush_tool_states(tool_states, &mut chunks);
             chunks.push(StreamChunk::Done {
-                stop_reason: map_finish_reason(finish_reason),
+                finish_reason: map_finish_reason(finish_reason),
             });
             *done_emitted = true;
         }
@@ -158,7 +158,7 @@ pub(crate) fn parse_mistral_done_response(
 
         if !*done_emitted {
             chunks.push(StreamChunk::Done {
-                stop_reason: map_finish_reason(&choice.finish_reason),
+                finish_reason: map_finish_reason(&choice.finish_reason),
             });
             *done_emitted = true;
         }

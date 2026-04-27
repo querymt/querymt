@@ -335,18 +335,30 @@ impl ChatProvider for MeshChatProvider {
                         Some(StreamRelayMessage::Chunk(chunk)) => {
                             chunk_index += 1;
                             let elapsed_ms = stream_start.elapsed().as_millis();
-                            let is_done = matches!(&chunk, StreamChunk::Done { .. });
-                            tracing::trace!(
-                                target: "remote::mesh_provider::stream",
-                                provider = %provider_for_stream,
-                                model = %model_for_stream,
-                                target_node = %target_for_stream,
-                                stream_rx = %stream_rx_name_for_log,
-                                chunk_index,
-                                elapsed_ms,
-                                is_done,
-                                "stream chunk received"
-                            );
+                            if let StreamChunk::Done { finish_reason } = &chunk {
+                                tracing::debug!(
+                                    target: "remote::mesh_provider::stream",
+                                    provider = %provider_for_stream,
+                                    model = %model_for_stream,
+                                    target_node = %target_for_stream,
+                                    stream_rx = %stream_rx_name_for_log,
+                                    chunk_index,
+                                    elapsed_ms,
+                                    finish_reason = ?finish_reason,
+                                    "stream done received from remote provider"
+                                );
+                            } else {
+                                tracing::trace!(
+                                    target: "remote::mesh_provider::stream",
+                                    provider = %provider_for_stream,
+                                    model = %model_for_stream,
+                                    target_node = %target_for_stream,
+                                    stream_rx = %stream_rx_name_for_log,
+                                    chunk_index,
+                                    elapsed_ms,
+                                    "stream chunk received"
+                                );
+                            }
                             Some((Ok(chunk), (raw_stream, None, chunk_index)))
                         }
                         Some(StreamRelayMessage::ProviderError { error }) => Some((

@@ -151,8 +151,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(querymt::chat::StreamChunk::Usage(u)) => {
                     println!("\n---\ninput={} output={}", u.input_tokens, u.output_tokens);
                 }
-                Ok(querymt::chat::StreamChunk::Done { stop_reason }) => {
-                    println!("stop: {}", stop_reason);
+                Ok(querymt::chat::StreamChunk::Done { finish_reason }) => {
+                    println!("stop: {:?}", finish_reason);
                 }
                 Err(e) => return Err(e.into()),
                 _ => {}

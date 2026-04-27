@@ -244,7 +244,7 @@ pub(crate) mod fixtures {
             let chunks = vec![
                 Ok(StreamChunk::Text(text)),
                 Ok(StreamChunk::Done {
-                    stop_reason: "end_turn".to_string(),
+                    finish_reason: querymt::chat::FinishReason::Stop,
                 }),
             ];
             Ok(Box::pin(stream::iter(chunks)))

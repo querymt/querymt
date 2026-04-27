@@ -663,8 +663,17 @@ pub fn codex_parse_stream_chunk_with_state(
         };
 
         if data == "[DONE]" {
+            let has_tool_calls = tool_state_buffer
+                .lock()
+                .unwrap()
+                .values()
+                .any(|s| s.started);
             results.push(StreamChunk::Done {
-                stop_reason: "end_turn".to_string(),
+                finish_reason: if has_tool_calls {
+                    FinishReason::ToolCalls
+                } else {
+                    FinishReason::Stop
+                },
             });
             continue;
         }
@@ -751,7 +760,16 @@ pub fn codex_parse_stream_chunk_with_state(
                     }
                 }
                 results.push(StreamChunk::Done {
-                    stop_reason: "end_turn".to_string(),
+                    finish_reason: if tool_state_buffer
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .any(|s| s.started)
+                    {
+                        FinishReason::ToolCalls
+                    } else {
+                        FinishReason::Stop
+                    },
                 });
             }
             "response.failed" => {
