@@ -317,7 +317,7 @@ impl LLMError {
             Self::HttpError(_) => true, // unclassified HTTP transport error — could be transient
             Self::RateLimited { .. } => true,
             Self::HttpStatus { status_code, .. } => {
-                matches!(status_code, 429 | 502 | 503 | 504 | 529)
+                matches!(status_code, 429 | 500..=599)
             }
             Self::PluginError(_) => true, // may be a transient WASM/HTTP issue
             Self::IoError { .. } => true,
@@ -398,12 +398,11 @@ pub fn classify_http_status(status_code: u16, headers: &http::HeaderMap, body: &
             retry_after_secs,
         },
         400 => LLMError::InvalidRequest(message),
-        502 | 503 | 504 | 529 => LLMError::HttpStatus {
+        500..=599 => LLMError::HttpStatus {
             status_code,
             message,
             retry_after_secs,
         },
-        500..=599 => LLMError::ProviderError(message),
         _ => LLMError::ProviderError(message),
     }
 }
