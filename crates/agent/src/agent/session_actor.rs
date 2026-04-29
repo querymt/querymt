@@ -1283,7 +1283,7 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         use crate::agent::file_proxy::{FileProxyError, ReadRemoteFileResponse};
-        use crate::tools::builtins::read_shared::render_read_output;
+        use crate::tools::builtins::read_shared::{ReadRange, render_read_output};
         use base64::Engine as _;
 
         let cwd = self
@@ -1310,9 +1310,17 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
             ));
         }
 
-        let blocks = render_read_output(&resolved, msg.offset, msg.limit)
-            .await
-            .map_err(FileProxyError::ReadError)?;
+        let blocks = render_read_output(
+            self.session_id.as_str(),
+            &resolved,
+            ReadRange {
+                offset: msg.offset,
+                limit: msg.limit,
+                ..ReadRange::default()
+            },
+        )
+        .await
+        .map_err(FileProxyError::ReadError)?;
 
         // Map the single Content block returned by render_read_output to the
         // appropriate ReadRemoteFileResponse variant.

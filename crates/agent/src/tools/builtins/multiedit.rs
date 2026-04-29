@@ -1,32 +1,22 @@
-//! Multiedit tool for applying multiple edits to a single file
+//! Anchor-based multiedit tool for applying multiple edits across one or more files.
+//!
+//! All anchors are resolved against original file contents before any file is
+//! written. If any edit fails validation, nothing is written. Returns compact
+//! line-oriented output with anchored change hunks for LLM follow-up edits.
 
 use async_trait::async_trait;
 use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
-use super::edit::EditTool;
+use crate::anchors::edit::{AnchorEditRequest, apply_anchor_edits};
+use crate::tools::builtins::anchored_edit_output::{
+    FileEditOutput, build_file_output, format_output,
+};
+use crate::tools::builtins::helpers::{display_path, resolve_root};
 use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
 
-#[derive(Debug, Serialize, Deserialize)]
-struct EditOperation {
-    #[serde(rename = "oldString")]
-    old_string: String,
-    #[serde(rename = "newString")]
-    new_string: String,
-    #[serde(rename = "replaceAll")]
-    #[serde(default)]
-    replace_all: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct EditResult {
-    index: usize,
-    success: bool,
-    error: Option<String>,
-}
-
-/// Multiedit tool for applying multiple edits sequentially
 pub struct MultiEditTool;
 
 impl MultiEditTool {
@@ -52,40 +42,49 @@ impl Tool for MultiEditTool {
             tool_type: "function".to_string(),
             function: FunctionTool {
                 name: self.name().to_string(),
-                description: "Apply multiple sequential edits to a single file. Each edit is applied in order, so later edits see the results of earlier ones. Returns status for each edit operation."
+                description: "Apply multiple anchor-based edits across one or more files in a single atomic call. All anchors are validated before any file is written; if any edit fails, nothing is written. Anchors MUST include the § delimiter and line text (e.g. 'xK7mQ2§fn main()'). The line text is validated against the file to prevent stale edits. Successful output includes fresh anchor-delimited hunks for the edited regions; use those anchors for follow-up edits. Do not call read_tool only to verify a successful edit or reacquire anchors for shown regions. Re-read the file only if you need additional context not shown, output was truncated, an anchor is stale, or the file may have changed externally."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "filePath": {
-                            "type": "string",
-                            "description": "The absolute path to the file to modify"
-                        },
-                        "edits": {
+                        "paths": {
                             "type": "array",
-                            "description": "Array of edit operations to apply sequentially",
+                            "description": "Array of file edit groups. Provide one entry per file, even for a single-file edit.",
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "oldString": {
+                                    "path": {
                                         "type": "string",
-                                        "description": "The text to replace"
+                                        "description": "Path to the file to modify."
                                     },
-                                    "newString": {
-                                        "type": "string",
-                                        "description": "The text to replace it with"
-                                    },
-                                    "replaceAll": {
-                                        "type": "boolean",
-                                        "description": "Replace all occurrences (default false)",
-                                        "default": false
+                                    "edits": {
+                                        "type": "array",
+                                        "description": "Anchor edit operations for this file.",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "operation": {
+                                                    "type": "string",
+                                                    "enum": ["replace", "insert_before", "insert_after", "delete"]
+                                                },
+                                                "startAnchor": { "type": "string", "description": "Anchor with § delimiter and line text." },
+                                                "endAnchor": { "type": "string", "description": "Optional inclusive end anchor." },
+                                                "newText": { "type": "string" }
+                                            },
+                                            "required": ["operation", "startAnchor"]
+                                        }
                                     }
                                 },
-                                "required": ["oldString", "newString"]
+                                "required": ["path", "edits"]
                             }
+                        },
+                        "root": {
+                            "type": "string",
+                            "description": "Workspace root directory.",
+                            "default": "."
                         }
                     },
-                    "required": ["filePath", "edits"]
+                    "required": ["paths"]
                 }),
             },
         }
@@ -100,82 +99,157 @@ impl Tool for MultiEditTool {
         args: Value,
         context: &dyn ToolContext,
     ) -> Result<Vec<Content>, ToolError> {
-        let file_path_str = args
-            .get("filePath")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidRequest("filePath is required".to_string()))?;
+        let _ = resolve_root(&args, context)?; // validates root arg exists
+        let file_groups = parse_file_groups(&args)?;
 
-        let edits_val = args
-            .get("edits")
-            .and_then(Value::as_array)
-            .ok_or_else(|| ToolError::InvalidRequest("edits array is required".to_string()))?;
-
-        let edits: Vec<EditOperation> = edits_val
-            .iter()
-            .map(|v| serde_json::from_value(v.clone()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| ToolError::InvalidRequest(format!("Invalid edit operation: {}", e)))?;
-
-        let file_path = context.resolve_path(file_path_str)?;
-
-        // Read initial content
-        let mut content = tokio::fs::read_to_string(&file_path)
-            .await
-            .map_err(|e| ToolError::ProviderError(format!("Failed to read file: {}", e)))?;
-
-        let mut results = Vec::new();
-
-        // Apply edits sequentially
-        for (index, edit) in edits.iter().enumerate() {
-            match EditTool::replace(
-                &content,
-                &edit.old_string,
-                &edit.new_string,
-                edit.replace_all,
-            ) {
-                Ok(new_content) => {
-                    content = new_content;
-                    results.push(EditResult {
-                        index,
-                        success: true,
-                        error: None,
-                    });
-                }
-                Err(e) => {
-                    results.push(EditResult {
-                        index,
-                        success: false,
-                        error: Some(e),
-                    });
-                    // Stop on first error
-                    break;
-                }
+        // Phase 1: Read all files.
+        let mut file_contents: HashMap<PathBuf, String> = HashMap::new();
+        for group in &file_groups {
+            let file_path = context.resolve_path(&group.path)?;
+            if file_contents.contains_key(&file_path) {
+                return Err(ToolError::InvalidRequest(format!(
+                    "Duplicate file path: {}",
+                    file_path.display()
+                )));
             }
+            if group.edits.is_empty() {
+                return Err(ToolError::InvalidRequest(format!(
+                    "edits array must not be empty for file {}",
+                    file_path.display()
+                )));
+            }
+            let content = tokio::fs::read_to_string(&file_path).await.map_err(|e| {
+                ToolError::ProviderError(format!("Failed to read {}: {e}", file_path.display()))
+            })?;
+            file_contents.insert(file_path.clone(), content);
         }
 
-        // Write final content if at least one edit succeeded
-        if results.iter().any(|r| r.success) {
-            tokio::fs::write(&file_path, &content)
+        // Phase 2: Apply edits per file in memory. Any failure = no writes.
+        let mut new_contents: HashMap<PathBuf, String> = HashMap::new();
+        let mut outputs: Vec<FileEditOutput> = Vec::new();
+
+        for group in &file_groups {
+            let file_path = context.resolve_path(&group.path)?;
+            let content = &file_contents[&file_path];
+
+            let (new_content, batch_result) = apply_anchor_edits(
+                context.session_id(),
+                &file_path,
+                content,
+                group.edits.clone(),
+            )
+            .map_err(|e| {
+                ToolError::ProviderError(format!(
+                    "No changes written (validation failed for {}): {e}",
+                    file_path.display()
+                ))
+            })?;
+
+            outputs.push(build_file_output(
+                display_path(&file_path, context.cwd()),
+                &batch_result,
+            ));
+            new_contents.insert(file_path.clone(), new_content);
+        }
+
+        // Phase 3: Write all files.
+        for (file_path, new_content) in &new_contents {
+            tokio::fs::write(file_path, new_content)
                 .await
-                .map_err(|e| ToolError::ProviderError(format!("Failed to write file: {}", e)))?;
+                .map_err(|e| {
+                    ToolError::ProviderError(format!(
+                        "Failed to write {}: {e}",
+                        file_path.display()
+                    ))
+                })?;
         }
 
-        let result = json!({
-            "file": file_path.display().to_string(),
-            "total_edits": edits.len(),
-            "successful_edits": results.iter().filter(|r| r.success).count(),
-            "results": results,
-        });
-
-        serde_json::to_string_pretty(&result)
-            .map(|s| vec![Content::text(s)])
-            .map_err(|e| ToolError::ProviderError(format!("Failed to serialize result: {}", e)))
+        // Phase 4: Format canonical contextual compact output.
+        Ok(vec![Content::text(format_output(&outputs))])
     }
+}
+
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
+
+struct FileGroup {
+    path: String,
+    edits: Vec<AnchorEditRequest>,
+}
+
+fn parse_file_groups(args: &Value) -> Result<Vec<FileGroup>, ToolError> {
+    let paths = args
+        .get("paths")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ToolError::InvalidRequest("paths array is required".to_string()))?;
+
+    if paths.is_empty() {
+        return Err(ToolError::InvalidRequest(
+            "paths must include at least one file group".to_string(),
+        ));
+    }
+
+    paths
+        .iter()
+        .map(|group| {
+            let path = group.get("path").and_then(Value::as_str).ok_or_else(|| {
+                ToolError::InvalidRequest("path is required in each group".to_string())
+            })?;
+            let edits_val = group
+                .get("edits")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    ToolError::InvalidRequest("edits array is required in each group".to_string())
+                })?;
+            let edits = edits_val
+                .iter()
+                .map(parse_edit_request)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ToolError::InvalidRequest)?;
+            Ok(FileGroup {
+                path: path.to_string(),
+                edits,
+            })
+        })
+        .collect()
+}
+
+fn parse_edit_request(value: &Value) -> Result<AnchorEditRequest, String> {
+    let operation = value
+        .get("operation")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "operation is required".to_string())
+        .and_then(crate::anchors::edit::AnchorEditOperation::parse)?;
+    let start_anchor = value
+        .get("startAnchor")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "startAnchor is required".to_string())?
+        .to_string();
+    let end_anchor = value
+        .get("endAnchor")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let new_text = value
+        .get("newText")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    Ok(AnchorEditRequest {
+        operation,
+        start_anchor,
+        end_anchor,
+        new_text,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::AgentToolContext;
+    use crate::tools::builtins::read_tool::ReadTool;
+    use std::fs;
+    use tempfile::TempDir;
 
     fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
         blocks
@@ -186,41 +260,353 @@ mod tests {
             })
             .unwrap_or_default()
     }
-    use crate::tools::AgentToolContext;
-    use std::fs;
-    use tempfile::TempDir;
+
+    fn anchor_for_line(text: &str, expected_line: &str) -> String {
+        text.lines()
+            .find_map(|line| line.strip_suffix(expected_line))
+            .and_then(|prefix| prefix.strip_suffix('§'))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("missing anchored line for {expected_line:?} in {text}"))
+    }
+
+    async fn read_anchor(
+        context: &AgentToolContext,
+        file_path: &std::path::Path,
+        line: &str,
+    ) -> String {
+        let read_tool = ReadTool::new();
+        let text = first_text_block(
+            read_tool
+                .call(json!({ "path": file_path.display().to_string() }), context)
+                .await
+                .unwrap(),
+        );
+        anchor_for_line(&text, line)
+    }
+
+    #[test]
+    fn schema_requires_paths_without_top_level_one_of() {
+        let parameters = MultiEditTool::new().definition().function.parameters;
+
+        assert_eq!(parameters.get("type"), Some(&json!("object")));
+        assert_eq!(parameters.get("required"), Some(&json!(["paths"])));
+        assert!(parameters.get("oneOf").is_none());
+        assert!(parameters.get("path").is_none());
+        assert!(parameters.get("edits").is_none());
+    }
 
     #[tokio::test]
-    async fn test_multiedit() {
+    async fn applies_multiple_anchor_edits() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test.txt");
-        fs::write(&file_path, "hello world\nrust is good\nrust is fast").unwrap();
-
+        fs::write(&file_path, "a\nb\nc\n").unwrap();
         let context =
             AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
-        let tool = MultiEditTool::new();
+        let a = read_anchor(&context, &file_path, "a").await;
+        let c = read_anchor(&context, &file_path, "c").await;
 
-        let args = json!({
-            "filePath": file_path.display().to_string(),
-            "edits": [
-                {
-                    "oldString": "hello",
-                    "newString": "hi"
-                },
-                {
-                    "oldString": "rust",
-                    "newString": "Rust",
-                    "replaceAll": true
-                }
-            ]
-        });
+        let result = first_text_block(
+            MultiEditTool::new()
+                .call(
+                    json!({
+                        "paths": [
+                            {
+                                "path": file_path.display().to_string(),
+                                "edits": [
+                                    { "operation": "replace", "startAnchor": a, "newText": "A" },
+                                    { "operation": "insert_before", "startAnchor": c, "newText": "bb" }
+                                ]
+                            }
+                        ]
+                    }),
+                    &context,
+                )
+                .await
+                .unwrap(),
+        );
 
-        let result = first_text_block(tool.call(args, &context).await.unwrap());
-        assert!(result.contains("\"successful_edits\": 2"));
+        assert!(result.starts_with("OK paths=1 edits=2 added=2 deleted=1 anchors=fresh"));
+        assert!(result.contains("P test.txt"));
+        assert!(result.contains("H replace"));
+        assert!(result.contains("H insert_before"));
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "A\nb\nbb\nc\n");
+    }
 
-        let new_content = fs::read_to_string(&file_path).unwrap();
-        assert!(new_content.contains("hi world"));
-        assert!(new_content.contains("Rust is good"));
-        assert!(new_content.contains("Rust is fast"));
+    #[tokio::test]
+    async fn canonical_paths_form() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        fs::write(&file_path, "alpha\nbeta\n").unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let anchor_a = read_anchor(&context, &file_path, "alpha").await;
+        let anchor_b = read_anchor(&context, &file_path, "beta").await;
+
+        let result = first_text_block(
+            MultiEditTool::new()
+                .call(
+                    json!({
+                        "paths": [
+                            {
+                                "path": file_path.display().to_string(),
+                                "edits": [
+                                    { "operation": "replace", "startAnchor": anchor_a, "newText": "ALPHA" },
+                                    { "operation": "replace", "startAnchor": anchor_b, "newText": "BETA" }
+                                ]
+                            }
+                        ]
+                    }),
+                    &context,
+                )
+                .await
+                .unwrap(),
+        );
+
+        assert!(result.starts_with("OK paths=1 edits=2"));
+        assert!(result.contains("P test.txt"));
+        assert!(result.contains("+"));
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "ALPHA\nBETA\n");
+    }
+
+    #[tokio::test]
+    async fn multi_file_atomic_edits() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_a = temp_dir.path().join("a.txt");
+        let file_b = temp_dir.path().join("b.txt");
+        fs::write(&file_a, "alpha\n").unwrap();
+        fs::write(&file_b, "beta\n").unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let anchor_a = read_anchor(&context, &file_a, "alpha").await;
+        let anchor_b = read_anchor(&context, &file_b, "beta").await;
+
+        let result = first_text_block(
+            MultiEditTool::new()
+                .call(
+                    json!({
+                        "paths": [
+                            {
+                                "path": file_a.display().to_string(),
+                                "edits": [{ "operation": "replace", "startAnchor": anchor_a, "newText": "ALPHA" }]
+                            },
+                            {
+                                "path": file_b.display().to_string(),
+                                "edits": [{ "operation": "replace", "startAnchor": anchor_b, "newText": "BETA" }]
+                            }
+                        ]
+                    }),
+                    &context,
+                )
+                .await
+                .unwrap(),
+        );
+
+        assert!(result.starts_with("OK paths=2 edits=2"));
+        assert!(result.contains("P a.txt"));
+        assert!(result.contains("P b.txt"));
+        assert_eq!(fs::read_to_string(&file_a).unwrap(), "ALPHA\n");
+        assert_eq!(fs::read_to_string(&file_b).unwrap(), "BETA\n");
+    }
+
+    #[tokio::test]
+    async fn resolves_all_anchors_against_original_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        fs::write(&file_path, "a\nb\nc\n").unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let a = read_anchor(&context, &file_path, "a").await;
+        let b = read_anchor(&context, &file_path, "b").await;
+
+        MultiEditTool::new()
+            .call(
+                json!({
+                    "paths": [
+                        {
+                            "path": file_path.display().to_string(),
+                            "edits": [
+                                { "operation": "insert_before", "startAnchor": a, "newText": "top" },
+                                { "operation": "replace", "startAnchor": b, "newText": "B" }
+                            ]
+                        }
+                    ]
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "top\na\nB\nc\n");
+    }
+
+    #[tokio::test]
+    async fn rejects_overlapping_replace_delete_ranges() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        fs::write(&file_path, "a\nb\nc\nd\n").unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let b = read_anchor(&context, &file_path, "b").await;
+        let c = read_anchor(&context, &file_path, "c").await;
+        let d = read_anchor(&context, &file_path, "d").await;
+
+        let error = MultiEditTool::new()
+            .call(
+                json!({
+                    "paths": [
+                        {
+                            "path": file_path.display().to_string(),
+                            "edits": [
+                                { "operation": "replace", "startAnchor": b, "endAnchor": c, "newText": "x" },
+                                { "operation": "delete", "startAnchor": c, "endAnchor": d }
+                            ]
+                        }
+                    ]
+                }),
+                &context,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error}").contains("Overlapping replace/delete ranges"));
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "a\nb\nc\nd\n");
+    }
+
+    #[tokio::test]
+    async fn invalid_edit_writes_nothing() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        fs::write(&file_path, "a\nb\n").unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let error = MultiEditTool::new()
+            .call(
+                json!({
+                    "paths": [
+                        {
+                            "path": file_path.display().to_string(),
+                            "edits": [
+                                { "operation": "replace", "startAnchor": "Missing", "newText": "x" }
+                            ]
+                        }
+                    ]
+                }),
+                &context,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error}").contains("No changes written"));
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "a\nb\n");
+    }
+
+    #[tokio::test]
+    async fn second_file_failure_leaves_first_unchanged() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_a = temp_dir.path().join("a.txt");
+        let file_b = temp_dir.path().join("b.txt");
+        fs::write(&file_a, "alpha\n").unwrap();
+        fs::write(&file_b, "beta\n").unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let anchor_a = read_anchor(&context, &file_a, "alpha").await;
+
+        let err = MultiEditTool::new()
+            .call(
+                json!({
+                    "paths": [
+                        {
+                            "path": file_a.display().to_string(),
+                            "edits": [{ "operation": "replace", "startAnchor": anchor_a, "newText": "ALPHA" }]
+                        },
+                        {
+                            "path": file_b.display().to_string(),
+                            "edits": [{ "operation": "replace", "startAnchor": "bad", "newText": "BETA" }]
+                        }
+                    ]
+                }),
+                &context,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(format!("{err}").contains("No changes written"));
+        assert_eq!(fs::read_to_string(&file_a).unwrap(), "alpha\n");
+        assert_eq!(fs::read_to_string(&file_b).unwrap(), "beta\n");
+    }
+
+    #[tokio::test]
+    async fn nearby_edits_no_corruption() {
+        // Regression test inspired by session 019dd89e where consecutive
+        // nearby edits corrupted get_symbol.rs with duplicated function bodies.
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.rs");
+        // Simulate a file with function signatures that look similar
+        fs::write(
+            &file_path,
+            "fn foo() {\n    1\n}\nfn bar() {\n    2\n}\nfn baz() {\n    3\n}\n",
+        )
+        .unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let foo_body = read_anchor(&context, &file_path, "    1").await;
+        let bar_body = read_anchor(&context, &file_path, "    2").await;
+        let baz_sig = read_anchor(&context, &file_path, "fn baz() {").await;
+
+        let output = first_text_block(
+            MultiEditTool::new()
+                .call(
+                    json!({
+                        "paths": [
+                            {
+                                "path": file_path.display().to_string(),
+                                "edits": [
+                                    { "operation": "replace", "startAnchor": foo_body, "newText": "    11" },
+                                    { "operation": "replace", "startAnchor": bar_body, "newText": "    22" },
+                                    { "operation": "insert_before", "startAnchor": baz_sig, "newText": "fn qux() { 4 }" }
+                                ]
+                            }
+                        ]
+                    }),
+                    &context,
+                )
+                .await
+                .unwrap(),
+        );
+
+        let result = fs::read_to_string(&file_path).unwrap();
+        assert!(result.contains("fn foo()"));
+        assert!(result.contains("    11"));
+        assert!(result.contains("fn bar()"));
+        assert!(result.contains("    22"));
+        assert!(result.contains("fn qux() { 4 }"));
+        assert!(result.contains("fn baz()"));
+        assert!(result.contains("    3"));
+        assert!(output.starts_with("OK paths=1 edits=3 added=3 deleted=2"));
+        assert!(output.contains("P test.rs"));
+        assert!(output.contains("H replace"));
+        assert!(output.contains("H insert_before"));
+        assert!(output.contains("+"));
+
+        // Ensure no duplication
+        assert_eq!(
+            result.matches("fn foo()").count(),
+            1,
+            "fn foo should appear exactly once"
+        );
+        assert_eq!(
+            result.matches("fn bar()").count(),
+            1,
+            "fn bar should appear exactly once"
+        );
+        assert_eq!(
+            result.matches("fn baz()").count(),
+            1,
+            "fn baz should appear exactly once"
+        );
     }
 }

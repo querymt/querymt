@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 
-use super::read_shared::{DEFAULT_READ_LIMIT, render_read_output};
+use super::read_shared::{DEFAULT_READ_LIMIT, ReadRange, render_read_output};
 
 pub struct ReadTool;
 
@@ -33,7 +33,7 @@ impl ToolTrait for ReadTool {
             tool_type: "function".to_string(),
             function: FunctionTool {
                 name: self.name().to_string(),
-                description: "Read a file or directory under the workspace. For text files, returns XML-like output with <path>, <type>, and <content> including line numbers. For image files (PNG, JPEG, GIF, WebP), returns the image content directly. For other binary files, returns a descriptive error. Supports non-recursive pagination via offset/limit for text files and directories."
+                description: "Read a file or directory under the workspace. For text files, returns XML-like output with <path>, <type>, one <range>, and <content> containing anchor-delimited lines like A00001§content. Supports numeric offset/limit and anchor range queries. For image files (PNG, JPEG, GIF, WebP), returns the image content directly. For other binary files, returns a descriptive error. Directories support non-recursive offset/limit pagination."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -58,6 +58,25 @@ impl ToolTrait for ReadTool {
                             "description": "Maximum number of lines (files) or entries (directories) to return. Defaults to 2000.",
                             "default": 2000,
                             "minimum": 1
+                        },
+                        "start_anchor": {
+                            "type": "string",
+                            "description": "Anchor to start from for text-file reads. If provided, offset is ignored."
+                        },
+                        "end_anchor": {
+                            "type": "string",
+                            "description": "Anchor to read through, inclusive, for text-file reads. Requires start_anchor."
+                        },
+                        "before": {
+                            "type": "integer",
+                            "description": "Number of lines before start_anchor to include.",
+                            "default": 0,
+                            "minimum": 0
+                        },
+                        "after": {
+                            "type": "integer",
+                            "description": "Number of lines after start_anchor to include when end_anchor is absent.",
+                            "minimum": 0
                         }
                     },
                     "required": ["path"]
@@ -99,9 +118,27 @@ impl ToolTrait for ReadTool {
             .get("limit")
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_READ_LIMIT as u64) as usize;
+        let before = args.get("before").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let after = args
+            .get("after")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        let start_anchor = args
+            .get("start_anchor")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let end_anchor = args
+            .get("end_anchor")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         if limit == 0 {
             return Err(ToolError::InvalidRequest("limit must be >= 1".to_string()));
+        }
+        if end_anchor.is_some() && start_anchor.is_none() {
+            return Err(ToolError::InvalidRequest(
+                "end_anchor requires start_anchor".to_string(),
+            ));
         }
 
         let path = context.resolve_path(path)?;
@@ -111,7 +148,16 @@ impl ToolTrait for ReadTool {
             root.join(path)
         };
 
-        render_read_output(&target, offset, limit)
+        let range = ReadRange {
+            offset,
+            limit,
+            start_anchor,
+            end_anchor,
+            before,
+            after,
+        };
+
+        render_read_output(context.session_id(), &target, range)
             .await
             .map_err(ToolError::ProviderError)
     }
@@ -147,6 +193,14 @@ mod tests {
         panic!("no Content::Text block found in result: {:?}", blocks);
     }
 
+    fn anchor_for_line(text: &str, expected_line: &str) -> String {
+        text.lines()
+            .find_map(|line| line.strip_suffix(expected_line))
+            .and_then(|prefix| prefix.strip_suffix('§'))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("missing anchored line for {expected_line:?} in {text}"))
+    }
+
     // ── existing text / directory tests (updated for Vec<Content>) ───────────
 
     #[tokio::test]
@@ -163,9 +217,11 @@ mod tests {
         let text = first_text(&result);
 
         assert!(text.contains("<type>file</type>"));
+        assert!(text.contains("<range start_offset=\"0\" end_offset=\"3\" total_lines=\"3\"/>"));
         assert!(text.contains("<content>"));
-        assert!(text.contains("00001| line 1"));
-        assert!(text.contains("00003| line 3"));
+        assert!(text.contains("§line 1"));
+        assert!(text.contains("§line 3"));
+        assert!(!text.contains("00001| line 1"));
         assert!(text.contains("(End of file - total 3 lines)"));
     }
 
@@ -187,10 +243,106 @@ mod tests {
         let result = tool.call(args, &context).await.unwrap();
         let text = first_text(&result);
 
-        assert!(text.contains("00002| line 2"));
-        assert!(text.contains("00003| line 3"));
-        assert!(!text.contains("00001| line 1"));
+        assert!(text.contains("<range start_offset=\"1\" end_offset=\"3\" total_lines=\"4\"/>"));
+        assert!(text.contains("§line 2"));
+        assert!(text.contains("§line 3"));
+        assert!(!text.contains("§line 1"));
         assert!(text.contains("Use 'offset' parameter to read beyond line 3"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_with_anchor_after_range() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let file_path =
+            create_test_file(&temp_dir, "test.txt", "line 1\nline 2\nline 3\nline 4").await;
+
+        let tool = ReadTool::new();
+        let first = tool
+            .call(json!({ "path": file_path.to_str().unwrap() }), &context)
+            .await
+            .unwrap();
+        let line_2_anchor = anchor_for_line(first_text(&first), "line 2");
+
+        let result = tool
+            .call(
+                json!({
+                    "path": file_path.to_str().unwrap(),
+                    "start_anchor": line_2_anchor,
+                    "before": 1,
+                    "after": 1
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+        let text = first_text(&result);
+
+        assert!(text.contains("<range start_offset=\"0\" end_offset=\"3\" total_lines=\"4\"/>"));
+        assert!(text.contains("§line 1"));
+        assert!(text.contains("§line 2"));
+        assert!(text.contains("§line 3"));
+        assert!(!text.contains("§line 4"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_with_anchor_end_range() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let file_path =
+            create_test_file(&temp_dir, "test.txt", "line 1\nline 2\nline 3\nline 4").await;
+
+        let tool = ReadTool::new();
+        let first = tool
+            .call(json!({ "path": file_path.to_str().unwrap() }), &context)
+            .await
+            .unwrap();
+        let text = first_text(&first);
+        let line_2_anchor = anchor_for_line(text, "line 2");
+        let line_4_anchor = anchor_for_line(text, "line 4");
+
+        let result = tool
+            .call(
+                json!({
+                    "path": file_path.to_str().unwrap(),
+                    "start_anchor": line_2_anchor,
+                    "end_anchor": line_4_anchor
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+        let text = first_text(&result);
+
+        assert!(text.contains("<range start_offset=\"1\" end_offset=\"4\" total_lines=\"4\"/>"));
+        assert!(!text.contains("§line 1"));
+        assert!(text.contains("§line 2"));
+        assert!(text.contains("§line 3"));
+        assert!(text.contains("§line 4"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_missing_anchor_errors() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let file_path = create_test_file(&temp_dir, "test.txt", "line 1\nline 2").await;
+
+        let tool = ReadTool::new();
+        let error = tool
+            .call(
+                json!({
+                    "path": file_path.to_str().unwrap(),
+                    "start_anchor": "Missing"
+                }),
+                &context,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error}").contains("missing or stale"));
     }
 
     #[tokio::test]
