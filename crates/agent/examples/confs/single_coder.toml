@@ -12,10 +12,10 @@
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"
 assume_mutating = false
-mutating_tools = ["edit", "write_file", "shell"]
+mutating_tools = ["edit", "multiedit", "write_file", "shell"]
 tools = [
   # File operations
-  "edit", "read_tool", "write_file",
+  "edit", "read_tool", "write_file", "multiedit",
   # Search & navigation
   "glob", "search_text", "ls", "index",
   # Execution
