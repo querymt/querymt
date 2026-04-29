@@ -8,6 +8,7 @@ import { PatchDiff } from '@pierre/diffs/react';
 import { generateToolSummary, normalizeToolName } from '../utils/toolSummary';
 import { EventItem } from '../types';
 import { getDashboardThemeVariant, getDiffThemeForDashboard } from '../utils/dashboardThemes';
+import { buildToolDiffPreview, type DiffPreviewData } from '../utils/diffPreview';
 
 type DiffRenderGuardProps = {
   children: ReactNode;
@@ -123,20 +124,21 @@ export const ToolSummary = memo(function ToolSummary({
 
   // Inline preview state - auto-expand for edits/patches
   const normalized = normalizeToolName(toolKind || toolName);
-  const isEdit = normalized === 'edit';
+  const isEdit = normalized === 'edit' || normalized === 'multiedit';
   const isPatch = normalized === 'apply_patch';
   const isWrite = normalized === 'write' || normalized === 'write_file';
   const isShell = normalized === 'shell' || normalized === 'bash';
   const hasInlinePreview = isEdit || isPatch || isWrite || isShell;
   const [showPreview, setShowPreview] = useState(!isMobile && (isEdit || isPatch || isWrite)); // Auto-expand diffs (collapsed on mobile)
   const diffContainerClass = `event-diff-container${isMobile ? ' diff-mobile' : ''}`;
+  const legacyDiffStats = summary.diffStats;
 
   // Build preview data
   const previewData = useMemo(() => {
     if (!hasInlinePreview) return null;
 
-    if ((isEdit || isPatch || isWrite) && rawInput && typeof rawInput === 'object') {
-      return buildDiffPreview(toolKind || toolName, rawInput as Record<string, unknown>, event.mergedResult);
+    if (isEdit || isPatch || isWrite) {
+      return buildToolDiffPreview(toolKind || toolName, rawInput, event.mergedResult);
     }
 
     if (isShell && hasMergedResult && event.mergedResult) {
@@ -146,6 +148,14 @@ export const ToolSummary = memo(function ToolSummary({
     return null;
   }, [hasInlinePreview, isEdit, isPatch, isWrite, isShell, toolKind, rawInput, event.mergedResult, hasMergedResult]);
 
+  const diffStats = previewData?.type === 'diff' && (previewData.additions !== undefined || previewData.deletions !== undefined)
+    ? {
+        additions: previewData.additions ?? 0,
+        deletions: previewData.deletions ?? 0,
+        filePath: previewData.filePath,
+      }
+    : legacyDiffStats;
+
   const handleClick = () => {
     if (isDelegate && onDelegateClick) {
       onDelegateClick();
@@ -153,7 +163,6 @@ export const ToolSummary = memo(function ToolSummary({
       onClick();
     }
   };
-
   const handlePreviewToggle = (e: React.MouseEvent) => {
     e.stopPropagation();
     setShowPreview(!showPreview);
@@ -207,13 +216,14 @@ export const ToolSummary = memo(function ToolSummary({
         </span>
 
         {/* Diff stats badge */}
-        {summary.diffStats && (summary.diffStats.additions > 0 || summary.diffStats.deletions > 0) && (
+        {diffStats && (diffStats.additions > 0 || diffStats.deletions > 0) && (
           <span className="flex-shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-surface-canvas/80 border border-surface-border/35">
-            <span className="text-status-success">+{summary.diffStats.additions}</span>
+            <span className="text-status-success">+{diffStats.additions}</span>
             <span className="text-ui-muted mx-0.5">/</span>
-            <span className="text-accent-secondary">-{summary.diffStats.deletions}</span>
+            <span className="text-accent-secondary">-{diffStats.deletions}</span>
           </span>
         )}
+
 
         {/* Shell exit code badge (inline) */}
         {isShell && previewData?.type === 'shell' && previewData.exitCode !== undefined && (
@@ -287,7 +297,7 @@ export const ToolSummary = memo(function ToolSummary({
             />
           )}
           {previewData.type === 'diff' && !previewData.patch && (
-            <div className="px-3 py-2 text-[10px] text-status-warning font-mono">
+            <div className="px-3 py-2 text-[10px] text-status-warning font-mono whitespace-pre-wrap break-words">
               {previewData.fallbackText ?? 'Diff preview unavailable.'}
             </div>
           )}
@@ -314,100 +324,9 @@ export const ToolSummary = memo(function ToolSummary({
   );
 });
 
-// Build diff preview data for edit/patch tools
-type DiffPreviewData = { type: 'diff'; patch: string | null; fallbackText?: string };
+
 type ShellPreviewData = { type: 'shell'; stdout?: string; stderr?: string; exitCode?: number };
 type PreviewData = DiffPreviewData | ShellPreviewData;
-
-function buildDiffPreview(
-  toolKind: string | undefined,
-  input: Record<string, unknown>,
-  mergedResult?: EventItem,
-): PreviewData | null {
-  const normalized = normalizeToolName(toolKind);
-
-  if (normalized === 'edit') {
-    const filePath = (input.filePath || input.file_path || input.path || 'file') as string;
-    const oldString = String(input.oldString || input.old_string || '');
-    const newString = String(input.newString || input.new_string || '');
-    const resultPayload = parseJsonMaybe(mergedResult?.toolCall?.raw_output ?? mergedResult?.content);
-    const startLineRaw = resultPayload?.startLineOld;
-    const oldLineCountRaw = resultPayload?.oldLineCount;
-    const newLineCountRaw = resultPayload?.newLineCount;
-
-    if (oldString || newString) {
-      const normalizedPath = filePath.replace(/^\/+/, '') || 'file';
-      const oldLines = Number.isInteger(oldLineCountRaw) ? oldLineCountRaw : oldString.split('\n').length;
-      const newLines = Number.isInteger(newLineCountRaw) ? newLineCountRaw : newString.split('\n').length;
-      const startLine = Number.isInteger(startLineRaw) ? startLineRaw : 1;
-      const oldBlock = oldString.split('\n').map(line => `-${line}`).join('\n');
-      const newBlock = newString.split('\n').map(line => `+${line}`).join('\n');
-      const patch = [
-        `diff --git a/${normalizedPath} b/${normalizedPath}`,
-        `--- a/${normalizedPath}`,
-        `+++ b/${normalizedPath}`,
-        `@@ -${startLine},${oldLines} +${startLine},${newLines} @@`,
-        oldBlock,
-        newBlock,
-      ].join('\n');
-      return { type: 'diff', patch };
-    }
-  }
-
-  if (normalized === 'write' || normalized === 'write_file') {
-    const filePath = (input.filePath || input.file_path || input.path || 'file') as string;
-    const content = input.content;
-    if (typeof content === 'string') {
-      const normalizedPath = filePath.replace(/^\/+/, '') || 'file';
-      const newLines = content.split('\n').length;
-      const newBlock = content.split('\n').map(line => `+${line}`).join('\n');
-      const patch = [
-        `diff --git a/${normalizedPath} b/${normalizedPath}`,
-        `new file mode 100644`,
-        `--- /dev/null`,
-        `+++ b/${normalizedPath}`,
-        `@@ -0,0 +1,${newLines} @@`,
-        newBlock,
-      ].join('\n');
-      return { type: 'diff', patch };
-    }
-  }
-
-  if (normalized === 'apply_patch') {
-    const rawPatch = extractPatchString(input);
-    if (!rawPatch) {
-      return { type: 'diff', patch: null, fallbackText: 'No patch payload available.' };
-    }
-    if (!isLikelyRenderablePatch(rawPatch)) {
-      return { type: 'diff', patch: null, fallbackText: 'Patch payload is malformed. Open details to inspect raw content.' };
-    }
-    return { type: 'diff', patch: rawPatch };
-  }
-
-  return null;
-}
-
-function extractPatchString(input: Record<string, unknown>): string | null {
-  if (typeof input.patch === 'string') {
-    return input.patch;
-  }
-
-  const args = parseJsonMaybe(input.arguments);
-  if (typeof args?.patch === 'string') {
-    return args.patch;
-  }
-
-  return null;
-}
-
-function isLikelyRenderablePatch(patch: string): boolean {
-  const trimmed = patch.trim();
-  if (trimmed.length === 0) {
-    return false;
-  }
-  return /diff --git\s+.+\s+.+/.test(trimmed) && /@@\s+-\d/.test(trimmed);
-}
-
 // Build shell output preview
 function buildShellPreview(resultEvent: EventItem): PreviewData | null {
   const rawOutput = resultEvent.toolCall?.raw_output ?? resultEvent.content;

@@ -163,7 +163,7 @@ pub(super) fn index_with_parser(
 }
 
 /// Get the language category for a file extension
-pub(super) fn get_language_category(ext: &str) -> Option<&'static str> {
+pub fn get_language_category(ext: &str) -> Option<&'static str> {
     match ext {
         "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => Some("typescript"),
         "rs" => Some("rust"),
@@ -257,7 +257,7 @@ pub(super) fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>, String> 
         functions_indexed = tracing::field::Empty,
     )
 )]
-pub(super) fn index_file_with_language(
+pub fn index_file_with_language(
     file_path: &Path,
     source: &str,
     language: &str,

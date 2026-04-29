@@ -4,9 +4,10 @@ pub mod context_impl;
 pub mod registry;
 
 pub use builtins::{
-    ApplyPatchTool, BrowseTool, CreateTaskTool, DelegateTool, DeleteFileTool,
-    KnowledgeConsolidateTool, KnowledgeIngestTool, KnowledgeListTool, KnowledgeQueryTool,
-    KnowledgeStatsTool, ReadTool, SearchTextTool, ShellTool, WebFetchTool, WriteFileTool,
+    ApplyPatchTool, BrowseTool, CreateTaskTool, DelegateTool, DeleteFileTool, GetFunctionTool,
+    GetSymbolTool, KnowledgeConsolidateTool, KnowledgeIngestTool, KnowledgeListTool,
+    KnowledgeQueryTool, KnowledgeStatsTool, ReadTool, SearchTextTool, ShellTool, WebFetchTool,
+    WriteFileTool,
 };
 pub use context::{CapabilityRequirement, Tool, ToolContext, ToolError};
 pub use context_impl::{AgentToolContext, ElicitationRequest};

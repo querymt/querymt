@@ -2,7 +2,30 @@
 use crate::config::OverflowStorage;
 use std::path::{Path, PathBuf};
 
+use crate::tools::{ToolContext, ToolError};
+
+/// Resolve the workspace root from args, falling back to the context cwd.
+pub fn resolve_root(
+    args: &serde_json::Value,
+    context: &dyn ToolContext,
+) -> Result<PathBuf, ToolError> {
+    args.get("root")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| context.resolve_path(s))
+        .transpose()?
+        .or_else(|| context.cwd().map(|p| p.to_path_buf()))
+        .ok_or_else(|| ToolError::InvalidRequest("No working directory available".into()))
+}
 /// Maximum lines to return before truncation
+pub fn display_path(path: &Path, cwd: Option<&Path>) -> String {
+    if let Some(cwd) = cwd
+        && let Ok(relative) = path.strip_prefix(cwd)
+    {
+        return relative.display().to_string();
+    }
+    path.display().to_string()
+}
+
 pub const MAX_LINES: usize = 2000;
 
 /// Maximum bytes to return before truncation

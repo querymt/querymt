@@ -18,6 +18,7 @@ pub use querymt_utils::secret_store::SecretStore;
 
 pub mod acp;
 pub mod agent;
+pub mod anchors;
 pub mod delegation;
 pub mod elicitation;
 pub mod event_fanout;
