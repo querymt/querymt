@@ -209,41 +209,36 @@ pub(super) async fn transition_call_llm(
         let provider = session_handle
             .provider()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to build provider: {}", e))?;
+            .map_err(|e| anyhow::Error::from(e).context("Failed to build provider"))?;
 
         if provider.supports_streaming() {
             // === STREAMING PATH (all capable providers) ===
             let message_id = Uuid::new_v4().to_string();
             streaming_message_id = Some(message_id.clone());
 
-            let mut stream = super::llm_retry::create_stream_with_retry(
-                config,
-                session_id,
-                &exec_ctx.cancellation_token,
-                || {
-                    let provider = &provider;
-                    let messages_with_cache = &messages_with_cache;
-                    let tools_slice = tools.as_ref();
-                    async move {
-                        provider
-                            .chat_stream_with_tools(messages_with_cache, Some(tools_slice))
-                            .await
-                    }
-                },
-            )
-            .await?;
+            let max_stream_retries = config.execution_policy.rate_limit.max_stream_retries;
 
+            // Accumulators live outside the retry loop so the post-stream
+            // processing below can read them regardless of how many attempts
+            // were needed.  On each retry they are reset to empty.
             let mut text = String::new();
             let mut thinking = String::new();
+            // Initial values are always overwritten inside the retry loop below
+            // before first read, so suppress the unused-assignment lint.
+            #[allow(unused_assignments)]
             let mut thinking_signature: Option<String> = None;
             let mut stream_tool_calls: Vec<ToolCall> = Vec::new();
             let mut tool_call_ids = std::collections::HashSet::new();
+            #[allow(unused_assignments)]
             let mut usage: Option<querymt::Usage> = None;
+            #[allow(unused_assignments)]
+            let mut stream_finish_reason: Option<FinishReason> = None;
 
             // Batching buffers — we flush at most every 50ms or 256 chars to
             // avoid per-token React state updates on fast local models.
             let mut text_buffer = String::new();
             let mut thinking_buffer = String::new();
+            #[allow(unused_assignments)]
             let mut last_flush = Instant::now();
             const BATCH_INTERVAL: Duration = Duration::from_millis(50);
             const BATCH_CHARS: usize = 256;
@@ -291,133 +286,213 @@ pub(super) async fn transition_call_llm(
                 };
             }
 
-            while let Some(item) = stream.next().await {
-                if exec_ctx.cancellation_token.is_cancelled() {
-                    return Ok(ExecutionState::Cancelled);
-                }
+            // ── Outer retry loop ─────────────────────────────────────────────
+            // On transient mid-stream errors we discard accumulated text and
+            // re-create the stream.  The provider treats it as a fresh request.
+            let mut stream_attempt = 0;
+            'stream: loop {
+                stream_attempt += 1;
 
-                let chunk = match item {
-                    Ok(chunk) => chunk,
-                    Err(LLMError::RemoteStreamDisconnected { message }) => {
-                        flush_buffers!(true);
-                        config.emit_event(
-                            session_id,
-                            AgentEventKind::RemoteStreamDisconnected {
-                                message,
-                                message_id: Some(message_id.clone()),
-                            },
-                        );
-                        continue;
-                    }
-                    Err(LLMError::RemoteStreamReconnected { message }) => {
-                        config.emit_event(
-                            session_id,
-                            AgentEventKind::RemoteStreamReconnected {
-                                message,
-                                message_id: Some(message_id.clone()),
-                            },
-                        );
-                        continue;
-                    }
-                    Err(e) => return Err(anyhow::anyhow!("LLM streaming error: {}", e)),
-                };
+                // Reset accumulators on retry so we start fresh.
+                text.clear();
+                thinking.clear();
+                thinking_signature = None;
+                stream_tool_calls.clear();
+                tool_call_ids.clear();
+                usage = None;
+                stream_finish_reason = None;
+                text_buffer.clear();
+                thinking_buffer.clear();
+                last_flush = Instant::now();
 
-                match chunk {
-                    StreamChunk::Text(delta) => {
-                        trace!(
-                            "stream chunk: session={} message_id={} type=text len={}",
-                            session_id,
-                            message_id,
-                            delta.len()
-                        );
-                        text.push_str(&delta);
-                        text_buffer.push_str(&delta);
-                    }
-                    StreamChunk::Thinking(delta) => {
-                        trace!(
-                            "stream chunk: session={} message_id={} type=thinking len={}",
-                            session_id,
-                            message_id,
-                            delta.len()
-                        );
-                        thinking.push_str(&delta);
-                        thinking_buffer.push_str(&delta);
-                    }
-                    StreamChunk::ThinkingSignature(signature) => {
-                        trace!(
-                            "stream chunk: session={} message_id={} type=thinking_signature len={}",
-                            session_id,
-                            message_id,
-                            signature.len()
-                        );
-                        thinking_signature = Some(signature);
-                    }
-                    StreamChunk::ToolUseComplete { tool_call, .. } => {
-                        // Flush before tool use so UI sees final text before tool starts
-                        trace!(
-                            "stream chunk: session={} message_id={} type=tool_use_complete id={}",
-                            session_id, message_id, tool_call.id
-                        );
-                        flush_buffers!(true);
-                        if tool_call_ids.insert(tool_call.id.clone()) {
-                            stream_tool_calls.push(tool_call);
+                let mut stream = super::llm_retry::create_stream_with_retry(
+                    config,
+                    session_id,
+                    &exec_ctx.cancellation_token,
+                    || {
+                        let provider = &provider;
+                        let messages_with_cache = &messages_with_cache;
+                        let tools_slice = tools.as_ref();
+                        async move {
+                            provider
+                                .chat_stream_with_tools(messages_with_cache, Some(tools_slice))
+                                .await
                         }
-                    }
-                    StreamChunk::Usage(u) => {
-                        trace!(
-                            "stream chunk: session={} message_id={} type=usage input={} output={} reasoning={}",
-                            session_id,
-                            message_id,
-                            u.input_tokens,
-                            u.output_tokens,
-                            u.reasoning_tokens
-                        );
-                        // Anthropic (and potentially other providers) split usage across
-                        // multiple streaming events: `input_tokens` arrives in
-                        // `message_start`, while cumulative `output_tokens` arrives in
-                        // `message_delta`.  Taking the field-wise maximum merges both
-                        // events correctly regardless of order.
-                        usage = Some(match usage {
-                            Some(prev) => prev.merge_max(u),
-                            None => u,
-                        });
-                    }
-                    StreamChunk::Done { .. } => {
-                        trace!(
-                            "stream chunk: session={} message_id={} type=done",
-                            session_id, message_id
-                        );
-                        // Some providers emit Usage AFTER Done in the same SSE
-                        // batch. Drain remaining items to capture any trailing
-                        // Usage events before exiting the loop.
-                        while let Some(remaining) = stream.next().await {
-                            match remaining {
-                                Ok(StreamChunk::Usage(u)) => {
-                                    trace!(
-                                        "stream chunk: session={} message_id={} type=usage (post-done drain) input={} output={}",
-                                        session_id, message_id, u.input_tokens, u.output_tokens
-                                    );
-                                    usage = Some(match usage {
-                                        Some(prev) => prev.merge_max(u),
-                                        None => u,
-                                    });
-                                }
-                                Err(_) | Ok(_) => break,
+                    },
+                )
+                .await?;
+
+                // ── Inner consume loop ───────────────────────────────────────
+                loop {
+                    let item = tokio::select! {
+                        item = stream.next() => item,
+                        _ = exec_ctx.cancellation_token.cancelled() => {
+                            return Ok(ExecutionState::Cancelled);
+                        }
+                    };
+
+                    let Some(item) = item else {
+                        break 'stream;
+                    };
+
+                    let chunk = match item {
+                        Ok(chunk) => chunk,
+                        Err(LLMError::RemoteStreamDisconnected { message }) => {
+                            flush_buffers!(true);
+                            config.emit_event(
+                                session_id,
+                                AgentEventKind::RemoteStreamDisconnected {
+                                    message,
+                                    message_id: Some(message_id.clone()),
+                                },
+                            );
+                            continue;
+                        }
+                        Err(LLMError::RemoteStreamReconnected { message }) => {
+                            config.emit_event(
+                                session_id,
+                                AgentEventKind::RemoteStreamReconnected {
+                                    message,
+                                    message_id: Some(message_id.clone()),
+                                },
+                            );
+                            continue;
+                        }
+                        Err(e) if e.is_retryable() && stream_attempt <= max_stream_retries => {
+                            debug!(
+                                "Session {}: retryable mid-stream error on attempt {}/{}: {}",
+                                session_id, stream_attempt, max_stream_retries, e
+                            );
+                            flush_buffers!(true);
+                            config.emit_event(
+                                session_id,
+                                AgentEventKind::StreamRecovering {
+                                    message: e.to_string(),
+                                    attempt: u32_from_usize(
+                                        stream_attempt,
+                                        "stream_attempt",
+                                        Some(session_id),
+                                    ),
+                                    max_attempts: u32_from_usize(
+                                        max_stream_retries,
+                                        "max_stream_retries",
+                                        Some(session_id),
+                                    ),
+                                    message_id: Some(message_id.clone()),
+                                },
+                            );
+                            continue 'stream; // retry with fresh stream + accumulators
+                        }
+                        Err(e) => return Err(anyhow::Error::from(e).context("LLM streaming error")),
+                    };
+
+                    match chunk {
+                        StreamChunk::Text(delta) => {
+                            trace!(
+                                "stream chunk: session={} message_id={} type=text len={}",
+                                session_id,
+                                message_id,
+                                delta.len()
+                            );
+                            text.push_str(&delta);
+                            text_buffer.push_str(&delta);
+                        }
+                        StreamChunk::Thinking(delta) => {
+                            trace!(
+                                "stream chunk: session={} message_id={} type=thinking len={}",
+                                session_id,
+                                message_id,
+                                delta.len()
+                            );
+                            thinking.push_str(&delta);
+                            thinking_buffer.push_str(&delta);
+                        }
+                        StreamChunk::ThinkingSignature(signature) => {
+                            trace!(
+                                "stream chunk: session={} message_id={} type=thinking_signature len={}",
+                                session_id,
+                                message_id,
+                                signature.len()
+                            );
+                            thinking_signature = Some(signature);
+                        }
+                        StreamChunk::ToolUseComplete { tool_call, .. } => {
+                            // Flush before tool use so UI sees final text before tool starts
+                            trace!(
+                                "stream chunk: session={} message_id={} type=tool_use_complete id={}",
+                                session_id, message_id, tool_call.id
+                            );
+                            flush_buffers!(true);
+                            if tool_call_ids.insert(tool_call.id.clone()) {
+                                stream_tool_calls.push(tool_call);
                             }
                         }
-                        break;
+                        StreamChunk::Usage(u) => {
+                            trace!(
+                                "stream chunk: session={} message_id={} type=usage input={} output={} reasoning={}",
+                                session_id,
+                                message_id,
+                                u.input_tokens,
+                                u.output_tokens,
+                                u.reasoning_tokens
+                            );
+                            // Anthropic (and potentially other providers) split usage across
+                            // multiple streaming events: `input_tokens` arrives in
+                            // `message_start`, while cumulative `output_tokens` arrives in
+                            // `message_delta`.  Taking the field-wise maximum merges both
+                            // events correctly regardless of order.
+                            usage = Some(match usage {
+                                Some(prev) => prev.merge_max(u),
+                                None => u,
+                            });
+                        }
+                        StreamChunk::Done { finish_reason } => {
+                            stream_finish_reason = Some(finish_reason);
+                            trace!(
+                                "stream chunk: session={} message_id={} type=done finish_reason={:?}",
+                                session_id, message_id, finish_reason
+                            );
+                            // Some providers emit Usage AFTER Done in the same SSE
+                            // batch. Drain remaining items to capture any trailing
+                            // Usage events before exiting the loop.
+                            loop {
+                                let remaining = tokio::select! {
+                                    remaining = stream.next() => remaining,
+                                    _ = exec_ctx.cancellation_token.cancelled() => {
+                                        return Ok(ExecutionState::Cancelled);
+                                    }
+                                };
+                                let Some(remaining) = remaining else {
+                                    break;
+                                };
+                                match remaining {
+                                    Ok(StreamChunk::Usage(u)) => {
+                                        trace!(
+                                            "stream chunk: session={} message_id={} type=usage (post-done drain) input={} output={}",
+                                            session_id, message_id, u.input_tokens, u.output_tokens
+                                        );
+                                        usage = Some(match usage {
+                                            Some(prev) => prev.merge_max(u),
+                                            None => u,
+                                        });
+                                    }
+                                    Err(_) | Ok(_) => break,
+                                }
+                            }
+                            break 'stream;
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
 
-                // Time- or size-based flush
-                if last_flush.elapsed() >= BATCH_INTERVAL
-                    || text_buffer.len() >= BATCH_CHARS
-                    || thinking_buffer.len() >= BATCH_CHARS
-                {
-                    flush_buffers!(true);
-                }
-            }
+                    // Time- or size-based flush
+                    if last_flush.elapsed() >= BATCH_INTERVAL
+                        || text_buffer.len() >= BATCH_CHARS
+                        || thinking_buffer.len() >= BATCH_CHARS
+                    {
+                        flush_buffers!(true);
+                    }
+                } // end inner consume loop
+            } // end outer retry loop ('stream)
 
             // Final flush of any remaining buffered content (no timer reset needed)
             flush_buffers!(false);
@@ -438,11 +513,16 @@ pub(super) async fn transition_call_llm(
                 return Ok(ExecutionState::Cancelled);
             }
 
-            let finish_reason = if stream_tool_calls.is_empty() {
-                Some(FinishReason::Stop)
-            } else {
-                Some(FinishReason::ToolCalls)
-            };
+            // Use the provider-mapped finish_reason from the Done chunk.
+            // Fall back to a tool-call heuristic when the stream ended
+            // without a Done chunk (e.g. unexpected EOF).
+            let finish_reason = stream_finish_reason.or({
+                if stream_tool_calls.is_empty() {
+                    Some(FinishReason::Stop)
+                } else {
+                    Some(FinishReason::ToolCalls)
+                }
+            });
 
             // Stash message_id in response so transition_after_llm reuses it
             // (see LlmResponse::with_message_id)

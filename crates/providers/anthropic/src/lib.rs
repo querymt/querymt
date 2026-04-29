@@ -654,6 +654,19 @@ impl ChatResponse for AnthropicCompleteResponse {
 }
 
 impl Anthropic {
+    /// Map a raw Anthropic `stop_reason` string to a typed `FinishReason`.
+    ///
+    /// Reuses the same mapping logic as `AnthropicCompleteResponse::finish_reason()`.
+    pub(crate) fn map_stop_reason(stop_reason: &str) -> FinishReason {
+        match stop_reason {
+            "end_turn" | "stop_sequence" => FinishReason::Stop,
+            "max_tokens" => FinishReason::Length,
+            "tool_use" => FinishReason::ToolCalls,
+            "refusal" | "pause_turn" => FinishReason::Other,
+            _ => FinishReason::Unknown,
+        }
+    }
+
     fn default_base_url() -> Url {
         Url::parse("https://api.anthropic.com/v1/").unwrap()
     }
@@ -1182,7 +1195,8 @@ impl HTTPChatProvider for Anthropic {
                         if let Some(delta) = stream_resp.delta
                             && let Some(stop_reason) = delta.stop_reason
                         {
-                            chunks.push(querymt::chat::StreamChunk::Done { stop_reason });
+                            let finish_reason = Self::map_stop_reason(&stop_reason);
+                            chunks.push(querymt::chat::StreamChunk::Done { finish_reason });
                         }
                     }
                     _ => {}
@@ -1682,8 +1696,8 @@ mod tests {
         assert!(
             matches!(
                 &chunks[4],
-                querymt::chat::StreamChunk::Done { stop_reason }
-                if stop_reason == "tool_use"
+                querymt::chat::StreamChunk::Done { finish_reason }
+                if *finish_reason == FinishReason::ToolCalls
             ),
             "expected Done, got {:?}",
             chunks[4]

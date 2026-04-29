@@ -248,7 +248,7 @@ macro_rules! impl_extism_http_plugin {
         // chat_stream wrapper (wireframe implementation)
         #[plugin_fn]
         pub fn chat_stream(Json(input): Json<ExtismChatRequest<$Config>>) -> FnResult<()> {
-            use querymt::chat::StreamChunk;
+            use querymt::chat::{FinishReason, StreamChunk};
             use querymt::plugin::extism_impl::ExtismChatChunk;
             use $crate::{
                 qmt_http_stream_close_wrapper, qmt_http_stream_next_wrapper,
@@ -268,7 +268,7 @@ macro_rules! impl_extism_http_plugin {
                     // Cancelled during stream open - yield Done and return
                     qmt_yield_chunk_wrapper(&ExtismChatChunk {
                         chunk: StreamChunk::Done {
-                            stop_reason: "cancelled".to_string(),
+                            finish_reason: FinishReason::Stop,
                         },
                         usage: None,
                     })?;
@@ -358,7 +358,7 @@ macro_rules! impl_extism_http_plugin {
                 if !done_received {
                     qmt_yield_chunk_wrapper(&ExtismChatChunk {
                         chunk: StreamChunk::Done {
-                            stop_reason: "cancelled".to_string(),
+                            finish_reason: FinishReason::Stop,
                         },
                         usage: None,
                     })?;

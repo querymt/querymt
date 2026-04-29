@@ -169,8 +169,8 @@ async fn main() -> Result<()> {
                             }
                             print!("{}", delta);
                         }
-                        Ok(StreamChunk::Done { stop_reason }) => {
-                            info!("stream done: {stop_reason}");
+                        Ok(StreamChunk::Done { finish_reason }) => {
+                            info!("stream done: {:?}", finish_reason);
                             break;
                         }
                         Ok(_) => {}

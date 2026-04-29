@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import * as Collapsible from '@radix-ui/react-collapsible';
 import { SessionGroup, SessionSummary } from '../types';
 import { ChevronDown, ChevronRight, Search, Plus, Clock, GitBranch, Globe, Trash2, Plug } from 'lucide-react';
@@ -9,15 +9,42 @@ interface SessionPickerProps {
   onSelectSession: (sessionId: string) => void;
   onDeleteSession: (sessionId: string, sessionLabel?: string) => void;
   onNewSession: () => void;
+  onLoadMoreSessions?: () => void;
+  onLoadMoreGroupSessions?: (cwd: string | null) => void;
+  onSearchSessions?: (query: string) => void;
   disabled?: boolean;
   activeSessionId?: string | null;
   thinkingBySession?: Map<string, Set<string>>;
   sessionParentMap?: Map<string, string>;
+  hasMoreSessions?: boolean;
+  sessionPageLoading?: boolean;
 }
 
-export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewSession, disabled, activeSessionId, thinkingBySession, sessionParentMap }: SessionPickerProps) {
+export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewSession, onLoadMoreSessions, onLoadMoreGroupSessions, onSearchSessions, disabled, activeSessionId, thinkingBySession, sessionParentMap, hasMoreSessions, sessionPageLoading }: SessionPickerProps) {
   const [filterText, setFilterText] = useState('');
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set(groups.map((_, i) => `group-${i}`)));
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Whether server-backed search is active (controls client-side filtering bypass).
+  const isServerSearch = !!onSearchSessions;
+
+  // Debounced search: only fires when the user actually types, not on mount.
+  // Avoids the infinite loop caused by putting onSearchSessions in a useEffect dep array.
+  const handleFilterChange = useCallback((value: string) => {
+    setFilterText(value);
+    if (!onSearchSessions) return;
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    searchTimerRef.current = setTimeout(() => {
+      onSearchSessions(value);
+    }, 200);
+  }, [onSearchSessions]);
+
+  // Cleanup debounce timer on unmount
+  useEffect(() => {
+    return () => {
+      if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    };
+  }, []);
   
   // Build session hierarchy and filter by search text
   const filteredGroups = useMemo(() => {
@@ -59,6 +86,8 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
     });
 
     if (!query) return groupsWithHierarchy;
+    // In server-backed search mode, groups are already filtered across the whole DB.
+    if (isServerSearch) return groupsWithHierarchy;
 
     // Filter with hierarchy awareness: keep a node if it or any descendant matches.
     const filterWithHierarchy = (
@@ -82,7 +111,7 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
           .filter((s): s is SessionSummary & { children?: SessionSummary[] } => s !== null),
       }))
       .filter(group => group.sessions.length > 0);
-  }, [groups, filterText]);
+  }, [groups, filterText, isServerSearch]);
   
   const thinkingSessionIds = useThinkingSessionIds(thinkingBySession, groups, sessionParentMap);
   
@@ -273,7 +302,7 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
               type="text"
               placeholder="Filter by session ID or title..."
               value={filterText}
-              onChange={(e) => setFilterText(e.target.value)}
+              onChange={(e) => handleFilterChange(e.target.value)}
               className="w-full pl-12 pr-4 py-3 bg-surface-elevated border-2 border-surface-border rounded-lg text-ui-primary placeholder:text-ui-muted focus:border-accent-primary focus:outline-none transition-colors session-filter-input"
             />
           </div>
@@ -309,7 +338,9 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
                       {groupLabel}
                     </span>
                     <span className="text-xs text-ui-muted">
-                      {group.sessions.length} session{group.sessions.length !== 1 ? 's' : ''}
+                      {group.sessions.length}
+                      {typeof group.total_count === 'number' ? ` / ${group.total_count}` : ''}
+                      {' '}session{(group.total_count ?? group.sessions.length) !== 1 ? 's' : ''}
                     </span>
                   </Collapsible.Trigger>
                   
@@ -318,6 +349,18 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
                     {group.sessions.map((session, sessionIndex) => 
                       renderSessionCard(session, sessionIndex, 0)
                     )}
+                    {group.next_cursor && (
+                      <div className="pt-2">
+                        <button
+                          type="button"
+                          onClick={() => onLoadMoreGroupSessions?.(group.cwd ?? null)}
+                          disabled={disabled || sessionPageLoading}
+                          className="px-3 py-1.5 rounded-md text-[11px] font-medium border border-surface-border/40 text-ui-secondary hover:text-ui-primary hover:border-accent-primary/50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                        >
+                          {sessionPageLoading ? 'Loading...' : 'Load more in workspace'}
+                        </button>
+                      </div>
+                    )}
                   </Collapsible.Content>
                 </Collapsible.Root>
               );
@@ -325,6 +368,19 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
           )}
         </div>
         
+        {/* Global pagination (browse/search mode) */}
+        {(hasMoreSessions || sessionPageLoading) && (
+          <div className="text-center mb-6">
+            <button
+              onClick={() => onLoadMoreSessions?.()}
+              disabled={disabled || sessionPageLoading || !hasMoreSessions}
+              className="px-4 py-2 rounded-lg text-xs font-medium border border-surface-border/40 text-ui-secondary hover:text-ui-primary hover:border-accent-primary/50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              {sessionPageLoading ? 'Loading...' : filterText.trim() ? 'Load more results' : 'Load more workspaces'}
+            </button>
+          </div>
+        )}
+
         {/* New session button */}
         <div className="text-center space-y-3">
           <button

@@ -837,10 +837,11 @@ pub enum StreamChunk {
     /// Usage metadata containing token counts
     Usage(Usage),
 
-    /// Stream ended with stop reason
+    /// Stream ended with finish reason
     Done {
-        /// The reason the stream stopped (e.g., "end_turn", "tool_use")
-        stop_reason: String,
+        /// The typed finish reason from the provider, mapped at emission time
+        /// using the same logic as `ChatResponse::finish_reason()`.
+        finish_reason: FinishReason,
     },
 }
 

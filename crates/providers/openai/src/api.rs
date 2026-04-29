@@ -1226,7 +1226,7 @@ pub fn parse_openai_sse_chunk(
                 }
             }
             results.push(StreamChunk::Done {
-                stop_reason: "end_turn".to_string(),
+                finish_reason: FinishReason::Stop,
             });
             done_emitted = true;
             continue;
@@ -1316,17 +1316,16 @@ pub fn parse_openai_sse_chunk(
                     }
                 }
 
-                // Map finish_reason to unified stop_reason
-                let stop_reason = match finish_reason.as_str() {
-                    "tool_calls" => "tool_use",
-                    "stop" => "end_turn",
-                    "length" => "max_tokens",
-                    other => other,
+                // Map finish_reason to FinishReason
+                let finish_reason = match finish_reason.as_str() {
+                    "tool_calls" => FinishReason::ToolCalls,
+                    "stop" => FinishReason::Stop,
+                    "length" => FinishReason::Length,
+                    "content_filter" => FinishReason::ContentFilter,
+                    _ => FinishReason::Unknown,
                 };
 
-                results.push(StreamChunk::Done {
-                    stop_reason: stop_reason.to_string(),
-                });
+                results.push(StreamChunk::Done { finish_reason });
                 done_emitted = true;
             }
         }

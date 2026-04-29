@@ -13,8 +13,9 @@ use agent_client_protocol::schema::{
     NewSessionResponse, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOption, SessionInfo, SessionMode, SessionModeState,
 };
-use kameo::actor::Spawn;
+use kameo::actor::{ActorRef, Spawn};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 fn all_session_modes() -> Vec<SessionMode> {
@@ -76,10 +77,22 @@ pub(crate) fn config_options(
     ]
 }
 
+/// Controls how a materialized session actor is integrated with remote infra.
+pub struct SessionMaterializationOptions {
+    pub attach_mesh_handle: bool,
+    pub register_in_dht: bool,
+}
+
 /// Manages session actors. Lives on the server layer.
+pub struct SessionMaterialization {
+    pub actor_ref: ActorRef<SessionActor>,
+    pub runtime: Arc<SessionRuntime>,
+}
+
 pub struct SessionRegistry {
     pub config: Arc<AgentConfig>,
     sessions: HashMap<String, SessionActorRef>,
+    local_actor_refs: HashMap<String, ActorRef<SessionActor>>,
     /// Tracks the `(relay_actor_id, relay_dht_name)` spawned for each remote
     /// session so that `detach_remote_session` can send `UnsubscribeEvents`
     /// with both values.
@@ -100,6 +113,7 @@ impl SessionRegistry {
         Self {
             config,
             sessions: HashMap::new(),
+            local_actor_refs: HashMap::new(),
             #[cfg(feature = "remote")]
             relay_actor_ids: HashMap::new(),
             #[cfg(feature = "remote")]
@@ -127,15 +141,13 @@ impl SessionRegistry {
     pub fn set_mesh(&mut self, mesh: Option<crate::agent::remote::MeshHandle>) {
         // Register all existing local sessions in DHT so remote peers can attach.
         if let Some(ref mesh) = mesh {
-            for (session_id, session_ref) in &self.sessions {
-                if let SessionActorRef::Local(ar) = session_ref {
-                    let dht_name = crate::agent::remote::dht_name::session(session_id);
-                    let mesh = mesh.clone();
-                    let ar = ar.clone();
-                    tokio::spawn(async move {
-                        mesh.register_actor(ar, dht_name).await;
-                    });
-                }
+            for (session_id, actor_ref) in &self.local_actor_refs {
+                let dht_name = crate::agent::remote::dht_name::session(session_id);
+                let mesh = mesh.clone();
+                let actor_ref = actor_ref.clone();
+                tokio::spawn(async move {
+                    mesh.register_actor(actor_ref, dht_name).await;
+                });
             }
         }
         self.mesh = mesh;
@@ -182,7 +194,87 @@ impl SessionRegistry {
     /// Accepts anything that converts into a `SessionActorRef`, including
     /// a bare `ActorRef<SessionActor>` (via the `From` impl).
     pub fn insert(&mut self, session_id: String, actor_ref: impl Into<SessionActorRef>) {
-        self.sessions.insert(session_id, actor_ref.into());
+        self.sessions.insert(session_id.clone(), actor_ref.into());
+        self.local_actor_refs.remove(&session_id);
+    }
+
+    pub fn local_actor_ref(&self, session_id: &str) -> Option<&ActorRef<SessionActor>> {
+        self.local_actor_refs.get(session_id)
+    }
+
+    pub async fn materialize_session_actor(
+        &mut self,
+        session_id: String,
+        cwd: Option<PathBuf>,
+        mcp_servers: &[McpServer],
+        initialize_fork: bool,
+        options: SessionMaterializationOptions,
+    ) -> Result<SessionMaterialization, Error> {
+        let merged_mcp = self.merged_mcp_servers(mcp_servers);
+        let tool_state = crate::agent::core::McpToolState::empty();
+        let mcp_services = crate::agent::protocol::build_mcp_state(
+            &merged_mcp,
+            self.config.pending_elicitations(),
+            self.config.event_sink.clone(),
+            session_id.clone(),
+            &crate::agent::mcp::agent_implementation(),
+            tool_state.clone(),
+        )
+        .await?;
+
+        if initialize_fork {
+            crate::session::runtime::SessionForkHelper::initialize_fork(
+                self.config.provider.history_store(),
+                &session_id,
+            )
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+        }
+
+        let runtime = SessionRuntime::new(cwd.clone(), mcp_services, tool_state);
+        #[cfg(feature = "remote")]
+        let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone())
+            .with_mesh(if options.attach_mesh_handle {
+                self.mesh.clone()
+            } else {
+                None
+            });
+        #[cfg(not(feature = "remote"))]
+        let actor = {
+            let _ = &options;
+            SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone())
+        };
+        let actor_ref = SessionActor::spawn(actor);
+        let session_ref = SessionActorRef::from(actor_ref.clone());
+
+        if let Some(ref bridge) = self.bridge
+            && let Err(e) = session_ref.set_bridge(bridge.clone()).await
+        {
+            log::warn!(
+                "Session {}: failed to set bridge on session actor: {}",
+                session_id,
+                e
+            );
+        }
+
+        self.sessions
+            .insert(session_id.clone(), session_ref.clone());
+        self.local_actor_refs
+            .insert(session_id.clone(), actor_ref.clone());
+
+        #[cfg(feature = "remote")]
+        if options.register_in_dht
+            && let Some(ref mesh) = self.mesh
+        {
+            let dht_name = crate::agent::remote::dht_name::session(&session_id);
+            let mesh = mesh.clone();
+            let actor_ref = actor_ref.clone();
+            tokio::spawn(async move {
+                mesh.register_actor(actor_ref, dht_name).await;
+            });
+        }
+
+        Ok(SessionMaterialization { actor_ref, runtime })
     }
 
     /// Remove a session actor from the registry.
@@ -195,6 +287,7 @@ impl SessionRegistry {
             let session_dht_name = crate::agent::remote::dht_name::session(session_id);
             mesh.deregister_actor(&session_dht_name);
         }
+        self.local_actor_refs.remove(session_id);
         self.sessions.remove(session_id)
     }
 
@@ -361,17 +454,12 @@ impl SessionRegistry {
         session_ref
     }
 
-    /// Detach a remote session: send `UnsubscribeEvents` to stop the remote
-    /// `EventForwarder`, then remove the session from the registry.
-    ///
-    /// This is the counterpart to [`attach_remote_session`](Self::attach_remote_session).
-    /// Call this instead of bare `remove()` for remote sessions so the
-    /// forwarder task on the remote node is properly cleaned up.
-    ///
-    /// For local sessions (or if the session is not in the registry) this
-    /// falls back to a plain `remove()`.
     #[cfg(feature = "remote")]
-    pub async fn detach_remote_session(&mut self, session_id: &str) -> Option<SessionActorRef> {
+    async fn detach_remote_session_inner(
+        &mut self,
+        session_id: &str,
+        preserve_bookmark: bool,
+    ) -> Option<SessionActorRef> {
         // Send UnsubscribeEvents before removing so the remote forwarder is aborted.
         if let (Some(session_ref), Some((relay_id, relay_dht_name))) = (
             self.sessions.get(session_id),
@@ -410,17 +498,43 @@ impl SessionRegistry {
             }
         }
 
-        // Remove the persisted bookmark.
-        let store = self.config.provider.history_store();
-        let sid = session_id.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = store.remove_remote_session_bookmark(&sid).await {
-                log::warn!("Failed to remove remote session bookmark {}: {}", sid, e);
-            }
-        });
+        if !preserve_bookmark {
+            let store = self.config.provider.history_store();
+            let sid = session_id.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = store.remove_remote_session_bookmark(&sid).await {
+                    log::warn!("Failed to remove remote session bookmark {}: {}", sid, e);
+                }
+            });
+        }
 
         self.relay_actor_ids.remove(session_id);
+        self.local_actor_refs.remove(session_id);
         self.sessions.remove(session_id)
+    }
+
+    /// Detach a remote session: send `UnsubscribeEvents` to stop the remote
+    /// `EventForwarder`, then remove the session from the registry.
+    ///
+    /// This is the counterpart to [`attach_remote_session`](Self::attach_remote_session).
+    /// Call this instead of bare `remove()` for remote sessions so the
+    /// forwarder task on the remote node is properly cleaned up.
+    ///
+    /// For local sessions (or if the session is not in the registry) this
+    /// falls back to a plain `remove()`.
+    #[cfg(feature = "remote")]
+    pub async fn detach_remote_session(&mut self, session_id: &str) -> Option<SessionActorRef> {
+        self.detach_remote_session_inner(session_id, false).await
+    }
+
+    /// Remove a remote session runtime from local tracking but keep its bookmark
+    /// so the stopped session remains visible and resumable.
+    #[cfg(feature = "remote")]
+    pub async fn detach_remote_session_preserve_bookmark(
+        &mut self,
+        session_id: &str,
+    ) -> Option<SessionActorRef> {
+        self.detach_remote_session_inner(session_id, true).await
     }
 
     /// Create a new session: build runtime, spawn SessionActor, return session_id.
@@ -458,60 +572,19 @@ impl SessionRegistry {
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
         let session_id = session_context.session().public_id.clone();
 
-        // Build MCP state: merge config-level MCP servers with any client-supplied ones.
-        let merged_mcp = self.merged_mcp_servers(&req.mcp_servers);
-        let tool_state = crate::agent::core::McpToolState::empty();
-        let mcp_services = crate::agent::protocol::build_mcp_state(
-            &merged_mcp,
-            self.config.pending_elicitations(),
-            self.config.event_sink.clone(),
-            session_id.clone(),
-            &crate::agent::mcp::agent_implementation(),
-            tool_state.clone(),
-        )
-        .await?;
-
-        // Initialize fork if parent_session_id was provided
-        if parent_session_id.is_some() {
-            crate::session::runtime::SessionForkHelper::initialize_fork(
-                self.config.provider.history_store(),
-                &session_id,
+        let materialization = self
+            .materialize_session_actor(
+                session_id.clone(),
+                cwd.clone(),
+                &req.mcp_servers,
+                parent_session_id.is_some(),
+                SessionMaterializationOptions {
+                    attach_mesh_handle: true,
+                    register_in_dht: true,
+                },
             )
-            .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?;
-        }
-
-        let runtime = SessionRuntime::new(cwd.clone(), mcp_services, tool_state);
-
-        // Spawn the session actor
-        let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone());
-        let actor_ref = SessionActor::spawn(actor);
-        let session_ref: SessionActorRef = actor_ref.clone().into();
-
-        // Propagate client bridge so the session can send notifications and
-        // tools like `language_query` can access the client's language server.
-        if let Some(ref bridge) = self.bridge
-            && let Err(e) = session_ref.set_bridge(bridge.clone()).await
-        {
-            log::warn!(
-                "Session {}: failed to set bridge on new session actor: {}",
-                session_id,
-                e
-            );
-        }
-
-        self.sessions.insert(session_id.clone(), session_ref);
-
-        // Register in DHT so remote peers can discover and attach to this session.
-        #[cfg(feature = "remote")]
-        if let Some(ref mesh) = self.mesh {
-            let dht_name = crate::agent::remote::dht_name::session(&session_id);
-            let mesh = mesh.clone();
-            let ar = actor_ref.clone();
-            tokio::spawn(async move {
-                mesh.register_actor(ar, dht_name).await;
-            });
-        }
+            .await?;
+        let runtime = materialization.runtime;
 
         self.config
             .emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);
@@ -628,47 +701,18 @@ impl SessionRegistry {
             Some(req.cwd.clone())
         };
 
-        let merged_mcp = self.merged_mcp_servers(&req.mcp_servers);
-        let tool_state = crate::agent::core::McpToolState::empty();
-        let mcp_services = crate::agent::protocol::build_mcp_state(
-            &merged_mcp,
-            self.config.pending_elicitations(),
-            self.config.event_sink.clone(),
-            session_id.clone(),
-            &crate::agent::mcp::agent_implementation(),
-            tool_state.clone(),
-        )
-        .await?;
-
-        let runtime = SessionRuntime::new(cwd, mcp_services, tool_state);
-
-        let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime);
-        let actor_ref = SessionActor::spawn(actor);
-        let session_ref: SessionActorRef = actor_ref.clone().into();
-
-        // Propagate client bridge (same as new_session)
-        if let Some(ref bridge) = self.bridge
-            && let Err(e) = session_ref.set_bridge(bridge.clone()).await
-        {
-            log::warn!(
-                "Session {}: failed to set bridge on loaded session actor: {}",
-                session_id,
-                e
-            );
-        }
-
-        self.sessions.insert(session_id.clone(), session_ref);
-
-        // Register in DHT so remote peers can discover and attach to this session.
-        #[cfg(feature = "remote")]
-        if let Some(ref mesh) = self.mesh {
-            let dht_name = crate::agent::remote::dht_name::session(&session_id);
-            let mesh = mesh.clone();
-            let ar = actor_ref.clone();
-            tokio::spawn(async move {
-                mesh.register_actor(ar, dht_name).await;
-            });
-        }
+        let _materialization = self
+            .materialize_session_actor(
+                session_id.clone(),
+                cwd,
+                &req.mcp_servers,
+                false,
+                SessionMaterializationOptions {
+                    attach_mesh_handle: true,
+                    register_in_dht: true,
+                },
+            )
+            .await?;
 
         // Stream full history to client
         // TODO: Implement full-fidelity history streaming with SessionUpdate notifications
@@ -799,47 +843,18 @@ impl SessionRegistry {
             Some(req.cwd.clone())
         };
 
-        let merged_mcp = self.merged_mcp_servers(&req.mcp_servers);
-        let tool_state = crate::agent::core::McpToolState::empty();
-        let mcp_services = crate::agent::protocol::build_mcp_state(
-            &merged_mcp,
-            self.config.pending_elicitations(),
-            self.config.event_sink.clone(),
-            session_id.clone(),
-            &crate::agent::mcp::agent_implementation(),
-            tool_state.clone(),
-        )
-        .await?;
-
-        let runtime = SessionRuntime::new(cwd, mcp_services, tool_state);
-
-        let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime);
-        let actor_ref = SessionActor::spawn(actor);
-        let session_ref: SessionActorRef = actor_ref.clone().into();
-
-        // Propagate client bridge (same as new_session)
-        if let Some(ref bridge) = self.bridge
-            && let Err(e) = session_ref.set_bridge(bridge.clone()).await
-        {
-            log::warn!(
-                "Session {}: failed to set bridge on resumed session actor: {}",
-                session_id,
-                e
-            );
-        }
-
-        self.sessions.insert(session_id.clone(), session_ref);
-
-        // Register in DHT so remote peers can discover and attach to this session.
-        #[cfg(feature = "remote")]
-        if let Some(ref mesh) = self.mesh {
-            let dht_name = crate::agent::remote::dht_name::session(&session_id);
-            let mesh = mesh.clone();
-            let ar = actor_ref.clone();
-            tokio::spawn(async move {
-                mesh.register_actor(ar, dht_name).await;
-            });
-        }
+        let _materialization = self
+            .materialize_session_actor(
+                session_id.clone(),
+                cwd,
+                &req.mcp_servers,
+                false,
+                SessionMaterializationOptions {
+                    attach_mesh_handle: true,
+                    register_in_dht: true,
+                },
+            )
+            .await?;
 
         self.config
             .emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);

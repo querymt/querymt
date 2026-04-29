@@ -503,14 +503,19 @@ mod event_forwarder_stub {
 #[cfg(feature = "remote")]
 mod node_manager_tests {
     use super::*;
+    use crate::agent::messages::GetMode;
     use crate::agent::remote::node_manager::{
-        CreateRemoteSession, DestroyRemoteSession, GetNodeInfo, ListRemoteSessions,
-        RemoteNodeManager,
+        CreateRemoteSession, DestroyRemoteSession, ForkRemoteSession, GetNodeInfo,
+        ListRemoteSessions, RemoteNodeManager, ResumeRemoteSession, SessionHandoff,
     };
     use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
+    use crate::model::{AgentMessage, MessagePart};
+    use crate::session::domain::IntentSnapshot;
     use kameo::actor::{ActorRef, Spawn};
     use kameo::error::SendError;
+    use querymt::chat::ChatRole;
     use tokio::sync::Mutex;
+    use uuid::Uuid;
 
     /// Spawn a `RemoteNodeManager` actor without mesh and return its `ActorRef`.
     async fn spawn_test_node_manager_no_mesh()
@@ -535,7 +540,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_create_session_no_cwd() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let resp = nm_ref
             .ask(CreateRemoteSession { cwd: None })
@@ -546,12 +551,34 @@ mod node_manager_tests {
             !resp.session_id.is_empty(),
             "session_id should not be empty"
         );
-        assert!(resp.actor_id > 0, "actor_id should be positive");
+        assert!(resp.created_at >= 0, "created_at should be populated");
+        assert!(matches!(resp.handoff, SessionHandoff::DirectRemote { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_create_session_no_mesh_never_claims_lookup_fallback() {
+        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
+
+        let resp = nm_ref
+            .ask(CreateRemoteSession { cwd: None })
+            .await
+            .expect("create session without mesh should succeed");
+
+        assert!(
+            matches!(
+                resp.handoff,
+                SessionHandoff::DirectRemote { .. } | SessionHandoff::NoAttachPath
+            ),
+            "no-mesh environments must not advertise lookup-only handoff"
+        );
+
+        let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
+        assert!(sessions.iter().any(|s| s.session_id == resp.session_id));
     }
 
     #[tokio::test]
     async fn test_create_session_valid_cwd() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
         let cwd_dir = TempDir::new().unwrap();
 
         let resp = nm_ref
@@ -566,7 +593,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_create_session_nonexistent_cwd() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let resp = nm_ref
             .ask(CreateRemoteSession {
@@ -580,7 +607,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_create_session_relative_cwd_rejected() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let result = nm_ref
             .ask(CreateRemoteSession {
@@ -603,7 +630,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_list_sessions_empty() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let sessions = nm_ref
             .ask(ListRemoteSessions)
@@ -615,7 +642,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_list_sessions_after_create() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let resp = nm_ref
             .ask(CreateRemoteSession { cwd: None })
@@ -630,8 +657,49 @@ mod node_manager_tests {
     }
 
     #[tokio::test]
+    async fn test_list_sessions_uses_initial_intent_snapshot_as_title() {
+        let (nm_ref, config, _td) = spawn_test_node_manager_with_mesh().await;
+
+        let resp = nm_ref
+            .ask(CreateRemoteSession { cwd: None })
+            .await
+            .expect("create");
+
+        let session = config
+            .provider
+            .history_store()
+            .get_session(&resp.session_id)
+            .await
+            .expect("session lookup")
+            .expect("created session should exist");
+
+        config
+            .provider
+            .history_store()
+            .create_intent_snapshot(IntentSnapshot {
+                id: 0,
+                session_id: session.id,
+                task_id: None,
+                summary: "Remote title from snapshot".to_string(),
+                constraints: None,
+                next_step_hint: None,
+                created_at: time::OffsetDateTime::now_utc(),
+            })
+            .await
+            .expect("create intent snapshot");
+
+        let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
+        let listed = sessions
+            .iter()
+            .find(|s| s.session_id == resp.session_id)
+            .expect("created session should be listed");
+
+        assert_eq!(listed.title.as_deref(), Some("Remote title from snapshot"));
+    }
+
+    #[tokio::test]
     async fn test_create_multiple_sessions() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let mut session_ids = Vec::new();
         for _ in 0..3 {
@@ -654,7 +722,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_destroy_session() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
+        let (nm_ref, config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let resp = nm_ref
             .ask(CreateRemoteSession { cwd: None })
@@ -670,11 +738,21 @@ mod node_manager_tests {
 
         let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
         assert!(sessions.is_empty());
+        assert!(
+            config
+                .provider
+                .history_store()
+                .get_session(&resp.session_id)
+                .await
+                .expect("session lookup")
+                .is_some(),
+            "destroy should remove only the runtime, not persisted history"
+        );
     }
 
     #[tokio::test]
     async fn test_destroy_nonexistent_session() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let result = nm_ref
             .ask(DestroyRemoteSession {
@@ -740,7 +818,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_create_session_cwd_tracked_in_list() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
         let cwd_dir = TempDir::new().unwrap();
         let cwd_str = cwd_dir.path().to_string_lossy().to_string();
 
@@ -760,7 +838,7 @@ mod node_manager_tests {
 
     #[tokio::test]
     async fn test_destroy_then_create_reuses_slot() {
-        let (nm_ref, _config, _td) = spawn_test_node_manager_no_mesh().await;
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         // Create + destroy
         let resp1 = nm_ref
@@ -786,6 +864,87 @@ mod node_manager_tests {
         let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, resp2.session_id);
+    }
+
+    #[tokio::test]
+    async fn test_resume_destroyed_session() {
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
+
+        let resp = nm_ref
+            .ask(CreateRemoteSession { cwd: None })
+            .await
+            .expect("create");
+
+        nm_ref
+            .ask(DestroyRemoteSession {
+                session_id: resp.session_id.clone(),
+            })
+            .await
+            .expect("destroy");
+
+        let resumed = nm_ref
+            .ask(ResumeRemoteSession {
+                session_id: resp.session_id.clone(),
+            })
+            .await
+            .expect("resume");
+
+        assert_eq!(resumed.session_id, resp.session_id);
+
+        let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, resp.session_id);
+    }
+
+    #[tokio::test]
+    async fn test_fork_remote_session_returns_live_child_ref() {
+        let (nm_ref, config, _td) = spawn_test_node_manager_with_mesh().await;
+
+        let parent = nm_ref
+            .ask(CreateRemoteSession { cwd: None })
+            .await
+            .expect("create parent");
+
+        let message_id = Uuid::new_v4().to_string();
+        config
+            .provider
+            .history_store()
+            .add_message(
+                &parent.session_id,
+                AgentMessage {
+                    id: message_id.clone(),
+                    session_id: parent.session_id.clone(),
+                    role: ChatRole::User,
+                    parts: vec![MessagePart::Text {
+                        content: "fork here".to_string(),
+                    }],
+                    created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+                    parent_message_id: None,
+                    source_provider: None,
+                    source_model: None,
+                },
+            )
+            .await
+            .expect("insert parent message");
+
+        let resp = nm_ref
+            .ask(ForkRemoteSession {
+                source_session_id: parent.session_id.clone(),
+                message_id,
+            })
+            .await
+            .expect("fork child");
+
+        assert_ne!(resp.session_id, parent.session_id);
+        let session_ref = match resp.handoff {
+            SessionHandoff::DirectRemote { session_ref } => session_ref,
+            SessionHandoff::LookupOnly => panic!("expected direct handoff in mesh test"),
+            SessionHandoff::NoAttachPath => panic!("expected attachable handoff in mesh test"),
+        };
+        assert!(session_ref.ask(&GetMode).await.is_ok());
+
+        let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
+        assert!(sessions.iter().any(|s| s.session_id == resp.session_id));
     }
 }
 

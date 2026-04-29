@@ -597,11 +597,11 @@ mod tests {
         assert!(has_tool_complete, "expected ToolUseComplete in {events3:?}");
 
         let has_done = events3.iter().any(|e| {
-            matches!(e, querymt::chat::StreamChunk::Done { stop_reason } if stop_reason == "tool_use")
+            matches!(e, querymt::chat::StreamChunk::Done { finish_reason } if *finish_reason == querymt::chat::FinishReason::ToolCalls)
         });
         assert!(
             has_done,
-            "expected Done with stop_reason 'tool_use' in {events3:?}"
+            "expected Done with FinishReason::ToolCalls in {events3:?}"
         );
     }
 
@@ -612,8 +612,8 @@ mod tests {
         let events = provider.parse_chat_stream_chunk(chunk).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
-            querymt::chat::StreamChunk::Done { stop_reason } => {
-                assert_eq!(stop_reason, "end_turn");
+            querymt::chat::StreamChunk::Done { finish_reason } => {
+                assert_eq!(*finish_reason, querymt::chat::FinishReason::Stop);
             }
             other => panic!("expected Done chunk, got {other:?}"),
         }
@@ -666,8 +666,8 @@ mod tests {
             "expected Done from data:[DONE], got {events:?}"
         );
         match &events[0] {
-            querymt::chat::StreamChunk::Done { stop_reason } => {
-                assert_eq!(stop_reason, "end_turn");
+            querymt::chat::StreamChunk::Done { finish_reason } => {
+                assert_eq!(*finish_reason, querymt::chat::FinishReason::Stop);
             }
             other => panic!("expected Done chunk, got {other:?}"),
         }

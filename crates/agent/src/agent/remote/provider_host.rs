@@ -19,6 +19,7 @@ use querymt::LLMProvider;
 use querymt::ToolCall;
 use querymt::Usage;
 use querymt::chat::{ChatMessage, ChatResponse, FinishReason, StreamChunk, Tool};
+use querymt::error::LLMErrorPayload;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fmt;
@@ -94,13 +95,13 @@ pub enum StreamRelayMessage {
     /// Normal streamed chunk from the upstream provider.
     Chunk(StreamChunk),
     /// Provider/model error produced by the upstream stream.
-    ProviderError { message: String },
+    ProviderError { error: LLMErrorPayload },
     /// The transport path to the requesting node disappeared but may recover.
     TransportDisconnected { reason: String },
     /// Delivery has resumed after a temporary transport disconnect.
     TransportReconnected { buffered_chunks: usize },
     /// The stream failed permanently because reconnect grace expired.
-    TransportFailed { reason: String },
+    TransportFailed { error: LLMErrorPayload },
 }
 
 /// Thin wrapper around a stream relay/control payload.
@@ -431,7 +432,7 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
             .await
             .map_err(|e| AgentError::ProviderChat {
                 operation: "chat_with_tools".to_string(),
-                reason: e.to_string(),
+                reason: serde_json::to_string(&e.to_payload()).unwrap_or_else(|_| e.to_string()),
             })?;
 
         let tool_calls = response.tool_calls().unwrap_or_default();
@@ -495,7 +496,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
             .await
             .map_err(|e| AgentError::ProviderChat {
                 operation: "chat_stream_with_tools".to_string(),
-                reason: e.to_string(),
+                reason: serde_json::to_string(&e.to_payload()).unwrap_or_else(|_| e.to_string()),
             })?;
 
         // Look up the StreamReceiverActor on the requesting node.
@@ -555,12 +556,28 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                     let message = match chunk_result {
                         Ok(chunk) => StreamRelayMessage::Chunk(chunk),
                         Err(e) => StreamRelayMessage::ProviderError {
-                            message: e.to_string(),
+                            error: e.to_payload(),
                         },
                     };
-                    let is_done = matches!(message, StreamRelayMessage::Chunk(StreamChunk::Done { .. }))
+                    let finish_reason = match &message {
+                        StreamRelayMessage::Chunk(StreamChunk::Done { finish_reason }) => Some(*finish_reason),
+                        _ => None,
+                    };
+                    let is_done = finish_reason.is_some()
                         || matches!(message, StreamRelayMessage::ProviderError { .. });
                     buffered.push_back(message);
+
+                    if let Some(reason) = finish_reason {
+                        tracing::debug!(
+                            target: "remote::provider_host::stream",
+                            provider = %provider_name,
+                            model = %model,
+                            receiver_name = %receiver_name,
+                            finish_reason = ?reason,
+                            chunk_index = chunk_count,
+                            "stream done from upstream provider"
+                        );
+                    }
 
                     loop {
                         if disconnected_since.is_some() {
@@ -588,10 +605,14 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                         let _ = receiver_ref
                                             .tell(&StreamChunkRelay {
                                                 message: StreamRelayMessage::TransportFailed {
-                                                    reason: format!(
-                                                        "reconnect grace expired after {:?}",
-                                                        reconnect_grace,
-                                                    ),
+                                                    error: querymt::error::LLMError::Transport {
+                                                        kind: querymt::error::TransportErrorKind::Timeout,
+                                                        message: format!(
+                                                            "reconnect grace expired after {:?}",
+                                                            reconnect_grace,
+                                                        ),
+                                                    }
+                                                    .to_payload(),
                                                 },
                                             })
                                             .send();

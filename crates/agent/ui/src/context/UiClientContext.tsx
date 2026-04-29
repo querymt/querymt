@@ -41,6 +41,9 @@ export interface UiClientActionsContextValue {
   attachRemoteSession: (nodeId: string, sessionId: string, sessionLabel?: string) => void;
   refreshAllModels: () => void;
   fetchRecentModels: () => void;
+  loadMoreSessions: (limit?: number) => void;
+  loadMoreGroupSessions: (cwd: string | null, limit?: number) => void;
+  searchSessions: (query: string, limit?: number) => void;
   requestAuthProviders: () => void;
   startOAuthLogin: (provider: string) => void;
   completeOAuthLogin: (flowId: string, response: string) => void;
@@ -138,9 +141,14 @@ export interface UiClientSessionContextValue {
   availableModes: string[];
   reasoningEffort: string | null;
   remoteNodes: RemoteNodeInfo[];
+  sessionNextCursor: string | null;
+  sessionTotalCount: number;
+  sessionPageLoading: boolean;
   meshInvites: MeshInviteInfo[];
   lastCreatedMeshInvite: MeshInviteCreated | null;
   /** Session ID of the last session that failed to load. Used to navigate away and stop retry loops. */
+  /** Tracks whether sessions have ever been loaded (persists across search/browse/delete). */
+  sessionsEverLoaded: boolean;
   lastLoadErrorSessionId: string | null;
   schedules: ScheduleInfo[];
   knowledgeEntries: KnowledgeEntryInfo[];
@@ -214,6 +222,9 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     attachRemoteSession: uiClient.attachRemoteSession,
     refreshAllModels: uiClient.refreshAllModels,
     fetchRecentModels: uiClient.fetchRecentModels,
+    loadMoreSessions: uiClient.loadMoreSessions,
+    loadMoreGroupSessions: uiClient.loadMoreGroupSessions,
+    searchSessions: uiClient.searchSessions,
     requestAuthProviders: uiClient.requestAuthProviders,
     startOAuthLogin: uiClient.startOAuthLogin,
     completeOAuthLogin: uiClient.completeOAuthLogin,
@@ -302,6 +313,10 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     availableModes: uiClient.availableModes,
     reasoningEffort: uiClient.reasoningEffort,
     remoteNodes: uiClient.remoteNodes,
+    sessionNextCursor: uiClient.sessionNextCursor,
+    sessionTotalCount: uiClient.sessionTotalCount,
+    sessionPageLoading: uiClient.sessionPageLoading,
+    sessionsEverLoaded: uiClient.sessionsEverLoaded,
     meshInvites: uiClient.meshInvites,
     lastCreatedMeshInvite: uiClient.lastCreatedMeshInvite,
     lastLoadErrorSessionId: uiClient.lastLoadErrorSessionId,
@@ -332,6 +347,10 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     uiClient.availableModes,
     uiClient.reasoningEffort,
     uiClient.remoteNodes,
+    uiClient.sessionNextCursor,
+    uiClient.sessionTotalCount,
+    uiClient.sessionPageLoading,
+    uiClient.sessionsEverLoaded,
     uiClient.meshInvites,
     uiClient.lastCreatedMeshInvite,
     uiClient.lastLoadErrorSessionId,

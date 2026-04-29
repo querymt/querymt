@@ -320,14 +320,18 @@ impl SessionCompaction {
 /// with the previous request.  Retrying just queues additional inference work,
 /// wasting compute and potentially causing cascading timeouts.
 ///
-/// Detection relies on the string representation produced by
-/// `MeshChatProvider::chat_with_tools` when kameo's `RemoteSendError` is
-/// formatted:
-///   - `"network timeout"` — clean `OutboundFailure::Timeout`
-///   - `"Eof {"` — CBOR decode truncation when the timeout fires mid-read
+/// Detection matches on the typed `LLMError::Transport { kind: Timeout, .. }`
+/// variant which is produced by `MeshChatProvider::chat_with_tools` when
+/// kameo's `RemoteSendError::Timeout` fires, or when a mesh stream's
+/// reconnect grace period expires.
 fn is_mesh_timeout_error(e: &querymt::error::LLMError) -> bool {
-    let msg = e.to_string();
-    msg.contains("network timeout") || msg.contains("Eof {")
+    matches!(
+        e,
+        querymt::error::LLMError::Transport {
+            kind: querymt::error::TransportErrorKind::Timeout,
+            ..
+        }
+    )
 }
 
 /// Filter messages to return only the "effective" history after the last compaction.
@@ -1128,11 +1132,10 @@ mod tests {
 
     #[test]
     fn test_mesh_timeout_network_timeout() {
-        let err = LLMError::ProviderError(
-            "MeshChatProvider: remote call to 'provider_host::peer::12D3KooW...' \
-             failed: network timeout"
-                .to_string(),
-        );
+        let err = LLMError::Transport {
+            kind: querymt::error::TransportErrorKind::Timeout,
+            message: "network timeout".to_string(),
+        };
         assert!(
             is_mesh_timeout_error(&err),
             "network timeout should be detected as mesh timeout"
@@ -1141,11 +1144,10 @@ mod tests {
 
     #[test]
     fn test_mesh_timeout_eof_error() {
-        let err = LLMError::ProviderError(
-            "MeshChatProvider: remote call to 'provider_host::peer::12D3KooW...' \
-             failed: Eof { name: \"enum\", expect: Small(1) }"
-                .to_string(),
-        );
+        let err = LLMError::Transport {
+            kind: querymt::error::TransportErrorKind::Timeout,
+            message: "Eof { name: \"enum\", expect: Small(1) }".to_string(),
+        };
         assert!(
             is_mesh_timeout_error(&err),
             "Eof decode error should be detected as mesh timeout"
@@ -1154,11 +1156,10 @@ mod tests {
 
     #[test]
     fn test_mesh_timeout_dial_failure_is_not_timeout() {
-        let err = LLMError::ProviderError(
-            "MeshChatProvider: remote call to 'provider_host::peer::12D3KooW...' \
-             failed: dial failure"
-                .to_string(),
-        );
+        let err = LLMError::Transport {
+            kind: querymt::error::TransportErrorKind::ConnectionRefused,
+            message: "dial failure".to_string(),
+        };
         assert!(
             !is_mesh_timeout_error(&err),
             "dial failure should NOT be classified as mesh timeout"
@@ -1176,9 +1177,10 @@ mod tests {
 
     #[test]
     fn test_mesh_timeout_connection_closed_is_not_timeout() {
-        let err = LLMError::ProviderError(
-            "MeshChatProvider: remote call to '...' failed: connection closed".to_string(),
-        );
+        let err = LLMError::Transport {
+            kind: querymt::error::TransportErrorKind::ConnectionClosed,
+            message: "connection closed".to_string(),
+        };
         assert!(
             !is_mesh_timeout_error(&err),
             "connection closed should NOT be classified as mesh timeout"
@@ -1192,9 +1194,10 @@ mod tests {
 
         // Simulate a mesh timeout on the first attempt — should NOT retry.
         let mock = MockCompactionProvider::new(vec![
-            Err(LLMError::ProviderError(
-                "MeshChatProvider: remote call to '...' failed: network timeout".to_string(),
-            )),
+            Err(LLMError::Transport {
+                kind: querymt::error::TransportErrorKind::Timeout,
+                message: "network timeout".to_string(),
+            }),
             // This second response should never be reached.
             Ok("should not be used".to_string()),
         ]);

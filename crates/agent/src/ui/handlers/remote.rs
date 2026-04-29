@@ -14,9 +14,13 @@ use super::super::connection::{send_error, send_message};
 use super::super::messages::{MeshInviteInfo, UiServerMessage};
 use super::session_ops::handle_list_sessions;
 #[cfg(feature = "remote")]
+use crate::agent::remote::node_manager::SessionHandoff;
+#[cfg(feature = "remote")]
 use crate::agent::utils::u32_from_usize;
 #[cfg(feature = "remote")]
 use kameo::actor::RemoteActorRef;
+#[cfg(feature = "remote")]
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 /// List remote nodes discovered in the kameo mesh.
@@ -120,73 +124,42 @@ pub async fn handle_create_remote_session(
             }
         };
 
-        let peer_label = state
-            .agent
-            .list_remote_nodes()
-            .await
-            .into_iter()
-            .find(|n| n.node_id.to_string() == node_id)
-            .map(|n| n.hostname)
-            .unwrap_or_else(|| node_id.to_string());
-
         match state
             .agent
-            .create_remote_session(
-                &node_manager_ref,
-                node_id.to_string(),
-                peer_label,
-                cwd.map(|s| s.to_string()),
-            )
+            .create_remote_session(&node_manager_ref, cwd.map(|s| s.to_string()))
             .await
         {
-            Ok((session_id, _session_actor_ref)) => {
-                let agent_id = super::super::session::PRIMARY_AGENT_ID.to_string();
-
+            Ok(resp) => {
+                let session_id = resp.session_id.clone();
+                let cwd_path = resp.cwd.as_ref().map(PathBuf::from);
+                if let Err(err) = finalize_remote_session_attach(
+                    state,
+                    conn_id,
+                    node_id,
+                    &session_id,
+                    resp.handoff,
+                    cwd_path,
+                    tx,
+                )
+                .await
                 {
-                    let mut connections = state.connections.lock().await;
-                    if let Some(conn) = connections.get_mut(conn_id) {
-                        conn.sessions.insert(agent_id.clone(), session_id.clone());
-                        conn.subscribed_sessions.insert(session_id.clone());
-                    }
-                }
-
-                {
-                    let mut agents = state.session_agents.lock().await;
-                    agents.insert(session_id.clone(), agent_id.clone());
-                }
-
-                if let Some(cwd_str) = cwd {
-                    let mut cwds = state.session_cwds.lock().await;
-                    cwds.insert(session_id.clone(), std::path::PathBuf::from(cwd_str));
+                    let _ = send_error(
+                        tx,
+                        format!("Failed to finalize remote session attach: {err}"),
+                    )
+                    .await;
+                    return;
                 }
 
                 let _ = send_message(
                     tx,
                     UiServerMessage::SessionCreated {
-                        agent_id,
+                        agent_id: super::super::session::PRIMARY_AGENT_ID.to_string(),
                         session_id: session_id.clone(),
                         request_id: request_id.map(|s| s.to_string()),
                     },
                 )
                 .await;
-
-                // Signal the UI that the workspace index is building.
-                // The UI will show "Loading files..." in the @ mention dropdown
-                // until WorkspaceIndexReady arrives via the event relay and the
-                // server pushes a FileIndex message reactively.
-                if cwd.is_some() {
-                    let _ = send_message(
-                        tx,
-                        UiServerMessage::WorkspaceIndexStatus {
-                            session_id: session_id.clone(),
-                            status: "building".to_string(),
-                            message: None,
-                        },
-                    )
-                    .await;
-                }
-
-                handle_list_sessions(state, tx).await;
 
                 log::info!(
                     "handle_create_remote_session: created session {} on node_id '{}'",
@@ -220,12 +193,13 @@ pub async fn handle_create_remote_session(
 }
 
 #[cfg(feature = "remote")]
-async fn finalize_remote_session_attach(
+pub(crate) async fn finalize_remote_session_attach(
     state: &ServerState,
     conn_id: &str,
     node_id: &str,
     session_id: &str,
-    remote_ref: RemoteActorRef<crate::agent::session_actor::SessionActor>,
+    handoff: SessionHandoff,
+    cwd: Option<PathBuf>,
     tx: &mpsc::Sender<String>,
 ) -> Result<(), String> {
     let peer_label = state
@@ -237,6 +211,19 @@ async fn finalize_remote_session_attach(
         .map(|n| n.hostname)
         .unwrap_or_else(|| node_id.to_string());
 
+    let remote_ref = match handoff {
+        SessionHandoff::DirectRemote { session_ref } => session_ref,
+        SessionHandoff::LookupOnly => {
+            lookup_remote_session_actor(state, node_id, session_id).await?
+        }
+        SessionHandoff::NoAttachPath => {
+            return Err(format!(
+                "Remote session '{}' was created on node '{}' but that node cannot provide a direct or lookup attach path",
+                session_id, node_id
+            ));
+        }
+    };
+
     let _session_actor_ref = state
         .agent
         .attach_remote_session(
@@ -247,8 +234,6 @@ async fn finalize_remote_session_attach(
         )
         .await;
 
-    // Health-check the attached session before publishing SessionLoaded.
-    // This avoids rendering a session that cannot accept prompts.
     let attached_session_ref = {
         let registry = state.agent.registry.lock().await;
         registry.get(session_id).cloned()
@@ -282,12 +267,11 @@ async fn finalize_remote_session_attach(
         agents.insert(session_id.to_string(), agent_id.clone());
     }
 
-    if let Some(cwd_path) = state.default_cwd.clone() {
+    if let Some(cwd_path) = cwd {
         let mut cwds = state.session_cwds.lock().await;
         cwds.insert(session_id.to_string(), cwd_path);
     }
 
-    // Fetch remote event history so the UI can render the conversation.
     let remote_events = {
         let session_ref = {
             let registry = state.agent.registry.lock().await;
@@ -330,8 +314,6 @@ async fn finalize_remote_session_attach(
         generated_at: time::OffsetDateTime::now_utc(),
     };
 
-    // Seed connection cursor so the event forwarder won't drop events
-    // that arrive while we're still sending the SessionLoaded payload.
     {
         let mut connections = state.connections.lock().await;
         if let Some(conn) = connections.get_mut(conn_id) {
@@ -363,7 +345,7 @@ async fn finalize_remote_session_attach(
     .await;
 
     super::super::connection::send_state(state, conn_id, tx).await;
-    handle_list_sessions(state, tx).await;
+    handle_list_sessions(state, tx, None, None, None, None, None).await;
 
     log::info!(
         "handle_attach_remote_session: attached session {} from node_id '{}'",
@@ -456,8 +438,43 @@ pub(crate) async fn attach_remote_session_via_lookup(
     session_id: &str,
     tx: &mpsc::Sender<String>,
 ) -> Result<(), String> {
-    let remote_ref = lookup_remote_session_actor(state, node_id, session_id).await?;
-    finalize_remote_session_attach(state, conn_id, node_id, session_id, remote_ref, tx).await
+    match finalize_remote_session_attach(
+        state,
+        conn_id,
+        node_id,
+        session_id,
+        SessionHandoff::LookupOnly,
+        None,
+        tx,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(lookup_err) => {
+            let nm_ref = state
+                .agent
+                .find_node_manager(node_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let resumed = state
+                .agent
+                .resume_remote_session(&nm_ref, session_id.to_string())
+                .await
+                .map_err(|e| e.to_string())?;
+
+            finalize_remote_session_attach(
+                state,
+                conn_id,
+                node_id,
+                session_id,
+                resumed.handoff,
+                resumed.cwd.map(PathBuf::from),
+                tx,
+            )
+            .await
+            .map_err(|resume_err| format!("{lookup_err}; resume failed: {resume_err}"))
+        }
+    }
 }
 
 /// Attach an existing remote session to the local registry.
@@ -519,7 +536,7 @@ pub async fn handle_dismiss_remote_session(
     }
 
     // 3. Refresh session list
-    handle_list_sessions(state, tx).await;
+    handle_list_sessions(state, tx, None, None, None, None, None).await;
 }
 
 /// Create a mesh invite token on the local node.

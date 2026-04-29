@@ -1251,85 +1251,44 @@ impl LocalAgentHandle {
             .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
     }
 
-    /// Create a session on a remote node and attach it to the local registry.
+    /// Create a session on a remote node and return the owning node's live session ref.
     ///
-    /// 1. Sends `CreateRemoteSession` to the remote `RemoteNodeManager`
-    /// 2. Gets back `(session_id, actor_id)` for the new remote `SessionActor`
-    /// 3. Looks up `RemoteActorRef<SessionActor>` by the session-scoped DHT name
-    ///    that `RemoteNodeManager` registered under `"session::{session_id}"`.
-    /// 4. Calls `attach_remote_session` on the local registry to insert it
-    ///    and set up event relay
-    ///
-    /// Returns the new session's ID and a `SessionActorRef` for it.
+    /// Callers can immediately finalize local attachment from the returned capability
+    /// while DHT registration continues as background discoverability for reconnects.
     #[cfg(feature = "remote")]
     pub async fn create_remote_session(
         &self,
         node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
-        remote_node_id: String,
-        peer_label: String,
         cwd: Option<String>,
-    ) -> Result<(String, crate::agent::remote::SessionActorRef), agent_client_protocol::Error> {
+    ) -> Result<crate::agent::remote::CreateRemoteSessionResponse, agent_client_protocol::Error>
+    {
         use crate::agent::remote::CreateRemoteSession;
-        use crate::agent::session_actor::SessionActor;
-
         use crate::error::AgentError;
-        let mesh = self
-            .mesh()
-            .ok_or_else(|| agent_client_protocol::Error::from(AgentError::MeshNotBootstrapped))?;
 
-        let resp = node_manager_ref
+        node_manager_ref
             .ask(&CreateRemoteSession { cwd })
             .await
-            .map_err(|e| {
-                agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string()))
-            })?;
+            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+    }
 
-        let session_id = resp.session_id.clone();
+    /// Fork a session on a remote node and return the forked child's live session ref.
+    #[cfg(feature = "remote")]
+    pub async fn fork_remote_session(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        source_session_id: String,
+        message_id: String,
+    ) -> Result<crate::agent::remote::ForkRemoteSessionResponse, agent_client_protocol::Error> {
+        use crate::agent::remote::ForkRemoteSession;
+        use crate::error::AgentError;
 
-        // Resolve the RemoteActorRef<SessionActor> via DHT lookup.
-        // RemoteNodeManager registers the session under "session::{session_id}"
-        // in its CreateRemoteSession handler once the swarm is up.
-        let dht_name = crate::agent::remote::dht_name::session(&session_id);
-        let remote_session_ref = mesh
-            .lookup_actor::<SessionActor>(dht_name.clone())
+        node_manager_ref
+            .ask(&ForkRemoteSession {
+                source_session_id,
+                message_id,
+            })
             .await
-            .map_err(|e| {
-                agent_client_protocol::Error::from(AgentError::SwarmLookupFailed {
-                    key: dht_name.clone(),
-                    reason: e.to_string(),
-                })
-            })?
-            .ok_or_else(|| {
-                agent_client_protocol::Error::from(AgentError::RemoteSessionNotFound {
-                    details: format!(
-                        "session {} (actor_id={}) not found in DHT under '{}'; \
-                     remote node may not have registered it yet",
-                        session_id, resp.actor_id, dht_name
-                    ),
-                })
-            })?;
-
-        // Attach to local registry (spawns EventRelayActor, sends SubscribeEvents)
-        // Persist the remote owner node id (not our local node id).
-        let node_id_str = remote_node_id;
-        let mut registry = self.registry.lock().await;
-        let session_actor_ref = registry
-            .attach_remote_session(
-                session_id.clone(),
-                remote_session_ref,
-                peer_label,
-                Some(mesh),
-                Some(node_id_str),
-            )
-            .await;
-
-        log::info!(
-            "create_remote_session: attached {} from DHT lookup '{}'",
-            session_id,
-            dht_name
-        );
-
-        Ok((session_id, session_actor_ref))
+            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
     }
 
     /// Attach an existing remote session (already has a `RemoteActorRef`) to
@@ -1351,6 +1310,113 @@ impl LocalAgentHandle {
         registry
             .attach_remote_session(session_id, remote_ref, peer_label, mesh, remote_node_id)
             .await
+    }
+
+    #[cfg(feature = "remote")]
+    pub async fn resume_remote_session(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        session_id: String,
+    ) -> Result<crate::agent::remote::CreateRemoteSessionResponse, agent_client_protocol::Error>
+    {
+        use crate::agent::remote::ResumeRemoteSession;
+        use crate::error::AgentError;
+
+        node_manager_ref
+            .ask(&ResumeRemoteSession { session_id })
+            .await
+            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+    }
+
+    pub async fn stop_session(&self, session_id: &str) -> Result<(), Error> {
+        use crate::agent::messages::SessionRuntimeStatus;
+
+        const STOP_ESCALATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+        let session_ref = {
+            let registry = self.registry.lock().await;
+            registry.get(session_id).cloned()
+        };
+
+        let Some(session_ref) = session_ref else {
+            log::warn!(
+                "Stop requested for session {} but not found in registry",
+                session_id
+            );
+            return Ok(());
+        };
+
+        self.config
+            .emit_event(session_id, AgentEventKind::SessionStopRequested);
+        let _ = session_ref.cancel().await;
+
+        tokio::time::sleep(STOP_ESCALATION_TIMEOUT).await;
+
+        let status = session_ref
+            .get_runtime_status()
+            .await
+            .unwrap_or(SessionRuntimeStatus::Running);
+        if matches!(
+            status,
+            SessionRuntimeStatus::Idle | SessionRuntimeStatus::CancelRequested
+        ) {
+            tracing::debug!(
+                "Session {} stop: status={:?}, graceful shutdown — returning without force-stop",
+                session_id,
+                status
+            );
+            return Ok(());
+        }
+
+        self.config.emit_event(
+            session_id,
+            AgentEventKind::SessionForceStopped {
+                escalated_after_ms: STOP_ESCALATION_TIMEOUT.as_millis() as u64,
+                reason: "graceful cancellation timeout elapsed".to_string(),
+            },
+        );
+
+        if session_ref.is_remote() {
+            #[cfg(feature = "remote")]
+            {
+                let bookmark = self
+                    .config
+                    .provider
+                    .history_store()
+                    .list_remote_session_bookmarks()
+                    .await
+                    .map_err(|e| Error::internal_error().data(e.to_string()))?
+                    .into_iter()
+                    .find(|b| b.session_id == session_id);
+
+                if let Some(bookmark) = bookmark {
+                    let nm_ref = self.find_node_manager(&bookmark.node_id).await?;
+                    nm_ref
+                        .ask(&crate::agent::remote::DestroyRemoteSession {
+                            session_id: session_id.to_string(),
+                        })
+                        .await
+                        .map_err(|e| {
+                            Error::from(crate::error::AgentError::RemoteActor(e.to_string()))
+                        })?;
+                }
+
+                let mut registry = self.registry.lock().await;
+                registry
+                    .detach_remote_session_preserve_bookmark(session_id)
+                    .await;
+            }
+        } else {
+            let removed = {
+                let mut registry = self.registry.lock().await;
+                registry.remove(session_id)
+            };
+            if let Some(session_ref) = removed {
+                let _ = session_ref.shutdown().await;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1626,21 +1692,7 @@ impl SendAgent for LocalAgentHandle {
     #[tracing::instrument(name = "acp.cancel", skip_all, fields(session_id = %notif.session_id))]
     async fn cancel(&self, notif: CancelNotification) -> Result<(), Error> {
         let session_id = notif.session_id.to_string();
-
-        let session_ref = {
-            let registry = self.registry.lock().await;
-            registry.get(&session_id).cloned()
-        };
-
-        if let Some(session_ref) = session_ref {
-            let _ = session_ref.cancel().await;
-        } else {
-            log::warn!(
-                "Cancel requested for session {} but not found in registry",
-                session_id
-            );
-        }
-        Ok(())
+        self.stop_session(&session_id).await
     }
 
     #[tracing::instrument(name = "acp.load_session", skip_all, fields(session_id = %req.session_id))]
@@ -2319,7 +2371,7 @@ mod tests {
     async fn test_cancel_unknown_session_is_noop() {
         let f = HandleFixture::new().await;
         let notif = CancelNotification::new(SessionId::from("no-such-session".to_string()));
-        // Should not return an error — cancel for unknown sessions is a no-op
+        // Should not return an error — stop for unknown sessions is a no-op
         let result = SendAgent::cancel(&f.handle, notif).await;
         assert!(result.is_ok());
     }

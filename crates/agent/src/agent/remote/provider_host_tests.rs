@@ -323,13 +323,18 @@ mod provider_host_tests {
     fn test_stream_chunk_relay_err_roundtrip() {
         let relay = StreamChunkRelay {
             message: StreamRelayMessage::ProviderError {
-                message: "oops".to_string(),
+                error: querymt::error::LLMError::ProviderError("oops".to_string()).to_payload(),
             },
         };
         let json = serde_json::to_string(&relay).expect("serialize");
         let back: StreamChunkRelay = serde_json::from_str(&json).expect("deserialize");
         match back.message {
-            StreamRelayMessage::ProviderError { message } => assert_eq!(message, "oops"),
+            StreamRelayMessage::ProviderError { error } => {
+                assert_eq!(
+                    querymt::error::LLMError::from_payload(error).to_string(),
+                    "LLM Provider Error: oops"
+                )
+            }
             other => panic!("expected ProviderError, got {:?}", other),
         }
     }
@@ -404,7 +409,7 @@ mod provider_host_tests {
 
         let done_relay = StreamChunkRelay {
             message: StreamRelayMessage::Chunk(StreamChunk::Done {
-                stop_reason: "end_turn".to_string(),
+                finish_reason: querymt::chat::FinishReason::Stop,
             }),
         };
 
@@ -448,7 +453,7 @@ mod provider_host_tests {
 
         let error_relay = StreamChunkRelay {
             message: StreamRelayMessage::ProviderError {
-                message: "boom".to_string(),
+                error: querymt::error::LLMError::ProviderError("boom".to_string()).to_payload(),
             },
         };
 
@@ -461,7 +466,12 @@ mod provider_host_tests {
 
         let received = rx.try_recv().expect("should have received error chunk");
         match received {
-            StreamRelayMessage::ProviderError { message } => assert_eq!(message, "boom"),
+            StreamRelayMessage::ProviderError { error } => {
+                assert_eq!(
+                    querymt::error::LLMError::from_payload(error).to_string(),
+                    "LLM Provider Error: boom"
+                )
+            }
             other => panic!("expected ProviderError, got {:?}", other),
         }
 

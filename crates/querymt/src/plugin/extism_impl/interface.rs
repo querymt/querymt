@@ -2,7 +2,7 @@ use crate::{
     ToolCall, Usage,
     chat::{ChatMessage, ChatResponse, FinishReason, Tool},
     completion::CompletionRequest,
-    error::LLMError,
+    error::{LLMError, LLMErrorPayload},
     stt, tts,
 };
 use serde::{Deserialize, Serialize};
@@ -18,87 +18,31 @@ use std::fmt;
 /// and received via `call_get_error_code` on the host side.
 /// The error string is JSON-serialized [`PluginError`].
 pub mod error_codes {
-    pub const GENERIC: i32 = 0;
-    pub const PROVIDER: i32 = 1;
-    pub const AUTH: i32 = 2;
-    pub const INVALID_REQUEST: i32 = 3;
-    pub const RATE_LIMITED: i32 = 4;
-    pub const HTTP: i32 = 5;
-    pub const NOT_IMPLEMENTED: i32 = 6;
-    pub const CANCELLED: i32 = 7;
+    pub const STRUCTURED: i32 = 1;
 }
 
 /// Structured error that crosses the WASM boundary as JSON.
 ///
-/// On the plugin side, [`LLMError`] is converted into this type and serialized
-/// to JSON as the extism error string, paired with an [`error_codes`] integer
-/// via `WithReturnCode`. On the host side, `call_get_error_code` yields
-/// `(error_string, code)` — the code selects the variant and the JSON string
-/// is deserialized back into this type to reconstruct the original [`LLMError`].
+/// On the plugin side, [`LLMError`] is converted into a serializable payload and
+/// sent as JSON paired with a stable code. On the host side, the payload is
+/// reconstructed back into the original [`LLMError`] without stringifying it.
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
-#[serde(tag = "kind", content = "data")]
-pub enum PluginError {
-    #[error("LLM Provider Error: {0}")]
-    Provider(String),
-
-    #[error("Auth Error: {0}")]
-    Auth(String),
-
-    #[error("Invalid Request: {0}")]
-    InvalidRequest(String),
-
-    #[error("Rate limited: {message}")]
-    RateLimited {
-        message: String,
-        retry_after_secs: Option<u64>,
-    },
-
-    #[error("HTTP Error: {0}")]
-    Http(String),
-
-    #[error("Cancelled")]
-    Cancelled,
-
-    #[error("Not Implemented: {0}")]
-    NotImplemented(String),
-
-    #[error("{0}")]
-    Generic(String),
+#[error("{payload:?}")]
+pub struct PluginError {
+    pub payload: LLMErrorPayload,
 }
 
 impl PluginError {
     /// Convert an [`LLMError`] into a `PluginError` for WASM transport.
     pub fn from_llm_error(err: &LLMError) -> Self {
-        match err {
-            LLMError::ProviderError(msg) => Self::Provider(msg.clone()),
-            LLMError::AuthError(msg) => Self::Auth(msg.clone()),
-            LLMError::InvalidRequest(msg) => Self::InvalidRequest(msg.clone()),
-            LLMError::RateLimited {
-                message,
-                retry_after_secs,
-            } => Self::RateLimited {
-                message: message.clone(),
-                retry_after_secs: *retry_after_secs,
-            },
-            LLMError::HttpError(msg) => Self::Http(msg.clone()),
-            LLMError::Cancelled => Self::Cancelled,
-            LLMError::NotImplemented(msg) => Self::NotImplemented(msg.clone()),
-            other => Self::Generic(other.to_string()),
+        Self {
+            payload: err.to_payload(),
         }
     }
 
     /// Error code for this variant, matching [`error_codes`].
     pub fn code(&self) -> i32 {
-        match self {
-            Self::Provider(_) => error_codes::PROVIDER,
-            Self::Auth(_) => error_codes::AUTH,
-            Self::InvalidRequest(_) => error_codes::INVALID_REQUEST,
-            Self::RateLimited { .. } => error_codes::RATE_LIMITED,
-            Self::Http(_) => error_codes::HTTP,
-            Self::Cancelled => error_codes::CANCELLED,
-            Self::NotImplemented(_) => error_codes::NOT_IMPLEMENTED,
-            Self::Generic(_) => error_codes::GENERIC,
-        }
+        error_codes::STRUCTURED
     }
 
     /// Serialize an [`LLMError`] into a `(json_string, error_code)` pair
@@ -112,54 +56,13 @@ impl PluginError {
 
     /// Reconstruct an [`LLMError`] from an error code and JSON string
     /// received from the WASM plugin.
-    ///
-    /// The error code determines which [`LLMError`] variant to construct.
-    /// The JSON string is deserialized for the structured payload (e.g.
-    /// `retry_after_secs` on rate-limit errors). Falls back to using the
-    /// raw string as the message if JSON parsing fails.
     pub fn decode(code: i32, json: &str) -> LLMError {
-        // Try to deserialize the JSON into PluginError first
-        let msg_from_json = || -> String {
-            serde_json::from_str::<PluginError>(json)
-                .map(|pe| match pe {
-                    Self::Provider(m)
-                    | Self::Auth(m)
-                    | Self::InvalidRequest(m)
-                    | Self::Http(m)
-                    | Self::NotImplemented(m)
-                    | Self::Generic(m) => m,
-                    Self::Cancelled => "cancelled".to_string(),
-                    Self::RateLimited { message, .. } => message,
-                })
-                .unwrap_or_else(|_| json.to_string())
-        };
-
-        match code {
-            error_codes::PROVIDER => LLMError::ProviderError(msg_from_json()),
-            error_codes::AUTH => LLMError::AuthError(msg_from_json()),
-            error_codes::INVALID_REQUEST => LLMError::InvalidRequest(msg_from_json()),
-            error_codes::RATE_LIMITED => {
-                if let Ok(PluginError::RateLimited {
-                    message,
-                    retry_after_secs,
-                }) = serde_json::from_str::<PluginError>(json)
-                {
-                    LLMError::RateLimited {
-                        message,
-                        retry_after_secs,
-                    }
-                } else {
-                    LLMError::RateLimited {
-                        message: msg_from_json(),
-                        retry_after_secs: None,
-                    }
-                }
-            }
-            error_codes::HTTP => LLMError::HttpError(msg_from_json()),
-            error_codes::CANCELLED => LLMError::Cancelled,
-            error_codes::NOT_IMPLEMENTED => LLMError::NotImplemented(msg_from_json()),
-            _ => LLMError::PluginError(msg_from_json()),
+        if code == error_codes::STRUCTURED {
+            return serde_json::from_str::<PluginError>(json)
+                .map(|pe| LLMError::from_payload(pe.payload))
+                .unwrap_or_else(|_| LLMError::PluginError(json.to_string()));
         }
+        LLMError::PluginError(json.to_string())
     }
 }
 

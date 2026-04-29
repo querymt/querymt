@@ -32,7 +32,7 @@ use querymt::LLMProvider;
 use querymt::chat::{ChatMessage, ChatProvider, StreamChunk, Tool};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
-use querymt::error::LLMError;
+use querymt::error::{LLMError, LLMErrorPayload, TransportErrorKind};
 use std::pin::Pin;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -167,12 +167,10 @@ impl ChatProvider for MeshChatProvider {
         };
 
         // ask() flattens Result<Result<T,E>, RemoteSendError> into Result<T, RemoteSendError<E>>
-        let chat_response = host_ref.ask(&request).await.map_err(|e| {
-            LLMError::ProviderError(format!(
-                "MeshChatProvider: remote call to '{}' failed: {}",
-                self.target_dht_name, e
-            ))
-        })?;
+        let chat_response = host_ref
+            .ask(&request)
+            .await
+            .map_err(remote_send_error_to_llm_error_with_handler)?;
 
         log::debug!(
             "MeshChatProvider: non-streaming response from {} ({}/{})",
@@ -258,12 +256,10 @@ impl ChatProvider for MeshChatProvider {
             params: self.params.clone(),
         };
 
-        host_ref.tell(&stream_request).send().map_err(|e| {
-            LLMError::ProviderError(format!(
-                "MeshChatProvider: failed to send stream request to '{}': {}",
-                self.target_dht_name, e
-            ))
-        })?;
+        host_ref
+            .tell(&stream_request)
+            .send()
+            .map_err(remote_send_error_to_llm_error_no_handler)?;
 
         log::debug!(
             "MeshChatProvider: streaming request sent to {} ({}/{})",
@@ -306,10 +302,13 @@ impl ChatProvider for MeshChatProvider {
                         let remaining = reconnect_grace.saturating_sub(elapsed);
                         if remaining.is_zero() {
                             return Some((
-                                Err(LLMError::ProviderError(format!(
-                                    "MeshChatProvider: reconnect grace expired after {:?}",
-                                    reconnect_grace,
-                                ))),
+                                Err(LLMError::Transport {
+                                    kind: TransportErrorKind::Timeout,
+                                    message: format!(
+                                        "reconnect grace expired after {:?}",
+                                        reconnect_grace,
+                                    ),
+                                }),
                                 (raw_stream, disconnected_since, chunk_index),
                             ));
                         }
@@ -317,10 +316,13 @@ impl ChatProvider for MeshChatProvider {
                             Ok(item) => item,
                             Err(_) => {
                                 return Some((
-                                    Err(LLMError::ProviderError(format!(
-                                        "MeshChatProvider: reconnect grace expired after {:?}",
-                                        reconnect_grace,
-                                    ))),
+                                    Err(LLMError::Transport {
+                                        kind: TransportErrorKind::Timeout,
+                                        message: format!(
+                                            "reconnect grace expired after {:?}",
+                                            reconnect_grace,
+                                        ),
+                                    }),
                                     (raw_stream, disconnected_since, chunk_index),
                                 ));
                             }
@@ -333,25 +335,34 @@ impl ChatProvider for MeshChatProvider {
                         Some(StreamRelayMessage::Chunk(chunk)) => {
                             chunk_index += 1;
                             let elapsed_ms = stream_start.elapsed().as_millis();
-                            let is_done = matches!(&chunk, StreamChunk::Done { .. });
-                            tracing::trace!(
-                                target: "remote::mesh_provider::stream",
-                                provider = %provider_for_stream,
-                                model = %model_for_stream,
-                                target_node = %target_for_stream,
-                                stream_rx = %stream_rx_name_for_log,
-                                chunk_index,
-                                elapsed_ms,
-                                is_done,
-                                "stream chunk received"
-                            );
+                            if let StreamChunk::Done { finish_reason } = &chunk {
+                                tracing::debug!(
+                                    target: "remote::mesh_provider::stream",
+                                    provider = %provider_for_stream,
+                                    model = %model_for_stream,
+                                    target_node = %target_for_stream,
+                                    stream_rx = %stream_rx_name_for_log,
+                                    chunk_index,
+                                    elapsed_ms,
+                                    finish_reason = ?finish_reason,
+                                    "stream done received from remote provider"
+                                );
+                            } else {
+                                tracing::trace!(
+                                    target: "remote::mesh_provider::stream",
+                                    provider = %provider_for_stream,
+                                    model = %model_for_stream,
+                                    target_node = %target_for_stream,
+                                    stream_rx = %stream_rx_name_for_log,
+                                    chunk_index,
+                                    elapsed_ms,
+                                    "stream chunk received"
+                                );
+                            }
                             Some((Ok(chunk), (raw_stream, None, chunk_index)))
                         }
-                        Some(StreamRelayMessage::ProviderError { message }) => Some((
-                            Err(LLMError::ProviderError(format!(
-                                "MeshChatProvider: {}",
-                                message,
-                            ))),
+                        Some(StreamRelayMessage::ProviderError { error }) => Some((
+                            Err(LLMError::from_payload(error)),
                             (raw_stream, disconnected_since, chunk_index),
                         )),
                         Some(StreamRelayMessage::TransportDisconnected { reason }) => {
@@ -378,11 +389,8 @@ impl ChatProvider for MeshChatProvider {
                                 (raw_stream, None, chunk_index),
                             ))
                         }
-                        Some(StreamRelayMessage::TransportFailed { reason }) => Some((
-                            Err(LLMError::ProviderError(format!(
-                                "MeshChatProvider: transport failed: {}",
-                                reason,
-                            ))),
+                        Some(StreamRelayMessage::TransportFailed { error }) => Some((
+                            Err(LLMError::from_payload(error)),
                             (raw_stream, disconnected_since, chunk_index),
                         )),
                         None => {
@@ -391,10 +399,13 @@ impl ChatProvider for MeshChatProvider {
                                 .is_some_and(|peer_id| mesh.is_peer_alive(peer_id));
                             if disconnected_since.is_some() || !peer_alive {
                                 Some((
-                                    Err(LLMError::ProviderError(format!(
-                                        "MeshChatProvider: stream receiver closed (peer_alive={})",
-                                        peer_alive,
-                                    ))),
+                                    Err(LLMError::Transport {
+                                        kind: TransportErrorKind::ConnectionClosed,
+                                        message: format!(
+                                            "stream receiver closed (peer_alive={})",
+                                            peer_alive,
+                                        ),
+                                    }),
                                     (raw_stream, disconnected_since, chunk_index),
                                 ))
                             } else {
@@ -435,6 +446,93 @@ impl EmbeddingProvider for MeshChatProvider {
 // ── LLMProvider ───────────────────────────────────────────────────────────────
 
 impl LLMProvider for MeshChatProvider {}
+
+fn remote_send_error_base<E>(error: kameo::error::RemoteSendError<E>) -> Result<LLMError, E> {
+    use kameo::error::RemoteSendError;
+
+    match error {
+        RemoteSendError::ActorNotRunning | RemoteSendError::ActorStopped => {
+            Ok(LLMError::Transport {
+                kind: TransportErrorKind::ConnectionClosed,
+                message: "remote actor not running".to_string(),
+            })
+        }
+        RemoteSendError::UnknownActor { .. } | RemoteSendError::UnknownMessage { .. } => {
+            Ok(LLMError::Transport {
+                kind: TransportErrorKind::ConnectionClosed,
+                message: "remote actor unavailable".to_string(),
+            })
+        }
+        RemoteSendError::BadActorType => {
+            Ok(LLMError::ProviderError("bad remote actor type".to_string()))
+        }
+        RemoteSendError::MailboxFull => Ok(LLMError::Transport {
+            kind: TransportErrorKind::Other,
+            message: "remote mailbox full".to_string(),
+        }),
+        RemoteSendError::ReplyTimeout | RemoteSendError::NetworkTimeout => {
+            Ok(LLMError::Transport {
+                kind: TransportErrorKind::Timeout,
+                message: "network timeout".to_string(),
+            })
+        }
+        RemoteSendError::DialFailure => Ok(LLMError::Transport {
+            kind: TransportErrorKind::ConnectionRefused,
+            message: "dial failure".to_string(),
+        }),
+        RemoteSendError::ConnectionClosed => Ok(LLMError::Transport {
+            kind: TransportErrorKind::ConnectionClosed,
+            message: "connection closed".to_string(),
+        }),
+        RemoteSendError::UnsupportedProtocols => Ok(LLMError::ProviderError(
+            "remote protocol unsupported".to_string(),
+        )),
+        RemoteSendError::SerializeMessage(err)
+        | RemoteSendError::DeserializeMessage(err)
+        | RemoteSendError::SerializeReply(err)
+        | RemoteSendError::SerializeHandlerError(err)
+        | RemoteSendError::DeserializeHandlerError(err) => Ok(LLMError::ProviderError(err)),
+        RemoteSendError::SwarmNotBootstrapped => Ok(LLMError::Transport {
+            kind: TransportErrorKind::Other,
+            message: "swarm not bootstrapped".to_string(),
+        }),
+        RemoteSendError::Io(Some(err)) => Ok(LLMError::from(err)),
+        RemoteSendError::Io(None) => Ok(LLMError::Transport {
+            kind: TransportErrorKind::Other,
+            message: "remote IO failure".to_string(),
+        }),
+        RemoteSendError::HandlerError(err) => Err(err),
+    }
+}
+
+fn remote_send_error_to_llm_error_with_handler(
+    error: kameo::error::RemoteSendError<crate::error::AgentError>,
+) -> LLMError {
+    match remote_send_error_base(error) {
+        Ok(err) => err,
+        Err(agent_error) => decode_remote_handler_error(agent_error),
+    }
+}
+
+fn remote_send_error_to_llm_error_no_handler(
+    error: kameo::error::RemoteSendError<kameo::error::Infallible>,
+) -> LLMError {
+    match remote_send_error_base(error) {
+        Ok(err) => err,
+        Err(never) => match never {},
+    }
+}
+
+fn decode_remote_handler_error(agent_error: crate::error::AgentError) -> LLMError {
+    match agent_error {
+        crate::error::AgentError::ProviderChat { reason, .. } => {
+            serde_json::from_str::<LLMErrorPayload>(&reason)
+                .map(LLMError::from_payload)
+                .unwrap_or_else(|_| LLMError::ProviderError(reason))
+        }
+        other => LLMError::ProviderError(other.to_string()),
+    }
+}
 
 // ── find_provider_on_mesh ─────────────────────────────────────────────────────
 

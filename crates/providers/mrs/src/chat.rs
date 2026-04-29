@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use futures::TryFutureExt;
 use mistralrs::{ChatCompletionResponse, RequestBuilder, ResponseOk};
-use querymt::chat::{ChatMessage, ChatProvider, ChatResponse, StreamChunk, Tool};
+use querymt::chat::{ChatMessage, ChatProvider, ChatResponse, FinishReason, StreamChunk, Tool};
 use querymt::error::LLMError;
 use querymt::{FunctionCall, ToolCall, Usage};
 use serde::Deserialize;
@@ -200,7 +200,7 @@ impl ChatProvider for MistralRS {
                 let mut chunks = Vec::new();
                 flush_tool_states(&mut tool_states, &mut chunks);
                 chunks.push(StreamChunk::Done {
-                    stop_reason: "end_turn".to_string(),
+                    finish_reason: FinishReason::Stop,
                 });
                 for chunk in chunks {
                     let _ = task_tx.send(Ok(chunk));

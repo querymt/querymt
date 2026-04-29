@@ -497,13 +497,12 @@ impl ChatProvider for LlamaCppProvider {
                     ) {
                         Ok((usage, has_tool_calls)) => {
                             let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Usage(usage)));
-                            let stop_reason = if has_tool_calls {
-                                "tool_use"
-                            } else {
-                                "end_turn"
-                            };
                             let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Done {
-                                stop_reason: stop_reason.to_string(),
+                                finish_reason: if has_tool_calls {
+                                    FinishReason::ToolCalls
+                                } else {
+                                    FinishReason::Stop
+                                },
                             }));
                         }
                         Err(err) => {
@@ -551,7 +550,7 @@ impl ChatProvider for LlamaCppProvider {
                     Ok(usage) => {
                         let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Usage(usage)));
                         let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Done {
-                            stop_reason: "end_turn".to_string(),
+                            finish_reason: FinishReason::Stop,
                         }));
                     }
                     Err(err) => {
@@ -592,7 +591,7 @@ impl ChatProvider for LlamaCppProvider {
             if let Some(usage) = final_usage {
                 let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Usage(usage)));
                 let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Done {
-                    stop_reason: "end_turn".to_string(),
+                    finish_reason: FinishReason::Stop,
                 }));
             }
         });

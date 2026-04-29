@@ -53,6 +53,19 @@ export type AgentEventKind =
 	message: string;
 	message_id?: string;
 }}
+	/**
+	 * Ephemeral signal emitted when mid-stream transport error is detected.
+	 * Accumulated text is discarded and a new stream is being created.
+	 */
+	| { type: "stream_recovering", data: {
+	/** Human-readable error message that triggered the retry */
+	message: string;
+	/** Current attempt (1-indexed) */
+	attempt: number;
+	/** Maximum attempts */
+	max_attempts: number;
+	message_id?: string;
+}}
 	| { type: "llm_request_start", data: {
 	message_count: number;
 }}
@@ -118,6 +131,11 @@ export type AgentEventKind =
 	/** Emitted when a prompt is queued because another operation is executing */
 	| { type: "session_queued", data: {
 	/** Reason for queueing (e.g., "waiting for previous operation to complete") */
+	reason: string;
+}}
+	| { type: "session_stop_requested", data?: undefined }
+	| { type: "session_force_stopped", data: {
+	escalated_after_ms: number;
 	reason: string;
 }}
 	| { type: "cancelled", data?: undefined }
@@ -721,6 +739,8 @@ export interface RemoteSessionInfo {
 	title?: string;
 	/** Human-readable label of the peer that owns this session */
 	peer_label: string;
+	/** High-level runtime lifecycle state for UI summaries. */
+	runtime_state?: string;
 }
 
 /** Schedule information DTO for the UI. */
@@ -750,30 +770,14 @@ export interface SessionSummary {
 	title?: string;
 	created_at?: string;
 	updated_at?: string;
-	/** Public ID of the parent session (if this is a child session) */
 	parent_session_id?: string;
-	/** Fork origin: "user" or "delegation" */
 	fork_origin?: string;
-	/** Session kind for specialized workflows (e.g. "recurring") */
 	session_kind?: string;
-	/** Whether this session has child sessions */
 	has_children: boolean;
-	/**
-	 * Node label where this session lives. "local" for local sessions,
-	 * peer hostname/label for remote sessions (display only).
-	 */
 	node?: string;
-	/**
-	 * Stable PeerId of the remote node. Required by the frontend to send
-	 * `attach_remote_session`. Only set for remote sessions.
-	 */
 	node_id?: string;
-	/**
-	 * Whether this remote session is currently attached (has a live actor ref).
-	 * `Some(true)` = attached, `Some(false)` = discovered but not attached,
-	 * `None` = local session (not applicable).
-	 */
 	attached?: boolean;
+	runtime_state?: string;
 }
 
 /** Group of sessions by working directory. */
@@ -781,6 +785,8 @@ export interface SessionGroup {
 	cwd?: string;
 	sessions: SessionSummary[];
 	latest_activity?: string;
+	total_count: number;
+	next_cursor?: string;
 }
 
 /**
@@ -948,7 +954,18 @@ export type UiClientMessage =
 	| { type: "prompt", data: {
 	prompt: UiPromptBlock[];
 }}
-	| { type: "list_sessions", data?: undefined }
+	| { type: "list_sessions", data: {
+	/** Query mode: browse (default), group, or search. */
+	mode?: string;
+	/** Opaque pagination cursor (offset as string for now). */
+	cursor?: string;
+	/** Max number of sessions to return. */
+	limit?: number;
+	/** Group key for mode=group (cwd path or null-group marker). */
+	cwd?: string;
+	/** Search query for mode=search. */
+	query?: string;
+}}
 	| { type: "load_session", data: {
 	session_id: string;
 }}
@@ -1235,6 +1252,8 @@ export type UiServerMessage =
 }}
 	| { type: "session_list", data: {
 	groups: SessionGroup[];
+	next_cursor?: string;
+	total_count: number;
 }}
 	| { type: "session_loaded", data: {
 	session_id: string;
