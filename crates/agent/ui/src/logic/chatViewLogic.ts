@@ -288,6 +288,9 @@ export function buildEventRowsWithDelegations(events: EventItem[]): {
     string,
     { eventId: string; depth: number; kind?: string; name?: string; rowIndex?: number }
   >();
+  // Holds tool_result events seen before their matching tool_call.
+  // Keyed by tool_call_id; attached retroactively when the call arrives.
+  const pendingToolResultsById = new Map<string, EventItem>();
   let currentAgentId: string | null = null;
   const pendingDelegationsByAgent = new Map<string, string[]>();
   const delegationIdToToolCall = new Map<string, string>();
@@ -483,6 +486,34 @@ export function buildEventRowsWithDelegations(events: EventItem[]): {
       
       depthMap.set(event.id, depth);
       rows.push({ ...event, depth, parentId, toolName, isDelegateToolCall, delegationGroupId });
+
+      // If there's a pending tool_result (arrived before this tool_call), attach it now
+      if (toolCallKey && pendingToolResultsById.has(toolCallKey)) {
+        const pendingResult = pendingToolResultsById.get(toolCallKey)!;
+        const insertedRow = rows[rows.length - 1];
+        insertedRow.mergedResult = pendingResult;
+        pendingToolResultsById.delete(toolCallKey);
+
+        // Also update delegation groups if applicable
+        if (delegationGroups.has(toolCallKey)) {
+          const group = delegationGroups.get(toolCallKey)!;
+          group.delegateEvent.mergedResult = pendingResult;
+          if (pendingResult.toolCall?.status === 'failed') {
+            group.status = 'failed';
+          }
+        }
+        if (insertedRow.delegationGroupId) {
+          const group = delegationGroups.get(insertedRow.delegationGroupId);
+          if (group) {
+            const groupEvent = group.events.find(
+              e => e.toolCall?.tool_call_id === toolCallKey
+            );
+            if (groupEvent) {
+              groupEvent.mergedResult = pendingResult;
+            }
+          }
+        }
+      }
     } else if (event.type === 'tool_result') {
       const toolCallKey = event.toolCall?.tool_call_id;
       const toolParent = toolCallKey ? toolCallMap.get(toolCallKey) : undefined;
@@ -515,7 +546,19 @@ export function buildEventRowsWithDelegations(events: EventItem[]): {
             }
           }
         }
+
+        // Clear any pending result for this key (already applied)
+        if (toolCallKey) {
+          pendingToolResultsById.delete(toolCallKey);
+        }
       } else {
+        // No matching tool_call yet — store as pending for later attachment.
+        // When the matching tool_call arrives later, pendingToolResultsById
+        // lets the tool_call branch retroactively attach mergedResult.
+        if (toolCallKey) {
+          pendingToolResultsById.set(toolCallKey, event);
+        }
+        
         // No matching tool_call
         if (toolParent) {
           parentId = toolParent.eventId;

@@ -1,6 +1,6 @@
 use tree_sitter::{Node, Parser};
 
-use crate::anchors::symbol_cache::SymbolDigest;
+use super::super::types::SymbolDigest;
 use crate::index::symbol_index::{SymbolEntry, SymbolError, SymbolKind};
 
 pub fn extract_c(source: &str) -> Result<Vec<SymbolEntry>, SymbolError> {

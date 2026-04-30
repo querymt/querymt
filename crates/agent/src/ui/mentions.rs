@@ -90,16 +90,7 @@ pub async fn build_prompt_blocks(
         }
 
         let is_dir = metadata.is_dir();
-        let Ok(content_blocks) = render_read_output(
-            "ui-mentions",
-            &resolved_path,
-            crate::tools::builtins::read_shared::ReadRange {
-                offset: 0,
-                limit: DEFAULT_READ_LIMIT,
-                ..crate::tools::builtins::read_shared::ReadRange::default()
-            },
-        )
-        .await
+        let Ok(content_blocks) = render_read_output(&resolved_path, 0, DEFAULT_READ_LIMIT).await
         else {
             continue;
         };

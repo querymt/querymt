@@ -1,4 +1,3 @@
-use crate::anchors::{FileAnchorState, reconcile_file, render_anchored_range, resolve_anchor};
 use querymt::chat::Content;
 use std::path::Path;
 
@@ -17,26 +16,16 @@ pub(crate) fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ReadRange {
-    pub offset: usize,
-    pub limit: usize,
-    pub start_anchor: Option<String>,
-    pub end_anchor: Option<String>,
-    pub before: usize,
-    pub after: Option<usize>,
-}
-
 /// Render read output for the given path.
 ///
-/// - Text files   -> `[Content::Text]` with anchored XML-like format
-/// - Image files  -> `[Content::Image { mime_type, data }]`
-/// - Other binary -> `[Content::Text]` with a descriptive error message
-/// - Directories  -> `[Content::Text]` with entry listing
+/// - Text files   → `[Content::Text]` with line-numbered XML-like format
+/// - Image files  → `[Content::Image { mime_type, data }]`
+/// - Other binary → `[Content::Text]` with a descriptive error message
+/// - Directories  → `[Content::Text]` with entry listing
 pub async fn render_read_output(
-    session_id: &str,
     target: &Path,
-    range: ReadRange,
+    offset: usize,
+    limit: usize,
 ) -> Result<Vec<Content>, String> {
     let metadata = tokio::fs::metadata(target)
         .await
@@ -65,13 +54,28 @@ pub async fn render_read_output(
         // Not a recognised binary format — try to interpret as UTF-8 text.
         match String::from_utf8(bytes) {
             Ok(content) => {
-                let state = reconcile_file(session_id, target, &content)?;
-                let (offset, limit) =
-                    resolve_read_range(session_id, target, &content, &state, &range)?;
-                let file_content = render_anchored_range(&content, &state, offset, limit);
+                let lines: Vec<&str> = content.lines().collect();
+                let total_lines = lines.len();
+                let end_idx = (offset + limit).min(total_lines);
+
+                let mut file_content = String::new();
+                for (idx, line_content) in lines.iter().enumerate().take(end_idx).skip(offset) {
+                    let line_number = idx + 1;
+                    file_content.push_str(&format!("{:05}| {}\n", line_number, line_content));
+                }
+
+                if end_idx < total_lines {
+                    file_content.push_str(&format!(
+                        "\n(File has more lines. Use 'offset' parameter to read beyond line {})\n",
+                        end_idx
+                    ));
+                } else {
+                    file_content
+                        .push_str(&format!("\n(End of file - total {} lines)\n", total_lines));
+                }
 
                 return Ok(vec![Content::text(format!(
-                    "<path>{}</path>\n<type>file</type>\n{}",
+                    "<path>{}</path>\n<type>file</type>\n<content>\n{}</content>",
                     target.display(),
                     file_content
                 ))]);
@@ -109,11 +113,11 @@ pub async fn render_read_output(
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
         let total_entries = entries.len();
-        let end_idx = (range.offset + range.limit).min(total_entries);
+        let end_idx = (offset + limit).min(total_entries);
         let has_more = end_idx < total_entries;
 
         let mut entries_output = String::new();
-        for (name, is_dir) in entries.iter().take(end_idx).skip(range.offset) {
+        for (name, is_dir) in entries.iter().take(end_idx).skip(offset) {
             if *is_dir {
                 entries_output.push_str(&format!("{}/\n", name));
             } else {
@@ -121,7 +125,7 @@ pub async fn render_read_output(
             }
         }
 
-        let shown = end_idx.saturating_sub(range.offset.min(total_entries));
+        let shown = end_idx.saturating_sub(offset.min(total_entries));
         entries_output.push_str(&format!("({} entries)\n", shown));
         if has_more {
             entries_output.push_str("(More entries available. Use a higher offset.)\n");
@@ -135,32 +139,4 @@ pub async fn render_read_output(
     }
 
     Err("Target is neither a file nor a directory".to_string())
-}
-
-fn resolve_read_range(
-    session_id: &str,
-    target: &Path,
-    content: &str,
-    state: &FileAnchorState,
-    range: &ReadRange,
-) -> Result<(usize, usize), String> {
-    let Some(start_anchor) = range.start_anchor.as_deref() else {
-        return Ok((range.offset, range.limit));
-    };
-
-    let anchor_line = resolve_anchor(session_id, target, content, start_anchor)?;
-    let start = anchor_line.saturating_sub(range.before);
-    let end_exclusive = if let Some(end_anchor) = range.end_anchor.as_deref() {
-        let end_line = resolve_anchor(session_id, target, content, end_anchor)?;
-        if end_line < start {
-            return Err("end_anchor resolves before start_anchor/before range".to_string());
-        }
-        end_line + 1
-    } else if let Some(after) = range.after {
-        (anchor_line + after + 1).min(state.line_count)
-    } else {
-        (start + range.limit).min(state.line_count)
-    };
-
-    Ok((start, end_exclusive.saturating_sub(start).max(1)))
 }

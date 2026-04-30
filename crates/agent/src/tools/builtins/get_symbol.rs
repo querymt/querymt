@@ -9,9 +9,6 @@ use serde_json::{Value, json};
 use std::path::Path;
 use std::str::FromStr;
 
-use crate::anchors::render::ANCHOR_DELIMITER;
-use crate::anchors::symbol_cache::{check_symbol_cache, record_symbol_read};
-use crate::anchors::{reconcile_file, render_anchored_range};
 use crate::index::symbol_index::{SymbolEntry, SymbolIndex, SymbolKind, SymbolKindFilter};
 use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
 
@@ -50,7 +47,7 @@ impl Tool for GetSymbolTool {
             tool_type: "function".to_string(),
             function: FunctionTool {
                 name: self.name().to_string(),
-                description: "Read structured AST symbols from source files. Provide explicit 'requests' entries for per-symbol path, kind, and occurrence control. Returns anchored bodies on first read or when changed; repeated unchanged reads return digest metadata unless force=true. Use context_mode=relevant to include imports and parent context."
+                description: "Read structured AST symbols from source files. Provide explicit 'requests' entries for per-symbol path, kind, and occurrence control. Returns line-numbered symbol bodies with digest metadata. Use context_mode=relevant to include imports and parent context."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -79,7 +76,6 @@ impl Tool for GetSymbolTool {
                             }
                         },
                         "root": { "type": "string", "description": "Workspace root directory to resolve relative paths against.", "default": "." },
-                        "force": { "type": "boolean", "description": "When true, always return anchored symbol bodies even if unchanged.", "default": false },
                         "context_lines": { "type": "integer", "description": "Number of surrounding lines before and after the symbol to include.", "default": 0, "minimum": 0 },
                         "context_mode": {
                             "type": "string",
@@ -104,7 +100,6 @@ impl Tool for GetSymbolTool {
         args: Value,
         context: &dyn ToolContext,
     ) -> Result<Vec<Content>, ToolError> {
-        let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
         let context_lines = args
             .get("context_lines")
             .and_then(Value::as_u64)
@@ -140,21 +135,16 @@ impl Tool for GetSymbolTool {
                     continue;
                 }
             };
-            let state = reconcile_file(context.session_id(), &target, &content)
-                .map_err(ToolError::ProviderError)?;
 
             let matches = symbol_index.find_by_name(&req.symbol, req.kind);
             let result = render_symbol_result(
-                context.session_id(),
                 &target,
                 &content,
-                &state,
                 &symbol_index,
                 &matches,
                 &req.symbol,
                 req.kind,
                 req.occurrence,
-                force,
                 context_lines,
                 context_mode,
                 max_relevant,
@@ -235,16 +225,13 @@ fn append_file_result(
 
 #[allow(clippy::too_many_arguments)]
 fn render_symbol_result(
-    session_id: &str,
     path: &Path,
     content: &str,
-    state: &crate::anchors::FileAnchorState,
     symbol_index: &SymbolIndex,
     matches: &[&SymbolEntry],
     symbol_name: &str,
     kind: SymbolKindFilter,
     occurrence: usize,
-    force: bool,
     context_lines: usize,
     context_mode: &str,
     max_relevant: usize,
@@ -270,13 +257,9 @@ fn render_symbol_result(
         ));
     }
     output.push(render_single_symbol(
-        session_id,
-        path,
         content,
-        state,
         symbol_index,
         symbol,
-        force,
         context_lines,
         context_mode,
         max_relevant,
@@ -286,17 +269,15 @@ fn render_symbol_result(
 
 #[allow(clippy::too_many_arguments)]
 fn render_single_symbol(
-    session_id: &str,
-    path: &Path,
     content: &str,
-    state: &crate::anchors::FileAnchorState,
     symbol_index: &SymbolIndex,
     symbol: &SymbolEntry,
-    force: bool,
     context_lines: usize,
     context_mode: &str,
     max_relevant: usize,
 ) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
     let start_offset = symbol.start_line.saturating_sub(1);
     let end_offset_exclusive = symbol.end_line;
     let digest = &symbol.digest;
@@ -311,48 +292,21 @@ fn render_single_symbol(
         digest.line_count
     );
 
-    let unchanged = check_symbol_cache(
-        session_id,
-        path,
-        symbol.kind.as_str(),
-        &symbol.qualified_name,
-        digest,
-        start_offset,
-        end_offset_exclusive,
-    );
-    record_symbol_read(
-        session_id,
-        path,
-        symbol.kind.as_str(),
-        &symbol.qualified_name,
-        start_offset,
-        end_offset_exclusive,
-        digest.clone(),
-    );
-
-    if unchanged && !force {
-        return format!(
-            "{header}\n  No changes since your last read. Use force=true to re-read the body."
-        );
-    }
-
     let effective_context = if context_mode == "none" {
         0
     } else {
         context_lines
     };
     let render_start = start_offset.saturating_sub(effective_context);
-    let render_end = (end_offset_exclusive + effective_context).min(state.line_count);
-    let body = render_anchored_range(
-        content,
-        state,
-        render_start,
-        render_end.saturating_sub(render_start).max(1),
-    );
+    let render_end = (end_offset_exclusive + effective_context).min(total_lines);
+
+    let mut body = String::new();
+    for (idx, line) in lines.iter().enumerate().take(render_end).skip(render_start) {
+        body.push_str(&format!("{:05}| {}\n", idx + 1, line));
+    }
 
     if context_mode == "relevant" {
-        let relevant_ctx =
-            extract_relevant_context(content, state, symbol_index, symbol, max_relevant);
+        let relevant_ctx = extract_relevant_context(content, symbol_index, symbol, max_relevant);
         if relevant_ctx.is_empty() {
             format!("{header}\n{body}")
         } else {
@@ -367,7 +321,6 @@ fn render_single_symbol(
 /// parent struct/class/impl header, and parent fields.
 fn extract_relevant_context(
     content: &str,
-    state: &crate::anchors::FileAnchorState,
     symbol_index: &SymbolIndex,
     symbol: &SymbolEntry,
     max_lines: usize,
@@ -390,12 +343,8 @@ fn extract_relevant_context(
             || imp.signature.contains(&symbol.name);
         if relevant {
             let line_idx = imp.start_line.saturating_sub(1);
-            if let Some(anchor_info) = state.lines.get(line_idx) {
-                let line_text = content.lines().nth(line_idx).unwrap_or("");
-                context_lines.push(format!(
-                    "{}{}{}",
-                    anchor_info.anchor, ANCHOR_DELIMITER, line_text
-                ));
+            if let Some(line_text) = content.lines().nth(line_idx) {
+                context_lines.push(format!("{:05}| {}", line_idx + 1, line_text));
                 line_count += 1;
             }
         }
@@ -406,12 +355,8 @@ fn extract_relevant_context(
         && line_count < max_lines
     {
         let parent_start = parent.start_line.saturating_sub(1);
-        if let Some(anchor_info) = state.lines.get(parent_start) {
-            let line_text = content.lines().nth(parent_start).unwrap_or("");
-            context_lines.push(format!(
-                "{}{}{}",
-                anchor_info.anchor, ANCHOR_DELIMITER, line_text
-            ));
+        if let Some(line_text) = content.lines().nth(parent_start) {
+            context_lines.push(format!("{:05}| {}", parent_start + 1, line_text));
             line_count += 1;
         }
 
@@ -423,12 +368,8 @@ fn extract_relevant_context(
                 }
                 if child.kind == SymbolKind::Field {
                     let field_idx = child.start_line.saturating_sub(1);
-                    if let Some(anchor_info) = state.lines.get(field_idx) {
-                        let line_text = content.lines().nth(field_idx).unwrap_or("");
-                        context_lines.push(format!(
-                            "{}{}{}",
-                            anchor_info.anchor, ANCHOR_DELIMITER, line_text
-                        ));
+                    if let Some(line_text) = content.lines().nth(field_idx) {
+                        context_lines.push(format!("{:05}| {}", field_idx + 1, line_text));
                         line_count += 1;
                     }
                 }
@@ -499,8 +440,6 @@ fn all_symbols(symbols: &[SymbolEntry]) -> Vec<&SymbolEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anchors::store::clear_anchor_store_for_tests;
-    use crate::anchors::symbol_cache::clear_symbol_cache_for_tests;
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;
 
@@ -522,10 +461,9 @@ mod tests {
         assert!(parameters.get("symbols").is_none());
         assert!(parameters.get("kind").is_none());
     }
+
     #[tokio::test]
-    async fn first_read_returns_symbol_body_then_unchanged_marker() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
+    async fn first_read_returns_symbol_body() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("lib.rs");
         tokio::fs::write(&path, "struct Config {\n    name: String,\n}\n")
@@ -535,7 +473,7 @@ mod tests {
             AgentToolContext::basic("session".to_string(), Some(dir.path().to_path_buf()));
         let tool = GetSymbolTool::new();
 
-        let first = text_content(
+        let result = text_content(
             tool.call(
                 json!({"requests": [{"path": "lib.rs", "symbol": "Config", "kind": "struct"}], "root": dir.path()}),
                 &context,
@@ -543,25 +481,12 @@ mod tests {
             .await
             .unwrap(),
         );
-        assert!(first.contains("kind=struct"));
-        assert!(first.contains("§struct Config"));
-
-        let second = text_content(
-            tool.call(
-                json!({"requests": [{"path": "lib.rs", "symbol": "Config", "kind": "struct"}], "root": dir.path()}),
-                &context,
-            )
-            .await
-            .unwrap(),
-        );
-        assert!(second.contains("No changes since your last read"));
-        assert!(!second.contains("§struct Config"));
+        assert!(result.contains("kind=struct"));
+        assert!(result.contains("00001| struct Config"));
     }
 
     #[tokio::test]
     async fn reads_nested_method_by_qualified_name() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("lib.rs");
         tokio::fs::write(
@@ -584,13 +509,11 @@ mod tests {
         );
 
         assert!(result.contains("Config::new kind=method"));
-        assert!(result.contains("§    fn new() -> Self"));
+        assert!(result.contains("00004|     fn new() -> Self"));
     }
 
     #[tokio::test]
     async fn ambiguous_symbols_report_candidates_and_occurrence() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("lib.rs");
         tokio::fs::write(
@@ -620,8 +543,6 @@ mod tests {
 
     #[tokio::test]
     async fn multi_file_reads_symbols_from_all_files() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         tokio::fs::write(dir.path().join("a.rs"), "struct Alpha { x: i32 }\n")
             .await
@@ -645,14 +566,12 @@ mod tests {
             .unwrap(),
         );
 
-        assert!(result.contains("§struct Alpha"));
-        assert!(result.contains("§struct Beta"));
+        assert!(result.contains("00001| struct Alpha"));
+        assert!(result.contains("00001| struct Beta"));
     }
 
     #[tokio::test]
     async fn explicit_requests_mode_reads_across_files() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         tokio::fs::write(
             dir.path().join("types.rs"),
@@ -682,14 +601,12 @@ mod tests {
             .unwrap(),
         );
 
-        assert!(result.contains("§struct Config"));
-        assert!(result.contains("§fn parse()"));
+        assert!(result.contains("00001| struct Config"));
+        assert!(result.contains("00001| fn parse()"));
     }
 
     #[tokio::test]
     async fn relevant_context_includes_parent_struct_for_method() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         tokio::fs::write(
             dir.path().join("lib.rs"),
@@ -720,8 +637,6 @@ mod tests {
 
     #[tokio::test]
     async fn go_smoke_reads_function_symbol() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("main.go");
         tokio::fs::write(&path, "package main\n\nfunc Run() {}\n")
@@ -741,13 +656,11 @@ mod tests {
         );
 
         assert!(result.contains("Run kind=function"));
-        assert!(result.contains("§func Run()"));
+        assert!(result.contains("00003| func Run()"));
     }
 
     #[tokio::test]
     async fn csharp_smoke_reads_class_symbol() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("lib.cs");
         tokio::fs::write(
@@ -772,13 +685,14 @@ mod tests {
         assert!(
             result.contains("MyApp::Config kind=class") || result.contains("Config kind=class")
         );
-        assert!(result.contains("§namespace MyApp") || result.contains("§public class Config"));
+        assert!(
+            result.contains("00001| namespace MyApp")
+                || result.contains("00001| public class Config")
+        );
     }
 
     #[tokio::test]
     async fn ruby_smoke_reads_method_symbol() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("lib.rb");
         tokio::fs::write(
@@ -801,6 +715,6 @@ mod tests {
         );
 
         assert!(result.contains("Config::validate kind=method"));
-        assert!(result.contains("§  def validate"));
+        assert!(result.contains("00002|   def validate"));
     }
 }
