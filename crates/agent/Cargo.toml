@@ -94,7 +94,7 @@ rust-stemmers = "1.2"
 whatlang = "0.18"
 indexmap = { version = "2", features = ["serde"] }
 gray_matter = "0.3"
-fast_html2md = { package = "fast_html2md", version = "0.0.61", features = ["scraper"] }
+fast_html2md = { package = "fast_html2md", version = "0.0.62", features = ["scraper"] }
 
 # Markdown Query cli tool for agent `mdq` tool
 mdq = "0.10.0"
