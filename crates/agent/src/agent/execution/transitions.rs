@@ -579,16 +579,17 @@ pub(super) async fn transition_call_llm(
 
     let (request_cost, cumulative_cost) = if let Some(usage_info) = &usage {
         let pricing = session_handle.get_pricing();
+        // Reasoning tokens are billed at the output rate (no separate pricing).
+        let billable_output =
+            usage_info.output_tokens as u64 + usage_info.reasoning_tokens as u64;
         let request_cost = pricing.as_ref().and_then(|p| {
-            p.calculate_cost(
-                usage_info.input_tokens as u64,
-                usage_info.output_tokens as u64,
-            )
+            p.calculate_cost(usage_info.input_tokens as u64, billable_output)
         });
         let cumulative_cost = pricing.as_ref().and_then(|p| {
             p.calculate_cost(
                 context.stats.total_input_tokens + usage_info.input_tokens as u64,
-                context.stats.total_output_tokens + usage_info.output_tokens as u64,
+                context.stats.total_output_tokens + usage_info.reasoning_tokens as u64
+                    + billable_output,
             )
         });
         (request_cost, cumulative_cost)

@@ -114,11 +114,13 @@ impl LimitsMiddleware {
 
     /// Calculate total cost for current context
     fn total_cost(&self, stats: &AgentStats, context: &ConversationContext) -> Option<f64> {
+        // Reasoning tokens are billed at the output rate (no separate pricing).
+        let billable_output = stats.total_output_tokens + stats.reasoning_tokens;
         match &self.config.model_info_source {
             ModelInfoSource::FromSession => {
                 // Use ModelInfo.calculate_cost() method
                 get_model_info(&context.provider, &context.model)?
-                    .calculate_cost(stats.total_input_tokens, stats.total_output_tokens)
+                    .calculate_cost(stats.total_input_tokens, billable_output)
             }
             ModelInfoSource::Manual {
                 input_cost_per_million,
@@ -135,7 +137,7 @@ impl LimitsMiddleware {
                     cache_read: None,
                     cache_write: None,
                 };
-                pricing.calculate_cost(stats.total_input_tokens, stats.total_output_tokens)
+                pricing.calculate_cost(stats.total_input_tokens, billable_output)
             }
         }
     }
@@ -429,10 +431,12 @@ impl PriceLimitMiddleware {
     }
 
     fn total_cost(&self, stats: &AgentStats) -> f64 {
+        // Reasoning tokens are billed at the output rate (no separate pricing).
+        let billable_output = stats.total_output_tokens + stats.reasoning_tokens;
         let input_cost =
             (stats.total_input_tokens as f64 / 1_000_000.0) * self.input_cost_per_million;
         let output_cost =
-            (stats.total_output_tokens as f64 / 1_000_000.0) * self.output_cost_per_million;
+            (billable_output as f64 / 1_000_000.0) * self.output_cost_per_million;
         let total = input_cost + output_cost;
         trace!("PriceLimitMiddleware: total cost = ${:.4}", total);
         total

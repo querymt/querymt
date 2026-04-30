@@ -36,10 +36,13 @@ impl AgentStats {
     /// This should be called whenever token counts are updated
     pub fn update_costs(&mut self, pricing: &querymt::providers::ModelPricing) {
         // Use ModelPricing methods directly
+        // Reasoning tokens are billed at the output rate (no separate reasoning pricing).
+        // output_tokens excludes reasoning, so we add it back for cost calculation.
+        let billable_output = self.total_output_tokens + self.reasoning_tokens;
 
         // Calculate base token costs
         if let Some(cost) =
-            pricing.calculate_cost(self.total_input_tokens, self.total_output_tokens)
+            pricing.calculate_cost(self.total_input_tokens, billable_output)
         {
             self.total_cost_usd = cost;
 
@@ -49,7 +52,7 @@ impl AgentStats {
             }
             if let Some(output_rate) = pricing.output {
                 self.output_cost_usd =
-                    (self.total_output_tokens as f64 / 1_000_000.0) * output_rate;
+                    (billable_output as f64 / 1_000_000.0) * output_rate;
             }
         }
 

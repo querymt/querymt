@@ -199,6 +199,11 @@ struct OpenAIRawUsage {
     prompt_tokens_details: Option<OpenAIPromptTokensDetails>,
     #[serde(default)]
     completion_tokens_details: Option<OpenAICompletionTokensDetails>,
+    /// DeepSeek: flat top-level cache fields (OpenAI puts them in prompt_tokens_details)
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u32>,
+    #[serde(default)]
+    prompt_cache_miss_tokens: Option<u32>,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -215,10 +220,15 @@ struct OpenAICompletionTokensDetails {
 
 impl OpenAIRawUsage {
     fn into_usage(self) -> Usage {
-        let cache_read = self
+        // OpenAI/Anthropic: cached_tokens nested in prompt_tokens_details
+        let openai_cached = self
             .prompt_tokens_details
             .map(|d| d.cached_tokens)
             .unwrap_or(0);
+        // DeepSeek: prompt_cache_hit_tokens at top level of usage
+        let deepseek_cached = self.prompt_cache_hit_tokens.unwrap_or(0);
+        let cache_read = openai_cached.max(deepseek_cached);
+
         let reasoning = self
             .completion_tokens_details
             .map(|d| d.reasoning_tokens)
@@ -1491,5 +1501,63 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         assert_eq!(openai_effort_str(ReasoningEffort::High), "high");
         // Max must map to "xhigh" — OpenAI API does not accept "max"
         assert_eq!(openai_effort_str(ReasoningEffort::Max), "xhigh");
+    }
+
+    #[test]
+    fn parse_deepseek_usage_with_cache_hit_tokens() {
+        use super::OpenAIRawUsage;
+
+        // DeepSeek returns cache info as flat top-level fields
+        let json = r#"{
+            "prompt_tokens": 10000,
+            "completion_tokens": 5000,
+            "prompt_cache_hit_tokens": 9000,
+            "prompt_cache_miss_tokens": 1000,
+            "total_tokens": 15000,
+            "completion_tokens_details": { "reasoning_tokens": 4000 }
+        }"#;
+        let raw: OpenAIRawUsage = serde_json::from_str(json).unwrap();
+        let usage = raw.into_usage();
+        assert_eq!(usage.cache_read, 9000);
+        assert_eq!(usage.input_tokens, 1000); // 10000 - 9000
+        assert_eq!(usage.output_tokens, 1000); // 5000 - 4000 (reasoning)
+        assert_eq!(usage.reasoning_tokens, 4000);
+    }
+
+    #[test]
+    fn parse_openai_usage_with_nested_cached_tokens() {
+        use super::OpenAIRawUsage;
+
+        // Standard OpenAI format: cached_tokens nested in prompt_tokens_details
+        let json = r#"{
+            "prompt_tokens": 10000,
+            "completion_tokens": 5000,
+            "prompt_tokens_details": { "cached_tokens": 7500 },
+            "completion_tokens_details": { "reasoning_tokens": 2000 }
+        }"#;
+        let raw: OpenAIRawUsage = serde_json::from_str(json).unwrap();
+        let usage = raw.into_usage();
+        assert_eq!(usage.cache_read, 7500);
+        assert_eq!(usage.input_tokens, 2500); // 10000 - 7500
+        assert_eq!(usage.output_tokens, 3000); // 5000 - 2000
+        assert_eq!(usage.reasoning_tokens, 2000);
+    }
+
+    #[test]
+    fn parse_usage_without_cache_or_reasoning() {
+        use super::OpenAIRawUsage;
+
+        // Minimal usage (no cache, no reasoning)
+        let json = r#"{
+            "prompt_tokens": 500,
+            "completion_tokens": 100,
+            "total_tokens": 600
+        }"#;
+        let raw: OpenAIRawUsage = serde_json::from_str(json).unwrap();
+        let usage = raw.into_usage();
+        assert_eq!(usage.cache_read, 0);
+        assert_eq!(usage.input_tokens, 500);
+        assert_eq!(usage.output_tokens, 100);
+        assert_eq!(usage.reasoning_tokens, 0);
     }
 }

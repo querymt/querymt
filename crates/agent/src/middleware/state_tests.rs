@@ -236,3 +236,62 @@ fn test_agent_stats_default() {
 }
 
 // Helper functions moved to test_utils module
+
+#[test]
+fn test_update_costs_includes_reasoning_tokens_in_output_cost() {
+    // Reasoning tokens must be billed at the output rate (no separate reasoning pricing).
+    // DeepSeek V4-Flash pricing: input $0.14/M, output $0.28/M, cache_read $0.0028/M
+    let pricing = querymt::providers::ModelPricing {
+        input: Some(0.14),
+        output: Some(0.28),
+        cache_read: Some(0.0028),
+        cache_write: None,
+    };
+
+    let mut stats = AgentStats {
+        total_input_tokens: 1_000,  // cache miss tokens (after subtracting cache_read)
+        total_output_tokens: 2_000,  // non-reasoning output tokens
+        reasoning_tokens: 18_000,    // reasoning tokens (should be billed at output rate)
+        cache_read_tokens: 9_000,
+        ..Default::default()
+    };
+
+    stats.update_costs(&pricing);
+
+    // billable_output = 2_000 + 18_000 = 20_000
+    // input_cost  = 1_000   × $0.14/M  = $0.000140
+    // output_cost = 20_000  × $0.28/M  = $0.005600
+    // cache_read  = 9_000   × $0.0028/M = $0.0000252
+    // total = $0.005600 + $0.000140 + $0.0000252 = $0.0057652
+    assert!((stats.input_cost_usd - 0.00014).abs() < 1e-10);
+    assert!((stats.output_cost_usd - 0.0056).abs() < 1e-10);
+    assert!((stats.cache_read_cost_usd - 0.0000252).abs() < 1e-10);
+    assert!((stats.total_cost_usd - 0.0057652).abs() < 1e-6);
+}
+
+#[test]
+fn test_update_costs_without_reasoning_tokens_unchanged() {
+    // When reasoning_tokens = 0, cost should be same as before
+    let pricing = querymt::providers::ModelPricing {
+        input: Some(3.0),
+        output: Some(15.0),
+        cache_read: None,
+        cache_write: None,
+    };
+
+    let mut stats = AgentStats {
+        total_input_tokens: 1_000_000,
+        total_output_tokens: 100_000,
+        reasoning_tokens: 0,
+        ..Default::default()
+    };
+
+    stats.update_costs(&pricing);
+
+    // input:  1_000_000 × $3/M  = $3.00
+    // output: 100_000 × $15/M   = $1.50
+    // total = $4.50
+    assert!((stats.total_cost_usd - 4.50).abs() < 1e-6);
+    assert!((stats.input_cost_usd - 3.0).abs() < 1e-6);
+    assert!((stats.output_cost_usd - 1.50).abs() < 1e-6);
+}
