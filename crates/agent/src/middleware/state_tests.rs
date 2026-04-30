@@ -249,9 +249,9 @@ fn test_update_costs_includes_reasoning_tokens_in_output_cost() {
     };
 
     let mut stats = AgentStats {
-        total_input_tokens: 1_000,  // cache miss tokens (after subtracting cache_read)
-        total_output_tokens: 2_000,  // non-reasoning output tokens
-        reasoning_tokens: 18_000,    // reasoning tokens (should be billed at output rate)
+        total_input_tokens: 1_000, // cache miss tokens (after subtracting cache_read)
+        total_output_tokens: 2_000, // non-reasoning output tokens
+        reasoning_tokens: 18_000,  // reasoning tokens (should be billed at output rate)
         cache_read_tokens: 9_000,
         ..Default::default()
     };

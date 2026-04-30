@@ -41,9 +41,7 @@ impl AgentStats {
         let billable_output = self.total_output_tokens + self.reasoning_tokens;
 
         // Calculate base token costs
-        if let Some(cost) =
-            pricing.calculate_cost(self.total_input_tokens, billable_output)
-        {
+        if let Some(cost) = pricing.calculate_cost(self.total_input_tokens, billable_output) {
             self.total_cost_usd = cost;
 
             // Calculate individual components if pricing is available
@@ -51,8 +49,7 @@ impl AgentStats {
                 self.input_cost_usd = (self.total_input_tokens as f64 / 1_000_000.0) * input_rate;
             }
             if let Some(output_rate) = pricing.output {
-                self.output_cost_usd =
-                    (billable_output as f64 / 1_000_000.0) * output_rate;
+                self.output_cost_usd = (billable_output as f64 / 1_000_000.0) * output_rate;
             }
         }
 

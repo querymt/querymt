@@ -435,8 +435,7 @@ impl PriceLimitMiddleware {
         let billable_output = stats.total_output_tokens + stats.reasoning_tokens;
         let input_cost =
             (stats.total_input_tokens as f64 / 1_000_000.0) * self.input_cost_per_million;
-        let output_cost =
-            (billable_output as f64 / 1_000_000.0) * self.output_cost_per_million;
+        let output_cost = (billable_output as f64 / 1_000_000.0) * self.output_cost_per_million;
         let total = input_cost + output_cost;
         trace!("PriceLimitMiddleware: total cost = ${:.4}", total);
         total
