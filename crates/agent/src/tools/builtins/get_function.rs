@@ -1,4 +1,4 @@
-//! Function body reads with session-scoped digest caching.
+//! Function body reads with line-numbered output.
 //!
 //! Supports multi-file batched reads via the `paths` array.
 
@@ -7,8 +7,6 @@ use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-use crate::anchors::symbol_cache::{check_symbol_cache, record_symbol_read};
-use crate::anchors::{reconcile_file, render_anchored_range};
 use crate::index::symbol_index::{SymbolEntry, SymbolIndex, SymbolKind, SymbolKindFilter};
 use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
 
@@ -39,7 +37,7 @@ impl Tool for GetFunctionTool {
             tool_type: "function".to_string(),
             function: FunctionTool {
                 name: self.name().to_string(),
-                description: "Read one or more functions from one or more source files by name. Returns anchor-delimited function bodies on first read or when changed; repeated unchanged reads return only digest metadata unless force=true."
+                description: "Read one or more functions from one or more source files by name. Returns line-numbered function bodies with digest metadata."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -59,14 +57,9 @@ impl Tool for GetFunctionTool {
                             "description": "Workspace root directory to resolve relative paths against.",
                             "default": "."
                         },
-                        "force": {
-                            "type": "boolean",
-                            "description": "When true, always return anchored function bodies even if unchanged.",
-                            "default": false
-                        },
                         "context_lines": {
                             "type": "integer",
-                            "description": "Number of surrounding lines before and after each function to include in the anchored body.",
+                            "description": "Number of surrounding lines before and after each function to include.",
                             "default": 0,
                             "minimum": 0
                         }
@@ -88,7 +81,6 @@ impl Tool for GetFunctionTool {
     ) -> Result<Vec<Content>, ToolError> {
         let path_strs = parse_paths(&args)?;
         let names = parse_names(&args)?;
-        let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
         let context_lines = args
             .get("context_lines")
             .and_then(Value::as_u64)
@@ -103,19 +95,14 @@ impl Tool for GetFunctionTool {
                 .map_err(|e| ToolError::ProviderError(format!("Failed to read file: {e}")))?;
             let symbol_index = SymbolIndex::from_source_for_path(&target, &content)
                 .map_err(|e| ToolError::ProviderError(e.to_string()))?;
-            let state = reconcile_file(context.session_id(), &target, &content)
-                .map_err(ToolError::ProviderError)?;
 
             let mut symbol_results = Vec::new();
             for name in &names {
                 symbol_results.push(render_function_result(
-                    context.session_id(),
                     &target,
                     &content,
-                    &state,
                     &symbol_index,
                     name,
-                    force,
                     context_lines,
                 ));
             }
@@ -183,15 +170,11 @@ fn parse_names(args: &Value) -> Result<Vec<String>, ToolError> {
     Ok(parsed)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_function_result(
-    session_id: &str,
     path: &Path,
     content: &str,
-    state: &crate::anchors::FileAnchorState,
     symbol_index: &SymbolIndex,
     name: &str,
-    force: bool,
     context_lines: usize,
 ) -> String {
     let matches = symbol_index
@@ -214,29 +197,15 @@ fn render_function_result(
     }
 
     for function in matches {
-        rendered.push(render_single_function(
-            session_id,
-            path,
-            content,
-            state,
-            function,
-            force,
-            context_lines,
-        ));
+        rendered.push(render_single_function(content, function, context_lines));
     }
 
     rendered.join("\n\n")
 }
 
-fn render_single_function(
-    session_id: &str,
-    path: &Path,
-    content: &str,
-    state: &crate::anchors::FileAnchorState,
-    function: &SymbolEntry,
-    force: bool,
-    context_lines: usize,
-) -> String {
+fn render_single_function(content: &str, function: &SymbolEntry, context_lines: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
     let start_offset = function.start_line.saturating_sub(1);
     let end_offset_exclusive = function.end_line;
     let digest = &function.digest;
@@ -250,39 +219,13 @@ fn render_single_function(
         digest.line_count
     );
 
-    let unchanged = check_symbol_cache(
-        session_id,
-        path,
-        function.kind.as_str(),
-        &function.qualified_name,
-        digest,
-        start_offset,
-        end_offset_exclusive,
-    );
-    record_symbol_read(
-        session_id,
-        path,
-        function.kind.as_str(),
-        &function.qualified_name,
-        start_offset,
-        end_offset_exclusive,
-        digest.clone(),
-    );
-
-    if unchanged && !force {
-        return format!(
-            "- {header}\n  No changes since your last read. Use force=true to re-read the body."
-        );
-    }
-
     let render_start = start_offset.saturating_sub(context_lines);
-    let render_end = (end_offset_exclusive + context_lines).min(state.line_count);
-    let body = render_anchored_range(
-        content,
-        state,
-        render_start,
-        render_end.saturating_sub(render_start).max(1),
-    );
+    let render_end = (end_offset_exclusive + context_lines).min(total_lines);
+
+    let mut body = String::new();
+    for (idx, line) in lines.iter().enumerate().take(render_end).skip(render_start) {
+        body.push_str(&format!("{:05}| {}\n", idx + 1, line));
+    }
 
     format!("- {header}\n{body}")
 }
@@ -331,8 +274,6 @@ fn matches_function_kind(kind: SymbolKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anchors::store::clear_anchor_store_for_tests;
-    use crate::anchors::symbol_cache::clear_symbol_cache_for_tests;
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;
 
@@ -344,9 +285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_read_returns_anchored_body_then_unchanged_marker() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
+    async fn first_read_returns_line_numbered_body() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("lib.rs");
         tokio::fs::write(&path, "fn alpha() {\n    println!(\"a\");\n}\n")
@@ -356,7 +295,7 @@ mod tests {
             AgentToolContext::basic("session".to_string(), Some(dir.path().to_path_buf()));
         let tool = GetFunctionTool::new();
 
-        let first = text_content(
+        let result = text_content(
             tool.call(
                 json!({"paths": ["lib.rs"], "names": ["alpha"], "root": dir.path()}),
                 &context,
@@ -364,93 +303,13 @@ mod tests {
             .await
             .unwrap(),
         );
-        assert!(first.contains("hash="));
-        assert!(first.contains("§fn alpha()"));
-
-        let second = text_content(
-            tool.call(
-                json!({"paths": ["lib.rs"], "names": ["alpha"], "root": dir.path()}),
-                &context,
-            )
-            .await
-            .unwrap(),
-        );
-        assert!(second.contains("No changes since your last read"));
-        assert!(!second.contains("§fn alpha()"));
-    }
-
-    #[tokio::test]
-    async fn force_returns_body_after_unchanged_read() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("lib.rs");
-        tokio::fs::write(&path, "fn beta() {\n    println!(\"b\");\n}\n")
-            .await
-            .unwrap();
-        let context =
-            AgentToolContext::basic("session".to_string(), Some(dir.path().to_path_buf()));
-        let tool = GetFunctionTool::new();
-
-        let _ = tool
-            .call(
-                json!({"paths": ["lib.rs"], "names": ["beta"], "root": dir.path()}),
-                &context,
-            )
-            .await
-            .unwrap();
-        let forced = text_content(
-            tool.call(
-                json!({"paths": ["lib.rs"], "names": ["beta"], "root": dir.path(), "force": true}),
-                &context,
-            )
-            .await
-            .unwrap(),
-        );
-
-        assert!(forced.contains("§fn beta()"));
-    }
-
-    #[tokio::test]
-    async fn modified_function_returns_updated_body() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("lib.rs");
-        tokio::fs::write(&path, "fn gamma() {\n    println!(\"old\");\n}\n")
-            .await
-            .unwrap();
-        let context =
-            AgentToolContext::basic("session".to_string(), Some(dir.path().to_path_buf()));
-        let tool = GetFunctionTool::new();
-
-        let _ = tool
-            .call(
-                json!({"paths": ["lib.rs"], "names": ["gamma"], "root": dir.path()}),
-                &context,
-            )
-            .await
-            .unwrap();
-        tokio::fs::write(&path, "fn gamma() {\n    println!(\"new\");\n}\n")
-            .await
-            .unwrap();
-        let changed = text_content(
-            tool.call(
-                json!({"paths": ["lib.rs"], "names": ["gamma"], "root": dir.path()}),
-                &context,
-            )
-            .await
-            .unwrap(),
-        );
-
-        assert!(changed.contains("§    println!(\"new\");"));
-        assert!(!changed.contains("No changes since your last read"));
+        assert!(result.contains("hash="));
+        assert!(result.contains("00001| fn alpha()"));
+        assert!(result.contains("00002|     println!(\"a\");"));
     }
 
     #[tokio::test]
     async fn reads_nested_methods_by_qualified_name() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("lib.rs");
         tokio::fs::write(
@@ -473,13 +332,11 @@ mod tests {
         );
 
         assert!(result.contains("Config::new"));
-        assert!(result.contains("§    fn new() -> Self"));
+        assert!(result.contains("00004|     fn new() -> Self"));
     }
 
     #[tokio::test]
     async fn multi_file_reads_functions_from_all_files() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         tokio::fs::write(dir.path().join("a.rs"), "fn alpha() {\n    1\n}\n")
             .await
@@ -500,16 +357,14 @@ mod tests {
             .unwrap(),
         );
 
-        assert!(result.contains("§fn alpha()"));
-        assert!(result.contains("§fn beta()"));
+        assert!(result.contains("00001| fn alpha()"));
+        assert!(result.contains("00001| fn beta()"));
         assert!(result.contains("alpha"));
         assert!(result.contains("beta"));
     }
 
     #[tokio::test]
     async fn missing_symbols_reported_compactly() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         tokio::fs::write(dir.path().join("lib.rs"), "fn exists() {}\n")
             .await

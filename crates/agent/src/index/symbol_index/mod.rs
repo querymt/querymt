@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::index::outline_index::common::get_language_for_extension;
 
-pub use types::{SymbolEntry, SymbolKind, SymbolKindFilter};
+pub use types::{SymbolDigest, SymbolEntry, SymbolKind, SymbolKindFilter};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SymbolError {

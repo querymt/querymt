@@ -999,7 +999,7 @@ pub fn extract_session_summary_from_history(history: &[AgentMessage]) -> String 
                     tool_arguments: Some(args),
                     ..
                 } => {
-                    if matches!(name.as_str(), "write_file" | "apply_patch" | "delete_file")
+                    if matches!(name.as_str(), "write_file" | "delete_file")
                         && let Ok(args_json) = serde_json::from_str::<serde_json::Value>(args)
                         && let Some(path) = args_json.get("path").and_then(|v| v.as_str())
                         && !files_modified.contains(&path.to_string())
@@ -1062,7 +1062,7 @@ fn extract_tool_args_preview(tool_name: &str, args_json: &str) -> String {
     };
 
     match tool_name {
-        "write_file" | "read_tool" | "delete_file" | "apply_patch" => args
+        "write_file" | "read_tool" | "delete_file" => args
             .get("path")
             .and_then(|v| v.as_str())
             .unwrap_or("")

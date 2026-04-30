@@ -221,7 +221,7 @@ fn todo_status_to_plan_status(status: &str) -> Option<PlanEntryStatus> {
 pub fn tool_kind_for_tool(name: &str) -> ToolKind {
     match name {
         "search_text" => ToolKind::Search,
-        "write_file" | "apply_patch" => ToolKind::Edit,
+        "write_file" | "edit" | "multiedit" => ToolKind::Edit,
         "delete_file" => ToolKind::Delete,
         "shell" => ToolKind::Execute,
         "web_fetch" | "browse" => ToolKind::Fetch,

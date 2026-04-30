@@ -1,4 +1,22 @@
-use crate::anchors::symbol_cache::SymbolDigest;
+use crate::hash::RapidHash;
+
+/// A compact digest of a symbol's body content for change detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolDigest {
+    pub hash: RapidHash,
+    pub byte_len: usize,
+    pub line_count: usize,
+}
+
+impl SymbolDigest {
+    pub fn new(bytes: &[u8], line_count: usize) -> Self {
+        Self {
+            hash: RapidHash::new(bytes),
+            byte_len: bytes.len(),
+            line_count,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SymbolKind {

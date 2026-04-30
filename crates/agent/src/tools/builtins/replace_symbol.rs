@@ -11,9 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use crate::anchors::store::reconcile_file;
-use crate::anchors::symbol_cache::{SymbolDigest, record_symbol_read};
-use crate::index::symbol_index::{SymbolIndex, SymbolKindFilter};
+use crate::index::symbol_index::{SymbolDigest, SymbolIndex, SymbolKindFilter};
 use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
 
 use super::helpers::resolve_root;
@@ -215,7 +213,6 @@ impl Tool for ReplaceSymbolTool {
         for (file_path, indices) in &files_to_write {
             let content = file_contents[file_path].clone();
             let (new_content, file_results) = apply_replacements_to_file(
-                context.session_id(),
                 file_path,
                 &content,
                 indices.iter().map(|&i| &resolved[i]).collect(),
@@ -236,10 +233,6 @@ impl Tool for ReplaceSymbolTool {
                         file_path.display()
                     ))
                 })?;
-
-            // Reconcile anchors for the new content
-            reconcile_file(context.session_id(), file_path, &new_content)
-                .map_err(ToolError::ProviderError)?;
 
             results.extend(file_results);
         }
@@ -344,8 +337,7 @@ fn validate_no_overlaps(resolved: &[ResolvedReplacement]) -> Result<(), ToolErro
 }
 
 fn apply_replacements_to_file(
-    session_id: &str,
-    path: &Path,
+    _path: &Path,
     content: &str,
     replacements: Vec<&ResolvedReplacement>,
 ) -> Result<(String, Vec<FileResult>), ToolError> {
@@ -380,17 +372,6 @@ fn apply_replacements_to_file(
         // Compute new hash
         let new_digest = SymbolDigest::new(new_bytes, new_text_lines);
         let new_hash = new_digest.hash.to_string();
-
-        // Record the symbol read with new digest so future unchanged detection works
-        record_symbol_read(
-            session_id,
-            path,
-            &r.kind_str,
-            &r.qualified_name,
-            new_start_line.saturating_sub(1),
-            new_end_line,
-            new_digest,
-        );
 
         results.push(FileResult {
             kind_str: r.kind_str.clone(),
@@ -436,8 +417,6 @@ fn format_results(results: &[FileResult]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anchors::store::clear_anchor_store_for_tests;
-    use crate::anchors::symbol_cache::clear_symbol_cache_for_tests;
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;
 
@@ -450,8 +429,6 @@ mod tests {
 
     #[tokio::test]
     async fn replaces_rust_function_body() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("lib.rs");
         tokio::fs::write(&path, "fn greet() {\n    println!(\"hello\");\n}\n")
@@ -486,8 +463,6 @@ mod tests {
 
     #[tokio::test]
     async fn replaces_struct() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("lib.rs");
         tokio::fs::write(&path, "struct Config {\n    name: String,\n}\n")
@@ -519,8 +494,6 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_hash_mismatch() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("lib.rs");
         tokio::fs::write(&path, "fn foo() {}\n").await.unwrap();
@@ -554,8 +527,6 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_overlapping_replacements() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("lib.rs");
         tokio::fs::write(&path, "fn a() {}\nfn b() {}\n")
@@ -586,8 +557,6 @@ mod tests {
 
     #[tokio::test]
     async fn multi_file_replacement() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         tokio::fs::write(dir.path().join("a.rs"), "fn alpha() { 1 }\n")
             .await
@@ -633,8 +602,6 @@ mod tests {
 
     #[tokio::test]
     async fn missing_symbol_returns_error() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         tokio::fs::write(dir.path().join("lib.rs"), "fn exists() {}\n")
             .await

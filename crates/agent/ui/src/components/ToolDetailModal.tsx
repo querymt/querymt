@@ -362,25 +362,13 @@ function DiffView({
     useCSSClasses: true,
     disableBackground: true,
   };
-  const rawCompactText = preview?.rawCompactText;
-  if (preview?.patch || rawCompactText) {
+  if (preview?.patch) {
     return (
       <div>
         {preview.patch && (
           <div className={diffContainerClass}>
             {renderSafePatchDiff(preview.patch, standardDiffOptions)}
           </div>
-        )}
-        {rawCompactText && (
-          <details className="border-t border-surface-border/20 px-3 py-2 text-ui-secondary">
-            <summary className="cursor-pointer font-mono text-[10px] text-ui-muted hover:text-ui-secondary transition-colors">
-              Show anchored output
-              {preview.anchorsFresh ? ' (fresh anchors)' : ''}
-            </summary>
-            <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-[10px]">
-              {rawCompactText}
-            </pre>
-          </details>
         )}
       </div>
     );

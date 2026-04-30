@@ -8,11 +8,28 @@ export type DiffPreviewData = {
   additions?: number;
   deletions?: number;
   filePath?: string;
-  rawCompactText?: string;
-  anchorsFresh?: boolean;
 };
 
-const ANCHORED_DIFF_LINE_RE = /^([ +\-])([A-Za-z0-9]{5,8})§/;
+/**
+ * Regex to match compact output lines.
+ * Format:  <prefix><5-digit-line-number>|<text>
+ * Prefix is one of ' ', '-', '+'
+ * Example: " 00001| context", "-00042| old line", "+00042| new line"
+ */
+const LINE_NUM_RE = /^([ +\-])\d{5}\| /;
+
+type CompactHunk = {
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+  lines: string[];
+};
+
+type CompactFilePatch = {
+  path: string;
+  hunks: CompactHunk[];
+};
 
 export function buildToolDiffPreview(
   toolKind: string | undefined,
@@ -47,17 +64,13 @@ export function buildToolDiffPreview(
         additions: countPatchAdditions(patch),
         deletions: countPatchDeletions(patch),
         filePath: extractFirstCompactPath(rawOutput),
-        rawCompactText: rawOutput,
-        anchorsFresh: rawOutput.includes('anchors=fresh'),
       };
     }
 
     return {
       type: 'diff',
       patch: null,
-      fallbackText: 'No compact edit diff payload available.',
-      rawCompactText: rawOutput,
-      anchorsFresh: rawOutput.includes('anchors=fresh'),
+      fallbackText: rawOutput,
     };
   }
 
@@ -93,16 +106,15 @@ export function buildToolDiffPreview(
       return { type: 'diff', patch: null, fallbackText: 'No patch payload available.' };
     }
 
-    const sanitizedPatch = stripAnchorsFromPatch(rawPatch);
-    if (!isLikelyRenderablePatch(sanitizedPatch)) {
+    if (!isLikelyRenderablePatch(rawPatch)) {
       return { type: 'diff', patch: null, fallbackText: 'Patch payload is malformed. Open details to inspect raw content.' };
     }
 
     return {
       type: 'diff',
-      patch: sanitizedPatch,
-      additions: countPatchAdditions(sanitizedPatch),
-      deletions: countPatchDeletions(sanitizedPatch),
+      patch: rawPatch,
+      additions: countPatchAdditions(rawPatch),
+      deletions: countPatchDeletions(rawPatch),
       filePath: extractPatchFilePath(input),
     };
   }
@@ -133,17 +145,6 @@ function parseJsonMaybe(value: unknown): any | undefined {
   }
   if (typeof value === 'object' && value !== null) return value;
   return undefined;
-}
-
-function stripAnchorsFromPatch(patch: string): string {
-  return patch
-    .split('\n')
-    .map((line) => stripVisualAnchorFromDiffLine(line))
-    .join('\n');
-}
-
-function stripVisualAnchorFromDiffLine(line: string): string {
-  return line.replace(ANCHORED_DIFF_LINE_RE, '$1');
 }
 
 function extractFilePath(input: Record<string, unknown>): string | undefined {
@@ -182,29 +183,16 @@ function countPatchDeletions(patch: string): number {
 }
 
 /**
- * Parse canonical compact anchored edit output into a unified diff patch.
+ * Parse compact line-numbered edit output into a unified diff patch.
  *
  * Format:
  *   OK paths=N edits=N added=N deleted=N
  *   P <path>
  *   H <op> old=<start>,<count> new=<start>,<count>
- *    <anchor>§<context line>
- *   -<anchor>§<old line>
- *   +<anchor>§<new line>
+ *    00001|<context line>
+ *   -00042|<old line>
+ *   +00042|<new line>
  */
-type CompactHunk = {
-  oldStart: number;
-  oldCount: number;
-  newStart: number;
-  newCount: number;
-  lines: string[];
-};
-
-type CompactFilePatch = {
-  path: string;
-  hunks: CompactHunk[];
-};
-
 function buildPatchFromCompactOutput(output: string): string | null {
   const lines = output.split('\n');
   const files: CompactFilePatch[] = [];
@@ -253,7 +241,7 @@ function buildPatchFromCompactOutput(output: string): string | null {
 
     if (line.startsWith(' ') || line.startsWith('-') || line.startsWith('+')) {
       if (!currentHunk) continue;
-      currentHunk.lines.push(stripVisualAnchorFromDiffLine(line));
+      currentHunk.lines.push(stripLineNumberFromDiffLine(line));
     }
   }
 
@@ -309,4 +297,14 @@ function hunksCanSharePatch(left: CompactHunk, right: CompactHunk): boolean {
   const leftNewEnd = left.newStart + Math.max(0, left.newCount - 1);
   const rightNewStart = right.newStart;
   return rightOldStart > leftOldEnd && rightNewStart > leftNewEnd;
+}
+
+/**
+ * Strip line-number prefix from a compact output line, keeping only the diff prefix and text.
+ * " 00001| context" → " context"
+ * "-00042| old" → "-old"
+ * "+00042| new" → "+new"
+ */
+function stripLineNumberFromDiffLine(line: string): string {
+  return line.replace(LINE_NUM_RE, '$1');
 }
