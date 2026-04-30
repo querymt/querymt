@@ -1,7 +1,7 @@
 //! Symbol reference discovery tool.
 //!
 //! Uses `SymbolIndex` for definitions and text-based identifier matching
-//! for references. Returns compact anchored results grouped by file.
+//! for references. Returns compact line-numbered results grouped by file.
 
 use async_trait::async_trait;
 use ignore::{WalkBuilder, types::TypesBuilder};
@@ -9,7 +9,6 @@ use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-use crate::anchors::store::reconcile_file;
 use crate::index::symbol_index::{SymbolIndex, SymbolKindFilter};
 use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
 
@@ -49,7 +48,7 @@ impl Tool for FindSymbolReferencesTool {
             tool_type: "function".to_string(),
             function: FunctionTool {
                 name: self.name().to_string(),
-                description: "Find definitions and references for symbols across files. Uses AST symbol index for definitions and identifier text matching for references. Returns compact anchored results grouped by file."
+                description: "Find definitions and references for symbols across files. Uses AST symbol index for definitions and identifier text matching for references. Returns compact line-numbered results grouped by file."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -167,8 +166,6 @@ impl FindSymbolReferencesTool {
             Err(_) => return,
         };
 
-        let state = reconcile_file("refs", path, &content).ok();
-
         for symbol_name in symbols {
             // Definitions via SymbolIndex
             if find_type == "definition" || find_type == "both" {
@@ -179,18 +176,10 @@ impl FindSymbolReferencesTool {
                     }
                     let line_idx = def.start_line.saturating_sub(1);
                     let text = content.lines().nth(line_idx).unwrap_or("").to_string();
-                    let anchor = state
-                        .as_ref()
-                        .and_then(|s| s.lines.get(line_idx))
-                        .map(|l| l.anchor.clone());
-                    let line_text = match anchor {
-                        Some(a) => format!("{}§{}", a, text),
-                        None => text,
-                    };
                     matches.push(RefMatch {
                         path: path.to_path_buf(),
                         line: def.start_line,
-                        text: line_text,
+                        text: format!("{:05}| {}", def.start_line, text),
                         match_type: "definition".to_string(),
                         symbol_name: def.qualified_name.clone(),
                     });
@@ -212,18 +201,10 @@ impl FindSymbolReferencesTool {
                         if is_def_line && find_type == "both" {
                             continue; // Already reported as definition
                         }
-                        let anchor = state
-                            .as_ref()
-                            .and_then(|s| s.lines.get(i))
-                            .map(|l| l.anchor.clone());
-                        let line_text = match anchor {
-                            Some(a) => format!("{}§{}", a, line),
-                            None => line.to_string(),
-                        };
                         matches.push(RefMatch {
                             path: path.to_path_buf(),
                             line: i + 1,
-                            text: line_text,
+                            text: format!("{:05}| {}", i + 1, line),
                             match_type: "reference".to_string(),
                             symbol_name: symbol_name.clone(),
                         });
@@ -357,8 +338,6 @@ fn format_matches(matches: &[RefMatch], root: &Path, truncated: bool) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anchors::store::clear_anchor_store_for_tests;
-    use crate::anchors::symbol_cache::clear_symbol_cache_for_tests;
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;
 
@@ -371,8 +350,6 @@ mod tests {
 
     #[tokio::test]
     async fn finds_definitions_and_references_in_file() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         tokio::fs::write(
             dir.path().join("lib.rs"),
@@ -404,8 +381,6 @@ mod tests {
 
     #[tokio::test]
     async fn finds_references_across_files_in_directory() {
-        clear_anchor_store_for_tests();
-        clear_symbol_cache_for_tests();
         let dir = TempDir::new().unwrap();
         tokio::fs::write(dir.path().join("a.rs"), "fn helper() -> i32 { 42 }\n")
             .await

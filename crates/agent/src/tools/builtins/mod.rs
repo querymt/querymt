@@ -1,10 +1,9 @@
-pub mod anchored_edit_output;
-pub mod apply_patch;
 pub mod browse;
 pub mod create_task;
 pub mod delegate;
 pub mod delete_file;
 pub mod edit;
+pub mod edit_output;
 pub mod find_references;
 pub mod get_function;
 pub mod get_symbol;
@@ -21,7 +20,6 @@ pub mod ls;
 pub mod mdq;
 pub mod multiedit;
 pub mod patch_utils;
-pub mod patch_validator;
 pub mod question;
 pub mod read_shared;
 pub mod read_tool;
@@ -38,7 +36,6 @@ pub mod use_remote_provider;
 pub use route_delegation_to_peer::RouteDelegationToPeerTool;
 pub use use_remote_provider::UseRemoteProviderTool;
 
-pub use apply_patch::ApplyPatchTool;
 pub use browse::BrowseTool;
 pub use create_task::CreateTaskTool;
 pub use delegate::DelegateTool;
@@ -76,7 +73,6 @@ use std::sync::Arc;
 /// Used for capability inference and tool registration.
 pub fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
     vec![
-        Arc::new(ApplyPatchTool::new()),
         Arc::new(BrowseTool::new()),
         Arc::new(CreateTaskTool::new()),
         Arc::new(DelegateTool::new()),

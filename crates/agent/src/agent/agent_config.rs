@@ -502,9 +502,10 @@ mod tests {
     #[tokio::test]
     async fn requires_permission_for_tool_edit_tools() {
         let (config, _td) = make_config().await;
-        // write_file and apply_patch → ToolKind::Edit, delete_file → Delete, shell → Execute
+        // write_file and edit → ToolKind::Edit, delete_file → Delete, shell → Execute
         assert!(config.requires_permission_for_tool("write_file"));
-        assert!(config.requires_permission_for_tool("apply_patch"));
+        assert!(config.requires_permission_for_tool("edit"));
+        assert!(config.requires_permission_for_tool("multiedit"));
         assert!(config.requires_permission_for_tool("delete_file"));
         assert!(config.requires_permission_for_tool("shell"));
         // read-only tools do NOT require permission
