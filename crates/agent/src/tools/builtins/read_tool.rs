@@ -33,7 +33,7 @@ impl ToolTrait for ReadTool {
             tool_type: "function".to_string(),
             function: FunctionTool {
                 name: self.name().to_string(),
-                description: "Read a file or directory under the workspace. For text files, returns XML-like output with <path>, <type>, and <content> including line numbers. For image files (PNG, JPEG, GIF, WebP), returns the image content directly. For other binary files, returns a descriptive error. Supports non-recursive pagination via offset/limit for text files and directories."
+                description: "Read a file or directory under the workspace. For text files, returns XML-like output with <path>, <type>, and <content> containing line-numbered lines like 00001| content. Supports numeric offset/limit pagination. For image files (PNG, JPEG, GIF, WebP), returns the image content directly. For other binary files, returns a descriptive error. Directories support non-recursive offset/limit pagination."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -147,7 +147,7 @@ mod tests {
         panic!("no Content::Text block found in result: {:?}", blocks);
     }
 
-    // ── existing text / directory tests (updated for Vec<Content>) ───────────
+    // ── text file tests ──────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_read_file_full() {
@@ -163,8 +163,8 @@ mod tests {
         let text = first_text(&result);
 
         assert!(text.contains("<type>file</type>"));
-        assert!(text.contains("<content>"));
         assert!(text.contains("00001| line 1"));
+        assert!(text.contains("00002| line 2"));
         assert!(text.contains("00003| line 3"));
         assert!(text.contains("(End of file - total 3 lines)"));
     }

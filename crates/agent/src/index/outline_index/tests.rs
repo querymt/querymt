@@ -537,6 +537,97 @@ end
     );
 }
 
+#[test]
+fn go_exclude_tests_and_truncate_children() {
+    let source = r#"
+type Config struct {
+    A int
+    B int
+    C int
+}
+
+func TestConfig(t *testing.T) {}
+"#;
+
+    let mut opts = default_opts();
+    opts.include_tests = false;
+    opts.max_children_per_item = Some(2);
+    let sections = index_source(source, "go", &opts).unwrap();
+
+    assert!(find_section(&sections, "tests").is_none());
+    let types = find_section(&sections, "types").unwrap();
+    let config = types
+        .entries
+        .iter()
+        .find(|e| e.label.contains("Config struct"))
+        .unwrap();
+    assert_eq!(config.children.len(), 3);
+    assert!(config.children[2].label.contains("more"));
+}
+
+#[test]
+fn csharp_namespaces_include_nested_types() {
+    let source = r#"
+using System;
+
+namespace MyApp {
+    public class Config {}
+    public interface IValidator { bool Validate(); }
+}
+"#;
+
+    let sections = index_source(source, "csharp", &default_opts()).unwrap();
+    let namespaces = find_section(&sections, "namespaces").unwrap();
+    assert!(
+        namespaces
+            .entries
+            .iter()
+            .any(|e| e.label.contains("namespace MyApp"))
+    );
+
+    let classes = find_section(&sections, "classes").unwrap();
+    assert!(
+        classes
+            .entries
+            .iter()
+            .any(|e| e.label.contains("class Config"))
+    );
+
+    let interfaces = find_section(&sections, "interfaces").unwrap();
+    assert!(
+        interfaces
+            .entries
+            .iter()
+            .any(|e| e.label.contains("IValidator"))
+    );
+}
+
+#[test]
+fn ruby_exclude_tests_hides_test_functions() {
+    let source = r#"
+def run(args)
+  puts args
+end
+
+def test_happy_path
+  true
+end
+"#;
+
+    let mut opts = default_opts();
+    opts.include_tests = false;
+    let sections = index_source(source, "ruby", &opts).unwrap();
+
+    assert!(find_section(&sections, "tests").is_none());
+    let functions = find_section(&sections, "functions").unwrap();
+    assert!(
+        functions
+            .entries
+            .iter()
+            .any(|e| e.label.contains("def run"))
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Output formatting
 // ---------------------------------------------------------------------------

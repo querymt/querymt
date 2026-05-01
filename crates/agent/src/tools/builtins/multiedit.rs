@@ -2,13 +2,14 @@
 
 use async_trait::async_trait;
 use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::edit::EditTool;
+use crate::tools::builtins::edit_output;
 use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct EditOperation {
     #[serde(rename = "oldString")]
     old_string: String,
@@ -17,13 +18,6 @@ struct EditOperation {
     #[serde(rename = "replaceAll")]
     #[serde(default)]
     replace_all: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct EditResult {
-    index: usize,
-    success: bool,
-    error: Option<String>,
 }
 
 /// Multiedit tool for applying multiple edits sequentially
@@ -119,11 +113,10 @@ impl Tool for MultiEditTool {
         let file_path = context.resolve_path(file_path_str)?;
 
         // Read initial content
-        let mut content = tokio::fs::read_to_string(&file_path)
+        let original_content = tokio::fs::read_to_string(&file_path)
             .await
             .map_err(|e| ToolError::ProviderError(format!("Failed to read file: {}", e)))?;
-
-        let mut results = Vec::new();
+        let mut content = original_content.clone();
 
         // Apply edits sequentially
         for (index, edit) in edits.iter().enumerate() {
@@ -135,41 +128,28 @@ impl Tool for MultiEditTool {
             ) {
                 Ok(new_content) => {
                     content = new_content;
-                    results.push(EditResult {
-                        index,
-                        success: true,
-                        error: None,
-                    });
                 }
                 Err(e) => {
-                    results.push(EditResult {
-                        index,
-                        success: false,
-                        error: Some(e),
-                    });
                     // Stop on first error
-                    break;
+                    return Err(ToolError::ProviderError(format!(
+                        "Edit {} failed: {}",
+                        index, e
+                    )));
                 }
             }
         }
 
-        // Write final content if at least one edit succeeded
-        if results.iter().any(|r| r.success) {
-            tokio::fs::write(&file_path, &content)
-                .await
-                .map_err(|e| ToolError::ProviderError(format!("Failed to write file: {}", e)))?;
-        }
+        // Write final content
+        tokio::fs::write(&file_path, &content)
+            .await
+            .map_err(|e| ToolError::ProviderError(format!("Failed to write file: {}", e)))?;
 
-        let result = json!({
-            "file": file_path.display().to_string(),
-            "total_edits": edits.len(),
-            "successful_edits": results.iter().filter(|r| r.success).count(),
-            "results": results,
-        });
-
-        serde_json::to_string_pretty(&result)
-            .map(|s| vec![Content::text(s)])
-            .map_err(|e| ToolError::ProviderError(format!("Failed to serialize result: {}", e)))
+        // Build compact line-numbered hunk output from the actual file diff so
+        // sequential edits produce precise hunks instead of whole-file replacements.
+        let file_output =
+            edit_output::build_file_output_from_diff(&file_path, &original_content, &content);
+        let output_text = edit_output::format_output(&[file_output]);
+        Ok(vec![Content::text(output_text)])
     }
 }
 
@@ -216,11 +196,54 @@ mod tests {
         });
 
         let result = first_text_block(tool.call(args, &context).await.unwrap());
-        assert!(result.contains("\"successful_edits\": 2"));
+        assert!(
+            result.contains("OK paths="),
+            "expected compact output, got: {}",
+            result
+        );
+        assert!(result.contains("| hi world") || result.contains("| hello world"));
 
         let new_content = fs::read_to_string(&file_path).unwrap();
         assert!(new_content.contains("hi world"));
         assert!(new_content.contains("Rust is good"));
         assert!(new_content.contains("Rust is fast"));
+    }
+
+    #[tokio::test]
+    async fn test_multiedit_distant_changes_produce_precise_hunks() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        fs::write(&file_path, "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n").unwrap();
+
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let tool = MultiEditTool::new();
+
+        let args = json!({
+            "filePath": file_path.display().to_string(),
+            "edits": [
+                {
+                    "oldString": "b",
+                    "newString": "B"
+                },
+                {
+                    "oldString": "j",
+                    "newString": "J"
+                }
+            ]
+        });
+
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
+        assert!(
+            result.contains("added=2 deleted=2"),
+            "unexpected output: {}",
+            result
+        );
+        assert_eq!(
+            result.matches("\nH replace ").count(),
+            2,
+            "unexpected output: {}",
+            result
+        );
     }
 }

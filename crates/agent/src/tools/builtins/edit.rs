@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
 use serde_json::{Value, json};
 
+use crate::tools::builtins::edit_output;
 use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
 
 /// Edit tool for precise string replacement with fuzzy matching
@@ -11,9 +12,6 @@ pub struct EditTool;
 
 struct ReplacementResult {
     content: String,
-    start_line_old: usize,
-    old_line_count: usize,
-    new_line_count: usize,
 }
 
 impl EditTool {
@@ -437,10 +435,6 @@ impl EditTool {
         matches
     }
 
-    fn line_number_at(content: &str, byte_idx: usize) -> usize {
-        content[..byte_idx].bytes().filter(|b| *b == b'\n').count() + 1
-    }
-
     /// Main replace function that tries all strategies and returns metadata for diff rendering.
     fn replace_with_metadata(
         content: &str,
@@ -475,16 +469,10 @@ impl EditTool {
             for search in matches {
                 if let Some(idx) = content.find(&search) {
                     found_any = true;
-                    let start_line_old = Self::line_number_at(content, idx);
-                    let old_line_count = search.split('\n').count();
-                    let new_line_count = new_string.split('\n').count();
 
                     if replace_all {
                         return Ok(ReplacementResult {
                             content: content.replace(&search, new_string),
-                            start_line_old,
-                            old_line_count,
-                            new_line_count,
                         });
                     }
 
@@ -496,12 +484,7 @@ impl EditTool {
                         result.push_str(&content[..idx]);
                         result.push_str(new_string);
                         result.push_str(&content[idx + search.len()..]);
-                        return Ok(ReplacementResult {
-                            content: result,
-                            start_line_old,
-                            old_line_count,
-                            new_line_count,
-                        });
+                        return Ok(ReplacementResult { content: result });
                     }
                     // Multiple occurrences found, continue to next replacer
                 }
@@ -633,19 +616,12 @@ impl Tool for EditTool {
             .await
             .map_err(|e| ToolError::ProviderError(format!("Failed to write file: {}", e)))?;
 
-        // Generate diff metadata for output
-        let result = json!({
-            "success": true,
-            "file": file_path.display().to_string(),
-            "replaced": if replace_all { "all occurrences" } else { "single occurrence" },
-            "startLineOld": replacement.start_line_old,
-            "oldLineCount": replacement.old_line_count,
-            "newLineCount": replacement.new_line_count,
-        });
-
-        serde_json::to_string_pretty(&result)
-            .map(|s| vec![Content::text(s)])
-            .map_err(|e| ToolError::ProviderError(format!("Failed to serialize result: {}", e)))
+        // Build compact line-numbered hunk output from the actual file diff so
+        // large context-matching replacements only mark lines that really changed.
+        let file_output =
+            edit_output::build_file_output_from_diff(&file_path, &content, &replacement.content);
+        let output_text = edit_output::format_output(&[file_output]);
+        Ok(vec![Content::text(output_text)])
     }
 }
 
@@ -683,7 +659,11 @@ mod tests {
         });
 
         let result = first_text_block(tool.call(args, &context).await.unwrap());
-        assert!(result.contains("success"));
+        assert!(
+            result.contains("OK paths="),
+            "expected compact output, got: {}",
+            result
+        );
 
         let new_content = fs::read_to_string(&file_path).unwrap();
         assert_eq!(new_content, "hello world\nrust is awesome");
@@ -707,10 +687,71 @@ mod tests {
         });
 
         let result = first_text_block(tool.call(args, &context).await.unwrap());
-        assert!(result.contains("success"));
+        assert!(
+            result.contains("OK paths="),
+            "expected compact output, got: {}",
+            result
+        );
 
         let new_content = fs::read_to_string(&file_path).unwrap();
         assert_eq!(new_content, "qux bar qux baz qux");
+    }
+
+    #[tokio::test]
+    async fn test_edit_context_heavy_match_reports_single_line_change() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.rs");
+        let original = [
+            "let now = 100;",
+            "let input = vec![function(1, true, 0, 100, 7)];",
+            "let in_flight = Arc::new(InFlightFunctions::new());",
+            "let outcome = scheduler_tick(now, &input, &in_flight, |_| None);",
+            "",
+            "assert!(outcome.modified_functions.is_empty());",
+            "assert_eq!(outcome.queue_submissions.len(), 1);",
+            "assert_eq!(outcome.queue_submissions[0].query_id, 1);",
+            "assert_eq!(outcome.queue_submissions[0].priority, 7);",
+        ]
+        .join("\n");
+        fs::write(&file_path, &original).unwrap();
+
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let tool = EditTool::new();
+
+        let updated = [
+            "let now = 100;",
+            "let input = vec![function(1, true, 0, 100, 7)];",
+            "let in_flight = Arc::new(InFlightFunctions::new());",
+            "let outcome = scheduler_tick(now, &input, &in_flight, |fid| Some(fid));",
+            "",
+            "assert!(outcome.modified_functions.is_empty());",
+            "assert_eq!(outcome.queue_submissions.len(), 1);",
+            "assert_eq!(outcome.queue_submissions[0].query_id, 1);",
+            "assert_eq!(outcome.queue_submissions[0].priority, 7);",
+        ]
+        .join("\n");
+
+        let args = json!({
+            "filePath": file_path.display().to_string(),
+            "oldString": original,
+            "newString": updated
+        });
+
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
+        assert!(
+            result.contains("added=1 deleted=1"),
+            "unexpected output: {}",
+            result
+        );
+        assert!(
+            result.contains(
+                "-00004| let outcome = scheduler_tick(now, &input, &in_flight, |_| None);"
+            )
+        );
+        assert!(result.contains(
+            "+00004| let outcome = scheduler_tick(now, &input, &in_flight, |fid| Some(fid));"
+        ));
     }
 
     #[test]

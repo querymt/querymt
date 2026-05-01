@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 
 // Capture PatchDiff props to inspect diffStyle
 const patchDiffSpy = vi.fn();
@@ -76,19 +77,14 @@ describe('ToolDetailModal diff style', () => {
     mergedResult: {
       id: 'e2',
       type: 'tool_result' as const,
-      content: '{"success":true}',
+      content: 'OK paths=1 edits=1 added=1 deleted=1\nP test/file.ts\nH replace old=3,1 new=3,1\n-00003| const a = 1;\n+00003| const a = 2;',
       timestamp: 1001,
       agentId: 'agent-0',
       toolCall: {
         tool_call_id: 'functions.edit:99',
         kind: 'functions.edit',
         status: 'completed',
-        raw_output: {
-          success: true,
-          startLineOld: 3,
-          oldLineCount: 1,
-          newLineCount: 1,
-        },
+        raw_output: 'OK paths=1 edits=1 added=1 deleted=1\nP test/file.ts\nH replace old=3,1 new=3,1\n-00003| const a = 1;\n+00003| const a = 2;',
       },
     },
   } as any;
@@ -115,6 +111,88 @@ describe('ToolDetailModal diff style', () => {
     expect(lastCall.options.diffStyle).toBe('unified');
   });
 
+  it('renders edit diff preview from oldString/newString input', () => {
+    setViewportWidth(1024);
+    const editEvent = {
+      id: 'e-edit',
+      type: 'tool_call' as const,
+      content: '',
+      timestamp: 1002,
+      agentId: 'agent-0',
+      toolCall: {
+        name: 'Edit',
+        kind: '',
+        tool_call_id: 'functions.edit:edit',
+        raw_input: {
+          filePath: '/test/file.ts',
+          oldString: 'const value = 1;',
+          newString: 'const value = 2;',
+        },
+        status: 'completed',
+      },
+      mergedResult: {
+        id: 'e-edit-result',
+        type: 'tool_result' as const,
+        content: 'OK paths=1 edits=1 added=1 deleted=1\nP test/file.ts\nH replace old=1,2 new=1,2\n-00001| const value = 1;\n+00001| const value = 2;',
+        timestamp: 1003,
+        agentId: 'agent-0',
+        toolCall: {
+          tool_call_id: 'functions.edit:edit',
+          kind: 'functions.edit',
+          status: 'completed',
+          raw_output: 'OK paths=1 edits=1 added=1 deleted=1\nP test/file.ts\nH replace old=1,2 new=1,2\n-00001| const value = 1;\n+00001| const value = 2;',
+        },
+      },
+    } as any;
+
+    render(<ToolDetailModal event={editEvent} onClose={vi.fn()} />);
+
+    expect(patchDiffSpy).toHaveBeenCalled();
+    const patch = String(patchDiffSpy.mock.calls[patchDiffSpy.mock.calls.length - 1][0].patch);
+    expect(patch).toContain('-const value = 1;');
+    expect(patch).toContain('+const value = 2;');
+  });
+
+  it('shows error text for failed edit operations', () => {
+    setViewportWidth(1024);
+    const failedEvent = {
+      id: 'e-edit-failed',
+      type: 'tool_call' as const,
+      content: '',
+      timestamp: 1006,
+      agentId: 'agent-0',
+      toolCall: {
+        name: 'Edit',
+        kind: '',
+        tool_call_id: 'functions.edit:failed',
+        raw_input: {
+          filePath: '/test/file.ts',
+          oldString: 'nonexistent',
+          newString: 'replacement',
+        },
+        status: 'failed',
+      },
+      mergedResult: {
+        id: 'e-edit-failed-result',
+        type: 'tool_result' as const,
+        content: 'Error: oldString not found in content',
+        timestamp: 1007,
+        agentId: 'agent-0',
+        toolCall: {
+          tool_call_id: 'functions.edit:failed',
+          kind: 'functions.edit',
+          status: 'failed',
+          raw_output: 'Error: oldString not found in content',
+        },
+      },
+    } as any;
+
+    render(<ToolDetailModal event={failedEvent} onClose={vi.fn()} />);
+
+    expect(screen.getAllByText(/oldString not found/).length).toBeGreaterThan(0);
+    expect(screen.queryByTestId('patch-diff')).not.toBeInTheDocument();
+  });
+
   it('shows malformed patch warning and skips PatchDiff for invalid apply_patch input', () => {
     const malformedPatchEvent = {
       id: 'e3',
@@ -134,7 +212,7 @@ describe('ToolDetailModal diff style', () => {
 
     render(<ToolDetailModal event={malformedPatchEvent} onClose={vi.fn()} />);
 
-    expect(screen.getByText('Patch payload is malformed. Use raw event data below.')).toBeInTheDocument();
+    expect(screen.getByText('Patch payload is malformed. Open details to inspect raw content.')).toBeInTheDocument();
     expect(patchDiffSpy).not.toHaveBeenCalled();
   });
 });
