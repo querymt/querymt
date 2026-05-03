@@ -156,6 +156,7 @@ export function useUiClient() {
   const [sessionNextCursor, setSessionNextCursor] = useState<string | null>(null);
   const [sessionTotalCount, setSessionTotalCount] = useState<number>(0);
   const [sessionPageLoading, setSessionPageLoading] = useState(false);
+  const [sessionChildrenLoading, setSessionChildrenLoading] = useState<Set<string>>(new Set());
   const [sessionGroupNextCursorByCwd, setSessionGroupNextCursorByCwd] = useState<Record<string, string | null>>({});
   const [sessionsEverLoaded, setSessionsEverLoaded] = useState(false);
   const sessionNextCursorRef = useRef<string | null>(null);
@@ -806,7 +807,7 @@ export function useUiClient() {
           pendingDeleteLabelsRef.current.clear();
           pushSessionActionNotice('error', d.message);
           pendingGroupLoadRef.current = null;
-          sendMessage({ type: 'list_sessions', data: { mode: 'browse' } } as UiClientMessage);
+          sendMessage({ type: 'list_sessions', data: { mode: 'browse', session_scope: SessionScope.Root } } as UiClientMessage);
           setSessionPageLoading(false);
         }
 
@@ -824,7 +825,7 @@ export function useUiClient() {
             setLastLoadErrorSessionId(failedSessionId);
           }
           pendingGroupLoadRef.current = null;
-          sendMessage({ type: 'list_sessions', data: { mode: 'browse' } } as UiClientMessage);
+          sendMessage({ type: 'list_sessions', data: { mode: 'browse', session_scope: SessionScope.Root } } as UiClientMessage);
         }
 
         // Connection-level errors have no session_id. Do not inject them into the
@@ -848,6 +849,25 @@ export function useUiClient() {
             setConnectionErrors((prev) => prev.filter((e) => e.id !== errorId));
           }, 8000);
         }
+        break;
+      }
+      case 'session_children': {
+        const d = msg.data;
+        setSessionChildrenLoading((prev) => {
+          const next = new Set(prev);
+          next.delete(d.parent_session_id);
+          return next;
+        });
+        setSessionGroups((prev) =>
+          prev.map((group) => ({
+            ...group,
+            sessions: group.sessions.map((session) =>
+              session.session_id === d.parent_session_id
+                ? { ...session, children: d.sessions, has_children: d.total_count > 0, fork_count: d.total_count }
+                : session
+            ),
+          }))
+        );
         break;
       }
       case 'session_list': {
@@ -1565,6 +1585,14 @@ export function useUiClient() {
     } as UiClientMessage);
   }, []);
 
+  const loadSessionChildren = useCallback((parentSessionId: string, limit: number = 50) => {
+    setSessionChildrenLoading((prev) => new Set(prev).add(parentSessionId));
+    sendMessage({
+      type: 'list_session_children',
+      data: { parent_session_id: parentSessionId, limit, session_scope: SessionScope.Forks },
+    } as UiClientMessage);
+  }, []);
+
   const requestAuthProviders = useCallback(() => {
     sendMessage({ type: 'list_auth_providers' });
   }, []);
@@ -1859,6 +1887,7 @@ export function useUiClient() {
     sessionNextCursor,
     sessionTotalCount,
     sessionPageLoading,
+    sessionChildrenLoading,
     sessionsEverLoaded,
     allModels,
     providerCapabilities,
@@ -1876,6 +1905,7 @@ export function useUiClient() {
     loadMoreSessions,
     loadMoreGroupSessions,
     searchSessions,
+    loadSessionChildren,
     requestAuthProviders,
     startOAuthLogin,
     completeOAuthLogin,

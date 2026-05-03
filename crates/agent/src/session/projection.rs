@@ -202,6 +202,14 @@ pub trait ViewStore: Send + Sync {
         session_scope: SessionScope,
     ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)>;
 
+    /// Page direct user-fork children for one parent/root session.
+    async fn list_session_children(
+        &self,
+        parent_session_id: String,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> SessionResult<(SessionGroup, usize)>;
+
     /// Export session as ATIF (Agent Trajectory Interchange Format)
     async fn get_atif(
         &self,
@@ -372,6 +380,7 @@ pub struct SessionListItem {
     pub session_kind: Option<String>,
     /// Whether this session has child sessions
     pub has_children: bool,
+    pub fork_count: usize,
 }
 
 /// Group of sessions by CWD
@@ -571,9 +580,11 @@ mod tests {
             fork_origin: None,
             session_kind: None,
             has_children: false,
+            fork_count: 0,
         };
         assert_eq!(item.session_id, "sess-x");
         assert!(!item.has_children);
+        assert_eq!(item.fork_count, 0);
     }
 
     #[test]

@@ -51,7 +51,6 @@ pub use session_ops::handle_get_agent_mode;
 pub use session_ops::handle_get_file_index;
 pub use session_ops::handle_get_llm_config;
 pub use session_ops::handle_get_reasoning_effort;
-pub use session_ops::handle_list_sessions;
 pub use session_ops::handle_load_session;
 pub use session_ops::handle_redo;
 pub use session_ops::handle_set_agent_mode;
@@ -61,6 +60,7 @@ pub use session_ops::handle_undo;
 pub use session_ops::handle_unsubscribe_session;
 #[cfg(all(test, feature = "remote"))]
 pub(crate) use session_ops::refresh_attached_remote_summary;
+pub use session_ops::{handle_list_session_children, handle_list_sessions};
 
 use super::ServerState;
 use super::connection::{send_error, send_state};
@@ -207,6 +207,22 @@ pub async fn handle_ui_message(
             session_scope,
         } => {
             handle_list_sessions(state, tx, mode, cursor, limit, cwd, query, session_scope).await;
+        }
+        UiClientMessage::ListSessionChildren {
+            parent_session_id,
+            cursor,
+            limit,
+            session_scope,
+        } => {
+            handle_list_session_children(
+                state,
+                tx,
+                parent_session_id,
+                cursor,
+                limit,
+                session_scope,
+            )
+            .await;
         }
         UiClientMessage::LoadSession { session_id } => {
             handle_load_session(state, conn_id, &session_id, tx).await;

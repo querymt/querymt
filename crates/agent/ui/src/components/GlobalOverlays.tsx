@@ -24,6 +24,8 @@ interface GlobalOverlaysProps {
   handleNewSession: () => Promise<void>;
   handleSelectSession: (sessionId: string) => void;
   handleDeleteSession: (sessionId: string, sessionLabel?: string) => void;
+  loadSessionChildren: (parentSessionId: string) => void;
+  sessionChildrenLoading: Set<string>;
   connected: boolean;
 
   // Shortcut gateway
@@ -94,6 +96,8 @@ export function GlobalOverlays(props: GlobalOverlaysProps) {
         onNewSession={props.handleNewSession}
         onSelectSession={props.handleSelectSession}
         onDeleteSession={props.handleDeleteSession}
+        onLoadSessionChildren={props.loadSessionChildren}
+        sessionChildrenLoading={props.sessionChildrenLoading}
         connected={props.connected}
       />
 

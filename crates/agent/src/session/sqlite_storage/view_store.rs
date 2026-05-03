@@ -245,7 +245,7 @@ impl ViewStore for SqliteStorage {
 
         // ---------------------------------------------------------------------------
         // Single query: fetch sessions with their initial intent title, recurring
-        // flag, and has_children flag — replacing the old N+1 per-session lookups.
+        // flag, and direct user-fork count — replacing the old N+1 per-session lookups.
         // ---------------------------------------------------------------------------
         let list_sessions_started = Instant::now();
 
@@ -261,7 +261,7 @@ impl ViewStore for SqliteStorage {
             session_kind: Option<String>,
             initial_intent: Option<String>,
             is_recurring: bool,
-            has_children: bool,
+            fork_count: usize,
         }
 
         // Extract SQL-level limit from filter before moving into the closure.
@@ -297,10 +297,9 @@ impl ViewStore for SqliteStorage {
                                 SELECT 1 FROM tasks t
                                 WHERE t.session_id = s.id AND t.kind = 'recurring'
                             )                                            AS is_recurring,
-                            EXISTS(
-                                SELECT 1 FROM sessions c
-                                WHERE c.parent_session_id = s.id
-                            )                                            AS has_children
+                            (SELECT COUNT(*) FROM sessions c
+                                WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'
+                            )                                            AS fork_count
                         FROM sessions s
                         LEFT JOIN intent_snapshots i
                             ON i.id = (
@@ -328,10 +327,9 @@ impl ViewStore for SqliteStorage {
                             SELECT 1 FROM tasks t
                             WHERE t.session_id = s.id AND t.kind = 'recurring'
                         )                                            AS is_recurring,
-                        EXISTS(
-                            SELECT 1 FROM sessions c
-                            WHERE c.parent_session_id = s.id
-                        )                                            AS has_children
+                        (SELECT COUNT(*) FROM sessions c
+                            WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'
+                        )                                            AS fork_count
                     FROM sessions s
                     LEFT JOIN intent_snapshots i
                         ON i.id = (
@@ -357,7 +355,7 @@ impl ViewStore for SqliteStorage {
                         session_kind: row.get(8)?,
                         initial_intent: row.get(9)?,
                         is_recurring: row.get::<_, i64>(10)? != 0,
-                        has_children: row.get::<_, i64>(11)? != 0,
+                        fork_count: row.get::<_, i64>(11)? as usize,
                     })
                 })?;
                 rows.collect::<Result<Vec<_>, _>>()
@@ -469,7 +467,8 @@ impl ViewStore for SqliteStorage {
                 parent_session_id,
                 fork_origin: row.fork_origin,
                 session_kind,
-                has_children: row.has_children,
+                has_children: row.fork_count > 0,
+                fork_count: row.fork_count,
             });
         }
         let title_lookup_ms = title_lookup_started.elapsed().as_millis() as u64;
@@ -660,7 +659,7 @@ impl ViewStore for SqliteStorage {
                             p.public_id,
                             s.fork_origin,
                             s.session_kind,
-                            EXISTS(SELECT 1 FROM sessions c WHERE c.parent_session_id = s.id),
+                            (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
                             i.summary
                         FROM sessions s
                         LEFT JOIN sessions p ON p.id = s.parent_session_id
@@ -684,7 +683,7 @@ impl ViewStore for SqliteStorage {
                             p.public_id,
                             s.fork_origin,
                             s.session_kind,
-                            EXISTS(SELECT 1 FROM sessions c WHERE c.parent_session_id = s.id),
+                            (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
                             i.summary
                         FROM sessions s
                         LEFT JOIN sessions p ON p.id = s.parent_session_id
@@ -729,7 +728,8 @@ impl ViewStore for SqliteStorage {
                                 parent_session_id: row.get(5)?,
                                 fork_origin: row.get(6)?,
                                 session_kind: row.get(7)?,
-                                has_children: row.get::<_, i64>(8)? != 0,
+                                has_children: row.get::<_, i64>(8)? > 0,
+                            fork_count: row.get::<_, i64>(8)? as usize,
                             })
                         })?
                         .collect::<Result<Vec<_>, _>>()?
@@ -764,7 +764,8 @@ impl ViewStore for SqliteStorage {
                                 parent_session_id: row.get(5)?,
                                 fork_origin: row.get(6)?,
                                 session_kind: row.get(7)?,
-                                has_children: row.get::<_, i64>(8)? != 0,
+                                has_children: row.get::<_, i64>(8)? > 0,
+                            fork_count: row.get::<_, i64>(8)? as usize,
                             })
                         })?
                         .collect::<Result<Vec<_>, _>>()?
@@ -867,7 +868,7 @@ impl ViewStore for SqliteStorage {
                         p.public_id,
                         s.fork_origin,
                         s.session_kind,
-                        EXISTS(SELECT 1 FROM sessions c WHERE c.parent_session_id = s.id),
+                        (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
                         i.summary
                     FROM sessions s
                     LEFT JOIN sessions p ON p.id = s.parent_session_id
@@ -891,7 +892,7 @@ impl ViewStore for SqliteStorage {
                         p.public_id,
                         s.fork_origin,
                         s.session_kind,
-                        EXISTS(SELECT 1 FROM sessions c WHERE c.parent_session_id = s.id),
+                        (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
                         i.summary
                     FROM sessions s
                     LEFT JOIN sessions p ON p.id = s.parent_session_id
@@ -936,7 +937,8 @@ impl ViewStore for SqliteStorage {
                             parent_session_id: row.get(5)?,
                             fork_origin: row.get(6)?,
                             session_kind: row.get(7)?,
-                            has_children: row.get::<_, i64>(8)? != 0,
+                            has_children: row.get::<_, i64>(8)? > 0,
+                            fork_count: row.get::<_, i64>(8)? as usize,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()?
@@ -971,7 +973,8 @@ impl ViewStore for SqliteStorage {
                             parent_session_id: row.get(5)?,
                             fork_origin: row.get(6)?,
                             session_kind: row.get(7)?,
-                            has_children: row.get::<_, i64>(8)? != 0,
+                            has_children: row.get::<_, i64>(8)? > 0,
+                            fork_count: row.get::<_, i64>(8)? as usize,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()?
@@ -986,6 +989,120 @@ impl ViewStore for SqliteStorage {
             Ok((
                 SessionGroup {
                     cwd,
+                    sessions,
+                    latest_activity,
+                    total_count: Some(total_count),
+                    next_cursor,
+                },
+                total_count,
+            ))
+        })
+        .await
+    }
+
+    async fn list_session_children(
+        &self,
+        parent_session_id: String,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> SessionResult<(SessionGroup, usize)> {
+        let offset = cursor
+            .as_deref()
+            .and_then(|c| c.parse::<usize>().ok())
+            .unwrap_or(0);
+        let limit = limit.clamp(1, 200);
+
+        self.run_blocking(move |conn| {
+            let parent_db_id: i64 = conn.query_row(
+                "SELECT id FROM sessions WHERE public_id = ?1",
+                params![parent_session_id],
+                |row| row.get(0),
+            )?;
+
+            let total_count: usize = conn.query_row(
+                "SELECT COUNT(*) FROM sessions s WHERE s.parent_session_id = ?1 AND s.fork_origin = 'user'",
+                params![parent_db_id],
+                |row| row.get::<_, i64>(0).map(|v| v as usize),
+            )?;
+
+            let latest_raw: Option<String> = conn.query_row(
+                "SELECT MAX(s.updated_at) FROM sessions s WHERE s.parent_session_id = ?1 AND s.fork_origin = 'user'",
+                params![parent_db_id],
+                |row| row.get(0),
+            )?;
+
+            let latest_activity = latest_raw.and_then(|v| {
+                time::OffsetDateTime::parse(&v, &time::format_description::well_known::Rfc3339).ok()
+            });
+
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT
+                    s.public_id,
+                    s.name,
+                    s.cwd,
+                    s.created_at,
+                    s.updated_at,
+                    p.public_id,
+                    s.fork_origin,
+                    s.session_kind,
+                    (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
+                    i.summary
+                FROM sessions s
+                LEFT JOIN sessions p ON p.id = s.parent_session_id
+                LEFT JOIN intent_snapshots i
+                    ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
+                WHERE s.parent_session_id = ?1 AND s.fork_origin = 'user'
+                ORDER BY s.updated_at DESC
+                LIMIT ?2 OFFSET ?3
+                "#,
+            )?;
+
+            let sessions = stmt
+                .query_map(params![parent_db_id, limit as i64, offset as i64], |row| {
+                    Ok(SessionListItem {
+                        session_id: row.get(0)?,
+                        name: row.get(1)?,
+                        cwd: row.get(2)?,
+                        title: row.get::<_, Option<String>>(9)?.map(|summary| {
+                            if summary.len() > 80 {
+                                format!("{}...", &summary[..77])
+                            } else {
+                                summary
+                            }
+                        }),
+                        created_at: row.get::<_, Option<String>>(3)?.and_then(|s| {
+                            time::OffsetDateTime::parse(
+                                &s,
+                                &time::format_description::well_known::Rfc3339,
+                            )
+                            .ok()
+                        }),
+                        updated_at: row.get::<_, Option<String>>(4)?.and_then(|s| {
+                            time::OffsetDateTime::parse(
+                                &s,
+                                &time::format_description::well_known::Rfc3339,
+                            )
+                            .ok()
+                        }),
+                        parent_session_id: row.get(5)?,
+                        fork_origin: row.get(6)?,
+                        session_kind: row.get(7)?,
+                        has_children: row.get::<_, i64>(8)? > 0,
+                                fork_count: row.get::<_, i64>(8)? as usize,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let next_cursor = if offset + sessions.len() < total_count {
+                Some((offset + sessions.len()).to_string())
+            } else {
+                None
+            };
+
+            Ok((
+                SessionGroup {
+                    cwd: None,
                     sessions,
                     latest_activity,
                     total_count: Some(total_count),
@@ -1062,7 +1179,7 @@ impl ViewStore for SqliteStorage {
                     p.public_id,
                     s.fork_origin,
                     s.session_kind,
-                    EXISTS(SELECT 1 FROM sessions c WHERE c.parent_session_id = s.id),
+                    (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
                     i.summary
                 FROM sessions_fts f
                 JOIN sessions s ON s.id = f.rowid
@@ -1106,7 +1223,8 @@ impl ViewStore for SqliteStorage {
                         parent_session_id: row.get(5)?,
                         fork_origin: row.get(6)?,
                         session_kind: row.get(7)?,
-                        has_children: row.get::<_, i64>(8)? != 0,
+                        has_children: row.get::<_, i64>(8)? > 0,
+                                fork_count: row.get::<_, i64>(8)? as usize,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;

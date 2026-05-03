@@ -12,6 +12,8 @@ interface SessionPickerProps {
   onLoadMoreSessions?: () => void;
   onLoadMoreGroupSessions?: (cwd: string | null) => void;
   onSearchSessions?: (query: string) => void;
+  onLoadSessionChildren?: (parentSessionId: string) => void;
+  sessionChildrenLoading?: Set<string>;
   disabled?: boolean;
   activeSessionId?: string | null;
   thinkingBySession?: Map<string, Set<string>>;
@@ -20,9 +22,10 @@ interface SessionPickerProps {
   sessionPageLoading?: boolean;
 }
 
-export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewSession, onLoadMoreSessions, onLoadMoreGroupSessions, onSearchSessions, disabled, activeSessionId, thinkingBySession, sessionParentMap, hasMoreSessions, sessionPageLoading }: SessionPickerProps) {
+export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewSession, onLoadMoreSessions, onLoadMoreGroupSessions, onSearchSessions, onLoadSessionChildren, sessionChildrenLoading = new Set(), disabled, activeSessionId, thinkingBySession, sessionParentMap, hasMoreSessions, sessionPageLoading }: SessionPickerProps) {
   const [filterText, setFilterText] = useState('');
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set(groups.map((_, i) => `group-${i}`)));
+  const [expandedSessions, setExpandedSessions] = useState<Set<string>>(new Set());
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Whether server-backed search is active (controls client-side filtering bypass).
@@ -157,13 +160,17 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
   // Helper to render a single session card with its children
   const renderSessionCard = (session: SessionSummary & { children?: SessionSummary[] }, sessionIndex: number, depth: number = 0) => {
     const isChild = !!session.parent_session_id;
-    const isDelegation = session.fork_origin === 'delegation';
     const isRecurring = session.session_kind === 'recurring';
     const isMemory = session.session_kind === 'memory';
     const isUnattached = session.attached === false;
     const indentClass = depth > 0 ? `ml-${depth * 6}` : '';
     const isActive = activeSessionId === session.session_id;
     const isThinking = thinkingSessionIds.has(session.session_id);
+    const hasLoadedChildren = !!session.children && session.children.length > 0;
+    const isExpanded = expandedSessions.has(session.session_id);
+    const isLoadingChildren = sessionChildrenLoading.has(session.session_id);
+    const forkCount = session.fork_count ?? 0;
+    const canExpandForks = !session.node && !session.parent_session_id && forkCount > 0;
     
     return (
       <div
@@ -208,11 +215,6 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
                   </span>
                 </span>
               )}
-              {isDelegation && (
-                <span className="text-[10px] px-1.5 py-0.5 bg-accent-tertiary/20 text-accent-tertiary rounded border border-accent-tertiary/30">
-                  delegated
-                </span>
-              )}
               {isRecurring && !isMemory && (
                 <span className="text-[10px] px-1.5 py-0.5 bg-accent-secondary/20 text-accent-secondary rounded border border-accent-secondary/30">
                   recurring
@@ -251,6 +253,39 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
             </div>
           </button>
 
+          {canExpandForks && (
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                setExpandedSessions((prev) => {
+                  const next = new Set(prev);
+                  if (next.has(session.session_id)) {
+                    next.delete(session.session_id);
+                  } else {
+                    next.add(session.session_id);
+                    if (!hasLoadedChildren) {
+                      onLoadSessionChildren?.(session.session_id);
+                    }
+                  }
+                  return next;
+                });
+              }}
+              disabled={disabled}
+              className="absolute right-12 top-1/2 -translate-y-1/2 inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-accent-primary/70 hover:text-accent-primary hover:bg-accent-primary/10 disabled:opacity-40 disabled:cursor-not-allowed"
+              aria-label={`${isExpanded ? 'Collapse' : 'Expand'} forks for ${session.title || session.name || session.session_id}`}
+              title={isLoadingChildren ? 'Loading forks...' : 'Show forks'}
+            >
+              <GitBranch className="w-3.5 h-3.5" />
+              <span className="text-[10px] font-medium leading-none">{forkCount}</span>
+              {isLoadingChildren || isExpanded ? (
+                <ChevronDown className="w-3.5 h-3.5" />
+              ) : (
+                <ChevronRight className="w-3.5 h-3.5" />
+              )}
+            </button>
+          )}
+
           {!session.node && (
             <button
               type="button"
@@ -269,7 +304,7 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
         </div>
         
         {/* Render children recursively */}
-        {session.children && session.children.length > 0 && (
+        {isExpanded && session.children && session.children.length > 0 && (
           <div className="mt-2 space-y-2">
             {session.children.map((child, childIndex) => 
               renderSessionCard(child, childIndex, depth + 1)

@@ -15,7 +15,7 @@ import { WelcomeScreen } from './WelcomeScreen';
 export function HomePage() {
   const { selectSession, createSession, goHome } = useSessionManager();
   
-  const { deleteSession, loadMoreSessions, loadMoreGroupSessions, searchSessions } = useUiClientActions();
+  const { deleteSession, loadMoreSessions, loadMoreGroupSessions, searchSessions, loadSessionChildren } = useUiClientActions();
   const {
     connected,
     sessionGroups,
@@ -25,6 +25,7 @@ export function HomePage() {
     sessionNextCursor,
     sessionTotalCount,
     sessionPageLoading,
+    sessionChildrenLoading,
     sessionsEverLoaded,
   } = useUiClientSession();
   
@@ -85,6 +86,8 @@ export function HomePage() {
           onLoadMoreSessions={handleLoadMoreSessions}
           onLoadMoreGroupSessions={handleLoadMoreGroupSessions}
           onSearchSessions={handleSearchSessions}
+          onLoadSessionChildren={loadSessionChildren}
+          sessionChildrenLoading={sessionChildrenLoading}
           disabled={loading}
           activeSessionId={sessionId}
           thinkingBySession={thinkingBySession}

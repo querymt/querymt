@@ -44,6 +44,7 @@ export interface UiClientActionsContextValue {
   loadMoreSessions: (limit?: number) => void;
   loadMoreGroupSessions: (cwd: string | null, limit?: number) => void;
   searchSessions: (query: string, limit?: number) => void;
+  loadSessionChildren: (parentSessionId: string, limit?: number) => void;
   requestAuthProviders: () => void;
   startOAuthLogin: (provider: string) => void;
   completeOAuthLogin: (flowId: string, response: string) => void;
@@ -144,6 +145,7 @@ export interface UiClientSessionContextValue {
   sessionNextCursor: string | null;
   sessionTotalCount: number;
   sessionPageLoading: boolean;
+  sessionChildrenLoading: Set<string>;
   meshInvites: MeshInviteInfo[];
   lastCreatedMeshInvite: MeshInviteCreated | null;
   /** Session ID of the last session that failed to load. Used to navigate away and stop retry loops. */
@@ -225,6 +227,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     loadMoreSessions: uiClient.loadMoreSessions,
     loadMoreGroupSessions: uiClient.loadMoreGroupSessions,
     searchSessions: uiClient.searchSessions,
+    loadSessionChildren: uiClient.loadSessionChildren,
     requestAuthProviders: uiClient.requestAuthProviders,
     startOAuthLogin: uiClient.startOAuthLogin,
     completeOAuthLogin: uiClient.completeOAuthLogin,
@@ -316,6 +319,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     sessionNextCursor: uiClient.sessionNextCursor,
     sessionTotalCount: uiClient.sessionTotalCount,
     sessionPageLoading: uiClient.sessionPageLoading,
+    sessionChildrenLoading: uiClient.sessionChildrenLoading,
     sessionsEverLoaded: uiClient.sessionsEverLoaded,
     meshInvites: uiClient.meshInvites,
     lastCreatedMeshInvite: uiClient.lastCreatedMeshInvite,
@@ -350,6 +354,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     uiClient.sessionNextCursor,
     uiClient.sessionTotalCount,
     uiClient.sessionPageLoading,
+    uiClient.sessionChildrenLoading,
     uiClient.sessionsEverLoaded,
     uiClient.meshInvites,
     uiClient.lastCreatedMeshInvite,

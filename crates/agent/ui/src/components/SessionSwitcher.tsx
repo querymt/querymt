@@ -1,7 +1,7 @@
 import { useMemo, useRef, useEffect, useState } from 'react';
 import { Command } from 'cmdk';
 import Fuse from 'fuse.js';
-import { Plus, GitBranch, Clock, Globe, Trash2, X } from 'lucide-react';
+import { Plus, GitBranch, Clock, Globe, Trash2, X, ChevronDown, ChevronRight } from 'lucide-react';
 import { SessionGroup, SessionSummary } from '../types';
 import { useUiStore } from '../store/uiStore';
 
@@ -21,13 +21,16 @@ interface SessionSwitcherProps {
   onNewSession: () => Promise<void>;
   onSelectSession: (sessionId: string) => void;
   onDeleteSession: (sessionId: string, sessionLabel?: string) => void;
+  onLoadSessionChildren?: (parentSessionId: string) => void;
+  sessionChildrenLoading?: Set<string>;
   connected: boolean;
 }
 
-interface FlatSession extends SessionSummary {
+type SessionWithChildren = SessionSummary & { children?: SessionSummary[] };
+
+interface FlatSession extends SessionWithChildren {
   workspace: string; // cwd from the group
   isChild: boolean;
-  isDelegation: boolean;
   isRecurring: boolean;
   isMemory: boolean;
   isRemote: boolean;
@@ -42,40 +45,53 @@ export function SessionSwitcher({
   onNewSession,
   onSelectSession,
   onDeleteSession,
+  onLoadSessionChildren,
+  sessionChildrenLoading = new Set(),
   connected,
 }: SessionSwitcherProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [search, setSearch] = useState('');
   const [selectedValue, setSelectedValue] = useState('');
+  const [expandedSessions, setExpandedSessions] = useState<Set<string>>(new Set());
   const { focusMainInput } = useUiStore();
   
-  // Flatten all sessions from all groups into a single searchable list
+  // Flatten all sessions from all groups into a single searchable list.
   const flatSessions = useMemo(() => {
+    const toFlat = (session: SessionWithChildren, workspace: string): FlatSession => ({
+      ...session,
+      workspace,
+      isChild: !!session.parent_session_id,
+      isRecurring: session.session_kind === 'recurring',
+      isMemory: session.session_kind === 'memory',
+      isRemote: !!session.node,
+    });
+    const roots = groups
+      .flatMap((group) => {
+        const cwd = group.cwd || 'No workspace';
+        return (group.sessions as SessionWithChildren[])
+          .filter((session) => session.fork_origin !== 'delegation')
+          .map((session) => ({ session, cwd }));
+      })
+      .sort((a, b) => {
+        const aTime = a.session.updated_at ? Date.parse(a.session.updated_at) : 0;
+        const bTime = b.session.updated_at ? Date.parse(b.session.updated_at) : 0;
+        return bTime - aTime;
+      });
+
     const flat: FlatSession[] = [];
-    
-    for (const group of groups) {
-      const cwd = group.cwd || 'No workspace';
-      
-      for (const session of group.sessions) {
-        flat.push({
-          ...session,
-          workspace: cwd,
-          isChild: !!session.parent_session_id,
-          isDelegation: session.fork_origin === 'delegation',
-          isRecurring: session.session_kind === 'recurring',
-          isMemory: session.session_kind === 'memory',
-          isRemote: !!session.node,
-        });
+    for (const { session, cwd } of roots) {
+      flat.push(toFlat(session, cwd));
+      if (expandedSessions.has(session.session_id) && session.children) {
+        for (const child of session.children) {
+          if (child.fork_origin !== 'delegation') {
+            flat.push(toFlat(child, cwd));
+          }
+        }
       }
     }
     
-    // Sort by updated_at (most recent first)
-    return flat.sort((a, b) => {
-      if (!a.updated_at) return 1;
-      if (!b.updated_at) return -1;
-      return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
-    });
-  }, [groups]);
+    return flat;
+  }, [groups, expandedSessions]);
   
   // Setup fuse.js for fuzzy search
   const fuse = useMemo(() => {
@@ -275,6 +291,11 @@ export function SessionSwitcher({
                   const isActive = activeSessionId === session.session_id;
                   const isThinking = (thinkingBySession.get(session.session_id)?.size ?? 0) > 0;
                   const sessionLabel = session.title || session.name || 'Untitled session';
+                  const hasLoadedChildren = !!session.children && session.children.length > 0;
+                  const isExpanded = expandedSessions.has(session.session_id);
+                  const isLoadingChildren = sessionChildrenLoading.has(session.session_id);
+                  const forkCount = session.fork_count ?? 0;
+                  const canExpandForks = !session.isRemote && forkCount > 0 && !session.isChild;
                   
                   return (
                     <Command.Item
@@ -298,6 +319,36 @@ export function SessionSwitcher({
                       <div className="flex-1 min-w-0">
                         {/* Title */}
                         <div className="flex items-center gap-2 mb-1">
+                          {canExpandForks && (
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setExpandedSessions((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(session.session_id)) {
+                                    next.delete(session.session_id);
+                                  } else {
+                                    next.add(session.session_id);
+                                    if (!hasLoadedChildren) {
+                                      onLoadSessionChildren?.(session.session_id);
+                                    }
+                                  }
+                                  return next;
+                                });
+                              }}
+                              className="inline-flex items-center gap-1 rounded px-1 py-0.5 text-accent-primary/70 hover:text-accent-primary hover:bg-accent-primary/10"
+                              aria-label={`${isExpanded ? 'Collapse' : 'Expand'} forks for ${sessionLabel}`}
+                            >
+                              <GitBranch className="w-3 h-3" />
+                              <span className="text-[10px] font-medium leading-none">{forkCount}</span>
+                              {isLoadingChildren || isExpanded ? (
+                                <ChevronDown className="w-3 h-3" />
+                              ) : (
+                                <ChevronRight className="w-3 h-3" />
+                              )}
+                            </button>
+                          )}
                           {session.isChild && (
                             <GitBranch className="w-3 h-3 text-accent-primary/70 flex-shrink-0" />
                           )}
@@ -312,11 +363,6 @@ export function SessionSwitcher({
                           {isThinking && (
                             <span className="text-[10px] px-1.5 py-0.5 bg-accent-tertiary/20 text-accent-tertiary rounded border border-accent-tertiary/30 flex-shrink-0">
                               thinking
-                            </span>
-                          )}
-                          {session.isDelegation && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-accent-tertiary/20 text-accent-tertiary rounded border border-accent-tertiary/30 flex-shrink-0">
-                              delegated
                             </span>
                           )}
                           {session.isRecurring && !session.isMemory && (
@@ -380,6 +426,11 @@ export function SessionSwitcher({
                   const isActive = activeSessionId === session.session_id;
                   const isThinking = (thinkingBySession.get(session.session_id)?.size ?? 0) > 0;
                   const sessionLabel = session.title || session.name || 'Untitled session';
+                  const hasLoadedChildren = !!session.children && session.children.length > 0;
+                  const isExpanded = expandedSessions.has(session.session_id);
+                  const isLoadingChildren = sessionChildrenLoading.has(session.session_id);
+                  const forkCount = session.fork_count ?? 0;
+                  const canExpandForks = !session.isRemote && forkCount > 0 && !session.isChild;
                   
                   return (
                     <Command.Item
@@ -403,6 +454,36 @@ export function SessionSwitcher({
                       <div className="flex-1 min-w-0">
                         {/* Title */}
                         <div className="flex items-center gap-2 mb-1">
+                          {canExpandForks && (
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setExpandedSessions((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(session.session_id)) {
+                                    next.delete(session.session_id);
+                                  } else {
+                                    next.add(session.session_id);
+                                    if (!hasLoadedChildren) {
+                                      onLoadSessionChildren?.(session.session_id);
+                                    }
+                                  }
+                                  return next;
+                                });
+                              }}
+                              className="inline-flex items-center gap-1 rounded px-1 py-0.5 text-accent-primary/70 hover:text-accent-primary hover:bg-accent-primary/10"
+                              aria-label={`${isExpanded ? 'Collapse' : 'Expand'} forks for ${sessionLabel}`}
+                            >
+                              <GitBranch className="w-3 h-3" />
+                              <span className="text-[10px] font-medium leading-none">{forkCount}</span>
+                              {isLoadingChildren || isExpanded ? (
+                                <ChevronDown className="w-3 h-3" />
+                              ) : (
+                                <ChevronRight className="w-3 h-3" />
+                              )}
+                            </button>
+                          )}
                           {session.isChild && (
                             <GitBranch className="w-3 h-3 text-accent-primary/70 flex-shrink-0" />
                           )}
@@ -417,11 +498,6 @@ export function SessionSwitcher({
                           {isThinking && (
                             <span className="text-[10px] px-1.5 py-0.5 bg-accent-tertiary/20 text-accent-tertiary rounded border border-accent-tertiary/30 flex-shrink-0">
                               thinking
-                            </span>
-                          )}
-                          {session.isDelegation && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-accent-tertiary/20 text-accent-tertiary rounded border border-accent-tertiary/30 flex-shrink-0">
-                              delegated
                             </span>
                           )}
                           {session.isRecurring && !session.isMemory && (

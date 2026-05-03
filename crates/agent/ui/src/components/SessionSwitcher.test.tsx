@@ -180,7 +180,7 @@ describe('SessionSwitcher', () => {
     expect(screen.getByText('thinking')).toBeInTheDocument();
   });
 
-  it('shows delegated badge for sessions with delegation origin', () => {
+  it('hides delegated sessions from the switcher', () => {
     const groupsWithDelegation: SessionGroup[] = [
       {
         cwd: '/workspace/test',
@@ -197,28 +197,151 @@ describe('SessionSwitcher', () => {
     
     render(<SessionSwitcher {...defaultProps} groups={groupsWithDelegation} />);
     
-    expect(screen.getByText('delegated')).toBeInTheDocument();
+    expect(screen.queryByText('Delegated Session')).not.toBeInTheDocument();
+    expect(screen.queryByText('delegated')).not.toBeInTheDocument();
   });
 
-  it('shows branch icon for child sessions', () => {
-    const groupsWithChildren: SessionGroup[] = [
+  it('keeps root sessions sorted by most recent while placing expanded forks under their parent', async () => {
+    const user = userEvent.setup();
+    const groupsWithOutOfOrderRoots: SessionGroup[] = [
+      {
+        cwd: '/workspace/old',
+        sessions: [
+          {
+            session_id: 'older-parent-123',
+            title: 'Older Parent',
+            has_children: true,
+            fork_count: 1,
+            updated_at: '2024-01-01T00:00:00.000Z',
+            children: [
+              {
+                session_id: 'older-child-456',
+                title: 'Older Child Fork',
+                parent_session_id: 'older-parent-123',
+                fork_origin: 'user',
+                updated_at: '2024-03-01T00:00:00.000Z',
+              },
+            ],
+          },
+        ],
+      },
+      {
+        cwd: '/workspace/new',
+        sessions: [
+          {
+            session_id: 'newer-root-789',
+            title: 'Newer Root',
+            updated_at: '2024-02-01T00:00:00.000Z',
+          },
+        ],
+      },
+    ];
+
+    render(<SessionSwitcher {...defaultProps} groups={groupsWithOutOfOrderRoots} />);
+    await user.click(screen.getByLabelText(/expand forks for older parent/i));
+
+    const items = screen.getAllByRole('option').map((item) => item.textContent ?? '');
+    const newerIndex = items.findIndex((text) => text.includes('Newer Root'));
+    const parentIndex = items.findIndex((text) => text.includes('Older Parent'));
+    const childIndex = items.findIndex((text) => text.includes('Older Child Fork'));
+
+    expect(newerIndex).toBeGreaterThanOrEqual(0);
+    expect(parentIndex).toBeGreaterThan(newerIndex);
+    expect(childIndex).toBe(parentIndex + 1);
+  });
+
+  it('expands a root session to show loaded forks', async () => {
+    const user = userEvent.setup();
+    const onLoadSessionChildren = vi.fn();
+    const groupsWithForks: SessionGroup[] = [
       {
         cwd: '/workspace/test',
         sessions: [
           {
-            session_id: 'session-child-123',
-            title: 'Child Session',
-            parent_session_id: 'parent-session-456',
+            session_id: 'root-session-123',
+            title: 'Root Session',
+            has_children: true,
+            fork_count: 3,
             updated_at: new Date().toISOString(),
+            children: [
+              {
+                session_id: 'fork-session-456',
+                title: 'User Fork',
+                parent_session_id: 'root-session-123',
+                fork_origin: 'user',
+                updated_at: new Date(Date.now() - 1000).toISOString(),
+              },
+            ],
           },
         ],
       },
     ];
     
-    render(<SessionSwitcher {...defaultProps} groups={groupsWithChildren} />);
+    render(
+      <SessionSwitcher
+        {...defaultProps}
+        groups={groupsWithForks as SessionGroup[]}
+        onLoadSessionChildren={onLoadSessionChildren}
+      />
+    );
     
-    // Should have a GitBranch icon rendered (we can check if the session has the branch icon class)
-    expect(screen.getByText('Child Session')).toBeInTheDocument();
+    await user.click(screen.getByLabelText(/expand forks for root session/i));
+
+    expect(screen.getByText('User Fork')).toBeInTheDocument();
+    expect(onLoadSessionChildren).not.toHaveBeenCalled();
+  });
+
+  it('shows the fork count in the root expand control', () => {
+    const groupsWithRoot: SessionGroup[] = [
+      {
+        cwd: '/workspace/test',
+        sessions: [
+          {
+            session_id: 'root-session-123',
+            title: 'Root Session',
+            has_children: true,
+            fork_count: 3,
+            updated_at: new Date().toISOString(),
+          },
+        ],
+      },
+    ];
+
+    render(<SessionSwitcher {...defaultProps} groups={groupsWithRoot} />);
+
+    const expandButton = screen.getByLabelText(/expand forks for root session/i);
+    expect(expandButton).toHaveTextContent('3');
+  });
+
+  it('requests forks when expanding an unloaded root', async () => {
+    const user = userEvent.setup();
+    const onLoadSessionChildren = vi.fn();
+    const groupsWithRoot: SessionGroup[] = [
+      {
+        cwd: '/workspace/test',
+        sessions: [
+          {
+            session_id: 'root-session-123',
+            title: 'Root Session',
+            has_children: true,
+            fork_count: 1,
+            updated_at: new Date().toISOString(),
+          },
+        ],
+      },
+    ];
+
+    render(
+      <SessionSwitcher
+        {...defaultProps}
+        groups={groupsWithRoot}
+        onLoadSessionChildren={onLoadSessionChildren}
+      />
+    );
+
+    await user.click(screen.getByLabelText(/expand forks for root session/i));
+
+    expect(onLoadSessionChildren).toHaveBeenCalledWith('root-session-123');
   });
 
   it('displays session IDs truncated', () => {
