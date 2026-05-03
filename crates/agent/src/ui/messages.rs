@@ -5,7 +5,7 @@
 
 use crate::events::EventEnvelope;
 use crate::index::FileIndexEntry;
-use crate::session::projection::AuditView;
+use crate::session::projection::{AuditView, SessionScope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -195,6 +195,9 @@ pub enum UiClientMessage {
         /// Search query for mode=search.
         #[serde(default)]
         query: Option<String>,
+        /// Session scope filter: all (default), root, forks, delegates, or children.
+        #[serde(default)]
+        session_scope: Option<SessionScope>,
     },
     LoadSession {
         session_id: String,

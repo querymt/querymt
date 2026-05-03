@@ -894,6 +894,14 @@ export enum ForkPointType {
 	ProgressEntry = "progress_entry",
 }
 
+export enum SessionScope {
+	All = "all",
+	Root = "root",
+	Forks = "forks",
+	Delegates = "delegates",
+	Children = "children",
+}
+
 /**
  * Mirror of `querymt_utils::OAuthFlowKind` for typeshare generation.
  * Matches the serialized JSON values of the upstream enum.
@@ -965,6 +973,8 @@ export type UiClientMessage =
 	cwd?: string;
 	/** Search query for mode=search. */
 	query?: string;
+	/** Session scope filter: all (default), root, forks, delegates, or children. */
+	session_scope?: SessionScope;
 }}
 	| { type: "load_session", data: {
 	session_id: string;

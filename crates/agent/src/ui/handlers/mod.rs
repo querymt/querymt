@@ -68,6 +68,8 @@ use super::messages::{UiClientMessage, UiPromptBlock};
 use super::session::{ensure_sessions_for_mode, prompt_for_mode, resolve_cwd};
 use models::{handle_get_recent_models, handle_set_session_model};
 use std::time::Instant;
+
+use crate::session::projection::SessionScope;
 use tokio::sync::mpsc;
 
 // ── Main dispatch ─────────────────────────────────────────────────────────────
@@ -86,7 +88,17 @@ pub async fn handle_ui_message(
             send_state(state, conn_id, tx).await;
             let send_state_ms = started.elapsed().as_millis() as u64;
 
-            handle_list_sessions(state, tx, None, None, None, None, None).await;
+            handle_list_sessions(
+                state,
+                tx,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(SessionScope::Root),
+            )
+            .await;
             audio::handle_audio_capabilities(state, tx).await;
             tracing::info!(
                 target: "querymt_agent::ui::handlers",
@@ -140,7 +152,17 @@ pub async fn handle_ui_message(
                 let _ = send_error(tx, err).await;
             }
 
-            handle_list_sessions(state, tx, None, None, None, None, None).await;
+            handle_list_sessions(
+                state,
+                tx,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(SessionScope::Root),
+            )
+            .await;
         }
         UiClientMessage::Prompt { prompt } => {
             let has_user_text = prompt.iter().any(|block| match block {
@@ -163,7 +185,17 @@ pub async fn handle_ui_message(
                     log::error!("prompt_for_mode failed: {}", err);
                     let _ = super::connection::send_error(&tx, err).await;
                 }
-                handle_list_sessions(&state, &tx, None, None, None, None, None).await;
+                handle_list_sessions(
+                    &state,
+                    &tx,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(SessionScope::Root),
+                )
+                .await;
             });
         }
         UiClientMessage::ListSessions {
@@ -172,8 +204,9 @@ pub async fn handle_ui_message(
             limit,
             cwd,
             query,
+            session_scope,
         } => {
-            handle_list_sessions(state, tx, mode, cursor, limit, cwd, query).await;
+            handle_list_sessions(state, tx, mode, cursor, limit, cwd, query, session_scope).await;
         }
         UiClientMessage::LoadSession { session_id } => {
             handle_load_session(state, conn_id, &session_id, tx).await;

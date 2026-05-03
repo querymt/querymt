@@ -664,7 +664,14 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                         // Refresh session list so the UI session picker updates
                         // with any newly-discoverable remote sessions (Bug 2 fix).
                         super::handlers::handle_list_sessions(
-                            &state, &tx, None, None, None, None, None,
+                            &state,
+                            &tx,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(crate::session::projection::SessionScope::Root),
                         )
                         .await;
                     } else {
@@ -747,7 +754,14 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                         // Refresh session list so expired peer's sessions are
                         // removed from the UI (Bug 2 fix).
                         super::handlers::handle_list_sessions(
-                            &state, &tx, None, None, None, None, None,
+                            &state,
+                            &tx,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(crate::session::projection::SessionScope::Root),
                         )
                         .await;
 

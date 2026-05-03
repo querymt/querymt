@@ -22,6 +22,7 @@ export {
   DelegationStatus,
   ForkOrigin,
   ForkPointType,
+  SessionScope,
   ProgressKind,
   TaskKind,
   TaskStatus,

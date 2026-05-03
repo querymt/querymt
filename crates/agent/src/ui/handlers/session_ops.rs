@@ -16,6 +16,7 @@ use crate::events::EventEnvelope;
 use crate::index::resolve_workspace_root;
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
+use crate::session::projection::SessionScope;
 use crate::ui::mentions::{filter_index_for_cwd, filter_index_for_cwd_entries};
 use agent_client_protocol::schema::{LoadSessionRequest, SessionId};
 use querymt::chat::ReasoningEffort;
@@ -78,10 +79,12 @@ pub async fn handle_list_sessions(
     limit: Option<u32>,
     cwd: Option<String>,
     query: Option<String>,
+    session_scope: Option<SessionScope>,
 ) {
     let started = Instant::now();
     let page_limit = limit.unwrap_or(20).clamp(1, 200) as usize;
     let mode = mode.unwrap_or_else(|| "browse".to_string());
+    let session_scope = session_scope.unwrap_or_default();
     let is_browse_first_page = mode == "browse" && cursor.is_none();
 
     let to_ui_group = |g: crate::session::projection::SessionGroup| SessionGroup {
@@ -119,7 +122,7 @@ pub async fn handle_list_sessions(
             };
             state
                 .view_store
-                .list_group_sessions(cwd_value, cursor, page_limit)
+                .list_group_sessions(cwd_value, cursor, page_limit, session_scope)
                 .await
                 .map(|(group, total)| {
                     let next_cursor = group.next_cursor.clone();
@@ -130,7 +133,7 @@ pub async fn handle_list_sessions(
             let q = query.unwrap_or_default();
             state
                 .view_store
-                .search_sessions(q, cursor, page_limit)
+                .search_sessions(q, cursor, page_limit, session_scope)
                 .await
                 .map(|(groups, next_cursor, total)| {
                     (
@@ -142,7 +145,7 @@ pub async fn handle_list_sessions(
         }
         _ => state
             .view_store
-            .browse_session_groups(cursor, page_limit, 10)
+            .browse_session_groups(cursor, page_limit, 10, session_scope)
             .await
             .map(|(groups, next_cursor, total)| {
                 (
@@ -685,7 +688,17 @@ pub async fn handle_delete_session(
     }
 
     send_state(state, conn_id, tx).await;
-    handle_list_sessions(state, tx, None, None, None, None, None).await;
+    handle_list_sessions(
+        state,
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(SessionScope::Root),
+    )
+    .await;
 }
 
 pub(super) async fn ensure_session_loaded(
@@ -1192,7 +1205,17 @@ pub async fn handle_fork_session(
             }
 
             send_state(state, conn_id, tx).await;
-            handle_list_sessions(state, tx, None, None, None, None, None).await;
+            handle_list_sessions(
+                state,
+                tx,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(SessionScope::Root),
+            )
+            .await;
 
             let _ = send_message(
                 tx,

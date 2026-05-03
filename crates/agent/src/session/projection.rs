@@ -181,6 +181,7 @@ pub trait ViewStore: Send + Sync {
         cursor: Option<String>,
         group_limit: usize,
         session_limit_per_group: usize,
+        session_scope: SessionScope,
     ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)>;
 
     /// Page sessions for one workspace group.
@@ -189,6 +190,7 @@ pub trait ViewStore: Send + Sync {
         cwd: Option<String>,
         cursor: Option<String>,
         limit: usize,
+        session_scope: SessionScope,
     ) -> SessionResult<(SessionGroup, usize)>;
 
     /// Search all sessions via FTS5 (DB-wide, not limited to loaded pages).
@@ -197,6 +199,7 @@ pub trait ViewStore: Send + Sync {
         query: String,
         cursor: Option<String>,
         limit: usize,
+        session_scope: SessionScope,
     ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)>;
 
     /// Export session as ATIF (Agent Trajectory Interchange Format)
@@ -322,7 +325,35 @@ pub struct SessionListFilter {
     pub offset: Option<usize>,
 }
 
-/// Individual session item for list display
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionScope {
+    All,
+    Root,
+    Forks,
+    Delegates,
+    Children,
+}
+
+impl Default for SessionScope {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+impl SessionScope {
+    pub fn from_option(value: Option<String>) -> Self {
+        match value.as_deref() {
+            Some("root") => Self::Root,
+            Some("forks") => Self::Forks,
+            Some("delegates") => Self::Delegates,
+            Some("children") => Self::Children,
+            _ => Self::All,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionListItem {
     pub session_id: String,

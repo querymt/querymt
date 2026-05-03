@@ -25,6 +25,7 @@ import {
   RemoteNodeInfo,
   PluginUpdateStatus,
   PluginUpdateResult,
+  SessionScope,
   ScheduleInfo,
   KnowledgeEntryInfo,
   ConsolidationInfo,
@@ -290,7 +291,7 @@ export function useUiClient() {
         sendOnSocket(socket, { type: 'list_mesh_invites' } as UiClientMessage);
         sendOnSocket(socket, {
           type: 'list_sessions',
-          data: { mode: 'browse', limit: 20 },
+          data: { mode: 'browse', limit: 20, session_scope: SessionScope.Root },
         } as UiClientMessage);
 
         // If we had an active session before disconnect, re-subscribe so
@@ -1530,7 +1531,7 @@ export function useUiClient() {
     setSessionPageLoading(true);
     sendMessage({
       type: 'list_sessions',
-      data: { mode: 'browse', cursor, limit },
+      data: { mode: 'browse', cursor, limit, session_scope: SessionScope.Root },
     } as UiClientMessage);
   }, []);
 
@@ -1544,7 +1545,7 @@ export function useUiClient() {
     setSessionPageLoading(true);
     sendMessage({
       type: 'list_sessions',
-      data: { mode: 'group', cwd: cwd ?? '__none__', cursor, limit },
+      data: { mode: 'group', cwd: cwd ?? '__none__', cursor, limit, session_scope: SessionScope.Root },
     } as UiClientMessage);
   }, []);
 
@@ -1554,13 +1555,13 @@ export function useUiClient() {
     if (!query.trim()) {
       // When search is cleared, reload the full browse list so sessions reappear.
       setSessionPageLoading(true);
-      sendMessage({ type: 'list_sessions', data: { mode: 'browse', limit: 20 } } as UiClientMessage);
+      sendMessage({ type: 'list_sessions', data: { mode: 'browse', limit: 20, session_scope: SessionScope.Root } } as UiClientMessage);
       return;
     }
     setSessionPageLoading(true);
     sendMessage({
       type: 'list_sessions',
-      data: { mode: 'search', query, limit },
+      data: { mode: 'search', query, limit, session_scope: SessionScope.Root },
     } as UiClientMessage);
   }, []);
 

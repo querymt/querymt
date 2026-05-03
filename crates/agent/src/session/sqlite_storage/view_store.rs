@@ -8,7 +8,7 @@ use crate::session::projection::{
     AuditView, DefaultRedactor, EventJournal, FilterExpr, PredicateOp, RecentModelEntry,
     RecentModelsView, RedactedArtifact, RedactedProgress, RedactedTask, RedactedView,
     RedactionPolicy, Redactor, SessionGroup, SessionListFilter, SessionListItem, SessionListView,
-    SummaryView, ViewStore,
+    SessionScope, SummaryView, ViewStore,
 };
 use crate::session::repo_artifact::SqliteArtifactRepository;
 use crate::session::repo_decision::SqliteDecisionRepository;
@@ -25,6 +25,22 @@ use crate::session::store::Session;
 use rusqlite::params;
 
 use super::SqliteStorage;
+
+fn session_scope_where(scope: SessionScope, alias: &str) -> String {
+    match scope {
+        SessionScope::All => "1 = 1".to_string(),
+        SessionScope::Root => format!("{}.parent_session_id IS NULL", alias),
+        SessionScope::Forks => format!(
+            "{}.parent_session_id IS NOT NULL AND {}.fork_origin = 'user'",
+            alias, alias
+        ),
+        SessionScope::Children => format!("{}.parent_session_id IS NOT NULL", alias),
+        SessionScope::Delegates => format!(
+            "{}.parent_session_id IS NOT NULL AND {}.fork_origin = 'delegation'",
+            alias, alias
+        ),
+    }
+}
 
 #[async_trait]
 impl ViewStore for SqliteStorage {
@@ -574,6 +590,7 @@ impl ViewStore for SqliteStorage {
         cursor: Option<String>,
         group_limit: usize,
         session_limit_per_group: usize,
+        session_scope: SessionScope,
     ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
         let group_offset = cursor
             .as_deref()
@@ -583,23 +600,27 @@ impl ViewStore for SqliteStorage {
         let preview_limit = session_limit_per_group.clamp(1, 100);
 
         self.run_blocking(move |conn| {
-            let total_sessions: usize =
-                conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| {
-                    row.get::<_, i64>(0).map(|v| v as usize)
-                })?;
+            let scope_where = session_scope_where(session_scope, "s");
+            let total_sessions: usize = conn.query_row(
+                &format!("SELECT COUNT(*) FROM sessions s WHERE {}", scope_where),
+                [],
+                |row| row.get::<_, i64>(0).map(|v| v as usize),
+            )?;
 
-            let mut summary_stmt = conn.prepare(
+            let mut summary_stmt = conn.prepare(&format!(
                 r#"
                 SELECT
-                    cwd,
+                    s.cwd,
                     COUNT(*) as total_count,
-                    MAX(updated_at) as latest_activity
-                FROM sessions
-                GROUP BY cwd
-                ORDER BY (cwd IS NOT NULL), MAX(updated_at) DESC
+                    MAX(s.updated_at) as latest_activity
+                FROM sessions s
+                WHERE {}
+                GROUP BY s.cwd
+                ORDER BY (s.cwd IS NOT NULL), MAX(s.updated_at) DESC
                 LIMIT ?1 OFFSET ?2
                 "#,
-            )?;
+                scope_where
+            ))?;
 
             let summaries = summary_stmt
                 .query_map(params![group_limit as i64, group_offset as i64], |row| {
@@ -612,7 +633,10 @@ impl ViewStore for SqliteStorage {
                 .collect::<Result<Vec<_>, _>>()?;
 
             let total_groups: usize = conn.query_row(
-                "SELECT COUNT(DISTINCT COALESCE(cwd, '__none__')) FROM sessions",
+                &format!(
+                    "SELECT COUNT(DISTINCT COALESCE(s.cwd, '__none__')) FROM sessions s WHERE {}",
+                    scope_where
+                ),
                 [],
                 |row| row.get::<_, i64>(0).map(|v| v as usize),
             )?;
@@ -625,7 +649,7 @@ impl ViewStore for SqliteStorage {
                 });
 
                 let mut session_stmt = if cwd.is_some() {
-                    conn.prepare(
+                    conn.prepare(&format!(
                         r#"
                         SELECT
                             s.public_id,
@@ -642,13 +666,14 @@ impl ViewStore for SqliteStorage {
                         LEFT JOIN sessions p ON p.id = s.parent_session_id
                         LEFT JOIN intent_snapshots i
                             ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
-                        WHERE s.cwd = ?1
+                        WHERE s.cwd = ?1 AND {}
                         ORDER BY s.updated_at DESC
                         LIMIT ?2
                         "#,
-                    )?
+                        scope_where
+                    ))?
                 } else {
-                    conn.prepare(
+                    conn.prepare(&format!(
                         r#"
                         SELECT
                             s.public_id,
@@ -665,11 +690,12 @@ impl ViewStore for SqliteStorage {
                         LEFT JOIN sessions p ON p.id = s.parent_session_id
                         LEFT JOIN intent_snapshots i
                             ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
-                        WHERE s.cwd IS NULL
+                        WHERE s.cwd IS NULL AND {}
                         ORDER BY s.updated_at DESC
                         LIMIT ?1
                         "#,
-                    )?
+                        scope_where
+                    ))?
                 };
 
                 let sessions = if let Some(ref cwd_value) = cwd {
@@ -775,6 +801,7 @@ impl ViewStore for SqliteStorage {
         cwd: Option<String>,
         cursor: Option<String>,
         limit: usize,
+        session_scope: SessionScope,
     ) -> SessionResult<(SessionGroup, usize)> {
         let offset = cursor
             .as_deref()
@@ -783,15 +810,22 @@ impl ViewStore for SqliteStorage {
         let limit = limit.clamp(1, 200);
 
         self.run_blocking(move |conn| {
+            let scope_where = session_scope_where(session_scope, "s");
             let total_count: usize = if let Some(ref cwd_value) = cwd {
                 conn.query_row(
-                    "SELECT COUNT(*) FROM sessions WHERE cwd = ?1",
+                    &format!(
+                        "SELECT COUNT(*) FROM sessions s WHERE s.cwd = ?1 AND {}",
+                        scope_where
+                    ),
                     params![cwd_value],
                     |row| row.get::<_, i64>(0).map(|v| v as usize),
                 )?
             } else {
                 conn.query_row(
-                    "SELECT COUNT(*) FROM sessions WHERE cwd IS NULL",
+                    &format!(
+                        "SELECT COUNT(*) FROM sessions s WHERE s.cwd IS NULL AND {}",
+                        scope_where
+                    ),
                     [],
                     |row| row.get::<_, i64>(0).map(|v| v as usize),
                 )?
@@ -799,13 +833,19 @@ impl ViewStore for SqliteStorage {
 
             let latest_raw: Option<String> = if let Some(ref cwd_value) = cwd {
                 conn.query_row(
-                    "SELECT MAX(updated_at) FROM sessions WHERE cwd = ?1",
+                    &format!(
+                        "SELECT MAX(s.updated_at) FROM sessions s WHERE s.cwd = ?1 AND {}",
+                        scope_where
+                    ),
                     params![cwd_value],
                     |row| row.get(0),
                 )?
             } else {
                 conn.query_row(
-                    "SELECT MAX(updated_at) FROM sessions WHERE cwd IS NULL",
+                    &format!(
+                        "SELECT MAX(s.updated_at) FROM sessions s WHERE s.cwd IS NULL AND {}",
+                        scope_where
+                    ),
                     [],
                     |row| row.get(0),
                 )?
@@ -816,7 +856,7 @@ impl ViewStore for SqliteStorage {
             });
 
             let mut session_stmt = if cwd.is_some() {
-                conn.prepare(
+                conn.prepare(&format!(
                     r#"
                     SELECT
                         s.public_id,
@@ -833,13 +873,14 @@ impl ViewStore for SqliteStorage {
                     LEFT JOIN sessions p ON p.id = s.parent_session_id
                     LEFT JOIN intent_snapshots i
                         ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
-                    WHERE s.cwd = ?1
+                    WHERE s.cwd = ?1 AND {}
                     ORDER BY s.updated_at DESC
                     LIMIT ?2 OFFSET ?3
                     "#,
-                )?
+                    scope_where
+                ))?
             } else {
-                conn.prepare(
+                conn.prepare(&format!(
                     r#"
                     SELECT
                         s.public_id,
@@ -856,11 +897,12 @@ impl ViewStore for SqliteStorage {
                     LEFT JOIN sessions p ON p.id = s.parent_session_id
                     LEFT JOIN intent_snapshots i
                         ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
-                    WHERE s.cwd IS NULL
+                    WHERE s.cwd IS NULL AND {}
                     ORDER BY s.updated_at DESC
                     LIMIT ?1 OFFSET ?2
                     "#,
-                )?
+                    scope_where
+                ))?
             };
 
             let sessions = if let Some(ref cwd_value) = cwd {
@@ -960,6 +1002,7 @@ impl ViewStore for SqliteStorage {
         query: String,
         cursor: Option<String>,
         limit: usize,
+        session_scope: SessionScope,
     ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
         let offset = cursor
             .as_deref()
@@ -972,8 +1015,12 @@ impl ViewStore for SqliteStorage {
         }
 
         self.run_blocking(move |conn| {
+            let scope_where = session_scope_where(session_scope, "s");
             let total_count: usize = match conn.query_row(
-                "SELECT COUNT(*) FROM sessions_fts WHERE sessions_fts MATCH ?1",
+                &format!(
+                    "SELECT COUNT(*) FROM sessions_fts f JOIN sessions s ON s.id = f.rowid WHERE sessions_fts MATCH ?1 AND {}",
+                    scope_where
+                ),
                 params![fts_query.clone()],
                 |row| row.get::<_, i64>(0).map(|v| v as usize),
             ) {
@@ -983,15 +1030,16 @@ impl ViewStore for SqliteStorage {
                 }
             };
 
-            let mut group_counts_stmt = conn.prepare(
+            let mut group_counts_stmt = conn.prepare(&format!(
                 r#"
                 SELECT s.cwd, COUNT(*)
                 FROM sessions_fts f
                 JOIN sessions s ON s.id = f.rowid
-                WHERE sessions_fts MATCH ?1
+                WHERE sessions_fts MATCH ?1 AND {}
                 GROUP BY s.cwd
                 "#,
-            )?;
+                scope_where
+            ))?;
             let group_counts = group_counts_stmt
                 .query_map(params![fts_query.clone()], |row| {
                     Ok((
@@ -1003,7 +1051,7 @@ impl ViewStore for SqliteStorage {
             let group_counts_map: std::collections::HashMap<Option<String>, usize> =
                 group_counts.into_iter().collect();
 
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 r#"
                 SELECT
                     s.public_id,
@@ -1021,11 +1069,12 @@ impl ViewStore for SqliteStorage {
                 LEFT JOIN sessions p ON p.id = s.parent_session_id
                 LEFT JOIN intent_snapshots i
                     ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
-                WHERE sessions_fts MATCH ?1
+                WHERE sessions_fts MATCH ?1 AND {}
                 ORDER BY bm25(sessions_fts), s.updated_at DESC
                 LIMIT ?2 OFFSET ?3
                 "#,
-            )?;
+                scope_where
+            ))?;
 
             let items = stmt
                 .query_map(params![fts_query, limit as i64, offset as i64], |row| {
