@@ -563,6 +563,51 @@ mod tests {
     }
 
     #[test]
+    fn test_session_scope_from_option_defaults_and_parses_known_values() {
+        assert_eq!(SessionScope::from_option(None), SessionScope::All);
+        assert_eq!(
+            SessionScope::from_option(Some("all".to_string())),
+            SessionScope::All
+        );
+        assert_eq!(
+            SessionScope::from_option(Some("root".to_string())),
+            SessionScope::Root
+        );
+        assert_eq!(
+            SessionScope::from_option(Some("forks".to_string())),
+            SessionScope::Forks
+        );
+        assert_eq!(
+            SessionScope::from_option(Some("delegates".to_string())),
+            SessionScope::Delegates
+        );
+        assert_eq!(
+            SessionScope::from_option(Some("children".to_string())),
+            SessionScope::Children
+        );
+        assert_eq!(
+            SessionScope::from_option(Some("unknown".to_string())),
+            SessionScope::All
+        );
+    }
+
+    #[test]
+    fn test_session_scope_serde_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&SessionScope::Root).unwrap(),
+            "\"root\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionScope::Delegates).unwrap(),
+            "\"delegates\""
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionScope>("\"children\"").unwrap(),
+            SessionScope::Children
+        );
+    }
+
+    #[test]
     fn test_session_list_item_construction() {
         let item = SessionListItem {
             session_id: "sess-x".to_string(),
