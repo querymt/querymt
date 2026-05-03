@@ -895,14 +895,6 @@ export enum ForkPointType {
 	ProgressEntry = "progress_entry",
 }
 
-export enum SessionScope {
-	All = "all",
-	Root = "root",
-	Forks = "forks",
-	Delegates = "delegates",
-	Children = "children",
-}
-
 /**
  * Mirror of `querymt_utils::OAuthFlowKind` for typeshare generation.
  * Matches the serialized JSON values of the upstream enum.
@@ -919,6 +911,14 @@ export enum OAuthFlowKindTs {
 export enum RoutingMode {
 	Single = "single",
 	Broadcast = "broadcast",
+}
+
+export enum SessionScope {
+	All = "all",
+	Root = "root",
+	Forks = "forks",
+	Delegates = "delegates",
+	Children = "children",
 }
 
 /**

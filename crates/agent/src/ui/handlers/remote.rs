@@ -12,12 +12,11 @@
 use super::super::ServerState;
 use super::super::connection::{send_error, send_message};
 use super::super::messages::{MeshInviteInfo, UiServerMessage};
-use super::session_ops::handle_list_sessions;
+use super::session_ops::{ListSessionsRequest, handle_list_sessions};
 #[cfg(feature = "remote")]
 use crate::agent::remote::node_manager::SessionHandoff;
 #[cfg(feature = "remote")]
 use crate::agent::utils::u32_from_usize;
-use crate::session::projection::SessionScope;
 #[cfg(feature = "remote")]
 use kameo::actor::RemoteActorRef;
 #[cfg(feature = "remote")]
@@ -346,17 +345,7 @@ pub(crate) async fn finalize_remote_session_attach(
     .await;
 
     super::super::connection::send_state(state, conn_id, tx).await;
-    handle_list_sessions(
-        state,
-        tx,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(SessionScope::Root),
-    )
-    .await;
+    handle_list_sessions(state, tx, ListSessionsRequest::root_browse()).await;
 
     log::info!(
         "handle_attach_remote_session: attached session {} from node_id '{}'",
@@ -547,17 +536,7 @@ pub async fn handle_dismiss_remote_session(
     }
 
     // 3. Refresh session list
-    handle_list_sessions(
-        state,
-        tx,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(SessionScope::Root),
-    )
-    .await;
+    handle_list_sessions(state, tx, ListSessionsRequest::root_browse()).await;
 }
 
 /// Create a mesh invite token on the local node.

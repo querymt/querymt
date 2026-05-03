@@ -58,12 +58,12 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
       s.title?.toLowerCase().includes(query) ||
       s.name?.toLowerCase().includes(query);
 
-    // Build hierarchy using a Map for O(1) child lookup instead of O(n) filter per parent.
+    // Build hierarchy using Maps for O(1) child lookup while preserving orphan children.
     const groupsWithHierarchy = groups.map(group => {
-      // Index children by parent id in one O(n) pass.
+      const sessionIds = new Set(group.sessions.map(s => s.session_id));
       const childrenByParent = new Map<string, SessionSummary[]>();
       for (const s of group.sessions) {
-        if (s.parent_session_id) {
+        if (s.parent_session_id && sessionIds.has(s.parent_session_id)) {
           let bucket = childrenByParent.get(s.parent_session_id);
           if (!bucket) {
             bucket = [];
@@ -82,7 +82,7 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
       };
 
       const topLevel = group.sessions
-        .filter(s => !s.parent_session_id)
+        .filter(s => !s.parent_session_id || !sessionIds.has(s.parent_session_id))
         .map(buildHierarchy);
 
       return { ...group, sessions: topLevel };

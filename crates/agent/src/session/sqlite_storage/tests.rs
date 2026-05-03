@@ -604,6 +604,22 @@ async fn list_session_children_returns_user_forks_and_excludes_delegates() {
 }
 
 #[tokio::test]
+async fn list_session_children_returns_empty_group_for_missing_parent() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let view: &dyn ViewStore = &storage;
+
+    let (group, total) = view
+        .list_session_children("missing-parent".to_string(), None, 20)
+        .await
+        .unwrap();
+
+    assert_eq!(total, 0);
+    assert_eq!(group.total_count, Some(0));
+    assert!(group.sessions.is_empty());
+    assert!(group.next_cursor.is_none());
+}
+
+#[tokio::test]
 async fn group_sessions_scope_filtering_respects_cursors_and_counts() {
     let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
     let (root_a, root_b, _, _) = seed_scoped_sessions(&storage).await;

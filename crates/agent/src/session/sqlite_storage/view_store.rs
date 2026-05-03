@@ -22,7 +22,7 @@ use crate::session::repository::{
     ProgressRepository, SessionRepository, TaskRepository,
 };
 use crate::session::store::Session;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use super::SqliteStorage;
 
@@ -1013,11 +1013,25 @@ impl ViewStore for SqliteStorage {
         let limit = limit.clamp(1, 200);
 
         self.run_blocking(move |conn| {
-            let parent_db_id: i64 = conn.query_row(
-                "SELECT id FROM sessions WHERE public_id = ?1",
-                params![parent_session_id],
-                |row| row.get(0),
-            )?;
+            let parent_db_id: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM sessions WHERE public_id = ?1",
+                    params![parent_session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(parent_db_id) = parent_db_id else {
+                return Ok((
+                    SessionGroup {
+                        cwd: None,
+                        sessions: Vec::new(),
+                        latest_activity: None,
+                        total_count: Some(0),
+                        next_cursor: None,
+                    },
+                    0,
+                ));
+            };
 
             let total_count: usize = conn.query_row(
                 "SELECT COUNT(*) FROM sessions s WHERE s.parent_session_id = ?1 AND s.fork_origin = 'user'",

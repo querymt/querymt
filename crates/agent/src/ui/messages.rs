@@ -124,6 +124,7 @@ pub struct SessionSummary {
     pub fork_origin: Option<String>,
     pub session_kind: Option<String>,
     pub has_children: bool,
+    #[typeshare(serialized_as = "number")]
     pub fork_count: u64,
     pub node: Option<String>,
     pub node_id: Option<String>,

@@ -91,6 +91,29 @@ describe('SessionPicker', () => {
     expect(screen.queryByLabelText(/expand forks for root session/i)).not.toBeInTheDocument();
   });
 
+  it('preserves orphan child sessions as top-level rows', () => {
+    render(
+      <SessionPicker
+        {...defaultProps}
+        groups={[
+          {
+            cwd: '/workspace/project',
+            sessions: [
+              {
+                session_id: 'orphan-fork-333',
+                title: 'Orphan Fork',
+                parent_session_id: 'missing-parent-000',
+                fork_origin: 'user',
+              },
+            ],
+          },
+        ] as SessionGroup[]}
+      />
+    );
+
+    expect(screen.getByText('Orphan Fork')).toBeInTheDocument();
+  });
+
   it('shows loaded forks without delegated badges', async () => {
     const user = userEvent.setup();
     const groupsWithFork = [

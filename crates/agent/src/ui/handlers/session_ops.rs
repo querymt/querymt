@@ -75,6 +75,25 @@ fn to_ui_summary(s: crate::session::projection::SessionListItem) -> SessionSumma
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ListSessionsRequest {
+    pub mode: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+    pub cwd: Option<String>,
+    pub query: Option<String>,
+    pub session_scope: Option<SessionScope>,
+}
+
+impl ListSessionsRequest {
+    pub fn root_browse() -> Self {
+        Self {
+            session_scope: Some(SessionScope::Root),
+            ..Self::default()
+        }
+    }
+}
+
 /// Handle session listing request.
 #[tracing::instrument(
     name = "ui.handle_list_sessions",
@@ -94,18 +113,23 @@ fn to_ui_summary(s: crate::session::projection::SessionListItem) -> SessionSumma
 pub async fn handle_list_sessions(
     state: &ServerState,
     tx: &mpsc::Sender<String>,
-    mode: Option<String>,
-    cursor: Option<String>,
-    limit: Option<u32>,
-    cwd: Option<String>,
-    query: Option<String>,
-    session_scope: Option<SessionScope>,
+    request: ListSessionsRequest,
 ) {
     let started = Instant::now();
+    let ListSessionsRequest {
+        mode,
+        cursor,
+        limit,
+        cwd,
+        query,
+        session_scope,
+    } = request;
     let page_limit = limit.unwrap_or(20).clamp(1, 200) as usize;
     let mode = mode.unwrap_or_else(|| "browse".to_string());
     let session_scope = session_scope.unwrap_or_default();
     let is_browse_first_page = mode == "browse" && cursor.is_none();
+    let should_merge_remote =
+        is_browse_first_page && matches!(session_scope, SessionScope::Root | SessionScope::All);
 
     let to_ui_group = |g: crate::session::projection::SessionGroup| SessionGroup {
         cwd: g.cwd,
@@ -180,7 +204,7 @@ pub async fn handle_list_sessions(
 
     let remote_merge_started = Instant::now();
     #[cfg(feature = "remote")]
-    if is_browse_first_page {
+    if should_merge_remote {
         async {
             // 1. Collect already-attached remote sessions from the registry.
             let attached_sessions: std::collections::HashSet<String>;
@@ -447,10 +471,19 @@ pub async fn handle_list_sessions(
                                     .iter_mut()
                                     .find(|g| g.cwd.as_deref() == Some(group_cwd.as_str()))
                                 {
-                                    let existing_ids: std::collections::HashSet<String> =
-                                        existing.sessions.iter().map(|s| s.session_id.clone()).collect();
                                     for s in sessions {
-                                        if !existing_ids.contains(&s.session_id) {
+                                        if let Some(existing_summary) = existing
+                                            .sessions
+                                            .iter_mut()
+                                            .find(|summary| summary.session_id == s.session_id)
+                                        {
+                                            existing_summary.attached = s.attached;
+                                            existing_summary.node_id = s.node_id;
+                                            existing_summary.runtime_state = s.runtime_state;
+                                            existing_summary.title = s.title.clone();
+                                            existing_summary.name = s.title;
+                                            existing_summary.cwd = s.cwd;
+                                        } else {
                                             existing.sessions.push(s);
                                         }
                                     }
@@ -516,13 +549,16 @@ pub async fn handle_list_session_children(
     limit: Option<u32>,
     session_scope: Option<SessionScope>,
 ) {
-    if matches!(session_scope, Some(SessionScope::Delegates)) {
-        let _ = send_error(
-            tx,
-            "Session children list only supports user forks".to_string(),
-        )
-        .await;
-        return;
+    match session_scope {
+        None | Some(SessionScope::Forks) => {}
+        Some(_) => {
+            let _ = send_error(
+                tx,
+                "Session children list only supports user forks".to_string(),
+            )
+            .await;
+            return;
+        }
     }
 
     let page_limit = limit.unwrap_or(20).clamp(1, 200) as usize;
@@ -735,17 +771,7 @@ pub async fn handle_delete_session(
     }
 
     send_state(state, conn_id, tx).await;
-    handle_list_sessions(
-        state,
-        tx,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(SessionScope::Root),
-    )
-    .await;
+    handle_list_sessions(state, tx, ListSessionsRequest::root_browse()).await;
 }
 
 pub(super) async fn ensure_session_loaded(
@@ -1252,17 +1278,7 @@ pub async fn handle_fork_session(
             }
 
             send_state(state, conn_id, tx).await;
-            handle_list_sessions(
-                state,
-                tx,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(SessionScope::Root),
-            )
-            .await;
+            handle_list_sessions(state, tx, ListSessionsRequest::root_browse()).await;
 
             let _ = send_message(
                 tx,
