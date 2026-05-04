@@ -7,6 +7,7 @@ import {
   UiClientMessage,
   UiServerMessage,
   SessionGroup,
+  SessionSummaryWithChildren,
   UiPromptBlock,
   AuditView,
   FileIndexEntry,
@@ -228,6 +229,8 @@ export function useUiClient() {
   const pendingRequestsRef = useRef<Map<string, (sessionId: string) => void>>(new Map());
   const pendingDeleteLabelsRef = useRef<Map<string, string>>(new Map());
   const pendingLoadLabelsRef = useRef<Map<string, string>>(new Map());
+  const pendingSessionChildrenRef = useRef<Set<string>>(new Set());
+  const pendingSessionChildrenCursorRef = useRef<Map<string, string | null>>(new Map());
   const pendingForkResolverRef = useRef<{
     resolve: (sessionId: string) => void;
     reject: (reason?: unknown) => void;
@@ -802,6 +805,9 @@ export function useUiClient() {
         console.error('UI server error:', d.message);
         const isDeleteError = d.message.includes('Failed to delete session');
         const isLoadError = d.message.includes('Failed to load session');
+        const isSessionChildrenError =
+          d.message.includes('Failed to list session children') ||
+          d.message.includes('Session children list only supports user forks');
 
         if (isDeleteError) {
           pendingDeleteLabelsRef.current.clear();
@@ -826,6 +832,17 @@ export function useUiClient() {
           }
           pendingGroupLoadRef.current = null;
           sendMessage({ type: 'list_sessions', data: { mode: 'browse', session_scope: SessionScope.Root } } as UiClientMessage);
+        }
+
+        if (isSessionChildrenError && pendingSessionChildrenRef.current.size > 0) {
+          const failedParentIds = new Set(pendingSessionChildrenRef.current);
+          pendingSessionChildrenRef.current.clear();
+          failedParentIds.forEach((parentId) => pendingSessionChildrenCursorRef.current.delete(parentId));
+          setSessionChildrenLoading((prev) => {
+            const next = new Set(prev);
+            failedParentIds.forEach((parentId) => next.delete(parentId));
+            return next;
+          });
         }
 
         // Connection-level errors have no session_id. Do not inject them into the
@@ -853,6 +870,9 @@ export function useUiClient() {
       }
       case 'session_children': {
         const d = msg.data;
+        const pendingCursor = pendingSessionChildrenCursorRef.current.get(d.parent_session_id) ?? null;
+        pendingSessionChildrenRef.current.delete(d.parent_session_id);
+        pendingSessionChildrenCursorRef.current.delete(d.parent_session_id);
         setSessionChildrenLoading((prev) => {
           const next = new Set(prev);
           next.delete(d.parent_session_id);
@@ -861,11 +881,20 @@ export function useUiClient() {
         setSessionGroups((prev) =>
           prev.map((group) => ({
             ...group,
-            sessions: group.sessions.map((session) =>
-              session.session_id === d.parent_session_id
-                ? { ...session, children: d.sessions, has_children: d.total_count > 0, fork_count: d.total_count }
-                : session
-            ),
+            sessions: group.sessions.map((session) => {
+              if (session.session_id !== d.parent_session_id) {
+                return session;
+              }
+              const existingChildren = (session as SessionSummaryWithChildren).children ?? [];
+              return {
+                ...session,
+                children: pendingCursor ? [...existingChildren, ...d.sessions] : d.sessions,
+                childrenNextCursor: d.next_cursor ?? null,
+                childrenTotalCount: d.total_count,
+                has_children: d.total_count > 0,
+                fork_count: d.total_count,
+              };
+            }),
           }))
         );
         break;
@@ -1585,11 +1614,20 @@ export function useUiClient() {
     } as UiClientMessage);
   }, []);
 
-  const loadSessionChildren = useCallback((parentSessionId: string, limit: number = 50) => {
+  const loadSessionChildren = useCallback((parentSessionId: string, limitOrCursor: number | string | null = 10, cursor?: string | null) => {
+    const limit = typeof limitOrCursor === 'number' ? limitOrCursor : 10;
+    const childCursor = typeof limitOrCursor === 'number' ? cursor ?? null : limitOrCursor ?? null;
+    pendingSessionChildrenRef.current.add(parentSessionId);
+    pendingSessionChildrenCursorRef.current.set(parentSessionId, childCursor);
     setSessionChildrenLoading((prev) => new Set(prev).add(parentSessionId));
     sendMessage({
       type: 'list_session_children',
-      data: { parent_session_id: parentSessionId, limit, session_scope: SessionScope.Forks },
+      data: {
+        parent_session_id: parentSessionId,
+        limit,
+        ...(childCursor ? { cursor: childCursor } : {}),
+        session_scope: SessionScope.Forks,
+      },
     } as UiClientMessage);
   }, []);
 

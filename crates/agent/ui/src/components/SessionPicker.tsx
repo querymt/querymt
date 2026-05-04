@@ -1,6 +1,6 @@
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import * as Collapsible from '@radix-ui/react-collapsible';
-import { SessionGroup, SessionSummary } from '../types';
+import { SessionGroup, SessionSummary, SessionSummaryWithChildren } from '../types';
 import { ChevronDown, ChevronRight, Search, Plus, Clock, GitBranch, Globe, Trash2, Plug } from 'lucide-react';
 import { useThinkingSessionIds } from '../hooks/useThinkingSessionIds';
 
@@ -12,7 +12,7 @@ interface SessionPickerProps {
   onLoadMoreSessions?: () => void;
   onLoadMoreGroupSessions?: (cwd: string | null) => void;
   onSearchSessions?: (query: string) => void;
-  onLoadSessionChildren?: (parentSessionId: string) => void;
+  onLoadSessionChildren?: (parentSessionId: string, cursor?: string | null) => void;
   sessionChildrenLoading?: Set<string>;
   disabled?: boolean;
   activeSessionId?: string | null;
@@ -73,7 +73,7 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
         }
       }
 
-      const buildHierarchy = (session: SessionSummary): SessionSummary & { children?: SessionSummary[] } => {
+      const buildHierarchy = (session: SessionSummary): SessionSummaryWithChildren => {
         const children = childrenByParent.get(session.session_id);
         if (children && children.length > 0) {
           return { ...session, children: children.map(buildHierarchy) };
@@ -93,12 +93,10 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
     if (isServerSearch) return groupsWithHierarchy;
 
     // Filter with hierarchy awareness: keep a node if it or any descendant matches.
-    const filterWithHierarchy = (
-      session: SessionSummary & { children?: SessionSummary[] }
-    ): (SessionSummary & { children?: SessionSummary[] }) | null => {
+    const filterWithHierarchy = (session: SessionSummaryWithChildren): SessionSummaryWithChildren | null => {
       const childrenFiltered = session.children
         ?.map(filterWithHierarchy)
-        .filter((c): c is SessionSummary & { children?: SessionSummary[] } => c !== null);
+        .filter((c): c is SessionSummaryWithChildren => c !== null);
 
       if (matchesQuery(session) || (childrenFiltered && childrenFiltered.length > 0)) {
         return { ...session, children: childrenFiltered?.length ? childrenFiltered : undefined };
@@ -158,7 +156,7 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
   };
 
   // Helper to render a single session card with its children
-  const renderSessionCard = (session: SessionSummary & { children?: SessionSummary[] }, sessionIndex: number, depth: number = 0) => {
+  const renderSessionCard = (session: SessionSummaryWithChildren, sessionIndex: number, depth: number = 0) => {
     const isChild = !!session.parent_session_id;
     const isRecurring = session.session_kind === 'recurring';
     const isMemory = session.session_kind === 'memory';
@@ -171,6 +169,7 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
     const isLoadingChildren = sessionChildrenLoading.has(session.session_id);
     const forkCount = session.fork_count ?? 0;
     const canExpandForks = !session.node && !session.parent_session_id && forkCount > 0;
+    const childCursor = session.childrenNextCursor ?? null;
     
     return (
       <div
@@ -308,6 +307,18 @@ export function SessionPicker({ groups, onSelectSession, onDeleteSession, onNewS
           <div className="mt-2 space-y-2">
             {session.children.map((child, childIndex) => 
               renderSessionCard(child, childIndex, depth + 1)
+            )}
+            {childCursor && (
+              <div className="pt-1" style={{ marginLeft: depth > 0 ? `${(depth + 1) * 1.5}rem` : '1.5rem' }}>
+                <button
+                  type="button"
+                  onClick={() => onLoadSessionChildren?.(session.session_id, childCursor)}
+                  disabled={disabled || isLoadingChildren}
+                  className="px-3 py-1.5 rounded-md text-[11px] font-medium border border-surface-border/40 text-ui-secondary hover:text-ui-primary hover:border-accent-primary/50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                >
+                  {isLoadingChildren ? 'Loading...' : 'Load more forks'}
+                </button>
+              </div>
             )}
           </div>
         )}

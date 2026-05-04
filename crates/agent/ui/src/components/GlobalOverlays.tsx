@@ -24,7 +24,7 @@ interface GlobalOverlaysProps {
   handleNewSession: () => Promise<void>;
   handleSelectSession: (sessionId: string) => void;
   handleDeleteSession: (sessionId: string, sessionLabel?: string) => void;
-  loadSessionChildren: (parentSessionId: string) => void;
+  loadSessionChildren: (parentSessionId: string, cursor?: string | null) => void;
   sessionChildrenLoading: Set<string>;
   connected: boolean;
 

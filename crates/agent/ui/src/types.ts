@@ -1,8 +1,9 @@
 // Import types from ACP SDK where possible
-import type { 
+import type {
   SessionNotification,
   SessionUpdate,
 } from '@agentclientprotocol/sdk';
+import type { SessionSummary as GeneratedSessionSummary } from './generated/types';
 
 // Re-export SDK types for use in other components
 export type { SessionNotification, SessionUpdate };
@@ -92,6 +93,12 @@ export interface ElicitationData {
 
 // ── UI-only view-model types ──────────────────────────────────────────────────
 // These are not generated from Rust and represent UI-specific data models.
+
+export type SessionSummaryWithChildren = GeneratedSessionSummary & {
+  children?: SessionSummaryWithChildren[];
+  childrenNextCursor?: string | null;
+  childrenTotalCount?: number;
+};
 
 export interface EventItem {
   id: string;

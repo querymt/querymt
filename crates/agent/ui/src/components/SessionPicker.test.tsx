@@ -114,6 +114,37 @@ describe('SessionPicker', () => {
     expect(screen.getByText('Orphan Fork')).toBeInTheDocument();
   });
 
+  it('loads more forks with the stored child cursor', async () => {
+    const user = userEvent.setup();
+    const groupsWithForkCursor = [
+      {
+        ...groups[0],
+        sessions: [
+          {
+            ...groups[0].sessions[0],
+            childrenNextCursor: '10',
+            children: [
+              {
+                session_id: 'fork-session-222',
+                title: 'User Fork',
+                parent_session_id: 'root-session-111',
+                fork_origin: 'user',
+                has_children: false,
+                fork_count: 0,
+              },
+            ],
+          },
+        ],
+      },
+    ];
+
+    render(<SessionPicker {...defaultProps} groups={groupsWithForkCursor as SessionGroup[]} />);
+    await user.click(screen.getByLabelText(/expand forks for root session/i));
+    await user.click(screen.getByRole('button', { name: /load more forks/i }));
+
+    expect(defaultProps.onLoadSessionChildren).toHaveBeenLastCalledWith('root-session-111', '10');
+  });
+
   it('shows loaded forks without delegated badges', async () => {
     const user = userEvent.setup();
     const groupsWithFork = [

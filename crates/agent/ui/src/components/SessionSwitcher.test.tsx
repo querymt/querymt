@@ -344,6 +344,50 @@ describe('SessionSwitcher', () => {
     expect(onLoadSessionChildren).toHaveBeenCalledWith('root-session-123');
   });
 
+  it('loads more forks with the stored child cursor', async () => {
+    const user = userEvent.setup();
+    const onLoadSessionChildren = vi.fn();
+    const groupsWithForkCursor: SessionGroup[] = [
+      {
+        cwd: '/workspace/test',
+        sessions: [
+          {
+            session_id: 'root-session-123',
+            title: 'Root Session',
+            has_children: true,
+            fork_count: 11,
+            updated_at: new Date().toISOString(),
+            childrenNextCursor: '10',
+            children: [
+              {
+                session_id: 'fork-session-456',
+                title: 'User Fork',
+                parent_session_id: 'root-session-123',
+                fork_origin: 'user',
+                has_children: false,
+                fork_count: 0,
+                updated_at: new Date(Date.now() - 1000).toISOString(),
+              },
+            ],
+          },
+        ],
+      },
+    ];
+
+    render(
+      <SessionSwitcher
+        {...defaultProps}
+        groups={groupsWithForkCursor}
+        onLoadSessionChildren={onLoadSessionChildren}
+      />
+    );
+
+    await user.click(screen.getByLabelText(/expand forks for root session/i));
+    await user.click(screen.getByRole('option', { name: /load more forks/i }));
+
+    expect(onLoadSessionChildren).toHaveBeenCalledWith('root-session-123', '10');
+  });
+
   it('displays session IDs truncated', () => {
     render(<SessionSwitcher {...defaultProps} />);
     

@@ -1,8 +1,8 @@
-import { useMemo, useRef, useEffect, useState } from 'react';
+import { Fragment, useMemo, useRef, useEffect, useState } from 'react';
 import { Command } from 'cmdk';
 import Fuse from 'fuse.js';
 import { Plus, GitBranch, Clock, Globe, Trash2, X, ChevronDown, ChevronRight } from 'lucide-react';
-import { SessionGroup, SessionSummary } from '../types';
+import { SessionGroup, SessionSummaryWithChildren } from '../types';
 import { useUiStore } from '../store/uiStore';
 
 /**
@@ -21,12 +21,12 @@ interface SessionSwitcherProps {
   onNewSession: () => Promise<void>;
   onSelectSession: (sessionId: string) => void;
   onDeleteSession: (sessionId: string, sessionLabel?: string) => void;
-  onLoadSessionChildren?: (parentSessionId: string) => void;
+  onLoadSessionChildren?: (parentSessionId: string, cursor?: string | null) => void;
   sessionChildrenLoading?: Set<string>;
   connected: boolean;
 }
 
-type SessionWithChildren = SessionSummary & { children?: SessionSummary[] };
+type SessionWithChildren = SessionSummaryWithChildren;
 
 interface FlatSession extends SessionWithChildren {
   workspace: string; // cwd from the group
@@ -92,7 +92,7 @@ export function SessionSwitcher({
     
     return flat;
   }, [groups, expandedSessions]);
-  
+
   // Setup fuse.js for fuzzy search
   const fuse = useMemo(() => {
     return new Fuse(flatSessions, {
@@ -296,10 +296,11 @@ export function SessionSwitcher({
                   const isLoadingChildren = sessionChildrenLoading.has(session.session_id);
                   const forkCount = session.fork_count ?? 0;
                   const canExpandForks = !session.isRemote && forkCount > 0 && !session.isChild;
+                  const childCursor = session.childrenNextCursor ?? null;
                   
                   return (
+                    <Fragment key={session.session_id}>
                     <Command.Item
-                      key={session.session_id}
                       value={session.session_id}
                       onSelect={() => handleSelectSession(session.session_id)}
                       className="flex items-start gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40 group"
@@ -414,6 +415,17 @@ export function SessionSwitcher({
                         </button>
                       )}
                     </Command.Item>
+                    {isExpanded && childCursor && (
+                      <Command.Item
+                        value={`${session.session_id}-load-more-forks`}
+                        onSelect={() => onLoadSessionChildren?.(session.session_id, childCursor)}
+                        disabled={isLoadingChildren}
+                        className="ml-8 mt-1 flex items-center px-3 py-1.5 rounded-md border border-surface-border/30 text-xs text-ui-secondary cursor-pointer data-[selected=true]:bg-accent-primary/10 data-[selected=true]:border-accent-primary/30 hover:text-ui-primary hover:border-accent-primary/40 data-[disabled=true]:opacity-40 data-[disabled=true]:cursor-not-allowed"
+                      >
+                        {isLoadingChildren ? 'Loading...' : 'Load more forks'}
+                      </Command.Item>
+                    )}
+                    </Fragment>
                   );
                 })}
               </Command.Group>
@@ -431,10 +443,11 @@ export function SessionSwitcher({
                   const isLoadingChildren = sessionChildrenLoading.has(session.session_id);
                   const forkCount = session.fork_count ?? 0;
                   const canExpandForks = !session.isRemote && forkCount > 0 && !session.isChild;
+                  const childCursor = session.childrenNextCursor ?? null;
                   
                   return (
+                    <Fragment key={session.session_id}>
                     <Command.Item
-                      key={session.session_id}
                       value={session.session_id}
                       onSelect={() => handleSelectSession(session.session_id)}
                       className="flex items-start gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40 group"
@@ -549,6 +562,17 @@ export function SessionSwitcher({
                         </button>
                       )}
                     </Command.Item>
+                    {isExpanded && childCursor && (
+                      <Command.Item
+                        value={`${session.session_id}-load-more-forks`}
+                        onSelect={() => onLoadSessionChildren?.(session.session_id, childCursor)}
+                        disabled={isLoadingChildren}
+                        className="ml-8 mt-1 flex items-center px-3 py-1.5 rounded-md border border-surface-border/30 text-xs text-ui-secondary cursor-pointer data-[selected=true]:bg-accent-primary/10 data-[selected=true]:border-accent-primary/30 hover:text-ui-primary hover:border-accent-primary/40 data-[disabled=true]:opacity-40 data-[disabled=true]:cursor-not-allowed"
+                      >
+                        {isLoadingChildren ? 'Loading...' : 'Load more forks'}
+                      </Command.Item>
+                    )}
+                    </Fragment>
                   );
                 })}
               </Command.Group>

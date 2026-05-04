@@ -44,7 +44,7 @@ export interface UiClientActionsContextValue {
   loadMoreSessions: (limit?: number) => void;
   loadMoreGroupSessions: (cwd: string | null, limit?: number) => void;
   searchSessions: (query: string, limit?: number) => void;
-  loadSessionChildren: (parentSessionId: string, limit?: number) => void;
+  loadSessionChildren: (parentSessionId: string, limitOrCursor?: number | string | null, cursor?: string | null) => void;
   requestAuthProviders: () => void;
   startOAuthLogin: (provider: string) => void;
   completeOAuthLogin: (flowId: string, response: string) => void;
