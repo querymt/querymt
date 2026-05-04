@@ -404,43 +404,6 @@ async fn spawn_and_register_mesh_actors(
     handle: &crate::agent::LocalAgentHandle,
     mesh: &crate::agent::remote::MeshHandle,
 ) {
-    use crate::agent::remote::ProviderHostActor;
-    use crate::agent::remote::RemoteNodeManager;
-    use crate::agent::remote::dht_name;
-    use kameo::actor::Spawn;
-
-    // ── RemoteNodeManager ────────────────────────────────────────────────────
-    let node_manager = RemoteNodeManager::new(
-        handle.config.clone(),
-        handle.registry.clone(),
-        Some(mesh.clone()),
-    );
-    let node_manager_ref = RemoteNodeManager::spawn(node_manager);
-
-    // Register under the global name (for lookup_all_actors / list_remote_nodes).
-    mesh.register_actor(node_manager_ref.clone(), dht_name::NODE_MANAGER)
+    let _ = crate::agent::remote::remote_setup::spawn_and_register_local_mesh_actors(handle, mesh)
         .await;
-    log::info!(
-        "RemoteNodeManager registered in DHT as '{}'",
-        dht_name::NODE_MANAGER
-    );
-
-    // Register under the per-peer name for O(1) direct lookup by peer_id.
-    // This is the name resolve_peer_node_id looks up — it must be present for
-    // peer delegates to route to this node.
-    let per_peer_name = dht_name::node_manager_for_peer(mesh.peer_id());
-    mesh.register_actor(node_manager_ref, per_peer_name.clone())
-        .await;
-    log::info!(
-        "RemoteNodeManager also registered in DHT as '{}'",
-        per_peer_name
-    );
-
-    // ── ProviderHostActor ────────────────────────────────────────────────────
-    let provider_host = ProviderHostActor::new(handle.config.clone());
-    let provider_host_ref = ProviderHostActor::spawn(provider_host);
-    let ph_dht_name = dht_name::provider_host(mesh.peer_id());
-    mesh.register_actor(provider_host_ref, ph_dht_name.clone())
-        .await;
-    log::info!("ProviderHostActor registered in DHT as '{}'", ph_dht_name);
 }

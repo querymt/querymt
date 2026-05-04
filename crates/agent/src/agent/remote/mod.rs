@@ -115,7 +115,10 @@ pub use registry_exchange::{
 #[cfg(feature = "remote")]
 pub use remote_handle::RemoteAgentHandle;
 #[cfg(feature = "remote")]
-pub use remote_setup::{MeshSetupResult, setup_mesh_from_config};
+pub use remote_setup::{
+    LocalMeshActorRefs, MeshSetupResult, setup_mesh_from_config,
+    spawn_and_register_local_mesh_actors,
+};
 pub use routing::{
     ClearRoute, ListRoutes, ResolvePeer, RouteConfirmation, RouteTarget, RoutingActor,
     RoutingPolicy, RoutingSnapshot, RoutingSnapshotHandle, SetProviderTarget, SetSessionTarget,

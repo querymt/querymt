@@ -7,7 +7,9 @@ members = [
     "crates/provider-common",
     "crates/querymt-utils",
     "crates/service-client",
-    "crates/providers/*", "crates/querymt-extism-macros",
+    "crates/providers/*",
+    "crates/querymt-extism-macros",
+    "crates/querymt-mobile-ffi",
 ]
 
 [workspace.package]
