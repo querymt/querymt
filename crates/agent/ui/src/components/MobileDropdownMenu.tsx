@@ -48,35 +48,37 @@ export function MobileDropdownMenu(props: MobileDropdownMenuProps) {
   return (
     <div className="md:hidden bg-surface-elevated border-b border-surface-border px-3 py-2.5 flex flex-col gap-2 z-30">
       {/* Model picker on mobile */}
-      <ModelPickerPopover
-        open={props.modelPickerOpen}
-        onOpenChange={props.handleMobilePickerOpenChange}
-        isInMobileMenu
-        connected={props.connected}
-        routingMode={props.routingMode}
-        activeAgentId={props.activeAgentId}
-        sessionId={props.sessionId}
-        sessionsByAgent={props.sessionsByAgent}
-        agents={props.agents}
-        allModels={props.allModels}
-        currentProvider={props.activeAgentModel?.provider}
-        currentModel={props.activeAgentModel?.model}
-        currentNode={props.activeAgentModel?.node}
-        remoteNodes={props.remoteNodes}
-        currentWorkspace={props.currentWorkspace}
-        recentModelsByWorkspace={props.recentModelsByWorkspace}
-        agentMode={props.agentMode}
-        reasoningEffort={props.reasoningEffort}
-        onRefresh={props.refreshAllModels}
-        onSetSessionModel={props.setSessionModel}
-        onSetReasoningEffort={props.setReasoningEffort}
-        onCycleReasoningEffort={props.cycleReasoningEffort}
-        providerCapabilities={props.providerCapabilities}
-        modelDownloads={props.modelDownloads}
-        onAddCustomModelFromHf={props.addCustomModelFromHf}
-        onAddCustomModelFromFile={props.addCustomModelFromFile}
-        onDeleteCustomModel={props.deleteCustomModel}
-      />
+      {props.sessionId && (
+        <ModelPickerPopover
+          open={props.modelPickerOpen}
+          onOpenChange={props.handleMobilePickerOpenChange}
+          isInMobileMenu
+          connected={props.connected}
+          routingMode={props.routingMode}
+          activeAgentId={props.activeAgentId}
+          sessionId={props.sessionId}
+          sessionsByAgent={props.sessionsByAgent}
+          agents={props.agents}
+          allModels={props.allModels}
+          currentProvider={props.activeAgentModel?.provider}
+          currentModel={props.activeAgentModel?.model}
+          currentNode={props.activeAgentModel?.node}
+          remoteNodes={props.remoteNodes}
+          currentWorkspace={props.currentWorkspace}
+          recentModelsByWorkspace={props.recentModelsByWorkspace}
+          agentMode={props.agentMode}
+          reasoningEffort={props.reasoningEffort}
+          onRefresh={props.refreshAllModels}
+          onSetSessionModel={props.setSessionModel}
+          onSetReasoningEffort={props.setReasoningEffort}
+          onCycleReasoningEffort={props.cycleReasoningEffort}
+          providerCapabilities={props.providerCapabilities}
+          modelDownloads={props.modelDownloads}
+          onAddCustomModelFromHf={props.addCustomModelFromHf}
+          onAddCustomModelFromFile={props.addCustomModelFromFile}
+          onDeleteCustomModel={props.deleteCustomModel}
+        />
+      )}
       <div className="flex items-center gap-2">
         <button
           type="button"

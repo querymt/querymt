@@ -116,6 +116,7 @@ export function AppShell() {
 
   const location = useLocation();
   const isHomePage = location.pathname === '/';
+  const visibleSessionId = isHomePage ? null : sessionId;
   const isMobile = useIsMobile();
   const [shortcutGatewayOpen, setShortcutGatewayOpen] = useState(false);
   const [themeSwitcherOpen, setThemeSwitcherOpen] = useState(false);
@@ -207,18 +208,18 @@ export function AppShell() {
   // --- Derived values ---
 
   const currentWorkspace = useMemo(() => {
-    if (!sessionId) return null;
+    if (!visibleSessionId) return null;
     for (const group of sessionGroups) {
-      if (group.sessions.some(s => s.session_id === sessionId)) {
+      if (group.sessions.some(s => s.session_id === visibleSessionId)) {
         return group.cwd || null;
       }
     }
     return null;
-  }, [sessionId, sessionGroups]);
+  }, [visibleSessionId, sessionGroups]);
 
   const activeAgentModel = useMemo(
-    () => agentModels[activeAgentId],
-    [agentModels, activeAgentId],
+    () => visibleSessionId ? agentModels[activeAgentId] : undefined,
+    [agentModels, activeAgentId, visibleSessionId],
   );
 
   // --- Callbacks ---
@@ -240,6 +241,12 @@ export function AppShell() {
     [setModelPickerOpen],
   );
 
+  useEffect(() => {
+    if (!isHomePage) return;
+    setModelPickerOpen(false);
+    setStatsDrawerOpen(false);
+  }, [isHomePage, setModelPickerOpen, setStatsDrawerOpen]);
+
   // --- Render ---
 
   const meshInvitePanel = (
@@ -259,7 +266,7 @@ export function AppShell() {
       <AppHeader
         isHomePage={isHomePage}
         isMobile={isMobile}
-        sessionId={sessionId}
+        sessionId={visibleSessionId}
         connected={connected}
         reconnecting={reconnecting}
         isSessionActive={isSessionActive}
@@ -307,7 +314,7 @@ export function AppShell() {
           connected={connected}
           routingMode={routingMode}
           activeAgentId={activeAgentId}
-          sessionId={sessionId}
+          sessionId={visibleSessionId}
           sessionsByAgent={sessionsByAgent}
           agents={agents}
           allModels={allModels}

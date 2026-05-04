@@ -184,34 +184,36 @@ export function AppHeader(props: AppHeaderProps) {
         {/* Desktop controls */}
         {!isMobile && (
           <div className="hidden md:flex items-center gap-2 min-w-0">
-            <ModelPickerPopover
-              open={modelPickerOpen}
-              onOpenChange={setModelPickerOpen}
-              connected={connected}
-              routingMode={props.routingMode}
-              activeAgentId={props.activeAgentId}
-              sessionId={sessionId}
-              sessionsByAgent={props.sessionsByAgent}
-              agents={props.agents}
-              allModels={props.allModels}
-              currentProvider={activeAgentModel?.provider}
-              currentModel={activeAgentModel?.model}
-              currentNode={activeAgentModel?.node}
-              remoteNodes={remoteNodes}
-              currentWorkspace={props.currentWorkspace}
-              recentModelsByWorkspace={props.recentModelsByWorkspace}
-              agentMode={agentMode}
-              reasoningEffort={props.reasoningEffort}
-              onRefresh={props.refreshAllModels}
-              onSetSessionModel={props.setSessionModel}
-              onSetReasoningEffort={props.setReasoningEffort}
-              onCycleReasoningEffort={props.cycleReasoningEffort}
-              providerCapabilities={props.providerCapabilities}
-              modelDownloads={props.modelDownloads}
-              onAddCustomModelFromHf={props.addCustomModelFromHf}
-              onAddCustomModelFromFile={props.addCustomModelFromFile}
-              onDeleteCustomModel={props.deleteCustomModel}
-            />
+            {sessionId && (
+              <ModelPickerPopover
+                open={modelPickerOpen}
+                onOpenChange={setModelPickerOpen}
+                connected={connected}
+                routingMode={props.routingMode}
+                activeAgentId={props.activeAgentId}
+                sessionId={sessionId}
+                sessionsByAgent={props.sessionsByAgent}
+                agents={props.agents}
+                allModels={props.allModels}
+                currentProvider={activeAgentModel?.provider}
+                currentModel={activeAgentModel?.model}
+                currentNode={activeAgentModel?.node}
+                remoteNodes={remoteNodes}
+                currentWorkspace={props.currentWorkspace}
+                recentModelsByWorkspace={props.recentModelsByWorkspace}
+                agentMode={agentMode}
+                reasoningEffort={props.reasoningEffort}
+                onRefresh={props.refreshAllModels}
+                onSetSessionModel={props.setSessionModel}
+                onSetReasoningEffort={props.setReasoningEffort}
+                onCycleReasoningEffort={props.cycleReasoningEffort}
+                providerCapabilities={props.providerCapabilities}
+                modelDownloads={props.modelDownloads}
+                onAddCustomModelFromHf={props.addCustomModelFromHf}
+                onAddCustomModelFromFile={props.addCustomModelFromFile}
+                onDeleteCustomModel={props.deleteCustomModel}
+              />
+            )}
 
             <RemoteNodeIndicator remoteNodes={remoteNodes} />
             {props.desktopActions}
