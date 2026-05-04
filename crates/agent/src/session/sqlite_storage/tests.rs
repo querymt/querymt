@@ -1,7 +1,10 @@
 use rusqlite::Connection;
 
 use crate::events::{AgentEventKind, EventOrigin};
-use crate::session::projection::{EventJournal, NewDurableEvent, RecentModelEntry, ViewStore};
+use crate::session::domain::ForkOrigin;
+use crate::session::projection::{
+    EventJournal, NewDurableEvent, RecentModelEntry, SessionScope, ViewStore,
+};
 use crate::session::store::SessionStore;
 
 use super::SqliteStorage;
@@ -413,6 +416,266 @@ async fn journal_ordering_is_monotonic_per_stream() {
             "stream_seq must be strictly increasing"
         );
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ViewStore — scoped session browsing tests
+// ══════════════════════════════════════════════════════════════════════
+
+async fn seed_scoped_sessions(storage: &SqliteStorage) -> (String, String, String, String) {
+    let root_a = storage
+        .create_session(
+            Some("root-alpha".to_string()),
+            Some("/workspace".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let root_b = storage
+        .create_session(
+            Some("root-beta".to_string()),
+            Some("/workspace".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let user_fork = storage
+        .create_session(
+            Some("user-fork".to_string()),
+            Some("/workspace".into()),
+            Some(root_a.public_id.clone()),
+            Some(ForkOrigin::User),
+        )
+        .await
+        .unwrap();
+    let delegate = storage
+        .create_session(
+            Some("delegate-child".to_string()),
+            Some("/workspace".into()),
+            Some(root_a.public_id.clone()),
+            Some(ForkOrigin::Delegation),
+        )
+        .await
+        .unwrap();
+
+    (
+        root_a.public_id,
+        root_b.public_id,
+        user_fork.public_id,
+        delegate.public_id,
+    )
+}
+
+fn session_ids(groups: &[crate::session::projection::SessionGroup]) -> Vec<String> {
+    groups
+        .iter()
+        .flat_map(|group| {
+            group
+                .sessions
+                .iter()
+                .map(|session| session.session_id.clone())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn browse_session_groups_filters_by_scope_and_counts_after_filtering() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let (root_a, root_b, user_fork, delegate) = seed_scoped_sessions(&storage).await;
+    let view: &dyn ViewStore = &storage;
+
+    let (groups, _, total) = view
+        .browse_session_groups(None, 20, 10, SessionScope::All)
+        .await
+        .unwrap();
+    assert_eq!(total, 4);
+    assert_eq!(session_ids(&groups).len(), 4);
+
+    let (groups, _, total) = view
+        .browse_session_groups(None, 20, 10, SessionScope::Root)
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(session_ids(&groups), vec![root_b.clone(), root_a.clone()]);
+    assert_eq!(groups[0].total_count, Some(2));
+
+    let (groups, _, total) = view
+        .browse_session_groups(None, 20, 10, SessionScope::Forks)
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(session_ids(&groups), vec![user_fork.clone()]);
+
+    let (groups, _, total) = view
+        .browse_session_groups(None, 20, 10, SessionScope::Delegates)
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(session_ids(&groups), vec![delegate.clone()]);
+
+    let (groups, _, total) = view
+        .browse_session_groups(None, 20, 10, SessionScope::Children)
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(session_ids(&groups), vec![delegate, user_fork]);
+}
+
+#[tokio::test]
+async fn browse_session_groups_marks_only_user_forks_as_children() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let root_with_user_fork = storage
+        .create_session(
+            Some("root-with-user-fork".to_string()),
+            Some("/workspace".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    storage
+        .create_session(
+            Some("user-fork".to_string()),
+            Some("/workspace".into()),
+            Some(root_with_user_fork.public_id.clone()),
+            Some(ForkOrigin::User),
+        )
+        .await
+        .unwrap();
+    let root_with_delegate_only = storage
+        .create_session(
+            Some("root-with-delegate-only".to_string()),
+            Some("/workspace".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    storage
+        .create_session(
+            Some("delegate-child".to_string()),
+            Some("/workspace".into()),
+            Some(root_with_delegate_only.public_id.clone()),
+            Some(ForkOrigin::Delegation),
+        )
+        .await
+        .unwrap();
+    let view: &dyn ViewStore = &storage;
+
+    let (groups, _, _) = view
+        .browse_session_groups(None, 20, 20, SessionScope::Root)
+        .await
+        .unwrap();
+    let sessions: Vec<_> = groups
+        .iter()
+        .flat_map(|group| group.sessions.iter())
+        .collect();
+
+    let root_with_user_fork_item = sessions
+        .iter()
+        .find(|session| session.session_id == root_with_user_fork.public_id)
+        .unwrap();
+    assert!(root_with_user_fork_item.has_children);
+    assert_eq!(root_with_user_fork_item.fork_count, 1);
+
+    let root_with_delegate_only_item = sessions
+        .iter()
+        .find(|session| session.session_id == root_with_delegate_only.public_id)
+        .unwrap();
+    assert!(!root_with_delegate_only_item.has_children);
+    assert_eq!(root_with_delegate_only_item.fork_count, 0);
+}
+
+#[tokio::test]
+async fn list_session_children_returns_user_forks_and_excludes_delegates() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let (root_a, _, user_fork, delegate) = seed_scoped_sessions(&storage).await;
+    let view: &dyn ViewStore = &storage;
+
+    let (group, total) = view.list_session_children(root_a, None, 20).await.unwrap();
+
+    assert_eq!(total, 1);
+    assert_eq!(group.total_count, Some(1));
+    assert_eq!(group.sessions[0].fork_count, 0);
+    assert_eq!(session_ids(&[group]), vec![user_fork.clone()]);
+    assert_ne!(delegate, user_fork);
+}
+
+#[tokio::test]
+async fn list_session_children_returns_empty_group_for_missing_parent() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let view: &dyn ViewStore = &storage;
+
+    let (group, total) = view
+        .list_session_children("missing-parent".to_string(), None, 20)
+        .await
+        .unwrap();
+
+    assert_eq!(total, 0);
+    assert_eq!(group.total_count, Some(0));
+    assert!(group.sessions.is_empty());
+    assert!(group.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn group_sessions_scope_filtering_respects_cursors_and_counts() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let (root_a, root_b, _, _) = seed_scoped_sessions(&storage).await;
+    let view: &dyn ViewStore = &storage;
+
+    let (group, total) = view
+        .list_group_sessions(Some("/workspace".to_string()), None, 1, SessionScope::Root)
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(group.total_count, Some(2));
+    assert_eq!(group.sessions.len(), 1);
+    assert_eq!(group.sessions[0].session_id, root_b);
+    assert_eq!(group.next_cursor.as_deref(), Some("1"));
+
+    let (group, total) = view
+        .list_group_sessions(
+            Some("/workspace".to_string()),
+            group.next_cursor,
+            1,
+            SessionScope::Root,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(group.sessions[0].session_id, root_a);
+    assert!(group.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn search_sessions_filters_by_scope() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    seed_scoped_sessions(&storage).await;
+    let view: &dyn ViewStore = &storage;
+
+    let (groups, _, total) = view
+        .search_sessions("root".to_string(), None, 20, SessionScope::Root)
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert!(
+        groups
+            .iter()
+            .flat_map(|group| group.sessions.iter())
+            .all(|session| session.parent_session_id.is_none())
+    );
+
+    let (groups, _, total) = view
+        .search_sessions("delegate".to_string(), None, 20, SessionScope::Delegates)
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(
+        groups[0].sessions[0].fork_origin.as_deref(),
+        Some("delegation")
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════

@@ -5,7 +5,7 @@
 
 use crate::events::EventEnvelope;
 use crate::index::FileIndexEntry;
-use crate::session::projection::AuditView;
+use crate::session::projection::{AuditView, SessionScope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -124,6 +124,8 @@ pub struct SessionSummary {
     pub fork_origin: Option<String>,
     pub session_kind: Option<String>,
     pub has_children: bool,
+    #[typeshare(serialized_as = "number")]
+    pub fork_count: u64,
     pub node: Option<String>,
     pub node_id: Option<String>,
     pub attached: Option<bool>,
@@ -195,6 +197,21 @@ pub enum UiClientMessage {
         /// Search query for mode=search.
         #[serde(default)]
         query: Option<String>,
+        /// Session scope filter: all (default), root, forks, delegates, or children.
+        #[serde(default)]
+        session_scope: Option<SessionScope>,
+    },
+    ListSessionChildren {
+        parent_session_id: String,
+        /// Opaque pagination cursor (offset as string for now).
+        #[serde(default)]
+        cursor: Option<String>,
+        /// Max number of child sessions to return.
+        #[serde(default)]
+        limit: Option<u32>,
+        /// Child scope filter. Defaults to forks; delegates are never returned here.
+        #[serde(default)]
+        session_scope: Option<SessionScope>,
     },
     LoadSession {
         session_id: String,
@@ -761,6 +778,14 @@ pub enum UiServerMessage {
         #[typeshare(serialized_as = "number")]
         total_count: u64,
     },
+    SessionChildren {
+        parent_session_id: String,
+        sessions: Vec<SessionSummary>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<String>,
+        #[typeshare(serialized_as = "number")]
+        total_count: u64,
+    },
     SessionLoaded {
         session_id: String,
         agent_id: String,
@@ -990,6 +1015,7 @@ impl UiServerMessage {
             Self::Event { .. } => "event",
             Self::Error { .. } => "error",
             Self::SessionList { .. } => "session_list",
+            Self::SessionChildren { .. } => "session_children",
             Self::SessionLoaded { .. } => "session_loaded",
             Self::WorkspaceIndexStatus { .. } => "workspace_index_status",
             Self::AllModelsList { .. } => "all_models_list",

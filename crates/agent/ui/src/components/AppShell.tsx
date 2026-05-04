@@ -52,6 +52,7 @@ export function AppShell() {
     dismissSessionActionNotice,
     updatePlugins,
     createSchedule,
+    loadSessionChildren,
   } = useUiClientActions();
 
   const {
@@ -74,6 +75,7 @@ export function AppShell() {
     remoteNodes,
     meshInvites,
     lastCreatedMeshInvite,
+    sessionChildrenLoading,
   } = useUiClientSession();
 
   const {
@@ -349,6 +351,8 @@ export function AppShell() {
         handleNewSession={handleNewSession}
         handleSelectSession={handleSelectSession}
         handleDeleteSession={handleDeleteSession}
+        loadSessionChildren={loadSessionChildren}
+        sessionChildrenLoading={sessionChildrenLoading}
         connected={connected}
         shortcutGatewayOpen={shortcutGatewayOpen}
         setShortcutGatewayOpen={setShortcutGatewayOpen}

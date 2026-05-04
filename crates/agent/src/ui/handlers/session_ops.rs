@@ -16,6 +16,7 @@ use crate::events::EventEnvelope;
 use crate::index::resolve_workspace_root;
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
+use crate::session::projection::SessionScope;
 use crate::ui::mentions::{filter_index_for_cwd, filter_index_for_cwd_entries};
 use agent_client_protocol::schema::{LoadSessionRequest, SessionId};
 use querymt::chat::ReasoningEffort;
@@ -54,6 +55,45 @@ pub(crate) fn refresh_attached_remote_summary(
 
 // ── Session list / load ───────────────────────────────────────────────────────
 
+fn to_ui_summary(s: crate::session::projection::SessionListItem) -> SessionSummary {
+    SessionSummary {
+        session_id: s.session_id,
+        name: s.name,
+        cwd: s.cwd,
+        title: s.title,
+        created_at: s.created_at.and_then(|t| t.format(&Rfc3339).ok()),
+        updated_at: s.updated_at.and_then(|t| t.format(&Rfc3339).ok()),
+        parent_session_id: s.parent_session_id,
+        fork_origin: s.fork_origin,
+        session_kind: s.session_kind,
+        has_children: s.has_children,
+        fork_count: s.fork_count as u64,
+        node: None,
+        node_id: None,
+        attached: None,
+        runtime_state: None,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ListSessionsRequest {
+    pub mode: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+    pub cwd: Option<String>,
+    pub query: Option<String>,
+    pub session_scope: Option<SessionScope>,
+}
+
+impl ListSessionsRequest {
+    pub fn root_browse() -> Self {
+        Self {
+            session_scope: Some(SessionScope::Root),
+            ..Self::default()
+        }
+    }
+}
+
 /// Handle session listing request.
 #[tracing::instrument(
     name = "ui.handle_list_sessions",
@@ -73,42 +113,30 @@ pub(crate) fn refresh_attached_remote_summary(
 pub async fn handle_list_sessions(
     state: &ServerState,
     tx: &mpsc::Sender<String>,
-    mode: Option<String>,
-    cursor: Option<String>,
-    limit: Option<u32>,
-    cwd: Option<String>,
-    query: Option<String>,
+    request: ListSessionsRequest,
 ) {
     let started = Instant::now();
+    let ListSessionsRequest {
+        mode,
+        cursor,
+        limit,
+        cwd,
+        query,
+        session_scope,
+    } = request;
     let page_limit = limit.unwrap_or(20).clamp(1, 200) as usize;
     let mode = mode.unwrap_or_else(|| "browse".to_string());
+    let session_scope = session_scope.unwrap_or_default();
     let is_browse_first_page = mode == "browse" && cursor.is_none();
+    let should_merge_remote =
+        is_browse_first_page && matches!(session_scope, SessionScope::Root | SessionScope::All);
 
     let to_ui_group = |g: crate::session::projection::SessionGroup| SessionGroup {
         cwd: g.cwd,
         latest_activity: g.latest_activity.and_then(|t| t.format(&Rfc3339).ok()),
         total_count: Some(g.total_count.unwrap_or(g.sessions.len()) as u64),
         next_cursor: g.next_cursor,
-        sessions: g
-            .sessions
-            .into_iter()
-            .map(|s| SessionSummary {
-                session_id: s.session_id,
-                name: s.name,
-                cwd: s.cwd,
-                title: s.title,
-                created_at: s.created_at.and_then(|t| t.format(&Rfc3339).ok()),
-                updated_at: s.updated_at.and_then(|t| t.format(&Rfc3339).ok()),
-                parent_session_id: s.parent_session_id,
-                fork_origin: s.fork_origin,
-                session_kind: s.session_kind,
-                has_children: s.has_children,
-                node: None,
-                node_id: None,
-                attached: None,
-                runtime_state: None,
-            })
-            .collect(),
+        sessions: g.sessions.into_iter().map(to_ui_summary).collect(),
     };
 
     let result = match mode.as_str() {
@@ -119,7 +147,7 @@ pub async fn handle_list_sessions(
             };
             state
                 .view_store
-                .list_group_sessions(cwd_value, cursor, page_limit)
+                .list_group_sessions(cwd_value, cursor, page_limit, session_scope)
                 .await
                 .map(|(group, total)| {
                     let next_cursor = group.next_cursor.clone();
@@ -130,7 +158,7 @@ pub async fn handle_list_sessions(
             let q = query.unwrap_or_default();
             state
                 .view_store
-                .search_sessions(q, cursor, page_limit)
+                .search_sessions(q, cursor, page_limit, session_scope)
                 .await
                 .map(|(groups, next_cursor, total)| {
                     (
@@ -142,7 +170,7 @@ pub async fn handle_list_sessions(
         }
         _ => state
             .view_store
-            .browse_session_groups(cursor, page_limit, 10)
+            .browse_session_groups(cursor, page_limit, 10, session_scope)
             .await
             .map(|(groups, next_cursor, total)| {
                 (
@@ -176,7 +204,7 @@ pub async fn handle_list_sessions(
 
     let remote_merge_started = Instant::now();
     #[cfg(feature = "remote")]
-    if is_browse_first_page {
+    if should_merge_remote {
         async {
             // 1. Collect already-attached remote sessions from the registry.
             let attached_sessions: std::collections::HashSet<String>;
@@ -232,6 +260,7 @@ pub async fn handle_list_sessions(
                             fork_origin: None,
                             session_kind: None,
                             has_children: false,
+                            fork_count: 0,
                             node: Some(peer_label),
                             node_id,
                             attached: Some(true),
@@ -307,6 +336,7 @@ pub async fn handle_list_sessions(
                                 fork_origin: None,
                                 session_kind: None,
                                 has_children: false,
+                                fork_count: 0,
                                 node: Some(peer_label.clone()),
                                 node_id: Some(node_id_str.clone()),
                                 attached: Some(false),
@@ -423,6 +453,7 @@ pub async fn handle_list_sessions(
                                         fork_origin: None,
                                         session_kind: None,
                                         has_children: false,
+                                        fork_count: 0,
                                         node: Some(bookmark.peer_label),
                                         node_id: Some(bookmark.node_id),
                                         attached: Some(reattached),
@@ -440,10 +471,19 @@ pub async fn handle_list_sessions(
                                     .iter_mut()
                                     .find(|g| g.cwd.as_deref() == Some(group_cwd.as_str()))
                                 {
-                                    let existing_ids: std::collections::HashSet<String> =
-                                        existing.sessions.iter().map(|s| s.session_id.clone()).collect();
                                     for s in sessions {
-                                        if !existing_ids.contains(&s.session_id) {
+                                        if let Some(existing_summary) = existing
+                                            .sessions
+                                            .iter_mut()
+                                            .find(|summary| summary.session_id == s.session_id)
+                                        {
+                                            existing_summary.attached = s.attached;
+                                            existing_summary.node_id = s.node_id;
+                                            existing_summary.runtime_state = s.runtime_state;
+                                            existing_summary.title = s.title.clone();
+                                            existing_summary.name = s.title;
+                                            existing_summary.cwd = s.cwd;
+                                        } else {
                                             existing.sessions.push(s);
                                         }
                                     }
@@ -501,6 +541,52 @@ pub async fn handle_list_sessions(
 }
 
 /// Handle session loading request.
+pub async fn handle_list_session_children(
+    state: &ServerState,
+    tx: &mpsc::Sender<String>,
+    parent_session_id: String,
+    cursor: Option<String>,
+    limit: Option<u32>,
+    session_scope: Option<SessionScope>,
+) {
+    match session_scope {
+        None | Some(SessionScope::Forks) => {}
+        Some(_) => {
+            let _ = send_error(
+                tx,
+                "Session children list only supports user forks".to_string(),
+            )
+            .await;
+            return;
+        }
+    }
+
+    let page_limit = limit.unwrap_or(20).clamp(1, 200) as usize;
+    let result = state
+        .view_store
+        .list_session_children(parent_session_id.clone(), cursor, page_limit)
+        .await;
+
+    let (group, total_count) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = send_error(tx, format!("Failed to list session children: {}", e)).await;
+            return;
+        }
+    };
+
+    let _ = send_message(
+        tx,
+        UiServerMessage::SessionChildren {
+            parent_session_id,
+            sessions: group.sessions.into_iter().map(to_ui_summary).collect(),
+            next_cursor: group.next_cursor,
+            total_count: total_count as u64,
+        },
+    )
+    .await;
+}
+
 pub async fn handle_load_session(
     state: &ServerState,
     conn_id: &str,
@@ -685,7 +771,7 @@ pub async fn handle_delete_session(
     }
 
     send_state(state, conn_id, tx).await;
-    handle_list_sessions(state, tx, None, None, None, None, None).await;
+    handle_list_sessions(state, tx, ListSessionsRequest::root_browse()).await;
 }
 
 pub(super) async fn ensure_session_loaded(
@@ -1192,7 +1278,7 @@ pub async fn handle_fork_session(
             }
 
             send_state(state, conn_id, tx).await;
-            handle_list_sessions(state, tx, None, None, None, None, None).await;
+            handle_list_sessions(state, tx, ListSessionsRequest::root_browse()).await;
 
             let _ = send_message(
                 tx,

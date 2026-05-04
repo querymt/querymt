@@ -181,6 +181,7 @@ pub trait ViewStore: Send + Sync {
         cursor: Option<String>,
         group_limit: usize,
         session_limit_per_group: usize,
+        session_scope: SessionScope,
     ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)>;
 
     /// Page sessions for one workspace group.
@@ -189,6 +190,7 @@ pub trait ViewStore: Send + Sync {
         cwd: Option<String>,
         cursor: Option<String>,
         limit: usize,
+        session_scope: SessionScope,
     ) -> SessionResult<(SessionGroup, usize)>;
 
     /// Search all sessions via FTS5 (DB-wide, not limited to loaded pages).
@@ -197,7 +199,16 @@ pub trait ViewStore: Send + Sync {
         query: String,
         cursor: Option<String>,
         limit: usize,
+        session_scope: SessionScope,
     ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)>;
+
+    /// Page direct user-fork children for one parent/root session.
+    async fn list_session_children(
+        &self,
+        parent_session_id: String,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> SessionResult<(SessionGroup, usize)>;
 
     /// Export session as ATIF (Agent Trajectory Interchange Format)
     async fn get_atif(
@@ -322,7 +333,30 @@ pub struct SessionListFilter {
     pub offset: Option<usize>,
 }
 
-/// Individual session item for list display
+#[typeshare]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionScope {
+    #[default]
+    All,
+    Root,
+    Forks,
+    Delegates,
+    Children,
+}
+
+impl SessionScope {
+    pub fn from_option(value: Option<String>) -> Self {
+        match value.as_deref() {
+            Some("root") => Self::Root,
+            Some("forks") => Self::Forks,
+            Some("delegates") => Self::Delegates,
+            Some("children") => Self::Children,
+            _ => Self::All,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionListItem {
     pub session_id: String,
@@ -341,6 +375,7 @@ pub struct SessionListItem {
     pub session_kind: Option<String>,
     /// Whether this session has child sessions
     pub has_children: bool,
+    pub fork_count: usize,
 }
 
 /// Group of sessions by CWD
@@ -528,6 +563,51 @@ mod tests {
     }
 
     #[test]
+    fn test_session_scope_from_option_defaults_and_parses_known_values() {
+        assert_eq!(SessionScope::from_option(None), SessionScope::All);
+        assert_eq!(
+            SessionScope::from_option(Some("all".to_string())),
+            SessionScope::All
+        );
+        assert_eq!(
+            SessionScope::from_option(Some("root".to_string())),
+            SessionScope::Root
+        );
+        assert_eq!(
+            SessionScope::from_option(Some("forks".to_string())),
+            SessionScope::Forks
+        );
+        assert_eq!(
+            SessionScope::from_option(Some("delegates".to_string())),
+            SessionScope::Delegates
+        );
+        assert_eq!(
+            SessionScope::from_option(Some("children".to_string())),
+            SessionScope::Children
+        );
+        assert_eq!(
+            SessionScope::from_option(Some("unknown".to_string())),
+            SessionScope::All
+        );
+    }
+
+    #[test]
+    fn test_session_scope_serde_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&SessionScope::Root).unwrap(),
+            "\"root\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionScope::Delegates).unwrap(),
+            "\"delegates\""
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionScope>("\"children\"").unwrap(),
+            SessionScope::Children
+        );
+    }
+
+    #[test]
     fn test_session_list_item_construction() {
         let item = SessionListItem {
             session_id: "sess-x".to_string(),
@@ -540,9 +620,11 @@ mod tests {
             fork_origin: None,
             session_kind: None,
             has_children: false,
+            fork_count: 0,
         };
         assert_eq!(item.session_id, "sess-x");
         assert!(!item.has_children);
+        assert_eq!(item.fork_count, 0);
     }
 
     #[test]

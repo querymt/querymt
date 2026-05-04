@@ -7,6 +7,7 @@ import {
   UiClientMessage,
   UiServerMessage,
   SessionGroup,
+  SessionSummaryWithChildren,
   UiPromptBlock,
   AuditView,
   FileIndexEntry,
@@ -25,6 +26,7 @@ import {
   RemoteNodeInfo,
   PluginUpdateStatus,
   PluginUpdateResult,
+  SessionScope,
   ScheduleInfo,
   KnowledgeEntryInfo,
   ConsolidationInfo,
@@ -155,6 +157,7 @@ export function useUiClient() {
   const [sessionNextCursor, setSessionNextCursor] = useState<string | null>(null);
   const [sessionTotalCount, setSessionTotalCount] = useState<number>(0);
   const [sessionPageLoading, setSessionPageLoading] = useState(false);
+  const [sessionChildrenLoading, setSessionChildrenLoading] = useState<Set<string>>(new Set());
   const [sessionGroupNextCursorByCwd, setSessionGroupNextCursorByCwd] = useState<Record<string, string | null>>({});
   const [sessionsEverLoaded, setSessionsEverLoaded] = useState(false);
   const sessionNextCursorRef = useRef<string | null>(null);
@@ -226,6 +229,8 @@ export function useUiClient() {
   const pendingRequestsRef = useRef<Map<string, (sessionId: string) => void>>(new Map());
   const pendingDeleteLabelsRef = useRef<Map<string, string>>(new Map());
   const pendingLoadLabelsRef = useRef<Map<string, string>>(new Map());
+  const pendingSessionChildrenRef = useRef<Set<string>>(new Set());
+  const pendingSessionChildrenCursorRef = useRef<Map<string, string | null>>(new Map());
   const pendingForkResolverRef = useRef<{
     resolve: (sessionId: string) => void;
     reject: (reason?: unknown) => void;
@@ -290,7 +295,7 @@ export function useUiClient() {
         sendOnSocket(socket, { type: 'list_mesh_invites' } as UiClientMessage);
         sendOnSocket(socket, {
           type: 'list_sessions',
-          data: { mode: 'browse', limit: 20 },
+          data: { mode: 'browse', limit: 20, session_scope: SessionScope.Root },
         } as UiClientMessage);
 
         // If we had an active session before disconnect, re-subscribe so
@@ -800,12 +805,15 @@ export function useUiClient() {
         console.error('UI server error:', d.message);
         const isDeleteError = d.message.includes('Failed to delete session');
         const isLoadError = d.message.includes('Failed to load session');
+        const isSessionChildrenError =
+          d.message.includes('Failed to list session children') ||
+          d.message.includes('Session children list only supports user forks');
 
         if (isDeleteError) {
           pendingDeleteLabelsRef.current.clear();
           pushSessionActionNotice('error', d.message);
           pendingGroupLoadRef.current = null;
-          sendMessage({ type: 'list_sessions', data: { mode: 'browse' } } as UiClientMessage);
+          sendMessage({ type: 'list_sessions', data: { mode: 'browse', session_scope: SessionScope.Root } } as UiClientMessage);
           setSessionPageLoading(false);
         }
 
@@ -823,7 +831,18 @@ export function useUiClient() {
             setLastLoadErrorSessionId(failedSessionId);
           }
           pendingGroupLoadRef.current = null;
-          sendMessage({ type: 'list_sessions', data: { mode: 'browse' } } as UiClientMessage);
+          sendMessage({ type: 'list_sessions', data: { mode: 'browse', session_scope: SessionScope.Root } } as UiClientMessage);
+        }
+
+        if (isSessionChildrenError && pendingSessionChildrenRef.current.size > 0) {
+          const failedParentIds = new Set(pendingSessionChildrenRef.current);
+          pendingSessionChildrenRef.current.clear();
+          failedParentIds.forEach((parentId) => pendingSessionChildrenCursorRef.current.delete(parentId));
+          setSessionChildrenLoading((prev) => {
+            const next = new Set(prev);
+            failedParentIds.forEach((parentId) => next.delete(parentId));
+            return next;
+          });
         }
 
         // Connection-level errors have no session_id. Do not inject them into the
@@ -847,6 +866,37 @@ export function useUiClient() {
             setConnectionErrors((prev) => prev.filter((e) => e.id !== errorId));
           }, 8000);
         }
+        break;
+      }
+      case 'session_children': {
+        const d = msg.data;
+        const pendingCursor = pendingSessionChildrenCursorRef.current.get(d.parent_session_id) ?? null;
+        pendingSessionChildrenRef.current.delete(d.parent_session_id);
+        pendingSessionChildrenCursorRef.current.delete(d.parent_session_id);
+        setSessionChildrenLoading((prev) => {
+          const next = new Set(prev);
+          next.delete(d.parent_session_id);
+          return next;
+        });
+        setSessionGroups((prev) =>
+          prev.map((group) => ({
+            ...group,
+            sessions: group.sessions.map((session) => {
+              if (session.session_id !== d.parent_session_id) {
+                return session;
+              }
+              const existingChildren = (session as SessionSummaryWithChildren).children ?? [];
+              return {
+                ...session,
+                children: pendingCursor ? [...existingChildren, ...d.sessions] : d.sessions,
+                childrenNextCursor: d.next_cursor ?? null,
+                childrenTotalCount: d.total_count,
+                has_children: d.total_count > 0,
+                fork_count: d.total_count,
+              };
+            }),
+          }))
+        );
         break;
       }
       case 'session_list': {
@@ -1530,7 +1580,7 @@ export function useUiClient() {
     setSessionPageLoading(true);
     sendMessage({
       type: 'list_sessions',
-      data: { mode: 'browse', cursor, limit },
+      data: { mode: 'browse', cursor, limit, session_scope: SessionScope.Root },
     } as UiClientMessage);
   }, []);
 
@@ -1544,7 +1594,7 @@ export function useUiClient() {
     setSessionPageLoading(true);
     sendMessage({
       type: 'list_sessions',
-      data: { mode: 'group', cwd: cwd ?? '__none__', cursor, limit },
+      data: { mode: 'group', cwd: cwd ?? '__none__', cursor, limit, session_scope: SessionScope.Root },
     } as UiClientMessage);
   }, []);
 
@@ -1554,13 +1604,30 @@ export function useUiClient() {
     if (!query.trim()) {
       // When search is cleared, reload the full browse list so sessions reappear.
       setSessionPageLoading(true);
-      sendMessage({ type: 'list_sessions', data: { mode: 'browse', limit: 20 } } as UiClientMessage);
+      sendMessage({ type: 'list_sessions', data: { mode: 'browse', limit: 20, session_scope: SessionScope.Root } } as UiClientMessage);
       return;
     }
     setSessionPageLoading(true);
     sendMessage({
       type: 'list_sessions',
-      data: { mode: 'search', query, limit },
+      data: { mode: 'search', query, limit, session_scope: SessionScope.Root },
+    } as UiClientMessage);
+  }, []);
+
+  const loadSessionChildren = useCallback((parentSessionId: string, limitOrCursor: number | string | null = 10, cursor?: string | null) => {
+    const limit = typeof limitOrCursor === 'number' ? limitOrCursor : 10;
+    const childCursor = typeof limitOrCursor === 'number' ? cursor ?? null : limitOrCursor ?? null;
+    pendingSessionChildrenRef.current.add(parentSessionId);
+    pendingSessionChildrenCursorRef.current.set(parentSessionId, childCursor);
+    setSessionChildrenLoading((prev) => new Set(prev).add(parentSessionId));
+    sendMessage({
+      type: 'list_session_children',
+      data: {
+        parent_session_id: parentSessionId,
+        limit,
+        ...(childCursor ? { cursor: childCursor } : {}),
+        session_scope: SessionScope.Forks,
+      },
     } as UiClientMessage);
   }, []);
 
@@ -1858,6 +1925,7 @@ export function useUiClient() {
     sessionNextCursor,
     sessionTotalCount,
     sessionPageLoading,
+    sessionChildrenLoading,
     sessionsEverLoaded,
     allModels,
     providerCapabilities,
@@ -1875,6 +1943,7 @@ export function useUiClient() {
     loadMoreSessions,
     loadMoreGroupSessions,
     searchSessions,
+    loadSessionChildren,
     requestAuthProviders,
     startOAuthLogin,
     completeOAuthLogin,

@@ -774,6 +774,7 @@ export interface SessionSummary {
 	fork_origin?: string;
 	session_kind?: string;
 	has_children: boolean;
+	fork_count: number;
 	node?: string;
 	node_id?: string;
 	attached?: boolean;
@@ -912,6 +913,14 @@ export enum RoutingMode {
 	Broadcast = "broadcast",
 }
 
+export enum SessionScope {
+	All = "all",
+	Root = "root",
+	Forks = "forks",
+	Delegates = "delegates",
+	Children = "children",
+}
+
 /**
  * Why execution was stopped.
  * Typeshare-annotated: generated for TypeScript and Swift.
@@ -965,6 +974,17 @@ export type UiClientMessage =
 	cwd?: string;
 	/** Search query for mode=search. */
 	query?: string;
+	/** Session scope filter: all (default), root, forks, delegates, or children. */
+	session_scope?: SessionScope;
+}}
+	| { type: "list_session_children", data: {
+	parent_session_id: string;
+	/** Opaque pagination cursor (offset as string for now). */
+	cursor?: string;
+	/** Max number of child sessions to return. */
+	limit?: number;
+	/** Child scope filter. Defaults to forks; delegates are never returned here. */
+	session_scope?: SessionScope;
 }}
 	| { type: "load_session", data: {
 	session_id: string;
@@ -1252,6 +1272,12 @@ export type UiServerMessage =
 }}
 	| { type: "session_list", data: {
 	groups: SessionGroup[];
+	next_cursor?: string;
+	total_count: number;
+}}
+	| { type: "session_children", data: {
+	parent_session_id: string;
+	sessions: SessionSummary[];
 	next_cursor?: string;
 	total_count: number;
 }}
