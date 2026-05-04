@@ -11140,6 +11140,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "querymt-mobile-ffi"
+version = "0.4.0"
+dependencies = [
+ "agent-client-protocol",
+ "agent-client-protocol-schema",
+ "anyhow",
+ "libp2p",
+ "log",
+ "once_cell",
+ "parking_lot",
+ "qmt-anthropic",
+ "qmt-openai",
+ "querymt",
+ "querymt-agent",
+ "querymt-utils",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "querymt-provider-common"
 version = "0.4.0"
 dependencies = [

@@ -792,6 +792,32 @@ impl Agent {
         Ok(agent)
     }
 
+    /// Build an Agent from a single agent config with injected registry, mesh, and infra.
+    ///
+    /// This is the mobile/embedded construction seam for remote-capable agents where the
+    /// caller must supply a custom plugin registry and storage backend rather than relying
+    /// on desktop defaults.
+    #[cfg(feature = "remote")]
+    pub async fn from_single_config_with_registry_and_infra(
+        config: SingleAgentConfig,
+        initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
+        mesh: Option<crate::agent::remote::MeshHandle>,
+        mesh_auto_fallback: bool,
+        infra: AgentInfra,
+    ) -> Result<Self> {
+        let mut builder = Self::builder_from_config(config, initial_registry)?;
+        builder = builder.infra(infra);
+        let agent = builder.build().await?;
+
+        agent.inner.set_mesh_fallback(mesh_auto_fallback);
+
+        if let Some(mesh) = mesh {
+            agent.inner.set_mesh(mesh);
+        }
+
+        Ok(agent)
+    }
+
     /// Configure an `AgentBuilder` from a `SingleAgentConfig`.
     ///
     /// Returns the builder before `build()` is called, allowing further
