@@ -33,6 +33,62 @@ pub struct MeshSetupResult {
     pub provider_host: Option<kameo::actor::ActorRef<ProviderHostActor>>,
 }
 
+/// Keepalive refs for local mesh actors registered after an agent is built.
+#[cfg(feature = "remote")]
+pub struct LocalMeshActorRefs {
+    pub node_manager: kameo::actor::ActorRef<crate::agent::remote::RemoteNodeManager>,
+    pub provider_host: kameo::actor::ActorRef<ProviderHostActor>,
+}
+
+/// Spawn and register the local mesh-facing actors for an already-built agent.
+///
+/// This is the post-build step needed when the caller already has a live
+/// `LocalAgentHandle` with mesh attached and wants to advertise local session and
+/// provider services to peers.
+#[cfg(feature = "remote")]
+pub async fn spawn_and_register_local_mesh_actors(
+    handle: &crate::agent::LocalAgentHandle,
+    mesh: &crate::agent::remote::MeshHandle,
+) -> LocalMeshActorRefs {
+    use crate::agent::remote::RemoteNodeManager;
+    use crate::agent::remote::dht_name;
+    use kameo::actor::Spawn;
+
+    let node_manager = RemoteNodeManager::new(
+        handle.config.clone(),
+        handle.registry.clone(),
+        Some(mesh.clone()),
+    );
+    let node_manager_ref = RemoteNodeManager::spawn(node_manager);
+
+    mesh.register_actor(node_manager_ref.clone(), dht_name::NODE_MANAGER)
+        .await;
+    log::info!(
+        "RemoteNodeManager registered in DHT as '{}'",
+        dht_name::NODE_MANAGER
+    );
+
+    let per_peer_name = dht_name::node_manager_for_peer(mesh.peer_id());
+    mesh.register_actor(node_manager_ref.clone(), per_peer_name.clone())
+        .await;
+    log::info!(
+        "RemoteNodeManager also registered in DHT as '{}'",
+        per_peer_name
+    );
+
+    let provider_host = ProviderHostActor::new(handle.config.clone());
+    let provider_host_ref = ProviderHostActor::spawn(provider_host);
+    let ph_dht_name = dht_name::provider_host(mesh.peer_id());
+    mesh.register_actor(provider_host_ref.clone(), ph_dht_name.clone())
+        .await;
+    log::info!("ProviderHostActor registered in DHT as '{}'", ph_dht_name);
+
+    LocalMeshActorRefs {
+        node_manager: node_manager_ref,
+        provider_host: provider_host_ref,
+    }
+}
+
 /// Bootstrap the kameo mesh and register remote agents from TOML config.
 ///
 /// Call this **before** building the `AgentHandle` so that the registry
