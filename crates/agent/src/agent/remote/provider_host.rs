@@ -471,6 +471,8 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
         fields(
             provider = %msg.provider,
             model = %msg.model,
+            session_id = %msg.session_id,
+            request_id = %msg.request_id,
             message_count = msg.messages.len(),
             has_tools = msg.tools.is_some(),
             has_params = msg.params.is_some(),
@@ -503,6 +505,8 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
         let receiver_ref = {
             let lookup_span = tracing::info_span!(
                 "remote.provider_host.stream.lookup_receiver",
+                session_id = %msg.session_id,
+                request_id = %msg.request_id,
                 receiver_name = %msg.stream_receiver_name,
                 found = tracing::field::Empty,
             );
@@ -531,6 +535,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
 
         let provider_name = msg.provider.clone();
         let model = msg.model.clone();
+        let session_id = msg.session_id.clone();
         let receiver_name = msg.stream_receiver_name.clone();
         let request_id = msg.request_id.clone();
         let reconnect_grace = Duration::from_secs(msg.reconnect_grace_secs.max(1));
@@ -540,6 +545,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
             "remote.provider_host.stream.relay",
             provider = %provider_name,
             model = %model,
+            session_id = %session_id,
             receiver_name = %receiver_name,
             request_id = %request_id,
             chunk_count = tracing::field::Empty,
@@ -570,6 +576,8 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                     if let Some(reason) = finish_reason {
                         tracing::debug!(
                             target: "remote::provider_host::stream",
+                            session_id = %session_id,
+                            request_id = %request_id,
                             provider = %provider_name,
                             model = %model,
                             receiver_name = %receiver_name,
@@ -629,10 +637,15 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                         };
                         let relay = StreamChunkRelay { message: front };
                         if let Err(e) = receiver_ref.tell(&relay).send() {
-                            log::warn!(
-                                "ProviderHostActor: failed to relay chunk to '{}': {}",
-                                receiver_name,
-                                e
+                            tracing::warn!(
+                                target: "remote::provider_host::stream",
+                                session_id = %session_id,
+                                request_id = %request_id,
+                                provider = %provider_name,
+                                model = %model,
+                                receiver_name = %receiver_name,
+                                error = %e,
+                                "failed to relay chunk to receiver"
                             );
                             if disconnected_since.is_none() {
                                 disconnected_since = Some(tokio::time::Instant::now());
@@ -653,6 +666,11 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                         let elapsed_ms = relay_start.elapsed().as_millis();
                         tracing::trace!(
                             target: "remote::provider_host::stream",
+                            session_id = %session_id,
+                            request_id = %request_id,
+                            provider = %provider_name,
+                            model = %model,
+                            receiver_name = %receiver_name,
                             chunk_index = chunk_count,
                             elapsed_ms,
                             is_done,
@@ -665,12 +683,15 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                 }
 
                 tracing::Span::current().record("chunk_count", chunk_count);
-                log::trace!(
-                    "ProviderHostActor: streaming call to {}/{} complete ({} chunks relayed to '{}')",
-                    provider_name,
-                    model,
+                tracing::trace!(
+                    target: "remote::provider_host::stream",
+                    session_id = %session_id,
+                    request_id = %request_id,
+                    provider = %provider_name,
+                    model = %model,
+                    receiver_name = %receiver_name,
                     chunk_count,
-                    receiver_name,
+                    "stream relay complete"
                 );
             }
             .instrument(relay_span),

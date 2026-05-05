@@ -1395,40 +1395,50 @@ impl Message<Prompt> for SessionActor {
         let mode = self.mode;
         let tool_config = self.tool_config.clone();
         let actor_ref = ctx.actor_ref().clone();
+        let span_session_id = session_id.clone();
 
-        ctx.spawn(async move {
-            let result = execute_prompt_detached(DetachedPromptExecution {
-                req: msg.req,
-                session_id: session_id.clone(),
-                runtime,
-                config,
-                cancel_token,
-                bridge,
-                mode,
-                tool_config,
-                execution_origin: crate::agent::execution_context::ExecutionOrigin::Interactive,
-            })
-            .await;
-
-            debug!("Session {}: sending PromptFinished to actor", session_id);
-            // Reset prompt_running flag via message back to actor
-            if let Err(e) = actor_ref
-                .tell(PromptFinished {
-                    generation: prompt_generation,
+        ctx.spawn(
+            async move {
+                let result = execute_prompt_detached(DetachedPromptExecution {
+                    req: msg.req,
+                    session_id: session_id.clone(),
+                    runtime,
+                    config,
+                    cancel_token,
+                    bridge,
+                    mode,
+                    tool_config,
+                    execution_origin: crate::agent::execution_context::ExecutionOrigin::Interactive,
                 })
-                .await
-            {
-                debug!(
-                    "Failed to send PromptFinished message to actor ({}): {:?}. \
-                     Actor may have been shutdown — next prompt will reset via generation guard.",
-                    session_id, e
-                );
-            } else {
-                debug!("Session {}: PromptFinished sent successfully", session_id);
-            }
+                .await;
 
-            result
-        })
+                debug!("Session {}: sending PromptFinished to actor", session_id);
+                // Reset prompt_running flag via message back to actor
+                if let Err(e) = actor_ref
+                    .tell(PromptFinished {
+                        generation: prompt_generation,
+                    })
+                    .await
+                {
+                    debug!(
+                        "Failed to send PromptFinished message to actor ({}): {:?}. \
+                         Actor may have been shutdown — next prompt will reset via generation guard.",
+                        session_id, e
+                    );
+                } else {
+                    debug!("Session {}: PromptFinished sent successfully", session_id);
+                }
+
+                result
+            }
+            .instrument(info_span!(
+                "agent.prompt.task",
+                session_id = %span_session_id,
+                prompt_generation,
+                execution_origin = ?crate::agent::execution_context::ExecutionOrigin::Interactive,
+                mode = %mode,
+            )),
+        )
     }
 }
 
@@ -1570,7 +1580,19 @@ struct DetachedPromptExecution {
 #[instrument(
     name = "agent.prompt.execute",
     skip(exec),
-    fields(session_id = %exec.session_id, mode = %exec.mode)
+    fields(
+        session_id = %exec.session_id,
+        execution_origin = ?exec.execution_origin,
+        mode = %exec.mode,
+        has_bridge = exec.bridge.is_some(),
+        cwd = tracing::field::display(
+            exec.runtime
+                .cwd
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "none".to_string())
+        )
+    )
 )]
 async fn execute_prompt_detached(
     exec: DetachedPromptExecution,

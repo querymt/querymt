@@ -65,6 +65,19 @@ pub struct MeshChatProvider {
 }
 
 impl MeshChatProvider {
+    fn target_peer_id(&self) -> Option<PeerId> {
+        self.target_dht_name
+            .strip_prefix("provider_host::peer::")
+            .and_then(|s| s.parse::<PeerId>().ok())
+    }
+
+    fn remote_session_id(&self) -> Option<&str> {
+        self.params
+            .as_ref()
+            .and_then(|v| v.get("_remote_session_id"))
+            .and_then(|v| v.as_str())
+    }
+
     /// Create a new `MeshChatProvider`.
     ///
     /// # Arguments
@@ -106,7 +119,15 @@ impl MeshChatProvider {
     #[tracing::instrument(
         name = "remote.mesh_provider.dht_lookup",
         skip(self),
-        fields(dht_name = %self.target_dht_name, found = tracing::field::Empty)
+        fields(
+            dht_name = %self.target_dht_name,
+            provider = %self.provider_name,
+            model = %self.model,
+            session_id = self.remote_session_id().unwrap_or("unknown-session"),
+            local_peer_id = %self.mesh.peer_id(),
+            target_peer_id = tracing::field::display(self.target_peer_id().as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
+            found = tracing::field::Empty,
+        )
     )]
     async fn lookup_provider_host(
         &self,
@@ -147,6 +168,9 @@ impl ChatProvider for MeshChatProvider {
             provider = %self.provider_name,
             model = %self.model,
             target_node = %self.target_dht_name,
+            session_id = self.remote_session_id().unwrap_or("unknown-session"),
+            local_peer_id = %self.mesh.peer_id(),
+            target_peer_id = tracing::field::display(self.target_peer_id().as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
             message_count = messages.len(),
             has_tools = tools.is_some(),
         )
@@ -189,6 +213,9 @@ impl ChatProvider for MeshChatProvider {
             provider = %self.provider_name,
             model = %self.model,
             target_node = %self.target_dht_name,
+            session_id = self.remote_session_id().unwrap_or("unknown-session"),
+            local_peer_id = %self.mesh.peer_id(),
+            target_peer_id = tracing::field::display(self.target_peer_id().as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
             message_count = messages.len(),
             has_tools = tools.is_some(),
             request_id = tracing::field::Empty,
@@ -210,10 +237,7 @@ impl ChatProvider for MeshChatProvider {
         // ── 2. Spawn the ephemeral StreamReceiverActor on the local node ──────
         let request_id = Uuid::now_v7().to_string();
         let session_id = self
-            .params
-            .as_ref()
-            .and_then(|v| v.get("_remote_session_id"))
-            .and_then(|v| v.as_str())
+            .remote_session_id()
             .unwrap_or("unknown-session")
             .to_string();
         let stream_rx_name = super::dht_name::stream_receiver(&session_id, &request_id);
@@ -222,7 +246,11 @@ impl ChatProvider for MeshChatProvider {
         {
             let reg_span = tracing::info_span!(
                 "remote.mesh_provider.dht_register_receiver",
+                session_id = %session_id,
+                request_id = %request_id,
                 stream_rx_name = %stream_rx_name,
+                local_peer_id = %self.mesh.peer_id(),
+                target_peer_id = tracing::field::display(self.target_peer_id().as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
             );
             let receiver_actor =
                 StreamReceiverActor::new(tx, stream_rx_name.clone(), Some(self.mesh.clone()));
@@ -249,7 +277,7 @@ impl ChatProvider for MeshChatProvider {
             model: self.model.clone(),
             messages: messages.to_vec(),
             tools: tools.map(|t| t.to_vec()),
-            session_id,
+            session_id: session_id.clone(),
             request_id: request_id.clone(),
             stream_receiver_name: stream_rx_name.clone(),
             reconnect_grace_secs: self.mesh.stream_reconnect_grace().as_secs(),
@@ -275,23 +303,26 @@ impl ChatProvider for MeshChatProvider {
         // boundary when the remote node disappears and does not come back.
         let raw_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
 
+        let session_id_for_stream = session_id.clone();
+        let request_id_for_stream = request_id.clone();
         let stream_rx_name_for_log = stream_rx_name.clone();
         let provider_for_stream = self.provider_name.clone();
         let model_for_stream = self.model.clone();
         let target_for_stream = self.target_dht_name.clone();
         let reconnect_grace = self.mesh.stream_reconnect_grace();
         let stream_start = Instant::now();
-        let target_peer_id = self
-            .target_dht_name
-            .strip_prefix("provider_host::peer::")
-            .and_then(|s| s.parse::<PeerId>().ok());
+        let local_peer_id = self.mesh.peer_id().to_string();
+        let target_peer_id = self.target_peer_id();
         let mesh = self.mesh.clone();
 
         let stream = futures_util::stream::unfold(
             (raw_stream, None::<tokio::time::Instant>, 0_u64),
             move |(mut raw_stream, disconnected_since, mut chunk_index)| {
                 let mesh = mesh.clone();
+                let session_id_for_stream = session_id_for_stream.clone();
+                let request_id_for_stream = request_id_for_stream.clone();
                 let target_peer_id = target_peer_id;
+                let local_peer_id = local_peer_id.clone();
                 let stream_rx_name_for_log = stream_rx_name_for_log.clone();
                 let provider_for_stream = provider_for_stream.clone();
                 let model_for_stream = model_for_stream.clone();
@@ -338,6 +369,10 @@ impl ChatProvider for MeshChatProvider {
                             if let StreamChunk::Done { finish_reason } = &chunk {
                                 tracing::debug!(
                                     target: "remote::mesh_provider::stream",
+                                    session_id = %session_id_for_stream,
+                                    request_id = %request_id_for_stream,
+                                    local_peer_id = %local_peer_id,
+                                    target_peer_id = tracing::field::display(target_peer_id.as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
                                     provider = %provider_for_stream,
                                     model = %model_for_stream,
                                     target_node = %target_for_stream,
@@ -350,6 +385,10 @@ impl ChatProvider for MeshChatProvider {
                             } else {
                                 tracing::trace!(
                                     target: "remote::mesh_provider::stream",
+                                    session_id = %session_id_for_stream,
+                                    request_id = %request_id_for_stream,
+                                    local_peer_id = %local_peer_id,
+                                    target_peer_id = tracing::field::display(target_peer_id.as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
                                     provider = %provider_for_stream,
                                     model = %model_for_stream,
                                     target_node = %target_for_stream,
@@ -366,10 +405,18 @@ impl ChatProvider for MeshChatProvider {
                             (raw_stream, disconnected_since, chunk_index),
                         )),
                         Some(StreamRelayMessage::TransportDisconnected { reason }) => {
-                            log::warn!(
-                                "MeshChatProvider: stream '{}' transport disconnected: {}",
-                                stream_rx_name_for_log,
+                            tracing::warn!(
+                                target: "remote::mesh_provider::stream",
+                                session_id = %session_id_for_stream,
+                                request_id = %request_id_for_stream,
+                                local_peer_id = %local_peer_id,
+                                target_peer_id = tracing::field::display(target_peer_id.as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
+                                provider = %provider_for_stream,
+                                model = %model_for_stream,
+                                target_node = %target_for_stream,
+                                stream_rx = %stream_rx_name_for_log,
                                 reason,
+                                "stream transport disconnected"
                             );
                             Some((
                                 Err(LLMError::RemoteStreamDisconnected { message: reason }),
@@ -377,10 +424,18 @@ impl ChatProvider for MeshChatProvider {
                             ))
                         }
                         Some(StreamRelayMessage::TransportReconnected { buffered_chunks }) => {
-                            log::info!(
-                                "MeshChatProvider: stream '{}' transport reconnected (buffered_chunks={})",
-                                stream_rx_name_for_log,
+                            tracing::info!(
+                                target: "remote::mesh_provider::stream",
+                                session_id = %session_id_for_stream,
+                                request_id = %request_id_for_stream,
+                                local_peer_id = %local_peer_id,
+                                target_peer_id = tracing::field::display(target_peer_id.as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
+                                provider = %provider_for_stream,
+                                model = %model_for_stream,
+                                target_node = %target_for_stream,
+                                stream_rx = %stream_rx_name_for_log,
                                 buffered_chunks,
+                                "stream transport reconnected"
                             );
                             Some((
                                 Err(LLMError::RemoteStreamReconnected {
