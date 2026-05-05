@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::string::FromUtf8Error;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,28 +342,116 @@ impl LLMError {
     }
 }
 
+/// Convert a [`Duration`] to whole seconds, rounding sub-second values up to 1.
+fn duration_to_secs(d: Duration) -> u64 {
+    let secs = d.as_secs();
+    if secs > 0 {
+        secs
+    } else if !d.is_zero() {
+        1
+    } else {
+        0
+    }
+}
+
+/// Parse an arbitrary retry-after value string into whole seconds.
+///
+/// Tries in order:
+/// 1. Plain integer seconds (RFC 7231 delay-seconds)
+/// 2. Duration strings via `humantime` (`"30s"`, `"1m30s"`, `"500ms"`, `"1.5s"`)
+fn parse_retry_after_value(s: &str) -> Option<u64> {
+    let s = s.trim();
+    // Fast path: plain integer seconds
+    if let Ok(secs) = s.parse::<u64>() {
+        return Some(secs);
+    }
+    // Duration strings: "30s", "1m30s", "500ms", "1.5s", etc.
+    humantime::parse_duration(s).ok().map(duration_to_secs)
+}
+
+/// Parse the standard `Retry-After` header value.
+///
+/// Per RFC 7231 §7.1.3 the value is either:
+/// - An integer delay in seconds, or
+/// - An HTTP-date indicating when to retry.
+fn parse_retry_after_header(s: &str) -> Option<u64> {
+    let s = s.trim();
+    // Integer delay-seconds
+    if let Ok(secs) = s.parse::<u64>() {
+        return Some(secs);
+    }
+    // HTTP-date: compute remaining seconds from now
+    httpdate::parse_http_date(s)
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .and_then(|target| {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .and_then(|now| target.checked_sub(now))
+        })
+        .map(duration_to_secs)
+}
+
+/// Extract `retry_after` from HTTP response headers.
+///
+/// Checks in order:
+/// 1. Standard `Retry-After` (integer or HTTP-date)
+/// 2. Anthropic-style `retry-after-ms` (milliseconds as integer)
+/// 3. Provider-specific `x-ratelimit-reset-requests` (duration string)
 pub fn parse_retry_after(headers: &http::HeaderMap) -> Option<u64> {
     headers
-        .get("retry-after")
+        .get(http::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
+        .and_then(parse_retry_after_header)
+        .or_else(|| {
+            headers
+                .get("retry-after-ms")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| {
+                    s.parse::<u64>()
+                        .ok()
+                        .map(|ms| duration_to_secs(Duration::from_millis(ms)))
+                })
+        })
         .or_else(|| {
             headers
                 .get("x-ratelimit-reset-requests")
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| {
-                    if s.ends_with('s') {
-                        let num_part = s.trim_end_matches('s');
-                        if let Some(m_pos) = num_part.find('m') {
-                            num_part[..m_pos].parse::<u64>().ok().map(|m| m * 60)
-                        } else {
-                            num_part.parse::<u64>().ok()
-                        }
-                    } else {
-                        None
-                    }
-                })
+                .and_then(parse_retry_after_value)
         })
+}
+
+/// Extract `retry_after` from a single JSON value (numeric or string).
+fn json_retry_after_value(v: &serde_json::Value) -> Option<u64> {
+    if let Some(n) = v.as_f64() {
+        let secs = n as u64;
+        return Some(if secs > 0 {
+            secs
+        } else if n > 0.0 {
+            1
+        } else {
+            0
+        });
+    }
+    v.as_str().and_then(parse_retry_after_value)
+}
+
+/// Extract `retry_after` from a parsed JSON response body.
+///
+/// Checks common locations where providers embed retry hints:
+/// - `error.retry_after` / `error.retry_after_secs`
+/// - top-level `retry_after` / `retry_after_secs`
+fn extract_retry_after_from_json(json: &serde_json::Value) -> Option<u64> {
+    [
+        json.pointer("/error/retry_after"),
+        json.pointer("/error/retry_after_secs"),
+        json.get("retry_after"),
+        json.get("retry_after_secs"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(json_retry_after_value)
 }
 
 pub fn classify_http_status(status_code: u16, headers: &http::HeaderMap, body: &[u8]) -> LLMError {
@@ -370,19 +459,18 @@ pub fn classify_http_status(status_code: u16, headers: &http::HeaderMap, body: &
         return LLMError::Cancelled;
     }
 
-    let retry_after_secs = parse_retry_after(headers);
-    let clean_message = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|json| {
-            json.pointer("/error/message")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| {
-            format!("{}", String::from_utf8_lossy(body))
-                .trim()
-                .to_string()
-        })
+    // Parse body JSON once; reuse for both retry-after and message extraction.
+    let body_json = serde_json::from_slice::<serde_json::Value>(body).ok();
+
+    let retry_after_secs = parse_retry_after(headers)
+        .or_else(|| body_json.as_ref().and_then(extract_retry_after_from_json));
+
+    let clean_message = body_json
+        .as_ref()
+        .and_then(|json| json.pointer("/error/message"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_string())
         .trim()
         .to_string();
     let message = if clean_message.is_empty() {
@@ -449,5 +537,224 @@ impl From<http::Error> for LLMError {
 impl From<FromUtf8Error> for LLMError {
     fn from(value: FromUtf8Error) -> Self {
         LLMError::GenericError(format!("Error decoding string: {:#}", value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── duration_to_secs ─────────────────────────────────────────────────
+
+    #[test]
+    fn duration_to_secs_zero() {
+        assert_eq!(duration_to_secs(Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn duration_to_secs_subsecond_rounds_up() {
+        assert_eq!(duration_to_secs(Duration::from_millis(60)), 1);
+        assert_eq!(duration_to_secs(Duration::from_millis(500)), 1);
+        assert_eq!(duration_to_secs(Duration::from_nanos(1)), 1);
+    }
+
+    #[test]
+    fn duration_to_secs_whole_seconds_preserved() {
+        assert_eq!(duration_to_secs(Duration::from_secs(30)), 30);
+        assert_eq!(duration_to_secs(Duration::from_secs(90)), 90);
+    }
+
+    // ── parse_retry_after_value ──────────────────────────────────────────
+
+    #[test]
+    fn parse_value_plain_integer() {
+        assert_eq!(parse_retry_after_value("30"), Some(30));
+        assert_eq!(parse_retry_after_value("0"), Some(0));
+    }
+
+    #[test]
+    fn parse_value_duration_strings() {
+        assert_eq!(parse_retry_after_value("30s"), Some(30));
+        assert_eq!(parse_retry_after_value("1m"), Some(60));
+        assert_eq!(parse_retry_after_value("1m30s"), Some(90));
+        assert_eq!(parse_retry_after_value("2h"), Some(7200));
+        assert_eq!(parse_retry_after_value("1h 30s"), Some(3630));
+    }
+
+    #[test]
+    fn parse_value_subsecond_durations_round_up() {
+        assert_eq!(parse_retry_after_value("500ms"), Some(1));
+        assert_eq!(parse_retry_after_value("60ms"), Some(1));
+    }
+
+    #[test]
+    fn parse_value_fractional_seconds() {
+        assert_eq!(parse_retry_after_value("1.5s"), Some(1)); // as_secs floors
+    }
+
+    #[test]
+    fn parse_value_garbage_returns_none() {
+        assert_eq!(parse_retry_after_value("abc"), None);
+        assert_eq!(parse_retry_after_value(""), None);
+    }
+
+    // ── parse_retry_after_header ─────────────────────────────────────────
+
+    #[test]
+    fn parse_header_integer() {
+        assert_eq!(parse_retry_after_header("60"), Some(60));
+        assert_eq!(parse_retry_after_header("0"), Some(0));
+    }
+
+    #[test]
+    fn parse_header_http_date_future() {
+        // A date 120 seconds from now should yield approximately 120s.
+        let future = SystemTime::now() + Duration::from_secs(120);
+        let http_date = httpdate::fmt_http_date(future);
+        let secs = parse_retry_after_header(&http_date).expect("should parse HTTP-date");
+        assert!((100..=130).contains(&secs), "expected ~120s, got {secs}");
+    }
+
+    #[test]
+    fn parse_header_http_date_past_returns_zero() {
+        let past = SystemTime::UNIX_EPOCH + Duration::from_secs(60);
+        let http_date = httpdate::fmt_http_date(past);
+        // A date in the past means the retry time has already elapsed.
+        // checked_sub returns None, so the whole thing returns None.
+        assert_eq!(parse_retry_after_header(&http_date), None);
+    }
+
+    #[test]
+    fn parse_header_garbage_returns_none() {
+        assert_eq!(parse_retry_after_header("not-a-date"), None);
+    }
+
+    // ── parse_retry_after (headers) ──────────────────────────────────────
+
+    #[test]
+    fn parse_headers_retry_after_integer() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, "30".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(30));
+    }
+
+    #[test]
+    fn parse_headers_retry_after_ms() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("retry-after-ms", "60000".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(60));
+    }
+
+    #[test]
+    fn parse_headers_retry_after_ms_subsecond_rounds_up() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("retry-after-ms", "60".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(1));
+    }
+
+    #[test]
+    fn parse_headers_x_ratelimit_reset() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-ratelimit-reset-requests", "1m30s".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(90));
+    }
+
+    #[test]
+    fn parse_headers_prefers_standard_over_provider() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, "10".parse().unwrap());
+        headers.insert("retry-after-ms", "5000".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(10));
+    }
+
+    #[test]
+    fn parse_headers_nothing_returns_none() {
+        let headers = http::HeaderMap::new();
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    // ── json_retry_after_value ───────────────────────────────────────────
+
+    #[test]
+    fn json_value_numeric() {
+        assert_eq!(json_retry_after_value(&serde_json::json!(30)), Some(30));
+        assert_eq!(json_retry_after_value(&serde_json::json!(0)), Some(0));
+    }
+
+    #[test]
+    fn json_value_fractional_rounds_up() {
+        assert_eq!(json_retry_after_value(&serde_json::json!(0.5)), Some(1));
+    }
+
+    #[test]
+    fn json_value_string_duration() {
+        assert_eq!(json_retry_after_value(&serde_json::json!("30s")), Some(30));
+        assert_eq!(
+            json_retry_after_value(&serde_json::json!("1m30s")),
+            Some(90)
+        );
+        assert_eq!(json_retry_after_value(&serde_json::json!("500ms")), Some(1));
+    }
+
+    // ── extract_retry_after_from_json ────────────────────────────────────
+
+    #[test]
+    fn extract_from_json_error_nested() {
+        let json = serde_json::json!({ "error": { "retry_after": 30, "message": "slow down" } });
+        assert_eq!(extract_retry_after_from_json(&json), Some(30));
+    }
+
+    #[test]
+    fn extract_from_json_top_level() {
+        let json = serde_json::json!({ "retry_after_secs": 60 });
+        assert_eq!(extract_retry_after_from_json(&json), Some(60));
+    }
+
+    #[test]
+    fn extract_from_json_string_value() {
+        let json = serde_json::json!({ "error": { "retry_after": "1m30s" } });
+        assert_eq!(extract_retry_after_from_json(&json), Some(90));
+    }
+
+    #[test]
+    fn extract_from_json_nothing() {
+        let json = serde_json::json!({ "error": { "message": "nope" } });
+        assert_eq!(extract_retry_after_from_json(&json), None);
+    }
+
+    // ── classify_http_status integration ─────────────────────────────────
+
+    #[test]
+    fn classify_429_with_header_and_body() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, "30".parse().unwrap());
+        let body = br#"{"error":{"message":"Rate limited"}}"#;
+        let err = classify_http_status(429, &headers, body);
+        assert_eq!(err.retry_after_secs(), Some(30));
+    }
+
+    #[test]
+    fn classify_429_with_body_only() {
+        let headers = http::HeaderMap::new();
+        let body = br#"{"error":{"message":"slow down","retry_after":60}}"#;
+        let err = classify_http_status(429, &headers, body);
+        assert_eq!(err.retry_after_secs(), Some(60));
+    }
+
+    #[test]
+    fn classify_429_no_retry_hint() {
+        let headers = http::HeaderMap::new();
+        let body = br#"{"error":{"message":"usage limit reached"}}"#;
+        let err = classify_http_status(429, &headers, body);
+        assert_eq!(err.retry_after_secs(), None);
+    }
+
+    #[test]
+    fn classify_500_with_x_ratelimit_header() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-ratelimit-reset-requests", "1m0s".parse().unwrap());
+        let body = b"Server Error";
+        let err = classify_http_status(503, &headers, body);
+        assert_eq!(err.retry_after_secs(), Some(60));
     }
 }

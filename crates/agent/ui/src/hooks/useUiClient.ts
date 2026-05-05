@@ -638,6 +638,19 @@ export function useUiClient() {
           // delegation will also trigger 'cancelled' on the child session, we rely on that.
           // However, we can defensively clear all thinking state to ensure UI responsiveness.
           // For now, just trust the child session's 'cancelled' event will arrive.
+        } else if (eventKind === 'rate_limited') {
+          // Keep thinking state active — the agent is still working (waiting to retry).
+          // The RateLimitIndicator component will show the countdown to the user.
+        } else if (eventKind === 'rate_limit_resume') {
+          // Agent is resuming after rate limit wait — ensure thinking state is set
+          // so the UI spinner stays visible during the retry.
+          setThinkingBySession(prev => {
+            const next = new Map(prev);
+            const sessionAgents = new Set(next.get(d.session_id) ?? []);
+            sessionAgents.add(d.agent_id);
+            next.set(d.session_id, sessionAgents);
+            return next;
+          });
         }
 
         // Auto-subscribe to delegation child sessions
@@ -2272,6 +2285,34 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       timestamp,
       compactionSummary: kindData.summary,
       compactionSummaryLen: kindData.summary_len,
+    };
+  }
+
+  if (kind === 'rate_limited') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'system',
+      content: kindData.message ?? 'Rate limited',
+      timestamp,
+      rateLimitMessage: kindData.message,
+      rateLimitWaitSecs: kindData.wait_secs,
+      rateLimitStartedAt: kindData.started_at,
+      rateLimitAttempt: kindData.attempt,
+      rateLimitMaxAttempts: kindData.max_attempts,
+    };
+  }
+
+  if (kind === 'rate_limit_resume') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'system',
+      content: 'Rate limit wait completed, resuming',
+      timestamp,
+      rateLimitResume: true,
     };
   }
 
