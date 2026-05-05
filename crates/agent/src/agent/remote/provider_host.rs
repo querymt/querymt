@@ -94,6 +94,8 @@ impl ChatResponse for ProviderChatResponse {
 pub enum StreamRelayMessage {
     /// Normal streamed chunk from the upstream provider.
     Chunk(StreamChunk),
+    /// Batched streamed chunks from the upstream provider.
+    ChunkBatch(Vec<StreamChunk>),
     /// Provider/model error produced by the upstream stream.
     ProviderError { error: LLMErrorPayload },
     /// The transport path to the requesting node disappeared but may recover.
@@ -243,12 +245,17 @@ impl Message<StreamChunkRelay> for StreamReceiverActor {
         msg: StreamChunkRelay,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let is_terminal = matches!(
-            &msg.message,
+        let is_terminal = match &msg.message {
             StreamRelayMessage::Chunk(StreamChunk::Done { .. })
-                | StreamRelayMessage::ProviderError { .. }
-                | StreamRelayMessage::TransportFailed { .. }
-        );
+            | StreamRelayMessage::ProviderError { .. }
+            | StreamRelayMessage::TransportFailed { .. } => true,
+            StreamRelayMessage::ChunkBatch(chunks) => chunks
+                .iter()
+                .any(|chunk| matches!(chunk, StreamChunk::Done { .. })),
+            StreamRelayMessage::Chunk(_)
+            | StreamRelayMessage::TransportDisconnected { .. }
+            | StreamRelayMessage::TransportReconnected { .. } => false,
+        };
 
         // Forward to channel (ignore send errors — receiver may have dropped).
         let _ = self.tx.send(msg.message).await;
@@ -487,6 +494,9 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
     ) -> Self::Reply {
         use futures_util::StreamExt;
 
+        const MAX_BATCH_SIZE: usize = 16;
+        const BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
+
         let provider = self
             .build_provider_for_request(&msg.provider, &msg.model, msg.params.as_ref())
             .await?;
@@ -549,42 +559,111 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
             receiver_name = %receiver_name,
             request_id = %request_id,
             chunk_count = tracing::field::Empty,
+            batch_count = tracing::field::Empty,
+            max_batch_size = tracing::field::Empty,
         );
         tokio::spawn(
             async move {
                 let mut receiver_ref = receiver_ref;
                 let mut chunk_count = 0usize;
+                let mut batch_count = 0usize;
+                let mut max_batch_size = 0usize;
                 let relay_start = std::time::Instant::now();
                 let mut buffered: VecDeque<StreamRelayMessage> = VecDeque::new();
+                let mut pending_batch: Vec<StreamChunk> = Vec::new();
                 let mut disconnected_since: Option<tokio::time::Instant> = None;
+                let mut upstream_done = false;
 
-                'outer: while let Some(chunk_result) = stream.next().await {
-                    let message = match chunk_result {
-                        Ok(chunk) => StreamRelayMessage::Chunk(chunk),
-                        Err(e) => StreamRelayMessage::ProviderError {
-                            error: e.to_payload(),
-                        },
+                let flush_batch = |buffered: &mut VecDeque<StreamRelayMessage>,
+                                   pending_batch: &mut Vec<StreamChunk>,
+                                   batch_count: &mut usize,
+                                   max_batch_size: &mut usize| {
+                    if pending_batch.is_empty() {
+                        return;
+                    }
+                    *batch_count += 1;
+                    *max_batch_size = (*max_batch_size).max(pending_batch.len());
+                    let message = if pending_batch.len() == 1 {
+                        StreamRelayMessage::Chunk(pending_batch.pop().expect("batch has one chunk"))
+                    } else {
+                        StreamRelayMessage::ChunkBatch(std::mem::take(pending_batch))
                     };
-                    let finish_reason = match &message {
-                        StreamRelayMessage::Chunk(StreamChunk::Done { finish_reason }) => Some(*finish_reason),
-                        _ => None,
-                    };
-                    let is_done = finish_reason.is_some()
-                        || matches!(message, StreamRelayMessage::ProviderError { .. });
                     buffered.push_back(message);
+                };
 
-                    if let Some(reason) = finish_reason {
-                        tracing::debug!(
-                            target: "remote::provider_host::stream",
-                            session_id = %session_id,
-                            request_id = %request_id,
-                            provider = %provider_name,
-                            model = %model,
-                            receiver_name = %receiver_name,
-                            finish_reason = ?reason,
-                            chunk_index = chunk_count,
-                            "stream done from upstream provider"
-                        );
+                'outer: loop {
+                    if !upstream_done {
+                        let next_chunk = if pending_batch.is_empty() {
+                            stream.next().await
+                        } else {
+                            match tokio::time::timeout(BATCH_FLUSH_INTERVAL, stream.next()).await {
+                                Ok(item) => item,
+                                Err(_) => {
+                                    flush_batch(
+                                        &mut buffered,
+                                        &mut pending_batch,
+                                        &mut batch_count,
+                                        &mut max_batch_size,
+                                    );
+                                    None
+                                }
+                            }
+                        };
+
+                        if let Some(chunk_result) = next_chunk {
+                            let mut finish_reason = None;
+                            match chunk_result {
+                                Ok(chunk) => {
+                                    if let StreamChunk::Done { finish_reason: reason } = &chunk {
+                                        finish_reason = Some(*reason);
+                                        upstream_done = true;
+                                    }
+                                    pending_batch.push(chunk);
+                                    if upstream_done || pending_batch.len() >= MAX_BATCH_SIZE {
+                                        flush_batch(
+                                            &mut buffered,
+                                            &mut pending_batch,
+                                            &mut batch_count,
+                                            &mut max_batch_size,
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    flush_batch(
+                                        &mut buffered,
+                                        &mut pending_batch,
+                                        &mut batch_count,
+                                        &mut max_batch_size,
+                                    );
+                                    upstream_done = true;
+                                    buffered.push_back(StreamRelayMessage::ProviderError {
+                                        error: e.to_payload(),
+                                    });
+                                }
+                            }
+
+                            if let Some(reason) = finish_reason {
+                                tracing::debug!(
+                                    target: "remote::provider_host::stream",
+                                    session_id = %session_id,
+                                    request_id = %request_id,
+                                    provider = %provider_name,
+                                    model = %model,
+                                    receiver_name = %receiver_name,
+                                    finish_reason = ?reason,
+                                    chunk_index = chunk_count + pending_batch.len(),
+                                    "stream done from upstream provider"
+                                );
+                            }
+                        } else {
+                            upstream_done = true;
+                            flush_batch(
+                                &mut buffered,
+                                &mut pending_batch,
+                                &mut batch_count,
+                                &mut max_batch_size,
+                            );
+                        }
                     }
 
                     loop {
@@ -662,8 +741,26 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                         }
 
                         buffered.pop_front();
-                        chunk_count += 1;
+                        let relayed_chunks = match &relay.message {
+                            StreamRelayMessage::Chunk(_) => 1,
+                            StreamRelayMessage::ChunkBatch(chunks) => chunks.len(),
+                            StreamRelayMessage::ProviderError { .. }
+                            | StreamRelayMessage::TransportDisconnected { .. }
+                            | StreamRelayMessage::TransportReconnected { .. }
+                            | StreamRelayMessage::TransportFailed { .. } => 0,
+                        };
+                        chunk_count += relayed_chunks;
                         let elapsed_ms = relay_start.elapsed().as_millis();
+                        let is_terminal = matches!(
+                            &relay.message,
+                            StreamRelayMessage::Chunk(StreamChunk::Done { .. })
+                                | StreamRelayMessage::ProviderError { .. }
+                                | StreamRelayMessage::TransportFailed { .. }
+                        ) || matches!(
+                            &relay.message,
+                            StreamRelayMessage::ChunkBatch(chunks)
+                                if chunks.iter().any(|chunk| matches!(chunk, StreamChunk::Done { .. }))
+                        );
                         tracing::trace!(
                             target: "remote::provider_host::stream",
                             session_id = %session_id,
@@ -672,17 +769,24 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                             model = %model,
                             receiver_name = %receiver_name,
                             chunk_index = chunk_count,
+                            relayed_chunks,
                             elapsed_ms,
-                            is_done,
+                            is_terminal,
                             "chunk relayed"
                         );
-                        if is_done {
+                        if is_terminal {
                             break 'outer;
                         }
+                    }
+
+                    if upstream_done && buffered.is_empty() && pending_batch.is_empty() {
+                        break;
                     }
                 }
 
                 tracing::Span::current().record("chunk_count", chunk_count);
+                tracing::Span::current().record("batch_count", batch_count);
+                tracing::Span::current().record("max_batch_size", max_batch_size);
                 tracing::trace!(
                     target: "remote::provider_host::stream",
                     session_id = %session_id,
@@ -691,6 +795,8 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                     model = %model,
                     receiver_name = %receiver_name,
                     chunk_count,
+                    batch_count,
+                    max_batch_size,
                     "stream relay complete"
                 );
             }

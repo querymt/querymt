@@ -9,7 +9,9 @@
 #[cfg(all(test, feature = "remote"))]
 #[allow(clippy::module_inception)]
 mod mesh_provider_tests {
-    use crate::agent::remote::mesh_provider::{MeshChatProvider, find_provider_on_mesh};
+    use crate::agent::remote::mesh_provider::{
+        MeshChatProvider, find_provider_on_mesh, should_retry_remote_send,
+    };
     use crate::agent::remote::test_helpers::fixtures::{ProviderHostFixture, get_test_mesh};
     use querymt::chat::ChatProvider;
     use querymt::completion::CompletionProvider;
@@ -206,5 +208,37 @@ mod mesh_provider_tests {
             "should return ProviderError (provider not buildable), got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn test_should_retry_remote_send_for_connection_failures() {
+        use kameo::error::RemoteSendError;
+
+        assert!(should_retry_remote_send::<()>(
+            &RemoteSendError::ActorNotRunning
+        ));
+        assert!(should_retry_remote_send::<()>(
+            &RemoteSendError::ConnectionClosed
+        ));
+        assert!(should_retry_remote_send::<()>(
+            &RemoteSendError::UnknownActor {
+                actor_remote_id: "actor".into(),
+            }
+        ));
+    }
+
+    #[test]
+    fn test_should_not_retry_remote_send_for_non_connection_failures() {
+        use kameo::error::RemoteSendError;
+
+        assert!(!should_retry_remote_send::<()>(
+            &RemoteSendError::MailboxFull
+        ));
+        assert!(!should_retry_remote_send::<()>(
+            &RemoteSendError::ReplyTimeout
+        ));
+        assert!(!should_retry_remote_send::<()>(
+            &RemoteSendError::BadActorType
+        ));
     }
 }

@@ -317,6 +317,28 @@ mod provider_host_tests {
         }
     }
 
+    #[test]
+    fn test_stream_chunk_relay_batch_roundtrip() {
+        let relay = StreamChunkRelay {
+            message: StreamRelayMessage::ChunkBatch(vec![
+                StreamChunk::Text("delta text".to_string()),
+                StreamChunk::Done {
+                    finish_reason: FinishReason::Stop,
+                },
+            ]),
+        };
+        let json = serde_json::to_string(&relay).expect("serialize");
+        let back: StreamChunkRelay = serde_json::from_str(&json).expect("deserialize");
+        match back.message {
+            StreamRelayMessage::ChunkBatch(chunks) => {
+                assert_eq!(chunks.len(), 2);
+                assert!(matches!(chunks[0], StreamChunk::Text(_)));
+                assert!(matches!(chunks[1], StreamChunk::Done { .. }));
+            }
+            other => panic!("expected ChunkBatch, got {:?}", other),
+        }
+    }
+
     // ── A.7 ──────────────────────────────────────────────────────────────────
 
     #[test]
@@ -440,6 +462,45 @@ mod provider_host_tests {
         assert!(
             send_result.is_err(),
             "actor should be dead after Done chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_receiver_actor_kill_on_done_batch() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let actor = StreamReceiverActor::new(tx, "test-done-batch".to_string(), None);
+        let actor_ref = StreamReceiverActor::spawn(actor);
+
+        let done_relay = StreamChunkRelay {
+            message: StreamRelayMessage::ChunkBatch(vec![
+                StreamChunk::Text("delta".to_string()),
+                StreamChunk::Done {
+                    finish_reason: querymt::chat::FinishReason::Stop,
+                },
+            ]),
+        };
+
+        actor_ref
+            .tell(done_relay)
+            .await
+            .expect("tell should succeed");
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let received = rx.try_recv().expect("should have received done batch");
+        assert!(
+            matches!(received, StreamRelayMessage::ChunkBatch(ref chunks) if chunks.len() == 2),
+            "expected done batch, got {:?}",
+            received
+        );
+
+        let extra = StreamChunkRelay {
+            message: StreamRelayMessage::Chunk(StreamChunk::Text("should be dropped".to_string())),
+        };
+        let send_result = actor_ref.tell(extra).await;
+        assert!(
+            send_result.is_err(),
+            "actor should be dead after Done batch"
         );
     }
 
