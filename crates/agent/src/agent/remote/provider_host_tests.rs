@@ -9,6 +9,7 @@
 #[cfg(all(test, feature = "remote"))]
 #[allow(clippy::module_inception)]
 mod provider_host_tests {
+    use tokio::sync::mpsc;
     // ── A.0 — SessionProvider::initial_params() ───────────────────────────────
     //
     // Regression test for the bug where `ProviderHostActor::get_or_build_provider`
@@ -172,7 +173,6 @@ mod provider_host_tests {
     use kameo::actor::Spawn;
     use querymt::chat::{ChatResponse, FinishReason, StreamChunk};
     use querymt::{FunctionCall, ToolCall};
-    use tokio::sync::mpsc;
 
     // ── A.1 ──────────────────────────────────────────────────────────────────
 

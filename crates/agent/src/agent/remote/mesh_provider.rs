@@ -355,14 +355,15 @@ impl ChatProvider for MeshChatProvider {
         };
 
         let send_started = Instant::now();
-        match host_ref.tell(&stream_request).send() {
+        match host_ref.tell(&stream_request).send_ack().await {
             Ok(()) => {}
             Err(error) if should_retry_remote_send(&error) => {
                 self.invalidate_cached_provider_host().await;
                 host_ref = self.lookup_provider_host().await?;
                 host_ref
                     .tell(&stream_request)
-                    .send()
+                    .send_ack()
+                    .await
                     .map_err(remote_send_error_to_llm_error_no_handler)?;
             }
             Err(error) => return Err(remote_send_error_to_llm_error_no_handler(error)),

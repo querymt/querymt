@@ -605,7 +605,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                         &mut batch_count,
                                         &mut max_batch_size,
                                     );
-                                    None
+                                    continue;
                                 }
                             }
                         };
