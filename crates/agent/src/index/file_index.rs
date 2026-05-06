@@ -326,6 +326,7 @@ impl FileIndexWatcher {
                             // build_gitignore() and WalkBuilder to stat <root>/.gitignore, which
                             // generates new Access/Metadata events that would otherwise re-trigger
                             // this rebuild indefinitely — especially when .gitignore doesn't exist.
+                            // Detect .gitignore changes to reload patterns and trigger full rebuild.
                             let gitignore_changed = pending_events.iter().any(|e| {
                                 matches!(
                                     e.kind,
@@ -338,6 +339,33 @@ impl FileIndexWatcher {
                                         | EventKind::Remove(_)
                                 ) && e.paths.iter().any(|p| {
                                     p.file_name().map(|n| n == ".gitignore").unwrap_or(false)
+                                })
+                            });
+
+                            // Detect branch switches by watching for .git/HEAD changes.
+                            // git checkout / git switch updates .git/HEAD (and the working tree),
+                            // but the burst of file events can be incomplete or arrive as
+                            // non-standard event kinds on some platforms.  A full rebuild is the
+                            // only reliable way to resync the index after a branch change.
+                            let head_changed = pending_events.iter().any(|e| {
+                                matches!(
+                                    e.kind,
+                                    EventKind::Create(_)
+                                        | EventKind::Modify(
+                                            ModifyKind::Data(_)
+                                                | ModifyKind::Any
+                                                | ModifyKind::Name(_)
+                                        )
+                                        | EventKind::Remove(_)
+                                ) && e.paths.iter().any(|p| {
+                                    p.file_name().map(|n| n == "HEAD").unwrap_or(false)
+                                        && p.parent()
+                                            .map(|d| {
+                                                d.file_name()
+                                                    .map(|n| n == ".git")
+                                                    .unwrap_or(false)
+                                            })
+                                            .unwrap_or(false)
                                 })
                             });
 
@@ -360,11 +388,18 @@ impl FileIndexWatcher {
                             );
                             pending_events.clear();
 
-                            if gitignore_changed {
-                                // Always do a full rebuild when .gitignore changes — previously
-                                // indexed files may now be ignored, or vice versa.
-                                log::debug!(
-                                    "FileIndexWatcher: Performing full rebuild after .gitignore change"
+                            if head_changed || gitignore_changed {
+                                // Full rebuild is required for branch switches and .gitignore
+                                // changes — incremental patching cannot reliably capture the
+                                // full set of added/removed files.
+                                let reason = if head_changed {
+                                    "branch switch detected (.git/HEAD changed)"
+                                } else {
+                                    ".gitignore changed"
+                                };
+                                log::info!(
+                                    "FileIndexWatcher: Performing full rebuild — {}",
+                                    reason
                                 );
                                 let root = root_clone.clone();
                                 let config = config_clone.clone();
@@ -375,8 +410,9 @@ impl FileIndexWatcher {
                                 }).await {
                                     index_clone.store(Arc::new(Some(new_index.clone())));
                                     log::debug!(
-                                        "FileIndexWatcher: Broadcasting rebuilt index with {} files after .gitignore change",
-                                        new_index.files.len()
+                                        "FileIndexWatcher: Broadcasting rebuilt index with {} files ({})",
+                                        new_index.files.len(),
+                                        reason
                                     );
                                     let _ = index_tx_clone.send(new_index);
                                 }
