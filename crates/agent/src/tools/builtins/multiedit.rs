@@ -46,7 +46,7 @@ impl Tool for MultiEditTool {
             tool_type: "function".to_string(),
             function: FunctionTool {
                 name: self.name().to_string(),
-                description: "Apply multiple sequential edits to a single file. Each edit is applied in order, so later edits see the results of earlier ones. Returns status for each edit operation."
+                description: "Apply multiple sequential edits to a single file. Later edits see earlier edits in memory. The operation is all-or-nothing: if any edit fails, no changes are written and the tool returns an error."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -110,33 +110,50 @@ impl Tool for MultiEditTool {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| ToolError::InvalidRequest(format!("Invalid edit operation: {}", e)))?;
 
+        if edits.is_empty() {
+            return Err(ToolError::InvalidRequest(
+                "edits array must not be empty".to_string(),
+            ));
+        }
+
+        for (index, edit) in edits.iter().enumerate() {
+            if edit.old_string.is_empty() {
+                return Err(ToolError::InvalidRequest(format!(
+                    "edit {} has empty oldString",
+                    index + 1
+                )));
+            }
+            if edit.old_string == edit.new_string {
+                return Err(ToolError::InvalidRequest(format!(
+                    "edit {} has identical oldString and newString",
+                    index + 1
+                )));
+            }
+        }
+
         let file_path = context.resolve_path(file_path_str)?;
 
-        // Read initial content
+        // Apply all edits in memory first so the file is only written once.
         let original_content = tokio::fs::read_to_string(&file_path)
             .await
             .map_err(|e| ToolError::ProviderError(format!("Failed to read file: {}", e)))?;
         let mut content = original_content.clone();
 
-        // Apply edits sequentially
         for (index, edit) in edits.iter().enumerate() {
-            match EditTool::replace(
+            content = EditTool::replace(
                 &content,
                 &edit.old_string,
                 &edit.new_string,
                 edit.replace_all,
-            ) {
-                Ok(new_content) => {
-                    content = new_content;
-                }
-                Err(e) => {
-                    // Stop on first error
-                    return Err(ToolError::ProviderError(format!(
-                        "Edit {} failed: {}",
-                        index, e
-                    )));
-                }
-            }
+            )
+            .map_err(|e| {
+                ToolError::ProviderError(format!(
+                    "multiedit failed at edit {} of {}: {}; no changes written",
+                    index + 1,
+                    edits.len(),
+                    e
+                ))
+            })?;
         }
 
         // Write final content
@@ -201,7 +218,6 @@ mod tests {
             "expected compact output, got: {}",
             result
         );
-        // Compact receipt: no diff lines
         assert!(
             !result.contains("| "),
             "compact receipt should not contain diff lines, got: {}",
@@ -212,6 +228,134 @@ mod tests {
         assert!(new_content.contains("hi world"));
         assert!(new_content.contains("Rust is good"));
         assert!(new_content.contains("Rust is fast"));
+    }
+
+    #[tokio::test]
+    async fn test_multiedit_failure_writes_nothing() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        let original = "hello world\nrust is good\nrust is fast";
+        fs::write(&file_path, original).unwrap();
+
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let tool = MultiEditTool::new();
+
+        let args = json!({
+            "filePath": file_path.display().to_string(),
+            "edits": [
+                {
+                    "oldString": "hello",
+                    "newString": "hi"
+                },
+                {
+                    "oldString": "missing",
+                    "newString": "x"
+                }
+            ]
+        });
+
+        let err = tool.call(args, &context).await.unwrap_err().to_string();
+        assert!(err.contains("multiedit failed at edit 2 of 2"));
+        assert!(err.contains("no changes written"));
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn test_multiedit_later_edit_sees_earlier_edit() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        fs::write(&file_path, "alpha").unwrap();
+
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let tool = MultiEditTool::new();
+
+        let args = json!({
+            "filePath": file_path.display().to_string(),
+            "edits": [
+                {
+                    "oldString": "alpha",
+                    "newString": "beta"
+                },
+                {
+                    "oldString": "beta",
+                    "newString": "gamma"
+                }
+            ]
+        });
+
+        tool.call(args, &context).await.unwrap();
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "gamma");
+    }
+
+    #[tokio::test]
+    async fn test_multiedit_empty_edits_rejected() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        fs::write(&file_path, "hello").unwrap();
+
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let tool = MultiEditTool::new();
+
+        let args = json!({
+            "filePath": file_path.display().to_string(),
+            "edits": []
+        });
+
+        let err = tool.call(args, &context).await.unwrap_err().to_string();
+        assert!(err.contains("edits array must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn test_multiedit_empty_old_string_rejected() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        fs::write(&file_path, "hello").unwrap();
+
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let tool = MultiEditTool::new();
+
+        let args = json!({
+            "filePath": file_path.display().to_string(),
+            "edits": [
+                {
+                    "oldString": "",
+                    "newString": "x"
+                }
+            ]
+        });
+
+        let err = tool.call(args, &context).await.unwrap_err().to_string();
+        assert!(err.contains("edit 1 has empty oldString"));
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn test_multiedit_identical_old_and_new_rejected() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        fs::write(&file_path, "hello").unwrap();
+
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let tool = MultiEditTool::new();
+
+        let args = json!({
+            "filePath": file_path.display().to_string(),
+            "edits": [
+                {
+                    "oldString": "hello",
+                    "newString": "hello"
+                }
+            ]
+        });
+
+        let err = tool.call(args, &context).await.unwrap_err().to_string();
+        assert!(err.contains("edit 1 has identical oldString and newString"));
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "hello");
     }
 
     #[tokio::test]
