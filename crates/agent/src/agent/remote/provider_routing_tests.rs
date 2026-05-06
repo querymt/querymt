@@ -357,6 +357,8 @@ mod provider_routing_integration_tests {
             request_id,
             stream_receiver_name: stream_rx_name,
             reconnect_grace_secs: 120,
+            heartbeat_interval_secs: 10,
+            lease_ttl_secs: 60,
             params: None,
         };
 

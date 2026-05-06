@@ -22,7 +22,8 @@
 use crate::agent::remote::NodeId;
 use crate::agent::remote::mesh::MeshHandle;
 use crate::agent::remote::provider_host::{
-    ProviderChatRequest, ProviderHostActor, ProviderStreamRequest, StreamReceiverActor,
+    CancelProviderStreamRequest, GetProviderStreamStatus, ProviderChatRequest, ProviderHostActor,
+    ProviderStreamRequest, ProviderStreamStatus, RenewProviderStreamLease, StreamReceiverActor,
     StreamRelayMessage,
 };
 use futures_util::StreamExt;
@@ -56,6 +57,7 @@ static PROVIDER_HOST_CACHE: OnceLock<
     RwLock<HashMap<String, kameo::actor::RemoteActorRef<ProviderHostActor>>>,
 > = OnceLock::new();
 
+#[derive(Clone)]
 pub struct MeshChatProvider {
     /// Provider name, e.g. `"anthropic"`.
     provider_name: String,
@@ -68,6 +70,10 @@ pub struct MeshChatProvider {
     /// Per-session LLM parameters (system prompt, temperature, etc.) to forward
     /// to the remote `ProviderHostActor`.
     params: Option<serde_json::Value>,
+    /// Heartbeat interval for remote provider stream liveness tracking.
+    heartbeat_interval_secs: u64,
+    /// Lease TTL for orphaned remote provider stream detection.
+    lease_ttl_secs: u64,
 }
 
 impl MeshChatProvider {
@@ -111,6 +117,8 @@ impl MeshChatProvider {
             mesh: mesh.clone(),
             target_dht_name: super::dht_name::provider_host(&target_node_id),
             params: None,
+            heartbeat_interval_secs: 10,
+            lease_ttl_secs: 60,
         }
     }
 
@@ -131,6 +139,66 @@ impl MeshChatProvider {
     pub fn with_params(mut self, params: Option<serde_json::Value>) -> Self {
         self.params = params;
         self
+    }
+
+    pub fn with_stream_controls(
+        mut self,
+        heartbeat_interval_secs: u64,
+        lease_ttl_secs: u64,
+    ) -> Self {
+        self.heartbeat_interval_secs = heartbeat_interval_secs.max(1);
+        self.lease_ttl_secs = lease_ttl_secs.max(1);
+        self
+    }
+
+    pub async fn cancel_remote_stream(
+        &self,
+        session_id: &str,
+        request_id: Option<&str>,
+        reason: Option<&str>,
+    ) {
+        let Ok(host_ref) = self.lookup_provider_host().await else {
+            return;
+        };
+        let _ = host_ref
+            .ask(&CancelProviderStreamRequest {
+                session_id: session_id.to_string(),
+                request_id: request_id.map(str::to_string),
+                reason: reason.map(str::to_string),
+            })
+            .await;
+    }
+
+    async fn renew_remote_stream_lease(&self, session_id: &str, request_id: &str) -> bool {
+        let Ok(host_ref) = self.lookup_provider_host().await else {
+            return false;
+        };
+        host_ref
+            .ask(&RenewProviderStreamLease {
+                session_id: session_id.to_string(),
+                request_id: request_id.to_string(),
+                lease_ttl_secs: self.lease_ttl_secs,
+            })
+            .await
+            .unwrap_or(false)
+    }
+
+    pub async fn get_remote_stream_status(
+        &self,
+        session_id: &str,
+        request_id: Option<&str>,
+    ) -> Option<ProviderStreamStatus> {
+        let Ok(host_ref) = self.lookup_provider_host().await else {
+            return None;
+        };
+        host_ref
+            .ask(&GetProviderStreamStatus {
+                session_id: session_id.to_string(),
+                request_id: request_id.map(str::to_string),
+            })
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Resolve the remote `ProviderHostActor` ref from the DHT.
@@ -351,6 +419,8 @@ impl ChatProvider for MeshChatProvider {
             request_id: request_id.clone(),
             stream_receiver_name: stream_rx_name.clone(),
             reconnect_grace_secs: self.mesh.stream_reconnect_grace().as_secs(),
+            heartbeat_interval_secs: self.heartbeat_interval_secs,
+            lease_ttl_secs: self.lease_ttl_secs,
             params: self.params.clone(),
         };
 
@@ -395,6 +465,8 @@ impl ChatProvider for MeshChatProvider {
         let local_peer_id = self.mesh.peer_id().to_string();
         let target_peer_id = self.target_peer_id();
         let mesh = self.mesh.clone();
+        let lease_renew_every = std::time::Duration::from_secs((self.lease_ttl_secs / 3).max(1));
+        let provider_handle = self.clone();
 
         let stream = futures_util::stream::unfold(
             (
@@ -403,6 +475,7 @@ impl ChatProvider for MeshChatProvider {
                 0_u64,
                 VecDeque::<StreamChunk>::new(),
                 false,
+                tokio::time::Instant::now() + lease_renew_every,
             ),
             move |(
                 mut raw_stream,
@@ -410,6 +483,7 @@ impl ChatProvider for MeshChatProvider {
                 mut chunk_index,
                 mut pending_chunks,
                 mut first_chunk_recorded,
+                mut renew_due,
             )| {
                 let mesh = mesh.clone();
                 let session_id_for_stream = session_id_for_stream.clone();
@@ -421,7 +495,18 @@ impl ChatProvider for MeshChatProvider {
                 let model_for_stream = model_for_stream.clone();
                 let target_for_stream = target_for_stream.clone();
                 let setup_span = setup_span.clone();
+                let provider_handle = provider_handle.clone();
                 async move {
+                    if tokio::time::Instant::now() >= renew_due {
+                        let _ = provider_handle
+                            .renew_remote_stream_lease(
+                                &session_id_for_stream,
+                                &request_id_for_stream,
+                            )
+                            .await;
+                        renew_due = tokio::time::Instant::now() + lease_renew_every;
+                    }
+
                     if let Some(chunk) = pending_chunks.pop_front() {
                         chunk_index += 1;
                         let elapsed_ms = stream_start.elapsed().as_millis();
@@ -437,34 +522,16 @@ impl ChatProvider for MeshChatProvider {
                                 chunk_index,
                                 pending_chunks,
                                 first_chunk_recorded,
+                                renew_due,
                             ),
                         ));
                     }
 
-                    let next = if let Some(since) = disconnected_since {
-                        let elapsed = since.elapsed();
-                        let remaining = reconnect_grace.saturating_sub(elapsed);
-                        if remaining.is_zero() {
-                            return Some((
-                                Err(LLMError::Transport {
-                                    kind: TransportErrorKind::Timeout,
-                                    message: format!(
-                                        "reconnect grace expired after {:?}",
-                                        reconnect_grace,
-                                    ),
-                                }),
-                                (
-                                    raw_stream,
-                                    disconnected_since,
-                                    chunk_index,
-                                    pending_chunks,
-                                    first_chunk_recorded,
-                                ),
-                            ));
-                        }
-                        match tokio::time::timeout(remaining, raw_stream.next()).await {
-                            Ok(item) => item,
-                            Err(_) => {
+                    loop {
+                        let next = if let Some(since) = disconnected_since {
+                            let elapsed = since.elapsed();
+                            let remaining = reconnect_grace.saturating_sub(elapsed);
+                            if remaining.is_zero() {
                                 return Some((
                                     Err(LLMError::Transport {
                                         kind: TransportErrorKind::Timeout,
@@ -479,38 +546,96 @@ impl ChatProvider for MeshChatProvider {
                                         chunk_index,
                                         pending_chunks,
                                         first_chunk_recorded,
+                                        renew_due,
                                     ),
                                 ));
                             }
-                        }
-                    } else {
-                        raw_stream.next().await
-                    };
-
-                    match next {
-                        Some(StreamRelayMessage::Chunk(chunk)) => {
-                            let elapsed_ms = stream_start.elapsed().as_millis();
-                            if !first_chunk_recorded {
-                                setup_span.record("first_chunk_ms", elapsed_ms as u64);
-                                first_chunk_recorded = true;
+                            match tokio::time::timeout(remaining, raw_stream.next()).await {
+                                Ok(item) => item,
+                                Err(_) => {
+                                    return Some((
+                                        Err(LLMError::Transport {
+                                            kind: TransportErrorKind::Timeout,
+                                            message: format!(
+                                                "reconnect grace expired after {:?}",
+                                                reconnect_grace,
+                                            ),
+                                        }),
+                                        (
+                                            raw_stream,
+                                            disconnected_since,
+                                            chunk_index,
+                                            pending_chunks,
+                                            first_chunk_recorded,
+                                            renew_due,
+                                        ),
+                                    ));
+                                }
                             }
-                            if let StreamChunk::Done { finish_reason } = &chunk {
-                                tracing::debug!(
-                                    target: "remote::mesh_provider::stream",
-                                    session_id = %session_id_for_stream,
-                                    request_id = %request_id_for_stream,
-                                    local_peer_id = %local_peer_id,
-                                    target_peer_id = tracing::field::display(target_peer_id.as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
-                                    provider = %provider_for_stream,
-                                    model = %model_for_stream,
-                                    target_node = %target_for_stream,
-                                    stream_rx = %stream_rx_name_for_log,
-                                    chunk_index = chunk_index + 1,
-                                    elapsed_ms,
-                                    finish_reason = ?finish_reason,
-                                    "stream done received from remote provider"
-                                );
-                            } else {
+                        } else {
+                            raw_stream.next().await
+                        };
+
+                        match next {
+                            Some(StreamRelayMessage::Chunk(chunk)) => {
+                                let elapsed_ms = stream_start.elapsed().as_millis();
+                                if !first_chunk_recorded {
+                                    setup_span.record("first_chunk_ms", elapsed_ms as u64);
+                                    first_chunk_recorded = true;
+                                }
+                                if let StreamChunk::Done { finish_reason } = &chunk {
+                                    tracing::debug!(
+                                        target: "remote::mesh_provider::stream",
+                                        session_id = %session_id_for_stream,
+                                        request_id = %request_id_for_stream,
+                                        local_peer_id = %local_peer_id,
+                                        target_peer_id = tracing::field::display(target_peer_id.as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
+                                        provider = %provider_for_stream,
+                                        model = %model_for_stream,
+                                        target_node = %target_for_stream,
+                                        stream_rx = %stream_rx_name_for_log,
+                                        chunk_index = chunk_index + 1,
+                                        elapsed_ms,
+                                        finish_reason = ?finish_reason,
+                                        "stream done received from remote provider"
+                                    );
+                                } else {
+                                    tracing::trace!(
+                                        target: "remote::mesh_provider::stream",
+                                        session_id = %session_id_for_stream,
+                                        request_id = %request_id_for_stream,
+                                        local_peer_id = %local_peer_id,
+                                        target_peer_id = tracing::field::display(target_peer_id.as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
+                                        provider = %provider_for_stream,
+                                        model = %model_for_stream,
+                                        target_node = %target_for_stream,
+                                        stream_rx = %stream_rx_name_for_log,
+                                        chunk_index = chunk_index + 1,
+                                        elapsed_ms,
+                                        "stream chunk received"
+                                    );
+                                }
+                                chunk_index += 1;
+                                break Some((
+                                    Ok(chunk),
+                                    (
+                                        raw_stream,
+                                        None,
+                                        chunk_index,
+                                        pending_chunks,
+                                        first_chunk_recorded,
+                                        renew_due,
+                                    ),
+                                ));
+                            }
+                            Some(StreamRelayMessage::ChunkBatch(chunks)) => {
+                                let elapsed_ms = stream_start.elapsed().as_millis();
+                                if !first_chunk_recorded && !chunks.is_empty() {
+                                    setup_span.record("first_chunk_ms", elapsed_ms as u64);
+                                    first_chunk_recorded = true;
+                                }
+                                let batch_len = chunks.len();
+                                pending_chunks.extend(chunks);
                                 tracing::trace!(
                                     target: "remote::mesh_provider::stream",
                                     session_id = %session_id_for_stream,
@@ -521,153 +646,153 @@ impl ChatProvider for MeshChatProvider {
                                     model = %model_for_stream,
                                     target_node = %target_for_stream,
                                     stream_rx = %stream_rx_name_for_log,
-                                    chunk_index = chunk_index + 1,
+                                    batch_len,
                                     elapsed_ms,
-                                    "stream chunk received"
+                                    "stream batch received"
                                 );
+                                let chunk = pending_chunks.pop_front()?;
+                                chunk_index += 1;
+                                break Some((
+                                    Ok(chunk),
+                                    (
+                                        raw_stream,
+                                        None,
+                                        chunk_index,
+                                        pending_chunks,
+                                        first_chunk_recorded,
+                                        renew_due,
+                                    ),
+                                ));
                             }
-                            chunk_index += 1;
-                            Some((
-                                Ok(chunk),
-                                (
-                                    raw_stream,
-                                    None,
-                                    chunk_index,
-                                    pending_chunks,
-                                    first_chunk_recorded,
-                                ),
-                            ))
-                        }
-                        Some(StreamRelayMessage::ChunkBatch(chunks)) => {
-                            let elapsed_ms = stream_start.elapsed().as_millis();
-                            if !first_chunk_recorded && !chunks.is_empty() {
-                                setup_span.record("first_chunk_ms", elapsed_ms as u64);
-                                first_chunk_recorded = true;
-                            }
-                            let batch_len = chunks.len();
-                            pending_chunks.extend(chunks);
-                            tracing::trace!(
-                                target: "remote::mesh_provider::stream",
-                                session_id = %session_id_for_stream,
-                                request_id = %request_id_for_stream,
-                                local_peer_id = %local_peer_id,
-                                target_peer_id = tracing::field::display(target_peer_id.as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
-                                provider = %provider_for_stream,
-                                model = %model_for_stream,
-                                target_node = %target_for_stream,
-                                stream_rx = %stream_rx_name_for_log,
-                                batch_len,
+                            Some(StreamRelayMessage::Heartbeat {
+                                phase,
                                 elapsed_ms,
-                                "stream batch received"
-                            );
-                            let chunk = pending_chunks.pop_front()?;
-                            chunk_index += 1;
-                            Some((
-                                Ok(chunk),
-                                (
-                                    raw_stream,
-                                    None,
-                                    chunk_index,
-                                    pending_chunks,
-                                    first_chunk_recorded,
-                                ),
-                            ))
-                        }
-                        Some(StreamRelayMessage::ProviderError { error }) => Some((
-                            Err(LLMError::from_payload(error)),
-                            (
-                                raw_stream,
-                                disconnected_since,
-                                chunk_index,
-                                pending_chunks,
-                                first_chunk_recorded,
-                            ),
-                        )),
-                        Some(StreamRelayMessage::TransportDisconnected { reason }) => {
-                            tracing::warn!(
-                                target: "remote::mesh_provider::stream",
-                                session_id = %session_id_for_stream,
-                                request_id = %request_id_for_stream,
-                                local_peer_id = %local_peer_id,
-                                target_peer_id = tracing::field::display(target_peer_id.as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
-                                provider = %provider_for_stream,
-                                model = %model_for_stream,
-                                target_node = %target_for_stream,
-                                stream_rx = %stream_rx_name_for_log,
-                                reason,
-                                "stream transport disconnected"
-                            );
-                            Some((
-                                Err(LLMError::RemoteStreamDisconnected { message: reason }),
-                                (
-                                    raw_stream,
-                                    Some(tokio::time::Instant::now()),
-                                    chunk_index,
-                                    pending_chunks,
-                                    first_chunk_recorded,
-                                ),
-                            ))
-                        }
-                        Some(StreamRelayMessage::TransportReconnected { buffered_chunks }) => {
-                            tracing::info!(
-                                target: "remote::mesh_provider::stream",
-                                session_id = %session_id_for_stream,
-                                request_id = %request_id_for_stream,
-                                local_peer_id = %local_peer_id,
-                                target_peer_id = tracing::field::display(target_peer_id.as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
-                                provider = %provider_for_stream,
-                                model = %model_for_stream,
-                                target_node = %target_for_stream,
-                                stream_rx = %stream_rx_name_for_log,
-                                buffered_chunks,
-                                "stream transport reconnected"
-                            );
-                            Some((
-                                Err(LLMError::RemoteStreamReconnected {
-                                    message: format!("buffered_chunks={}", buffered_chunks),
-                                }),
-                                (
-                                    raw_stream,
-                                    None,
-                                    chunk_index,
-                                    pending_chunks,
-                                    first_chunk_recorded,
-                                ),
-                            ))
-                        }
-                        Some(StreamRelayMessage::TransportFailed { error }) => Some((
-                            Err(LLMError::from_payload(error)),
-                            (
-                                raw_stream,
-                                disconnected_since,
-                                chunk_index,
-                                pending_chunks,
-                                first_chunk_recorded,
-                            ),
-                        )),
-                        None => {
-                            let peer_alive = target_peer_id
-                                .as_ref()
-                                .is_some_and(|peer_id| mesh.is_peer_alive(peer_id));
-                            if disconnected_since.is_some() || !peer_alive {
-                                Some((
-                                    Err(LLMError::Transport {
-                                        kind: TransportErrorKind::ConnectionClosed,
-                                        message: format!(
-                                            "stream receiver closed (peer_alive={})",
-                                            peer_alive,
-                                        ),
-                                    }),
+                                idle_ms,
+                                chunk_count,
+                            }) => {
+                                tracing::info!(
+                                    target: "remote::mesh_provider::heartbeat",
+                                    session_id = %session_id_for_stream,
+                                    request_id = %request_id_for_stream,
+                                    local_peer_id = %local_peer_id,
+                                    target_peer_id = tracing::field::display(target_peer_id.as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
+                                    provider = %provider_for_stream,
+                                    model = %model_for_stream,
+                                    target_node = %target_for_stream,
+                                    stream_rx = %stream_rx_name_for_log,
+                                    phase = ?phase,
+                                    elapsed_ms,
+                                    idle_ms,
+                                    chunk_count,
+                                    "remote provider heartbeat"
+                                );
+                                continue;
+                            }
+                            Some(StreamRelayMessage::ProviderError { error }) => {
+                                break Some((
+                                    Err(LLMError::from_payload(error)),
                                     (
                                         raw_stream,
                                         disconnected_since,
                                         chunk_index,
                                         pending_chunks,
                                         first_chunk_recorded,
+                                        renew_due,
                                     ),
-                                ))
-                            } else {
-                                None
+                                ));
+                            }
+                            Some(StreamRelayMessage::TransportDisconnected { reason }) => {
+                                tracing::warn!(
+                                    target: "remote::mesh_provider::stream",
+                                    session_id = %session_id_for_stream,
+                                    request_id = %request_id_for_stream,
+                                    local_peer_id = %local_peer_id,
+                                    target_peer_id = tracing::field::display(target_peer_id.as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
+                                    provider = %provider_for_stream,
+                                    model = %model_for_stream,
+                                    target_node = %target_for_stream,
+                                    stream_rx = %stream_rx_name_for_log,
+                                    reason,
+                                    "stream transport disconnected"
+                                );
+                                break Some((
+                                    Err(LLMError::RemoteStreamDisconnected { message: reason }),
+                                    (
+                                        raw_stream,
+                                        None,
+                                        chunk_index,
+                                        pending_chunks,
+                                        first_chunk_recorded,
+                                        renew_due,
+                                    ),
+                                ));
+                            }
+                            Some(StreamRelayMessage::TransportReconnected { buffered_chunks }) => {
+                                tracing::info!(
+                                    target: "remote::mesh_provider::stream",
+                                    session_id = %session_id_for_stream,
+                                    request_id = %request_id_for_stream,
+                                    local_peer_id = %local_peer_id,
+                                    target_peer_id = tracing::field::display(target_peer_id.as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
+                                    provider = %provider_for_stream,
+                                    model = %model_for_stream,
+                                    target_node = %target_for_stream,
+                                    stream_rx = %stream_rx_name_for_log,
+                                    buffered_chunks,
+                                    "stream transport reconnected"
+                                );
+                                break Some((
+                                    Err(LLMError::RemoteStreamReconnected {
+                                        message: format!("buffered_chunks={}", buffered_chunks),
+                                    }),
+                                    (
+                                        raw_stream,
+                                        None,
+                                        chunk_index,
+                                        pending_chunks,
+                                        first_chunk_recorded,
+                                        renew_due,
+                                    ),
+                                ));
+                            }
+                            Some(StreamRelayMessage::TransportFailed { error }) => {
+                                break Some((
+                                    Err(LLMError::from_payload(error)),
+                                    (
+                                        raw_stream,
+                                        disconnected_since,
+                                        chunk_index,
+                                        pending_chunks,
+                                        first_chunk_recorded,
+                                        renew_due,
+                                    ),
+                                ));
+                            }
+                            None => {
+                                let peer_alive = target_peer_id
+                                    .as_ref()
+                                    .is_some_and(|peer_id| mesh.is_peer_alive(peer_id));
+                                if disconnected_since.is_some() || !peer_alive {
+                                    break Some((
+                                        Err(LLMError::Transport {
+                                            kind: TransportErrorKind::ConnectionClosed,
+                                            message: format!(
+                                                "stream receiver closed (peer_alive={})",
+                                                peer_alive,
+                                            ),
+                                        }),
+                                        (
+                                            raw_stream,
+                                            disconnected_since,
+                                            chunk_index,
+                                            pending_chunks,
+                                            first_chunk_recorded,
+                                            renew_due,
+                                        ),
+                                    ));
+                                } else {
+                                    break None;
+                                }
                             }
                         }
                     }

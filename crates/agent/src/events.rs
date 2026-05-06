@@ -179,6 +179,18 @@ pub enum AgentEventKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
     },
+    /// Ephemeral signal emitted when a remote provider host reports liveness while waiting.
+    RemoteProviderHeartbeat {
+        phase: String,
+        #[typeshare(serialized_as = "number")]
+        elapsed_ms: u64,
+        #[typeshare(serialized_as = "number")]
+        idle_ms: u64,
+        #[typeshare(serialized_as = "number")]
+        chunk_count: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
     /// Ephemeral signal emitted when mid-stream transport error is detected.
     /// Accumulated text is discarded and a new stream is being created.
     StreamRecovering {
@@ -667,6 +679,7 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         AgentEventKind::AssistantThinkingDelta { .. } => Durability::Ephemeral,
         AgentEventKind::RemoteStreamDisconnected { .. } => Durability::Ephemeral,
         AgentEventKind::RemoteStreamReconnected { .. } => Durability::Ephemeral,
+        AgentEventKind::RemoteProviderHeartbeat { .. } => Durability::Ephemeral,
         AgentEventKind::StreamRecovering { .. } => Durability::Ephemeral,
 
         // Everything else is durable by default.

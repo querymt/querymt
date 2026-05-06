@@ -6,6 +6,9 @@
 
 use crate::agent::handle::AgentHandle;
 use crate::agent::remote::SessionActorRef;
+use crate::agent::remote::provider_host::{
+    CancelProviderStreamRequest, GetProviderStreamStatus, ProviderHostActor,
+};
 use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
 use crate::event_fanout::EventFanout;
 use crate::events::{AgentEventKind, EphemeralEvent, EventEnvelope, EventOrigin};
@@ -44,6 +47,38 @@ impl RemoteAgentHandle {
             event_fanout: Arc::new(EventFanout::new()),
             sessions: Mutex::new(HashMap::new()),
         }
+    }
+
+    async fn best_effort_cancel_remote_provider_stream(&self, session_id: &str) {
+        let Some(node_id) = self.mesh.resolve_peer_node_id(&self.peer_label).await else {
+            return;
+        };
+        let provider_host_name = crate::agent::remote::dht_name::provider_host(&node_id);
+        let Ok(Some(provider_host)) = self
+            .mesh
+            .lookup_actor::<ProviderHostActor>(&provider_host_name)
+            .await
+        else {
+            return;
+        };
+
+        let status = provider_host
+            .ask(&GetProviderStreamStatus {
+                session_id: session_id.to_string(),
+                request_id: None,
+            })
+            .await
+            .ok()
+            .flatten();
+
+        let request_id = status.as_ref().map(|status| status.request_id.clone());
+        let _ = provider_host
+            .ask(&CancelProviderStreamRequest {
+                session_id: session_id.to_string(),
+                request_id,
+                reason: Some("remote prompt request failed".to_string()),
+            })
+            .await;
     }
 
     #[cfg(test)]
@@ -205,7 +240,12 @@ impl AgentHandle for RemoteAgentHandle {
             }
         };
 
-        session_ref.prompt(req).await
+        let result = session_ref.prompt(req).await;
+        if result.is_err() {
+            self.best_effort_cancel_remote_provider_stream(&session_id)
+                .await;
+        }
+        result
     }
 
     async fn cancel(&self, notif: CancelNotification) -> Result<(), Error> {

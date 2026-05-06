@@ -166,8 +166,9 @@ mod provider_host_tests {
         }
     }
     use crate::agent::remote::provider_host::{
-        ProviderChatRequest, ProviderChatResponse, StreamChunkRelay, StreamReceiverActor,
-        StreamRelayMessage,
+        CancelProviderStreamRequest, GetProviderStreamStatus, ProviderChatRequest,
+        ProviderChatResponse, ProviderStreamPhase, RenewProviderStreamLease, StreamChunkRelay,
+        StreamReceiverActor, StreamRelayMessage,
     };
     use crate::agent::remote::test_helpers::fixtures::ProviderHostFixture;
     use kameo::actor::Spawn;
@@ -543,6 +544,44 @@ mod provider_host_tests {
         assert!(actor_ref.tell(extra).await.is_err());
     }
 
+    #[tokio::test]
+    async fn test_stream_receiver_actor_keeps_running_on_heartbeat() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let actor = StreamReceiverActor::new(tx, "test-heartbeat".to_string(), None);
+        let actor_ref = StreamReceiverActor::spawn(actor);
+
+        actor_ref
+            .tell(StreamChunkRelay {
+                message: StreamRelayMessage::Heartbeat {
+                    phase: ProviderStreamPhase::WaitingFirstChunk,
+                    elapsed_ms: 1500,
+                    idle_ms: 1500,
+                    chunk_count: 0,
+                },
+            })
+            .await
+            .expect("tell should succeed");
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let received = rx.try_recv().expect("should receive heartbeat");
+        assert!(matches!(
+            received,
+            StreamRelayMessage::Heartbeat {
+                phase: ProviderStreamPhase::WaitingFirstChunk,
+                elapsed_ms: 1500,
+                idle_ms: 1500,
+                chunk_count: 0,
+            }
+        ));
+
+        actor_ref
+            .tell(StreamChunkRelay {
+                message: StreamRelayMessage::Chunk(StreamChunk::Text("still alive".to_string())),
+            })
+            .await
+            .expect("actor should remain alive after heartbeat");
+    }
+
     // ── A.12 ─────────────────────────────────────────────────────────────────
 
     #[test]
@@ -698,11 +737,47 @@ mod provider_host_tests {
             request_id: "request-test".to_string(),
             stream_receiver_name: "stream_rx::session-test::request-test".to_string(),
             reconnect_grace_secs: 120,
+            heartbeat_interval_secs: 7,
+            lease_ttl_secs: 33,
             params: Some(serde_json::json!({"system": ["prompt"]})),
         };
         let json = serde_json::to_string(&stream_req).expect("serialize");
         let back: ProviderStreamRequest = serde_json::from_str(&json).expect("deserialize");
         assert!(back.params.is_some());
+        assert_eq!(back.heartbeat_interval_secs, 7);
+        assert_eq!(back.lease_ttl_secs, 33);
+    }
+
+    #[test]
+    fn test_provider_stream_control_messages_roundtrip() {
+        let cancel = CancelProviderStreamRequest {
+            session_id: "session-test".to_string(),
+            request_id: Some("request-test".to_string()),
+            reason: Some("manual stop".to_string()),
+        };
+        let cancel_json = serde_json::to_string(&cancel).expect("serialize cancel");
+        let cancel_back: CancelProviderStreamRequest =
+            serde_json::from_str(&cancel_json).expect("deserialize cancel");
+        assert_eq!(cancel_back.request_id.as_deref(), Some("request-test"));
+
+        let renew = RenewProviderStreamLease {
+            session_id: "session-test".to_string(),
+            request_id: "request-test".to_string(),
+            lease_ttl_secs: 45,
+        };
+        let renew_json = serde_json::to_string(&renew).expect("serialize renew");
+        let renew_back: RenewProviderStreamLease =
+            serde_json::from_str(&renew_json).expect("deserialize renew");
+        assert_eq!(renew_back.lease_ttl_secs, 45);
+
+        let status_req = GetProviderStreamStatus {
+            session_id: "session-test".to_string(),
+            request_id: Some("request-test".to_string()),
+        };
+        let status_json = serde_json::to_string(&status_req).expect("serialize status req");
+        let status_back: GetProviderStreamStatus =
+            serde_json::from_str(&status_json).expect("deserialize status req");
+        assert_eq!(status_back.request_id.as_deref(), Some("request-test"));
     }
 
     // ── A.15 — params: None backward compatibility ────────────────────────────

@@ -105,6 +105,22 @@ mod mesh_provider_tests {
         assert!(provider.supports_streaming());
     }
 
+    #[tokio::test]
+    async fn test_mesh_chat_provider_with_stream_controls_and_status_lookup() {
+        let mesh = get_test_mesh().await;
+        let provider = MeshChatProvider::new(mesh, "missing-node", "anthropic", "claude-3")
+            .with_stream_controls(7, 33);
+
+        assert!(provider.supports_streaming());
+        assert!(
+            provider
+                .get_remote_stream_status("missing-session", None)
+                .await
+                .is_none(),
+            "status lookup against an unregistered provider host should return None"
+        );
+    }
+
     // ── B.4 ──────────────────────────────────────────────────────────────────
 
     #[tokio::test]

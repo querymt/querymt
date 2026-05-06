@@ -31,6 +31,7 @@
 //! Use `MeshDiscovery::None` with explicit `bootstrap_peers` addresses for
 //! deployments where mDNS multicast is not available.
 
+use kameo::remote;
 use libp2p::{Multiaddr, PeerId};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -867,6 +868,131 @@ fn reconnect_backoff_duration(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+fn log_kameo_messaging_event(event: &remote::messaging::Event) {
+    match event {
+        remote::messaging::Event::AskResult {
+            peer,
+            connection_id,
+            request_id,
+            result,
+        } => match result {
+            Ok(_) => tracing::debug!(
+                target: "remote::mesh::messaging",
+                peer = %peer,
+                connection_id = ?connection_id,
+                request_id = %request_id,
+                "kameo ask completed"
+            ),
+            Err(error) => tracing::warn!(
+                target: "remote::mesh::messaging",
+                peer = %peer,
+                connection_id = ?connection_id,
+                request_id = %request_id,
+                error = ?error,
+                "kameo ask failed"
+            ),
+        },
+        remote::messaging::Event::TellResult {
+            peer,
+            connection_id,
+            request_id,
+            result,
+        } => match result {
+            Ok(()) => tracing::debug!(
+                target: "remote::mesh::messaging",
+                peer = %peer,
+                connection_id = ?connection_id,
+                request_id = %request_id,
+                "kameo tell acknowledged"
+            ),
+            Err(error) => tracing::warn!(
+                target: "remote::mesh::messaging",
+                peer = %peer,
+                connection_id = ?connection_id,
+                request_id = %request_id,
+                error = %error,
+                "kameo tell failed"
+            ),
+        },
+        remote::messaging::Event::LinkResult {
+            peer,
+            connection_id,
+            request_id,
+            result,
+        } => tracing::debug!(
+            target: "remote::mesh::messaging",
+            peer = %peer,
+            connection_id = ?connection_id,
+            request_id = %request_id,
+            ok = result.is_ok(),
+            "kameo link result"
+        ),
+        remote::messaging::Event::UnlinkResult {
+            peer,
+            connection_id,
+            request_id,
+            result,
+        } => tracing::debug!(
+            target: "remote::mesh::messaging",
+            peer = %peer,
+            connection_id = ?connection_id,
+            request_id = %request_id,
+            ok = result.is_ok(),
+            "kameo unlink result"
+        ),
+        remote::messaging::Event::SignalLinkDiedResult {
+            peer,
+            connection_id,
+            request_id,
+            result,
+        } => tracing::debug!(
+            target: "remote::mesh::messaging",
+            peer = %peer,
+            connection_id = ?connection_id,
+            request_id = %request_id,
+            ok = result.is_ok(),
+            "kameo signal_link_died result"
+        ),
+        remote::messaging::Event::OutboundFailure {
+            peer,
+            connection_id,
+            request_id,
+            error,
+        } => tracing::warn!(
+            target: "remote::mesh::messaging",
+            peer = %peer,
+            connection_id = %connection_id,
+            request_id = %request_id,
+            error = %error,
+            "kameo outbound failure"
+        ),
+        remote::messaging::Event::InboundFailure {
+            peer,
+            connection_id,
+            request_id,
+            error,
+        } => tracing::warn!(
+            target: "remote::mesh::messaging",
+            peer = %peer,
+            connection_id = %connection_id,
+            request_id = %request_id,
+            error = ?error,
+            "kameo inbound failure"
+        ),
+        remote::messaging::Event::ResponseSent {
+            peer,
+            connection_id,
+            request_id,
+        } => tracing::trace!(
+            target: "remote::mesh::messaging",
+            peer = %peer,
+            connection_id = %connection_id,
+            request_id = %request_id,
+            "kameo response sent"
+        ),
+    }
+}
+
 /// Shared pre-bootstrap setup: load identity, validate peers, create channels.
 struct MeshBootstrapContext {
     keypair: libp2p::identity::Keypair,
@@ -1072,6 +1198,11 @@ async fn bootstrap_lan_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
     tokio::spawn(async move {
         loop {
             match swarm.select_next_some().await {
+                SwarmEvent::Behaviour(MeshBehaviourEvent::Kameo(remote::Event::Messaging(
+                    event,
+                ))) => {
+                    log_kameo_messaging_event(&event);
+                }
                 SwarmEvent::Behaviour(MeshBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                     // A single mDNS event may carry multiple (peer_id, multiaddr)
                     // pairs — one per transport (TCP, QUIC) and one per address.
@@ -1512,6 +1643,9 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
                 }
                 event = swarm.select_next_some() => {
                 match event {
+                SwarmEvent::Behaviour(IrohMeshBehaviourEvent::Kameo(remote::Event::Messaging(event))) => {
+                    log_kameo_messaging_event(&event);
+                }
                 SwarmEvent::ConnectionEstablished {
                     peer_id, endpoint, ..
                 } => {

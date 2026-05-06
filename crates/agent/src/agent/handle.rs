@@ -1390,6 +1390,59 @@ impl LocalAgentHandle {
                     .find(|b| b.session_id == session_id);
 
                 if let Some(bookmark) = bookmark {
+                    if let Some(mesh) = self.mesh() {
+                        let provider_host_name =
+                            crate::agent::remote::dht_name::provider_host(&bookmark.node_id);
+                        if let Ok(Some(provider_host)) = mesh
+                            .lookup_actor::<crate::agent::remote::provider_host::ProviderHostActor>(
+                                &provider_host_name,
+                            )
+                            .await
+                        {
+                            let status = provider_host
+                                .ask(
+                                    &crate::agent::remote::provider_host::GetProviderStreamStatus {
+                                        session_id: session_id.to_string(),
+                                        request_id: None,
+                                    },
+                                )
+                                .await
+                                .ok()
+                                .flatten();
+                            if let Some(status) = status {
+                                tracing::warn!(
+                                    session_id,
+                                    request_id = %status.request_id,
+                                    phase = ?status.phase,
+                                    elapsed_ms = status.elapsed_ms,
+                                    idle_ms = status.idle_ms,
+                                    chunk_count = status.chunk_count,
+                                    receiver_connected = status.receiver_connected,
+                                    lease_expires_in_ms = status.lease_expires_in_ms,
+                                    provider = %status.provider,
+                                    model = %status.model,
+                                    last_error = ?status.last_error,
+                                    "remote stop found active provider stream; issuing provider-host cancel"
+                                );
+                                let _ = provider_host
+                                    .ask(&crate::agent::remote::provider_host::CancelProviderStreamRequest {
+                                        session_id: session_id.to_string(),
+                                        request_id: Some(status.request_id.clone()),
+                                        reason: Some("session stop requested".to_string()),
+                                    })
+                                    .await;
+                            } else {
+                                let _ = provider_host
+                                    .ask(&crate::agent::remote::provider_host::CancelProviderStreamRequest {
+                                        session_id: session_id.to_string(),
+                                        request_id: None,
+                                        reason: Some("session stop requested without status".to_string()),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+
                     let nm_ref = self.find_node_manager(&bookmark.node_id).await?;
                     nm_ref
                         .ask(&crate::agent::remote::DestroyRemoteSession {
