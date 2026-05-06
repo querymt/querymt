@@ -4,144 +4,97 @@ import type { EventItem } from '../types';
 import { buildToolDiffPreview } from './diffPreview';
 
 describe('buildToolDiffPreview', () => {
-  it('parses compact output with insert_after hunk', () => {
-    const rawOutput = [
-      'OK paths=1 edits=1 added=1 deleted=0',
-      'P file.txt',
-      'H insert_after old=1,5 new=1,6',
-      ' 00001| a',
-      ' 00002| b',
-      '+00003| bb',
-      ' 00004| c',
-      ' 00005| d',
-      ' 00006| e',
-    ].join('\n');
-
+  it('builds diff from edit input', () => {
     const preview = buildToolDiffPreview(
       'functions.edit',
-      { filePath: 'file.txt', oldString: 'b', newString: 'bb' },
+      { filePath: 'file.txt', oldString: 'hello', newString: 'world' },
       {
         id: 'tool-result-1',
         type: 'tool_result',
-        content: rawOutput,
+        content: 'OK paths=1 edits=1 added=1 deleted=1',
         timestamp: Date.now(),
         agentId: 'agent',
         toolCall: {
           tool_call_id: 'functions.edit:1',
           kind: 'functions.edit',
           status: 'completed',
-          raw_output: rawOutput,
+          raw_output: 'OK paths=1 edits=1 added=1 deleted=1',
         },
       } as EventItem,
     );
 
     expect(preview?.type).toBe('diff');
-    expect(preview?.patch).toContain('@@ -1,5 +1,6 @@');
-    expect(preview?.patch).toContain(' a\n b\n+bb\n c');
+    expect(preview?.patch).toContain('diff --git');
+    expect(preview?.patch).toContain('-hello');
+    expect(preview?.patch).toContain('+world');
+    expect(preview?.filePath).toBe('file.txt');
   });
 
-  it('splits overlapping multiedit hunks into separate diff sections', () => {
-    const rawOutput = [
-      'OK paths=1 edits=2 added=1 deleted=5',
-      'P edit.rs',
-      'H delete old=372,11 new=372,6',
-      ' 00372|     }',
-      ' 00373| ',
-      '-00374| struct DiffRegionLine {',
-      '-00375|     anchor: &str,',
-      '-00376|     text: &str,',
-      '-00377|     line_number: usize,',
-      '-00378| }',
-      ' 00379| ',
-      ' 00380| struct DiffRegionLine {',
-      ' 00381|     anchor: &str,',
-      'H insert_before old=373,6 new=373,7',
-      ' 00373| ',
-      '+00374| #[derive(Clone, Copy)]',
-      ' 00375| struct DiffRegionLine {',
-      ' 00376|     anchor: &str,',
-      ' 00377|     text: &str,',
-      ' 00378|     line_number: usize,',
-    ].join('\n');
-
+  it('builds diff from multiedit input with multiple edits', () => {
     const preview = buildToolDiffPreview(
       'functions.multiedit',
-      { paths: [{ path: 'edit.rs', edits: [] }] },
+      {
+        filePath: 'edit.rs',
+        edits: [
+          { oldString: 'foo', newString: 'bar' },
+          { oldString: 'baz', newString: 'qux' },
+        ],
+      },
       {
         id: 'tool-result-2',
         type: 'tool_result',
-        content: rawOutput,
+        content: 'OK paths=1 edits=2 added=2 deleted=2',
         timestamp: Date.now(),
         agentId: 'agent',
         toolCall: {
           tool_call_id: 'functions.multiedit:1',
           kind: 'functions.multiedit',
           status: 'completed',
-          raw_output: rawOutput,
+          raw_output: 'OK paths=1 edits=2 added=2 deleted=2',
         },
       } as EventItem,
     );
 
     expect(preview?.type).toBe('diff');
     const patch = preview?.patch ?? '';
-    expect((patch.match(/^diff --git /gm) || []).length).toBe(2);
+    // Single file → one diff --git section, two hunks
+    expect((patch.match(/^diff --git /gm) || []).length).toBe(1);
     expect((patch.match(/^@@ /gm) || []).length).toBe(2);
-    expect(patch).toContain('@@ -372,10 +372,5 @@');
-    expect(patch).toContain('@@ -373,5 +373,6 @@');
+    expect(patch).toContain('-foo');
+    expect(patch).toContain('+bar');
+    expect(patch).toContain('-baz');
+    expect(patch).toContain('+qux');
   });
 
-  it('renders the exact session-shaped multiedit fixture coherently', () => {
-    const rawOutput = [
-      'OK paths=1 edits=2 added=1 deleted=5',
-      'P edit.rs',
-      'H delete old=1,11 new=1,6',
-      ' 00001| head',
-      ' 00002| keep before',
-      ' 00003| ',
-      '-00004| struct DiffRegionLine {',
-      '-00005|     anchor: &str,',
-      '-00006|     text: &str,',
-      '-00007|     line_number: usize,',
-      '-00008| }',
-      ' 00009| ',
-      ' 00010| #[derive(Clone, Copy)]',
-      ' 00011| struct DiffRegionLine {',
-      'H insert_before old=2,6 new=2,7',
-      ' 00002| keep before',
-      ' 00003| ',
-      ' 00004| ',
-      '+00005| #[derive(Clone, Copy)]',
-      ' 00006| struct DiffRegionLine {',
-      ' 00007|     anchor: &str,',
-      ' 00008|     text: &str,',
-    ].join('\n');
+  it('builds diff from multiedit input with multi-line edits', () => {
+    const oldBlock = 'struct DiffRegionLine {\n    anchor: &str,\n    text: &str,\n    line_number: usize,\n}';
+    const newBlock = '#[derive(Clone, Copy)]\nstruct DiffRegionLine {\n    anchor: &str,\n    text: &str,\n    line_number: usize,\n}';
 
     const preview = buildToolDiffPreview(
       'functions.multiedit',
-      { paths: [{ path: 'edit.rs', edits: [] }] },
       {
-        id: 'tool-result-session-shaped',
+        filePath: 'edit.rs',
+        edits: [{ oldString: oldBlock, newString: newBlock }],
+      },
+      {
+        id: 'tool-result-multi-line',
         type: 'tool_result',
-        content: rawOutput,
+        content: 'OK paths=1 edits=1 added=1 deleted=0',
         timestamp: Date.now(),
         agentId: 'agent',
         toolCall: {
-          tool_call_id: 'functions.multiedit:session-shaped',
+          tool_call_id: 'functions.multiedit:ml',
           kind: 'functions.multiedit',
           status: 'completed',
-          raw_output: rawOutput,
+          raw_output: 'OK paths=1 edits=1 added=1 deleted=0',
         },
       } as EventItem,
     );
 
     expect(preview?.type).toBe('diff');
-    const patch = preview?.patch ?? '';
-    expect((patch.match(/^diff --git /gm) || []).length).toBe(2);
-    expect((patch.match(/^@@ /gm) || []).length).toBe(2);
-    expect(patch).toContain('@@ -1,11 +1,6 @@');
-    expect(patch).toContain('@@ -2,6 +2,7 @@');
-    expect(patch).toContain('-struct DiffRegionLine {');
-    expect(patch).toContain('+#[derive(Clone, Copy)]');
+    expect(preview?.patch).toContain('diff --git');
+    expect(preview?.patch).toContain('-struct DiffRegionLine {');
+    expect(preview?.patch).toContain('+#[derive(Clone, Copy)]');
   });
 
   it('renders write_file as new file diff', () => {

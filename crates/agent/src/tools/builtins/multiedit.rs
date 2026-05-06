@@ -148,7 +148,7 @@ impl Tool for MultiEditTool {
         // sequential edits produce precise hunks instead of whole-file replacements.
         let file_output =
             edit_output::build_file_output_from_diff(&file_path, &original_content, &content);
-        let output_text = edit_output::format_output(&[file_output]);
+        let output_text = edit_output::format_compact_receipt(&[file_output]);
         Ok(vec![Content::text(output_text)])
     }
 }
@@ -201,7 +201,12 @@ mod tests {
             "expected compact output, got: {}",
             result
         );
-        assert!(result.contains("| hi world") || result.contains("| hello world"));
+        // Compact receipt: no diff lines
+        assert!(
+            !result.contains("| "),
+            "compact receipt should not contain diff lines, got: {}",
+            result
+        );
 
         let new_content = fs::read_to_string(&file_path).unwrap();
         assert!(new_content.contains("hi world"));

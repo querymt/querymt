@@ -1,14 +1,15 @@
 //!
-//! Output format:
+//! Compact receipt format for edit/multiedit results.
+//!
+//! Output format (no diff lines, no context):
 //! ```text
 //! OK paths=1 edits=1 added=1 deleted=1
 //! P src/file.rs
-//! H replace old=1,3 new=1,3
-//!  00001| context before
-//! -00002| old line
-//! +00002| new line
-//!  00003| context after
+//! H replace old=1,3 new=1,3 +1 -1
 //! ```
+//!
+//! The receipt confirms success and reports which files/lines changed, without
+//! echoing context the model already knows from its tool arguments.
 
 use std::ops::Range;
 use std::path::Path;
@@ -101,8 +102,12 @@ pub fn build_replace_hunk(
         .unwrap_or_else(empty_hunk)
 }
 
-/// Format one or more file edit results into the compact output string.
-pub fn format_output(results: &[FileEditOutput]) -> String {
+/// Format one or more file edit results into a compact receipt string (no diff lines).
+///
+/// The receipt tells the model the edit succeeded, which files were touched,
+/// and the line ranges affected — without echoing back context lines that the
+/// model already knows from its tool arguments.
+pub fn format_compact_receipt(results: &[FileEditOutput]) -> String {
     let total_paths = results.len();
     let total_edits = results.iter().map(|r| r.hunks.len()).sum::<usize>();
     let total_added = results
@@ -125,12 +130,15 @@ pub fn format_output(results: &[FileEditOutput]) -> String {
         lines.push(format!("P {}", result.path));
         for hunk in &result.hunks {
             lines.push(format!(
-                "H {} old={},{} new={},{}",
-                hunk.operation, hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count,
+                "H {} old={},{} new={},{} +{} -{}",
+                hunk.operation,
+                hunk.old_start,
+                hunk.old_count,
+                hunk.new_start,
+                hunk.new_count,
+                hunk.lines_inserted,
+                hunk.lines_deleted,
             ));
-            for dl in &hunk.lines {
-                lines.push(dl.render());
-            }
         }
     }
 
@@ -360,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_output() {
+    fn test_format_compact_receipt() {
         let original = "a\nb\nc\n";
         let new = "a\nb\nz\n";
         let output = FileEditOutput {
@@ -368,11 +376,13 @@ mod tests {
             hunks: vec![build_replace_hunk(original, new, 3, 1, 1)],
         };
 
-        let formatted = format_output(&[output]);
+        let formatted = format_compact_receipt(&[output]);
         assert!(formatted.starts_with("OK paths=1"));
         assert!(formatted.contains("P src/lib.rs"));
         assert!(formatted.contains("H replace"));
-        assert!(formatted.contains("| "));
+        assert!(formatted.contains("+1 -1"));
+        // Compact receipt should NOT contain diff lines
+        assert!(!formatted.contains("| "));
     }
 
     #[test]

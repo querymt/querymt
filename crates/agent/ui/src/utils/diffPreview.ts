@@ -10,27 +10,6 @@ export type DiffPreviewData = {
   filePath?: string;
 };
 
-/**
- * Regex to match compact output lines.
- * Format:  <prefix><5-digit-line-number>|<text>
- * Prefix is one of ' ', '-', '+'
- * Example: " 00001| context", "-00042| old line", "+00042| new line"
- */
-const LINE_NUM_RE = /^([ +\-])\d{5}\| /;
-
-type CompactHunk = {
-  oldStart: number;
-  oldCount: number;
-  newStart: number;
-  newCount: number;
-  lines: string[];
-};
-
-type CompactFilePatch = {
-  path: string;
-  hunks: CompactHunk[];
-};
-
 export function buildToolDiffPreview(
   toolKind: string | undefined,
   rawInput: unknown,
@@ -42,36 +21,30 @@ export function buildToolDiffPreview(
   const input = rawInput as Record<string, unknown>;
 
   if (normalized === 'edit' || normalized === 'multiedit') {
+    // Check for error in output first
     const rawOutput = typeof resultEvent?.toolCall?.raw_output === 'string'
       ? resultEvent.toolCall.raw_output
       : typeof resultEvent?.content === 'string'
         ? resultEvent.content
         : null;
 
-    if (!rawOutput) {
-      return { type: 'diff', patch: null, fallbackText: 'No compact edit diff payload available.' };
-    }
-
-    if (!rawOutput.startsWith('OK ')) {
+    if (rawOutput && !rawOutput.startsWith('OK ')) {
       return { type: 'diff', patch: null, fallbackText: rawOutput };
     }
 
-    const patch = buildPatchFromCompactOutput(rawOutput);
+    // Build diff from tool input (oldString / newString)
+    const patch = buildPatchFromEditInput(input);
     if (patch) {
       return {
         type: 'diff',
         patch,
         additions: countPatchAdditions(patch),
         deletions: countPatchDeletions(patch),
-        filePath: extractFirstCompactPath(rawOutput),
+        filePath: extractFilePath(input),
       };
     }
 
-    return {
-      type: 'diff',
-      patch: null,
-      fallbackText: rawOutput,
-    };
+    return { type: 'diff', patch: null, fallbackText: rawOutput || 'Edit diff unavailable.' };
   }
 
   if (normalized === 'write' || normalized === 'write_file') {
@@ -163,13 +136,6 @@ function extractPatchFilePath(input: Record<string, unknown>): string | undefine
   return match?.[1];
 }
 
-function extractFirstCompactPath(output: string): string | undefined {
-  for (const line of output.split('\n')) {
-    if (line.startsWith('P ')) return line.slice(2).trim();
-  }
-  return undefined;
-}
-
 function normalizePatchPath(path: string): string {
   return path.replace(/^\/+/, '') || 'file';
 }
@@ -183,128 +149,63 @@ function countPatchDeletions(patch: string): number {
 }
 
 /**
- * Parse compact line-numbered edit output into a unified diff patch.
- *
- * Format:
- *   OK paths=N edits=N added=N deleted=N
- *   P <path>
- *   H <op> old=<start>,<count> new=<start>,<count>
- *    00001|<context line>
- *   -00042|<old line>
- *   +00042|<new line>
+ * Build a unified diff patch from edit/multiedit tool input.
+ * Uses oldString/newString from the tool arguments.
  */
-function buildPatchFromCompactOutput(output: string): string | null {
-  const lines = output.split('\n');
-  const files: CompactFilePatch[] = [];
+function buildPatchFromEditInput(input: Record<string, unknown>): string | null {
+  const filePath = extractFilePath(input);
+  if (!filePath) return null;
+  const normalizedPath = normalizePatchPath(filePath);
 
-  let currentFile: CompactFilePatch | null = null;
-  let currentHunk: CompactHunk | null = null;
+  const edits: Array<{ oldString: string; newString: string }> = [];
 
-  function finalizeCurrentHunk() {
-    if (!currentFile || !currentHunk || currentHunk.lines.length === 0) return;
-    currentHunk.oldCount = currentHunk.lines.filter((line) => line.startsWith(' ') || line.startsWith('-')).length;
-    currentHunk.newCount = currentHunk.lines.filter((line) => line.startsWith(' ') || line.startsWith('+')).length;
-    currentFile.hunks.push(currentHunk);
-    currentHunk = null;
-  }
-
-  function finalizeCurrentFile() {
-    finalizeCurrentHunk();
-    if (!currentFile || currentFile.hunks.length === 0) return;
-    files.push(currentFile);
-    currentFile = null;
-  }
-
-  for (const line of lines) {
-    if (line.startsWith('P ')) {
-      finalizeCurrentFile();
-      currentFile = { path: line.slice(2).trim(), hunks: [] };
-      continue;
-    }
-
-    if (line.startsWith('H ')) {
-      finalizeCurrentHunk();
-      const match = line.match(/^H \S+ old=(\d+),(\d+) new=(\d+),(\d+)/);
-      if (!match) {
-        currentHunk = null;
-        continue;
-      }
-      currentHunk = {
-        oldStart: parseInt(match[1], 10),
-        oldCount: 0,
-        newStart: parseInt(match[3], 10),
-        newCount: 0,
-        lines: [],
-      };
-      continue;
-    }
-
-    if (line.startsWith(' ') || line.startsWith('-') || line.startsWith('+')) {
-      if (!currentHunk) continue;
-      currentHunk.lines.push(stripLineNumberFromDiffLine(line));
-    }
-  }
-
-  finalizeCurrentFile();
-
-  const patches: string[] = [];
-  for (const file of files) {
-    const normalizedPath = normalizePatchPath(file.path);
-    const groups = splitIntoRenderableGroups(file.hunks);
-    for (const hunks of groups) {
-      patches.push(`diff --git a/${normalizedPath} b/${normalizedPath}`);
-      patches.push(`--- a/${normalizedPath}`);
-      patches.push(`+++ b/${normalizedPath}`);
-      for (const hunk of hunks) {
-        patches.push(`@@ -${hunk.oldStart},${hunk.oldCount} +${hunk.newStart},${hunk.newCount} @@`);
-        patches.push(...hunk.lines);
+  // multiedit: { filePath, edits: [{ oldString, newString }] }
+  const editsArray = input.edits;
+  if (Array.isArray(editsArray)) {
+    for (const edit of editsArray) {
+      if (edit && typeof edit === 'object') {
+        const oldStr = String(edit.oldString ?? '');
+        const newStr = String(edit.newString ?? '');
+        edits.push({ oldString: oldStr, newString: newStr });
       }
     }
+  } else {
+    // edit: { filePath, oldString, newString }
+    const oldStr = String(input.oldString ?? '');
+    const newStr = String(input.newString ?? '');
+    if (!oldStr && !newStr) return null;
+    edits.push({ oldString: oldStr, newString: newStr });
   }
 
-  if (patches.length === 0) return null;
-  return patches.join('\n');
-}
+  if (edits.length === 0) return null;
 
-function splitIntoRenderableGroups(hunks: CompactHunk[]): CompactHunk[][] {
-  if (hunks.length === 0) return [];
-  const sorted = [...hunks].sort((left, right) => {
-    if (left.oldStart !== right.oldStart) return left.oldStart - right.oldStart;
-    return left.newStart - right.newStart;
-  });
+  const hunks: string[] = [];
+  let lineOffset = 0;
 
-  const groups: CompactHunk[][] = [];
-  let currentGroup: CompactHunk[] = [];
-  let previous: CompactHunk | null = null;
+  for (const { oldString, newString } of edits) {
+    const oldLines = oldString.split('\n');
+    const newLines = newString.split('\n');
+    const oldStart = lineOffset + 1;
+    const newStart = lineOffset + 1;
 
-  for (const hunk of sorted) {
-    if (!previous || hunksCanSharePatch(previous, hunk)) {
-      currentGroup.push(hunk);
-    } else {
-      groups.push(currentGroup);
-      currentGroup = [hunk];
-    }
-    previous = hunk;
+    const hunkLines: string[] = [];
+    for (const line of oldLines) hunkLines.push(`-${line}`);
+    for (const line of newLines) hunkLines.push(`+${line}`);
+
+    hunks.push(
+      `@@ -${oldStart},${oldLines.length} +${newStart},${newLines.length} @@`,
+      ...hunkLines,
+    );
+
+    lineOffset += Math.max(oldLines.length, newLines.length);
   }
 
-  if (currentGroup.length > 0) groups.push(currentGroup);
-  return groups;
+  return [
+    `diff --git a/${normalizedPath} b/${normalizedPath}`,
+    `--- a/${normalizedPath}`,
+    `+++ b/${normalizedPath}`,
+    ...hunks,
+  ].join('\n');
 }
 
-function hunksCanSharePatch(left: CompactHunk, right: CompactHunk): boolean {
-  const leftOldEnd = left.oldStart + Math.max(0, left.oldCount - 1);
-  const rightOldStart = right.oldStart;
-  const leftNewEnd = left.newStart + Math.max(0, left.newCount - 1);
-  const rightNewStart = right.newStart;
-  return rightOldStart > leftOldEnd && rightNewStart > leftNewEnd;
-}
 
-/**
- * Strip line-number prefix from a compact output line, keeping only the diff prefix and text.
- * " 00001| context" → " context"
- * "-00042| old" → "-old"
- * "+00042| new" → "+new"
- */
-function stripLineNumberFromDiffLine(line: string): string {
-  return line.replace(LINE_NUM_RE, '$1');
-}

@@ -529,7 +529,7 @@ impl Tool for EditTool {
                 name: self.name().to_string(),
                 description: "Performs exact string replacements in files. \n\n\
                     Usage:\n\
-                    - You must use your `read_tool` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file. \n\
+                    - You must inspect the exact current text before editing using `get_function`, `get_symbol`, or `read_tool`. This tool will error if you attempt an edit without reading the file. \n\
                     - When editing text from read_tool tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is '00001| ' (5 digits + pipe + space). Everything after '| ' is the actual file content to match. Never include any part of the line number prefix in the oldString or newString.\n\
                     - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n\
                     - Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.\n\
@@ -620,7 +620,7 @@ impl Tool for EditTool {
         // large context-matching replacements only mark lines that really changed.
         let file_output =
             edit_output::build_file_output_from_diff(&file_path, &content, &replacement.content);
-        let output_text = edit_output::format_output(&[file_output]);
+        let output_text = edit_output::format_compact_receipt(&[file_output]);
         Ok(vec![Content::text(output_text)])
     }
 }
@@ -744,14 +744,17 @@ mod tests {
             "unexpected output: {}",
             result
         );
+        // Compact receipt: no diff lines, just header info
         assert!(
-            result.contains(
-                "-00004| let outcome = scheduler_tick(now, &input, &in_flight, |_| None);"
-            )
+            result.contains("H replace"),
+            "expected hunk header, got: {}",
+            result
         );
-        assert!(result.contains(
-            "+00004| let outcome = scheduler_tick(now, &input, &in_flight, |fid| Some(fid));"
-        ));
+        assert!(
+            !result.contains("| "),
+            "compact receipt should not contain diff lines, got: {}",
+            result
+        );
     }
 
     #[test]
