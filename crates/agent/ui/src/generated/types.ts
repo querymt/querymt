@@ -53,6 +53,14 @@ export type AgentEventKind =
 	message: string;
 	message_id?: string;
 }}
+	/** Ephemeral signal emitted when a remote provider host reports liveness while waiting. */
+	| { type: "remote_provider_heartbeat", data: {
+	phase: string;
+	elapsed_ms: number;
+	idle_ms: number;
+	chunk_count: number;
+	message_id?: string;
+}}
 	/**
 	 * Ephemeral signal emitted when mid-stream transport error is detected.
 	 * Accumulated text is discarded and a new stream is being created.
