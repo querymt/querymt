@@ -218,33 +218,4 @@ describe('ToolSummary edit visualization', () => {
     expect(patchDiffSpy).not.toHaveBeenCalled();
   });
 
-  it('shows fallback text and skips PatchDiff for malformed apply_patch payloads', () => {
-    const event = {
-      id: 'tool-call-3',
-      type: 'tool_call',
-      content: 'apply_patch',
-      timestamp: Date.now(),
-      agentId: 'primary',
-      toolCall: {
-        tool_call_id: 'apply_patch:1',
-        kind: 'apply_patch',
-        status: 'completed',
-        raw_input: {
-          patch: 'this is not a unified diff',
-        },
-      },
-    } as EventItem;
-
-    render(
-      <ToolSummary
-        event={event}
-        onClick={vi.fn()}
-        isMobile={false}
-        selectedTheme="default-dark"
-      />,
-    );
-
-    expect(screen.getByText('Patch payload is malformed. Open details to inspect raw content.')).toBeInTheDocument();
-    expect(patchDiffSpy).not.toHaveBeenCalled();
-  });
 });

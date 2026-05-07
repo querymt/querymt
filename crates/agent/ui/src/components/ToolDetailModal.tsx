@@ -49,7 +49,6 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
   // Check for special tool types
   const normalizedToolKind = normalizeToolName(toolKind || toolName);
   const isEdit = normalizedToolKind === 'edit' || normalizedToolKind === 'multiedit';
-  const isPatch = normalizedToolKind === 'apply_patch';
   const isShell = normalizedToolKind === 'shell' || normalizedToolKind === 'bash';
   const isRead = normalizedToolKind === 'read' || normalizedToolKind === 'read_tool';
 
@@ -179,7 +178,7 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
                 onCopy={() => copyToClipboard(JSON.stringify(rawInput, null, 2), 'input')}
                 copied={copiedSection === 'input'}
               >
-                {(isEdit || isPatch) ? (
+                {isEdit ? (
                   <DiffView
                     toolKind={toolKind || toolName}
                     rawInput={rawInput}
@@ -332,7 +331,7 @@ function renderSafePatchDiff(
   );
 }
 
-// Diff viewer for edit/patch tools
+// Diff viewer for edit tools
 function DiffView({
   toolKind,
   rawInput,

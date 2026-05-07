@@ -19,7 +19,6 @@ pub mod language_query;
 pub mod ls;
 pub mod mdq;
 pub mod multiedit;
-pub mod patch_utils;
 pub mod question;
 pub mod read_shared;
 pub mod read_tool;

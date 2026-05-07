@@ -1,6 +1,7 @@
 use tree_sitter::{Node, Parser};
 
 use super::super::types::SymbolDigest;
+use super::safe_slice;
 use crate::index::symbol_index::{SymbolEntry, SymbolError, SymbolKind};
 
 pub fn extract(source: &str) -> Result<Vec<SymbolEntry>, SymbolError> {
@@ -474,12 +475,6 @@ fn is_test_module(node: &Node, source: &str) -> bool {
 
 fn node_text<'a>(node: &Node, source: &'a str) -> &'a str {
     safe_slice(source, node.start_byte(), node.end_byte())
-}
-
-fn safe_slice(source: &str, from: usize, to: usize) -> &str {
-    let from = source.floor_char_boundary(from.min(source.len()));
-    let to = source.ceil_char_boundary(to.min(source.len()));
-    &source[from..to]
 }
 
 fn find_child_by_kind<'a>(node: &'a Node<'a>, kind: &str) -> Option<Node<'a>> {

@@ -84,18 +84,8 @@ struct HunkRegion {
     changes: Vec<ChangeRange>,
 }
 
-/// Build hunks from original and new content, detecting the changed region.
-///
-/// The old/new span arguments are kept for backward compatibility with callers,
-/// but the rendered hunk is computed from an actual line diff so unchanged lines
-/// inside a matched replacement block are emitted as context instead of delete/insert.
-pub fn build_replace_hunk(
-    original: &str,
-    new: &str,
-    _old_start_line: usize,
-    _old_line_count: usize,
-    _new_line_count: usize,
-) -> HunkOutput {
+/// Build the first hunk from a diff of original vs new content.
+pub fn build_first_hunk(original: &str, new: &str) -> HunkOutput {
     build_hunks_from_diff(original, new)
         .into_iter()
         .next()
@@ -143,18 +133,6 @@ pub fn format_compact_receipt(results: &[FileEditOutput]) -> String {
     }
 
     lines.join("\n")
-}
-
-/// Build a single-file `FileEditOutput` by diffing original and new content.
-pub fn build_file_output(
-    path: &Path,
-    original: &str,
-    new: &str,
-    _old_start_line: usize,
-    _old_line_count: usize,
-    _new_line_count: usize,
-) -> FileEditOutput {
-    build_file_output_from_diff(path, original, new)
 }
 
 pub fn build_file_output_from_diff(path: &Path, original: &str, new: &str) -> FileEditOutput {
@@ -322,7 +300,7 @@ mod tests {
     fn test_replace_hunk_basic() {
         let original = "a\nb\nc\nd\ne\nf\ng\n";
         let new = "a\nb\nX\nY\nd\ne\nf\ng\n";
-        let hunk = build_replace_hunk(original, new, 3, 2, 2);
+        let hunk = build_first_hunk(original, new);
 
         assert_eq!(hunk.operation, "replace");
         assert_eq!(hunk.lines_deleted, 1);
@@ -343,7 +321,7 @@ mod tests {
     fn test_replace_hunk_context_lines() {
         let original = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\n";
         let new = "line1\nline2\nCHANGED\nline4\nline5\nline6\nline7\nline8\nline9\n";
-        let hunk = build_replace_hunk(original, new, 3, 1, 1);
+        let hunk = build_first_hunk(original, new);
 
         let context_before = hunk
             .lines
@@ -373,7 +351,7 @@ mod tests {
         let new = "a\nb\nz\n";
         let output = FileEditOutput {
             path: "src/lib.rs".to_string(),
-            hunks: vec![build_replace_hunk(original, new, 3, 1, 1)],
+            hunks: vec![build_first_hunk(original, new)],
         };
 
         let formatted = format_compact_receipt(&[output]);
@@ -389,7 +367,7 @@ mod tests {
     fn test_replace_hunk_line_numbers_coherent() {
         let original = "a\nb\nc\nd\ne\nf\ng\nh\ni\n";
         let new = "a\nb\nX\nY\nf\ng\nh\ni\n";
-        let hunk = build_replace_hunk(original, new, 3, 3, 2);
+        let hunk = build_first_hunk(original, new);
 
         let mut saw_insert = false;
         for dl in &hunk.lines {
@@ -409,7 +387,7 @@ mod tests {
     fn test_no_trailing_newline_in_original() {
         let original = "a\nb\nc";
         let new = "a\nb\nz";
-        let hunk = build_replace_hunk(original, new, 3, 1, 1);
+        let hunk = build_first_hunk(original, new);
         assert!(!hunk.lines.is_empty());
     }
 
@@ -417,7 +395,7 @@ mod tests {
     fn test_replace_at_start_of_file() {
         let original = "old first\nmiddle\nlast\n";
         let new = "new first\nmiddle\nlast\n";
-        let hunk = build_replace_hunk(original, new, 1, 1, 1);
+        let hunk = build_first_hunk(original, new);
         assert!(hunk.lines.iter().any(|l| l.text == "old first"));
         assert!(hunk.lines.iter().any(|l| l.text == "new first"));
     }
@@ -426,7 +404,7 @@ mod tests {
     fn test_replace_all_lines() {
         let original = "old1\nold2\nold3\n";
         let new = "new1\nnew2\nnew3\nnew4\n";
-        let hunk = build_replace_hunk(original, new, 1, 3, 4);
+        let hunk = build_first_hunk(original, new);
         assert_eq!(hunk.lines_deleted, 3);
         assert_eq!(hunk.lines_inserted, 4);
     }
@@ -458,7 +436,7 @@ mod tests {
         ]
         .join("\n");
 
-        let hunk = build_replace_hunk(&original, &new, 1, 9, 9);
+        let hunk = build_first_hunk(&original, &new);
         assert_eq!(hunk.lines_deleted, 1);
         assert_eq!(hunk.lines_inserted, 1);
         let context_lines = hunk

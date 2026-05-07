@@ -9,10 +9,10 @@ use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-use crate::index::symbol_index::{SymbolIndex, SymbolKindFilter};
+use crate::index::symbol_index::SymbolIndex;
 use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
 
-use super::helpers::resolve_root;
+use super::helpers::{parse_paths, resolve_root, resolve_target};
 
 pub struct FindSymbolReferencesTool;
 
@@ -111,7 +111,7 @@ impl Tool for FindSymbolReferencesTool {
         let mut matches: Vec<RefMatch> = Vec::new();
 
         for search_path in &search_paths {
-            let resolved = resolve_search_target(search_path, &root, context)?;
+            let resolved = resolve_target(search_path, &root, context)?;
             if resolved.is_file() {
                 self.search_file(
                     &resolved,
@@ -167,10 +167,15 @@ impl FindSymbolReferencesTool {
         };
 
         for symbol_name in symbols {
+            // Cache definition line numbers once per symbol to avoid
+            // re-traversing the symbol tree for every reference match.
+            let defs = symbol_index.find_by_name(symbol_name, None);
+            let def_lines: std::collections::HashSet<usize> =
+                defs.iter().map(|d| d.start_line).collect();
+
             // Definitions via SymbolIndex
             if find_type == "definition" || find_type == "both" {
-                let defs = symbol_index.find_by_name(symbol_name, SymbolKindFilter::Any);
-                for def in defs {
+                for def in &defs {
                     if matches.len() >= remaining {
                         return;
                     }
@@ -193,18 +198,15 @@ impl FindSymbolReferencesTool {
                         return;
                     }
                     if line.contains(symbol_name.as_str()) {
+                        let line_num = i + 1;
                         // Skip if this line is the definition itself
-                        let is_def_line = symbol_index
-                            .find_by_name(symbol_name, SymbolKindFilter::Any)
-                            .iter()
-                            .any(|d| d.start_line == i + 1);
-                        if is_def_line && find_type == "both" {
+                        if def_lines.contains(&line_num) && find_type == "both" {
                             continue; // Already reported as definition
                         }
                         matches.push(RefMatch {
                             path: path.to_path_buf(),
-                            line: i + 1,
-                            text: format!("{:05}| {}", i + 1, line),
+                            line: line_num,
+                            text: format!("{:05}| {}", line_num, line),
                             match_type: "reference".to_string(),
                             symbol_name: symbol_name.clone(),
                         });
@@ -259,36 +261,6 @@ impl FindSymbolReferencesTool {
             }
         }
     }
-}
-
-fn resolve_search_target(
-    path_str: &str,
-    root: &Path,
-    context: &dyn ToolContext,
-) -> Result<PathBuf, ToolError> {
-    let resolved = context.resolve_path(path_str)?;
-    Ok(if resolved.is_absolute() {
-        resolved
-    } else {
-        root.join(resolved)
-    })
-}
-
-fn parse_paths(args: &Value) -> Result<Vec<String>, ToolError> {
-    let paths = args
-        .get("paths")
-        .and_then(Value::as_array)
-        .ok_or_else(|| ToolError::InvalidRequest("paths must be an array".to_string()))?;
-    let result: Vec<String> = paths
-        .iter()
-        .filter_map(|v| v.as_str().map(str::to_string))
-        .collect();
-    if result.is_empty() {
-        return Err(ToolError::InvalidRequest(
-            "paths must include at least one path".to_string(),
-        ));
-    }
-    Ok(result)
 }
 
 fn parse_symbols(args: &Value) -> Result<Vec<String>, ToolError> {

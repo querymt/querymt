@@ -9,6 +9,14 @@ pub mod typescript;
 
 use super::{SymbolEntry, SymbolError};
 
+/// Safely slice `source` between byte offsets, snapping both boundaries to
+/// valid UTF-8 char boundaries. Shared by all language extractors.
+pub(crate) fn safe_slice(source: &str, from: usize, to: usize) -> &str {
+    let from = source.floor_char_boundary(from.min(source.len()));
+    let to = source.ceil_char_boundary(to.min(source.len()));
+    &source[from..to]
+}
+
 pub fn extract_symbols(source: &str, language: &str) -> Result<Vec<SymbolEntry>, SymbolError> {
     match language {
         "c" => c_family::extract_c(source),

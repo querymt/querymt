@@ -7,12 +7,11 @@ use async_trait::async_trait;
 use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
 use serde_json::{Value, json};
 use std::path::Path;
-use std::str::FromStr;
 
-use crate::index::symbol_index::{SymbolEntry, SymbolIndex, SymbolKind, SymbolKindFilter};
+use crate::index::symbol_index::{SymbolEntry, SymbolIndex, SymbolKind, parse_kind_filter};
 use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
 
-use super::helpers::resolve_root;
+use super::helpers::{resolve_root, resolve_target};
 
 pub struct GetSymbolTool;
 
@@ -32,7 +31,7 @@ impl Default for GetSymbolTool {
 struct SymbolRequest {
     path: String,
     symbol: String,
-    kind: SymbolKindFilter,
+    kind: Option<SymbolKind>,
     occurrence: usize,
 }
 
@@ -162,19 +161,6 @@ impl Tool for GetSymbolTool {
     }
 }
 
-fn resolve_target(
-    path_str: &str,
-    root: &Path,
-    context: &dyn ToolContext,
-) -> Result<std::path::PathBuf, ToolError> {
-    let resolved = context.resolve_path(path_str)?;
-    Ok(if resolved.is_absolute() {
-        resolved
-    } else {
-        root.join(resolved)
-    })
-}
-
 /// Parse explicit symbol read requests.
 fn parse_requests(args: &Value) -> Result<Vec<SymbolRequest>, ToolError> {
     let requests = args
@@ -198,7 +184,7 @@ fn parse_requests(args: &Value) -> Result<Vec<SymbolRequest>, ToolError> {
                 ToolError::InvalidRequest("each request requires a symbol".to_string())
             })?;
             let kind = r.get("kind").and_then(Value::as_str).unwrap_or("any");
-            let kind = SymbolKindFilter::from_str(kind).map_err(ToolError::InvalidRequest)?;
+            let kind = parse_kind_filter(kind).map_err(ToolError::InvalidRequest)?;
             let occurrence = r.get("occurrence").and_then(Value::as_u64).unwrap_or(0) as usize;
             Ok(SymbolRequest {
                 path: path.to_string(),
@@ -230,7 +216,7 @@ fn render_symbol_result(
     symbol_index: &SymbolIndex,
     matches: &[&SymbolEntry],
     symbol_name: &str,
-    kind: SymbolKindFilter,
+    kind: Option<SymbolKind>,
     occurrence: usize,
     context_lines: usize,
     context_mode: &str,
@@ -383,7 +369,7 @@ fn extract_relevant_context(
 fn render_missing_symbol(
     _path: &Path,
     symbol_name: &str,
-    kind: SymbolKindFilter,
+    kind: Option<SymbolKind>,
     symbol_index: &SymbolIndex,
 ) -> String {
     let mut candidates = all_symbols(&symbol_index.symbols)

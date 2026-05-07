@@ -125,11 +125,10 @@ export const ToolSummary = memo(function ToolSummary({
   // Inline preview state - auto-expand for edits/patches
   const normalized = normalizeToolName(toolKind || toolName);
   const isEdit = normalized === 'edit' || normalized === 'multiedit';
-  const isPatch = normalized === 'apply_patch';
   const isWrite = normalized === 'write' || normalized === 'write_file';
   const isShell = normalized === 'shell' || normalized === 'bash';
-  const hasInlinePreview = isEdit || isPatch || isWrite || isShell;
-  const [showPreview, setShowPreview] = useState(!isMobile && (isEdit || isPatch || isWrite)); // Auto-expand diffs (collapsed on mobile)
+  const hasInlinePreview = isEdit || isWrite || isShell;
+  const [showPreview, setShowPreview] = useState(!isMobile && (isEdit || isWrite)); // Auto-expand diffs (collapsed on mobile)
   const diffContainerClass = `event-diff-container${isMobile ? ' diff-mobile' : ''}`;
   const legacyDiffStats = summary.diffStats;
 
@@ -137,7 +136,7 @@ export const ToolSummary = memo(function ToolSummary({
   const previewData = useMemo(() => {
     if (!hasInlinePreview) return null;
 
-    if (isEdit || isPatch || isWrite) {
+    if (isEdit || isWrite) {
       return buildToolDiffPreview(toolKind || toolName, rawInput, event.mergedResult);
     }
 
@@ -146,7 +145,7 @@ export const ToolSummary = memo(function ToolSummary({
     }
 
     return null;
-  }, [hasInlinePreview, isEdit, isPatch, isWrite, isShell, toolKind, rawInput, event.mergedResult, hasMergedResult]);
+  }, [hasInlinePreview, isEdit, isWrite, isShell, toolKind, rawInput, event.mergedResult, hasMergedResult]);
 
   const diffStats = previewData?.type === 'diff' && (previewData.additions !== undefined || previewData.deletions !== undefined)
     ? {

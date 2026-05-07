@@ -73,67 +73,12 @@ export function buildToolDiffPreview(
     };
   }
 
-  if (normalized === 'apply_patch') {
-    const rawPatch = extractPatchString(input);
-    if (!rawPatch) {
-      return { type: 'diff', patch: null, fallbackText: 'No patch payload available.' };
-    }
-
-    if (!isLikelyRenderablePatch(rawPatch)) {
-      return { type: 'diff', patch: null, fallbackText: 'Patch payload is malformed. Open details to inspect raw content.' };
-    }
-
-    return {
-      type: 'diff',
-      patch: rawPatch,
-      additions: countPatchAdditions(rawPatch),
-      deletions: countPatchDeletions(rawPatch),
-      filePath: extractPatchFilePath(input),
-    };
-  }
-
   return null;
-}
-
-export function isLikelyRenderablePatch(patch: string): boolean {
-  const trimmed = patch.trim();
-  if (trimmed.length === 0) return false;
-  return /diff --git\s+.+\s+.+/.test(trimmed) && /@@\s+-\d/.test(trimmed);
-}
-
-function extractPatchString(input: Record<string, unknown>): string | null {
-  if (typeof input.patch === 'string') return input.patch;
-  const args = parseJsonMaybe(input.arguments);
-  if (typeof args?.patch === 'string') return args.patch;
-  return null;
-}
-
-function parseJsonMaybe(value: unknown): any | undefined {
-  if (typeof value === 'string') {
-    try {
-      return JSON.parse(value);
-    } catch {
-      return undefined;
-    }
-  }
-  if (typeof value === 'object' && value !== null) return value;
-  return undefined;
 }
 
 function extractFilePath(input: Record<string, unknown>): string | undefined {
   const path = input.filePath || input.file_path || input.path || input.file;
   return typeof path === 'string' ? path : undefined;
-}
-
-function extractPatchFilePath(input: Record<string, unknown>): string | undefined {
-  const direct = extractFilePath(input);
-  if (direct) return direct;
-
-  const patch = extractPatchString(input);
-  if (!patch) return undefined;
-
-  const match = patch.match(/^(?:---|\+\+\+)\s+[ab]\/([^\n\r]+)/m);
-  return match?.[1];
 }
 
 function normalizePatchPath(path: string): string {

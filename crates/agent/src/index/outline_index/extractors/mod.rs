@@ -1,8 +1,7 @@
 //! Language-specific outline extractors.
 //!
-//! Each sub-module implements extraction for a single language (or family).
-//! The public entry point is [`extract_outline`], which dispatches to the
-//! correct extractor based on the language name.
+//! Delegates to the shared [`SymbolIndex`] infrastructure and projects
+//! symbols into outline sections. The public entry point is [`extract_outline`].
 
 pub(crate) mod helpers;
 
@@ -17,36 +16,9 @@ pub fn extract_outline(
     language: &str,
     options: &IndexOptions,
 ) -> Result<Vec<Section>, OutlineError> {
-    match language {
-        "rust" => SymbolIndex::from_source(source, "rust")
-            .map(|index| symbols_to_sections(&index.symbols, options))
-            .map_err(symbol_error_to_outline),
-        "python" => SymbolIndex::from_source(source, "python")
-            .map(|index| symbols_to_sections(&index.symbols, options))
-            .map_err(symbol_error_to_outline),
-        "typescript" | "javascript" => SymbolIndex::from_source(source, language)
-            .map(|index| symbols_to_sections(&index.symbols, options))
-            .map_err(symbol_error_to_outline),
-        "go" => SymbolIndex::from_source(source, "go")
-            .map(|index| symbols_to_sections(&index.symbols, options))
-            .map_err(symbol_error_to_outline),
-        "java" => SymbolIndex::from_source(source, "java")
-            .map(|index| symbols_to_sections(&index.symbols, options))
-            .map_err(symbol_error_to_outline),
-        "c" => SymbolIndex::from_source(source, "c")
-            .map(|index| symbols_to_sections(&index.symbols, options))
-            .map_err(symbol_error_to_outline),
-        "cpp" => SymbolIndex::from_source(source, "cpp")
-            .map(|index| symbols_to_sections(&index.symbols, options))
-            .map_err(symbol_error_to_outline),
-        "csharp" => SymbolIndex::from_source(source, "csharp")
-            .map(|index| symbols_to_sections(&index.symbols, options))
-            .map_err(symbol_error_to_outline),
-        "ruby" => SymbolIndex::from_source(source, "ruby")
-            .map(|index| symbols_to_sections(&index.symbols, options))
-            .map_err(symbol_error_to_outline),
-        other => Err(OutlineError::UnsupportedLanguage(other.to_string())),
-    }
+    SymbolIndex::from_source(source, language)
+        .map(|index| symbols_to_sections(&index.symbols, options))
+        .map_err(symbol_error_to_outline)
 }
 
 fn symbol_error_to_outline(error: SymbolError) -> OutlineError {

@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::index::outline_index::common::get_language_for_extension;
 
-pub use types::{SymbolDigest, SymbolEntry, SymbolKind, SymbolKindFilter};
+pub use types::{SymbolDigest, SymbolEntry, SymbolKind, parse_kind_filter};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SymbolError {
@@ -47,7 +47,7 @@ impl SymbolIndex {
         })
     }
 
-    pub fn find_by_name(&self, name: &str, kind: SymbolKindFilter) -> Vec<&SymbolEntry> {
+    pub fn find_by_name(&self, name: &str, kind: Option<SymbolKind>) -> Vec<&SymbolEntry> {
         let mut matches = Vec::new();
         for symbol in &self.symbols {
             collect_name_matches(symbol, name, kind, &mut matches);
@@ -87,7 +87,7 @@ impl SymbolIndex {
 fn collect_name_matches<'a>(
     symbol: &'a SymbolEntry,
     name: &str,
-    kind: SymbolKindFilter,
+    kind: Option<SymbolKind>,
     matches: &mut Vec<&'a SymbolEntry>,
 ) {
     if symbol.kind.matches_filter(kind) && symbol.matches_name(name) {
@@ -165,20 +165,20 @@ pub fn run() {}
     fn rust_symbols_include_top_level_and_nested_methods() {
         let index = SymbolIndex::from_source(rust_source(), "rust").unwrap();
 
-        let config = index.find_by_name("Config", SymbolKindFilter::Struct);
+        let config = index.find_by_name("Config", Some(SymbolKind::Struct));
         assert_eq!(config.len(), 1);
         assert_eq!(config[0].kind, SymbolKind::Struct);
         assert_eq!(config[0].children[0].qualified_name, "Config::name");
 
-        let imports = index.find_by_name("use std::fmt", SymbolKindFilter::Import);
+        let imports = index.find_by_name("use std::fmt", Some(SymbolKind::Import));
         assert!(imports.is_empty());
 
-        let method = index.find_by_name("Config::new", SymbolKindFilter::Method);
+        let method = index.find_by_name("Config::new", Some(SymbolKind::Method));
         assert_eq!(method.len(), 1);
         assert_eq!(method[0].name, "new");
         assert_eq!(method[0].parent.as_deref(), Some("Config"));
 
-        let run = index.find_by_name("run", SymbolKindFilter::Function);
+        let run = index.find_by_name("run", Some(SymbolKind::Function));
         assert_eq!(run.len(), 1);
         assert_eq!(run[0].signature, "pub fn run()");
     }
@@ -186,7 +186,7 @@ pub fn run() {}
     #[test]
     fn rust_symbols_have_ranges_and_digests() {
         let index = SymbolIndex::from_source(rust_source(), "rust").unwrap();
-        let run = index.find_by_name("run", SymbolKindFilter::Function)[0];
+        let run = index.find_by_name("run", Some(SymbolKind::Function))[0];
 
         assert!(run.start_line <= run.end_line);
         assert!(run.start_byte < run.end_byte);
@@ -224,7 +224,7 @@ const DEFAULT_TIMEOUT = 5000;
 "#;
         let index = SymbolIndex::from_source(source, "typescript").unwrap();
 
-        let config = index.find_by_name("Config", SymbolKindFilter::Interface);
+        let config = index.find_by_name("Config", Some(SymbolKind::Interface));
         assert_eq!(config.len(), 1);
         assert!(
             config[0]
@@ -233,7 +233,7 @@ const DEFAULT_TIMEOUT = 5000;
                 .any(|child| child.name == "validate")
         );
 
-        let class = index.find_by_name("AppService", SymbolKindFilter::Class);
+        let class = index.find_by_name("AppService", Some(SymbolKind::Class));
         assert_eq!(class.len(), 1);
         assert!(
             class[0]
@@ -242,11 +242,11 @@ const DEFAULT_TIMEOUT = 5000;
                 .any(|child| child.qualified_name == "AppService::fetchData")
         );
 
-        let run = index.find_by_name("run", SymbolKindFilter::Function);
+        let run = index.find_by_name("run", Some(SymbolKind::Function));
         assert_eq!(run.len(), 1);
         assert!(run[0].signature.contains("export function run"));
 
-        let constant = index.find_by_name("DEFAULT_TIMEOUT", SymbolKindFilter::Const);
+        let constant = index.find_by_name("DEFAULT_TIMEOUT", Some(SymbolKind::Const));
         assert_eq!(constant.len(), 1);
     }
 
@@ -272,7 +272,7 @@ DEFAULT_TIMEOUT = 5000
 "#;
         let index = SymbolIndex::from_source(source, "python").unwrap();
 
-        let config = index.find_by_name("Config", SymbolKindFilter::Class);
+        let config = index.find_by_name("Config", Some(SymbolKind::Class));
         assert_eq!(config.len(), 1);
         assert!(
             config[0]
@@ -281,14 +281,14 @@ DEFAULT_TIMEOUT = 5000
                 .any(|child| child.qualified_name == "Config::validate")
         );
 
-        let main = index.find_by_name("main", SymbolKindFilter::Function);
+        let main = index.find_by_name("main", Some(SymbolKind::Function));
         assert_eq!(main.len(), 1);
         assert!(main[0].signature.contains("def main"));
 
-        let test = index.find_by_name("test_something", SymbolKindFilter::Test);
+        let test = index.find_by_name("test_something", Some(SymbolKind::Test));
         assert_eq!(test.len(), 1);
 
-        let constant = index.find_by_name("DEFAULT_TIMEOUT", SymbolKindFilter::Const);
+        let constant = index.find_by_name("DEFAULT_TIMEOUT", Some(SymbolKind::Const));
         assert_eq!(constant.len(), 1);
     }
 
@@ -321,13 +321,13 @@ enum Mode {
 "#;
         let index = SymbolIndex::from_source(source, "java").unwrap();
 
-        let package = index.find_by_name("package com.example", SymbolKindFilter::Import);
+        let package = index.find_by_name("package com.example", Some(SymbolKind::Import));
         assert_eq!(package.len(), 1);
 
-        let import = index.find_by_name("import java.util.List", SymbolKindFilter::Import);
+        let import = index.find_by_name("import java.util.List", Some(SymbolKind::Import));
         assert_eq!(import.len(), 1);
 
-        let class = index.find_by_name("Config", SymbolKindFilter::Class);
+        let class = index.find_by_name("Config", Some(SymbolKind::Class));
         assert_eq!(class.len(), 1);
         assert!(
             class[0]
@@ -342,7 +342,7 @@ enum Mode {
                 .any(|child| child.qualified_name == "Config::name")
         );
 
-        let interface = index.find_by_name("Validator", SymbolKindFilter::Interface);
+        let interface = index.find_by_name("Validator", Some(SymbolKind::Interface));
         assert_eq!(interface.len(), 1);
         assert!(
             interface[0]
@@ -351,7 +351,7 @@ enum Mode {
                 .any(|child| child.qualified_name == "Validator::validate")
         );
 
-        let mode = index.find_by_name("Mode", SymbolKindFilter::Enum);
+        let mode = index.find_by_name("Mode", Some(SymbolKind::Enum));
         assert_eq!(mode.len(), 1);
         assert!(
             mode[0]
@@ -394,7 +394,7 @@ func TestConfig(t *testing.T) {}
                 .any(|symbol| symbol.kind == SymbolKind::Import && symbol.signature.contains("fmt"))
         );
 
-        let config = index.find_by_name("Config", SymbolKindFilter::Struct);
+        let config = index.find_by_name("Config", Some(SymbolKind::Struct));
         assert_eq!(config.len(), 1);
         assert!(
             config[0]
@@ -403,13 +403,13 @@ func TestConfig(t *testing.T) {}
                 .any(|child| child.qualified_name.contains("Config::"))
         );
 
-        let runner = index.find_by_name("Runner", SymbolKindFilter::Interface);
+        let runner = index.find_by_name("Runner", Some(SymbolKind::Interface));
         assert_eq!(runner.len(), 1);
 
-        let new_config = index.find_by_name("NewConfig", SymbolKindFilter::Function);
+        let new_config = index.find_by_name("NewConfig", Some(SymbolKind::Function));
         assert_eq!(new_config.len(), 1);
 
-        let test = index.find_by_name("TestConfig", SymbolKindFilter::Test);
+        let test = index.find_by_name("TestConfig", Some(SymbolKind::Test));
         assert_eq!(test.len(), 1);
     }
 
@@ -431,13 +431,13 @@ void run(void) {}
 "#;
         let c_index = SymbolIndex::from_source(c_source, "c").unwrap();
 
-        let include = c_index.find_by_name("#include <stdio.h>", SymbolKindFilter::Import);
+        let include = c_index.find_by_name("#include <stdio.h>", Some(SymbolKind::Import));
         assert_eq!(include.len(), 1);
 
-        let config = c_index.find_by_name("Config", SymbolKindFilter::Struct);
+        let config = c_index.find_by_name("Config", Some(SymbolKind::Struct));
         assert_eq!(config.len(), 1);
 
-        let status = c_index.find_by_name("Status", SymbolKindFilter::Enum);
+        let status = c_index.find_by_name("Status", Some(SymbolKind::Enum));
         assert_eq!(status.len(), 1);
 
         assert!(
@@ -456,7 +456,7 @@ public:
 "#;
         let cpp_index = SymbolIndex::from_source(cpp_source, "cpp").unwrap();
 
-        let class_box = cpp_index.find_by_name("Box", SymbolKindFilter::Class);
+        let class_box = cpp_index.find_by_name("Box", Some(SymbolKind::Class));
         assert_eq!(class_box.len(), 1);
         assert!(!class_box[0].children.is_empty());
     }
@@ -478,16 +478,16 @@ namespace MyApp {
 "#;
         let index = SymbolIndex::from_source(source, "csharp").unwrap();
 
-        let using_directive = index.find_by_name("using System", SymbolKindFilter::Import);
+        let using_directive = index.find_by_name("using System", Some(SymbolKind::Import));
         assert_eq!(using_directive.len(), 1);
 
-        let ns = index.find_by_name("MyApp", SymbolKindFilter::Module);
+        let ns = index.find_by_name("MyApp", Some(SymbolKind::Module));
         assert_eq!(ns.len(), 1);
 
-        let class_config = index.find_by_name("Config", SymbolKindFilter::Class);
+        let class_config = index.find_by_name("Config", Some(SymbolKind::Class));
         assert_eq!(class_config.len(), 1);
 
-        let interface = index.find_by_name("IValidator", SymbolKindFilter::Interface);
+        let interface = index.find_by_name("IValidator", Some(SymbolKind::Interface));
         assert_eq!(interface.len(), 1);
     }
 
@@ -512,16 +512,16 @@ end
 "#;
         let index = SymbolIndex::from_source(source, "ruby").unwrap();
 
-        let requires = index.find_by_name("require 'json'", SymbolKindFilter::Import);
+        let requires = index.find_by_name("require 'json'", Some(SymbolKind::Import));
         assert_eq!(requires.len(), 1);
 
-        let class_config = index.find_by_name("Config", SymbolKindFilter::Class);
+        let class_config = index.find_by_name("Config", Some(SymbolKind::Class));
         assert_eq!(class_config.len(), 1);
 
-        let run = index.find_by_name("run", SymbolKindFilter::Function);
+        let run = index.find_by_name("run", Some(SymbolKind::Function));
         assert_eq!(run.len(), 1);
 
-        let test = index.find_by_name("test_happy_path", SymbolKindFilter::Test);
+        let test = index.find_by_name("test_happy_path", Some(SymbolKind::Test));
         assert_eq!(test.len(), 1);
     }
 }

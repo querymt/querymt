@@ -12,7 +12,7 @@ use crate::session::domain::ForkOrigin;
 use agent_client_protocol::schema::{
     Content, ContentBlock, ContentChunk, Error, Plan, PlanEntry, PlanEntryPriority,
     PlanEntryStatus, RequestPermissionOutcome, SessionUpdate, TextContent, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol_schema::AGENT_METHOD_NAMES;
 use serde::{Deserialize, Serialize};
@@ -218,16 +218,7 @@ fn todo_status_to_plan_status(status: &str) -> Option<PlanEntryStatus> {
 }
 
 /// Map tool names to ToolKind enum.
-pub fn tool_kind_for_tool(name: &str) -> ToolKind {
-    match name {
-        "search_text" => ToolKind::Search,
-        "write_file" | "edit" | "multiedit" => ToolKind::Edit,
-        "delete_file" => ToolKind::Delete,
-        "shell" => ToolKind::Execute,
-        "web_fetch" | "browse" => ToolKind::Fetch,
-        _ => ToolKind::Other,
-    }
-}
+pub use crate::agent::utils::tool_kind_for_tool;
 
 /// Check if an event belongs to a specific connection.
 ///

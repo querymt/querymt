@@ -64,60 +64,14 @@ impl SymbolKind {
         }
     }
 
-    pub fn matches_filter(self, filter: SymbolKindFilter) -> bool {
-        filter == SymbolKindFilter::Any || SymbolKindFilter::from(self) == filter
+    /// Returns true if this kind matches the optional filter.
+    /// `None` means "any" and always matches.
+    pub fn matches_filter(self, filter: Option<SymbolKind>) -> bool {
+        filter.is_none_or(|f| f == self)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SymbolKindFilter {
-    Import,
-    Function,
-    Method,
-    Class,
-    Struct,
-    Enum,
-    Trait,
-    Impl,
-    TypeAlias,
-    Const,
-    Static,
-    Field,
-    Interface,
-    EnumVariant,
-    Module,
-    Macro,
-    Test,
-    Unknown,
-    Any,
-}
-
-impl From<SymbolKind> for SymbolKindFilter {
-    fn from(kind: SymbolKind) -> Self {
-        match kind {
-            SymbolKind::Import => Self::Import,
-            SymbolKind::Function => Self::Function,
-            SymbolKind::Method => Self::Method,
-            SymbolKind::Class => Self::Class,
-            SymbolKind::Struct => Self::Struct,
-            SymbolKind::Enum => Self::Enum,
-            SymbolKind::Trait => Self::Trait,
-            SymbolKind::Impl => Self::Impl,
-            SymbolKind::TypeAlias => Self::TypeAlias,
-            SymbolKind::Const => Self::Const,
-            SymbolKind::Static => Self::Static,
-            SymbolKind::Field => Self::Field,
-            SymbolKind::Interface => Self::Interface,
-            SymbolKind::EnumVariant => Self::EnumVariant,
-            SymbolKind::Module => Self::Module,
-            SymbolKind::Macro => Self::Macro,
-            SymbolKind::Test => Self::Test,
-            SymbolKind::Unknown => Self::Unknown,
-        }
-    }
-}
-
-impl std::str::FromStr for SymbolKindFilter {
+impl std::str::FromStr for SymbolKind {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -140,9 +94,16 @@ impl std::str::FromStr for SymbolKindFilter {
             "macro" => Ok(Self::Macro),
             "test" => Ok(Self::Test),
             "unknown" => Ok(Self::Unknown),
-            "any" | "*" => Ok(Self::Any),
-            other => Err(format!("Unsupported symbol kind filter: {other}")),
+            other => Err(format!("Unsupported symbol kind: {other}")),
         }
+    }
+}
+
+/// Parse a kind filter string, returning `None` for "any"/"*".
+pub fn parse_kind_filter(value: &str) -> Result<Option<SymbolKind>, String> {
+    match value {
+        "any" | "*" => Ok(None),
+        _ => value.parse().map(Some),
     }
 }
 

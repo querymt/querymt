@@ -9,12 +9,11 @@ use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
-use crate::index::symbol_index::{SymbolDigest, SymbolIndex, SymbolKindFilter};
+use crate::index::symbol_index::{SymbolDigest, SymbolIndex, SymbolKind, parse_kind_filter};
 use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
 
-use super::helpers::resolve_root;
+use super::helpers::{resolve_root, resolve_target};
 
 pub struct ReplaceSymbolTool;
 
@@ -35,7 +34,7 @@ impl Default for ReplaceSymbolTool {
 struct ReplacementRequest {
     path: String,
     symbol: String,
-    kind: SymbolKindFilter,
+    kind: Option<SymbolKind>,
     occurrence: usize,
     expected_hash: Option<String>,
     new_text: String,
@@ -243,19 +242,6 @@ impl Tool for ReplaceSymbolTool {
     }
 }
 
-fn resolve_target(
-    path_str: &str,
-    root: &Path,
-    context: &dyn ToolContext,
-) -> Result<PathBuf, ToolError> {
-    let resolved = context.resolve_path(path_str)?;
-    Ok(if resolved.is_absolute() {
-        resolved
-    } else {
-        root.join(resolved)
-    })
-}
-
 fn parse_replacements(args: &Value) -> Result<Vec<ReplacementRequest>, ToolError> {
     let arr = args
         .get("replacements")
@@ -277,7 +263,7 @@ fn parse_replacements(args: &Value) -> Result<Vec<ReplacementRequest>, ToolError
                 ToolError::InvalidRequest("each replacement requires a symbol".to_string())
             })?;
             let kind_str = r.get("kind").and_then(Value::as_str).unwrap_or("any");
-            let kind = SymbolKindFilter::from_str(kind_str).map_err(ToolError::InvalidRequest)?;
+            let kind = parse_kind_filter(kind_str).map_err(ToolError::InvalidRequest)?;
             let occurrence = r.get("occurrence").and_then(Value::as_u64).unwrap_or(0) as usize;
             let expected_hash = r
                 .get("expectedHash")

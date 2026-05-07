@@ -5,12 +5,12 @@
 use async_trait::async_trait;
 use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::index::symbol_index::{SymbolEntry, SymbolIndex, SymbolKind, SymbolKindFilter};
+use crate::index::symbol_index::{SymbolEntry, SymbolIndex, SymbolKind};
 use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
 
-use super::helpers::resolve_root;
+use super::helpers::{parse_paths, resolve_root, resolve_target};
 
 pub struct GetFunctionTool;
 
@@ -117,39 +117,6 @@ impl Tool for GetFunctionTool {
     }
 }
 
-fn resolve_target(
-    path_str: &str,
-    root: &Path,
-    context: &dyn ToolContext,
-) -> Result<PathBuf, ToolError> {
-    let resolved = context.resolve_path(path_str)?;
-    Ok(if resolved.is_absolute() {
-        resolved
-    } else {
-        root.join(resolved)
-    })
-}
-
-fn parse_paths(args: &Value) -> Result<Vec<String>, ToolError> {
-    let paths = args
-        .get("paths")
-        .and_then(Value::as_array)
-        .ok_or_else(|| ToolError::InvalidRequest("paths must be an array".to_string()))?;
-
-    let parsed: Vec<String> = paths
-        .iter()
-        .filter_map(|v| v.as_str().map(str::to_string))
-        .collect();
-
-    if parsed.is_empty() {
-        return Err(ToolError::InvalidRequest(
-            "paths must include at least one file path".to_string(),
-        ));
-    }
-
-    Ok(parsed)
-}
-
 fn parse_names(args: &Value) -> Result<Vec<String>, ToolError> {
     let names = args
         .get("names")
@@ -178,7 +145,7 @@ fn render_function_result(
     context_lines: usize,
 ) -> String {
     let matches = symbol_index
-        .find_by_name(name, SymbolKindFilter::Any)
+        .find_by_name(name, None)
         .into_iter()
         .filter(|symbol| matches_function_kind(symbol.kind))
         .collect::<Vec<_>>();

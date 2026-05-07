@@ -17,7 +17,7 @@ pub use function_index::{
     FunctionIndex, FunctionIndexConfig, IndexedFunctionEntry, SimilarFunctionMatch,
 };
 pub use merkle::DiffPaths;
-pub use symbol_index::{SymbolEntry, SymbolError, SymbolIndex, SymbolKind, SymbolKindFilter};
+pub use symbol_index::{SymbolEntry, SymbolError, SymbolIndex, SymbolKind, parse_kind_filter};
 pub use workspace_actor::{
     WorkspaceHandle, WorkspaceIndexActor, WorkspaceIndexError, WorkspaceIndexStats,
 };

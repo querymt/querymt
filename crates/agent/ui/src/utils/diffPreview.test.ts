@@ -111,31 +111,6 @@ describe('buildToolDiffPreview', () => {
     expect(preview?.patch).toContain('+line 2');
   });
 
-  it('renders apply_patch with valid unified diff', () => {
-    const patch = 'diff --git a/file.ts b/file.ts\n--- a/file.ts\n+++ b/file.ts\n@@ -1,1 +1,1 @@\n-old\n+new';
-    const preview = buildToolDiffPreview(
-      'apply_patch',
-      { patch },
-      undefined,
-    );
-
-    expect(preview?.type).toBe('diff');
-    expect(preview?.patch).toContain('-old');
-    expect(preview?.patch).toContain('+new');
-  });
-
-  it('returns fallback for malformed apply_patch', () => {
-    const preview = buildToolDiffPreview(
-      'apply_patch',
-      { patch: 'not a diff' },
-      undefined,
-    );
-
-    expect(preview?.type).toBe('diff');
-    expect(preview?.patch).toBeNull();
-    expect(preview?.fallbackText).toContain('malformed');
-  });
-
   it('returns null for unknown tool kinds', () => {
     const preview = buildToolDiffPreview(
       'shell',
