@@ -3,9 +3,23 @@
 //! The FFI layer exposes callbacks that fire from Rust's event system and log
 //! framework. Callbacks must be non-blocking from Rust's perspective; native
 //! layers should dispatch heavy work to their own queues.
+//!
+//! ## Telemetry
+//!
+//! When `MobileTelemetryConfig::enabled` is true, the FFI layer initializes
+//! `querymt_utils::telemetry::setup_telemetry` which installs a
+//! `tracing_subscriber` with OTLP export (traces + logs over gRPC) and a
+//! console layer. A custom `FfiCallbackLayer` forwards all `tracing` events
+//! to the native log callback (Swift/Android JNI) as well, so logs reach
+//! both OTLP *and* the app UI.
+//!
+//! When telemetry is disabled, only the FFI callback logger is installed
+//! (using the simpler `log` crate path).
 
-use crate::types::FfiErrorCode;
+use crate::types::{FfiErrorCode, MobileTelemetryConfig};
 use std::sync::Mutex;
+use tracing_subscriber::layer::Context;
+use tracing_subscriber::prelude::*;
 
 // ─── Callback Function Pointer Types ────────────────────────────────────────
 
@@ -92,7 +106,7 @@ pub fn set_log_handler(
 }
 
 /// Invoke the global log handler if one is registered.
-pub fn invoke_log_handler(level: log::Level, message: &str) {
+fn invoke_log_handler(level: log::Level, message: &str) {
     let state = GLOBAL_LOG_HANDLER.lock().unwrap();
     if let Some(ref state) = *state {
         let c_message = std::ffi::CString::new(message).unwrap_or_default();
@@ -109,7 +123,60 @@ pub fn invoke_log_handler(level: log::Level, message: &str) {
     }
 }
 
-/// Log callback for the `log` crate. Registered via `log::set_boxed_logger`.
+// ─── Tracing Layer for FFI Callback ─────────────────────────────────────────
+
+/// A `tracing_subscriber::Layer` that forwards every event to the FFI log
+/// callback registered via `set_log_handler`. This works whether or not OTLP
+/// telemetry is active.
+struct FfiCallbackLayer;
+
+impl<S> tracing_subscriber::Layer<S> for FfiCallbackLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        // Convert the tracing event to a string and forward to FFI callback.
+        let mut visitor = FfiEventVisitor(String::new());
+        event.record(&mut visitor);
+
+        let level = match *event.metadata().level() {
+            tracing::Level::ERROR => log::Level::Error,
+            tracing::Level::WARN => log::Level::Warn,
+            tracing::Level::INFO => log::Level::Info,
+            tracing::Level::DEBUG => log::Level::Debug,
+            tracing::Level::TRACE => log::Level::Trace,
+        };
+        invoke_log_handler(level, &visitor.0);
+    }
+}
+
+/// Simple visitor that concatenates the event message + fields.
+struct FfiEventVisitor(String);
+
+impl tracing::field::Visit for FfiEventVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{:?}", value);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(&mut self.0, " {}={:?}", field.name(), value);
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0 = value.to_string();
+        } else {
+            use std::fmt::Write;
+            let _ = write!(&mut self.0, " {}={}", field.name(), value);
+        }
+    }
+}
+
+// ─── Fallback: log-crate-only logger (no telemetry) ─────────────────────────
+
+/// Log callback for the `log` crate. Registered via `log::set_boxed_logger`
+/// when telemetry is disabled.
 struct FfiLogger;
 
 impl log::Log for FfiLogger {
@@ -125,11 +192,32 @@ impl log::Log for FfiLogger {
     fn flush(&self) {}
 }
 
+// ─── Initialization ─────────────────────────────────────────────────────────
+
 static LOGGER_INITIALIZED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Initialize the FFI log logger (call once at startup).
-pub fn ensure_logger() {
+/// The OTLP endpoint that was configured (if telemetry is enabled).
+/// Stored so mesh_status can report it.
+static ACTIVE_OTLP_ENDPOINT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Return the active OTLP endpoint, if telemetry was enabled.
+pub fn active_otlp_endpoint() -> Option<String> {
+    ACTIVE_OTLP_ENDPOINT.lock().unwrap().clone()
+}
+
+/// Initialize the logging/telemetry subsystem.
+///
+/// When `config.enabled` is true, sets up a full `tracing_subscriber` with:
+/// - OTLP traces + logs export via gRPC
+/// - Console (fmt) layer for stderr
+/// - FFI callback layer forwarding to native log handler
+///
+/// When telemetry is disabled, falls back to a simple `log`-crate logger
+/// that only forwards to the FFI callback.
+///
+/// This function is idempotent; subsequent calls are no-ops.
+pub fn setup_mobile_telemetry(config: &MobileTelemetryConfig) {
     if LOGGER_INITIALIZED
         .compare_exchange(
             false,
@@ -137,11 +225,111 @@ pub fn ensure_logger() {
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::SeqCst,
         )
-        .is_ok()
+        .is_err()
     {
-        // Use the lowest level so we see everything; the callback can filter.
-        log::set_max_level(log::LevelFilter::Debug);
-        // Ignore errors if a logger was already set.
-        let _ = log::set_boxed_logger(Box::new(FfiLogger));
+        // Already initialized.
+        return;
     }
+
+    if config.enabled {
+        init_telemetry(config);
+    } else {
+        init_fallback_logger();
+    }
+}
+
+/// Full telemetry init: tracing subscriber with OTLP + FFI callback layers.
+fn init_telemetry(_config: &MobileTelemetryConfig) {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+    use tracing_opentelemetry::OpenTelemetryLayer;
+    use tracing_subscriber::EnvFilter;
+
+    // Resolve endpoint: env var → querymt-utils default.
+    let default_endpoint = querymt_utils::telemetry::default_otlp_endpoint();
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .unwrap_or_else(|_| default_endpoint.to_string());
+
+    // Store for mesh_status diagnostics.
+    {
+        let mut active = ACTIVE_OTLP_ENDPOINT.lock().unwrap();
+        *active = Some(endpoint.clone());
+    }
+
+    // Bridge log -> tracing so log::info! etc. also flow through.
+    let _ = tracing_log::LogTracer::init();
+
+    // Console filter
+    let console_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("error"));
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .with_filter(console_filter);
+
+    // OTLP telemetry filter — read QMT_TELEMETRY_LEVEL, default info.
+    let telemetry_level = std::env::var("QMT_TELEMETRY_LEVEL").unwrap_or_else(|_| "info".into());
+    let trace_filter = EnvFilter::new(&telemetry_level);
+    let log_filter = EnvFilter::new(&telemetry_level);
+
+    // FFI callback filter — forward info+ to native side.
+    let ffi_filter = EnvFilter::new("info");
+
+    // Build OTLP providers using querymt-utils helpers.
+    let tracer_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        querymt_utils::telemetry::init_tracer_provider(
+            "querymt-mobile",
+            env!("CARGO_PKG_VERSION"),
+            &endpoint,
+        )
+    }));
+    let logger_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        querymt_utils::telemetry::init_logger_provider(
+            "querymt-mobile",
+            env!("CARGO_PKG_VERSION"),
+            &endpoint,
+        )
+    }));
+
+    match (tracer_result, logger_result) {
+        (Ok(tracer_provider), Ok(logger_provider)) => {
+            let tracer = tracer_provider.tracer("qmt-mobile-tracer");
+
+            let subscriber = tracing_subscriber::Registry::default()
+                .with(fmt_layer)
+                .with(OpenTelemetryLayer::new(tracer).with_filter(trace_filter))
+                .with(OpenTelemetryTracingBridge::new(&logger_provider).with_filter(log_filter))
+                .with(FfiCallbackLayer.with_filter(ffi_filter));
+
+            match tracing::subscriber::set_global_default(subscriber) {
+                Ok(()) => {
+                    log::info!("OTLP telemetry initialized, endpoint={}", endpoint);
+                }
+                Err(e) => {
+                    log::warn!("Failed to set global subscriber: {e}; OTLP will not be active");
+                }
+            }
+        }
+        (tracer_err, logger_err) => {
+            if tracer_err.is_err() {
+                log::warn!("OTLP tracer provider init failed for endpoint {endpoint}");
+            }
+            if logger_err.is_err() {
+                log::warn!("OTLP logger provider init failed for endpoint {endpoint}");
+            }
+            init_fallback_logger();
+        }
+    }
+}
+
+/// Fallback: simple log-crate logger that only forwards to FFI callback.
+fn init_fallback_logger() {
+    log::set_max_level(log::LevelFilter::Debug);
+    let _ = log::set_boxed_logger(Box::new(FfiLogger));
+}
+
+/// Backwards-compatible entry point. Equivalent to
+/// `setup_mobile_telemetry(&MobileTelemetryConfig::default())`.
+pub fn ensure_logger() {
+    setup_mobile_telemetry(&MobileTelemetryConfig::default());
 }

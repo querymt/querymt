@@ -89,7 +89,7 @@ model = "claude-haiku-4-5-20251001"
 
 [mesh]
 enabled = true
-listen = "/ip4/0.0.0.0/tcp/9000"
+listen = "/ip4/0.0.0.0/tcp/0"
 discovery = "mdns"                    # or "none" with explicit peers
 
 # Specify a direct connection to your gpu instance

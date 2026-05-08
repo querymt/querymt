@@ -50,6 +50,17 @@ pub async fn spawn_and_register_local_mesh_actors(
     handle: &crate::agent::LocalAgentHandle,
     mesh: &crate::agent::remote::MeshHandle,
 ) -> LocalMeshActorRefs {
+    spawn_and_register_local_mesh_actors_with_name(handle, mesh, None).await
+}
+
+/// Like [`spawn_and_register_local_mesh_actors`] but overrides the node name
+/// advertised to mesh peers (useful on mobile where OS hostname is "unknown").
+#[cfg(feature = "remote")]
+pub async fn spawn_and_register_local_mesh_actors_with_name(
+    handle: &crate::agent::LocalAgentHandle,
+    mesh: &crate::agent::remote::MeshHandle,
+    node_name: Option<String>,
+) -> LocalMeshActorRefs {
     use crate::agent::remote::RemoteNodeManager;
     use crate::agent::remote::dht_name;
     use kameo::actor::Spawn;
@@ -59,6 +70,10 @@ pub async fn spawn_and_register_local_mesh_actors(
         handle.registry.clone(),
         Some(mesh.clone()),
     );
+    let node_manager = match node_name {
+        Some(name) => node_manager.with_node_name(name),
+        None => node_manager,
+    };
     let node_manager_ref = RemoteNodeManager::spawn(node_manager);
 
     mesh.register_actor(node_manager_ref.clone(), dht_name::NODE_MANAGER)

@@ -51,6 +51,15 @@ int32_t qmt_mobile_create_session(
     uint64_t *out_session
 );
 
+/// Create a new local session and return both the FFI handle and the real
+/// session ID.  out_session_id must be freed with qmt_mobile_free_string.
+int32_t qmt_mobile_create_session_with_id(
+    uint64_t agent_handle,
+    const char *options_json,
+    uint64_t *out_session,
+    char **out_session_id
+);
+
 /// Load an existing local session from persistent storage.
 int32_t qmt_mobile_load_session(
     uint64_t agent_handle,
@@ -90,6 +99,16 @@ int32_t qmt_mobile_create_session_on_node(
     const char *node_id,
     const char *options_json,
     uint64_t *out_session
+);
+
+/// Create a session on a specific node and return both the FFI handle and the
+/// real session ID.  out_session_id must be freed with qmt_mobile_free_string.
+int32_t qmt_mobile_create_session_on_node_with_id(
+    uint64_t agent_handle,
+    const char *node_id,
+    const char *options_json,
+    uint64_t *out_session,
+    char **out_session_id
 );
 
 /// List sessions available on a remote node.
@@ -184,6 +203,17 @@ int32_t qmt_mobile_set_session_model(
     const char *provider,
     const char *model,
     const char *node_id
+);
+
+/// Set a session config option (mode, reasoning effort, etc.).
+/// request_json: ACP SetSessionConfigOptionRequest JSON.
+/// out_json: receives the SetSessionConfigOptionResponse JSON.
+///            Must be freed with qmt_mobile_free_string.
+int32_t qmt_mobile_set_session_config_option(
+    uint64_t agent_handle,
+    uint64_t session_handle,
+    const char *request_json,
+    char **out_json
 );
 
 // ============================================================================

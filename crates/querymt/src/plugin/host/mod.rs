@@ -33,7 +33,9 @@ pub trait PluginLoader: Send + Sync {
     ) -> Result<Arc<dyn LLMProviderFactory>, LLMError>;
 }
 
+#[cfg(feature = "extism_host")]
 mod oci;
+#[cfg(feature = "extism_host")]
 pub use oci::{OciDownloadPhase, OciDownloadProgress, OciProgressCallback};
 
 #[cfg(feature = "native")]
@@ -42,6 +44,7 @@ pub mod native;
 pub struct PluginRegistry {
     loaders: HashMap<PluginType, Box<dyn PluginLoader>>,
     factories: RwLock<HashMap<String, Arc<dyn LLMProviderFactory>>>,
+    #[cfg(feature = "extism_host")]
     pub oci_downloader: Arc<oci::OciDownloader>,
     pub config: config::PluginConfig,
     pub cache_path: PathBuf,
@@ -80,6 +83,7 @@ impl PluginRegistry {
         Ok(PluginRegistry {
             loaders: HashMap::new(),
             factories: RwLock::new(HashMap::new()),
+            #[cfg(feature = "extism_host")]
             oci_downloader: Arc::new(oci::OciDownloader::new(config.oci.clone())),
             config,
             cache_path,
@@ -94,9 +98,11 @@ impl PluginRegistry {
         PluginRegistry {
             loaders: HashMap::new(),
             factories: RwLock::new(HashMap::new()),
+            #[cfg(feature = "extism_host")]
             oci_downloader: Arc::new(oci::OciDownloader::new(None)),
             config: config::PluginConfig {
                 providers: Vec::new(),
+                #[cfg(feature = "extism_host")]
                 oci: None,
             },
             cache_path: PathBuf::new(),
@@ -193,22 +199,32 @@ impl PluginRegistry {
         log::debug!("Processing plugin: {:?}", provider_cfg);
 
         let provider_plugin;
-        if provider_cfg.path.starts_with("oci") {
-            let image_reference = provider_cfg.path.strip_prefix("oci://").unwrap();
-            provider_plugin = self
-                .oci_downloader
-                .pull_and_extract(image_reference, None, &self.cache_path, false, None)
-                .await
-                .map_err(|e| {
-                    LLMError::PluginError(format!(
-                        "Failed to fetch OCI plugin for provider '{}' from '{}': {}",
-                        provider_cfg.name, provider_cfg.path, e
-                    ))
-                })?;
-            log::debug!(
-                "Discovered type '{:?}' via OCI annotation.",
-                provider_plugin.plugin_type
-            );
+        if provider_cfg.path.starts_with("oci://") {
+            #[cfg(feature = "extism_host")]
+            {
+                let image_reference = provider_cfg.path.strip_prefix("oci://").unwrap();
+                provider_plugin = self
+                    .oci_downloader
+                    .pull_and_extract(image_reference, None, &self.cache_path, false, None)
+                    .await
+                    .map_err(|e| {
+                        LLMError::PluginError(format!(
+                            "Failed to fetch OCI plugin for provider '{}' from '{}': {}",
+                            provider_cfg.name, provider_cfg.path, e
+                        ))
+                    })?;
+                log::debug!(
+                    "Discovered type '{:?}' via OCI annotation.",
+                    provider_plugin.plugin_type
+                );
+            }
+            #[cfg(not(feature = "extism_host"))]
+            {
+                return Err(LLMError::PluginError(format!(
+                    "OCI plugins require feature 'extism_host' for provider '{}'",
+                    provider_cfg.name
+                )));
+            }
         } else {
             let file_path = Path::new(&provider_cfg.path);
             if !file_path.exists() {
@@ -283,6 +299,7 @@ impl PluginRegistry {
     ///
     /// Returns a vec of `(provider_name, result)` pairs, one per OCI provider found
     /// in the registry configuration.
+    #[cfg(feature = "extism_host")]
     pub async fn update_oci_plugins(
         &self,
         progress: Option<OciProgressCallback>,

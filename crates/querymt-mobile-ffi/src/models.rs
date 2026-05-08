@@ -3,8 +3,9 @@
 use crate::ffi_helpers::{check_not_backgrounded, set_last_error};
 use crate::runtime::global_runtime;
 use crate::state;
-use crate::types::{FfiErrorCode, ModelInfo, ModelListResponse};
-use agent_client_protocol::schema::SetSessionModelRequest;
+use crate::types::FfiErrorCode;
+use agent_client_protocol::schema::{SetSessionConfigOptionRequest, SetSessionModelRequest};
+use querymt_agent::send_agent::SendAgent;
 use std::ffi::CStr;
 
 pub fn list_models_inner(
@@ -18,67 +19,23 @@ pub fn list_models_inner(
 
     let runtime = global_runtime();
     runtime.block_on(async {
-        let (registry, agent) = state::with_agent_read(agent_handle, |r| {
-            Ok((r.plugin_registry.clone(), r.agent.handle()))
-        })?;
+        let agent = state::with_agent_read(agent_handle, |r| Ok(r.agent.handle()))?;
 
-        let factories = registry.list();
-        let mut models = Vec::new();
-
-        for factory in &factories {
-            let provider_name = factory.name().to_string();
-            // Try to list models via the factory using the default (empty) config
-            match factory.list_models("{}").await {
-                Ok(model_ids) => {
-                    for model_id in model_ids {
-                        models.push(ModelInfo {
-                            provider: provider_name.clone(),
-                            model: model_id.clone(),
-                            display_name: format!("{} ({})", model_id, provider_name),
-                            node_id: None,
-                            is_local: true,
-                        });
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Failed to list models for provider '{}': {}",
-                        provider_name,
-                        e
-                    );
-                }
-            }
-        }
-
+        // Use the shared ModelRegistry — same path as the desktop UI.
+        // Returns Vec<ModelEntry> with id, label, source, provider, model,
+        // node_id, node_label, family, quant — all the fields the generated
+        // TS ModelEntry type expects.
         #[cfg(feature = "remote")]
-        {
-            if agent.mesh().is_some() {
-                let nodes = agent.list_remote_nodes().await;
-                for node in &nodes {
-                    let node_id_str = node.node_id.to_string();
-                    if let Ok(nm_ref) = agent.find_node_manager(&node_id_str).await {
-                        use querymt_agent::agent::remote::ListAvailableModels;
-                        let resp = nm_ref.ask(&ListAvailableModels).await;
-                        let available = match resp {
-                            Ok(models) => models,
-                            _ => continue,
-                        };
-                        for am in available {
-                            models.push(ModelInfo {
-                                provider: am.provider.clone(),
-                                model: am.model.clone(),
-                                display_name: format!("{} on {}", am.model, node_id_str),
-                                node_id: Some(node_id_str.clone()),
-                                is_local: false,
-                            });
-                        }
-                    }
-                }
-            }
-        }
+        let models = agent
+            .model_registry
+            .get_all_models(&agent.config, agent.mesh().as_ref())
+            .await;
 
-        let json =
-            serde_json::to_string(&ModelListResponse { models }).map_err(|e| serde_err(e))?;
+        #[cfg(not(feature = "remote"))]
+        let models = agent.model_registry.get_all_models(&agent.config).await;
+
+        let json = serde_json::to_string(&serde_json::json!({ "models": models }))
+            .map_err(|e| serde_err(e))?;
         unsafe {
             *out_json = alloc_cstr(&json);
         }
@@ -102,6 +59,12 @@ pub fn set_session_model_inner(
     let model_str = cstr_to_string(model)?;
     let node_id_str: Option<String> = ptr_to_opt_string(node_id);
 
+    // Combine into "provider/model" so parse_transport_model_id() in the
+    // session actor can split them correctly.  The desktop UI sends the
+    // same format; bare model names fall back to the session's current
+    // provider which is wrong for remote models.
+    let model_id = format!("{}/{}", provider_str, model_str);
+
     #[cfg(not(feature = "remote"))]
     if let Some(ref nid) = node_id_str {
         if !nid.is_empty() {
@@ -115,8 +78,8 @@ pub fn set_session_model_inner(
         let session_id =
             state::with_session(agent_handle, session_handle, |s| Ok(s.session_id.clone()))?;
 
-        // Model IDs are ACP-level identifiers; for now encode provider/model as `provider:model`.
-        let model_id = format!("{}:{}", provider_str, model_str);
+        // Use the combined "provider/model" identifier so the session actor
+        // resolves the correct provider — matching the desktop UI path.
         let req = SetSessionModelRequest::new(session_id.clone(), model_id);
 
         // Route through the session ref so remote sessions and provider_node_id work.
@@ -196,4 +159,48 @@ fn ptr_to_opt_string(ptr: *const std::ffi::c_char) -> Option<String> {
     } else {
         unsafe { CStr::from_ptr(ptr).to_str().ok().map(|s| s.to_string()) }
     }
+}
+
+// ─── Session Config Options ──────────────────────────────────────────────────
+
+pub fn set_session_config_option_inner(
+    agent_handle: u64,
+    session_handle: u64,
+    request_json: *const std::ffi::c_char,
+    out_json: *mut *mut std::ffi::c_char,
+) -> Result<(), FfiErrorCode> {
+    check_not_backgrounded()?;
+    if request_json.is_null() || out_json.is_null() {
+        return Err(invalid_arg("request_json or out_json is null"));
+    }
+
+    let req_str = cstr_to_string(request_json)?;
+    let req: SetSessionConfigOptionRequest = serde_json::from_str(&req_str).map_err(|e| {
+        set_last_error(
+            FfiErrorCode::InvalidArgument,
+            format!("Failed to parse SetSessionConfigOptionRequest: {e}"),
+        );
+        FfiErrorCode::InvalidArgument
+    })?;
+
+    let runtime = global_runtime();
+    runtime.block_on(async {
+        let agent = state::with_agent_read(agent_handle, |r| Ok(r.agent.handle()))?;
+        let _session_id =
+            state::with_session(agent_handle, session_handle, |s| Ok(s.session_id.clone()))?;
+
+        let response = agent.set_session_config_option(req).await.map_err(|e| {
+            set_last_error(
+                FfiErrorCode::RuntimeError,
+                format!("Set session config option failed: {e}"),
+            );
+            FfiErrorCode::RuntimeError
+        })?;
+
+        let json = serde_json::to_string(&response).map_err(|e| serde_err(e))?;
+        unsafe {
+            *out_json = alloc_cstr(&json);
+        }
+        Ok(())
+    })
 }

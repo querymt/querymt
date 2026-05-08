@@ -14,9 +14,11 @@ homepage = "https://query.mt"
 default = ["http-client", "mcp", "extism_host", "tracing"]
 http-client = ["reqwest", "tokio", "once_cell", "http-serde-ext"]
 reqwest-client = ["http-client"]
-native = ["libloading", "once_cell"]
+plugin_host = ["dirs", "toml", "serde_yaml"]
+model-registry = ["dirs", "reqwest-client"]
+native = ["plugin_host", "libloading", "once_cell"]
 mcp = ["rmcp", "toml", "tokio", "jsonschema", "reqwest"]
-extism_host = ["dep:extism", "docker_credential", "sigstore", "oci-client", "tar", "flate2", "sha2", "serde_yaml", "dirs", "hex", "reqwest-client", "tempfile"]
+extism_host = ["plugin_host", "dep:extism", "docker_credential", "sigstore", "oci-client", "tar", "flate2", "sha2", "serde_yaml", "dirs", "hex", "reqwest-client", "tempfile"]
 extism_plugin = ["http-serde-ext"]
 tracing = ["dep:tracing"]
 

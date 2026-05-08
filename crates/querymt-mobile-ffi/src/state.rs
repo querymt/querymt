@@ -43,6 +43,10 @@ pub struct AgentRecord {
     #[cfg(feature = "remote")]
     pub local_mesh_actors: Option<querymt_agent::agent::remote::LocalMeshActorRefs>,
 
+    /// Diagnostic: the listen/discovery config used at bootstrap.
+    pub mesh_listen: Option<String>,
+    pub mesh_discovery: Option<String>,
+
     /// Track active FFI calls for this agent.
     pub call_tracker: Arc<ActiveCallTracker>,
 
@@ -84,6 +88,8 @@ pub fn insert_agent(
             plugin_registry,
             #[cfg(feature = "remote")]
             local_mesh_actors: None,
+            mesh_listen: None,
+            mesh_discovery: None,
             call_tracker: Arc::new(ActiveCallTracker::new()),
             sessions: HashMap::new(),
             event_callbacks: None,

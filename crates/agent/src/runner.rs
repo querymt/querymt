@@ -253,7 +253,7 @@ impl From<AgentRunner> for Box<dyn ChatRunner> {
 /// ```toml
 /// [mesh]
 /// enabled = true
-/// listen = "/ip4/0.0.0.0/tcp/9000"
+/// listen = "/ip4/0.0.0.0/tcp/0"
 /// discovery = "mdns"
 ///
 /// [[remote_agents]]
@@ -301,47 +301,6 @@ pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner>
 
     match config {
         Config::Single(single_config) => {
-            // bootstrap mesh from config if enabled (remote feature only).
-            #[cfg(feature = "remote")]
-            if single_config.mesh.enabled {
-                use crate::agent::remote::remote_setup::setup_mesh_from_config;
-                use std::sync::Arc;
-
-                log::info!("mesh.enabled = true in config, bootstrapping mesh...");
-                match setup_mesh_from_config(
-                    &single_config.mesh,
-                    &single_config.remote_agents,
-                    None, // spawned below after AgentConfig is built
-                    None, // spawned below after AgentConfig is built
-                )
-                .await
-                {
-                    Ok(result) => {
-                        use crate::delegation::AgentRegistry as _;
-                        log::info!(
-                            "mesh bootstrapped, {} remote agent(s) registered",
-                            result.registry.list_agents().len()
-                        );
-                        let auto_fallback = single_config.mesh.auto_fallback;
-                        let agent = Agent::from_single_config_with_registry(
-                            single_config,
-                            Some(Arc::new(result.registry)),
-                            Some(result.mesh.clone()),
-                            auto_fallback,
-                        )
-                        .await?;
-                        // Now that we have an AgentConfig, spawn and register the
-                        // RemoteNodeManager and ProviderHostActor so remote peers can
-                        // discover this node in the DHT and create sessions here.
-                        spawn_and_register_mesh_actors(&agent.handle(), &result.mesh).await;
-                        return Ok(AgentRunner::new(agent));
-                    }
-                    Err(e) => {
-                        log::warn!("mesh bootstrap failed: {}; continuing without mesh", e);
-                    }
-                }
-            }
-
             let agent = Agent::from_single_config(single_config).await?;
             Ok(AgentRunner::new(agent))
         }
@@ -378,7 +337,11 @@ pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner>
                         // Now that we have an AgentConfig, spawn and register the
                         // RemoteNodeManager and ProviderHostActor so remote peers can
                         // discover this node in the DHT and create sessions here.
-                        spawn_and_register_mesh_actors(&agent.handle(), &result.mesh).await;
+                        let _ = crate::agent::remote::remote_setup::spawn_and_register_local_mesh_actors(
+                            &agent.handle(),
+                            &result.mesh,
+                        )
+                        .await;
                         return Ok(AgentRunner::new(agent));
                     }
                     Err(e) => {
@@ -391,19 +354,4 @@ pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner>
             Ok(AgentRunner::new(agent))
         }
     }
-}
-
-/// Spawn a `RemoteNodeManager` and a `ProviderHostActor` for this node and
-/// register them in the kameo DHT so remote peers can discover and use them.
-///
-/// This is called by `from_config` immediately after the agent/quorum is built,
-/// once an `AgentConfig` is available. It replicates the registration that
-/// `qmtcode --mesh` does manually, making mesh-enabled configs self-contained.
-#[cfg(feature = "remote")]
-async fn spawn_and_register_mesh_actors(
-    handle: &crate::agent::LocalAgentHandle,
-    mesh: &crate::agent::remote::MeshHandle,
-) {
-    let _ = crate::agent::remote::remote_setup::spawn_and_register_local_mesh_actors(handle, mesh)
-        .await;
 }
