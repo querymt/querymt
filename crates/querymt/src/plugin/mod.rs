@@ -8,7 +8,7 @@ pub mod http;
 pub use http::HTTPFactoryCtor;
 pub use http::HTTPLLMProviderFactory;
 
-#[cfg(any(feature = "extism_host", feature = "native"))]
+#[cfg(feature = "plugin_host")]
 pub mod host;
 
 #[cfg(any(feature = "extism_host", feature = "extism_plugin"))]

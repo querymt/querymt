@@ -94,6 +94,26 @@ pub fn create_session_on_node_inner(
     options_json: *const std::ffi::c_char,
     out_session: *mut u64,
 ) -> Result<(), FfiErrorCode> {
+    create_session_on_node_with_id_inner(
+        agent_handle,
+        node_id,
+        options_json,
+        out_session,
+        std::ptr::null_mut(),
+    )
+}
+
+/// Create a session on a specific node, optionally returning the real session ID.
+///
+/// When `out_session_id` is non-null, the caller must free the returned string
+/// with `qmt_mobile_free_string`.
+pub fn create_session_on_node_with_id_inner(
+    agent_handle: u64,
+    node_id: *const std::ffi::c_char,
+    options_json: *const std::ffi::c_char,
+    out_session: *mut u64,
+    out_session_id: *mut *mut std::ffi::c_char,
+) -> Result<(), FfiErrorCode> {
     check_not_backgrounded()?;
     if out_session.is_null() {
         return Err(invalid_arg("out_session is null"));
@@ -103,7 +123,12 @@ pub fn create_session_on_node_inner(
 
     // NULL/empty → local session
     if node_id_str.as_ref().map_or(true, |s| s.is_empty()) {
-        return crate::session::create_session_inner(agent_handle, options_json, out_session);
+        return crate::session::create_session_with_id_inner(
+            agent_handle,
+            options_json,
+            out_session,
+            out_session_id,
+        );
     }
 
     #[cfg(not(feature = "remote"))]
@@ -163,10 +188,18 @@ pub fn create_session_on_node_inner(
                 }
             }
 
-            let s_handle =
-                state::register_session(agent_handle, session_id, true, Some(node_id_val), None)?;
+            let s_handle = state::register_session(
+                agent_handle,
+                session_id.clone(),
+                true,
+                Some(node_id_val),
+                None,
+            )?;
             unsafe {
                 *out_session = s_handle;
+                if !out_session_id.is_null() {
+                    *out_session_id = alloc_cstr(&session_id);
+                }
             }
             Ok(())
         })
@@ -505,6 +538,11 @@ pub fn mesh_status_inner(
     runtime.block_on(async {
         let agent = state::with_agent_read(agent_handle, |r| Ok(r.agent.handle()))?;
 
+        // Read diagnostic config from the agent record.
+        let (mesh_listen, mesh_discovery) = state::with_agent(agent_handle, |r| {
+            Ok((r.mesh_listen.clone(), r.mesh_discovery.clone()))
+        })?;
+
         #[cfg(feature = "remote")]
         if let Some(mesh) = agent.mesh() {
             let known_peer_count = mesh.known_peer_ids().len();
@@ -521,6 +559,9 @@ pub fn mesh_status_inner(
                 known_peer_count,
                 has_invite_store: mesh.invite_store().is_some(),
                 has_membership_store: mesh.membership_store().is_some(),
+                listen: mesh_listen,
+                discovery: mesh_discovery,
+                telemetry_endpoint: crate::events::active_otlp_endpoint(),
             };
             let json = serde_json::to_string(&status).map_err(|e| serde_err(e))?;
             unsafe {
@@ -538,6 +579,9 @@ pub fn mesh_status_inner(
             known_peer_count: 0,
             has_invite_store: false,
             has_membership_store: false,
+            listen: mesh_listen,
+            discovery: mesh_discovery,
+            telemetry_endpoint: crate::events::active_otlp_endpoint(),
         };
         let json = serde_json::to_string(&status).map_err(|e| serde_err(e))?;
         unsafe {

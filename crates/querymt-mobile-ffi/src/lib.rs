@@ -50,9 +50,21 @@ pub unsafe extern "C" fn qmt_mobile_init_agent(
     config_json: *const std::ffi::c_char,
     out_agent: *mut u64,
 ) -> i32 {
-    events::ensure_logger();
+    // Parse config first so we can extract telemetry settings.
+    let config_result = agent::parse_config(config_json);
+    let config = match config_result {
+        Ok(c) => c,
+        Err(code) => return code as i32,
+    };
 
-    let result = agent::init_agent_inner(config_json, out_agent);
+    // Enter the Tokio runtime context so that telemetry init (hyper-util,
+    // gRPC) and agent startup can find a reactor on this thread.
+    let _rt_guard = runtime::global_runtime().enter();
+
+    // Initialize telemetry/logging based on config (idempotent).
+    events::setup_mobile_telemetry(&config.telemetry);
+
+    let result = agent::init_agent_from_config(config, out_agent);
     match result {
         Ok(()) => {
             ffi_helpers::clear_last_error();
@@ -101,6 +113,24 @@ pub unsafe extern "C" fn qmt_mobile_create_session(
     out_session: *mut u64,
 ) -> i32 {
     let result = session::create_session_inner(agent_handle, options_json, out_session);
+    ffi_result_code(result)
+}
+
+/// Create a new local session and return both the FFI handle and the real
+/// session ID string.  `out_session_id` must be freed with `qmt_mobile_free_string`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qmt_mobile_create_session_with_id(
+    agent_handle: u64,
+    options_json: *const std::ffi::c_char,
+    out_session: *mut u64,
+    out_session_id: *mut *mut std::ffi::c_char,
+) -> i32 {
+    let result = session::create_session_with_id_inner(
+        agent_handle,
+        options_json,
+        out_session,
+        out_session_id,
+    );
     ffi_result_code(result)
 }
 
@@ -159,6 +189,27 @@ pub unsafe extern "C" fn qmt_mobile_create_session_on_node(
 ) -> i32 {
     let result =
         mesh::create_session_on_node_inner(agent_handle, node_id, options_json, out_session);
+    ffi_result_code(result)
+}
+
+/// Create a session on a specific node and return both the FFI handle and the
+/// real session ID string.  `out_session_id` must be freed with
+/// `qmt_mobile_free_string`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qmt_mobile_create_session_on_node_with_id(
+    agent_handle: u64,
+    node_id: *const std::ffi::c_char,
+    options_json: *const std::ffi::c_char,
+    out_session: *mut u64,
+    out_session_id: *mut *mut std::ffi::c_char,
+) -> i32 {
+    let result = mesh::create_session_on_node_with_id_inner(
+        agent_handle,
+        node_id,
+        options_json,
+        out_session,
+        out_session_id,
+    );
     ffi_result_code(result)
 }
 
@@ -288,6 +339,25 @@ pub unsafe extern "C" fn qmt_mobile_set_session_model(
 ) -> i32 {
     let result =
         models::set_session_model_inner(agent_handle, session_handle, provider, model, node_id);
+    ffi_result_code(result)
+}
+
+/// Set a session config option (mode, reasoning effort, etc.).
+/// request_json: ACP SetSessionConfigOptionRequest JSON.
+/// out_json: receives the SetSessionConfigOptionResponse JSON. Must be freed with qmt_mobile_free_string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qmt_mobile_set_session_config_option(
+    agent_handle: u64,
+    session_handle: u64,
+    request_json: *const std::ffi::c_char,
+    out_json: *mut *mut std::ffi::c_char,
+) -> i32 {
+    let result = models::set_session_config_option_inner(
+        agent_handle,
+        session_handle,
+        request_json,
+        out_json,
+    );
     ffi_result_code(result)
 }
 
