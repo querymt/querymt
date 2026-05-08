@@ -11149,6 +11149,10 @@ dependencies = [
  "libp2p",
  "log",
  "once_cell",
+ "opentelemetry",
+ "opentelemetry-appender-tracing",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
  "parking_lot",
  "qmt-anthropic",
  "qmt-openai",
@@ -11160,6 +11164,9 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-log",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]

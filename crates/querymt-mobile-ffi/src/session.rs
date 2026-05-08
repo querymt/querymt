@@ -14,6 +14,24 @@ pub fn create_session_inner(
     options_json: *const std::ffi::c_char,
     out_session: *mut u64,
 ) -> Result<(), FfiErrorCode> {
+    create_session_with_id_inner(
+        agent_handle,
+        options_json,
+        out_session,
+        std::ptr::null_mut(),
+    )
+}
+
+/// Create a new local session, optionally returning the real session ID.
+///
+/// When `out_session_id` is non-null, the caller must free the returned string
+/// with `qmt_mobile_free_string`.
+pub fn create_session_with_id_inner(
+    agent_handle: u64,
+    options_json: *const std::ffi::c_char,
+    out_session: *mut u64,
+    out_session_id: *mut *mut std::ffi::c_char,
+) -> Result<(), FfiErrorCode> {
     check_not_backgrounded()?;
     if out_session.is_null() {
         set_last_error(FfiErrorCode::InvalidArgument, "out_session is null".into());
@@ -52,9 +70,13 @@ pub fn create_session_inner(
             }
         }
 
-        let s_handle = state::register_session(agent_handle, session_id, false, None, None)?;
+        let s_handle =
+            state::register_session(agent_handle, session_id.clone(), false, None, None)?;
         unsafe {
             *out_session = s_handle;
+            if !out_session_id.is_null() {
+                *out_session_id = alloc_cstr(&session_id);
+            }
         }
         Ok(())
     })
