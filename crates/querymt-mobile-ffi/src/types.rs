@@ -116,6 +116,43 @@ mod tests {
     }
 
     #[test]
+    fn mobile_mesh_config_peers_and_listen_parse() {
+        let json = r#"{
+            "agent": {"provider": "openai", "model": "gpt-4o"},
+            "mesh": {
+                "enabled": true,
+                "listen": "/ip4/0.0.0.0/tcp/0",
+                "discovery": "mdns",
+                "peers": [
+                    {"name": "desktop", "addr": "/ip4/192.168.1.100/tcp/9001"}
+                ],
+                "request_timeout_secs": 120,
+                "stream_reconnect_grace_secs": 60
+            }
+        }"#;
+        let config: MobileInitConfig = serde_json::from_str(json).expect("should parse");
+        assert_eq!(config.mesh.listen.as_deref(), Some("/ip4/0.0.0.0/tcp/0"));
+        assert_eq!(config.mesh.discovery, "mdns");
+        assert_eq!(config.mesh.peers.len(), 1);
+        assert_eq!(config.mesh.peers[0].name, "desktop");
+        assert_eq!(config.mesh.peers[0].addr, "/ip4/192.168.1.100/tcp/9001");
+        assert_eq!(config.mesh.request_timeout_secs, 120);
+        assert_eq!(config.mesh.stream_reconnect_grace_secs, 60);
+    }
+
+    #[test]
+    fn mobile_mesh_config_defaults() {
+        let json =
+            r#"{"agent": {"provider": "openai", "model": "gpt-4o"}, "mesh": {"enabled": true}}"#;
+        let config: MobileInitConfig = serde_json::from_str(json).expect("should parse");
+        assert_eq!(config.mesh.listen.as_deref(), Some("/ip4/0.0.0.0/tcp/0"));
+        assert_eq!(config.mesh.discovery, "mdns");
+        assert!(config.mesh.peers.is_empty());
+        assert_eq!(config.mesh.request_timeout_secs, 300);
+        assert_eq!(config.mesh.stream_reconnect_grace_secs, 120);
+    }
+
+    #[test]
     fn mobile_init_config_fails_if_provider_missing() {
         let json = r#"{"agent": {"model": "gpt-4o"}}"#;
         let result: Result<MobileInitConfig, _> = serde_json::from_str(json);
@@ -214,6 +251,10 @@ pub struct MobileInitConfig {
     /// Remote agent declarations.
     #[serde(default, rename = "remote_agents")]
     pub remote_agents: Vec<MobileRemoteAgentConfig>,
+
+    /// Telemetry (OTLP) configuration.
+    #[serde(default)]
+    pub telemetry: MobileTelemetryConfig,
 }
 
 /// Agent settings within the mobile init config.
@@ -262,15 +303,67 @@ pub struct MobileMeshConfig {
     #[serde(default)]
     pub auto_fallback: bool,
 
+    /// Multiaddr to listen on. Defaults to "/ip4/0.0.0.0/tcp/0" (OS picks
+    /// a random free port) so mobile nodes don't collide with desktop agents.
+    #[serde(default = "default_listen")]
+    pub listen: Option<String>,
+
+    /// Peer discovery strategy: "mdns" (default), "kademlia", or "none".
+    #[serde(default = "default_discovery")]
+    pub discovery: String,
+
+    /// Explicit bootstrap peers to dial at startup.
+    /// Each entry has a `name` and a libp2p multiaddr `addr`.
+    #[serde(default)]
+    pub peers: Vec<MobileMeshPeerConfig>,
+
+    /// Timeout in seconds for non-streaming mesh requests. Default: 300.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+
+    /// Grace period (seconds) for mesh reconnection. Default: 120.
+    #[serde(default = "default_stream_reconnect_grace_secs")]
+    pub stream_reconnect_grace_secs: u64,
+
     /// Path to the persistent ed25519 identity file for the mesh node.
     pub identity_file: Option<String>,
 
     /// Invite token to join an existing mesh at startup.
     pub invite: Option<String>,
+
+    /// Human-readable node name advertised to mesh peers.
+    /// When absent, falls back to OS hostname (which is often "unknown" on mobile).
+    #[serde(default)]
+    pub node_name: Option<String>,
+}
+
+/// A single mesh bootstrap peer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MobileMeshPeerConfig {
+    /// Human-readable label.
+    pub name: String,
+    /// Libp2p multiaddr, e.g. "/ip4/192.168.1.100/tcp/9000".
+    pub addr: String,
 }
 
 fn default_transport() -> String {
     "lan".to_string()
+}
+
+fn default_listen() -> Option<String> {
+    Some("/ip4/0.0.0.0/tcp/0".to_string())
+}
+
+fn default_discovery() -> String {
+    "mdns".to_string()
+}
+
+fn default_request_timeout_secs() -> u64 {
+    300
+}
+
+fn default_stream_reconnect_grace_secs() -> u64 {
+    120
 }
 
 impl Default for MobileMeshConfig {
@@ -279,10 +372,28 @@ impl Default for MobileMeshConfig {
             enabled: false,
             transport: default_transport(),
             auto_fallback: false,
+            listen: default_listen(),
+            discovery: default_discovery(),
+            peers: Vec::new(),
+            request_timeout_secs: default_request_timeout_secs(),
+            stream_reconnect_grace_secs: default_stream_reconnect_grace_secs(),
             identity_file: None,
             invite: None,
+            node_name: None,
         }
     }
+}
+
+/// Telemetry (OTLP) configuration within the mobile init config.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MobileTelemetryConfig {
+    /// Whether to enable OTLP telemetry export. Default: false.
+    ///
+    /// When enabled, the endpoint is read from `OTEL_EXPORTER_OTLP_ENDPOINT`
+    /// (falling back to the default in `querymt-utils`) and the level from
+    /// `QMT_TELEMETRY_LEVEL` (default `info`).
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Remote agent config within the mobile init config.
@@ -419,22 +530,12 @@ pub struct MeshStatusResponse {
     pub known_peer_count: usize,
     pub has_invite_store: bool,
     pub has_membership_store: bool,
-}
-
-/// Response for model listing.
-#[derive(Debug, Clone, Serialize)]
-pub struct ModelListResponse {
-    pub models: Vec<ModelInfo>,
-}
-
-/// A single model entry.
-#[derive(Debug, Clone, Serialize)]
-pub struct ModelInfo {
-    pub provider: String,
-    pub model: String,
-    pub display_name: String,
-    pub node_id: Option<String>,
-    pub is_local: bool,
+    /// The listen multiaddr used at bootstrap (diagnostic).
+    pub listen: Option<String>,
+    /// The discovery mode used at bootstrap (diagnostic).
+    pub discovery: Option<String>,
+    /// OTLP telemetry endpoint in use (diagnostic).
+    pub telemetry_endpoint: Option<String>,
 }
 
 /// Event envelope wrapping a QueryMT event with routing metadata.

@@ -14,10 +14,16 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Registry, fmt};
 
 /// Default OTLP endpoint for telemetry
-const DEFAULT_OTLP_ENDPOINT: &str = "http://otel.query.mt:4317";
+pub const DEFAULT_OTLP_ENDPOINT: &str = "http://otel.query.mt:4317";
+
+/// Returns the default OTLP endpoint. Useful for callers that need the value
+/// without duplicating the constant.
+pub fn default_otlp_endpoint() -> &'static str {
+    DEFAULT_OTLP_ENDPOINT
+}
 
 /// Build a resource with service name & version
-fn resource(service_name: &str, service_version: &str) -> Resource {
+pub fn resource(service_name: &str, service_version: &str) -> Resource {
     Resource::builder()
         .with_service_name(service_name.to_string())
         .with_schema_url(
@@ -28,7 +34,7 @@ fn resource(service_name: &str, service_version: &str) -> Resource {
 }
 
 /// Initialize an OTLP tracer provider
-fn init_tracer_provider(
+pub fn init_tracer_provider(
     service_name: &str,
     service_version: &str,
     endpoint: &str,
@@ -47,7 +53,7 @@ fn init_tracer_provider(
 }
 
 /// Initialize an OTLP logger provider
-fn init_logger_provider(
+pub fn init_logger_provider(
     service_name: &str,
     service_version: &str,
     endpoint: &str,
