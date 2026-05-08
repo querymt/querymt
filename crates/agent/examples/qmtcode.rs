@@ -18,11 +18,11 @@
 //!
 //! # LAN mesh-only mode (runs until Ctrl+C)
 //! cargo run --example qmtcode --features remote -- --mesh
-//! cargo run --example qmtcode --features remote -- --mesh=/ip4/0.0.0.0/tcp/9000
+//! cargo run --example qmtcode --features remote -- --mesh=/ip4/0.0.0.0/tcp/0
 //!
 //! # Dashboard mode with kameo mesh enabled (cross-machine sessions)
 //! cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh
-//! cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh=/ip4/0.0.0.0/tcp/9000
+//! cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh=/ip4/0.0.0.0/tcp/0
 //!
 //! # Internet mesh: host a mesh and generate an invite token
 //! cargo run --example qmtcode --features "remote-internet" -- --mesh --mesh-invite
@@ -47,7 +47,7 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(feature = "api")]
 const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:3000";
 #[cfg(feature = "remote")]
-const DEFAULT_MESH_ADDR: &str = "/ip4/0.0.0.0/tcp/9000";
+const DEFAULT_MESH_ADDR: &str = "/ip4/0.0.0.0/tcp/0";
 const EMBEDDED_CONFIG: &str = include_str!("confs/single_coder.toml");
 
 #[derive(RustEmbed)]
@@ -96,10 +96,10 @@ struct Cli {
     /// Starts a libp2p swarm with mDNS peer discovery and registers this node
     /// as a `RemoteNodeManager` so remote peers can create sessions here.
     ///
-    /// Optionally specify the multiaddr to listen on (default: /ip4/0.0.0.0/tcp/9000).
+    /// Optionally specify the multiaddr to listen on (default: /ip4/0.0.0.0/tcp/0).
     ///
     /// Examples:
-    ///   --mesh                          → listen on /ip4/0.0.0.0/tcp/9000
+    ///   --mesh                          → listen on /ip4/0.0.0.0/tcp/0 (OS-assigned random port)
     ///   --mesh=/ip4/0.0.0.0/tcp/9001   → listen on port 9001
     ///   --mesh=/ip4/0.0.0.0/tcp/0      → OS-assigned random port
     ///

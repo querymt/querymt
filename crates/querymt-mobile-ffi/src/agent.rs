@@ -9,11 +9,11 @@ use querymt::plugin::host::PluginRegistry;
 use std::ffi::CStr;
 use std::sync::Arc;
 
-pub fn init_agent_inner(
+/// Parse and validate the config JSON. Returns the parsed config or an error code.
+pub fn parse_config(
     config_json: *const std::ffi::c_char,
-    out_agent: *mut u64,
-) -> Result<(), FfiErrorCode> {
-    if config_json.is_null() || out_agent.is_null() {
+) -> Result<MobileInitConfig, FfiErrorCode> {
+    if config_json.is_null() {
         set_last_error(
             FfiErrorCode::InvalidArgument,
             "Null pointer argument".into(),
@@ -54,6 +54,23 @@ pub fn init_agent_inner(
         return Err(FfiErrorCode::InvalidArgument);
     }
 
+    Ok(config)
+}
+
+/// Create the agent from an already-parsed config. The caller should have
+/// already called `events::setup_mobile_telemetry(&config.telemetry)`.
+pub fn init_agent_from_config(
+    config: MobileInitConfig,
+    out_agent: *mut u64,
+) -> Result<(), FfiErrorCode> {
+    if out_agent.is_null() {
+        set_last_error(
+            FfiErrorCode::InvalidArgument,
+            "Null pointer argument".into(),
+        );
+        return Err(FfiErrorCode::InvalidArgument);
+    }
+
     let runtime = global_runtime();
     let result = runtime.block_on(async { init_agent_async(config).await });
 
@@ -69,6 +86,14 @@ pub fn init_agent_inner(
 }
 
 async fn init_agent_async(config: MobileInitConfig) -> Result<u64, FfiErrorCode> {
+    // Bootstrap providers metadata cache (models.dev.json) so that
+    // get_model_info() can resolve context limits, pricing, etc.
+    // Best-effort: if the device is offline on first launch the cache
+    // simply stays empty and model info falls back to defaults.
+    if let Err(e) = querymt::providers::update_providers_if_stale().await {
+        log::warn!("Failed to bootstrap providers metadata cache: {e}");
+    }
+
     let plugin_registry = Arc::new(PluginRegistry::empty());
     register_static_providers(&plugin_registry);
     let storage = create_storage_backend(&config).await?;
@@ -78,42 +103,9 @@ async fn init_agent_async(config: MobileInitConfig) -> Result<u64, FfiErrorCode>
         storage: Some(storage.clone()),
     };
 
-    let (mesh_handle, mesh_auto_fallback) = if config.mesh.enabled {
-        match bootstrap_mesh_from_config(&config).await {
-            Ok((mesh, fb)) => (Some(mesh), fb),
-            Err(e) => {
-                set_last_error(
-                    FfiErrorCode::RuntimeError,
-                    format!("Mesh bootstrap failed: {:#}", e),
-                );
-                return Err(FfiErrorCode::RuntimeError);
-            }
-        }
-    } else {
-        (None, false)
-    };
-
     let agent_config = build_single_agent_config(&config)?;
 
-    #[cfg(feature = "remote")]
-    let agent = querymt_agent::api::Agent::from_single_config_with_registry_and_infra(
-        agent_config,
-        None,
-        mesh_handle,
-        mesh_auto_fallback,
-        infra,
-    )
-    .await
-    .map_err(|e| {
-        set_last_error(
-            FfiErrorCode::RuntimeError,
-            format!("Agent construction failed: {:#}", e),
-        );
-        FfiErrorCode::RuntimeError
-    })?;
-
-    #[cfg(not(feature = "remote"))]
-    let agent = querymt_agent::api::Agent::from_config(agent_config, infra)
+    let agent = querymt_agent::api::Agent::from_single_config_with_infra(agent_config, infra)
         .await
         .map_err(|e| {
             set_last_error(
@@ -125,15 +117,29 @@ async fn init_agent_async(config: MobileInitConfig) -> Result<u64, FfiErrorCode>
 
     let handle = state::insert_agent(agent, storage, plugin_registry.clone());
 
+    // Store mesh config diagnostics so mesh_status can report them.
+    #[cfg(feature = "remote")]
+    if config.mesh.enabled {
+        let listen_str = config.mesh.listen.clone();
+        let discovery_str = config.mesh.discovery.clone();
+        state::with_agent(handle, |record| {
+            record.mesh_listen = listen_str;
+            record.mesh_discovery = Some(discovery_str);
+            Ok(())
+        })?;
+    }
+
     #[cfg(feature = "remote")]
     if config.mesh.enabled {
         let inner = state::with_agent_read(handle, |record| Ok(record.agent.inner().clone()))?;
         if let Some(mesh) = inner.mesh() {
-            let refs = querymt_agent::agent::remote::spawn_and_register_local_mesh_actors(
-                inner.as_ref(),
-                &mesh,
-            )
-            .await;
+            let refs =
+                querymt_agent::agent::remote::spawn_and_register_local_mesh_actors_with_name(
+                    inner.as_ref(),
+                    &mesh,
+                    config.mesh.node_name.clone(),
+                )
+                .await;
             state::set_local_mesh_actors(handle, refs)?;
         }
     }
@@ -233,10 +239,27 @@ fn build_single_agent_config(
                 "iroh" => querymt_agent::config::MeshTransportConfig::Iroh,
                 _ => querymt_agent::config::MeshTransportConfig::Lan,
             },
+            listen: config.mesh.listen.clone(),
+            discovery: match config.mesh.discovery.as_str() {
+                "none" => querymt_agent::config::MeshDiscoveryConfig::None,
+                "kademlia" => querymt_agent::config::MeshDiscoveryConfig::Kademlia,
+                _ => querymt_agent::config::MeshDiscoveryConfig::Mdns,
+            },
             auto_fallback: config.mesh.auto_fallback,
+            peers: config
+                .mesh
+                .peers
+                .iter()
+                .map(|p| querymt_agent::config::MeshPeerConfig {
+                    name: p.name.clone(),
+                    addr: p.addr.clone(),
+                })
+                .collect(),
+            request_timeout_secs: config.mesh.request_timeout_secs,
+            stream_reconnect_grace_secs: config.mesh.stream_reconnect_grace_secs,
             identity_file: config.mesh.identity_file.clone(),
             invite: config.mesh.invite.clone(),
-            ..Default::default()
+            node_name: config.mesh.node_name.clone(),
         },
         remote_agents: config
             .remote_agents
@@ -250,46 +273,4 @@ fn build_single_agent_config(
             })
             .collect(),
     })
-}
-
-#[cfg(feature = "remote")]
-async fn bootstrap_mesh_from_config(
-    config: &MobileInitConfig,
-) -> Result<(querymt_agent::agent::remote::MeshHandle, bool), anyhow::Error> {
-    use querymt_agent::agent::remote::{
-        MeshConfig, MeshDiscovery, MeshTransportMode, bootstrap_mesh,
-    };
-
-    let transport = match config.mesh.transport.as_str() {
-        "iroh" => MeshTransportMode::Iroh,
-        _ => MeshTransportMode::Lan,
-    };
-
-    let mesh_config = MeshConfig {
-        listen: Some("/ip4/0.0.0.0/tcp/9000".to_string()),
-        discovery: MeshDiscovery::Mdns,
-        bootstrap_peers: vec![],
-        directory: Default::default(),
-        request_timeout: std::time::Duration::from_secs(300),
-        stream_reconnect_grace: std::time::Duration::from_secs(30),
-        transport,
-        identity_file: config
-            .mesh
-            .identity_file
-            .clone()
-            .map(std::path::PathBuf::from),
-        invite: None,
-    };
-
-    let mesh_handle = bootstrap_mesh(&mesh_config).await?;
-    Ok((mesh_handle, config.mesh.auto_fallback))
-}
-
-#[cfg(not(feature = "remote"))]
-async fn bootstrap_mesh_from_config(
-    _config: &MobileInitConfig,
-) -> Result<(std::convert::Infallible, bool), anyhow::Error> {
-    Err(anyhow::anyhow!(
-        "Mesh not available (feature=remote not enabled)"
-    ))
 }

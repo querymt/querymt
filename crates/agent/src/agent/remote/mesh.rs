@@ -12,7 +12,7 @@
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let config = MeshConfig {
-//!     listen: Some("/ip4/0.0.0.0/tcp/9000".to_string()),
+//!     listen: Some("/ip4/0.0.0.0/tcp/0".to_string()),
 //!     discovery: MeshDiscovery::Mdns,
 //!     bootstrap_peers: vec![],
 //!     directory: DirectoryMode::default(),
@@ -122,7 +122,7 @@ pub enum DirectoryMode {
 /// Configuration for the kameo mesh (libp2p swarm).
 #[derive(Debug, Clone)]
 pub struct MeshConfig {
-    /// Multiaddr to listen on, e.g. `"/ip4/0.0.0.0/tcp/9000"`.
+    /// Multiaddr to listen on, e.g. `"/ip4/0.0.0.0/tcp/0"` (OS-assigned random port).
     ///
     /// `None` lets the OS pick a random port (useful for tests/ephemeral nodes).
     pub listen: Option<String>,
@@ -180,10 +180,10 @@ pub struct MeshConfig {
 }
 
 impl Default for MeshConfig {
-    /// Sensible defaults for local development: listen on port 9000 with mDNS.
+    /// Sensible defaults: listen on a random port with mDNS.
     fn default() -> Self {
         Self {
-            listen: Some("/ip4/0.0.0.0/tcp/9000".to_string()),
+            listen: Some("/ip4/0.0.0.0/tcp/0".to_string()),
             discovery: MeshDiscovery::Mdns,
             bootstrap_peers: vec![],
             directory: DirectoryMode::default(),
