@@ -42,6 +42,21 @@ use types::FfiErrorCode;
 // Lifecycle
 // ============================================================================
 
+/// Initialize Android's rustls platform verifier bridge.
+///
+/// `env` must be the current `JNIEnv*` and `context` an Android `Context` object.
+/// This must run before any reqwest/TLS work on Android.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qmt_mobile_android_init(
+    env: *mut std::ffi::c_void,
+    context: *mut std::ffi::c_void,
+) -> i32 {
+    ffi_panic_boundary("qmt_mobile_android_init", || unsafe {
+        android_init_impl(env, context)
+    })
+}
+
 /// Initialize the agent runtime. Call once per agent instance.
 ///
 /// `config_json` is a JSON representation of a mobile agent config.
@@ -535,6 +550,46 @@ pub unsafe extern "C" fn qmt_mobile_free_string(ptr: *mut std::ffi::c_char) {
 // ============================================================================
 // Internal Helpers
 // ============================================================================
+
+#[cfg(target_os = "android")]
+unsafe fn android_init_impl(env: *mut std::ffi::c_void, context: *mut std::ffi::c_void) -> i32 {
+    if env.is_null() || context.is_null() {
+        set_last_error(
+            FfiErrorCode::InvalidArgument,
+            "JNIEnv and Android Context must not be null".into(),
+        );
+        return FfiErrorCode::InvalidArgument as i32;
+    }
+
+    let mut env = match unsafe { jni::JNIEnv::from_raw(env.cast::<jni::sys::JNIEnv>()) } {
+        Ok(env) => env,
+        Err(err) => {
+            set_last_error(
+                FfiErrorCode::RuntimeError,
+                format!("failed to wrap JNIEnv: {err}"),
+            );
+            return FfiErrorCode::RuntimeError as i32;
+        }
+    };
+
+    let context = unsafe { jni::objects::JObject::from_raw(context.cast::<jni::sys::_jobject>()) };
+    match rustls_platform_verifier::android::init_with_env(&mut env, context) {
+        Ok(()) => {
+            // init_with_env stores global refs internally and is idempotent.
+            std::mem::forget(env);
+            ffi_helpers::clear_last_error();
+            FfiErrorCode::Ok as i32
+        }
+        Err(err) => {
+            std::mem::forget(env);
+            set_last_error(
+                FfiErrorCode::RuntimeError,
+                format!("failed to initialize rustls platform verifier: {err}"),
+            );
+            FfiErrorCode::RuntimeError as i32
+        }
+    }
+}
 
 unsafe fn init_agent_impl(config_json: *const std::ffi::c_char, out_agent: *mut u64) -> i32 {
     // Parse config first so we can extract telemetry settings.
