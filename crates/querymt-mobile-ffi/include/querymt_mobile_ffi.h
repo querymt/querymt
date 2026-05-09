@@ -25,6 +25,10 @@ extern "C" {
 // Lifecycle
 // ============================================================================
 
+/// Android-only: initialize rustls-platform-verifier with JNIEnv* and Context.
+/// Call before qmt_mobile_init_agent or any other network/TLS work.
+int32_t qmt_mobile_android_init(void *env, void *context);
+
 /// Initialize the agent runtime. Call once per agent instance.
 /// config_json: JSON representation of the agent configuration.
 /// out_agent: receives an opaque handle.
