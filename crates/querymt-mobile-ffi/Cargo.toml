@@ -23,7 +23,7 @@ provider-openai = ["dep:qmt-openai"]
 
 [lib]
 name = "querymt_mobile_ffi"
-crate-type = ["staticlib", "rlib"]
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 querymt = { path = "../querymt", default-features = false, features = ["http-client", "plugin_host", "model-registry", "mcp", "tracing"] }
