@@ -1,8 +1,7 @@
-use dirs;
 use reqwest::Client;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::types::ProvidersRegistry;
@@ -11,6 +10,36 @@ use crate::error::LLMError;
 const CACHE_FILE: &str = "models.dev.json";
 const CACHE_DURATION: u64 = 86_400; // 24 hours in seconds
 const API_URL: &str = "https://models.dev/api.json";
+
+fn provider_cache_dir() -> Result<PathBuf, LLMError> {
+    if let Ok(path) = std::env::var("QMT_PROVIDER_CACHE_DIR")
+        && !path.trim().is_empty()
+    {
+        return Ok(PathBuf::from(path));
+    }
+
+    if let Ok(path) = std::env::var("QMT_CONFIG_DIR")
+        && !path.trim().is_empty()
+    {
+        return Ok(PathBuf::from(path));
+    }
+
+    if let Ok(path) = std::env::var("QMT_HOME")
+        && !path.trim().is_empty()
+    {
+        return Ok(PathBuf::from(path));
+    }
+
+    dirs::home_dir()
+        .map(|home| home.join(".qmt"))
+        .ok_or_else(|| {
+            LLMError::GenericError("Could not determine QueryMT provider cache directory".into())
+        })
+}
+
+fn provider_cache_path() -> Result<PathBuf, LLMError> {
+    Ok(provider_cache_dir()?.join(CACHE_FILE))
+}
 
 fn is_cache_fresh(file_path: &Path) -> bool {
     if let Ok(metadata) = fs::metadata(file_path)
@@ -41,13 +70,7 @@ async fn download_and_cache_providers(file_path: &Path) -> Result<ProvidersRegis
     // API returns a top-level map of providers, convert into ProvidersRegistry
     let map = response
         .json::<std::collections::HashMap<String, super::types::ProviderInfo>>()
-        .await;
-
-    // TODO: Use LLMError
-    let map = match map {
-        Ok(r) => r,
-        Err(e) => panic!("{}", e),
-    };
+        .await?;
 
     let registry: ProvidersRegistry = map.into();
 
@@ -60,8 +83,7 @@ async fn download_and_cache_providers(file_path: &Path) -> Result<ProvidersRegis
 }
 
 pub fn read_providers_from_cache() -> Result<ProvidersRegistry, LLMError> {
-    let home_dir = dirs::home_dir().expect("Could not find home directory");
-    let file_path = home_dir.join(".qmt").join(CACHE_FILE);
+    let file_path = provider_cache_path()?;
 
     let mut file = File::open(file_path)?;
     let mut contents = String::new();
@@ -71,8 +93,7 @@ pub fn read_providers_from_cache() -> Result<ProvidersRegistry, LLMError> {
 }
 
 pub async fn update_providers_if_stale() -> Result<bool, LLMError> {
-    let home_dir = dirs::home_dir().expect("Could not find home directory");
-    let file_path = home_dir.join(".qmt").join(CACHE_FILE);
+    let file_path = provider_cache_path()?;
 
     if is_cache_fresh(&file_path) {
         return Ok(false);
