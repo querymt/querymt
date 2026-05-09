@@ -35,6 +35,7 @@ mod providers;
 mod session;
 
 use ffi_helpers::{set_last_error, take_last_error_code, take_last_error_message};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use types::FfiErrorCode;
 
 // ============================================================================
@@ -50,28 +51,9 @@ pub unsafe extern "C" fn qmt_mobile_init_agent(
     config_json: *const std::ffi::c_char,
     out_agent: *mut u64,
 ) -> i32 {
-    // Parse config first so we can extract telemetry settings.
-    let config_result = agent::parse_config(config_json);
-    let config = match config_result {
-        Ok(c) => c,
-        Err(code) => return code as i32,
-    };
-
-    // Enter the Tokio runtime context so that telemetry init (hyper-util,
-    // gRPC) and agent startup can find a reactor on this thread.
-    let _rt_guard = runtime::global_runtime().enter();
-
-    // Initialize telemetry/logging based on config (idempotent).
-    events::setup_mobile_telemetry(&config.telemetry);
-
-    let result = agent::init_agent_from_config(config, out_agent);
-    match result {
-        Ok(()) => {
-            ffi_helpers::clear_last_error();
-            FfiErrorCode::Ok as i32
-        }
-        Err(code) => code as i32,
-    }
+    ffi_panic_boundary("qmt_mobile_init_agent", || unsafe {
+        init_agent_impl(config_json, out_agent)
+    })
 }
 
 /// Shut down an agent and release all resources owned by the handle.
@@ -554,6 +536,54 @@ pub unsafe extern "C" fn qmt_mobile_free_string(ptr: *mut std::ffi::c_char) {
 // Internal Helpers
 // ============================================================================
 
+unsafe fn init_agent_impl(config_json: *const std::ffi::c_char, out_agent: *mut u64) -> i32 {
+    // Parse config first so we can extract telemetry settings.
+    let config_result = agent::parse_config(config_json);
+    let config = match config_result {
+        Ok(c) => c,
+        Err(code) => return code as i32,
+    };
+
+    // Enter the Tokio runtime context so that telemetry init (hyper-util,
+    // gRPC) and agent startup can find a reactor on this thread.
+    let _rt_guard = runtime::global_runtime().enter();
+
+    // Initialize telemetry/logging based on config (idempotent).
+    events::setup_mobile_telemetry(&config.telemetry);
+
+    let result = agent::init_agent_from_config(config, out_agent);
+    ffi_result_code(result)
+}
+
+fn ffi_panic_boundary<F>(function_name: &'static str, f: F) -> i32
+where
+    F: FnOnce() -> i32,
+{
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(code) => code,
+        Err(payload) => {
+            let panic_message = panic_payload_message(payload.as_ref());
+            set_last_error(
+                FfiErrorCode::RuntimeError,
+                format!("{function_name} panicked: {panic_message}"),
+            );
+            FfiErrorCode::RuntimeError as i32
+        }
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<std::fmt::Arguments<'_>>() {
+        message.to_string()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
 /// Convert a `Result<(), FfiErrorCode>` to an i32 return code.
 fn ffi_result_code(result: Result<(), FfiErrorCode>) -> i32 {
     match result {
@@ -570,4 +600,48 @@ fn alloc_string(s: &str) -> *mut std::ffi::c_char {
     std::ffi::CString::new(s)
         .unwrap_or_else(|_| std::ffi::CString::new("").unwrap())
         .into_raw()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panic_payload_message_extracts_str_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_payload_message(payload.as_ref()), "boom");
+    }
+
+    #[test]
+    fn panic_payload_message_extracts_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("owned boom"));
+        assert_eq!(panic_payload_message(payload.as_ref()), "owned boom");
+    }
+
+    #[test]
+    fn ffi_panic_boundary_converts_panic_to_runtime_error() {
+        ffi_helpers::clear_last_error();
+
+        let code = ffi_panic_boundary("test_boundary", || {
+            std::panic::panic_any(String::from("boundary boom"))
+        });
+
+        assert_eq!(code, FfiErrorCode::RuntimeError as i32);
+        assert_eq!(take_last_error_code(), FfiErrorCode::RuntimeError);
+        assert_eq!(
+            take_last_error_message(),
+            "test_boundary panicked: boundary boom"
+        );
+    }
+
+    #[test]
+    fn ffi_panic_boundary_preserves_success_code() {
+        ffi_helpers::clear_last_error();
+
+        let code = ffi_panic_boundary("test_boundary", || FfiErrorCode::Unsupported as i32);
+
+        assert_eq!(code, FfiErrorCode::Unsupported as i32);
+        assert_eq!(take_last_error_code(), FfiErrorCode::Ok);
+        assert_eq!(take_last_error_message(), "");
+    }
 }
