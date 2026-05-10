@@ -35,7 +35,7 @@ pub fn list_models_inner(
         let models = agent.model_registry.get_all_models(&agent.config).await;
 
         let json = serde_json::to_string(&serde_json::json!({ "models": models }))
-            .map_err(|e| serde_err(e))?;
+            .map_err(serde_err)?;
         unsafe {
             *out_json = alloc_cstr(&json);
         }
@@ -197,7 +197,7 @@ pub fn set_session_config_option_inner(
             FfiErrorCode::RuntimeError
         })?;
 
-        let json = serde_json::to_string(&response).map_err(|e| serde_err(e))?;
+        let json = serde_json::to_string(&response).map_err(serde_err)?;
         unsafe {
             *out_json = alloc_cstr(&json);
         }
