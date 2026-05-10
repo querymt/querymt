@@ -77,7 +77,7 @@ pub fn list_nodes_inner(
                 local_node_id,
                 nodes: node_infos,
             };
-            let json = serde_json::to_string(&response).map_err(|e| serde_err(e))?;
+            let json = serde_json::to_string(&response).map_err(serde_err)?;
             unsafe {
                 *out_json = alloc_cstr(&json);
             }
@@ -122,7 +122,7 @@ pub fn create_session_on_node_with_id_inner(
     let node_id_str: Option<String> = ptr_to_opt_string(node_id);
 
     // NULL/empty → local session
-    if node_id_str.as_ref().map_or(true, |s| s.is_empty()) {
+    if node_id_str.as_ref().is_none_or(|s| s.is_empty()) {
         return crate::session::create_session_with_id_inner(
             agent_handle,
             options_json,
@@ -262,7 +262,7 @@ pub fn list_remote_sessions_inner(
                 node_id: node_id_str,
                 sessions: summaries,
             };
-            let json = serde_json::to_string(&response).map_err(|e| serde_err(e))?;
+            let json = serde_json::to_string(&response).map_err(serde_err)?;
             unsafe {
                 *out_json = alloc_cstr(&json);
             }
@@ -444,7 +444,7 @@ pub fn create_invite_inner(
                 can_invite: signed.grant.permissions.can_invite,
             };
 
-            let json = serde_json::to_string(&response).map_err(|e| serde_err(e))?;
+            let json = serde_json::to_string(&response).map_err(serde_err)?;
             unsafe {
                 *out_json = alloc_cstr(&json);
             }
@@ -515,7 +515,7 @@ pub fn join_mesh_inner(
                 inviter_peer_id: grant.grant.inviter_peer_id.to_string(),
             };
 
-            let json = serde_json::to_string(&response).map_err(|e| serde_err(e))?;
+            let json = serde_json::to_string(&response).map_err(serde_err)?;
             unsafe {
                 *out_json = alloc_cstr(&json);
             }
@@ -563,7 +563,7 @@ pub fn mesh_status_inner(
                 discovery: mesh_discovery,
                 telemetry_endpoint: crate::events::active_otlp_endpoint(),
             };
-            let json = serde_json::to_string(&status).map_err(|e| serde_err(e))?;
+            let json = serde_json::to_string(&status).map_err(serde_err)?;
             unsafe {
                 *out_json = alloc_cstr(&json);
             }
@@ -583,7 +583,7 @@ pub fn mesh_status_inner(
             discovery: mesh_discovery,
             telemetry_endpoint: crate::events::active_otlp_endpoint(),
         };
-        let json = serde_json::to_string(&status).map_err(|e| serde_err(e))?;
+        let json = serde_json::to_string(&status).map_err(serde_err)?;
         unsafe {
             *out_json = alloc_cstr(&json);
         }

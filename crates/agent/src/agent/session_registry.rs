@@ -5,6 +5,7 @@
 
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, SessionRuntime};
+use crate::agent::protocol::build_mcp_state;
 use crate::agent::remote::SessionActorRef;
 use crate::agent::session_actor::SessionActor;
 use crate::error::AgentError;
@@ -14,9 +15,18 @@ use agent_client_protocol::schema::{
     SessionConfigSelectOption, SessionInfo, SessionMode, SessionModeState,
 };
 use kameo::actor::{ActorRef, Spawn};
+use rmcp::RoleClient;
+use rmcp::service::Peer;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// A pre-connected MCP peer that should be merged into session tool state.
+///
+/// The string is the MCP server name used for adapter metadata and diagnostics.
+/// The peer is already initialized (has completed MCP handshake) and can be
+/// reused across multiple sessions without re-initializing.
+pub type PreconnectedMcpPeer = (String, Peer<RoleClient>);
 
 fn all_session_modes() -> Vec<SessionMode> {
     vec![
@@ -208,7 +218,7 @@ impl SessionRegistry {
         cwd: Option<PathBuf>,
         mcp_servers: &[McpServer],
         initialize_fork: bool,
-        options: SessionMaterializationOptions,
+        options: &mut SessionMaterializationOptions,
     ) -> Result<SessionMaterialization, Error> {
         let merged_mcp = self.merged_mcp_servers(mcp_servers);
         let tool_state = crate::agent::core::McpToolState::empty();
@@ -241,7 +251,6 @@ impl SessionRegistry {
             });
         #[cfg(not(feature = "remote"))]
         let actor = {
-            let _ = &options;
             SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone())
         };
         let actor_ref = SessionActor::spawn(actor);
@@ -542,6 +551,20 @@ impl SessionRegistry {
         &mut self,
         req: NewSessionRequest,
     ) -> Result<NewSessionResponse, Error> {
+        self.new_session_with_preconnected(req, Vec::new()).await
+    }
+
+    /// Create a new session and merge tools from already-connected MCP peers.
+    ///
+    /// Used by mobile FFI clients that manage MCP transport lifetimes externally
+    /// (for example iOS/Android pipe transports) and want those tools available in
+    /// each newly created session. The peers are already initialized and can be
+    /// reused across sessions without re-initializing.
+    pub async fn new_session_with_preconnected(
+        &mut self,
+        req: NewSessionRequest,
+        preconnected_peers: Vec<PreconnectedMcpPeer>,
+    ) -> Result<NewSessionResponse, Error> {
         let cwd = if req.cwd.as_os_str().is_empty() {
             None
         } else {
@@ -578,13 +601,20 @@ impl SessionRegistry {
                 cwd.clone(),
                 &req.mcp_servers,
                 parent_session_id.is_some(),
-                SessionMaterializationOptions {
+                &mut SessionMaterializationOptions {
                     attach_mesh_handle: true,
                     register_in_dht: true,
                 },
             )
             .await?;
         let runtime = materialization.runtime;
+
+        // Merge tools from already-connected MCP peers (e.g. mobile pipe transports).
+        crate::agent::protocol::merge_preconnected_mcp_peers(
+            runtime.mcp_tool_state.clone(),
+            &preconnected_peers,
+        )
+        .await?;
 
         self.config
             .emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);
@@ -674,6 +704,15 @@ impl SessionRegistry {
         &mut self,
         req: agent_client_protocol::schema::LoadSessionRequest,
     ) -> Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
+        self.load_session_with_preconnected(req, Vec::new()).await
+    }
+
+    /// Load an existing session and merge tools from already-connected MCP peers.
+    pub async fn load_session_with_preconnected(
+        &mut self,
+        req: agent_client_protocol::schema::LoadSessionRequest,
+        preconnected_peers: Vec<PreconnectedMcpPeer>,
+    ) -> Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
         let session_id = req.session_id.to_string();
         let _session = self
             .config
@@ -701,18 +740,25 @@ impl SessionRegistry {
             Some(req.cwd.clone())
         };
 
-        let _materialization = self
+        let materialization = self
             .materialize_session_actor(
                 session_id.clone(),
                 cwd,
                 &req.mcp_servers,
                 false,
-                SessionMaterializationOptions {
+                &mut SessionMaterializationOptions {
                     attach_mesh_handle: true,
                     register_in_dht: true,
                 },
             )
             .await?;
+
+        // Merge tools from already-connected MCP peers (e.g. mobile pipe transports).
+        crate::agent::protocol::merge_preconnected_mcp_peers(
+            materialization.runtime.mcp_tool_state.clone(),
+            &preconnected_peers,
+        )
+        .await?;
 
         // Stream full history to client
         // TODO: Implement full-fidelity history streaming with SessionUpdate notifications
@@ -849,7 +895,7 @@ impl SessionRegistry {
                 cwd,
                 &req.mcp_servers,
                 false,
-                SessionMaterializationOptions {
+                &mut SessionMaterializationOptions {
                     attach_mesh_handle: true,
                     register_in_dht: true,
                 },

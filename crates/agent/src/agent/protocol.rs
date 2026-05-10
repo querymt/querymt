@@ -10,7 +10,8 @@ use rmcp::{
     model::Implementation,
     service::{RunningService, serve_client},
     transport::{
-        StreamableHttpClientTransport, child_process::TokioChildProcess,
+        StreamableHttpClientTransport,
+        child_process::TokioChildProcess,
         streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
@@ -83,6 +84,56 @@ pub(crate) async fn build_mcp_state(
     });
 
     Ok(clients)
+}
+
+/// Merge tools from already-connected MCP peers into an existing tool state.
+///
+/// This is used by embedders that manage MCP transport lifetimes externally
+/// (for example mobile FFI pipe transports) and want those tools available in
+/// each newly created or loaded session. The peers are already initialized and
+/// can be reused across sessions without re-initializing.
+pub(crate) async fn merge_preconnected_mcp_peers(
+    tool_state: Arc<McpToolState>,
+    preconnected_peers: &[(String, rmcp::service::Peer<RoleClient>)],
+) -> Result<(), Error> {
+    if preconnected_peers.is_empty() {
+        return Ok(());
+    }
+
+    let current = tool_state.load();
+    let mut tools = current.tools.clone();
+    let mut tool_defs = current.tool_defs.clone();
+
+    for (server_name, peer) in preconnected_peers {
+        let tool_list = peer
+            .list_all_tools()
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        for tool in tool_list {
+            let adapter = querymt::mcp::adapter::McpToolAdapter::try_new(
+                tool,
+                peer.clone(),
+                server_name.clone(),
+            )
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+            let name = adapter.descriptor().function.name.clone();
+            if tools.contains_key(&name) {
+                warn!("Duplicate MCP tool '{}', keeping first instance", name);
+                continue;
+            }
+            tool_defs.push(adapter.descriptor());
+            tools.insert(name, Arc::new(adapter));
+        }
+    }
+
+    tool_state.store(crate::agent::core::McpToolSnapshot {
+        tools,
+        tool_defs,
+        tools_hash: None,
+    });
+
+    Ok(())
 }
 
 /// Starts an MCP server based on its configuration.

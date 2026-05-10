@@ -6,7 +6,6 @@ use crate::runtime::global_runtime;
 use crate::state;
 use crate::types::{FfiErrorCode, SessionListResponse, SessionOptions, SessionSummary};
 use agent_client_protocol::schema::{LoadSessionRequest, NewSessionRequest};
-use querymt_agent::send_agent::SendAgent;
 use std::ffi::CStr;
 
 pub fn create_session_inner(
@@ -42,18 +41,23 @@ pub fn create_session_with_id_inner(
 
     let runtime = global_runtime();
     runtime.block_on(async {
-        let agent = state::with_agent_read(agent_handle, |r| Ok(r.agent.handle()))?;
+        let inner = state::with_agent_read(agent_handle, |r| Ok(r.agent.inner()))?;
 
-        let mcp_servers = mcp::registered_mcp_servers(agent_handle);
+        // Collect preconnected MCP pipe peers. This lazily connects any
+        // registered pipe servers exactly once and reuses the connected
+        // peer across sessions (no repeated MCP initialize).
+        let preconnected = mcp::collect_preconnected_mcp_servers(agent_handle).await?;
+
         let req = match &options.cwd {
             Some(cwd) => {
-                NewSessionRequest::new(std::path::PathBuf::from(cwd)).mcp_servers(mcp_servers)
+                NewSessionRequest::new(std::path::PathBuf::from(cwd))
             }
-            None => NewSessionRequest::new(std::path::PathBuf::new()).mcp_servers(mcp_servers),
+            None => NewSessionRequest::new(std::path::PathBuf::new()),
         };
 
-        let agent_trait: &dyn querymt_agent::agent::handle::AgentHandle = agent.as_ref();
-        let response = agent_trait.new_session(req).await.map_err(|e| {
+        // Use new_session_with_preconnected to create the session and merge
+        // preconnected MCP peer tools into the session tool state.
+        let resp = inner.new_session_with_preconnected(req, preconnected).await.map_err(|e| {
             set_last_error(
                 FfiErrorCode::RuntimeError,
                 format!("Failed to create session: {e}"),
@@ -61,14 +65,13 @@ pub fn create_session_with_id_inner(
             FfiErrorCode::RuntimeError
         })?;
 
-        let session_id = response.session_id.to_string();
+        let session_id = resp.session_id.to_string();
 
         // Apply provider/model overrides if provided
-        if let (Some(provider), Some(model)) = (&options.provider, &options.model) {
-            if let Err(e) = agent.set_provider(&session_id, provider, model).await {
+        if let (Some(provider), Some(model)) = (&options.provider, &options.model)
+            && let Err(e) = inner.set_provider(&session_id, provider, model).await {
                 log::warn!("Failed to set session provider/model: {e}");
             }
-        }
 
         let s_handle =
             state::register_session(agent_handle, session_id.clone(), false, None, None)?;
@@ -96,7 +99,7 @@ pub fn load_session_inner(
     let runtime = global_runtime();
     runtime.block_on(async {
         let store = state::with_agent_read(agent_handle, |r| Ok(r.storage.session_store()))?;
-        let agent = state::with_agent_read(agent_handle, |r| Ok(r.agent.handle()))?;
+        let inner = state::with_agent_read(agent_handle, |r| Ok(r.agent.inner()))?;
 
         let session = store.get_session(&sid).await.map_err(|e| {
             set_last_error(FfiErrorCode::RuntimeError, format!("Storage error: {e}"));
@@ -105,13 +108,12 @@ pub fn load_session_inner(
 
         match session {
             Some(_) => {
-                // Pass registered MCP servers to the load request so they get attached
-                let mcp_servers = mcp::registered_mcp_servers(agent_handle);
-                let sid_for_req = sid.clone();
-                let load_req = LoadSessionRequest::new(sid_for_req, std::path::PathBuf::new())
-                    .mcp_servers(mcp_servers);
-                let _ = agent.load_session(load_req).await.map_err(|e| {
-                    log::warn!("Failed to attach MCP servers to loaded session: {e}");
+                // Collect preconnected MCP pipe peers (lazily connected once).
+        let preconnected = mcp::collect_preconnected_mcp_servers(agent_handle).await?;
+
+                let load_req = LoadSessionRequest::new(sid.clone(), std::path::PathBuf::new());
+                let _ = inner.load_session_with_preconnected(load_req, preconnected).await.map_err(|e| {
+                    log::warn!("Failed to load session with MCP peers: {e}");
                 });
 
                 let s_handle = state::register_session(agent_handle, sid, false, None, None)?;
@@ -162,7 +164,7 @@ pub fn list_sessions_inner(
             sessions: summaries,
             next_cursor: None,
         })
-        .map_err(|e| serde_err(e))?;
+        .map_err(serde_err)?;
         unsafe {
             *out_json = alloc_cstr(&json);
         }

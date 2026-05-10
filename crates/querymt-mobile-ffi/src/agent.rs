@@ -4,16 +4,18 @@ use crate::ffi_helpers::set_last_error;
 use crate::mcp;
 use crate::runtime::global_runtime;
 use crate::state;
-use crate::types::{FfiErrorCode, MobileInitConfig};
+use crate::types::FfiErrorCode;
 use querymt::plugin::host::PluginRegistry;
+use querymt_agent::config::{Config, ConfigSource};
 use std::ffi::CStr;
 use std::sync::Arc;
 
-/// Parse and validate the config JSON. Returns the parsed config or an error code.
+/// Parse inline TOML config using the shared `querymt_agent::config::load_config`
+/// parser. Returns a `Config` (Single or Multi) or an error code.
 pub fn parse_config(
-    config_json: *const std::ffi::c_char,
-) -> Result<MobileInitConfig, FfiErrorCode> {
-    if config_json.is_null() {
+    config_toml: *const std::ffi::c_char,
+) -> Result<Config, FfiErrorCode> {
+    if config_toml.is_null() {
         set_last_error(
             FfiErrorCode::InvalidArgument,
             "Null pointer argument".into(),
@@ -22,45 +24,33 @@ pub fn parse_config(
     }
 
     let config_str = unsafe {
-        CStr::from_ptr(config_json).to_str().map_err(|_| {
+        CStr::from_ptr(config_toml).to_str().map_err(|_| {
             set_last_error(
                 FfiErrorCode::InvalidArgument,
-                "config_json is not valid UTF-8".into(),
+                "config_toml is not valid UTF-8".into(),
             );
             FfiErrorCode::InvalidArgument
         })?
     };
 
-    let config: MobileInitConfig = serde_json::from_str(config_str).map_err(|e| {
-        set_last_error(
-            FfiErrorCode::InvalidArgument,
-            format!("Failed to parse config JSON: {:#}", e),
-        );
-        FfiErrorCode::InvalidArgument
-    })?;
-
-    if config.agent.provider.is_empty() {
-        set_last_error(
-            FfiErrorCode::InvalidArgument,
-            "Missing required field: agent.provider".into(),
-        );
-        return Err(FfiErrorCode::InvalidArgument);
-    }
-    if config.agent.model.is_empty() {
-        set_last_error(
-            FfiErrorCode::InvalidArgument,
-            "Missing required field: agent.model".into(),
-        );
-        return Err(FfiErrorCode::InvalidArgument);
-    }
-
-    Ok(config)
+    let rt = global_runtime();
+    rt.block_on(async {
+        querymt_agent::config::load_config(ConfigSource::Toml(config_str.to_owned()))
+            .await
+            .map_err(|e| {
+                set_last_error(
+                    FfiErrorCode::InvalidArgument,
+                    format!("Failed to parse config: {:#}", e),
+                );
+                FfiErrorCode::InvalidArgument
+            })
+    })
 }
 
 /// Create the agent from an already-parsed config. The caller should have
-/// already called `events::setup_mobile_telemetry(&config.telemetry)`.
+/// already called `events::setup_mobile_telemetry()`.
 pub fn init_agent_from_config(
-    config: MobileInitConfig,
+    config: Config,
     out_agent: *mut u64,
 ) -> Result<(), FfiErrorCode> {
     if out_agent.is_null() {
@@ -85,7 +75,7 @@ pub fn init_agent_from_config(
     }
 }
 
-async fn init_agent_async(config: MobileInitConfig) -> Result<u64, FfiErrorCode> {
+async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
     // Bootstrap providers metadata cache (models.dev.json) so that
     // get_model_info() can resolve context limits, pricing, etc.
     // Best-effort: if the device is offline on first launch the cache
@@ -96,48 +86,75 @@ async fn init_agent_async(config: MobileInitConfig) -> Result<u64, FfiErrorCode>
 
     let plugin_registry = Arc::new(PluginRegistry::empty());
     register_static_providers(&plugin_registry);
-    let storage = create_storage_backend(&config).await?;
+
+    // Extract mesh config for diagnostics before consuming config.
+    let mesh_config = match &config {
+        Config::Single(single) => single.mesh.clone(),
+        Config::Multi(quorum) => quorum.mesh.clone(),
+    };
+    let db_path = match &config {
+        Config::Single(single) => single.agent.db.clone(),
+        Config::Multi(_) => None,
+    };
+
+    let storage = create_storage_backend(db_path).await?;
 
     let infra = querymt_agent::api::AgentInfra {
         plugin_registry: plugin_registry.clone(),
         storage: Some(storage.clone()),
     };
 
-    let agent_config = build_single_agent_config(&config)?;
-
-    let agent = querymt_agent::api::Agent::from_single_config_with_infra(agent_config, infra)
-        .await
-        .map_err(|e| {
-            set_last_error(
-                FfiErrorCode::RuntimeError,
-                format!("Agent construction failed: {:#}", e),
-            );
-            FfiErrorCode::RuntimeError
-        })?;
+    let agent = match config {
+        Config::Single(single) => {
+            querymt_agent::api::Agent::from_single_config_with_infra(single, infra)
+                .await
+                .map_err(|e| {
+                    set_last_error(
+                        FfiErrorCode::RuntimeError,
+                        format!("Agent construction failed: {:#}", e),
+                    );
+                    FfiErrorCode::RuntimeError
+                })?
+        }
+        Config::Multi(quorum) => {
+            log::info!("Initializing multi-agent/quorum config");
+            querymt_agent::api::Agent::from_quorum_config_with_infra(quorum, infra)
+                .await
+                .map_err(|e| {
+                    set_last_error(
+                        FfiErrorCode::RuntimeError,
+                        format!("Quorum construction failed: {:#}", e),
+                    );
+                    FfiErrorCode::RuntimeError
+                })?
+        }
+    };
 
     let handle = state::insert_agent(agent, storage, plugin_registry.clone());
 
     // Store mesh config diagnostics so mesh_status can report them.
     #[cfg(feature = "remote")]
-    if config.mesh.enabled {
-        let listen_str = config.mesh.listen.clone();
-        let discovery_str = config.mesh.discovery.clone();
+    if mesh_config.enabled {
+        let listen_str = mesh_config.listen.clone();
+        let discovery_str = match mesh_config.discovery {
+            querymt_agent::config::MeshDiscoveryConfig::Mdns => "mdns",
+            querymt_agent::config::MeshDiscoveryConfig::Kademlia => "kademlia",
+            querymt_agent::config::MeshDiscoveryConfig::None => "none",
+        };
+        let node_name = mesh_config.node_name.clone();
         state::with_agent(handle, |record| {
             record.mesh_listen = listen_str;
-            record.mesh_discovery = Some(discovery_str);
+            record.mesh_discovery = Some(discovery_str.to_string());
             Ok(())
         })?;
-    }
 
-    #[cfg(feature = "remote")]
-    if config.mesh.enabled {
         let inner = state::with_agent_read(handle, |record| Ok(record.agent.inner().clone()))?;
         if let Some(mesh) = inner.mesh() {
             let refs =
                 querymt_agent::agent::remote::spawn_and_register_local_mesh_actors_with_name(
                     inner.as_ref(),
                     &mesh,
-                    config.mesh.node_name.clone(),
+                    node_name,
                 )
                 .await;
             state::set_local_mesh_actors(handle, refs)?;
@@ -176,10 +193,10 @@ fn register_static_providers(registry: &PluginRegistry) {
 }
 
 async fn create_storage_backend(
-    config: &MobileInitConfig,
+    db_path: Option<std::path::PathBuf>,
 ) -> Result<Arc<dyn querymt_agent::session::backend::StorageBackend>, FfiErrorCode> {
-    let db_path = match &config.agent.db {
-        Some(path) => std::path::PathBuf::from(path),
+    let db_path = match db_path {
+        Some(path) => path,
         None => querymt_agent::session::backend::default_agent_db_path().map_err(|e| {
             set_last_error(
                 FfiErrorCode::RuntimeError,
@@ -200,77 +217,4 @@ async fn create_storage_backend(
         })?;
 
     Ok(Arc::new(storage))
-}
-
-fn build_single_agent_config(
-    config: &MobileInitConfig,
-) -> Result<querymt_agent::config::SingleAgentConfig, FfiErrorCode> {
-    let agent_part = querymt_agent::config::AgentSettings {
-        provider: config.agent.provider.clone(),
-        model: config.agent.model.clone(),
-        cwd: config.agent.cwd.clone().map(std::path::PathBuf::from),
-        db: config.agent.db.clone().map(std::path::PathBuf::from),
-        tools: config.agent.tools.clone(),
-        system: config
-            .agent
-            .system
-            .iter()
-            .map(|s| querymt_agent::config::SystemPart::Inline(s.clone()))
-            .collect(),
-        api_key: config.agent.api_key.clone(),
-        parameters: config
-            .agent
-            .parameters
-            .clone()
-            .map(|m| m.into_iter().collect()),
-        execution: querymt_agent::config::ExecutionPolicy::default(),
-        skills: querymt_agent::config::SkillsConfig::default(),
-        assume_mutating: true,
-        mutating_tools: vec![],
-    };
-
-    Ok(querymt_agent::config::SingleAgentConfig {
-        agent: agent_part,
-        mcp: vec![],
-        middleware: vec![],
-        mesh: querymt_agent::config::MeshTomlConfig {
-            enabled: config.mesh.enabled,
-            transport: match config.mesh.transport.as_str() {
-                "iroh" => querymt_agent::config::MeshTransportConfig::Iroh,
-                _ => querymt_agent::config::MeshTransportConfig::Lan,
-            },
-            listen: config.mesh.listen.clone(),
-            discovery: match config.mesh.discovery.as_str() {
-                "none" => querymt_agent::config::MeshDiscoveryConfig::None,
-                "kademlia" => querymt_agent::config::MeshDiscoveryConfig::Kademlia,
-                _ => querymt_agent::config::MeshDiscoveryConfig::Mdns,
-            },
-            auto_fallback: config.mesh.auto_fallback,
-            peers: config
-                .mesh
-                .peers
-                .iter()
-                .map(|p| querymt_agent::config::MeshPeerConfig {
-                    name: p.name.clone(),
-                    addr: p.addr.clone(),
-                })
-                .collect(),
-            request_timeout_secs: config.mesh.request_timeout_secs,
-            stream_reconnect_grace_secs: config.mesh.stream_reconnect_grace_secs,
-            identity_file: config.mesh.identity_file.clone(),
-            invite: config.mesh.invite.clone(),
-            node_name: config.mesh.node_name.clone(),
-        },
-        remote_agents: config
-            .remote_agents
-            .iter()
-            .map(|r| querymt_agent::config::RemoteAgentConfig {
-                id: r.id.clone(),
-                name: r.name.clone(),
-                description: r.description.clone(),
-                peer: r.peer.clone(),
-                capabilities: r.capabilities.clone(),
-            })
-            .collect(),
-    })
 }

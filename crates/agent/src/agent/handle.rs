@@ -322,6 +322,50 @@ impl LocalAgentHandle {
         None
     }
 
+    /// Create a new session with already-connected MCP peers.
+    ///
+    /// This is used by mobile FFI clients that manage MCP transport lifetimes
+    /// externally (e.g. pipe transports) and want those tools available in
+    /// each newly created session.
+    pub async fn new_session_with_preconnected(
+        &self,
+        req: NewSessionRequest,
+        preconnected_peers: Vec<crate::agent::session_registry::PreconnectedMcpPeer>,
+    ) -> std::result::Result<NewSessionResponse, Error> {
+        // Auth check stays on LocalAgentHandle (connection-level concern)
+        if let Ok(state) = self.client_state.lock()
+            && let Some(state) = state.as_ref()
+        {
+            let auth_required = !self.config.auth_methods.is_empty();
+
+            if auth_required && !state.authenticated {
+                return Err(Error::auth_required());
+            }
+        }
+
+        // Delegate to kameo SessionRegistry
+        let mut registry = self.registry.lock().await;
+        registry
+            .new_session_with_preconnected(req, preconnected_peers)
+            .await
+    }
+
+    /// Load an existing session with already-connected MCP peers.
+    ///
+    /// This is used by mobile FFI clients that manage MCP transport lifetimes
+    /// externally (e.g. pipe transports) and want those tools available in
+    /// loaded sessions.
+    pub async fn load_session_with_preconnected(
+        &self,
+        req: agent_client_protocol::schema::LoadSessionRequest,
+        preconnected_peers: Vec<crate::agent::session_registry::PreconnectedMcpPeer>,
+    ) -> std::result::Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
+        let mut registry = self.registry.lock().await;
+        registry
+            .load_session_with_preconnected(req, preconnected_peers)
+            .await
+    }
+
     /// Gracefully shutdown the agent and all background tasks.
     pub async fn shutdown(&self) {
         if self.shutdown_done.swap(true, Ordering::SeqCst) {

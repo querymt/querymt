@@ -73,7 +73,7 @@ parking_lot = "0.12"
 moka = { version = "0.12", features = ["future"] }
 
 imara-diff = "0.2"
-rmcp = { version = "1.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "elicitation", "reqwest"] }
+rmcp = { version = "1.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-async-rw", "elicitation", "reqwest"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 rust-embed = { version = "8.6", features = ["axum"] }

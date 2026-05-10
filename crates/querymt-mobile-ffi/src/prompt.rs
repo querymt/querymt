@@ -6,6 +6,7 @@ use crate::state;
 use crate::types::{FfiErrorCode, SessionHistoryResponse, SessionMessage};
 use agent_client_protocol::schema::{CancelNotification, ContentBlock, PromptRequest, TextContent};
 use querymt_agent::agent::handle::AgentHandle;
+use querymt_agent::model::MessagePart;
 use std::ffi::CStr;
 
 pub fn prompt_inner(
@@ -91,7 +92,8 @@ pub fn get_session_history_inner(
                 let parts: Vec<serde_json::Value> = msg
                     .parts
                     .iter()
-                    .map(|part| serde_json::to_value(part).unwrap_or_default())
+                    .filter_map(message_part_to_acp_block)
+                    .filter_map(|block| serde_json::to_value(block).ok())
                     .collect();
                 SessionMessage {
                     role,
@@ -103,7 +105,7 @@ pub fn get_session_history_inner(
             .collect();
 
         let json = serde_json::to_string(&SessionHistoryResponse { messages })
-            .map_err(|e| serde_err(e))?;
+            .map_err(serde_err)?;
         unsafe {
             *out_json = alloc_cstr(&json);
         }
@@ -136,7 +138,7 @@ pub fn get_session_events_inner(
                 FfiErrorCode::RuntimeError
             })?;
 
-        let json = serde_json::to_string(&events).map_err(|e| serde_err(e))?;
+        let json = serde_json::to_string(&events).map_err(serde_err)?;
         unsafe {
             *out_json = alloc_cstr(&json);
         }
@@ -173,5 +175,30 @@ fn ptr_to_opt_string(ptr: *const std::ffi::c_char) -> Option<String> {
         None
     } else {
         unsafe { CStr::from_ptr(ptr).to_str().ok().map(|s| s.to_string()) }
+    }
+}
+
+/// Convert a stored `MessagePart` into an ACP `ContentBlock` for mobile history.
+///
+/// Only displayable parts are converted; tool-use, snapshot, and patch parts
+/// are dropped since the mobile chat UI does not render them from history.
+fn message_part_to_acp_block(part: &MessagePart) -> Option<ContentBlock> {
+    match part {
+        MessagePart::Text { content } => {
+            Some(ContentBlock::Text(TextContent::new(content.clone())))
+        }
+        MessagePart::Prompt { blocks } => {
+            // Prompt blocks are already ACP ContentBlock values; return the
+            // first text block (the user-visible prompt text).
+            blocks.first().cloned()
+        }
+        MessagePart::Reasoning { content, .. } => {
+            // Skip reasoning for mobile history chat bubbles.
+            let _ = content;
+            None
+        }
+        // Tool calls, results, patches, snapshots, compaction — not shown in
+        // mobile chat bubble history.
+        _ => None,
     }
 }

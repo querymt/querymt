@@ -292,7 +292,7 @@ mod remote_impl {
                         cwd_path.clone(),
                         &[],
                         false,
-                        SessionMaterializationOptions {
+                        &mut SessionMaterializationOptions {
                             attach_mesh_handle: true,
                             register_in_dht: true,
                         },
