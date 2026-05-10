@@ -462,6 +462,29 @@ pub unsafe extern "C" fn qmt_mobile_get_session_events(
     ffi_result_code(result)
 }
 
+/// Get the full durable event stream for a session directly from the
+/// attached session actor (works for both local and remote sessions).
+///
+/// This is the mobile equivalent of `session_ref.get_event_stream()`
+/// used by the desktop attach handler. For remote sessions, it queries
+/// the remote session actor over the mesh.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `session_id` must be a valid pointer to a null-terminated C string.
+/// - `out_json` must be a valid pointer to a `*mut c_char` that will receive
+///   an allocated C string. Caller must free it with `qmt_mobile_free_string`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qmt_mobile_get_remote_session_events(
+    agent_handle: u64,
+    session_id: *const std::ffi::c_char,
+    out_json: *mut *mut std::ffi::c_char,
+) -> i32 {
+    let result = prompt::get_remote_session_events_inner(agent_handle, session_id, out_json);
+    ffi_result_code(result)
+}
+
 // ============================================================================
 // Models & Providers
 // ============================================================================
