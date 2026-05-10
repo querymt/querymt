@@ -59,15 +59,46 @@ pub unsafe extern "C" fn qmt_mobile_android_init(
 
 /// Initialize the agent runtime. Call once per agent instance.
 ///
-/// `config_json` is a JSON representation of a mobile agent config.
+/// `config_toml` is an inline TOML config string, parsed by the shared
+/// `querymt_agent::config::load_config` parser. Supports both single-agent
+/// (`[agent]`) and multi-agent/quorum (`[quorum]`/`[planner]`) configs.
 /// On success, `*out_agent` is set to an opaque handle.
+///
+/// Telemetry is controlled via environment variables:
+/// - `QMT_MOBILE_TELEMETRY=1` or `OTEL_EXPORTER_OTLP_ENDPOINT` to enable OTLP.
+///
+/// # Safety
+///
+/// - `config_toml` must be a valid pointer to a null-terminated C string.
+/// - `out_agent` must be a valid pointer to a `u64` that will receive the handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_init_agent(
-    config_json: *const std::ffi::c_char,
+    config_toml: *const std::ffi::c_char,
     out_agent: *mut u64,
 ) -> i32 {
     ffi_panic_boundary("qmt_mobile_init_agent", || unsafe {
-        init_agent_impl(config_json, out_agent)
+        // Parse config using the shared querymt-agent parser.
+        let config_result = agent::parse_config(config_toml);
+        let config = match config_result {
+            Ok(c) => c,
+            Err(code) => return code as i32,
+        };
+
+        // Enter the Tokio runtime context so that telemetry init (hyper-util,
+        // gRPC) and agent startup can find a reactor on this thread.
+        let _rt_guard = runtime::global_runtime().enter();
+
+        // Initialize telemetry/logging from environment (idempotent).
+        events::setup_mobile_telemetry();
+
+        let result = agent::init_agent_from_config(config, out_agent);
+        match result {
+            Ok(()) => {
+                ffi_helpers::clear_last_error();
+                FfiErrorCode::Ok as i32
+            }
+            Err(code) => code as i32,
+        }
     })
 }
 
@@ -76,6 +107,10 @@ pub unsafe extern "C" fn qmt_mobile_init_agent(
 /// Returns `QMT_MOBILE_BUSY` if the agent has active FFI calls.
 /// Is idempotent only after the first successful shutdown; later calls with the
 /// same stale handle return `QMT_MOBILE_NOT_FOUND`.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_shutdown(agent_handle: u64) -> i32 {
     let result = agent::shutdown_agent_inner(agent_handle);
@@ -92,6 +127,10 @@ pub unsafe extern "C" fn qmt_mobile_shutdown(agent_handle: u64) -> i32 {
 ///
 /// Mesh networking stays alive while backgrounded. Foreground-only user
 /// operations return `QMT_MOBILE_INVALID_STATE` while backgrounded.
+///
+/// # Safety
+///
+/// No additional safety requirements beyond calling from a valid thread context.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_set_backgrounded(backgrounded: i32) -> i32 {
     ffi_helpers::set_backgrounded(backgrounded != 0);
@@ -103,6 +142,12 @@ pub unsafe extern "C" fn qmt_mobile_set_backgrounded(backgrounded: i32) -> i32 {
 // ============================================================================
 
 /// Create a new local session.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `options_json` must be a valid pointer to a null-terminated C string, or null.
+/// - `out_session` must be a valid pointer to a `u64` that will receive the handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_create_session(
     agent_handle: u64,
@@ -115,6 +160,14 @@ pub unsafe extern "C" fn qmt_mobile_create_session(
 
 /// Create a new local session and return both the FFI handle and the real
 /// session ID string.  `out_session_id` must be freed with `qmt_mobile_free_string`.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `options_json` must be a valid pointer to a null-terminated C string, or null.
+/// - `out_session` must be a valid pointer to a `u64` that will receive the handle.
+/// - `out_session_id` must be a valid pointer to a `*mut c_char` that will receive
+///   an allocated C string. Caller must free it with `qmt_mobile_free_string`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_create_session_with_id(
     agent_handle: u64,
@@ -132,6 +185,12 @@ pub unsafe extern "C" fn qmt_mobile_create_session_with_id(
 }
 
 /// Load an existing local session from persistent storage.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `session_id` must be a valid pointer to a null-terminated C string.
+/// - `out_session` must be a valid pointer to a `u64` that will receive the handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_load_session(
     agent_handle: u64,
@@ -143,6 +202,12 @@ pub unsafe extern "C" fn qmt_mobile_load_session(
 }
 
 /// List persisted local sessions.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `out_json` must be a valid pointer to a `*mut c_char` that will receive
+///   an allocated C string. Caller must free it with `qmt_mobile_free_string`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_list_sessions(
     agent_handle: u64,
@@ -153,6 +218,11 @@ pub unsafe extern "C" fn qmt_mobile_list_sessions(
 }
 
 /// Delete a local session and all associated FFI session handles.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `session_id` must be a valid pointer to a null-terminated C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_delete_session(
     agent_handle: u64,
@@ -167,6 +237,12 @@ pub unsafe extern "C" fn qmt_mobile_delete_session(
 // ============================================================================
 
 /// List local and reachable remote mesh nodes.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `out_json` must be a valid pointer to a `*mut c_char` that will receive
+///   an allocated C string. Caller must free it with `qmt_mobile_free_string`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_list_nodes(
     agent_handle: u64,
@@ -177,6 +253,13 @@ pub unsafe extern "C" fn qmt_mobile_list_nodes(
 }
 
 /// Create a session on a specific node. Null/empty node_id creates local session.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `node_id` must be a valid pointer to a null-terminated C string, or null.
+/// - `options_json` must be a valid pointer to a null-terminated C string, or null.
+/// - `out_session` must be a valid pointer to a `u64` that will receive the handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_create_session_on_node(
     agent_handle: u64,
@@ -192,6 +275,15 @@ pub unsafe extern "C" fn qmt_mobile_create_session_on_node(
 /// Create a session on a specific node and return both the FFI handle and the
 /// real session ID string.  `out_session_id` must be freed with
 /// `qmt_mobile_free_string`.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `node_id` must be a valid pointer to a null-terminated C string, or null.
+/// - `options_json` must be a valid pointer to a null-terminated C string, or null.
+/// - `out_session` must be a valid pointer to a `u64` that will receive the handle.
+/// - `out_session_id` must be a valid pointer to a `*mut c_char` that will receive
+///   an allocated C string. Caller must free it with `qmt_mobile_free_string`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_create_session_on_node_with_id(
     agent_handle: u64,
@@ -211,6 +303,13 @@ pub unsafe extern "C" fn qmt_mobile_create_session_on_node_with_id(
 }
 
 /// List sessions available on a remote node.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `node_id` must be a valid pointer to a null-terminated C string.
+/// - `out_json` must be a valid pointer to a `*mut c_char` that will receive
+///   an allocated C string. Caller must free it with `qmt_mobile_free_string`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_list_remote_sessions(
     agent_handle: u64,
@@ -222,6 +321,13 @@ pub unsafe extern "C" fn qmt_mobile_list_remote_sessions(
 }
 
 /// Attach/resume an existing remote session.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `node_id` must be a valid pointer to a null-terminated C string.
+/// - `session_id` must be a valid pointer to a null-terminated C string.
+/// - `out_session` must be a valid pointer to a `u64` that will receive the handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_attach_remote_session(
     agent_handle: u64,
@@ -234,6 +340,13 @@ pub unsafe extern "C" fn qmt_mobile_attach_remote_session(
 }
 
 /// Create an invite token.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `options_json` must be a valid pointer to a null-terminated C string, or null.
+/// - `out_json` must be a valid pointer to a `*mut c_char` that will receive
+///   an allocated C string. Caller must free it with `qmt_mobile_free_string`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_create_invite(
     agent_handle: u64,
@@ -245,6 +358,13 @@ pub unsafe extern "C" fn qmt_mobile_create_invite(
 }
 
 /// Join a mesh from an invite token after agent initialization.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `invite_token` must be a valid pointer to a null-terminated C string.
+/// - `out_json` must be a valid pointer to a `*mut c_char` that will receive
+///   an allocated C string. Caller must free it with `qmt_mobile_free_string`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_join_mesh(
     agent_handle: u64,
@@ -256,6 +376,12 @@ pub unsafe extern "C" fn qmt_mobile_join_mesh(
 }
 
 /// Return local mesh state for UI/debugging.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `out_json` must be a valid pointer to a `*mut c_char` that will receive
+///   an allocated C string. Caller must free it with `qmt_mobile_free_string`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_mesh_status(
     agent_handle: u64,
@@ -270,6 +396,13 @@ pub unsafe extern "C" fn qmt_mobile_mesh_status(
 // ============================================================================
 
 /// Send a user prompt to an active session.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `session_handle` must be a valid session handle.
+/// - `content_json` must be a valid pointer to a null-terminated C string.
+/// - `request_id` must be a valid pointer to a null-terminated C string, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_prompt(
     agent_handle: u64,
@@ -282,6 +415,11 @@ pub unsafe extern "C" fn qmt_mobile_prompt(
 }
 
 /// Cancel active execution in a session.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `session_handle` must be a valid session handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_cancel(agent_handle: u64, session_handle: u64) -> i32 {
     let result = prompt::cancel_inner(agent_handle, session_handle);
@@ -289,6 +427,13 @@ pub unsafe extern "C" fn qmt_mobile_cancel(agent_handle: u64, session_handle: u6
 }
 
 /// Get persisted session history.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `session_id` must be a valid pointer to a null-terminated C string.
+/// - `out_json` must be a valid pointer to a `*mut c_char` that will receive
+///   an allocated C string. Caller must free it with `qmt_mobile_free_string`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_get_session_history(
     agent_handle: u64,
@@ -300,6 +445,13 @@ pub unsafe extern "C" fn qmt_mobile_get_session_history(
 }
 
 /// Get durable agent events for a session.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `session_id` must be a valid pointer to a null-terminated C string.
+/// - `out_json` must be a valid pointer to a `*mut c_char` that will receive
+///   an allocated C string. Caller must free it with `qmt_mobile_free_string`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_get_session_events(
     agent_handle: u64,
@@ -315,6 +467,13 @@ pub unsafe extern "C" fn qmt_mobile_get_session_events(
 // ============================================================================
 
 /// List available local and mesh-routable models.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `out_json` must be a valid pointer to a `*mut c_char` that will receive
+///   an allocated C string. Caller must free it with `qmt_mobile_free_string`.
+/// - `traceparent` must be a valid pointer to a null-terminated C string, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_list_models(
     agent_handle: u64,
@@ -326,6 +485,14 @@ pub unsafe extern "C" fn qmt_mobile_list_models(
 }
 
 /// Set the model/provider for a session.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `session_handle` must be a valid session handle.
+/// - `provider` must be a valid pointer to a null-terminated C string.
+/// - `model` must be a valid pointer to a null-terminated C string.
+/// - `node_id` must be a valid pointer to a null-terminated C string, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_set_session_model(
     agent_handle: u64,
@@ -342,6 +509,14 @@ pub unsafe extern "C" fn qmt_mobile_set_session_model(
 /// Set a session config option (mode, reasoning effort, etc.).
 /// request_json: ACP SetSessionConfigOptionRequest JSON.
 /// out_json: receives the SetSessionConfigOptionResponse JSON. Must be freed with qmt_mobile_free_string.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `session_handle` must be a valid session handle.
+/// - `request_json` must be a valid pointer to a null-terminated C string.
+/// - `out_json` must be a valid pointer to a `*mut c_char` that will receive
+///   an allocated C string. Caller must free it with `qmt_mobile_free_string`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_set_session_config_option(
     agent_handle: u64,
@@ -362,26 +537,14 @@ pub unsafe extern "C" fn qmt_mobile_set_session_config_option(
 // MCP Server Registration
 // ============================================================================
 
-/// Register an in-process MCP server via callback functions.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn qmt_mobile_register_inproc_mcp(
-    agent_handle: u64,
-    server_name: *const std::ffi::c_char,
-    handler: Option<events::McpHandlerFn>,
-    free_response: Option<events::McpFreeFn>,
-    user_data: *mut std::ffi::c_void,
-) -> i32 {
-    let result = mcp::register_inproc_mcp_inner(
-        agent_handle,
-        server_name,
-        handler,
-        free_response,
-        user_data,
-    );
-    ffi_result_code(result)
-}
-
 /// Register an in-process MCP server via platform pipes.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `server_name` must be a valid pointer to a null-terminated C string.
+/// - `out_read_fd` must be a valid pointer to an `i32` that will receive the read FD.
+/// - `out_write_fd` must be a valid pointer to an `i32` that will receive the write FD.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_register_inproc_mcp_pipe(
     agent_handle: u64,
@@ -395,6 +558,11 @@ pub unsafe extern "C" fn qmt_mobile_register_inproc_mcp_pipe(
 }
 
 /// Unregister a previously registered MCP server.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - `server_name` must be a valid pointer to a null-terminated C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_unregister_inproc_mcp(
     agent_handle: u64,
@@ -409,6 +577,13 @@ pub unsafe extern "C" fn qmt_mobile_unregister_inproc_mcp(
 // ============================================================================
 
 /// Set the event handler callback for an agent.
+///
+/// # Safety
+///
+/// - `agent_handle` must be a valid handle returned by `qmt_mobile_init_agent`.
+/// - If `handler` is non-null, `user_data` must remain valid for the lifetime
+///   of the registration (until the agent is shut down or a new handler is set).
+/// - The `handler` function pointer must be safe to call from any thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_set_event_handler(
     agent_handle: u64,
@@ -433,7 +608,6 @@ pub unsafe extern "C" fn qmt_mobile_set_event_handler(
             });
             // Wire up the event subscription
             let mut rx = record.agent.subscribe();
-            let agent_handle = agent_handle;
             let user_data_bits = user_data as usize;
             std::thread::spawn(move || {
                 let user_data = user_data_bits as *mut std::ffi::c_void;
@@ -486,6 +660,12 @@ pub unsafe extern "C" fn qmt_mobile_set_event_handler(
 }
 
 /// Set the global log handler callback.
+///
+/// # Safety
+///
+/// - If `handler` is non-null, `user_data` must remain valid for the lifetime
+///   of the process or until a new handler is set.
+/// - The `handler` function pointer must be safe to call from any thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_set_log_handler(
     handler: Option<events::LogHandlerFn>,
@@ -508,6 +688,10 @@ pub unsafe extern "C" fn qmt_mobile_set_log_handler(
 // ============================================================================
 
 /// Return the last error code for the calling thread.
+///
+/// # Safety
+///
+/// No additional safety requirements beyond calling from a valid thread context.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_last_error_code() -> i32 {
     take_last_error_code() as i32
@@ -515,6 +699,10 @@ pub unsafe extern "C" fn qmt_mobile_last_error_code() -> i32 {
 
 /// Return a human-readable name for an error code.
 /// Caller must free the returned string with `qmt_mobile_free_string`.
+///
+/// # Safety
+///
+/// No additional safety requirements. The `error_code` parameter is a plain `i32`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_error_name(error_code: i32) -> *mut std::ffi::c_char {
     match error_code {
@@ -532,12 +720,22 @@ pub unsafe extern "C" fn qmt_mobile_error_name(error_code: i32) -> *mut std::ffi
 
 /// Return the last error message for the calling thread.
 /// Caller must free the returned string with `qmt_mobile_free_string`.
+///
+/// # Safety
+///
+/// No additional safety requirements beyond calling from a valid thread context.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_last_error_message() -> *mut std::ffi::c_char {
     alloc_string(&take_last_error_message())
 }
 
 /// Free a string allocated by the FFI layer. NULL is a no-op.
+///
+/// # Safety
+///
+/// - `ptr` must be either NULL or a pointer previously returned by an FFI
+///   function that allocates a C string. The pointer must not have been freed
+///   already, and must not be used after this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_mobile_free_string(ptr: *mut std::ffi::c_char) {
     if !ptr.is_null() {
@@ -589,25 +787,6 @@ unsafe fn android_init_impl(env: *mut std::ffi::c_void, context: *mut std::ffi::
             FfiErrorCode::RuntimeError as i32
         }
     }
-}
-
-unsafe fn init_agent_impl(config_json: *const std::ffi::c_char, out_agent: *mut u64) -> i32 {
-    // Parse config first so we can extract telemetry settings.
-    let config_result = agent::parse_config(config_json);
-    let config = match config_result {
-        Ok(c) => c,
-        Err(code) => return code as i32,
-    };
-
-    // Enter the Tokio runtime context so that telemetry init (hyper-util,
-    // gRPC) and agent startup can find a reactor on this thread.
-    let _rt_guard = runtime::global_runtime().enter();
-
-    // Initialize telemetry/logging based on config (idempotent).
-    events::setup_mobile_telemetry(&config.telemetry);
-
-    let result = agent::init_agent_from_config(config, out_agent);
-    ffi_result_code(result)
 }
 
 fn ffi_panic_boundary<F>(function_name: &'static str, f: F) -> i32
