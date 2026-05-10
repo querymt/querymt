@@ -187,6 +187,14 @@ int32_t qmt_mobile_get_session_events(
     char **out_json
 );
 
+/// Get the full durable event stream for a session from the attached session
+/// actor (works for both local and remote sessions).
+int32_t qmt_mobile_get_remote_session_events(
+    uint64_t agent_handle,
+    const char *session_id,
+    char **out_json
+);
+
 // ============================================================================
 // Models & Providers
 // ============================================================================

@@ -6,6 +6,7 @@ use crate::state;
 use crate::types::{FfiErrorCode, SessionHistoryResponse, SessionMessage};
 use agent_client_protocol::schema::{CancelNotification, ContentBlock, PromptRequest, TextContent};
 use querymt_agent::agent::handle::AgentHandle;
+use querymt_agent::agent::remote::actor_ref::SessionActorRef;
 use querymt_agent::model::MessagePart;
 use std::ffi::CStr;
 
@@ -137,6 +138,68 @@ pub fn get_session_events_inner(
                 );
                 FfiErrorCode::RuntimeError
             })?;
+
+        let json = serde_json::to_string(&events).map_err(serde_err)?;
+        unsafe {
+            *out_json = alloc_cstr(&json);
+        }
+        Ok(())
+    })
+}
+
+/// Get the full durable event stream for a session from the attached session
+/// actor (works for both local and remote sessions).
+///
+/// This is the mobile equivalent of `session_ref.get_event_stream()` used by
+/// the desktop attach handler — it queries the session actor via the registry
+/// rather than reading a local storage backend. For remote sessions, the
+/// request is forwarded over the mesh to the remote session actor.
+pub fn get_remote_session_events_inner(
+    agent_handle: u64,
+    session_id: *const std::ffi::c_char,
+    out_json: *mut *mut std::ffi::c_char,
+) -> Result<(), FfiErrorCode> {
+    check_not_backgrounded()?;
+    if session_id.is_null() || out_json.is_null() {
+        return Err(invalid_arg("Null pointer"));
+    }
+
+    let sid = cstr_to_string(session_id)?;
+    let runtime = global_runtime();
+    runtime.block_on(async {
+        let agent = state::with_agent_read(agent_handle, |r| Ok(r.agent.handle()))?;
+
+        // Look up the session in the kameo session registry
+        let session_ref = {
+            let registry = agent.registry.lock().await;
+            registry
+                .get(&sid)
+                .cloned()
+                .ok_or_else(|| {
+                    set_last_error(
+                        FfiErrorCode::NotFound,
+                        format!("Session {sid} not found in registry"),
+                    );
+                    FfiErrorCode::NotFound
+                })
+        }?;
+
+        // Get the full event stream from the session actor
+        let events = session_ref
+            .get_event_stream()
+            .await
+            .map_err(|e| {
+                set_last_error(
+                    FfiErrorCode::RuntimeError,
+                    format!("Failed to get event stream: {e}"),
+                );
+                FfiErrorCode::RuntimeError
+            })?;
+
+        log::info!(
+            "[get_remote_session_events] session={sid} returned {} events",
+            events.len()
+        );
 
         let json = serde_json::to_string(&events).map_err(serde_err)?;
         unsafe {
