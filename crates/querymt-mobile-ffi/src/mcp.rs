@@ -7,8 +7,8 @@ use crate::ffi_helpers::set_last_error;
 use crate::state;
 use crate::types::FfiErrorCode;
 use querymt_agent::agent::session_registry::PreconnectedMcpPeer;
-use rmcp::service::{Peer, RunningService, serve_client};
 use rmcp::RoleClient;
+use rmcp::service::{Peer, RunningService, serve_client};
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -189,13 +189,14 @@ pub fn register_inproc_mcp_pipe_inner(
 fn ensure_not_duplicate(name: &str, agent_handle: u64) -> Result<(), FfiErrorCode> {
     let regs = MCP_REGISTRATIONS.lock();
     if let Some(agent_regs) = regs.get(&agent_handle)
-        && agent_regs.contains_key(name) {
-            set_last_error(
-                FfiErrorCode::AlreadyExists,
-                format!("MCP server '{name}' already registered"),
-            );
-            return Err(FfiErrorCode::AlreadyExists);
-        }
+        && agent_regs.contains_key(name)
+    {
+        set_last_error(
+            FfiErrorCode::AlreadyExists,
+            format!("MCP server '{name}' already registered"),
+        );
+        return Err(FfiErrorCode::AlreadyExists);
+    }
     Ok(())
 }
 
@@ -251,15 +252,13 @@ async fn connect_one_pipe_server(
         querymt_agent::agent::core::McpToolState::empty(),
     );
 
-    let running = serve_client(handler, transport)
-        .await
-        .map_err(|e| {
-            set_last_error(
-                FfiErrorCode::RuntimeError,
-                format!("failed to connect in-process MCP pipe {server_name}: {e}"),
-            );
-            FfiErrorCode::RuntimeError
-        })?;
+    let running = serve_client(handler, transport).await.map_err(|e| {
+        set_last_error(
+            FfiErrorCode::RuntimeError,
+            format!("failed to connect in-process MCP pipe {server_name}: {e}"),
+        );
+        FfiErrorCode::RuntimeError
+    })?;
 
     let peer = running.peer().clone();
     log::info!("Connected in-process MCP pipe server: {server_name}");
@@ -312,10 +311,7 @@ pub async fn collect_preconnected_mcp_servers(
             let InprocMcpServer::Pipe(pipe_server) = server;
             if let Some(connected) = &pipe_server.connected {
                 // Already connected — just clone the peer.
-                preconnected.push((
-                    name.clone(),
-                    connected.peer.clone(),
-                ));
+                preconnected.push((name.clone(), connected.peer.clone()));
             } else if pipe_server.rust_read_fd >= 0 && pipe_server.rust_write_fd >= 0 {
                 // Not yet connected and FDs are valid — take ownership.
                 pending_connects.push(PendingPipeConnect {
@@ -345,11 +341,10 @@ pub async fn collect_preconnected_mcp_servers(
                 // Phase 3: re-lock and store the connected peer.
                 let mut regs = MCP_REGISTRATIONS.lock();
                 if let Some(agent_regs) = regs.get_mut(&agent_handle)
-                    && let Some(InprocMcpServer::Pipe(pipe_server)) =
-                        agent_regs.get_mut(&name)
-                    {
-                        pipe_server.connected = Some(connected);
-                    }
+                    && let Some(InprocMcpServer::Pipe(pipe_server)) = agent_regs.get_mut(&name)
+                {
+                    pipe_server.connected = Some(connected);
+                }
             }
             Err(e) => {
                 log::warn!(

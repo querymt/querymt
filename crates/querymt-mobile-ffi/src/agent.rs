@@ -12,9 +12,7 @@ use std::sync::Arc;
 
 /// Parse inline TOML config using the shared `querymt_agent::config::load_config`
 /// parser. Returns a `Config` (Single or Multi) or an error code.
-pub fn parse_config(
-    config_toml: *const std::ffi::c_char,
-) -> Result<Config, FfiErrorCode> {
+pub fn parse_config(config_toml: *const std::ffi::c_char) -> Result<Config, FfiErrorCode> {
     if config_toml.is_null() {
         set_last_error(
             FfiErrorCode::InvalidArgument,
@@ -49,10 +47,7 @@ pub fn parse_config(
 
 /// Create the agent from an already-parsed config. The caller should have
 /// already called `events::setup_mobile_telemetry()`.
-pub fn init_agent_from_config(
-    config: Config,
-    out_agent: *mut u64,
-) -> Result<(), FfiErrorCode> {
+pub fn init_agent_from_config(config: Config, out_agent: *mut u64) -> Result<(), FfiErrorCode> {
     if out_agent.is_null() {
         set_last_error(
             FfiErrorCode::InvalidArgument,

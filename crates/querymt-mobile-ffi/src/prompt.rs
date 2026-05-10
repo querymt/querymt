@@ -105,8 +105,8 @@ pub fn get_session_history_inner(
             })
             .collect();
 
-        let json = serde_json::to_string(&SessionHistoryResponse { messages })
-            .map_err(serde_err)?;
+        let json =
+            serde_json::to_string(&SessionHistoryResponse { messages }).map_err(serde_err)?;
         unsafe {
             *out_json = alloc_cstr(&json);
         }
@@ -172,29 +172,23 @@ pub fn get_remote_session_events_inner(
         // Look up the session in the kameo session registry
         let session_ref = {
             let registry = agent.registry.lock().await;
-            registry
-                .get(&sid)
-                .cloned()
-                .ok_or_else(|| {
-                    set_last_error(
-                        FfiErrorCode::NotFound,
-                        format!("Session {sid} not found in registry"),
-                    );
-                    FfiErrorCode::NotFound
-                })
+            registry.get(&sid).cloned().ok_or_else(|| {
+                set_last_error(
+                    FfiErrorCode::NotFound,
+                    format!("Session {sid} not found in registry"),
+                );
+                FfiErrorCode::NotFound
+            })
         }?;
 
         // Get the full event stream from the session actor
-        let events = session_ref
-            .get_event_stream()
-            .await
-            .map_err(|e| {
-                set_last_error(
-                    FfiErrorCode::RuntimeError,
-                    format!("Failed to get event stream: {e}"),
-                );
-                FfiErrorCode::RuntimeError
-            })?;
+        let events = session_ref.get_event_stream().await.map_err(|e| {
+            set_last_error(
+                FfiErrorCode::RuntimeError,
+                format!("Failed to get event stream: {e}"),
+            );
+            FfiErrorCode::RuntimeError
+        })?;
 
         log::info!(
             "[get_remote_session_events] session={sid} returned {} events",
