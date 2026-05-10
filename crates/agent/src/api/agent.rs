@@ -417,10 +417,21 @@ impl AgentBuilder {
         }
 
         if !self.tools.is_empty() {
-            // Use BuiltInAndProvider when MCP servers are also configured so
-            // that MCP tool definitions reach the LLM.  With BuiltInOnly the
-            // collect_tools() gate strips them out entirely.
-            let policy = if !self.mcp_servers.is_empty() {
+            // Infer tool policy from the tools list:
+            // - If any tool spec looks like an external/MCP pattern (contains a
+            //   dot separator like "server.*" or "server.tool"), use
+            //   BuiltInAndProvider so MCP tool definitions reach the LLM.
+            // - Otherwise BuiltInOnly is sufficient.
+            //
+            // This handles both config-based MCP servers and preconnected
+            // runtime MCP peers (e.g. mobile in-process MCP), since the tools
+            // list already declares the intended tool scope.
+            let has_external_tools = self.tools.iter().any(|t| {
+                // MCP-style specs contain a dot: "server.*" or "server.tool_name"
+                // while builtins are plain names like "create_task", "read_tool".
+                t.contains('.') || self.mcp_servers.iter().any(|m| t == m.name())
+            });
+            let policy = if has_external_tools || !self.mcp_servers.is_empty() {
                 ToolPolicy::BuiltInAndProvider
             } else {
                 ToolPolicy::BuiltInOnly

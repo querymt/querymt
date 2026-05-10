@@ -6,17 +6,15 @@
 //!
 //! ## Telemetry
 //!
-//! When `MobileTelemetryConfig::enabled` is true, the FFI layer initializes
-//! `querymt_utils::telemetry::setup_telemetry` which installs a
-//! `tracing_subscriber` with OTLP export (traces + logs over gRPC) and a
-//! console layer. A custom `FfiCallbackLayer` forwards all `tracing` events
-//! to the native log callback (Swift/Android JNI) as well, so logs reach
-//! both OTLP *and* the app UI.
+//! Telemetry is controlled via environment variables:
+//! - `QMT_MOBILE_TELEMETRY=1` or `OTEL_EXPORTER_OTLP_ENDPOINT` — enables OTLP
+//!   traces + logs export via gRPC.
+//! - `QMT_TELEMETRY_LEVEL` — log level for telemetry (default: `info`).
 //!
-//! When telemetry is disabled, only the FFI callback logger is installed
-//! (using the simpler `log` crate path).
+//! When telemetry is not enabled via env, only the FFI callback logger is
+//! installed (using the simpler `log` crate path).
 
-use crate::types::{FfiErrorCode, MobileTelemetryConfig};
+use crate::types::FfiErrorCode;
 use std::sync::Mutex;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
@@ -41,18 +39,6 @@ pub type LogHandlerFn = unsafe extern "C" fn(
     message: *const std::ffi::c_char,
     user_data: *mut std::ffi::c_void,
 );
-
-/// C free function for MCP response strings.
-/// Use `Option<McpFreeFn>` for nullable parameters.
-pub type McpFreeFn =
-    unsafe extern "C" fn(ptr: *mut std::ffi::c_char, user_data: *mut std::ffi::c_void);
-
-/// C handler function for MCP requests.
-/// Use `Option<McpHandlerFn>` for nullable parameters.
-pub type McpHandlerFn = unsafe extern "C" fn(
-    request_json: *const std::ffi::c_char,
-    user_data: *mut std::ffi::c_void,
-) -> *mut std::ffi::c_char;
 
 // ─── Registered Callback State ──────────────────────────────────────────────
 
@@ -208,16 +194,14 @@ pub fn active_otlp_endpoint() -> Option<String> {
 
 /// Initialize the logging/telemetry subsystem.
 ///
-/// When `config.enabled` is true, sets up a full `tracing_subscriber` with:
-/// - OTLP traces + logs export via gRPC
-/// - Console (fmt) layer for stderr
-/// - FFI callback layer forwarding to native log handler
-///
-/// When telemetry is disabled, falls back to a simple `log`-crate logger
-/// that only forwards to the FFI callback.
+/// Checks environment variables to decide whether to enable OTLP telemetry:
+/// - `QMT_MOBILE_TELEMETRY=1` or a non-empty `OTEL_EXPORTER_OTLP_ENDPOINT`
+///   enables full telemetry (tracing subscriber with OTLP + FFI callback).
+/// - Otherwise falls back to a simple `log`-crate logger that only forwards
+///   to the FFI callback.
 ///
 /// This function is idempotent; subsequent calls are no-ops.
-pub fn setup_mobile_telemetry(config: &MobileTelemetryConfig) {
+pub fn setup_mobile_telemetry() {
     if LOGGER_INITIALIZED
         .compare_exchange(
             false,
@@ -231,15 +215,22 @@ pub fn setup_mobile_telemetry(config: &MobileTelemetryConfig) {
         return;
     }
 
-    if config.enabled {
-        init_telemetry(config);
+    let telemetry_enabled = std::env::var("QMT_MOBILE_TELEMETRY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+        || std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+
+    if telemetry_enabled {
+        init_telemetry();
     } else {
         init_fallback_logger();
     }
 }
 
 /// Full telemetry init: tracing subscriber with OTLP + FFI callback layers.
-fn init_telemetry(_config: &MobileTelemetryConfig) {
+fn init_telemetry() {
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
     use tracing_opentelemetry::OpenTelemetryLayer;
@@ -328,8 +319,7 @@ fn init_fallback_logger() {
     let _ = log::set_boxed_logger(Box::new(FfiLogger));
 }
 
-/// Backwards-compatible entry point. Equivalent to
-/// `setup_mobile_telemetry(&MobileTelemetryConfig::default())`.
+/// Backwards-compatible entry point. Equivalent to `setup_mobile_telemetry()`.
 pub fn ensure_logger() {
-    setup_mobile_telemetry(&MobileTelemetryConfig::default());
+    setup_mobile_telemetry();
 }

@@ -105,6 +105,12 @@ pub struct ActiveCallTracker {
     active: Mutex<HashSet<u64>>,
 }
 
+impl Default for ActiveCallTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ActiveCallTracker {
     pub fn new() -> Self {
         Self {
