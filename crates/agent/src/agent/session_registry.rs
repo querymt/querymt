@@ -250,9 +250,7 @@ impl SessionRegistry {
                 None
             });
         #[cfg(not(feature = "remote"))]
-        let actor = {
-            SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone())
-        };
+        let actor = { SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone()) };
         let actor_ref = SessionActor::spawn(actor);
         let session_ref = SessionActorRef::from(actor_ref.clone());
 

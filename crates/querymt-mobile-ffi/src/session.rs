@@ -49,29 +49,31 @@ pub fn create_session_with_id_inner(
         let preconnected = mcp::collect_preconnected_mcp_servers(agent_handle).await?;
 
         let req = match &options.cwd {
-            Some(cwd) => {
-                NewSessionRequest::new(std::path::PathBuf::from(cwd))
-            }
+            Some(cwd) => NewSessionRequest::new(std::path::PathBuf::from(cwd)),
             None => NewSessionRequest::new(std::path::PathBuf::new()),
         };
 
         // Use new_session_with_preconnected to create the session and merge
         // preconnected MCP peer tools into the session tool state.
-        let resp = inner.new_session_with_preconnected(req, preconnected).await.map_err(|e| {
-            set_last_error(
-                FfiErrorCode::RuntimeError,
-                format!("Failed to create session: {e}"),
-            );
-            FfiErrorCode::RuntimeError
-        })?;
+        let resp = inner
+            .new_session_with_preconnected(req, preconnected)
+            .await
+            .map_err(|e| {
+                set_last_error(
+                    FfiErrorCode::RuntimeError,
+                    format!("Failed to create session: {e}"),
+                );
+                FfiErrorCode::RuntimeError
+            })?;
 
         let session_id = resp.session_id.to_string();
 
         // Apply provider/model overrides if provided
         if let (Some(provider), Some(model)) = (&options.provider, &options.model)
-            && let Err(e) = inner.set_provider(&session_id, provider, model).await {
-                log::warn!("Failed to set session provider/model: {e}");
-            }
+            && let Err(e) = inner.set_provider(&session_id, provider, model).await
+        {
+            log::warn!("Failed to set session provider/model: {e}");
+        }
 
         let s_handle =
             state::register_session(agent_handle, session_id.clone(), false, None, None)?;
@@ -109,12 +111,15 @@ pub fn load_session_inner(
         match session {
             Some(_) => {
                 // Collect preconnected MCP pipe peers (lazily connected once).
-        let preconnected = mcp::collect_preconnected_mcp_servers(agent_handle).await?;
+                let preconnected = mcp::collect_preconnected_mcp_servers(agent_handle).await?;
 
                 let load_req = LoadSessionRequest::new(sid.clone(), std::path::PathBuf::new());
-                let _ = inner.load_session_with_preconnected(load_req, preconnected).await.map_err(|e| {
-                    log::warn!("Failed to load session with MCP peers: {e}");
-                });
+                let _ = inner
+                    .load_session_with_preconnected(load_req, preconnected)
+                    .await
+                    .map_err(|e| {
+                        log::warn!("Failed to load session with MCP peers: {e}");
+                    });
 
                 let s_handle = state::register_session(agent_handle, sid, false, None, None)?;
                 unsafe {

@@ -34,8 +34,8 @@ pub fn list_models_inner(
         #[cfg(not(feature = "remote"))]
         let models = agent.model_registry.get_all_models(&agent.config).await;
 
-        let json = serde_json::to_string(&serde_json::json!({ "models": models }))
-            .map_err(serde_err)?;
+        let json =
+            serde_json::to_string(&serde_json::json!({ "models": models })).map_err(serde_err)?;
         unsafe {
             *out_json = alloc_cstr(&json);
         }
