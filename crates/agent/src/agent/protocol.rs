@@ -10,8 +10,7 @@ use rmcp::{
     model::Implementation,
     service::{RunningService, serve_client},
     transport::{
-        StreamableHttpClientTransport,
-        child_process::TokioChildProcess,
+        StreamableHttpClientTransport, child_process::TokioChildProcess,
         streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
