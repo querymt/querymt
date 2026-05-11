@@ -36,7 +36,6 @@ const TOOL_ICONS: Record<string, string> = {
   mcp_write: '📝',
   edit: '✏️',
   mcp_edit: '✏️',
-  apply_patch: '🔧',
   
   // Search/explore
   glob: '🔍',
@@ -155,9 +154,7 @@ export function extractKeyParam(toolKind: string | undefined, rawInput: unknown)
     case 'fetch':
       return truncate(String(obj.url || ''), 50);
       
-    case 'apply_patch':
-      return extractPatchFilePath(obj);
-      
+    
     default:
       // Try to find any file-like parameter
       const filePath = extractFilePath(obj);
@@ -203,16 +200,6 @@ export function calculateDiffStats(toolKind: string | undefined, rawInput: unkno
     }
   }
   
-  if (normalized === 'apply_patch') {
-    const patch = String(obj.patch || '');
-    const filePath = extractPatchFilePath(obj);
-    
-    if (patch) {
-      const additions = (patch.match(/^\+[^+]/gm) || []).length;
-      const deletions = (patch.match(/^-[^-]/gm) || []).length;
-      return { additions, deletions, filePath };
-    }
-  }
   
   return undefined;
 }
@@ -328,21 +315,6 @@ function extractDelegateInfo(obj: Record<string, unknown>): string | undefined {
   if (typeof description === 'string') {
     return truncate(description, 40);
   }
-  return undefined;
-}
-
-function extractPatchFilePath(obj: Record<string, unknown>): string | undefined {
-  // Try direct file path first
-  const direct = extractFilePath(obj);
-  if (direct) return direct;
-  
-  // Try to extract from patch content
-  const patch = String(obj.patch || '');
-  const match = patch.match(/^(?:---|\+\+\+)\s+[ab]\/(.+)$/m);
-  if (match?.[1]) {
-    return truncate(match[1], 50);
-  }
-  
   return undefined;
 }
 

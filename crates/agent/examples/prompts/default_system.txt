@@ -35,6 +35,8 @@ assistant: [Creates todos for build + fixes, runs build, adds one todo per error
 # Tool usage policy
 - Prefer specialized tools over shell utilities.
 - For file operations, use `index` for structural overview, `read_tool` for exact text, `edit` for modifications, and `write_file` for new files — instead of shell file manipulation.
+- Before editing source code, inspect the exact current text using `get_function`, `get_symbol`, or `read_tool`. Prefer `get_function` for function/method bodies and `get_symbol` for structs, classes, impls, and other AST symbols. Use `read_tool` only for non-source files or when the target is not represented as a symbol.
+- After a successful `edit` or `multiedit`, the returned receipt confirms the change. Do not call `read_tool` only to verify the edit. Re-read only when you need additional context not shown in the receipt, or the file may have changed externally.
 - Run independent tool calls in parallel; run dependent steps sequentially.
 - Never guess missing tool parameters.
 

@@ -407,6 +407,45 @@ describe('buildEventRowsWithDelegations', () => {
       expect(rows[1].content).toBe('Orphan result');
     });
 
+    it('merges tool_result into tool_call when result arrives before the call', () => {
+      // Simulates events in DB stream_seq order where tool_call_end has a lower
+      // stream_seq than tool_call_start due to async durable emission.
+      const toolCallId = 'edit:abc123';
+      const events = [
+        makeAgentEvent('Processing...'),
+        // tool_result arrives first (as it would in a reversed-seq scenario)
+        makeToolResultEvent(toolCallId, {
+          content: 'OK paths=1 edits=1 added=1 deleted=1\nP file.rs\nH replace old=1,3 new=1,3',
+        }),
+        // tool_call arrives second
+        makeToolCallEvent('edit', { toolCall: { tool_call_id: toolCallId } }),
+      ];
+      const { rows } = buildEventRowsWithDelegations(events);
+
+      // Should have 3 rows (agent + orphan tool_result + merged tool_call)
+      expect(rows).toHaveLength(3);
+      expect(rows[1].type).toBe('tool_result');
+
+      const toolCall = rows.find(r => r.type === 'tool_call');
+      expect(toolCall).toBeDefined();
+      expect(toolCall!.mergedResult).toBeDefined();
+      expect(toolCall!.mergedResult!.type).toBe('tool_result');
+      expect(toolCall!.mergedResult!.content).toContain('OK paths=1');
+    });
+
+    it('still orphans tool_result with truly unknown tool_call_id', () => {
+      const events = [
+        makeAgentEvent('Processing...'),
+        makeToolResultEvent('truly-orphan-id', { content: 'Orphan result' }),
+      ];
+      const { rows } = buildEventRowsWithDelegations(events);
+
+      // Should have 2 rows (agent + tool_result)
+      expect(rows).toHaveLength(2);
+      expect(rows[1].type).toBe('tool_result');
+      expect(rows[1].content).toBe('Orphan result');
+    });
+
     it('handles multiple tool calls with results', () => {
       const events = [
         makeAgentEvent('Processing...'),

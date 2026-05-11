@@ -910,9 +910,10 @@ pub struct AgentSettings {
     /// Built-in tools: `read_tool`, `index`, `edit`, `write_file`, `delete_file`,
     /// `shell`, `glob`, `search_text`, `ls`, `web_fetch`, `browse`, `mdq`,
     /// `question`, `delegate`, `create_task`, `todowrite`, `todoread`,
-    /// `semantic_edit`, `multiedit`, `apply_patch`, `knowledge_consolidate`,
-    /// `knowledge_ingest`, `knowledge_list_unconsolidated`, `knowledge_query`,
-    /// `knowledge_stats`, `language_query`.
+    /// `semantic_edit`, `multiedit`, `get_function`, `get_symbol`,
+    /// `replace_symbol`, `find_symbol_references`,
+    /// `knowledge_consolidate`, `knowledge_ingest`, `knowledge_list_unconsolidated`,
+    /// `knowledge_query`, `knowledge_stats`, `language_query`.
     ///
     /// MCP patterns: `"server_name.*"` (all tools from server),
     /// `"server_name.tool_name"` (specific tool).
@@ -943,9 +944,9 @@ pub struct AgentSettings {
 
     /// Explicit allowlist of tools that modify the filesystem or execute
     /// commands and therefore require permission confirmation.
-    /// Common values: `["edit", "write_file", "delete_file", "shell", "apply_patch"]`.
+    /// Common values: `["edit", "write_file", "delete_file", "shell"]`.
     #[serde(default)]
-    #[schemars(extend("examples" = [["edit", "write_file", "shell"], ["edit", "write_file", "delete_file", "shell", "apply_patch"]]))]
+    #[schemars(extend("examples" = [["edit", "write_file", "shell"], ["edit", "write_file", "delete_file", "shell"]]))]
     pub mutating_tools: Vec<String>,
 
     /// Execution policy (tool output truncation, pruning, compaction, snapshot, rate limit).
@@ -1197,7 +1198,7 @@ pub struct DelegateConfig {
     pub assume_mutating: bool,
 
     /// Explicit allowlist of tools that modify the filesystem or execute commands.
-    /// Common values: `["edit", "write_file", "delete_file", "shell", "apply_patch"]`.
+    /// Common values: `["edit", "write_file", "delete_file", "shell"]`.
     #[serde(default)]
     pub mutating_tools: Vec<String>,
 

@@ -2,7 +2,63 @@
 use crate::config::OverflowStorage;
 use std::path::{Path, PathBuf};
 
+use crate::tools::{ToolContext, ToolError};
+
+/// Resolve the workspace root from args, falling back to the context cwd.
+pub fn resolve_root(
+    args: &serde_json::Value,
+    context: &dyn ToolContext,
+) -> Result<PathBuf, ToolError> {
+    args.get("root")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| context.resolve_path(s))
+        .transpose()?
+        .or_else(|| context.cwd().map(|p| p.to_path_buf()))
+        .ok_or_else(|| ToolError::InvalidRequest("No working directory available".into()))
+}
+/// Resolve a tool target path: if the resolved path is absolute, return it
+/// as-is; otherwise join it with `root`.
+pub fn resolve_target(
+    path_str: &str,
+    root: &Path,
+    context: &dyn ToolContext,
+) -> Result<PathBuf, ToolError> {
+    let resolved = context.resolve_path(path_str)?;
+    Ok(if resolved.is_absolute() {
+        resolved
+    } else {
+        root.join(resolved)
+    })
+}
+
+/// Parse a required `"paths"` JSON array argument into a `Vec<String>`.
+pub fn parse_paths(args: &serde_json::Value) -> Result<Vec<String>, ToolError> {
+    let paths = args
+        .get("paths")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| ToolError::InvalidRequest("paths must be an array".to_string()))?;
+    let result: Vec<String> = paths
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    if result.is_empty() {
+        return Err(ToolError::InvalidRequest(
+            "paths must include at least one path".to_string(),
+        ));
+    }
+    Ok(result)
+}
+
 /// Maximum lines to return before truncation
+pub fn display_path(path: &Path, cwd: Option<&Path>) -> String {
+    if let Some(cwd) = cwd
+        && let Ok(relative) = path.strip_prefix(cwd)
+    {
+        return relative.display().to_string();
+    }
+    path.display().to_string()
+}
+
 pub const MAX_LINES: usize = 2000;
 
 /// Maximum bytes to return before truncation
@@ -90,32 +146,6 @@ pub fn format_truncation_message(
         result.original_line_count,
         result.original_byte_count
     )
-}
-
-/// Check if a path is outside the working directory
-pub fn is_external_path(path: &Path, cwd: &Path) -> bool {
-    // Normalize both paths
-    let path = match path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => {
-            // If we can't canonicalize (file doesn't exist yet), check parent
-            if let Some(parent) = path.parent() {
-                match parent.canonicalize() {
-                    Ok(p) => p.join(path.file_name().unwrap_or_default()),
-                    Err(_) => return true, // Can't verify, assume external
-                }
-            } else {
-                return true;
-            }
-        }
-    };
-
-    let cwd = match cwd.canonicalize() {
-        Ok(p) => p,
-        Err(_) => return true, // Can't verify cwd, assume external
-    };
-
-    !path.starts_with(&cwd)
 }
 
 /// Description interpolation helper

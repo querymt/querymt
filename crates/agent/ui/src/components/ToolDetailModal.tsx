@@ -16,6 +16,7 @@ import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useUiStore } from '../store/uiStore';
 import { getDashboardThemeVariant, getDiffThemeForDashboard } from '../utils/dashboardThemes';
+import { buildToolDiffPreview } from '../utils/diffPreview';
 
 export interface ToolDetailModalProps {
   event: EventItem & { mergedResult?: EventItem };
@@ -47,8 +48,7 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
 
   // Check for special tool types
   const normalizedToolKind = normalizeToolName(toolKind || toolName);
-  const isEdit = normalizedToolKind === 'edit';
-  const isPatch = normalizedToolKind === 'apply_patch';
+  const isEdit = normalizedToolKind === 'edit' || normalizedToolKind === 'multiedit';
   const isShell = normalizedToolKind === 'shell' || normalizedToolKind === 'bash';
   const isRead = normalizedToolKind === 'read' || normalizedToolKind === 'read_tool';
 
@@ -178,7 +178,7 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
                 onCopy={() => copyToClipboard(JSON.stringify(rawInput, null, 2), 'input')}
                 copied={copiedSection === 'input'}
               >
-                {(isEdit || isPatch) ? (
+                {isEdit ? (
                   <DiffView
                     toolKind={toolKind || toolName}
                     rawInput={rawInput}
@@ -198,9 +198,11 @@ export function ToolDetailModal({ event, onClose }: ToolDetailModalProps) {
                 title="Result"
                 copyable
                 onCopy={() => copyToClipboard(
-                  resultEvent.toolCall?.raw_output
-                    ? JSON.stringify(resultEvent.toolCall.raw_output, null, 2)
-                    : resultEvent.content || '',
+                  typeof resultEvent.toolCall?.raw_output === 'string'
+                    ? resultEvent.toolCall.raw_output
+                    : resultEvent.toolCall?.raw_output
+                      ? JSON.stringify(resultEvent.toolCall.raw_output, null, 2)
+                      : resultEvent.content || '',
                   'result'
                 )}
                 copied={copiedSection === 'result'}
@@ -329,7 +331,7 @@ function renderSafePatchDiff(
   );
 }
 
-// Diff viewer for edit/patch tools
+// Diff viewer for edit tools
 function DiffView({
   toolKind,
   rawInput,
@@ -346,8 +348,7 @@ function DiffView({
   const isMobile = useIsMobile();
   const preferredDiffStyle: 'unified' | 'split' = isMobile ? 'unified' : 'split';
   const diffContainerClass = `event-diff-container${isMobile ? ' diff-mobile' : ''}`;
-  const normalizedToolKind = normalizeToolName(toolKind);
-  const input = rawInput as Record<string, unknown>;
+  const preview = buildToolDiffPreview(toolKind, rawInput, resultEvent);
 
   const standardDiffOptions: React.ComponentProps<typeof PatchDiff>['options'] = {
     theme: diffTheme,
@@ -360,78 +361,25 @@ function DiffView({
     useCSSClasses: true,
     disableBackground: true,
   };
-  
-  // Handle write tool - show as diff with empty left side
-  if (normalizedToolKind === 'write' || normalizedToolKind === 'write_file') {
-    const filePath = input.filePath || input.file_path || input.path;
-    const content = input.content;
-    
-    if (typeof filePath === 'string' && typeof content === 'string') {
-      const normalizedPath = (filePath as string).replace(/^\/+/, '') || 'file';
-      const newLines = content.split('\n').length;
-      const newBlock = content.split('\n').map((line: string) => `+${line}`).join('\n');
-      const patch = [
-        `diff --git a/${normalizedPath} b/${normalizedPath}`,
-        `new file mode 100644`,
-        `--- /dev/null`,
-        `+++ b/${normalizedPath}`,
-        `@@ -0,0 +1,${newLines} @@`,
-        newBlock,
-      ].join('\n');
-      
-      return (
-        <div>
-          <div className="text-[11px] text-ui-secondary mb-2 font-mono">
-            Writing to: <span className="text-accent-primary">{filePath as string}</span>
-          </div>
-          <div className={diffContainerClass}>
-            {renderSafePatchDiff(patch, standardDiffOptions)}
-          </div>
-        </div>
-      );
-    }
-  }
-  
-  // Handle edit tool
-  if (normalizedToolKind === 'edit') {
-    const resultPayload = parseJsonMaybe(resultEvent?.toolCall?.raw_output ?? resultEvent?.content);
-    const editInput = extractEditInput(input, resultPayload);
-    if (editInput?.oldString || editInput?.newString) {
-      const patch = buildEditPatch(editInput);
-      return (
-        <div className={diffContainerClass}>
-          {renderSafePatchDiff(patch, standardDiffOptions)}
-        </div>
-      );
-    }
-  }
-  
-  // Handle apply_patch tool
-  const patchValue = extractPatchValue(input);
-  if (patchValue) {
-    if (!isLikelyRenderablePatch(patchValue)) {
-      return (
-        <div className="px-3 py-2 text-xs text-status-warning font-mono">
-          Patch payload is malformed. Use raw event data below.
-        </div>
-      );
-    }
-
+  if (preview?.patch) {
     return (
-      <div className={diffContainerClass}>
-        {renderSafePatchDiff(patchValue, {
-          theme: diffTheme,
-          themeType: diffThemeType,
-          diffStyle: 'unified',
-          diffIndicators: 'bars',
-          overflow: 'wrap',
-          useCSSClasses: true,
-          disableBackground: true,
-        })}
+      <div>
+        {preview.patch && (
+          <div className={diffContainerClass}>
+            {renderSafePatchDiff(preview.patch, standardDiffOptions)}
+          </div>
+        )}
       </div>
     );
   }
 
+  if (preview?.fallbackText) {
+    return (
+      <div className="px-3 py-2 text-xs text-status-warning font-mono whitespace-pre-wrap break-words">
+        {preview.fallbackText}
+      </div>
+    );
+  }
   // Fallback to JSON
   return <JsonView data={rawInput} />;
 }
@@ -593,105 +541,3 @@ function parseJsonMaybe(value: unknown): any | undefined {
   return undefined;
 }
 
-type EditInput = {
-  filePath?: string;
-  oldString?: string;
-  newString?: string;
-  startLineOld?: number;
-  oldLineCount?: number;
-  newLineCount?: number;
-};
-
-function extractEditInput(rawInput: unknown, resultPayload?: any): EditInput | undefined {
-  if (!rawInput) return undefined;
-
-  const withMetadata = (input: EditInput): EditInput => ({
-    ...input,
-    startLineOld: Number.isInteger(resultPayload?.startLineOld) ? resultPayload.startLineOld : undefined,
-    oldLineCount: Number.isInteger(resultPayload?.oldLineCount) ? resultPayload.oldLineCount : undefined,
-    newLineCount: Number.isInteger(resultPayload?.newLineCount) ? resultPayload.newLineCount : undefined,
-  });
-
-  if (typeof rawInput === 'object' && rawInput !== null) {
-    const direct = rawInput as EditInput & { arguments?: unknown };
-    if (direct.oldString || direct.newString || direct.filePath) {
-      return withMetadata({
-        filePath: direct.filePath,
-        oldString: direct.oldString,
-        newString: direct.newString,
-      });
-    }
-    const args = direct.arguments;
-    if (typeof args === 'string') {
-      const parsed = parseJsonMaybe(args);
-      if (parsed && typeof parsed === 'object') {
-        const parsedEdit = parsed as EditInput;
-        return withMetadata({
-          filePath: parsedEdit.filePath,
-          oldString: parsedEdit.oldString,
-          newString: parsedEdit.newString,
-        });
-      }
-    }
-    if (typeof args === 'object' && args !== null) {
-      const parsedEdit = args as EditInput;
-      return withMetadata({
-        filePath: parsedEdit.filePath,
-        oldString: parsedEdit.oldString,
-        newString: parsedEdit.newString,
-      });
-    }
-  }
-  return undefined;
-}
-
-function buildEditPatch(editInput: EditInput): string {
-  const rawPath = editInput.filePath ?? 'file';
-  const normalizedPath = rawPath.replace(/^\/+/, '') || 'file';
-  const oldText = editInput.oldString ?? '';
-  const newText = editInput.newString ?? '';
-  const oldLines = Number.isInteger(editInput.oldLineCount) ? editInput.oldLineCount : oldText.split('\n').length;
-  const newLines = Number.isInteger(editInput.newLineCount) ? editInput.newLineCount : newText.split('\n').length;
-  const startLine = Number.isInteger(editInput.startLineOld) ? editInput.startLineOld : 1;
-  const oldBlock = oldText
-    .split('\n')
-    .map((line) => `-${line}`)
-    .join('\n');
-  const newBlock = newText
-    .split('\n')
-    .map((line) => `+${line}`)
-    .join('\n');
-  return [
-    `diff --git a/${normalizedPath} b/${normalizedPath}`,
-    `--- a/${normalizedPath}`,
-    `+++ b/${normalizedPath}`,
-    `@@ -${startLine},${oldLines} +${startLine},${newLines} @@`,
-    oldBlock,
-    newBlock,
-  ].join('\n');
-}
-
-function extractPatchValue(rawInput: unknown): string | undefined {
-  if (!rawInput || typeof rawInput !== 'object') return undefined;
-
-  const direct = (rawInput as { patch?: unknown }).patch;
-  if (typeof direct === 'string') {
-    return direct;
-  }
-
-  const args = (rawInput as { arguments?: unknown }).arguments;
-  const parsedArgs = parseJsonMaybe(args);
-  if (typeof parsedArgs?.patch === 'string') {
-    return parsedArgs.patch;
-  }
-
-  return undefined;
-}
-
-function isLikelyRenderablePatch(patch: string): boolean {
-  const trimmed = patch.trim();
-  if (trimmed.length === 0) {
-    return false;
-  }
-  return /diff --git\s+.+\s+.+/.test(trimmed) && /@@\s+-\d/.test(trimmed);
-}

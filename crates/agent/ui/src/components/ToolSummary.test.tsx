@@ -53,7 +53,18 @@ describe('ToolSummary edit visualization', () => {
     patchDiffSpy.mockClear();
   });
 
-  it('renders inline diff preview for namespaced edit tool using result metadata', () => {
+  it('renders inline diff preview for compact edit output', () => {
+    const compactOutput = [
+      'OK paths=1 edits=1 added=1 deleted=2',
+      'P workspace/src/main.ts',
+      'H replace old=42,4 new=42,3',
+      ' 00041|  fn foo() {',
+      '-00042| old line',
+      '-00043| second old line',
+      ' 00044|  }',
+      '+00042| new line',
+    ].join('\n');
+
     const event = {
       id: 'tool-call-1',
       type: 'tool_call',
@@ -61,9 +72,8 @@ describe('ToolSummary edit visualization', () => {
       timestamp: Date.now(),
       agentId: 'primary',
       toolCall: {
-            tool_call_id: 'functions.edit:1',
-            kind: 'functions.edit',
-
+        tool_call_id: 'functions.edit:1',
+        kind: 'functions.edit',
         status: 'in_progress',
         raw_input: {
           filePath: '/workspace/src/main.ts',
@@ -74,19 +84,14 @@ describe('ToolSummary edit visualization', () => {
       mergedResult: {
         id: 'tool-result-1',
         type: 'tool_result',
-        content: '{"success":true}',
+        content: compactOutput,
         timestamp: Date.now(),
         agentId: 'primary',
         toolCall: {
           tool_call_id: 'functions.edit:1',
           kind: 'functions.edit',
           status: 'completed',
-          raw_output: {
-            success: true,
-            startLineOld: 42,
-            oldLineCount: 2,
-            newLineCount: 1,
-          },
+          raw_output: compactOutput,
         },
       } as EventItem,
     } as EventItem & { mergedResult: EventItem };
@@ -105,13 +110,20 @@ describe('ToolSummary edit visualization', () => {
 
     const patch = String(patchDiffSpy.mock.calls[0][0].patch);
     expect(patch).toContain('diff --git a/workspace/src/main.ts b/workspace/src/main.ts');
-    expect(patch).toContain('@@ -42,2 +42,1 @@');
     expect(patch).toContain('-old line');
     expect(patch).toContain('-second old line');
     expect(patch).toContain('+new line');
   });
 
   it('renders inline diff preview when tool kind is empty but tool_call_id is namespaced', () => {
+    const compactOutput = [
+      'OK paths=1 edits=1 added=1 deleted=1',
+      'P workspace/src/alt.ts',
+      'H replace old=1,2 new=1,2',
+      '-00001| before',
+      '+00001| after',
+    ].join('\n');
+
     const event = {
       id: 'tool-call-2',
       type: 'tool_call',
@@ -131,19 +143,14 @@ describe('ToolSummary edit visualization', () => {
       mergedResult: {
         id: 'tool-result-2',
         type: 'tool_result',
-        content: '{"success":true}',
+        content: compactOutput,
         timestamp: Date.now(),
         agentId: 'primary',
         toolCall: {
           tool_call_id: 'functions.edit:2',
           kind: 'functions.edit',
           status: 'completed',
-          raw_output: {
-            success: true,
-            startLineOld: 7,
-            oldLineCount: 1,
-            newLineCount: 1,
-          },
+          raw_output: compactOutput,
         },
       } as EventItem,
     } as EventItem & { mergedResult: EventItem };
@@ -161,27 +168,41 @@ describe('ToolSummary edit visualization', () => {
     expect(patchDiffSpy).toHaveBeenCalled();
     const patch = String(patchDiffSpy.mock.calls[patchDiffSpy.mock.calls.length - 1][0].patch);
     expect(patch).toContain('diff --git a/workspace/src/alt.ts b/workspace/src/alt.ts');
-    expect(patch).toContain('@@ -7,1 +7,1 @@');
     expect(patch).toContain('-before');
     expect(patch).toContain('+after');
   });
 
-  it('shows fallback text and skips PatchDiff for malformed apply_patch payloads', () => {
+  it('shows error text inline instead of diff preview for failed edits', () => {
     const event = {
-      id: 'tool-call-3',
+      id: 'tool-call-error',
       type: 'tool_call',
-      content: 'apply_patch',
+      content: 'functions.edit',
       timestamp: Date.now(),
       agentId: 'primary',
       toolCall: {
-        tool_call_id: 'apply_patch:1',
-        kind: 'apply_patch',
-        status: 'completed',
+        tool_call_id: 'functions.edit:error',
+        kind: 'functions.edit',
+        status: 'in_progress',
         raw_input: {
-          patch: 'this is not a unified diff',
+          filePath: '/workspace/src/file.ts',
+          oldString: 'nonexistent',
+          newString: 'replacement',
         },
       },
-    } as EventItem;
+      mergedResult: {
+        id: 'tool-result-error',
+        type: 'tool_result',
+        content: 'Error: oldString not found in content',
+        timestamp: Date.now(),
+        agentId: 'primary',
+        toolCall: {
+          tool_call_id: 'functions.edit:error',
+          kind: 'functions.edit',
+          status: 'failed',
+          raw_output: 'Error: oldString not found in content',
+        },
+      } as EventItem,
+    } as EventItem & { mergedResult: EventItem };
 
     render(
       <ToolSummary
@@ -192,7 +213,9 @@ describe('ToolSummary edit visualization', () => {
       />,
     );
 
-    expect(screen.getByText('Patch payload is malformed. Open details to inspect raw content.')).toBeInTheDocument();
+    expect(screen.getByText(/oldString not found/)).toBeInTheDocument();
+    expect(screen.queryByTestId('patch-diff')).not.toBeInTheDocument();
     expect(patchDiffSpy).not.toHaveBeenCalled();
   });
+
 });
