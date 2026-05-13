@@ -6,7 +6,7 @@ license.workspace = true
 description = "Mobile FFI crate exposing a stable C ABI for iOS and Android QueryMT bindings"
 
 [features]
-default = ["remote", "remote-internet", "provider-anthropic", "provider-openai"]
+default = ["remote", "remote-internet", "provider-anthropic", "provider-openai", "provider-google", "provider-deepseek"]
 
 # Remote agent / mesh support
 remote = ["querymt-agent/plugin-host-only", "querymt-agent/remote"]
@@ -15,9 +15,10 @@ remote-internet = ["remote", "querymt-agent/remote-internet"]
 # Static provider registration for mobile
 provider-anthropic = ["dep:qmt-anthropic"]
 provider-openai = ["dep:qmt-openai"]
+provider-google = ["dep:qmt-google"]
+provider-deepseek = ["dep:qmt-deepseek"]
 
 # Future providers (can be added independently)
-# provider-google = ["dep:qmt-google"]
 # provider-groq = ["dep:qmt-groq"]
 # provider-ollama = ["dep:qmt-ollama"]
 
@@ -37,6 +38,8 @@ agent-client-protocol-schema = { version = "0.12", features = ["unstable"]}
 # Provider crates for static registration
 qmt-anthropic = { path = "../providers/anthropic", optional = true, default-features = false, features = ["api"] }
 qmt-openai = { path = "../providers/openai", optional = true, default-features = false, features = ["api"] }
+qmt-google = { path = "../providers/google", optional = true, default-features = false, features = ["api"] }
+qmt-deepseek = { path = "../providers/deepseek", optional = true, default-features = false, features = ["api"] }
 
 serde.workspace = true
 serde_json.workspace = true
