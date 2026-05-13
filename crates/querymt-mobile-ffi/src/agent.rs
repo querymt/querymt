@@ -185,6 +185,18 @@ fn register_static_providers(registry: &PluginRegistry) {
         registry.register_static_http(factory);
         log::info!("Registered static provider: openai");
     }
+    #[cfg(feature = "provider-google")]
+    {
+        let factory = qmt_google::create_http_factory();
+        registry.register_static_http(factory);
+        log::info!("Registered static provider: google");
+    }
+    #[cfg(feature = "provider-deepseek")]
+    {
+        let factory = qmt_deepseek::create_http_factory();
+        registry.register_static_http(factory);
+        log::info!("Registered static provider: deepseek");
+    }
 }
 
 async fn create_storage_backend(

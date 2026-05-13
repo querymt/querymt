@@ -11184,6 +11184,8 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "qmt-anthropic",
+ "qmt-deepseek",
+ "qmt-google",
  "qmt-openai",
  "querymt",
  "querymt-agent",
