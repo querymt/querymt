@@ -19,11 +19,11 @@ log.workspace = true
 tracing-log = "0.2"
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["logs"] }
-opentelemetry-otlp = { version = "0.31", features = ["metrics", "grpc-tonic", "logs"] }
-opentelemetry-appender-tracing = { version = "0.31", features = ["log"] }
-opentelemetry-semantic-conventions = "0.31"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["logs"] }
+opentelemetry-otlp = { version = "0.32", features = ["metrics", "grpc-tonic", "logs"] }
+opentelemetry-appender-tracing = { version = "0.32", features = ["log"] }
+opentelemetry-semantic-conventions = "0.32"
 
 # Secret store dependencies (optional, behind secret-store feature)
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native", "crypto-rust"], optional = true }
