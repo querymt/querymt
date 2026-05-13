@@ -11035,6 +11035,7 @@ dependencies = [
  "log",
  "open",
  "querymt",
+ "querymt-service-client",
  "querymt-utils",
  "rustyline",
  "rustyline-derive",
@@ -11044,6 +11045,7 @@ dependencies = [
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -11068,6 +11070,18 @@ dependencies = [
  "hf-hub 0.5.0",
  "log",
  "tokio",
+]
+
+[[package]]
+name = "querymt-service-client"
+version = "0.4.0"
+dependencies = [
+ "oauth2",
+ "querymt-utils",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
 ]
 
 [[package]]

@@ -92,6 +92,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: SecretsCommands,
     },
+    /// Manage QueryMT service authentication
+    #[cfg(feature = "service")]
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommands,
+    },
     /// List available providers
     Providers,
     /// List available models for providers
@@ -153,6 +159,17 @@ pub enum AuthCommands {
         #[arg(long, default_value = "false")]
         no_refresh: bool,
     },
+}
+
+#[cfg(feature = "service")]
+#[derive(Subcommand, Debug)]
+pub enum ServiceCommands {
+    /// Login to QueryMT service using OAuth
+    Login,
+    /// Logout from QueryMT service locally
+    Logout,
+    /// Check QueryMT service authentication and API status
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
