@@ -43,9 +43,26 @@ pub struct RpcRequest {
 #[derive(Serialize)]
 pub struct RpcResponse {
     pub jsonrpc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<serde_json::Value>,
     pub id: serde_json::Value,
+}
+
+pub struct RpcDispatchOutput {
+    pub notifications: Vec<serde_json::Value>,
+    pub response: RpcResponse,
+}
+
+pub fn event_envelopes_to_notifications<I>(events: I) -> Vec<serde_json::Value>
+where
+    I: IntoIterator<Item = EventEnvelope>,
+{
+    events
+        .into_iter()
+        .filter_map(|event| translate_event_to_notification(&event))
+        .collect()
 }
 
 /// Translate an internal agent event to a JSON-RPC notification.
@@ -92,25 +109,38 @@ pub fn translate_event_to_notification(event: &EventEnvelope) -> Option<serde_js
 /// Returns `None` if the event should not be sent to the client.
 pub fn translate_event_to_update(event: &EventEnvelope) -> Option<SessionUpdate> {
     match event.kind() {
-        AgentEventKind::PromptReceived { content, .. } => Some(SessionUpdate::UserMessageChunk(
-            ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone()))),
+        AgentEventKind::PromptReceived {
+            content,
+            message_id,
+        } => Some(SessionUpdate::UserMessageChunk(
+            ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
+                .message_id(message_id.clone()),
         )),
-        AgentEventKind::AssistantMessageStored { content, .. } => {
+        AgentEventKind::AssistantMessageStored {
+            content,
+            message_id,
+            ..
+        } => {
             if content.is_empty() {
                 return None;
             }
-            Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                ContentBlock::Text(TextContent::new(content.clone())),
-            )))
+            Some(SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
+                    .message_id(message_id.clone()),
+            ))
         }
         // Streaming text deltas: forward to ACP clients so they also benefit from streaming.
-        AgentEventKind::AssistantContentDelta { content, .. } => {
+        AgentEventKind::AssistantContentDelta {
+            content,
+            message_id,
+        } => {
             if content.is_empty() {
                 return None;
             }
-            Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                ContentBlock::Text(TextContent::new(content.clone())),
-            )))
+            Some(SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
+                    .message_id(Some(message_id.clone())),
+            ))
         }
         // Thinking/reasoning deltas: ACP has no thinking content type yet — drop.
         AgentEventKind::AssistantThinkingDelta { .. } => None,
@@ -299,7 +329,7 @@ pub async fn handle_rpc_message<S: SendAgent>(
     pending_elicitations: &PendingElicitationMap,
     conn_id: &str,
     req: RpcRequest,
-) -> RpcResponse {
+) -> RpcDispatchOutput {
     let result = match req.method.as_str() {
         m if m == AGENT_METHOD_NAMES.initialize => match serde_json::from_value(req.params) {
             Ok(params) => agent
@@ -371,21 +401,35 @@ pub async fn handle_rpc_message<S: SendAgent>(
                 Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
             }
         },
-        m if m == AGENT_METHOD_NAMES.session_load => match serde_json::from_value(req.params) {
-            Ok(params) => {
-                let response = agent.load_session(params).await;
-                match response {
-                    Ok(r) => Ok(serde_json::to_value(r).unwrap()),
-                    Err(e) => Err(e),
+        m if m == AGENT_METHOD_NAMES.session_load => {
+            match serde_json::from_value::<agent_client_protocol::schema::LoadSessionRequest>(
+                req.params,
+            ) {
+                Ok(params) => {
+                    let response = agent.load_session(params).await;
+                    match response {
+                        Ok(r) => Ok(serde_json::to_value(r).unwrap()),
+
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => {
+                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
                 }
             }
+        }
+        m if m == AGENT_METHOD_NAMES.session_resume => match serde_json::from_value(req.params) {
+            Ok(params) => agent
+                .resume_session(params)
+                .await
+                .map(|r| serde_json::to_value(r).unwrap()),
             Err(e) => {
                 Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
             }
         },
-        m if m == AGENT_METHOD_NAMES.session_resume => match serde_json::from_value(req.params) {
+        m if m == AGENT_METHOD_NAMES.session_close => match serde_json::from_value(req.params) {
             Ok(params) => agent
-                .resume_session(params)
+                .close_session(params)
                 .await
                 .map(|r| serde_json::to_value(r).unwrap()),
             Err(e) => {
@@ -525,7 +569,7 @@ pub async fn handle_rpc_message<S: SendAgent>(
         _ => Err(Error::method_not_found()),
     };
 
-    match result {
+    let response = match result {
         Ok(res) => RpcResponse {
             jsonrpc: "2.0".to_string(),
             result: Some(res),
@@ -538,6 +582,11 @@ pub async fn handle_rpc_message<S: SendAgent>(
             error: Some(serde_json::to_value(e).unwrap()),
             id: req.id,
         },
+    };
+
+    RpcDispatchOutput {
+        notifications: Vec::new(),
+        response,
     }
 }
 
@@ -584,6 +633,85 @@ mod tests {
                 is_error: false,
             },
         })
+    }
+
+    #[test]
+    fn prompt_received_preserves_message_id() {
+        let event = EventEnvelope::Durable(DurableEvent {
+            event_id: "evt-prompt".into(),
+            stream_seq: 1,
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::PromptReceived {
+                content: "hello".to_string(),
+                message_id: Some("u-1".to_string()),
+            },
+        });
+
+        let Some(SessionUpdate::UserMessageChunk(chunk)) = translate_event_to_update(&event) else {
+            panic!("expected user message chunk");
+        };
+
+        assert_eq!(chunk.message_id.as_deref(), Some("u-1"));
+    }
+
+    #[test]
+    fn rpc_error_response_omits_result_field() {
+        let response = RpcResponse {
+            jsonrpc: "2.0".to_string(),
+            result: None,
+            error: Some(serde_json::json!({
+                "code": -32602,
+                "message": "invalid params"
+            })),
+            id: serde_json::json!(10),
+        };
+
+        let value = serde_json::to_value(response).expect("serialize rpc response");
+        assert!(value.get("result").is_none());
+        assert_eq!(value["error"]["code"], serde_json::json!(-32602));
+    }
+
+    #[test]
+    fn assistant_updates_preserve_message_id() {
+        let stored = EventEnvelope::Durable(DurableEvent {
+            event_id: "evt-stored".into(),
+            stream_seq: 1,
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::AssistantMessageStored {
+                content: "answer".to_string(),
+                thinking: None,
+                message_id: Some("a-1".to_string()),
+            },
+        });
+        let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::AssistantContentDelta {
+                content: "ans".to_string(),
+                message_id: "a-1".to_string(),
+            },
+        });
+
+        let Some(SessionUpdate::AgentMessageChunk(stored_chunk)) =
+            translate_event_to_update(&stored)
+        else {
+            panic!("expected stored assistant chunk");
+        };
+        let Some(SessionUpdate::AgentMessageChunk(delta_chunk)) = translate_event_to_update(&delta)
+        else {
+            panic!("expected delta assistant chunk");
+        };
+
+        assert_eq!(stored_chunk.message_id.as_deref(), Some("a-1"));
+        assert_eq!(delta_chunk.message_id.as_deref(), Some("a-1"));
     }
 
     #[test]
@@ -716,6 +844,124 @@ mod tests {
         assert_eq!(select.current_value.0.as_ref(), "auto");
     }
 
+    #[tokio::test]
+    async fn session_close_rpc_forwards_to_send_agent() {
+        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+
+        struct Dummy;
+
+        #[async_trait::async_trait]
+        impl SendAgent for Dummy {
+            async fn initialize(
+                &self,
+                _: agent_client_protocol::schema::InitializeRequest,
+            ) -> Result<agent_client_protocol::schema::InitializeResponse, Error> {
+                unreachable!()
+            }
+            async fn authenticate(
+                &self,
+                _: agent_client_protocol::schema::AuthenticateRequest,
+            ) -> Result<agent_client_protocol::schema::AuthenticateResponse, Error> {
+                unreachable!()
+            }
+            async fn new_session(
+                &self,
+                _: agent_client_protocol::schema::NewSessionRequest,
+            ) -> Result<agent_client_protocol::schema::NewSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn prompt(
+                &self,
+                _: agent_client_protocol::schema::PromptRequest,
+            ) -> Result<agent_client_protocol::schema::PromptResponse, Error> {
+                unreachable!()
+            }
+            async fn cancel(
+                &self,
+                _: agent_client_protocol::schema::CancelNotification,
+            ) -> Result<(), Error> {
+                unreachable!()
+            }
+            async fn load_session(
+                &self,
+                _: agent_client_protocol::schema::LoadSessionRequest,
+            ) -> Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn list_sessions(
+                &self,
+                _: agent_client_protocol::schema::ListSessionsRequest,
+            ) -> Result<agent_client_protocol::schema::ListSessionsResponse, Error> {
+                unreachable!()
+            }
+            async fn fork_session(
+                &self,
+                _: agent_client_protocol::schema::ForkSessionRequest,
+            ) -> Result<agent_client_protocol::schema::ForkSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn resume_session(
+                &self,
+                _: agent_client_protocol::schema::ResumeSessionRequest,
+            ) -> Result<agent_client_protocol::schema::ResumeSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn close_session(
+                &self,
+                _: agent_client_protocol::schema::CloseSessionRequest,
+            ) -> Result<agent_client_protocol::schema::CloseSessionResponse, Error> {
+                Ok(agent_client_protocol::schema::CloseSessionResponse::new())
+            }
+            async fn set_session_model(
+                &self,
+                _: agent_client_protocol::schema::SetSessionModelRequest,
+            ) -> Result<agent_client_protocol::schema::SetSessionModelResponse, Error> {
+                unreachable!()
+            }
+            async fn ext_method(
+                &self,
+                _: agent_client_protocol::schema::ExtRequest,
+            ) -> Result<agent_client_protocol::schema::ExtResponse, Error> {
+                unreachable!()
+            }
+            async fn ext_notification(
+                &self,
+                _: agent_client_protocol::schema::ExtNotification,
+            ) -> Result<(), Error> {
+                unreachable!()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let output = handle_rpc_message(
+            &Dummy,
+            &session_owners,
+            &pending_permissions,
+            &pending_elicitations,
+            "conn-1",
+            RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: AGENT_METHOD_NAMES.session_close.to_string(),
+                params: serde_json::json!({
+                    "sessionId": "s-1"
+                }),
+                id: serde_json::json!(1),
+            },
+        )
+        .await;
+        let response = output.response;
+
+        assert!(
+            response.error.is_none(),
+            "expected successful close response"
+        );
+        assert_eq!(response.result, Some(serde_json::json!({})));
+    }
+
     /// Verify that the RPC dispatcher correctly forwards set_session_config_option
     /// to the SendAgent trait method (default impl returns method_not_found).
     #[tokio::test]
@@ -784,6 +1030,12 @@ mod tests {
             ) -> Result<agent_client_protocol::schema::ResumeSessionResponse, Error> {
                 unreachable!()
             }
+            async fn close_session(
+                &self,
+                _: agent_client_protocol::schema::CloseSessionRequest,
+            ) -> Result<agent_client_protocol::schema::CloseSessionResponse, Error> {
+                unreachable!()
+            }
             async fn set_session_model(
                 &self,
                 _: agent_client_protocol::schema::SetSessionModelRequest,
@@ -807,7 +1059,7 @@ mod tests {
             }
         }
 
-        let response = handle_rpc_message(
+        let output = handle_rpc_message(
             &Dummy,
             &session_owners,
             &pending_permissions,
@@ -825,6 +1077,7 @@ mod tests {
             },
         )
         .await;
+        let response = output.response;
 
         // Default SendAgent impl returns method_not_found
         assert!(response.error.is_some(), "expected error from default impl");
@@ -850,7 +1103,7 @@ mod tests {
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations = fixture.planner.pending_elicitations();
 
-        let response = handle_rpc_message(
+        let output = handle_rpc_message(
             fixture.planner.as_ref(),
             &session_owners,
             &pending_permissions,
@@ -868,6 +1121,7 @@ mod tests {
             },
         )
         .await;
+        let response = output.response;
 
         assert!(
             response.error.is_none(),

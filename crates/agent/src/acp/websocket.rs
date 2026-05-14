@@ -168,7 +168,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: WsServerState) {
             match result {
                 Ok(Message::Text(text)) => match serde_json::from_str::<RpcRequest>(&text) {
                     Ok(request) => {
-                        let response = handle_rpc_message(
+                        let output = handle_rpc_message(
                             state.agent.as_ref(),
                             &state.session_owners,
                             &state.pending_permissions,
@@ -177,7 +177,13 @@ async fn handle_websocket_connection(socket: WebSocket, state: WsServerState) {
                             request,
                         )
                         .await;
-                        let json = serde_json::to_string(&response).unwrap_or_default();
+                        for notification in output.notifications {
+                            let json = serde_json::to_string(&notification).unwrap_or_default();
+                            if tx.send(json).await.is_err() {
+                                break;
+                            }
+                        }
+                        let json = serde_json::to_string(&output.response).unwrap_or_default();
 
                         if tx.send(json).await.is_err() {
                             break;

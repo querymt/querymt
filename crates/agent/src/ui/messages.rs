@@ -5,6 +5,7 @@
 
 use crate::events::EventEnvelope;
 use crate::index::FileIndexEntry;
+pub use crate::session::load_snapshot::{SessionLoadSnapshot, StreamCursor, cursor_from_events};
 use crate::session::projection::{AuditView, SessionScope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -556,17 +557,6 @@ pub struct ConsolidationInfo {
     #[typeshare(serialized_as = "number")]
     pub source_count: u32,
     pub created_at: String,
-}
-
-#[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct StreamCursor {
-    #[serde(default)]
-    #[typeshare(serialized_as = "number")]
-    pub local_seq: i64,
-    #[serde(default)]
-    #[typeshare(serialized_as = "Record<string, number>")]
-    pub remote_seq_by_source: HashMap<String, i64>,
 }
 
 /// Mesh invite DTO for the UI.

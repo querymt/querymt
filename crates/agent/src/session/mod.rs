@@ -54,8 +54,12 @@ pub use domain_schedule::{
 pub use repo_schedule::ScheduleRepository;
 
 // Projection stores
+pub mod load_snapshot;
 pub mod projection;
 
+pub use load_snapshot::{
+    SessionLoadSnapshot, StreamCursor, cursor_from_events, load_session_snapshot,
+};
 pub use projection::{
     AuditView, DefaultRedactor, FieldPredicate, FieldSensitivity, FilterExpr, PredicateOp,
     RedactedView, RedactionPolicy, Redactor, SessionGroup, SessionListFilter, SessionListItem,

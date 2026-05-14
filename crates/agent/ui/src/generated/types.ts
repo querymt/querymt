@@ -812,8 +812,13 @@ export interface SessionLimits {
 }
 
 export interface StreamCursor {
-	local_seq?: number;
-	remote_seq_by_source?: Record<string, number>;
+	local_seq: number;
+	remote_seq_by_source: Record<string, number>;
+}
+
+export interface SessionLoadSnapshot {
+	audit: AuditView;
+	cursor: StreamCursor;
 }
 
 /**

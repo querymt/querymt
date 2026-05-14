@@ -19,13 +19,13 @@
 /// - `prompt`: The main interaction method
 /// - `cancel`: Cancellation support
 use agent_client_protocol::schema::{
-    AuthenticateRequest, AuthenticateResponse, CancelNotification, Error, ExtNotification,
-    ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
-    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    ResumeSessionRequest, ResumeSessionResponse, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
-    SetSessionModelRequest, SetSessionModelResponse,
+    AuthenticateRequest, AuthenticateResponse, CancelNotification, CloseSessionRequest,
+    CloseSessionResponse, Error, ExtNotification, ExtRequest, ExtResponse, ForkSessionRequest,
+    ForkSessionResponse, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, PromptRequest, PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
 use async_trait::async_trait;
 use std::any::Any;
@@ -95,6 +95,9 @@ pub trait SendAgent: Send + Sync + Any {
         &self,
         req: ResumeSessionRequest,
     ) -> Result<ResumeSessionResponse, Error>;
+
+    /// Close an active session and release associated runtime resources.
+    async fn close_session(&self, req: CloseSessionRequest) -> Result<CloseSessionResponse, Error>;
 
     /// Change the LLM model for a session.
     ///

@@ -5,8 +5,12 @@ pub mod websocket;
 
 // Internal modules
 pub(crate) mod client_bridge;
-pub(crate) mod shared;
+pub mod cwd;
+pub mod shared;
 pub(crate) mod stdio;
+
+#[cfg(test)]
+mod session_load_snapshot_tests;
 
 // Public re-exports
 pub use transport::AcpTransport;
@@ -120,7 +124,7 @@ impl AcpServer {
             }
             match serde_json::from_str::<RpcRequest>(&line) {
                 Ok(request) => {
-                    let response = handle_rpc_message(
+                    let output = handle_rpc_message(
                         state.agent.as_ref(),
                         &state.session_owners,
                         &state.pending_permissions,
@@ -129,7 +133,13 @@ impl AcpServer {
                         request,
                     )
                     .await;
-                    let json = serde_json::to_string(&response).unwrap_or_default();
+                    for notification in output.notifications {
+                        let json = serde_json::to_string(&notification).unwrap_or_default();
+                        if tx.send(json).await.is_err() {
+                            break;
+                        }
+                    }
+                    let json = serde_json::to_string(&output.response).unwrap_or_default();
                     if tx.send(json).await.is_err() {
                         break;
                     }
@@ -175,7 +185,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: ServerState) {
             match result {
                 Ok(Message::Text(text)) => match serde_json::from_str::<RpcRequest>(&text) {
                     Ok(request) => {
-                        let response = handle_rpc_message(
+                        let output = handle_rpc_message(
                             state.agent.as_ref(),
                             &state.session_owners,
                             &state.pending_permissions,
@@ -184,7 +194,13 @@ async fn handle_websocket_connection(socket: WebSocket, state: ServerState) {
                             request,
                         )
                         .await;
-                        let json = serde_json::to_string(&response).unwrap_or_default();
+                        for notification in output.notifications {
+                            let json = serde_json::to_string(&notification).unwrap_or_default();
+                            if tx.send(json).await.is_err() {
+                                break;
+                            }
+                        }
+                        let json = serde_json::to_string(&output.response).unwrap_or_default();
 
                         if tx.send(json).await.is_err() {
                             break;

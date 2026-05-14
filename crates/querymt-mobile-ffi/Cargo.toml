@@ -27,7 +27,7 @@ name = "querymt_mobile_ffi"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-querymt = { path = "../querymt", default-features = false, features = ["http-client", "plugin_host", "model-registry", "mcp", "tracing"] }
+querymt = { path = "../querymt", default-features = false, features = ["runtime"] }
 querymt-agent = { path = "../agent", default-features = false }
 querymt-utils = { path = "../querymt-utils", features = ["providers", "serde", "secret-store"] }
 

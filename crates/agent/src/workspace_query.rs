@@ -4,9 +4,9 @@
 //! language intelligence (diagnostics, references, definitions, symbols,
 //! hover info) from the connected client (e.g., VS Code extension).
 //!
-//! The query is serialized as an [`ExtRequest`] with method `"workspace/query"`,
-//! which the ACP SDK sends as `"_workspace/query"` on the wire. The client
-//! handles it by calling VS Code language APIs and returns the result.
+//! The query is sent as an ACP SDK `AgentRequest::ExtMethodRequest` using the
+//! wire-form method `"_workspace/query"`. The client handles it by calling VS
+//! Code language APIs and returns the result.
 //!
 //! ## Data flow
 //!
@@ -15,7 +15,7 @@
 //!   → tool builds WorkspaceQueryRequest
 //!   → ClientBridgeSender::workspace_query(req)
 //!   → bridge task receives WorkspaceQuery message
-//!   → connection.ext_method(ExtRequest::new("workspace/query", ...))
+//!   → connection.send_request(AgentRequest::ExtMethodRequest(...))
 //!   → client (VS Code) handles _workspace/query
 //!   → client returns JSON-RPC response
 //!   → bridge task parses WorkspaceQueryResponse

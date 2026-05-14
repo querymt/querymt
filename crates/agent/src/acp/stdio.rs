@@ -40,16 +40,30 @@ use crate::acp::shutdown;
 use crate::event_fanout::EventFanout;
 use crate::send_agent::SendAgent;
 use agent_client_protocol::schema::{
-    AuthenticateRequest, CancelNotification, ExtRequest, ForkSessionRequest, InitializeRequest,
-    ListSessionsRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
-    ResumeSessionRequest, SessionId, SessionNotification, SetSessionConfigOptionRequest,
-    SetSessionModeRequest, SetSessionModelRequest,
+    AgentRequest, AuthenticateRequest, CancelNotification, ClientNotification, ClientRequest,
+    CloseSessionRequest, ExtRequest, ForkSessionRequest, InitializeRequest, ListSessionsRequest,
+    LoadSessionRequest, NewSessionRequest, PromptRequest, ResumeSessionRequest, SessionId,
+    SessionNotification, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    SetSessionModelRequest,
 };
 use agent_client_protocol::{self as acp, ByteStreams, ConnectionTo};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::info_span;
+
+fn agent_ext_request(
+    method: &'static str,
+    params: impl serde::Serialize,
+) -> Result<AgentRequest, acp::Error> {
+    let params_json = serde_json::to_string(&params).map_err(acp::Error::into_internal_error)?;
+    let raw_value = serde_json::value::RawValue::from_string(params_json)
+        .map_err(acp::Error::into_internal_error)?;
+    Ok(AgentRequest::ExtMethodRequest(ExtRequest::new(
+        method,
+        Arc::from(raw_value),
+    )))
+}
 
 /// Run the client bridge task inside LocalSet.
 ///
@@ -96,24 +110,18 @@ async fn run_bridge_task(
             } => {
                 let _span = info_span!("acp.elicit").entered();
                 log::debug!(
-                    "Bridge: forwarding elicitation via ext_method: {}",
+                    "Bridge: forwarding elicitation via ACP extension request: {}",
                     elicitation_id
                 );
 
-                // Serialize elicitation as an ext_method request to the client
                 let params = serde_json::json!({
                     "elicitationId": elicitation_id,
                     "message": message,
                     "requestedSchema": requested_schema,
                     "source": source,
                 });
-                let params_json = serde_json::to_string(&params).unwrap();
-                let raw_value = serde_json::value::RawValue::from_string(params_json)
-                    .expect("valid JSON from serde_json::to_string");
-
-                let ext_req = ExtRequest::new("querymt/elicit", std::sync::Arc::from(raw_value));
-                let result = match acp::UntypedMessage::new(&ext_req.method, &ext_req.params) {
-                    Ok(outbound) => connection.send_request(outbound).block_task().await,
+                let result = match agent_ext_request("_querymt/elicit", params) {
+                    Ok(ext_req) => connection.send_request(ext_req).block_task().await,
                     Err(err) => Err(err),
                 };
 
@@ -162,16 +170,9 @@ async fn run_bridge_task(
                 let _span = info_span!("acp.workspace_query").entered();
                 log::debug!("Bridge: forwarding workspace query: {:?}", query);
 
-                // Serialize the query as raw JSON for ExtRequest
-                let params_json = serde_json::to_string(&query).unwrap();
-                let raw_value = serde_json::value::RawValue::from_string(params_json)
-                    .expect("valid JSON from serde_json::to_string");
-
-                let ext_req = ExtRequest::new("workspace/query", Arc::from(raw_value));
-
-                // Send via ext request which becomes "_workspace/query" on the wire
-                let result = match acp::UntypedMessage::new(&ext_req.method, &ext_req.params) {
-                    Ok(outbound) => connection.send_request(outbound).block_task().await,
+                // Send a wire-form ACP extension request to the client.
+                let result = match agent_ext_request("_workspace/query", &query) {
+                    Ok(ext_req) => connection.send_request(ext_req).block_task().await,
                     Err(err) => Err(err),
                 };
 
@@ -419,6 +420,15 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         .on_receive_request(
             {
                 let agent = agent.clone();
+                async move |req: CloseSessionRequest, responder, _cx| {
+                    responder.respond_with_result(agent.close_session(req).await)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
                 async move |req: SetSessionModelRequest, responder, _cx| {
                     responder.respond_with_result(agent.set_session_model(req).await)
                 }
@@ -446,66 +456,33 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         .on_receive_dispatch(
             {
                 let agent = agent.clone();
-                async move |dispatch: acp::Dispatch<acp::UntypedMessage, acp::UntypedMessage>,
-                            _cx| {
-                    let dispatch = match dispatch.into_request::<acp::UntypedMessage>() {
-                        Ok(Ok((request, responder))) => {
-                            if request.method.starts_with("_querymt/")
-                                || request.method.starts_with("querymt/")
-                            {
-                                let params_json = serde_json::to_string(&request.params)
-                                    .unwrap_or_else(|_| "null".to_string());
-                                let raw = serde_json::value::RawValue::from_string(params_json)
-                                    .unwrap_or_else(|_| {
-                                        serde_json::value::RawValue::from_string("null".to_string())
-                                            .unwrap()
-                                    });
-                                let ext_req =
-                                    ExtRequest::new(request.method, std::sync::Arc::from(raw));
-                                let ext_resp = agent.ext_method(ext_req).await;
-                                let ext_value = ext_resp.and_then(|resp| {
-                                    serde_json::from_str(resp.0.get()).map_err(|e| {
-                                        acp::Error::internal_error().data(e.to_string())
-                                    })
-                                });
-                                responder.respond_with_result(ext_value)?;
-                                return Ok(acp::Handled::Yes);
-                            }
-                            acp::Dispatch::Request(request, responder)
+                async move |dispatch: acp::Dispatch<ClientRequest, ClientNotification>, _cx| {
+                    match dispatch {
+                        acp::Dispatch::Request(ClientRequest::ExtMethodRequest(req), responder) => {
+                            let ext_value = agent.ext_method(req).await.and_then(|resp| {
+                                serde_json::from_str(resp.0.get())
+                                    .map_err(|e| acp::Error::internal_error().data(e.to_string()))
+                            });
+                            responder.respond_with_result(ext_value)?;
+                            Ok(acp::Handled::Yes)
                         }
-                        Ok(Err(dispatch)) => dispatch,
-                        Err(err) => return Err(err),
-                    };
-
-                    let dispatch = match dispatch.into_notification::<acp::UntypedMessage>() {
-                        Ok(Ok(notification)) => {
-                            if notification.method.starts_with("_querymt/")
-                                || notification.method.starts_with("querymt/")
-                            {
-                                let params_json = serde_json::to_string(&notification.params)
-                                    .unwrap_or_else(|_| "null".to_string());
-                                let raw = serde_json::value::RawValue::from_string(params_json)
-                                    .unwrap_or_else(|_| {
-                                        serde_json::value::RawValue::from_string("null".to_string())
-                                            .unwrap()
-                                    });
-                                let ext_notif = agent_client_protocol::schema::ExtNotification::new(
-                                    notification.method,
-                                    std::sync::Arc::from(raw),
-                                );
-                                agent.ext_notification(ext_notif).await?;
-                                return Ok(acp::Handled::Yes);
-                            }
-                            acp::Dispatch::Notification(notification)
+                        acp::Dispatch::Notification(ClientNotification::ExtNotification(notif)) => {
+                            agent.ext_notification(notif).await?;
+                            Ok(acp::Handled::Yes)
                         }
-                        Ok(Err(dispatch)) => dispatch,
-                        Err(err) => return Err(err),
-                    };
-
-                    Ok(acp::Handled::No {
-                        message: dispatch,
-                        retry: false,
-                    })
+                        acp::Dispatch::Request(request, responder) => Ok(acp::Handled::No {
+                            message: acp::Dispatch::Request(request, responder),
+                            retry: false,
+                        }),
+                        acp::Dispatch::Notification(notification) => Ok(acp::Handled::No {
+                            message: acp::Dispatch::Notification(notification),
+                            retry: false,
+                        }),
+                        acp::Dispatch::Response(result, router) => Ok(acp::Handled::No {
+                            message: acp::Dispatch::Response(result, router),
+                            retry: false,
+                        }),
+                    }
                 }
             },
             acp::on_receive_dispatch!(),
@@ -558,4 +535,31 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
 
     log::info!("ACP stdio server shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod stdio_tests {
+    use super::agent_ext_request;
+    use agent_client_protocol::JsonRpcMessage;
+    use agent_client_protocol::schema::AgentRequest;
+
+    #[test]
+    fn outbound_workspace_query_preserves_wire_extension_method() {
+        let request = agent_ext_request(
+            "_workspace/query",
+            serde_json::json!({ "sessionId": "s-1" }),
+        )
+        .expect("agent ext request");
+
+        assert_eq!(request.method(), "_workspace/query");
+        match &request {
+            AgentRequest::ExtMethodRequest(ext) => {
+                assert_eq!(ext.method.as_ref(), "_workspace/query");
+            }
+            other => panic!("expected ext request, got {other:?}"),
+        }
+
+        let untyped = request.to_untyped_message().expect("untyped ext request");
+        assert_eq!(untyped.method, "_workspace/query");
+    }
 }
