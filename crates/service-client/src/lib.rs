@@ -1014,45 +1014,13 @@ fn now_unix_seconds() -> u64 {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use tokio::net::TcpListener;
+    use wiremock::matchers::{body_string_contains, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[derive(Default)]
     struct MemoryServiceAuthStore {
         endpoint: Option<Url>,
         secrets: HashMap<&'static str, String>,
-    }
-
-    async fn read_test_http_request(stream: &mut TcpStream) -> (String, String) {
-        let mut buffer = Vec::with_capacity(1024);
-        let mut chunk = [0; 512];
-        let headers_end = loop {
-            let read = stream.read(&mut chunk).await.unwrap();
-            if read == 0 {
-                panic!("connection closed before request headers completed");
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-            if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-                break position + 4;
-            }
-        };
-
-        let headers = String::from_utf8(buffer[..headers_end].to_vec()).unwrap();
-        let content_length = headers
-            .lines()
-            .find_map(|line| line.strip_prefix("content-length: "))
-            .and_then(|length| length.parse::<usize>().ok())
-            .unwrap_or(0);
-        let mut body = buffer[headers_end..].to_vec();
-        if body.len() < content_length {
-            body.resize(content_length, 0);
-            stream
-                .read_exact(&mut body[buffer.len() - headers_end..])
-                .await
-                .unwrap();
-        }
-        body.truncate(content_length);
-
-        (headers, String::from_utf8(body).unwrap())
     }
 
     impl ServiceAuthStore for MemoryServiceAuthStore {
@@ -1198,9 +1166,8 @@ mod tests {
 
     #[tokio::test]
     async fn exchange_posts_authorization_code_and_pkce_to_local_token_endpoint() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let endpoint = Url::parse(&format!("http://{address}/service/")).unwrap();
+        let server = MockServer::start().await;
+        let endpoint = Url::parse(&format!("{}/service/", server.uri())).unwrap();
         let flow = build_service_authorization_flow(endpoint.clone()).unwrap();
         let callback = ServiceAuthorizationCallback {
             code: "auth-code".to_string(),
@@ -1208,25 +1175,29 @@ mod tests {
         };
         let verifier = flow.pkce_verifier.secret().to_string();
 
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let (request, body) = read_test_http_request(&mut stream).await;
-
-            assert!(request.starts_with("POST /service/oauth/token HTTP/1.1\r\n"));
-            assert!(request.contains("\r\ncontent-type: application/x-www-form-urlencoded\r\n"));
-            assert!(body.contains("grant_type=authorization_code"));
-            assert!(body.contains("code=auth-code"));
-            assert!(body.contains(&format!("client_id={}", service_oauth_client_id())));
-            assert!(body.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback"));
-            assert!(body.contains(&format!("code_verifier={verifier}")));
-
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 128\r\n\r\n{\"access_token\":\"access-token\",\"token_type\":\"Bearer\",\"expires_in\":3600,\"refresh_token\":\"refresh-token\",\"scope\":\"service:status\"}",
-                )
-                .await
-                .unwrap();
-        });
+        Mock::given(method("POST"))
+            .and(path("/service/oauth/token"))
+            .and(header("content-type", "application/x-www-form-urlencoded"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .and(body_string_contains("code=auth-code"))
+            .and(body_string_contains(format!(
+                "client_id={}",
+                service_oauth_client_id()
+            )))
+            .and(body_string_contains(
+                "redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback",
+            ))
+            .and(body_string_contains(format!("code_verifier={verifier}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": "refresh-token",
+                "scope": "service:status"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let tokens = exchange_service_authorization_code(&endpoint, &flow, &callback)
             .await
@@ -1241,30 +1212,27 @@ mod tests {
                 .expires_at
                 .is_some_and(|expires_at| expires_at > now_unix_seconds())
         );
-        server.await.unwrap();
     }
 
     #[tokio::test]
     async fn exchange_maps_local_token_endpoint_error() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
+        let server = MockServer::start().await;
+        let endpoint = Url::parse(&format!("{}/", server.uri())).unwrap();
         let flow = build_service_authorization_flow(endpoint.clone()).unwrap();
         let callback = ServiceAuthorizationCallback {
             code: "bad-code".to_string(),
             state: flow.state.secret().to_string(),
         };
 
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let _request = read_callback_http_request(&mut stream).await.unwrap();
-            stream
-                .write_all(
-                    b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 74\r\n\r\n{\"error\":\"invalid_grant\",\"error_description\":\"expired authorization code\"}",
-                )
-                .await
-                .unwrap();
-        });
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "expired authorization code"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let error = exchange_service_authorization_code(&endpoint, &flow, &callback)
             .await
@@ -1276,7 +1244,6 @@ mod tests {
                 if message.contains("invalid_grant")
                     && message.contains("expired authorization code")
         ));
-        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -1510,9 +1477,8 @@ mod tests {
 
     #[tokio::test]
     async fn logout_cleanup_can_delete_local_credentials_after_revoke_failure() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
+        let server = MockServer::start().await;
+        let endpoint = Url::parse(&format!("{}/", server.uri())).unwrap();
         let mut store = MemoryServiceAuthStore::default();
         let tokens = ServiceTokenSet {
             access_token: "access-token".to_string(),
@@ -1524,14 +1490,12 @@ mod tests {
         store.set_endpoint(&endpoint).unwrap();
         store.set_tokens(&tokens).unwrap();
 
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let _request = read_callback_http_request(&mut stream).await.unwrap();
-            stream
-                .write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n")
-                .await
-                .unwrap();
-        });
+        Mock::given(method("POST"))
+            .and(path("/oauth/revoke"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let revoke_error = revoke_service_tokens(&endpoint, &tokens).await.unwrap_err();
         store.delete_tokens().unwrap();
@@ -1543,31 +1507,26 @@ mod tests {
         ));
         assert_eq!(store.get_tokens().unwrap(), None);
         assert_eq!(store.get_endpoint().unwrap(), None);
-        server.await.unwrap();
     }
 
     #[tokio::test]
     async fn service_revoke_posts_oauth_revocation_form() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let endpoint = Url::parse(&format!("http://{address}/service/")).unwrap();
-        let expected_path = "/service/oauth/revoke".to_string();
+        let server = MockServer::start().await;
+        let endpoint = Url::parse(&format!("{}/service/", server.uri())).unwrap();
 
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let (request, body) = read_test_http_request(&mut stream).await;
-
-            assert!(request.starts_with(&format!("POST {expected_path} HTTP/1.1\r\n")));
-            assert!(request.contains("\r\ncontent-type: application/x-www-form-urlencoded\r\n"));
-            assert!(body.contains("token=refresh-token"));
-            assert!(body.contains("token_type_hint=refresh_token"));
-            assert!(body.contains(&format!("client_id={}", service_oauth_client_id())));
-
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
-                .await
-                .unwrap();
-        });
+        Mock::given(method("POST"))
+            .and(path("/service/oauth/revoke"))
+            .and(header("content-type", "application/x-www-form-urlencoded"))
+            .and(body_string_contains("token=refresh-token"))
+            .and(body_string_contains("token_type_hint=refresh_token"))
+            .and(body_string_contains(format!(
+                "client_id={}",
+                service_oauth_client_id()
+            )))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let tokens = ServiceTokenSet {
             access_token: "access-token".to_string(),
@@ -1578,25 +1537,19 @@ mod tests {
         };
 
         revoke_service_tokens(&endpoint, &tokens).await.unwrap();
-        server.await.unwrap();
     }
 
     #[tokio::test]
     async fn service_revoke_maps_non_success_status() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
+        let server = MockServer::start().await;
+        let endpoint = Url::parse(&format!("{}/", server.uri())).unwrap();
 
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let _request = read_callback_http_request(&mut stream).await.unwrap();
-            stream
-                .write_all(
-                    b"HTTP/1.1 400 Bad Request\r\ncontent-type: text/plain\r\ncontent-length: 11\r\n\r\nbad request",
-                )
-                .await
-                .unwrap();
-        });
+        Mock::given(method("POST"))
+            .and(path("/oauth/revoke"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let tokens = ServiceTokenSet {
             access_token: "access-token".to_string(),
@@ -1612,14 +1565,12 @@ mod tests {
             error,
             ServiceClientError::OAuthTokenRevoke(ref message) if message == "HTTP 400: bad request"
         ));
-        server.await.unwrap();
     }
 
     #[tokio::test]
     async fn refresh_helper_posts_refresh_token_and_updates_store_from_local_token_endpoint() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let endpoint = Url::parse(&format!("http://{address}/service/")).unwrap();
+        let server = MockServer::start().await;
+        let endpoint = Url::parse(&format!("{}/service/", server.uri())).unwrap();
         let previous_tokens = ServiceTokenSet {
             access_token: "expired-access".to_string(),
             refresh_token: Some("old-refresh".to_string()),
@@ -1630,22 +1581,23 @@ mod tests {
         let mut store = MemoryServiceAuthStore::default();
         store.set_tokens(&previous_tokens).unwrap();
 
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let (request, body) = read_test_http_request(&mut stream).await;
-
-            assert!(request.starts_with("POST /service/oauth/token HTTP/1.1\r\n"));
-            assert!(body.contains("grant_type=refresh_token"));
-            assert!(body.contains("refresh_token=old-refresh"));
-            assert!(body.contains(&format!("client_id={}", service_oauth_client_id())));
-
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 96\r\n\r\n{\"access_token\":\"fresh-access\",\"token_type\":\"Bearer\",\"expires_in\":3600,\"scope\":\"service:status\"}",
-                )
-                .await
-                .unwrap();
-        });
+        Mock::given(method("POST"))
+            .and(path("/service/oauth/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("refresh_token=old-refresh"))
+            .and(body_string_contains(format!(
+                "client_id={}",
+                service_oauth_client_id()
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh-access",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "service:status"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let refreshed_tokens = refresh_service_tokens_if_needed(&endpoint, &mut store)
             .await
@@ -1657,30 +1609,22 @@ mod tests {
             Some("old-refresh")
         );
         assert_eq!(store.get_tokens().unwrap(), Some(refreshed_tokens));
-        server.await.unwrap();
     }
 
     #[tokio::test]
     async fn service_api_client_status_sends_bearer_token_and_parses_json() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let endpoint = Url::parse(&format!("http://{address}/service/")).unwrap();
-        let expected_path = "/service/api/service/status".to_string();
+        let server = MockServer::start().await;
+        let endpoint = Url::parse(&format!("{}/service/", server.uri())).unwrap();
 
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let request = read_callback_http_request(&mut stream).await.unwrap();
-
-            assert!(request.starts_with(&format!("GET {expected_path} HTTP/1.1\r\n")));
-            assert!(request.contains("\r\nauthorization: Bearer access-token\r\n"));
-
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 12\r\n\r\n{\"ok\":true}\n",
-                )
-                .await
-                .unwrap();
-        });
+        Mock::given(method("GET"))
+            .and(path("/service/api/service/status"))
+            .and(header("authorization", "Bearer access-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let client = ServiceApiClient::new(endpoint).unwrap();
         let mut store = MemoryServiceAuthStore::default();
@@ -1697,28 +1641,23 @@ mod tests {
         let status = client.status(&mut store).await.unwrap();
 
         assert_eq!(status.raw, serde_json::json!({"ok": true}));
-        server.await.unwrap();
     }
 
     #[tokio::test]
     async fn service_api_client_status_maps_unauthorized_and_forbidden_errors() {
         for (response_status, expected_error) in [
-            (
-                "401 Unauthorized",
-                ServiceClientError::ServiceApiUnauthorized,
-            ),
-            ("403 Forbidden", ServiceClientError::ServiceApiForbidden),
+            (401, ServiceClientError::ServiceApiUnauthorized),
+            (403, ServiceClientError::ServiceApiForbidden),
         ] {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
+            let server = MockServer::start().await;
+            let endpoint = Url::parse(&format!("{}/", server.uri())).unwrap();
 
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let _request = read_callback_http_request(&mut stream).await.unwrap();
-                let response = format!("HTTP/1.1 {response_status}\r\ncontent-length: 0\r\n\r\n");
-                stream.write_all(response.as_bytes()).await.unwrap();
-            });
+            Mock::given(method("GET"))
+                .and(path("/api/service/status"))
+                .respond_with(ResponseTemplate::new(response_status))
+                .expect(1)
+                .mount(&server)
+                .await;
 
             let client = ServiceApiClient::new(endpoint).unwrap();
             let mut store = MemoryServiceAuthStore::default();
@@ -1735,26 +1674,20 @@ mod tests {
             let error = client.status(&mut store).await.unwrap_err();
 
             assert_eq!(error.to_string(), expected_error.to_string());
-            server.await.unwrap();
         }
     }
 
     #[tokio::test]
     async fn service_api_client_status_returns_http_error_with_body() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
+        let server = MockServer::start().await;
+        let endpoint = Url::parse(&format!("{}/", server.uri())).unwrap();
 
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let _request = read_callback_http_request(&mut stream).await.unwrap();
-            stream
-                .write_all(
-                    b"HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain\r\ncontent-length: 4\r\n\r\noops",
-                )
-                .await
-                .unwrap();
-        });
+        Mock::given(method("GET"))
+            .and(path("/api/service/status"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("oops"))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let client = ServiceApiClient::new(endpoint).unwrap();
         let mut store = MemoryServiceAuthStore::default();
@@ -1774,7 +1707,6 @@ mod tests {
             error,
             ServiceClientError::ServiceApiHttp { status: 500, ref body } if body == "oops"
         ));
-        server.await.unwrap();
     }
 
     #[test]
