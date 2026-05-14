@@ -45,7 +45,7 @@ use querymt_service_client::{
     QUERYMT_SERVICE_ENDPOINT_ENV, SecretStoreServiceAuthStore, ServiceApiClient, ServiceAuthStore,
     ServiceClientError, build_service_authorization_flow, exchange_service_authorization_code,
     listen_for_service_authorization_callback, parse_manual_service_authorization_callback,
-    resolve_service_endpoint,
+    resolve_service_endpoint, revoke_service_tokens,
 };
 #[cfg(feature = "service")]
 use url::Url;
@@ -74,7 +74,7 @@ async fn handle_service_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         ServiceCommands::Login { manual } => service_login(*manual).await,
-        ServiceCommands::Logout => service_logout(),
+        ServiceCommands::Logout => service_logout().await,
         ServiceCommands::Status => service_status().await,
     }
 }
@@ -136,10 +136,28 @@ async fn service_login(manual: bool) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(feature = "service")]
-fn service_logout() -> Result<(), Box<dyn std::error::Error>> {
+async fn service_logout() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = SecretStoreServiceAuthStore::new()?;
+    let tokens = store.get_tokens()?;
+    let endpoint = resolve_service_endpoint_for_status(&store).ok();
+    let mut revoke_error = None;
+
+    if let (Some(endpoint), Some(tokens)) = (endpoint.as_ref(), tokens.as_ref()) {
+        if let Err(error) = revoke_service_tokens(endpoint, tokens).await {
+            revoke_error = Some(error);
+        }
+    }
+
     store.delete_tokens()?;
     store.delete_endpoint()?;
+
+    if let Some(error) = revoke_error {
+        println!(
+            "{} Remote service token revoke failed, but local credentials were removed: {}",
+            "!".bright_yellow(),
+            error
+        );
+    }
     println!(
         "{} Logged out from QueryMT service locally",
         "✓".bright_green()

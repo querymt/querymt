@@ -32,6 +32,8 @@ pub const DEFAULT_SERVICE_ENDPOINT: &str = "https://service.querymt.invalid/";
 pub const SERVICE_OAUTH_AUTHORIZE_PATH: &str = "/oauth/authorize";
 /// Future token exchange endpoint path under the resolved QueryMT service endpoint.
 pub const SERVICE_OAUTH_TOKEN_PATH: &str = "/oauth/token";
+/// OAuth token revocation endpoint path under the resolved QueryMT service endpoint.
+pub const SERVICE_OAUTH_REVOKE_PATH: &str = "/oauth/revoke";
 /// Service status API endpoint path under the resolved QueryMT service endpoint.
 pub const SERVICE_API_STATUS_PATH: &str = "/api/service/status";
 
@@ -79,6 +81,7 @@ pub enum ServiceClientError {
     InvalidOAuthUrl(url::ParseError),
     OAuthTokenExchange(String),
     OAuthTokenRefresh(String),
+    OAuthTokenRevoke(String),
     ServiceAuthRequired,
     ServiceTokenRefreshUnavailable,
     ServiceApiTransport(String),
@@ -116,6 +119,9 @@ impl std::fmt::Display for ServiceClientError {
                     f,
                     "service OAuth token refresh failed; sign in again: {error}"
                 )
+            }
+            Self::OAuthTokenRevoke(error) => {
+                write!(f, "service OAuth token revoke failed: {error}")
             }
             Self::ServiceAuthRequired => write!(f, "service sign-in required"),
             Self::ServiceTokenRefreshUnavailable => write!(
@@ -185,6 +191,7 @@ impl std::error::Error for ServiceClientError {
             Self::InvalidOAuthUrl(error) => Some(error),
             Self::OAuthTokenExchange(_)
             | Self::OAuthTokenRefresh(_)
+            | Self::OAuthTokenRevoke(_)
             | Self::ServiceAuthRequired
             | Self::ServiceTokenRefreshUnavailable
             | Self::ServiceApiTransport(_)
@@ -374,6 +381,10 @@ impl ServiceApiClient {
             .map(|raw| ServiceStatus { raw })
     }
 
+    pub async fn revoke_tokens(&self, tokens: &ServiceTokenSet) -> Result<()> {
+        revoke_service_tokens_with_client(&self.http_client, &self.endpoint, tokens).await
+    }
+
     async fn authenticated_get_json(
         &self,
         path: &str,
@@ -397,6 +408,66 @@ fn service_endpoint_url(endpoint: &Url, path: &str) -> Result<Url> {
     endpoint
         .join(path.trim_start_matches('/'))
         .map_err(ServiceClientError::InvalidOAuthUrl)
+}
+
+/// Revoke persisted service OAuth tokens without mutating local token storage.
+pub async fn revoke_service_tokens(endpoint: &Url, tokens: &ServiceTokenSet) -> Result<()> {
+    let http_client = service_api_http_client()?;
+    revoke_service_tokens_with_client(&http_client, endpoint, tokens).await
+}
+
+async fn revoke_service_tokens_with_client(
+    http_client: &reqwest::Client,
+    endpoint: &Url,
+    tokens: &ServiceTokenSet,
+) -> Result<()> {
+    let Some((token, token_type_hint)) = service_revoke_token_request(tokens) else {
+        return Ok(());
+    };
+    let url = service_endpoint_url(endpoint, SERVICE_OAUTH_REVOKE_PATH)?;
+    let form = [
+        ("token", token),
+        ("token_type_hint", token_type_hint),
+        ("client_id", service_oauth_client_id()),
+    ];
+
+    let response = http_client
+        .post(url)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|error| ServiceClientError::OAuthTokenRevoke(error.to_string()))?;
+
+    map_service_revoke_response(response).await
+}
+
+fn service_revoke_token_request(tokens: &ServiceTokenSet) -> Option<(String, String)> {
+    tokens
+        .refresh_token
+        .as_ref()
+        .filter(|token| !token.is_empty())
+        .map(|token| (token.clone(), "refresh_token".to_string()))
+        .or_else(|| {
+            (!tokens.access_token.is_empty())
+                .then(|| (tokens.access_token.clone(), "access_token".to_string()))
+        })
+}
+
+async fn map_service_revoke_response(response: reqwest::Response) -> Result<()> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+
+    let body = response
+        .text()
+        .await
+        .map_err(|error| ServiceClientError::OAuthTokenRevoke(error.to_string()))?;
+    Err(ServiceClientError::OAuthTokenRevoke(format!(
+        "HTTP {}: {}",
+        status.as_u16(),
+        body
+    )))
 }
 
 /// Wait for the service OAuth redirect on the default loopback callback address.
@@ -951,6 +1022,39 @@ mod tests {
         secrets: HashMap<&'static str, String>,
     }
 
+    async fn read_test_http_request(stream: &mut TcpStream) -> (String, String) {
+        let mut buffer = Vec::with_capacity(1024);
+        let mut chunk = [0; 512];
+        let headers_end = loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                panic!("connection closed before request headers completed");
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+
+        let headers = String::from_utf8(buffer[..headers_end].to_vec()).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .and_then(|length| length.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = buffer[headers_end..].to_vec();
+        if body.len() < content_length {
+            body.resize(content_length, 0);
+            stream
+                .read_exact(&mut body[buffer.len() - headers_end..])
+                .await
+                .unwrap();
+        }
+        body.truncate(content_length);
+
+        (headers, String::from_utf8(body).unwrap())
+    }
+
     impl ServiceAuthStore for MemoryServiceAuthStore {
         fn set_endpoint(&mut self, endpoint: &Url) -> Result<()> {
             self.endpoint = Some(endpoint.clone());
@@ -1256,6 +1360,111 @@ mod tests {
             status_url.as_str(),
             "https://service.querymt.example/root/api/service/status"
         );
+    }
+
+    #[test]
+    fn service_revoke_prefers_refresh_token_with_hint() {
+        let tokens = ServiceTokenSet {
+            access_token: "access-token".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            token_type: Some("bearer".to_string()),
+            scope: Some("service:status".to_string()),
+            expires_at: Some(now_unix_seconds() + 60),
+        };
+
+        let request = service_revoke_token_request(&tokens).unwrap();
+
+        assert_eq!(
+            request,
+            ("refresh-token".to_string(), "refresh_token".to_string())
+        );
+    }
+
+    #[test]
+    fn service_revoke_falls_back_to_access_token_with_hint() {
+        let tokens = ServiceTokenSet {
+            access_token: "access-token".to_string(),
+            refresh_token: None,
+            token_type: Some("bearer".to_string()),
+            scope: Some("service:status".to_string()),
+            expires_at: Some(now_unix_seconds() + 60),
+        };
+
+        let request = service_revoke_token_request(&tokens).unwrap();
+
+        assert_eq!(
+            request,
+            ("access-token".to_string(), "access_token".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn service_revoke_posts_oauth_revocation_form() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let endpoint = Url::parse(&format!("http://{address}/service/")).unwrap();
+        let expected_path = "/service/oauth/revoke".to_string();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (request, body) = read_test_http_request(&mut stream).await;
+
+            assert!(request.starts_with(&format!("POST {expected_path} HTTP/1.1\r\n")));
+            assert!(request.contains("\r\ncontent-type: application/x-www-form-urlencoded\r\n"));
+            assert!(body.contains("token=refresh-token"));
+            assert!(body.contains("token_type_hint=refresh_token"));
+            assert!(body.contains(&format!("client_id={}", service_oauth_client_id())));
+
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let tokens = ServiceTokenSet {
+            access_token: "access-token".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            token_type: Some("bearer".to_string()),
+            scope: Some("service:status".to_string()),
+            expires_at: Some(now_unix_seconds() + 60),
+        };
+
+        revoke_service_tokens(&endpoint, &tokens).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_revoke_maps_non_success_status() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_callback_http_request(&mut stream).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\ncontent-type: text/plain\r\ncontent-length: 11\r\n\r\nbad request",
+                )
+                .await
+                .unwrap();
+        });
+
+        let tokens = ServiceTokenSet {
+            access_token: "access-token".to_string(),
+            refresh_token: None,
+            token_type: Some("bearer".to_string()),
+            scope: Some("service:status".to_string()),
+            expires_at: Some(now_unix_seconds() + 60),
+        };
+
+        let error = revoke_service_tokens(&endpoint, &tokens).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ServiceClientError::OAuthTokenRevoke(ref message) if message == "HTTP 400: bad request"
+        ));
+        server.await.unwrap();
     }
 
     #[tokio::test]
