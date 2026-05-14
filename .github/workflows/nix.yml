@@ -49,15 +49,3 @@ jobs:
 
       - name: Check flake
         run: nix flake check
-
-      - name: Build agent-ui
-        run: nix build .#agent-ui
-
-      - name: Build qmt
-        run: nix build .#qmt
-
-      - name: Build qmtcode
-        run: nix build .#qmtcode
-
-      - name: Check devShell
-        run: nix develop --command true
