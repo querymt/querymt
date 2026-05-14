@@ -1197,6 +1197,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exchange_posts_authorization_code_and_pkce_to_local_token_endpoint() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let endpoint = Url::parse(&format!("http://{address}/service/")).unwrap();
+        let flow = build_service_authorization_flow(endpoint.clone()).unwrap();
+        let callback = ServiceAuthorizationCallback {
+            code: "auth-code".to_string(),
+            state: flow.state.secret().to_string(),
+        };
+        let verifier = flow.pkce_verifier.secret().to_string();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (request, body) = read_test_http_request(&mut stream).await;
+
+            assert!(request.starts_with("POST /service/oauth/token HTTP/1.1\r\n"));
+            assert!(request.contains("\r\ncontent-type: application/x-www-form-urlencoded\r\n"));
+            assert!(body.contains("grant_type=authorization_code"));
+            assert!(body.contains("code=auth-code"));
+            assert!(body.contains(&format!("client_id={}", service_oauth_client_id())));
+            assert!(body.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback"));
+            assert!(body.contains(&format!("code_verifier={verifier}")));
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 128\r\n\r\n{\"access_token\":\"access-token\",\"token_type\":\"Bearer\",\"expires_in\":3600,\"refresh_token\":\"refresh-token\",\"scope\":\"service:status\"}",
+                )
+                .await
+                .unwrap();
+        });
+
+        let tokens = exchange_service_authorization_code(&endpoint, &flow, &callback)
+            .await
+            .unwrap();
+
+        assert_eq!(tokens.access_token, "access-token");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("refresh-token"));
+        assert_eq!(tokens.token_type.as_deref(), Some("bearer"));
+        assert_eq!(tokens.scope.as_deref(), Some("service:status"));
+        assert!(
+            tokens
+                .expires_at
+                .is_some_and(|expires_at| expires_at > now_unix_seconds())
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exchange_maps_local_token_endpoint_error() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
+        let flow = build_service_authorization_flow(endpoint.clone()).unwrap();
+        let callback = ServiceAuthorizationCallback {
+            code: "bad-code".to_string(),
+            state: flow.state.secret().to_string(),
+        };
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_callback_http_request(&mut stream).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 74\r\n\r\n{\"error\":\"invalid_grant\",\"error_description\":\"expired authorization code\"}",
+                )
+                .await
+                .unwrap();
+        });
+
+        let error = exchange_service_authorization_code(&endpoint, &flow, &callback)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ServiceClientError::OAuthTokenExchange(ref message)
+                if message.contains("invalid_grant")
+                    && message.contains("expired authorization code")
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn refresh_helper_requires_stored_tokens() {
         let endpoint = Url::parse("https://service.querymt.example/").unwrap();
         let mut store = MemoryServiceAuthStore::default();
@@ -1318,6 +1401,33 @@ mod tests {
     }
 
     #[test]
+    fn service_auth_store_persists_and_deletes_endpoint_and_tokens() {
+        let mut store = MemoryServiceAuthStore::default();
+        let endpoint = Url::parse("https://service.querymt.example/local/").unwrap();
+        let tokens = ServiceTokenSet {
+            access_token: "access-token".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            token_type: Some("bearer".to_string()),
+            scope: Some("service:status".to_string()),
+            expires_at: Some(now_unix_seconds() + 60),
+        };
+
+        store.set_endpoint(&endpoint).unwrap();
+        store.set_tokens(&tokens).unwrap();
+
+        assert_eq!(store.get_endpoint().unwrap(), Some(endpoint));
+        assert_eq!(store.get_tokens().unwrap(), Some(tokens));
+        assert!(store.secrets.contains_key(SERVICE_OAUTH_TOKENS_SECRET_KEY));
+        assert!(!store.secrets.contains_key(SERVICE_ENDPOINT_SECRET_KEY));
+
+        store.delete_tokens().unwrap();
+        store.delete_endpoint().unwrap();
+
+        assert_eq!(store.get_tokens().unwrap(), None);
+        assert_eq!(store.get_endpoint().unwrap(), None);
+    }
+
+    #[test]
     fn endpoint_resolution_uses_env_override() {
         let endpoint = resolve_service_endpoint_from_config(ServiceEndpointConfig::new(
             Some("https://dev.querymt.example/api".to_string()),
@@ -1399,6 +1509,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn logout_cleanup_can_delete_local_credentials_after_revoke_failure() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
+        let mut store = MemoryServiceAuthStore::default();
+        let tokens = ServiceTokenSet {
+            access_token: "access-token".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            token_type: Some("bearer".to_string()),
+            scope: Some("service:status".to_string()),
+            expires_at: Some(now_unix_seconds() + 60),
+        };
+        store.set_endpoint(&endpoint).unwrap();
+        store.set_tokens(&tokens).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_callback_http_request(&mut stream).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let revoke_error = revoke_service_tokens(&endpoint, &tokens).await.unwrap_err();
+        store.delete_tokens().unwrap();
+        store.delete_endpoint().unwrap();
+
+        assert!(matches!(
+            revoke_error,
+            ServiceClientError::OAuthTokenRevoke(ref message) if message == "HTTP 503: "
+        ));
+        assert_eq!(store.get_tokens().unwrap(), None);
+        assert_eq!(store.get_endpoint().unwrap(), None);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn service_revoke_posts_oauth_revocation_form() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1464,6 +1612,51 @@ mod tests {
             error,
             ServiceClientError::OAuthTokenRevoke(ref message) if message == "HTTP 400: bad request"
         ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_helper_posts_refresh_token_and_updates_store_from_local_token_endpoint() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let endpoint = Url::parse(&format!("http://{address}/service/")).unwrap();
+        let previous_tokens = ServiceTokenSet {
+            access_token: "expired-access".to_string(),
+            refresh_token: Some("old-refresh".to_string()),
+            token_type: Some("bearer".to_string()),
+            scope: Some("service:status".to_string()),
+            expires_at: Some(now_unix_seconds().saturating_sub(1)),
+        };
+        let mut store = MemoryServiceAuthStore::default();
+        store.set_tokens(&previous_tokens).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (request, body) = read_test_http_request(&mut stream).await;
+
+            assert!(request.starts_with("POST /service/oauth/token HTTP/1.1\r\n"));
+            assert!(body.contains("grant_type=refresh_token"));
+            assert!(body.contains("refresh_token=old-refresh"));
+            assert!(body.contains(&format!("client_id={}", service_oauth_client_id())));
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 96\r\n\r\n{\"access_token\":\"fresh-access\",\"token_type\":\"Bearer\",\"expires_in\":3600,\"scope\":\"service:status\"}",
+                )
+                .await
+                .unwrap();
+        });
+
+        let refreshed_tokens = refresh_service_tokens_if_needed(&endpoint, &mut store)
+            .await
+            .unwrap();
+
+        assert_eq!(refreshed_tokens.access_token, "fresh-access");
+        assert_eq!(
+            refreshed_tokens.refresh_token.as_deref(),
+            Some("old-refresh")
+        );
+        assert_eq!(store.get_tokens().unwrap(), Some(refreshed_tokens));
         server.await.unwrap();
     }
 
