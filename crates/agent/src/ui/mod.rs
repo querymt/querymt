@@ -17,7 +17,9 @@ mod mentions;
 mod messages;
 mod session;
 
-pub use messages::{RoutingMode, UiAgentInfo};
+pub use messages::{
+    RoutingMode, SessionLoadSnapshot, StreamCursor, UiAgentInfo, cursor_from_events,
+};
 
 #[cfg(test)]
 mod fork_tests;
@@ -35,7 +37,6 @@ use crate::event_fanout::EventFanout;
 use crate::index::WorkspaceIndexManagerActor;
 use crate::session::projection::ViewStore;
 use crate::session::store::SessionStore;
-use crate::ui::messages::StreamCursor;
 use axum::{
     Router,
     extract::{State, ws::WebSocketUpgrade},
@@ -90,32 +91,6 @@ pub(crate) struct ConnectionState {
     pub session_cursors: HashMap<String, StreamCursor>,
     pub current_workspace_root: Option<PathBuf>,
     pub file_index_forwarder: Option<JoinHandle<()>>,
-}
-
-pub(crate) fn cursor_from_events(events: &[crate::events::AgentEvent]) -> StreamCursor {
-    let mut cursor = StreamCursor::default();
-
-    for event in events {
-        match event.origin {
-            crate::events::EventOrigin::Local => {
-                cursor.local_seq = cursor.local_seq.max(event.seq);
-            }
-            crate::events::EventOrigin::Remote => {
-                if let Some(source) = event.source_node.as_ref() {
-                    cursor
-                        .remote_seq_by_source
-                        .entry(source.clone())
-                        .and_modify(|seq| *seq = (*seq).max(event.seq))
-                        .or_insert(event.seq);
-                }
-            }
-            crate::events::EventOrigin::Unknown(_) => {
-                cursor.local_seq = cursor.local_seq.max(event.seq);
-            }
-        }
-    }
-
-    cursor
 }
 
 impl UiServer {

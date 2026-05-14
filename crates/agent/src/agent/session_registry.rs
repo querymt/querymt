@@ -3,12 +3,13 @@
 //! Lives on the server layer. Not an actor — just a plain data structure
 //! protected by a mutex (acceptable: only accessed for routing, not during execution).
 
+use crate::acp::cwd::acp_cwd_to_optional;
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, SessionRuntime};
-use crate::agent::protocol::build_mcp_state;
 use crate::agent::remote::SessionActorRef;
 use crate::agent::session_actor::SessionActor;
 use crate::error::AgentError;
+use crate::events::AgentEventKind;
 use agent_client_protocol::schema::{
     Error, ListSessionsRequest, ListSessionsResponse, McpServer, NewSessionRequest,
     NewSessionResponse, SessionConfigOption, SessionConfigOptionCategory,
@@ -563,17 +564,7 @@ impl SessionRegistry {
         req: NewSessionRequest,
         preconnected_peers: Vec<PreconnectedMcpPeer>,
     ) -> Result<NewSessionResponse, Error> {
-        let cwd = if req.cwd.as_os_str().is_empty() {
-            None
-        } else {
-            if !req.cwd.is_absolute() {
-                return Err(Error::invalid_params().data(serde_json::json!({
-                    "message": "cwd must be an absolute path",
-                    "cwd": req.cwd.display().to_string(),
-                })));
-            }
-            Some(req.cwd.clone())
-        };
+        let cwd = acp_cwd_to_optional(&req.cwd)?;
 
         let parent_session_id = req
             .meta
@@ -712,6 +703,32 @@ impl SessionRegistry {
         preconnected_peers: Vec<PreconnectedMcpPeer>,
     ) -> Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
         let session_id = req.session_id.to_string();
+
+        let attached_remote = self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session_ref| session_ref.is_remote());
+
+        if attached_remote {
+            let current_mode = {
+                let session_ref = self
+                    .sessions
+                    .get(&session_id)
+                    .ok_or_else(|| {
+                        Error::internal_error().data("remote session missing after attach")
+                    })?
+                    .clone();
+                session_ref.get_mode().await.map_err(Error::from)?
+            };
+
+            return Ok(agent_client_protocol::schema::LoadSessionResponse::new()
+                .modes(mode_state(current_mode))
+                .config_options(config_options(
+                    current_mode,
+                    **self.config.default_reasoning_effort.load(),
+                )));
+        }
+
         let _session = self
             .config
             .provider
@@ -726,17 +743,7 @@ impl SessionRegistry {
                 }))
             })?;
 
-        let cwd = if req.cwd.as_os_str().is_empty() {
-            None
-        } else {
-            if !req.cwd.is_absolute() {
-                return Err(Error::invalid_params().data(serde_json::json!({
-                    "message": "cwd must be an absolute path",
-                    "cwd": req.cwd.display().to_string(),
-                })));
-            }
-            Some(req.cwd.clone())
-        };
+        let cwd = acp_cwd_to_optional(&req.cwd)?;
 
         let materialization = self
             .materialize_session_actor(
@@ -758,11 +765,8 @@ impl SessionRegistry {
         )
         .await?;
 
-        // Stream full history to client
-        // TODO: Implement full-fidelity history streaming with SessionUpdate notifications
-        // For now, we'll return success without streaming history
         self.config
-            .emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);
+            .emit_event(&session_id, AgentEventKind::SessionCreated);
 
         // Emit initial provider configuration so UI can display context limits
         if let Ok(Some(llm_config)) = self

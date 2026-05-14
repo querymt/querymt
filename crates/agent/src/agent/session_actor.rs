@@ -1711,6 +1711,8 @@ async fn execute_prompt_detached(
     // User text only for intent snapshot (clean, no attachments)
     let user_text = format_prompt_user_text_only(&req.prompt);
 
+    let message_id = Uuid::new_v4().to_string();
+
     for block in &req.prompt {
         if cancel_token.is_cancelled() {
             break;
@@ -1718,7 +1720,9 @@ async fn execute_prompt_detached(
         if let Some(ref bridge) = bridge {
             let notification = agent_client_protocol::schema::SessionNotification::new(
                 agent_client_protocol::schema::SessionId::from(session_id.clone()),
-                SessionUpdate::UserMessageChunk(ContentChunk::new(block.clone())),
+                SessionUpdate::UserMessageChunk(
+                    ContentChunk::new(block.clone()).message_id(Some(message_id.clone())),
+                ),
             );
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
@@ -1730,8 +1734,6 @@ async fn execute_prompt_detached(
             }
         }
     }
-
-    let message_id = Uuid::new_v4().to_string();
     config.emit_event(
         &session_id,
         AgentEventKind::PromptReceived {
