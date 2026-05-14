@@ -269,11 +269,7 @@ impl Redactor for DefaultRedactor {
             }
             RedactionPolicy::Minimal => {
                 // Only show first 100 chars as summary
-                if content.len() > 100 {
-                    format!("{}...", &content[..100])
-                } else {
-                    content.to_string()
-                }
+                querymt_utils::str_utils::truncate_with_ellipsis(content, 100)
             }
         }
     }

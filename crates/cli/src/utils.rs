@@ -148,11 +148,7 @@ fn format_tool_args(args_json: &str) -> String {
 
                     let value_str = match value {
                         serde_json::Value::String(s) => {
-                            if s.len() > 20 {
-                                format!("{}...", &s[..17])
-                            } else {
-                                s.clone()
-                            }
+                            querymt_utils::str_utils::truncate_with_ellipsis(s, 20)
                         }
                         serde_json::Value::Number(n) => n.to_string(),
                         serde_json::Value::Bool(b) => b.to_string(),

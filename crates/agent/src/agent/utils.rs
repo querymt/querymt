@@ -112,7 +112,8 @@ pub fn truncate_to_bytes(input: &str, max_bytes: usize) -> String {
     }
     let note = "\n[truncated]";
     if max_bytes <= note.len() {
-        return note[..max_bytes].to_string();
+        // Not enough room for text + note: return as many whole chars as fit.
+        return input.chars().take(max_bytes).collect();
     }
 
     let mut end = max_bytes - note.len();
