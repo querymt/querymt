@@ -73,14 +73,14 @@ async fn handle_service_command(
     command: &ServiceCommands,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        ServiceCommands::Login => service_login().await,
+        ServiceCommands::Login { manual } => service_login(*manual).await,
         ServiceCommands::Logout => service_logout(),
         ServiceCommands::Status => service_status().await,
     }
 }
 
 #[cfg(feature = "service")]
-async fn service_login() -> Result<(), Box<dyn std::error::Error>> {
+async fn service_login(manual: bool) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = resolve_service_endpoint()?;
     let flow = build_service_authorization_flow(endpoint.clone())?;
     let mut store = SecretStoreServiceAuthStore::new()?;
@@ -93,20 +93,27 @@ async fn service_login() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nPlease visit this URL to authorize:");
     println!("{}\n", flow.authorization_url.as_str().bright_yellow());
 
-    match open::that(flow.authorization_url.as_str()) {
-        Ok(_) => println!("{} Browser opened automatically\n", "✓".bright_green()),
-        Err(error) => println!(
-            "{} Could not open browser automatically: {}\n",
-            "!".bright_yellow(),
-            error
-        ),
-    }
+    let callback = if manual {
+        println!("Paste the full callback URL or query string after authorization.");
+        let mut input = String::new();
+        print!("Callback URL/query: ");
+        io::stdout().flush()?;
+        io::stdin().read_line(&mut input)?;
+        parse_manual_service_authorization_callback(input.trim(), flow.state.secret())?
+    } else {
+        match open::that(flow.authorization_url.as_str()) {
+            Ok(_) => println!("{} Browser opened automatically\n", "✓".bright_green()),
+            Err(error) => println!(
+                "{} Could not open browser automatically: {}\n",
+                "!".bright_yellow(),
+                error
+            ),
+        }
 
-    println!(
-        "Waiting for OAuth callback on {}...",
-        flow.redirect_uri.as_str()
-    );
-    let callback =
+        println!(
+            "Waiting for OAuth callback on {}...",
+            flow.redirect_uri.as_str()
+        );
         match listen_for_service_authorization_callback(&flow, Duration::from_secs(300)).await {
             Ok(callback) => callback,
             Err(error) => {
@@ -118,7 +125,8 @@ async fn service_login() -> Result<(), Box<dyn std::error::Error>> {
                 io::stdin().read_line(&mut input)?;
                 parse_manual_service_authorization_callback(input.trim(), flow.state.secret())?
             }
-        };
+        }
+    };
 
     let tokens = exchange_service_authorization_code(&endpoint, &flow, &callback).await?;
     store.set_tokens(&tokens)?;

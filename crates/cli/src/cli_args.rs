@@ -165,7 +165,11 @@ pub enum AuthCommands {
 #[derive(Subcommand, Debug)]
 pub enum ServiceCommands {
     /// Login to QueryMT service using OAuth
-    Login,
+    Login {
+        /// Prompt for a pasted callback URL/query instead of opening a browser and listening locally
+        #[arg(long)]
+        manual: bool,
+    },
     /// Logout from QueryMT service locally
     Logout,
     /// Check QueryMT service authentication and API status
