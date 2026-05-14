@@ -1117,6 +1117,9 @@ pub(crate) async fn resolve_api_key_with_preference(
     preferred: Option<&AuthMethod>,
     use_oauth_resolver: &mut bool,
 ) -> Option<String> {
+    #[cfg(not(feature = "oauth"))]
+    let _ = use_oauth_resolver;
+
     // Build the resolution order based on preference
     let order: Vec<AuthMethod> = match preferred {
         Some(AuthMethod::OAuth) | None => {

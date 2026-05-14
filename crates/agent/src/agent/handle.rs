@@ -20,11 +20,12 @@ use crate::send_agent::SendAgent;
 use crate::session::store::LLMConfig;
 use crate::tools::ToolRegistry;
 use agent_client_protocol::schema::{
-    AuthenticateRequest, AuthenticateResponse, CancelNotification, Error, ExtNotification,
-    ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
-    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    ResumeSessionRequest, ResumeSessionResponse, SetSessionModelRequest, SetSessionModelResponse,
+    AuthenticateRequest, AuthenticateResponse, CancelNotification, CloseSessionRequest,
+    CloseSessionResponse, Error, ExtNotification, ExtRequest, ExtResponse, ForkSessionRequest,
+    ForkSessionResponse, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, PromptRequest, PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
+    SetSessionModelRequest, SetSessionModelResponse,
 };
 use anyhow::Result;
 use arc_swap::ArcSwap;
@@ -1694,7 +1695,9 @@ impl SendAgent for LocalAgentHandle {
     #[tracing::instrument(name = "acp.initialize", skip_all)]
     async fn initialize(&self, req: InitializeRequest) -> Result<InitializeResponse, Error> {
         use agent_client_protocol::schema::{
-            AgentCapabilities, Implementation, McpCapabilities, PromptCapabilities, ProtocolVersion,
+            AgentCapabilities, Implementation, McpCapabilities, PromptCapabilities,
+            ProtocolVersion, SessionCapabilities, SessionCloseCapabilities,
+            SessionForkCapabilities, SessionListCapabilities, SessionResumeCapabilities,
         };
 
         let protocol_version = if req.protocol_version <= ProtocolVersion::LATEST {
@@ -1717,7 +1720,14 @@ impl SendAgent for LocalAgentHandle {
         let mut capabilities = AgentCapabilities::new()
             .load_session(true)
             .prompt_capabilities(PromptCapabilities::new().embedded_context(true))
-            .mcp_capabilities(McpCapabilities::new().http(true).sse(true));
+            .mcp_capabilities(McpCapabilities::new().http(true).sse(true))
+            .session_capabilities(
+                SessionCapabilities::new()
+                    .list(SessionListCapabilities::new())
+                    .fork(SessionForkCapabilities::new())
+                    .resume(SessionResumeCapabilities::new())
+                    .close(SessionCloseCapabilities::new()),
+            );
 
         // Add delegation metadata if agent registry is available
         if let Some(delegation_meta) = self.build_delegation_meta() {
@@ -1823,6 +1833,13 @@ impl SendAgent for LocalAgentHandle {
         registry.resume_session(req).await
     }
 
+    #[tracing::instrument(name = "acp.close_session", skip_all, fields(session_id = %req.session_id))]
+    async fn close_session(&self, req: CloseSessionRequest) -> Result<CloseSessionResponse, Error> {
+        let session_id = req.session_id.to_string();
+        self.stop_session(&session_id).await?;
+        Ok(CloseSessionResponse::new())
+    }
+
     #[tracing::instrument(name = "acp.set_session_model", skip_all, fields(session_id = %req.session_id))]
     async fn set_session_model(
         &self,
@@ -1887,6 +1904,73 @@ impl SendAgent for LocalAgentHandle {
         let session_id = req.session_id.0.to_string();
 
         match config_id {
+            "model" => {
+                #[derive(serde::Deserialize)]
+                struct QuerymtMeta {
+                    #[serde(rename = "modelEntry")]
+                    model_entry: crate::model_registry::ModelEntry,
+                }
+
+                #[derive(serde::Deserialize)]
+                struct RequestMeta {
+                    querymt: QuerymtMeta,
+                }
+
+                let model_id = value_id.0.to_string();
+                let provider_node_id = req
+                    .meta
+                    .as_ref()
+                    .and_then(|m| serde_json::from_value::<RequestMeta>(serde_json::Value::Object(m.clone())).ok())
+                    .and_then(|m| m.querymt.model_entry.node_id)
+                    .map(|node_id| {
+                        #[cfg(feature = "remote")]
+                        {
+                            crate::agent::remote::NodeId::parse(&node_id).map_err(|e| {
+                                Error::invalid_params().data(serde_json::json!({
+                                    "error": format!("invalid modelEntry.node_id '{}': {}", node_id, e),
+                                }))
+                            })
+                        }
+                        #[cfg(not(feature = "remote"))]
+                        {
+                            let _ = node_id;
+                            Ok::<(), Error>(())
+                        }
+                    })
+                    .transpose()?;
+
+                let session_ref = {
+                    let registry = self.registry.lock().await;
+                    registry.get(&session_id).cloned().ok_or_else(|| {
+                        Error::invalid_params().data(serde_json::json!({
+                            "message": "unknown session",
+                            "sessionId": session_id,
+                        }))
+                    })?
+                };
+
+                #[cfg(feature = "remote")]
+                let msg = crate::agent::messages::SetSessionModel {
+                    req: SetSessionModelRequest::new(session_id.clone(), model_id),
+                    provider_node_id,
+                };
+                #[cfg(not(feature = "remote"))]
+                let msg = crate::agent::messages::SetSessionModel {
+                    req: SetSessionModelRequest::new(session_id.clone(), model_id),
+                    provider_node_id: None,
+                };
+
+                session_ref.set_session_model_with_node(msg).await?;
+
+                let mode = session_ref.get_mode().await.unwrap_or(AgentMode::Build);
+                let effort = session_ref.get_reasoning_effort().await.ok().flatten();
+
+                Ok(
+                    agent_client_protocol::schema::SetSessionConfigOptionResponse::new(
+                        config_options(mode, effort),
+                    ),
+                )
+            }
             "mode" => {
                 let mode = value_id
                     .0
@@ -2133,7 +2217,328 @@ impl SendAgent for LocalAgentHandle {
                 ext_json_response(&result)
             }
 
+            "querymt/session/delete" => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct DeleteSessionReq {
+                    session_id: String,
+                }
+
+                let parsed: DeleteSessionReq =
+                    serde_json::from_str(req.params.get()).map_err(|e| {
+                        Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+                    })?;
+
+                let is_loaded = {
+                    let registry = self.registry.lock().await;
+                    registry.get(&parsed.session_id).is_some()
+                };
+                if is_loaded {
+                    // Closing is best-effort: deleting persisted history is the primary intent.
+                    let _ = self.stop_session(&parsed.session_id).await;
+                }
+
+                self.config
+                    .provider
+                    .history_store()
+                    .delete_session(&parsed.session_id)
+                    .await
+                    .map_err(|e| {
+                        Error::internal_error().data(serde_json::json!({"error": e.to_string()}))
+                    })?;
+
+                ext_json_response(&serde_json::json!({"success": true}))
+            }
+
             // ── querymt/mesh extensions ────────────────────────────────
+            "querymt/mesh/status" => {
+                #[cfg(feature = "remote")]
+                {
+                    if let Some(mesh) = self.mesh() {
+                        let result = serde_json::json!({
+                            "enabled": true,
+                            "peer_id": mesh.peer_id().to_string(),
+                            "transport": if mesh.is_iroh_transport() { "iroh" } else { "lan" },
+                            "known_peer_count": mesh.known_peer_ids().len(),
+                            "has_invite_store": mesh.invite_store().is_some(),
+                            "has_membership_store": mesh.membership_store().is_some(),
+                        });
+                        return ext_json_response(&result);
+                    }
+                }
+
+                ext_json_response(&serde_json::json!({
+                    "enabled": false,
+                    "peer_id": serde_json::Value::Null,
+                    "transport": serde_json::Value::Null,
+                    "known_peer_count": 0,
+                    "has_invite_store": false,
+                    "has_membership_store": false,
+                }))
+            }
+            "querymt/mesh/join" => {
+                #[cfg(feature = "remote-internet")]
+                {
+                    #[derive(serde::Deserialize)]
+                    #[serde(rename_all = "camelCase")]
+                    struct JoinReq {
+                        invite: String,
+                    }
+
+                    let parsed: JoinReq = serde_json::from_str(req.params.get()).map_err(|e| {
+                        Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+                    })?;
+
+                    let invite =
+                        crate::agent::remote::invite::SignedInviteGrant::decode(&parsed.invite)
+                            .map_err(|e| {
+                                Error::invalid_params().data(
+                            serde_json::json!({"error": format!("invalid mesh invite: {}", e)}),
+                        )
+                            })?;
+
+                    let mesh = crate::agent::remote::join_mesh_via_invite(&invite, None)
+                        .await
+                        .map_err(|e| {
+                            Error::internal_error()
+                                .data(serde_json::json!({"error": e.to_string()}))
+                        })?;
+
+                    self.set_mesh(mesh.clone());
+
+                    return ext_json_response(&serde_json::json!({
+                        "joined": true,
+                        "peer_id": mesh.peer_id().to_string(),
+                        "mesh_name": invite.grant.mesh_name,
+                        "inviter_peer_id": invite.grant.inviter_peer_id,
+                    }));
+                }
+
+                #[cfg(not(feature = "remote-internet"))]
+                {
+                    Err(Error::method_not_found())
+                }
+            }
+            "querymt/mesh/nodes" => {
+                #[cfg(feature = "remote")]
+                {
+                    let nodes = self
+                        .list_remote_nodes()
+                        .await
+                        .into_iter()
+                        .map(|n| {
+                            serde_json::json!({
+                                "id": n.node_id.to_string(),
+                                "label": n.hostname,
+                                "capabilities": n.capabilities,
+                                "active_sessions": n.active_sessions,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    return ext_json_response(&serde_json::json!({ "nodes": nodes }));
+                }
+
+                #[cfg(not(feature = "remote"))]
+                {
+                    ext_json_response(&serde_json::json!({ "nodes": [] }))
+                }
+            }
+            "querymt/remote/sessions" => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct RemoteSessionsReq {
+                    node_id: String,
+                }
+
+                let parsed: RemoteSessionsReq =
+                    serde_json::from_str(req.params.get()).map_err(|e| {
+                        Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+                    })?;
+
+                #[cfg(feature = "remote")]
+                {
+                    let nm_ref = self.find_node_manager(&parsed.node_id).await?;
+                    let sessions = self.list_remote_sessions(&nm_ref).await?;
+                    return ext_json_response(&serde_json::json!({
+                        "nodeId": parsed.node_id,
+                        "sessions": sessions,
+                    }));
+                }
+
+                #[cfg(not(feature = "remote"))]
+                {
+                    let _ = parsed;
+                    Err(Error::method_not_found())
+                }
+            }
+            "querymt/remote/createSession" => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct CreateReq {
+                    node_id: String,
+                    #[serde(default)]
+                    cwd: Option<String>,
+                }
+
+                let parsed: CreateReq = serde_json::from_str(req.params.get()).map_err(|e| {
+                    Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+                })?;
+
+                #[cfg(feature = "remote")]
+                {
+                    let nm_ref = self.find_node_manager(&parsed.node_id).await?;
+                    let resp = self
+                        .create_remote_session(&nm_ref, parsed.cwd.clone())
+                        .await?;
+
+                    let remote_ref = match resp.handoff {
+                        crate::agent::remote::node_manager::SessionHandoff::DirectRemote {
+                            session_ref,
+                        } => session_ref,
+                        _ => {
+                            let mesh = self.mesh().ok_or_else(|| {
+                                Error::invalid_request().data("mesh not bootstrapped")
+                            })?;
+                            let dht_name =
+                                crate::agent::remote::dht_name::session(&resp.session_id);
+                            mesh.lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name)
+                                .await
+                                .map_err(|e| {
+                                    Error::internal_error()
+                                        .data(serde_json::json!({"error": e.to_string()}))
+                                })?
+                                .ok_or_else(|| {
+                                    Error::invalid_request().data("remote session actor not found")
+                                })?
+                        }
+                    };
+
+                    let peer_label = self
+                        .list_remote_nodes()
+                        .await
+                        .into_iter()
+                        .find(|n| n.node_id.to_string() == parsed.node_id)
+                        .map(|n| n.hostname)
+                        .unwrap_or_else(|| parsed.node_id.clone());
+
+                    self.attach_remote_session(
+                        resp.session_id.clone(),
+                        remote_ref,
+                        peer_label,
+                        Some(parsed.node_id.clone()),
+                    )
+                    .await;
+
+                    return ext_json_response(&serde_json::json!({
+                        "sessionId": resp.session_id,
+                        "nodeId": parsed.node_id,
+                        "attached": true,
+                        "configOptions": [],
+                    }));
+                }
+
+                #[cfg(not(feature = "remote"))]
+                {
+                    let _ = parsed;
+                    Err(Error::method_not_found())
+                }
+            }
+            "querymt/remote/attachSession" => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct AttachReq {
+                    node_id: String,
+                    session_id: String,
+                }
+
+                let parsed: AttachReq = serde_json::from_str(req.params.get()).map_err(|e| {
+                    Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+                })?;
+
+                #[cfg(feature = "remote")]
+                {
+                    let mesh = self
+                        .mesh()
+                        .ok_or_else(|| Error::invalid_request().data("mesh not bootstrapped"))?;
+                    let dht_name = crate::agent::remote::dht_name::session(&parsed.session_id);
+                    let remote_ref = mesh
+                        .lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name)
+                        .await
+                        .map_err(|e| {
+                            Error::internal_error()
+                                .data(serde_json::json!({"error": e.to_string()}))
+                        })?
+                        .ok_or_else(|| {
+                            Error::invalid_request().data("remote session actor not found")
+                        })?;
+
+                    let peer_label = self
+                        .list_remote_nodes()
+                        .await
+                        .into_iter()
+                        .find(|n| n.node_id.to_string() == parsed.node_id)
+                        .map(|n| n.hostname)
+                        .unwrap_or_else(|| parsed.node_id.clone());
+
+                    self.attach_remote_session(
+                        parsed.session_id.clone(),
+                        remote_ref,
+                        peer_label,
+                        Some(parsed.node_id.clone()),
+                    )
+                    .await;
+
+                    return ext_json_response(&serde_json::json!({
+                        "sessionId": parsed.session_id,
+                        "nodeId": parsed.node_id,
+                        "attached": true,
+                        "configOptions": [],
+                    }));
+                }
+
+                #[cfg(not(feature = "remote"))]
+                {
+                    let _ = parsed;
+                    Err(Error::method_not_found())
+                }
+            }
+            "querymt/remote/dismissSession" => {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct DismissReq {
+                    session_id: String,
+                }
+
+                let parsed: DismissReq = serde_json::from_str(req.params.get()).map_err(|e| {
+                    Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+                })?;
+
+                #[cfg(feature = "remote")]
+                {
+                    {
+                        let mut registry = self.registry.lock().await;
+                        registry.detach_remote_session(&parsed.session_id).await;
+                    }
+
+                    self.config
+                        .provider
+                        .history_store()
+                        .remove_remote_session_bookmark(&parsed.session_id)
+                        .await
+                        .map_err(|e| {
+                            Error::internal_error()
+                                .data(serde_json::json!({"error": e.to_string()}))
+                        })?;
+
+                    return ext_json_response(&serde_json::json!({ "success": true }));
+                }
+
+                #[cfg(not(feature = "remote"))]
+                {
+                    let _ = parsed;
+                    Err(Error::method_not_found())
+                }
+            }
             "querymt/mesh/createInvite" => {
                 #[derive(serde::Deserialize, Default)]
                 struct CreateInviteReq {
@@ -2302,14 +2707,7 @@ impl SendAgent for LocalAgentHandle {
                 }
             }
 
-            _ => {
-                // Unknown extension method — return null
-                let raw_value = serde_json::value::RawValue::from_string("null".to_string())
-                    .map_err(|e| {
-                        Error::from(crate::error::AgentError::Serialization(e.to_string()))
-                    })?;
-                Ok(ExtResponse::new(Arc::from(raw_value)))
-            }
+            _ => Err(Error::method_not_found()),
         }
     }
 
@@ -2354,7 +2752,8 @@ mod tests {
         mock_plugin_registry, mock_session,
     };
     use agent_client_protocol::schema::{
-        CancelNotification, InitializeRequest, ListSessionsRequest, ProtocolVersion, SessionId,
+        CancelNotification, CloseSessionRequest, InitializeRequest, ListSessionsRequest,
+        ProtocolVersion, SessionId,
     };
     use querymt::LLMParams;
     use std::sync::Arc;
@@ -2465,6 +2864,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_initialize_advertises_session_capabilities() {
+        let f = HandleFixture::new().await;
+        let req = InitializeRequest::new(ProtocolVersion::LATEST);
+        let resp = f.handle.initialize(req).await.expect("initialize");
+
+        assert!(resp.agent_capabilities.load_session);
+        assert!(resp.agent_capabilities.session_capabilities.list.is_some());
+        assert!(resp.agent_capabilities.session_capabilities.fork.is_some());
+        assert!(
+            resp.agent_capabilities
+                .session_capabilities
+                .resume
+                .is_some()
+        );
+        assert!(resp.agent_capabilities.session_capabilities.close.is_some());
+    }
+
+    #[tokio::test]
     async fn test_list_sessions_empty() {
         let f = HandleFixture::new().await;
         let req = ListSessionsRequest::new();
@@ -2482,6 +2899,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_close_unknown_session_is_noop() {
+        let f = HandleFixture::new().await;
+        let req = CloseSessionRequest::new(SessionId::from("no-such-session".to_string()));
+        let result = SendAgent::close_session(&f.handle, req).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
     async fn test_prompt_unknown_session_returns_error() {
         let f = HandleFixture::new().await;
         let req = agent_client_protocol::schema::PromptRequest::new(
@@ -2493,14 +2918,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ext_method_returns_null() {
+    async fn test_unknown_ext_method_returns_method_not_found() {
         let f = HandleFixture::new().await;
         let null_params = std::sync::Arc::from(
             serde_json::value::RawValue::from_string("null".to_string()).unwrap(),
         );
         let req = agent_client_protocol::schema::ExtRequest::new("my_method", null_params);
+        let err = f
+            .handle
+            .ext_method(req)
+            .await
+            .expect_err("unknown ext_method should fail");
+        assert_eq!(err.code, agent_client_protocol::ErrorCode::MethodNotFound);
+    }
+
+    #[tokio::test]
+    async fn test_querymt_models_ext_method_returns_models() {
+        let f = HandleFixture::new().await;
+        let null_params = std::sync::Arc::from(
+            serde_json::value::RawValue::from_string("null".to_string()).unwrap(),
+        );
+        let req = agent_client_protocol::schema::ExtRequest::new("querymt/models", null_params);
         let resp = f.handle.ext_method(req).await.expect("ext_method");
-        assert_eq!(resp.0.get(), "null");
+        let value: serde_json::Value = serde_json::from_str(resp.0.get()).expect("valid JSON");
+        assert!(value.get("models").is_some());
     }
 
     #[tokio::test]

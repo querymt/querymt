@@ -6,19 +6,20 @@ license.workspace = true
 description = "Agent and Session management for querymt"
 
 [features]
-default = []
+default = ["plugin-loaders"]
 # Enables the API UI server for alternate clients over /ui/ws.
 api = []
-# QueryMT provider registry without dynamic plugin loaders.
-plugin-host-only = ["agent-mcp", "agent-tracing", "querymt/plugin_host", "querymt/model-registry"]
+# QueryMT core runtime is always enabled; this remains as a compatibility alias
+# for embedders that want the agent without dynamic plugin loading.
+plugin-host-only = ["agent-mcp", "agent-tracing"]
 # Desktop/plugin-loading support. Mobile embedders should use plugin-host-only.
-plugin-loaders = ["plugin-host-only", "querymt/extism_host", "querymt/native"]
+plugin-loaders = ["plugin-host-only", "querymt/dynamic-plugins"]
 agent-mcp = ["querymt/mcp"]
 agent-tracing = ["querymt/tracing"]
 # Enables the web dashboard UI with React frontend assets.
 # Locally, the build script uses bun (or npm fallback) to build UI assets.
 # Packagers can bypass runtime installs by setting QMT_UI_DIST to a prebuilt dist/.
-dashboard = ["api"]
+dashboard = ["api", "plugin-loaders"]
 # Enables OAuth token support for authentication (reads tokens from system keyring)
 oauth = ["querymt-utils/oauth"]
 
@@ -38,7 +39,7 @@ remote-internet = ["remote", "dep:libp2p-iroh", "dep:qrcode"]
 
 [dependencies]
 typeshare = "1.0"
-querymt = { path = "../querymt", default-features = false }
+querymt = { path = "../querymt", default-features = false, features = ["runtime"] }
 querymt-provider-common = { path = "../provider-common" }
 querymt-utils = { path = "../querymt-utils", features = ["providers", "serde", "secret-store"] }
 agent-client-protocol = { version = "0.11", features = ["unstable"] }
