@@ -9,8 +9,12 @@ use querymt::{
 
 use spinners::{Spinner, Spinners};
 use std::fs;
+#[cfg(feature = "service")]
+use std::io::Write;
 use std::io::{self, IsTerminal};
 use std::sync::Arc;
+#[cfg(feature = "service")]
+use std::time::Duration;
 
 mod auth;
 mod chat;
@@ -22,6 +26,11 @@ mod tracing;
 mod utils;
 
 use chat::{chat_pipe, interactive_loop};
+#[cfg(feature = "service")]
+use cli_args::{
+    AuthCommands, CliArgs, Commands, SecretsCommands, ServiceCommands, ToolConfig, ToolPolicyState,
+};
+#[cfg(not(feature = "service"))]
 use cli_args::{AuthCommands, CliArgs, Commands, SecretsCommands, ToolConfig, ToolPolicyState};
 use embed::embed_pipe;
 use provider::{
@@ -30,6 +39,16 @@ use provider::{
 use secret_store::SecretStore;
 use tracing::setup_logging;
 use utils::{ToolLoadingStats, get_provider_api_key, parse_tool_names};
+
+#[cfg(feature = "service")]
+use querymt_service_client::{
+    QUERYMT_SERVICE_ENDPOINT_ENV, SecretStoreServiceAuthStore, ServiceApiClient, ServiceAuthStore,
+    ServiceClientError, build_service_authorization_flow, exchange_service_authorization_code,
+    listen_for_service_authorization_callback, parse_manual_service_authorization_callback,
+    resolve_service_endpoint, revoke_service_tokens,
+};
+#[cfg(feature = "service")]
+use url::Url;
 
 fn load_tool_config() -> Result<ToolConfig, Box<dyn std::error::Error>> {
     match querymt_utils::providers::find_config_in_home(&["tools-policy.toml"]) {
@@ -47,6 +66,152 @@ fn load_tool_config() -> Result<ToolConfig, Box<dyn std::error::Error>> {
             })
         }
     }
+}
+
+#[cfg(feature = "service")]
+async fn handle_service_command(
+    command: &ServiceCommands,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        ServiceCommands::Login { manual } => service_login(*manual).await,
+        ServiceCommands::Logout => service_logout().await,
+        ServiceCommands::Status => service_status().await,
+    }
+}
+
+#[cfg(feature = "service")]
+async fn service_login(manual: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = resolve_service_endpoint()?;
+    let flow = build_service_authorization_flow(endpoint.clone())?;
+    let mut store = SecretStoreServiceAuthStore::new()?;
+    store.set_endpoint(&endpoint)?;
+
+    println!(
+        "QueryMT service endpoint: {}",
+        endpoint.as_str().bright_cyan()
+    );
+    println!("\nPlease visit this URL to authorize:");
+    println!("{}\n", flow.authorization_url.as_str().bright_yellow());
+
+    let callback = if manual {
+        println!("Paste the full callback URL or query string after authorization.");
+        let mut input = String::new();
+        print!("Callback URL/query: ");
+        io::stdout().flush()?;
+        io::stdin().read_line(&mut input)?;
+        parse_manual_service_authorization_callback(input.trim(), flow.state.secret())?
+    } else {
+        match open::that(flow.authorization_url.as_str()) {
+            Ok(_) => println!("{} Browser opened automatically\n", "✓".bright_green()),
+            Err(error) => println!(
+                "{} Could not open browser automatically: {}\n",
+                "!".bright_yellow(),
+                error
+            ),
+        }
+
+        println!(
+            "Waiting for OAuth callback on {}...",
+            flow.redirect_uri.as_str()
+        );
+        match listen_for_service_authorization_callback(&flow, Duration::from_secs(300)).await {
+            Ok(callback) => callback,
+            Err(error) => {
+                println!("{} Callback capture failed: {}", "!".bright_yellow(), error);
+                println!("Paste the full callback URL or query string after authorization.");
+                let mut input = String::new();
+                print!("Callback URL/query: ");
+                io::stdout().flush()?;
+                io::stdin().read_line(&mut input)?;
+                parse_manual_service_authorization_callback(input.trim(), flow.state.secret())?
+            }
+        }
+    };
+
+    let tokens = exchange_service_authorization_code(&endpoint, &flow, &callback).await?;
+    store.set_tokens(&tokens)?;
+
+    println!("{} Logged in to QueryMT service", "✓".bright_green());
+    Ok(())
+}
+
+#[cfg(feature = "service")]
+async fn service_logout() -> Result<(), Box<dyn std::error::Error>> {
+    let mut store = SecretStoreServiceAuthStore::new()?;
+    let tokens = store.get_tokens()?;
+    let endpoint = resolve_service_endpoint_for_status(&store).ok();
+    let mut revoke_error = None;
+
+    if let (Some(endpoint), Some(tokens)) = (endpoint.as_ref(), tokens.as_ref()) {
+        if let Err(error) = revoke_service_tokens(endpoint, tokens).await {
+            revoke_error = Some(error);
+        }
+    }
+
+    store.delete_tokens()?;
+    store.delete_endpoint()?;
+
+    if let Some(error) = revoke_error {
+        println!(
+            "{} Remote service token revoke failed, but local credentials were removed: {}",
+            "!".bright_yellow(),
+            error
+        );
+    }
+    println!(
+        "{} Logged out from QueryMT service locally",
+        "✓".bright_green()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "service")]
+async fn service_status() -> Result<(), Box<dyn std::error::Error>> {
+    let mut store = SecretStoreServiceAuthStore::new()?;
+    let endpoint = resolve_service_endpoint_for_status(&store)?;
+    let client = ServiceApiClient::new(endpoint.clone())?;
+
+    match client.status(&mut store).await {
+        Ok(status) => {
+            println!(
+                "QueryMT service endpoint: {}",
+                endpoint.as_str().bright_cyan()
+            );
+            println!("{} Signed in; service status:", "✓".bright_green());
+            println!("{}", serde_json::to_string_pretty(&status.raw)?);
+            Ok(())
+        }
+        Err(ServiceClientError::ServiceAuthRequired) => {
+            println!(
+                "{} Not signed in. Run `qmt service login` to authenticate.",
+                "!".bright_yellow()
+            );
+            Ok(())
+        }
+        Err(ServiceClientError::ServiceTokenRefreshUnavailable)
+        | Err(ServiceClientError::ServiceApiUnauthorized) => {
+            println!(
+                "{} Service session expired or was rejected. Run `qmt service login` again.",
+                "!".bright_yellow()
+            );
+            Ok(())
+        }
+        Err(error) => Err(Box::new(error)),
+    }
+}
+
+#[cfg(feature = "service")]
+fn resolve_service_endpoint_for_status(
+    store: &SecretStoreServiceAuthStore,
+) -> querymt_service_client::Result<Url> {
+    if std::env::var_os(QUERYMT_SERVICE_ENDPOINT_ENV).is_some() {
+        return resolve_service_endpoint();
+    }
+
+    store
+        .get_endpoint()?
+        .map(Ok)
+        .unwrap_or_else(resolve_service_endpoint)
 }
 
 fn resolve_provider_and_model(
@@ -91,6 +256,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(Commands::Completion { shell }) = &args.command {
         let mut cmd = CliArgs::command();
         clap_complete::generate(*shell, &mut cmd, "qmt", &mut io::stdout());
+        return Ok(());
+    }
+
+    #[cfg(feature = "service")]
+    if let Some(Commands::Service { command }) = &args.command {
+        handle_service_command(command).await?;
         return Ok(());
     }
 
@@ -381,6 +552,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Commands::Auth { command: _ } => {
                 unreachable!("Auth commands are handled before plugin loading")
+            }
+            #[cfg(feature = "service")]
+            Commands::Service { command: _ } => {
+                unreachable!("Service commands are handled before plugin loading")
             }
             // This command is handled before the match statement
             Commands::Completion { .. } => unreachable!(),

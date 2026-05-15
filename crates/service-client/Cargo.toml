@@ -1,0 +1,23 @@
+[package]
+name = "querymt-service-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Isolated QueryMT service OAuth and API client primitives"
+
+[features]
+default = []
+dbus-secret-service = ["querymt-utils/dbus-secret-service"]
+
+[dependencies]
+oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest", "rustls-tls"] }
+querymt-utils = { path = "../querymt-utils", features = ["secret-store"] }
+serde = { workspace = true }
+serde_json.workspace = true
+tokio = { version = "1", features = ["io-util", "net", "time"] }
+url.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"] }
+wiremock = "0.6"
