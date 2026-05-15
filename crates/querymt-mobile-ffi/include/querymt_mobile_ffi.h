@@ -41,6 +41,9 @@ typedef void (*qmt_ffi_acp_message_handler_fn)(
 // Lifecycle
 // ============================================================================
 
+#ifdef __ANDROID__
+int32_t qmt_ffi_android_init(void *env, void *context);
+#endif
 int32_t qmt_ffi_init_agent(const char *config_toml, uint64_t *out_agent);
 int32_t qmt_ffi_shutdown(uint64_t agent_handle);
 int32_t qmt_ffi_set_lifecycle_state(uint64_t agent_handle, int32_t backgrounded);

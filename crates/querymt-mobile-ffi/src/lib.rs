@@ -834,6 +834,29 @@ unsafe fn qmt_internal_set_log_handler(
 // Canonical qmt_ffi API
 // ============================================================================
 
+/// Initialize Android JNI state required by TLS certificate verification.
+///
+/// Android callers must invoke this entrypoint before `qmt_ffi_init_agent` and
+/// before any TLS/reqwest work. The `rustls-platform-verifier` backend needs the
+/// current `JNIEnv*` and an Android `Context`; repeated calls are safe because
+/// the verifier initialization is idempotent.
+///
+/// Returns a `QMT_FFI_*` status code and sets the thread-local last error on
+/// failure.
+///
+/// # Safety
+///
+/// - `env` must be a valid `JNIEnv*` for the current thread.
+/// - `context` must be a valid Android application `Context` JNI object.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qmt_ffi_android_init(
+    env: *mut std::ffi::c_void,
+    context: *mut std::ffi::c_void,
+) -> i32 {
+    unsafe { qmt_internal_android_init(env, context) }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_ffi_init_agent(
     config_toml: *const std::ffi::c_char,
@@ -927,33 +950,28 @@ unsafe fn android_init_impl(env: *mut std::ffi::c_void, context: *mut std::ffi::
         return FfiErrorCode::InvalidArgument as i32;
     }
 
-    let mut env = match unsafe { jni::JNIEnv::from_raw(env.cast::<jni::sys::JNIEnv>()) } {
-        Ok(env) => env,
-        Err(err) => {
-            set_last_error(
-                FfiErrorCode::RuntimeError,
-                format!("failed to wrap JNIEnv: {err}"),
-            );
-            return FfiErrorCode::RuntimeError as i32;
-        }
-    };
-
-    let context = unsafe { jni::objects::JObject::from_raw(context.cast::<jni::sys::_jobject>()) };
-    match rustls_platform_verifier::android::init_with_env(&mut env, context) {
-        Ok(()) => {
+    let mut env = unsafe { jni::EnvUnowned::from_raw(env.cast::<jni::sys::JNIEnv>()) };
+    let context = context.cast::<jni::sys::_jobject>();
+    match env
+        .with_env_no_catch(|env| {
+            let context = unsafe { jni::objects::JObject::from_raw(env, context) };
+            rustls_platform_verifier::android::init_with_env(env, context)
+        })
+        .into_outcome()
+    {
+        jni::Outcome::Ok(()) => {
             // init_with_env stores global refs internally and is idempotent.
-            std::mem::forget(env);
             ffi_helpers::clear_last_error();
             FfiErrorCode::Ok as i32
         }
-        Err(err) => {
-            std::mem::forget(env);
+        jni::Outcome::Err(err) => {
             set_last_error(
                 FfiErrorCode::RuntimeError,
                 format!("failed to initialize rustls platform verifier: {err}"),
             );
             FfiErrorCode::RuntimeError as i32
         }
+        jni::Outcome::Panic(payload) => std::panic::resume_unwind(payload),
     }
 }
 
