@@ -3213,8 +3213,6 @@ dependencies = [
 [[package]]
 name = "ed25519-dalek"
 version = "3.0.0-pre.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad207ed88a133091f83224265eac21109930db09bedcad05d5252f2af2de20a1"
 dependencies = [
  "curve25519-dalek 5.0.0-pre.1",
  "ed25519 3.0.0",
