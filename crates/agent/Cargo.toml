@@ -39,7 +39,7 @@ agent-client-protocol = { version = "0.11", features = ["unstable"] }
 agent-client-protocol-schema = { version = "0.13", features = ["unstable"]}
 kameo = "0.20"
 libp2p = { version = "0.56", optional = true, default-features = false }
-libp2p-iroh = { git = "https://github.com/querymt/libp2p-iroh.git", branch = "kademlia", optional = true }
+libp2p-iroh = { git = "https://github.com/querymt/libp2p-iroh.git", branch = "iroh_098", optional = true }
 qrcode = { version = "0.14", optional = true }
 async-trait.workspace = true
 anyhow = "1.0"
