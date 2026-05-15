@@ -26,6 +26,11 @@ use rusqlite::{OptionalExtension, params};
 
 use super::SqliteStorage;
 
+/// Truncate a session title / intent summary to at most 80 bytes (UTF-8-safe).
+fn truncate_title(summary: String) -> String {
+    querymt_utils::str_utils::truncate_with_ellipsis(&summary, 80)
+}
+
 fn session_scope_where(scope: SessionScope, alias: &str) -> String {
     match scope {
         SessionScope::All => "1 = 1".to_string(),
@@ -433,13 +438,7 @@ impl ViewStore for SqliteStorage {
         let mut items = Vec::with_capacity(raw_rows.len());
 
         for row in raw_rows {
-            let title = row.initial_intent.map(|summary| {
-                if summary.len() > 80 {
-                    format!("{}...", &summary[..77])
-                } else {
-                    summary
-                }
-            });
+            let title = row.initial_intent.map(truncate_title);
 
             let parent_session_id = row
                 .parent_session_id_internal
@@ -704,13 +703,7 @@ impl ViewStore for SqliteStorage {
                                 session_id: row.get(0)?,
                                 name: row.get(1)?,
                                 cwd: row.get(2)?,
-                                title: row.get::<_, Option<String>>(9)?.map(|summary| {
-                                    if summary.len() > 80 {
-                                        format!("{}...", &summary[..77])
-                                    } else {
-                                        summary
-                                    }
-                                }),
+                                title: row.get::<_, Option<String>>(9)?.map(truncate_title),
                                 created_at: row.get::<_, Option<String>>(3)?.and_then(|s| {
                                     time::OffsetDateTime::parse(
                                         &s,
@@ -740,13 +733,7 @@ impl ViewStore for SqliteStorage {
                                 session_id: row.get(0)?,
                                 name: row.get(1)?,
                                 cwd: row.get(2)?,
-                                title: row.get::<_, Option<String>>(9)?.map(|summary| {
-                                    if summary.len() > 80 {
-                                        format!("{}...", &summary[..77])
-                                    } else {
-                                        summary
-                                    }
-                                }),
+                                title: row.get::<_, Option<String>>(9)?.map(truncate_title),
                                 created_at: row.get::<_, Option<String>>(3)?.and_then(|s| {
                                     time::OffsetDateTime::parse(
                                         &s,
@@ -913,13 +900,7 @@ impl ViewStore for SqliteStorage {
                             session_id: row.get(0)?,
                             name: row.get(1)?,
                             cwd: row.get(2)?,
-                            title: row.get::<_, Option<String>>(9)?.map(|summary| {
-                                if summary.len() > 80 {
-                                    format!("{}...", &summary[..77])
-                                } else {
-                                    summary
-                                }
-                            }),
+                            title: row.get::<_, Option<String>>(9)?.map(truncate_title),
                             created_at: row.get::<_, Option<String>>(3)?.and_then(|s| {
                                 time::OffsetDateTime::parse(
                                     &s,
@@ -949,13 +930,7 @@ impl ViewStore for SqliteStorage {
                             session_id: row.get(0)?,
                             name: row.get(1)?,
                             cwd: row.get(2)?,
-                            title: row.get::<_, Option<String>>(9)?.map(|summary| {
-                                if summary.len() > 80 {
-                                    format!("{}...", &summary[..77])
-                                } else {
-                                    summary
-                                }
-                            }),
+                            title: row.get::<_, Option<String>>(9)?.map(truncate_title),
                             created_at: row.get::<_, Option<String>>(3)?.and_then(|s| {
                                 time::OffsetDateTime::parse(
                                     &s,
@@ -1078,13 +1053,7 @@ impl ViewStore for SqliteStorage {
                         session_id: row.get(0)?,
                         name: row.get(1)?,
                         cwd: row.get(2)?,
-                        title: row.get::<_, Option<String>>(9)?.map(|summary| {
-                            if summary.len() > 80 {
-                                format!("{}...", &summary[..77])
-                            } else {
-                                summary
-                            }
-                        }),
+                        title: row.get::<_, Option<String>>(9)?.map(truncate_title),
                         created_at: row.get::<_, Option<String>>(3)?.and_then(|s| {
                             time::OffsetDateTime::parse(
                                 &s,
@@ -1213,13 +1182,7 @@ impl ViewStore for SqliteStorage {
                         session_id: row.get(0)?,
                         name: row.get(1)?,
                         cwd: row.get(2)?,
-                        title: row.get::<_, Option<String>>(9)?.map(|summary| {
-                            if summary.len() > 80 {
-                                format!("{}...", &summary[..77])
-                            } else {
-                                summary
-                            }
-                        }),
+                        title: row.get::<_, Option<String>>(9)?.map(truncate_title),
                         created_at: row.get::<_, Option<String>>(3)?.and_then(|s| {
                             time::OffsetDateTime::parse(
                                 &s,

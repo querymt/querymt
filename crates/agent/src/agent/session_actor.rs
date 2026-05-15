@@ -67,12 +67,10 @@ fn summarize_intent_candidate(input: &str) -> Option<String> {
         return None;
     }
 
-    let max_len = 240;
-    if single_line.len() > max_len {
-        Some(format!("{}...", &single_line[..max_len - 3]))
-    } else {
-        Some(single_line)
-    }
+    Some(querymt_utils::str_utils::truncate_with_ellipsis(
+        &single_line,
+        240,
+    ))
 }
 
 fn normalize_intent_text(text: &str) -> String {
@@ -2716,5 +2714,24 @@ mod tests {
             "Instead, let's switch to building a web UI for analytics.",
         );
         assert_eq!(decision, IntentUpdateDecision::AskUser);
+    }
+
+    #[test]
+    fn summarize_intent_candidate_ukrainian_no_panic() {
+        // Regression test for issue #525: byte 237 landed inside 'ч' (2-byte char).
+        let ukrainian = "зроби коміт без gpg, до цього стану та почни виправленя. \
+                         А ще, зараз проблема з подвійним натисканням шифт + клік, \
+                         щоб переместити річ у сховище";
+        let result = summarize_intent_candidate(ukrainian).unwrap();
+        assert!(result.len() <= 240);
+        assert!(result.is_char_boundary(result.len()));
+    }
+
+    #[test]
+    fn summarize_intent_candidate_cjk_no_panic() {
+        let cjk = "你好".repeat(200); // 2 chars * 200 = 400 chars, each 3 bytes = 1200 bytes
+        let result = summarize_intent_candidate(&cjk).unwrap();
+        assert!(result.len() <= 240);
+        assert!(result.is_char_boundary(result.len()));
     }
 }

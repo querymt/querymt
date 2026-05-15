@@ -100,11 +100,7 @@ impl ToolTrait for KnowledgeIngestTool {
             .map(|s| s.to_string())
             .unwrap_or_else(|| {
                 // Default summary: truncate to 200 chars
-                if raw_text.len() > 200 {
-                    format!("{}...", &raw_text[..200])
-                } else {
-                    raw_text.clone()
-                }
+                querymt_utils::str_utils::truncate_with_ellipsis(&raw_text, 200)
             });
 
         let entities = args["entities"]

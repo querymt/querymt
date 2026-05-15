@@ -1,3 +1,4 @@
+pub mod str_utils;
 pub mod telemetry;
 
 pub const BUILD_VERSION: &str = env!("QMT_BUILD_VERSION");

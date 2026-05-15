@@ -75,9 +75,11 @@ impl<'a> ContextSink<'a> {
         let trimmed = String::from_utf8_lossy(text);
         let trimmed = trimmed.trim_end();
         let text_str = if trimmed.len() > MAX_MATCH_TEXT_BYTES {
-            let mut truncated = trimmed[..MAX_MATCH_TEXT_BYTES].to_string();
-            truncated.push_str("...[truncated]");
-            truncated
+            querymt_utils::str_utils::truncate_with_suffix(
+                trimmed,
+                MAX_MATCH_TEXT_BYTES,
+                "...[truncated]",
+            )
         } else {
             trimmed.to_string()
         };
@@ -226,9 +228,11 @@ impl SearchTextTool {
 
                             let trimmed = line.trim_end();
                             let text = if trimmed.len() > MAX_MATCH_TEXT_BYTES {
-                                let mut truncated = trimmed[..MAX_MATCH_TEXT_BYTES].to_string();
-                                truncated.push_str("...[truncated]");
-                                truncated
+                                querymt_utils::str_utils::truncate_with_suffix(
+                                    trimmed,
+                                    MAX_MATCH_TEXT_BYTES,
+                                    "...[truncated]",
+                                )
                             } else {
                                 trimmed.to_string()
                             };

@@ -645,13 +645,10 @@ mod remote_impl {
                 // Match local session-list title behavior: use the initial intent summary
                 // (truncated) as the display title, then fall back to session.name.
                 let title = match store.get_initial_intent_snapshot(&sid).await {
-                    Ok(Some(snapshot)) => {
-                        if snapshot.summary.len() > 80 {
-                            Some(format!("{}...", &snapshot.summary[..77]))
-                        } else {
-                            Some(snapshot.summary)
-                        }
-                    }
+                    Ok(Some(snapshot)) => Some(querymt_utils::str_utils::truncate_with_ellipsis(
+                        &snapshot.summary,
+                        80,
+                    )),
                     _ => session_name,
                 };
 

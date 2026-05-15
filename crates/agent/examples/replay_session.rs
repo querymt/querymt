@@ -191,7 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("      Part {}: {} chars", i + 1, s.len());
                 // Show first 100 chars
                 let preview = if s.len() > 100 {
-                    format!("{}...", &s[..100])
+                    querymt_utils::str_utils::truncate_with_ellipsis(s, 100)
                 } else {
                     s.to_string()
                 };
