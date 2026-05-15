@@ -46,7 +46,7 @@ tar = { version = "0.4.44", optional = true }
 # TODO: upgrade to stable sha2 0.11.x once iroh-base drops its exact pin on
 # digest =0.11.0-rc.10 (likely iroh-base >=0.98). See: iroh 0.97 forces
 # pre-release crypto crates which conflict with stable sha2/digest.
-sha2 = { version = "=0.11.0-rc.2", optional = true }
+sha2 = { version = "=0.11.0-rc.5", optional = true }
 serde_yaml = { version = "0.9.34", optional = true }
 dirs = { version ="6.0", optional = true }
 hex = { version = "0.4", optional = true }
