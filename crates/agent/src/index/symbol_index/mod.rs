@@ -524,4 +524,200 @@ end
         let test = index.find_by_name("test_happy_path", Some(SymbolKind::Test));
         assert_eq!(test.len(), 1);
     }
+
+    #[test]
+    fn elixir_symbols_include_modules_functions_macros_imports_and_tests() {
+        let source = r#"defmodule MyApp.ConfigTest do
+  use ExUnit.Case
+  alias MyApp.Repo
+  import Ecto.Query
+  require Logger
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts)
+  end
+
+  defp normalize(opts), do: opts
+
+  defmacro field(name) do
+    quote do: unquote(name)
+  end
+
+  describe "validate/1" do
+    test "accepts valid opts" do
+      assert :ok
+    end
+  end
+end
+
+def run(args), do: args
+
+defprotocol MyApp.Renderable do
+  def render(value)
+end
+
+defimpl MyApp.Renderable, for: Atom do
+  def render(value), do: Atom.to_string(value)
+end
+"#;
+        let index = SymbolIndex::from_source(source, "elixir").unwrap();
+
+        let module = index.find_by_name("MyApp.ConfigTest", Some(SymbolKind::Module));
+        assert_eq!(module.len(), 1);
+        assert_eq!(module[0].start_line, 1);
+        assert!(module[0].end_line > module[0].start_line);
+        assert!(module[0].digest.byte_len > 0);
+        assert!(
+            module[0]
+                .children
+                .iter()
+                .any(|child| child.name == "start_link" && child.kind == SymbolKind::Method)
+        );
+        assert!(
+            module[0]
+                .children
+                .iter()
+                .any(|child| child.name == "field" && child.kind == SymbolKind::Macro)
+        );
+
+        let use_exunit = index.find_by_name("ExUnit.Case", Some(SymbolKind::Import));
+        assert_eq!(use_exunit.len(), 1);
+
+        let run = index.find_by_name("run", Some(SymbolKind::Function));
+        assert_eq!(run.len(), 1);
+
+        let describe = index.find_by_name("validate/1", Some(SymbolKind::Test));
+        assert_eq!(describe.len(), 1);
+        assert!(
+            describe[0]
+                .children
+                .iter()
+                .any(|child| child.name == "accepts valid opts" && child.kind == SymbolKind::Test)
+        );
+
+        let nested_test = index.find_by_name(
+            "MyApp.ConfigTest::validate/1::accepts valid opts",
+            Some(SymbolKind::Test),
+        );
+        assert_eq!(nested_test.len(), 1);
+
+        let protocol = index.find_by_name("MyApp.Renderable", Some(SymbolKind::Trait));
+        assert_eq!(protocol.len(), 1);
+
+        let impls = index.find_by_name("MyApp.Renderable, for: Atom", Some(SymbolKind::Impl));
+        assert_eq!(impls.len(), 1);
+    }
+
+    #[test]
+    fn elixir_defimpl_names_include_for_target() {
+        let source = r#"defimpl MyProto, for: Atom do
+  def render(value), do: value
+end
+
+defimpl MyProto, for: BitString do
+  def render(value), do: value
+end
+"#;
+        let index = SymbolIndex::from_source(source, "elixir").unwrap();
+
+        let atom_impl = index.find_by_name("MyProto, for: Atom", Some(SymbolKind::Impl));
+        let bitstring_impl = index.find_by_name("MyProto, for: BitString", Some(SymbolKind::Impl));
+        assert_eq!(atom_impl.len(), 1);
+        assert_eq!(bitstring_impl.len(), 1);
+        assert_ne!(
+            atom_impl[0].qualified_name,
+            bitstring_impl[0].qualified_name
+        );
+    }
+
+    #[test]
+    fn elixir_test_named_functions_require_test_module_context() {
+        let source = r#"defmodule MyApp.Connection do
+  def test_connection, do: :ok
+  def connection_test, do: :ok
+end
+
+defmodule MyApp.ConnectionTest do
+  def test_connection, do: :ok
+end
+"#;
+        let index = SymbolIndex::from_source(source, "elixir").unwrap();
+
+        let module = index.find_by_name("MyApp.Connection", Some(SymbolKind::Module));
+        assert_eq!(module.len(), 1);
+        assert!(
+            module[0]
+                .children
+                .iter()
+                .any(|child| child.name == "test_connection" && child.kind == SymbolKind::Method)
+        );
+        assert!(
+            module[0]
+                .children
+                .iter()
+                .any(|child| child.name == "connection_test" && child.kind == SymbolKind::Method)
+        );
+
+        let test_module = index.find_by_name("MyApp.ConnectionTest", Some(SymbolKind::Module));
+        assert_eq!(test_module.len(), 1);
+        assert!(
+            test_module[0]
+                .children
+                .iter()
+                .any(|child| child.name == "test_connection" && child.kind == SymbolKind::Test)
+        );
+    }
+
+    #[test]
+    fn elixir_describe_and_test_calls_require_exunit_context() {
+        let source = r#"defmodule MyApp.Schema do
+  describe "fields" do
+    test "accepts options" do
+      :ok
+    end
+  end
+end
+
+defmodule MyApp.SchemaTest do
+  use ExUnit.Case, async: true
+
+  describe "fields" do
+    test "accepts options" do
+      assert :ok
+    end
+  end
+end
+"#;
+        let index = SymbolIndex::from_source(source, "elixir").unwrap();
+
+        let module = index.find_by_name("MyApp.Schema", Some(SymbolKind::Module));
+        assert_eq!(module.len(), 1);
+        let non_exunit_describe = module[0]
+            .children
+            .iter()
+            .find(|child| child.name == "fields")
+            .unwrap();
+        assert_eq!(non_exunit_describe.kind, SymbolKind::Method);
+        assert!(
+            non_exunit_describe
+                .children
+                .iter()
+                .any(|child| child.name == "accepts options" && child.kind == SymbolKind::Method)
+        );
+        assert!(
+            index
+                .find_by_name("MyApp.Schema::fields", Some(SymbolKind::Test))
+                .is_empty()
+        );
+
+        let exunit_describe =
+            index.find_by_name("MyApp.SchemaTest::fields", Some(SymbolKind::Test));
+        assert_eq!(exunit_describe.len(), 1);
+        assert!(
+            exunit_describe[0]
+                .children
+                .iter()
+                .any(|child| child.name == "accepts options" && child.kind == SymbolKind::Test)
+        );
+    }
 }

@@ -1,5 +1,6 @@
 pub mod c_family;
 pub mod csharp;
+pub mod elixir;
 pub mod go;
 pub mod java;
 pub mod python;
@@ -22,6 +23,7 @@ pub fn extract_symbols(source: &str, language: &str) -> Result<Vec<SymbolEntry>,
         "c" => c_family::extract_c(source),
         "cpp" => c_family::extract_cpp(source),
         "csharp" => csharp::extract(source),
+        "elixir" => elixir::extract(source),
         "go" => go::extract(source),
         "java" => java::extract(source),
         "python" => python::extract(source),

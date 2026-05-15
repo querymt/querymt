@@ -37,7 +37,7 @@ impl ToolTrait for IndexTool {
             tool_type: "function".to_string(),
             function: FunctionTool {
                 name: self.name().to_string(),
-                description: "Produce a compact structural skeleton of a source file with exact line ranges per item. Use this before read_tool to understand file structure and target reads to relevant sections. Returns imports, types, classes, traits, impls, functions, tests, etc. with [start-end] line ranges. Supports Rust, Python, TypeScript, JavaScript, Go, Java, C, C++, C#, and Ruby."
+                description: "Produce a compact structural skeleton of a source file with exact line ranges per item. Use this before read_tool to understand file structure and target reads to relevant sections. Returns imports, types, classes, traits, impls, functions, tests, etc. with [start-end] line ranges. Supports Rust, Python, TypeScript, JavaScript, Go, Java, C, C++, C#, Ruby, and Elixir."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -139,7 +139,7 @@ impl ToolTrait for IndexTool {
 
         let sections = index_file(&target, &options).map_err(|e| match e {
             OutlineError::UnsupportedLanguage(ext) => ToolError::InvalidRequest(format!(
-                "Unsupported file extension '.{}'. Supported: rs, py, ts, tsx, js, jsx, go, java, c, h, cpp, hpp, cc, cs, rb",
+                "Unsupported file extension '.{}'. Supported: rs, py, ts, tsx, js, jsx, go, java, c, h, cpp, hpp, cc, cs, rb, ex, exs",
                 ext
             )),
             OutlineError::FileTooLarge { size, limit } => ToolError::InvalidRequest(format!(
@@ -281,6 +281,7 @@ def main():
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Unsupported"));
+        assert!(err.contains("ex"));
     }
 
     #[tokio::test]
