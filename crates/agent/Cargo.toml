@@ -122,6 +122,7 @@ tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-ruby = "0.23"
+tree-sitter-elixir = "0.3"
 
 # Rust AST parsing for rich structural fingerprinting during function indexing
 syn = { version = "2", features = ["full", "visit"] }

@@ -118,6 +118,7 @@ pub fn get_language_for_extension(ext: &str) -> Option<&'static str> {
         "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "c++" => Some("cpp"),
         "cs" => Some("csharp"),
         "rb" => Some("ruby"),
+        "ex" | "exs" => Some("elixir"),
         _ => None,
     }
 }

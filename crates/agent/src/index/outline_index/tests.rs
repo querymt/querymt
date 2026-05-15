@@ -603,6 +603,18 @@ namespace MyApp {
 }
 
 #[test]
+fn extension_mapping_includes_elixir() {
+    assert_eq!(
+        super::common::get_language_for_extension("ex"),
+        Some("elixir")
+    );
+    assert_eq!(
+        super::common::get_language_for_extension("exs"),
+        Some("elixir")
+    );
+}
+
+#[test]
 fn ruby_exclude_tests_hides_test_functions() {
     let source = r#"
 def run(args)
@@ -625,6 +637,273 @@ end
             .entries
             .iter()
             .any(|e| e.label.contains("def run"))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Elixir
+// ---------------------------------------------------------------------------
+
+#[test]
+fn elixir_basic_outline() {
+    let source = r#"
+defmodule MyApp.Config do
+  use GenServer
+  alias MyApp.Repo
+  import Ecto.Query
+  require Logger
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts)
+  end
+
+  defp normalize(opts), do: opts
+
+  defmacro field(name) do
+    quote do: unquote(name)
+  end
+
+  defmodule Nested do
+    def run, do: :ok
+  end
+end
+
+defprotocol MyApp.Renderable do
+  def render(value)
+end
+
+defimpl MyApp.Renderable, for: Atom do
+  def render(value), do: Atom.to_string(value)
+end
+"#;
+
+    let sections = index_source(source, "elixir", &default_opts()).unwrap();
+
+    let modules = find_section(&sections, "modules").unwrap();
+    assert!(modules.entries[0].label.contains("defmodule MyApp.Config"));
+    assert!(
+        modules.entries[0]
+            .children
+            .iter()
+            .any(|e| e.label.contains("use GenServer"))
+    );
+    assert!(
+        modules.entries[0]
+            .children
+            .iter()
+            .any(|e| e.label.contains("require Logger"))
+    );
+    assert!(
+        modules.entries[0]
+            .children
+            .iter()
+            .any(|e| e.label.contains("def start_link"))
+    );
+    assert!(
+        modules.entries[0]
+            .children
+            .iter()
+            .any(|e| e.label.contains("defmodule Nested"))
+    );
+
+    let traits = find_section(&sections, "traits").unwrap();
+    assert!(
+        traits.entries[0]
+            .label
+            .contains("defprotocol MyApp.Renderable")
+    );
+
+    let impls = find_section(&sections, "impls").unwrap();
+    assert!(impls.entries[0].label.contains("defimpl MyApp.Renderable"));
+
+    assert!(
+        modules.entries[0]
+            .children
+            .iter()
+            .any(|e| e.label.contains("defmacro field"))
+    );
+}
+
+#[test]
+fn elixir_exclude_tests_hides_exunit_tests() {
+    let source = r#"
+defmodule MyApp.ConfigTest do
+  use ExUnit.Case
+
+  describe "validate/1" do
+    test "accepts valid opts" do
+      assert :ok
+    end
+  end
+
+  def helper, do: :ok
+end
+"#;
+
+    let mut opts = default_opts();
+    opts.include_tests = false;
+    let sections = index_source(source, "elixir", &opts).unwrap();
+
+    assert!(find_section(&sections, "tests").is_none());
+    let modules = find_section(&sections, "modules").unwrap();
+    assert!(
+        modules.entries[0]
+            .children
+            .iter()
+            .any(|e| e.label.contains("def helper"))
+    );
+    assert!(
+        modules.entries[0]
+            .children
+            .iter()
+            .all(|e| !e.label.contains("describe") && !e.label.contains("test"))
+    );
+}
+
+#[test]
+fn elixir_nested_describe_tests_are_indexed() {
+    let source = r#"
+defmodule MyApp.ConfigTest do
+  use ExUnit.Case
+
+  describe "validate/1" do
+    test "accepts valid opts" do
+      assert :ok
+    end
+  end
+end
+"#;
+
+    let sections = index_source(source, "elixir", &default_opts()).unwrap();
+
+    let modules = find_section(&sections, "modules").unwrap();
+    let describe = modules.entries[0]
+        .children
+        .iter()
+        .find(|e| e.label.contains("describe \"validate/1\""))
+        .unwrap();
+    assert!(
+        describe
+            .children
+            .iter()
+            .any(|e| e.label.contains("test \"accepts valid opts\""))
+    );
+}
+
+#[test]
+fn elixir_exclude_tests_keeps_test_named_non_exunit_functions() {
+    let source = r#"
+defmodule MyApp.Connection do
+  def test_connection, do: :ok
+  def connection_test, do: :ok
+end
+"#;
+
+    let mut opts = default_opts();
+    opts.include_tests = false;
+    let sections = index_source(source, "elixir", &opts).unwrap();
+
+    assert!(find_section(&sections, "tests").is_none());
+    let modules = find_section(&sections, "modules").unwrap();
+    assert!(
+        modules.entries[0]
+            .children
+            .iter()
+            .any(|e| e.label.contains("def test_connection"))
+    );
+    assert!(
+        modules.entries[0]
+            .children
+            .iter()
+            .any(|e| e.label.contains("def connection_test"))
+    );
+}
+
+#[test]
+fn elixir_exclude_tests_does_not_treat_non_exunit_dsl_as_tests() {
+    let source = r#"
+defmodule MyApp.Schema do
+  describe "fields" do
+    test "accepts options" do
+      :ok
+    end
+  end
+end
+
+defmodule MyApp.SchemaTest do
+  use ExUnit.Case, async: true
+
+  describe "fields" do
+    test "accepts options" do
+      assert :ok
+    end
+  end
+end
+"#;
+
+    let mut opts = default_opts();
+    opts.include_tests = false;
+    let sections = index_source(source, "elixir", &opts).unwrap();
+
+    assert!(find_section(&sections, "tests").is_none());
+    let modules = find_section(&sections, "modules").unwrap();
+    let non_exunit_module = modules
+        .entries
+        .iter()
+        .find(|e| e.label.contains("MyApp.Schema do"))
+        .unwrap();
+    let exunit_module = modules
+        .entries
+        .iter()
+        .find(|e| e.label.contains("MyApp.SchemaTest do"))
+        .unwrap();
+
+    let non_exunit_describe = non_exunit_module
+        .children
+        .iter()
+        .find(|e| e.label.contains("describe \"fields\""))
+        .unwrap();
+    assert!(
+        non_exunit_describe
+            .children
+            .iter()
+            .any(|e| e.label.contains("test \"accepts options\""))
+    );
+    assert!(
+        exunit_module
+            .children
+            .iter()
+            .all(|e| !e.label.contains("describe") && !e.label.contains("test"))
+    );
+}
+
+#[test]
+fn elixir_defimpl_outline_distinguishes_for_targets() {
+    let source = r#"
+defimpl MyProto, for: Atom do
+  def render(value), do: value
+end
+
+defimpl MyProto, for: BitString do
+  def render(value), do: value
+end
+"#;
+
+    let sections = index_source(source, "elixir", &default_opts()).unwrap();
+
+    let impls = find_section(&sections, "impls").unwrap();
+    assert_eq!(impls.entries.len(), 2);
+    assert!(
+        impls
+            .entries
+            .iter()
+            .any(|e| e.label.contains("defimpl MyProto, for: Atom"))
+    );
+    assert!(
+        impls
+            .entries
+            .iter()
+            .any(|e| e.label.contains("defimpl MyProto, for: BitString"))
     );
 }
 

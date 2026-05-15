@@ -40,7 +40,11 @@ pub fn symbols_to_sections(symbols: &[SymbolEntry], options: &IndexOptions) -> V
                     usings.push(symbol_to_entry(symbol, options));
                     split_interface_enum_sections = true;
                 } else if symbol.signature.starts_with("require") {
-                    requires.push(symbol_to_entry(symbol, options));
+                    if symbol.parent.is_some() {
+                        imports.push(symbol_to_entry(symbol, options));
+                    } else {
+                        requires.push(symbol_to_entry(symbol, options));
+                    }
                 } else {
                     imports.push(symbol_to_entry(symbol, options));
                 }
@@ -59,7 +63,9 @@ pub fn symbols_to_sections(symbols: &[SymbolEntry], options: &IndexOptions) -> V
                         &mut interfaces,
                         &mut enums,
                     );
-                } else if symbol.signature.starts_with("module ") {
+                } else if symbol.signature.starts_with("module ")
+                    || symbol.signature.starts_with("defmodule ")
+                {
                     modules.push(symbol_to_entry(symbol, options));
                 } else {
                     types.push(symbol_to_entry(symbol, options));
