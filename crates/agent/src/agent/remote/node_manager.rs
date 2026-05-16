@@ -73,9 +73,9 @@ pub struct AvailableModel {
 #[cfg(feature = "remote")]
 pub use remote_impl::{
     AdmissionRequest, AdmissionResponse, CreateRemoteSession, CreateRemoteSessionResponse,
-    DestroyRemoteSession, ForkRemoteSession, ForkRemoteSessionResponse, GetNodeInfo,
-    ListAvailableModels, ListRemoteSessions, RemoteNodeManager, ResumeRemoteSession,
-    SessionHandoff,
+    ForkRemoteSession, ForkRemoteSessionResponse, GetNodeInfo, ListAvailableModels,
+    ListRemoteSessions, RemoteNodeManager, ResumeRemoteSession, SessionHandoff,
+    StopRemoteSessionRuntime,
 };
 
 #[cfg(feature = "remote")]
@@ -182,9 +182,14 @@ mod remote_impl {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ListAvailableModels;
 
-    /// Destroy (shutdown) a session on this node.
+    /// Shut down the live runtime actor for a session on this node.
+    ///
+    /// This removes the session actor from the in-memory registry and
+    /// deregisters it from the mesh DHT, but **does not** delete the
+    /// persisted session history from SQLite. The session can later be
+    /// re-materialized via `ResumeRemoteSession`.
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct DestroyRemoteSession {
+    pub struct StopRemoteSessionRuntime {
         pub session_id: String,
     }
 
@@ -800,17 +805,17 @@ mod remote_impl {
         }
     }
 
-    impl Message<DestroyRemoteSession> for RemoteNodeManager {
+    impl Message<StopRemoteSessionRuntime> for RemoteNodeManager {
         type Reply = Result<(), AgentError>;
 
         #[tracing::instrument(
-            name = "remote.node_manager.destroy_session",
+            name = "remote.node_manager.stop_session_runtime",
             skip(self, _ctx),
             fields(session_id = %msg.session_id, found = tracing::field::Empty)
         )]
         async fn handle(
             &mut self,
-            msg: DestroyRemoteSession,
+            msg: StopRemoteSessionRuntime,
             _ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
             let session_ref = {
@@ -821,7 +826,7 @@ mod remote_impl {
             if let Some(session_ref) = session_ref {
                 tracing::Span::current().record("found", true);
 
-                // Bound shutdown latency so destroy requests cannot hang forever
+                // Bound shutdown latency so stop requests cannot hang forever
                 // if an actor is unresponsive.
                 let shutdown_timeout = std::time::Duration::from_secs(2);
                 match tokio::time::timeout(shutdown_timeout, session_ref.shutdown()).await {
@@ -843,14 +848,14 @@ mod remote_impl {
                 }
 
                 // Ensure this session's re-registration closure is removed from the
-                // mesh handle so repeated create/destroy cycles don't leak entries.
+                // mesh handle so repeated create/stop cycles don't leak entries.
                 if let Some(ref mesh) = self.mesh {
                     let dht_name = crate::agent::remote::dht_name::session(&msg.session_id);
                     mesh.deregister_actor(&dht_name);
                 }
 
                 log::info!(
-                    "RemoteNodeManager: destroyed runtime for session {}",
+                    "RemoteNodeManager: stopped runtime for session {}",
                     msg.session_id
                 );
                 Ok(())
@@ -1219,9 +1224,9 @@ mod remote_impl {
         REG_LIST_REMOTE_SESSIONS
     );
     remote_node_msg_impl!(
-        DestroyRemoteSession,
-        "querymt::DestroyRemoteSession",
-        REG_DESTROY_REMOTE_SESSION
+        StopRemoteSessionRuntime,
+        "querymt::StopRemoteSessionRuntime",
+        REG_STOP_REMOTE_SESSION_RUNTIME
     );
     remote_node_msg_impl!(
         ResumeRemoteSession,
