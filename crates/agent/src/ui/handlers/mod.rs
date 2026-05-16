@@ -292,8 +292,12 @@ pub async fn handle_ui_message(
         UiClientMessage::ListRemoteNodes => {
             handle_list_remote_nodes(state, tx).await;
         }
-        UiClientMessage::ListRemoteSessions { node_id } => {
-            handle_list_remote_sessions(state, &node_id, tx).await;
+        UiClientMessage::ListRemoteSessions {
+            node_id,
+            offset,
+            limit,
+        } => {
+            handle_list_remote_sessions(state, &node_id, offset, limit, tx).await;
         }
         UiClientMessage::CreateRemoteSession {
             node_id,

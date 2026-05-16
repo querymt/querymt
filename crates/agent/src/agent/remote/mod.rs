@@ -96,7 +96,7 @@ pub use mesh::{
 #[cfg(feature = "remote")]
 pub use mesh_provider::MeshChatProvider;
 pub use node_id::NodeId;
-pub use node_manager::{AvailableModel, NodeInfo, RemoteSessionInfo};
+pub use node_manager::{AvailableModel, ListRemoteSessionsResponse, NodeInfo, RemoteSessionInfo};
 #[cfg(feature = "remote")]
 pub use node_manager::{
     CreateRemoteSession, CreateRemoteSessionResponse, DestroyRemoteSession, ForkRemoteSession,

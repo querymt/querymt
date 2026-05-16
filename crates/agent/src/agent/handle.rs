@@ -1287,11 +1287,16 @@ impl LocalAgentHandle {
     pub async fn list_remote_sessions(
         &self,
         node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
-    ) -> Result<Vec<crate::agent::remote::RemoteSessionInfo>, agent_client_protocol::Error> {
+        offset: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<
+        crate::agent::remote::node_manager::ListRemoteSessionsResponse,
+        agent_client_protocol::Error,
+    > {
         use crate::agent::remote::ListRemoteSessions;
         use crate::error::AgentError;
         node_manager_ref
-            .ask(&ListRemoteSessions)
+            .ask(&ListRemoteSessions { offset, limit })
             .await
             .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
     }
@@ -1614,6 +1619,106 @@ impl LocalAgentHandle {
             .await;
 
         Ok(session_ref)
+    }
+
+    /// Resolve a `SessionHandoff` into a concrete remote actor reference.
+    ///
+    /// - `DirectRemote` → return the embedded ref directly.
+    /// - `LookupOnly` → DHT lookup for the session.
+    /// - `NoAttachPath` → error.
+    #[cfg(feature = "remote")]
+    pub async fn resolve_handoff(
+        &self,
+        session_id: &str,
+        handoff: crate::agent::remote::node_manager::SessionHandoff,
+    ) -> Result<
+        kameo::actor::RemoteActorRef<crate::agent::session_actor::SessionActor>,
+        agent_client_protocol::Error,
+    > {
+        use crate::error::AgentError;
+
+        match handoff {
+            crate::agent::remote::node_manager::SessionHandoff::DirectRemote { session_ref } => {
+                Ok(session_ref)
+            }
+            crate::agent::remote::node_manager::SessionHandoff::LookupOnly => {
+                let mesh = self.mesh().ok_or_else(|| {
+                    agent_client_protocol::Error::from(AgentError::MeshNotBootstrapped)
+                })?;
+                let dht_name = crate::agent::remote::dht_name::session(session_id);
+                mesh.lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name)
+                    .await
+                    .map_err(|e| {
+                        agent_client_protocol::Error::from(AgentError::SwarmLookupFailed {
+                            key: session_id.to_string(),
+                            reason: e.to_string(),
+                        })
+                    })?
+                    .ok_or_else(|| {
+                        agent_client_protocol::Error::from(AgentError::RemoteSessionNotFound {
+                            details: format!(
+                                "session {} registered but not found in DHT after lookup",
+                                session_id
+                            ),
+                        })
+                    })
+            }
+            crate::agent::remote::node_manager::SessionHandoff::NoAttachPath => Err(
+                agent_client_protocol::Error::from(AgentError::RemoteSessionNotFound {
+                    details: format!(
+                        "session {} was created but the remote node cannot provide an attach path",
+                        session_id
+                    ),
+                }),
+            ),
+        }
+    }
+
+    /// Build a lightweight `SessionLoadSnapshot` from the locally-attached
+    /// remote session's event stream. Used by the ACP extension path to
+    /// return history to mobile clients.
+    #[cfg(feature = "remote")]
+    pub async fn build_remote_attach_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<serde_json::Value, agent_client_protocol::Error> {
+        use crate::error::AgentError;
+
+        let session_ref = {
+            let registry = self.registry.lock().await;
+            registry.get(session_id).cloned()
+        };
+        let Some(session_ref) = session_ref else {
+            return Err(agent_client_protocol::Error::from(
+                AgentError::SessionNotFound {
+                    session_id: session_id.to_string(),
+                },
+            ));
+        };
+
+        let events = session_ref.get_event_stream().await.unwrap_or_default();
+        log::info!(
+            "remote attach snapshot built from attached session ref: session_id={}, events={}",
+            session_id,
+            events.len()
+        );
+        let cursor = crate::session::cursor_from_events(&events);
+        let audit = crate::session::projection::AuditView {
+            session_id: session_id.to_string(),
+            events,
+            tasks: Vec::new(),
+            intent_snapshots: Vec::new(),
+            decisions: Vec::new(),
+            progress_entries: Vec::new(),
+            artifacts: Vec::new(),
+            delegations: Vec::new(),
+            generated_at: time::OffsetDateTime::now_utc(),
+        };
+
+        Ok(serde_json::json!({
+            "audit": audit,
+            "cursor": cursor,
+        }))
     }
 }
 
@@ -2348,6 +2453,10 @@ impl SendAgent for LocalAgentHandle {
                 #[serde(rename_all = "camelCase")]
                 struct RemoteSessionsReq {
                     node_id: String,
+                    #[serde(default)]
+                    offset: Option<u32>,
+                    #[serde(default)]
+                    limit: Option<u32>,
                 }
 
                 let parsed: RemoteSessionsReq =
@@ -2358,10 +2467,14 @@ impl SendAgent for LocalAgentHandle {
                 #[cfg(feature = "remote")]
                 {
                     let nm_ref = self.find_node_manager(&parsed.node_id).await?;
-                    let sessions = self.list_remote_sessions(&nm_ref).await?;
+                    let response = self
+                        .list_remote_sessions(&nm_ref, parsed.offset, parsed.limit)
+                        .await?;
                     return ext_json_response(&serde_json::json!({
                         "nodeId": parsed.node_id,
-                        "sessions": sessions,
+                        "sessions": response.sessions,
+                        "nextOffset": response.next_offset,
+                        "totalCount": response.total_count,
                     }));
                 }
 
@@ -2391,27 +2504,7 @@ impl SendAgent for LocalAgentHandle {
                         .create_remote_session(&nm_ref, parsed.cwd.clone())
                         .await?;
 
-                    let remote_ref = match resp.handoff {
-                        crate::agent::remote::node_manager::SessionHandoff::DirectRemote {
-                            session_ref,
-                        } => session_ref,
-                        _ => {
-                            let mesh = self.mesh().ok_or_else(|| {
-                                Error::invalid_request().data("mesh not bootstrapped")
-                            })?;
-                            let dht_name =
-                                crate::agent::remote::dht_name::session(&resp.session_id);
-                            mesh.lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name)
-                                .await
-                                .map_err(|e| {
-                                    Error::internal_error()
-                                        .data(serde_json::json!({"error": e.to_string()}))
-                                })?
-                                .ok_or_else(|| {
-                                    Error::invalid_request().data("remote session actor not found")
-                                })?
-                        }
-                    };
+                    let remote_ref = self.resolve_handoff(&resp.session_id, resp.handoff).await?;
 
                     let peer_label = self
                         .list_remote_nodes()
@@ -2460,17 +2553,26 @@ impl SendAgent for LocalAgentHandle {
                     let mesh = self
                         .mesh()
                         .ok_or_else(|| Error::invalid_request().data("mesh not bootstrapped"))?;
+
+                    // Try DHT lookup first — works for already-hydrated sessions.
                     let dht_name = crate::agent::remote::dht_name::session(&parsed.session_id);
-                    let remote_ref = mesh
+                    let remote_ref = match mesh
                         .lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name)
                         .await
-                        .map_err(|e| {
-                            Error::internal_error()
-                                .data(serde_json::json!({"error": e.to_string()}))
-                        })?
-                        .ok_or_else(|| {
-                            Error::invalid_request().data("remote session actor not found")
-                        })?;
+                    {
+                        Ok(Some(r)) => r,
+                        _ => {
+                            // Session not in DHT — ask the remote node to
+                            // resume (materialize) it from persistence, then
+                            // resolve the handoff into a remote actor ref.
+                            let nm_ref = self.find_node_manager(&parsed.node_id).await?;
+                            let resumed = self
+                                .resume_remote_session(&nm_ref, parsed.session_id.clone())
+                                .await?;
+                            self.resolve_handoff(&parsed.session_id, resumed.handoff)
+                                .await?
+                        }
+                    };
 
                     let peer_label = self
                         .list_remote_nodes()
@@ -2488,11 +2590,17 @@ impl SendAgent for LocalAgentHandle {
                     )
                     .await;
 
+                    let snapshot = self
+                        .build_remote_attach_snapshot(&parsed.session_id)
+                        .await
+                        .unwrap_or(serde_json::Value::Null);
+
                     return ext_json_response(&serde_json::json!({
                         "sessionId": parsed.session_id,
                         "nodeId": parsed.node_id,
                         "attached": true,
                         "configOptions": [],
+                        "snapshot": snapshot,
                     }));
                 }
 
