@@ -417,10 +417,21 @@ impl AgentBuilder {
         }
 
         if !self.tools.is_empty() {
-            // Use BuiltInAndProvider when MCP servers are also configured so
-            // that MCP tool definitions reach the LLM.  With BuiltInOnly the
-            // collect_tools() gate strips them out entirely.
-            let policy = if !self.mcp_servers.is_empty() {
+            // Infer tool policy from the tools list:
+            // - If any tool spec looks like an external/MCP pattern (contains a
+            //   dot separator like "server.*" or "server.tool"), use
+            //   BuiltInAndProvider so MCP tool definitions reach the LLM.
+            // - Otherwise BuiltInOnly is sufficient.
+            //
+            // This handles both config-based MCP servers and preconnected
+            // runtime MCP peers (e.g. mobile in-process MCP), since the tools
+            // list already declares the intended tool scope.
+            let has_external_tools = self.tools.iter().any(|t| {
+                // MCP-style specs contain a dot: "server.*" or "server.tool_name"
+                // while builtins are plain names like "create_task", "read_tool".
+                t.contains('.') || self.mcp_servers.iter().any(|m| t == m.name())
+            });
+            let policy = if has_external_tools || !self.mcp_servers.is_empty() {
                 ToolPolicy::BuiltInAndProvider
             } else {
                 ToolPolicy::BuiltInOnly
@@ -755,41 +766,65 @@ impl Agent {
     /// # }
     /// ```
     pub async fn from_config(config: SingleAgentConfig, infra: AgentInfra) -> Result<Self> {
-        let mut builder = Self::builder_from_config(config, None)?;
-        builder = builder.infra(infra);
-        builder.build().await
+        Self::from_single_config_with_optional_infra(config, Some(infra)).await
     }
 
     /// Build an Agent from a single agent config (default infrastructure).
     pub async fn from_single_config(config: SingleAgentConfig) -> Result<Self> {
-        let builder = Self::builder_from_config(config, None)?;
-        builder.build().await
+        Self::from_single_config_with_optional_infra(config, None).await
     }
 
-    /// Build an Agent from a single agent config, optionally injecting a pre-populated
-    /// agent registry (Phase 7: for remote agents discovered from `[[remote_agents]]`).
+    /// Build an Agent from a single agent config with injected infrastructure.
     ///
-    /// When `initial_registry` is `Some`, it is used as the agent registry instead of the
-    /// default empty `DefaultAgentRegistry`.  When `mesh` is `Some`, the `MeshHandle` is
-    /// stored on the resulting `AgentHandle` via `set_mesh()`. `mesh_auto_fallback`
-    /// controls whether `provider_node_id = None` may resolve providers from mesh peers.
-    #[cfg(feature = "remote")]
-    pub async fn from_single_config_with_registry(
+    /// Unlike the old mobile-specific path, this constructor treats
+    /// `SingleAgentConfig.mesh` as the single source of truth and performs mesh
+    /// setup through the shared remote setup path.
+    pub async fn from_single_config_with_infra(
         config: SingleAgentConfig,
-        initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
-        mesh: Option<crate::agent::remote::MeshHandle>,
-        mesh_auto_fallback: bool,
+        infra: AgentInfra,
     ) -> Result<Self> {
-        let builder = Self::builder_from_config(config, initial_registry)?;
-        let agent = builder.build().await?;
+        Self::from_single_config_with_optional_infra(config, Some(infra)).await
+    }
 
-        agent.inner.set_mesh_fallback(mesh_auto_fallback);
+    async fn from_single_config_with_optional_infra(
+        config: SingleAgentConfig,
+        infra: Option<AgentInfra>,
+    ) -> Result<Self> {
+        #[cfg(feature = "remote")]
+        {
+            use crate::agent::remote::{
+                setup_mesh_from_config, spawn_and_register_local_mesh_actors,
+            };
+            use crate::delegation::AgentRegistry as _;
 
-        if let Some(mesh) = mesh {
-            agent.inner.set_mesh(mesh);
+            if config.mesh.enabled {
+                log::info!("mesh.enabled = true in config, bootstrapping mesh...");
+                let result =
+                    setup_mesh_from_config(&config.mesh, &config.remote_agents, None, None).await?;
+                log::info!(
+                    "mesh bootstrapped, {} remote agent(s) registered",
+                    result.registry.list_agents().len()
+                );
+
+                let auto_fallback = config.mesh.auto_fallback;
+                let mut builder =
+                    Self::builder_from_config(config, Some(Arc::new(result.registry)))?;
+                if let Some(infra) = infra {
+                    builder = builder.infra(infra);
+                }
+                let agent = builder.build().await?;
+                agent.inner.set_mesh_fallback(auto_fallback);
+                agent.inner.set_mesh(result.mesh.clone());
+                let _ = spawn_and_register_local_mesh_actors(&agent.handle(), &result.mesh).await;
+                return Ok(agent);
+            }
         }
 
-        Ok(agent)
+        let mut builder = Self::builder_from_config(config, None)?;
+        if let Some(infra) = infra {
+            builder = builder.infra(infra);
+        }
+        builder.build().await
     }
 
     /// Configure an `AgentBuilder` from a `SingleAgentConfig`.

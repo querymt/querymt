@@ -96,12 +96,12 @@ pub use mesh::{
 #[cfg(feature = "remote")]
 pub use mesh_provider::MeshChatProvider;
 pub use node_id::NodeId;
-pub use node_manager::{AvailableModel, NodeInfo, RemoteSessionInfo};
+pub use node_manager::{AvailableModel, ListRemoteSessionsResponse, NodeInfo, RemoteSessionInfo};
 #[cfg(feature = "remote")]
 pub use node_manager::{
-    CreateRemoteSession, CreateRemoteSessionResponse, DestroyRemoteSession, ForkRemoteSession,
-    ForkRemoteSessionResponse, GetNodeInfo, ListAvailableModels, ListRemoteSessions,
-    RemoteNodeManager, ResumeRemoteSession,
+    CreateRemoteSession, CreateRemoteSessionResponse, ForkRemoteSession, ForkRemoteSessionResponse,
+    GetNodeInfo, ListAvailableModels, ListRemoteSessions, RemoteNodeManager, ResumeRemoteSession,
+    StopRemoteSessionRuntime,
 };
 #[cfg(feature = "remote")]
 pub use provider_host::{
@@ -115,7 +115,10 @@ pub use registry_exchange::{
 #[cfg(feature = "remote")]
 pub use remote_handle::RemoteAgentHandle;
 #[cfg(feature = "remote")]
-pub use remote_setup::{MeshSetupResult, setup_mesh_from_config};
+pub use remote_setup::{
+    LocalMeshActorRefs, MeshSetupResult, setup_mesh_from_config,
+    spawn_and_register_local_mesh_actors, spawn_and_register_local_mesh_actors_with_name,
+};
 pub use routing::{
     ClearRoute, ListRoutes, ResolvePeer, RouteConfirmation, RouteTarget, RoutingActor,
     RoutingPolicy, RoutingSnapshot, RoutingSnapshotHandle, SetProviderTarget, SetSessionTarget,

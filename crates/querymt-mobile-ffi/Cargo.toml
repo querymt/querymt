@@ -1,0 +1,68 @@
+[package]
+name = "querymt-mobile-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Mobile FFI crate exposing a stable C ABI for iOS and Android QueryMT bindings"
+
+[features]
+default = ["remote", "remote-internet", "provider-anthropic", "provider-openai", "provider-google", "provider-deepseek"]
+
+# Remote agent / mesh support
+remote = ["querymt-agent/plugin-host-only", "querymt-agent/remote"]
+remote-internet = ["remote", "querymt-agent/remote-internet"]
+
+# Static provider registration for mobile
+provider-anthropic = ["dep:qmt-anthropic"]
+provider-openai = ["dep:qmt-openai"]
+provider-google = ["dep:qmt-google"]
+provider-deepseek = ["dep:qmt-deepseek"]
+
+# Future providers (can be added independently)
+# provider-groq = ["dep:qmt-groq"]
+# provider-ollama = ["dep:qmt-ollama"]
+
+[lib]
+name = "querymt_mobile_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+querymt = { path = "../querymt", default-features = false, features = ["runtime"] }
+querymt-agent = { path = "../agent", default-features = false }
+querymt-utils = { path = "../querymt-utils", features = ["providers", "serde", "secret-store"] }
+
+# Agent client protocol for session/prompt types
+agent-client-protocol = { version = "0.11", features = ["unstable"] }
+agent-client-protocol-schema = { version = "0.12", features = ["unstable"]}
+
+# Provider crates for static registration
+qmt-anthropic = { path = "../providers/anthropic", optional = true, default-features = false, features = ["api"] }
+qmt-openai = { path = "../providers/openai", optional = true, default-features = false, features = ["api"] }
+qmt-google = { path = "../providers/google", optional = true, default-features = false, features = ["api"] }
+qmt-deepseek = { path = "../providers/deepseek", optional = true, default-features = false, features = ["api"] }
+
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+tracing.workspace = true
+tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["logs"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "logs"] }
+opentelemetry-appender-tracing = { version = "0.31", features = ["log"] }
+tracing-opentelemetry = "0.32"
+anyhow = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "sync", "macros", "io-util", "net"] }
+once_cell = "1.20"
+parking_lot = "0.12"
+libc = "0.2"
+rmcp = { version = "1.0", features = ["client", "transport-async-rw", "elicitation"] }
+libp2p = { version = "0.56", optional = true, default-features = false }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22"
+rustls-platform-verifier = "0.7.0"
+
+[build-dependencies]

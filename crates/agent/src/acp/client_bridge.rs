@@ -82,8 +82,8 @@ pub enum ClientBridgeMessage {
 
     /// Workspace query request (agent → client → VS Code LSP).
     ///
-    /// The bridge task serializes this as an `ExtRequest` with method `"workspace/query"`,
-    /// which the ACP SDK sends as `"_workspace/query"` on the wire.
+    /// The bridge task sends this as an ACP SDK `AgentRequest::ExtMethodRequest`
+    /// using the wire-form method `"_workspace/query"`.
     /// The client (VS Code extension) handles it by calling VS Code language APIs
     /// and returns the result.
     WorkspaceQuery {

@@ -11178,6 +11178,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "querymt-mobile-ffi"
+version = "0.4.0"
+dependencies = [
+ "agent-client-protocol",
+ "agent-client-protocol-schema 0.12.0",
+ "anyhow",
+ "jni",
+ "libc",
+ "libp2p",
+ "log",
+ "once_cell",
+ "opentelemetry",
+ "opentelemetry-appender-tracing",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "parking_lot",
+ "qmt-anthropic",
+ "qmt-deepseek",
+ "qmt-google",
+ "qmt-openai",
+ "querymt",
+ "querymt-agent",
+ "querymt-utils",
+ "rmcp",
+ "rustls-platform-verifier",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-log",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "querymt-provider-common"
 version = "0.4.0"
 dependencies = [

@@ -34,6 +34,20 @@ pub struct RemoteSessionInfo {
     pub runtime_state: Option<String>,
 }
 
+/// Paginated response for listing sessions on a remote node.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListRemoteSessionsResponse {
+    /// Sessions in the requested page.
+    pub sessions: Vec<RemoteSessionInfo>,
+    /// Offset for the next page; `None` when there are no more pages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<u32>,
+    /// Total sessions across all pages.
+    #[typeshare(serialized_as = "number")]
+    pub total_count: u32,
+}
+
 /// Metadata about a remote node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
@@ -59,14 +73,14 @@ pub struct AvailableModel {
 #[cfg(feature = "remote")]
 pub use remote_impl::{
     AdmissionRequest, AdmissionResponse, CreateRemoteSession, CreateRemoteSessionResponse,
-    DestroyRemoteSession, ForkRemoteSession, ForkRemoteSessionResponse, GetNodeInfo,
-    ListAvailableModels, ListRemoteSessions, RemoteNodeManager, ResumeRemoteSession,
-    SessionHandoff,
+    ForkRemoteSession, ForkRemoteSessionResponse, GetNodeInfo, ListAvailableModels,
+    ListRemoteSessions, RemoteNodeManager, ResumeRemoteSession, SessionHandoff,
+    StopRemoteSessionRuntime,
 };
 
 #[cfg(feature = "remote")]
 mod remote_impl {
-    use super::{AvailableModel, NodeInfo, RemoteSessionInfo};
+    use super::{AvailableModel, ListRemoteSessionsResponse, NodeInfo, RemoteSessionInfo};
     use crate::agent::agent_config::AgentConfig;
     use crate::agent::remote::NodeId;
     use crate::agent::remote::mesh::MeshHandle;
@@ -153,17 +167,29 @@ mod remote_impl {
         pub created_at: i64,
     }
 
-    /// List sessions active on this node.
+    /// List sessions active on this node, with pagination.
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct ListRemoteSessions;
+    pub struct ListRemoteSessions {
+        /// Number of sessions to skip (default 0).
+        #[serde(default)]
+        pub offset: Option<u32>,
+        /// Maximum sessions to return (default 20, clamped to 1..100).
+        #[serde(default)]
+        pub limit: Option<u32>,
+    }
 
     /// List all provider/model pairs this node can serve (has valid credentials for).
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ListAvailableModels;
 
-    /// Destroy (shutdown) a session on this node.
+    /// Shut down the live runtime actor for a session on this node.
+    ///
+    /// This removes the session actor from the in-memory registry and
+    /// deregisters it from the mesh DHT, but **does not** delete the
+    /// persisted session history from SQLite. The session can later be
+    /// re-materialized via `ResumeRemoteSession`.
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct DestroyRemoteSession {
+    pub struct StopRemoteSessionRuntime {
         pub session_id: String,
     }
 
@@ -238,6 +264,9 @@ mod remote_impl {
         session_meta: HashMap<String, (i64, Option<String>)>,
         /// Mesh handle for DHT registration of newly created sessions.
         mesh: Option<MeshHandle>,
+        /// Per-session async locks preventing concurrent materialization of the
+        /// same `session_id`.  Different sessions are independent.
+        materialization_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
         /// Optional fixed node name returned by `GetNodeInfo`.
         ///
         /// When `Some`, `GetNodeInfo` returns this value directly as `hostname`
@@ -259,6 +288,7 @@ mod remote_impl {
                 registry,
                 session_meta: HashMap::new(),
                 mesh,
+                materialization_locks: HashMap::new(),
                 node_name: None,
             }
         }
@@ -275,6 +305,61 @@ mod remote_impl {
             self
         }
 
+        /// Get (or create) the per-session materialization lock.
+        fn materialization_lock_for(&mut self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+            self.materialization_locks
+                .entry(session_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        }
+
+        /// Best-effort cleanup of a per-session lock map entry when no other
+        /// task is waiting on it.
+        fn cleanup_materialization_lock(
+            &mut self,
+            session_id: &str,
+            lock: &Arc<tokio::sync::Mutex<()>>,
+        ) {
+            if Arc::strong_count(lock) == 2 {
+                self.materialization_locks.remove(session_id);
+            }
+        }
+
+        /// Build a `SessionHandoff` from an already-spawned local actor ref.
+        async fn handoff_for_local_actor(
+            &self,
+            session_id: &str,
+            actor_ref: kameo::actor::ActorRef<SessionActor>,
+        ) -> SessionHandoff {
+            let actor_id_raw = actor_ref.id().sequence_id();
+            log::info!(
+                "RemoteNodeManager: reusing already-materialized session {} (actor_id={})",
+                session_id,
+                actor_id_raw,
+            );
+
+            match std::panic::AssertUnwindSafe(async { actor_ref.into_remote_ref().await })
+                .catch_unwind()
+                .await
+            {
+                Ok(remote_ref) => SessionHandoff::direct(remote_ref),
+                Err(_) if self.mesh.is_some() => {
+                    log::warn!(
+                        "RemoteNodeManager: direct remote export unavailable for existing session {}; returning lookup-only handoff",
+                        session_id
+                    );
+                    SessionHandoff::lookup_only()
+                }
+                Err(_) => {
+                    log::warn!(
+                        "RemoteNodeManager: direct remote export unavailable for existing session {} and no mesh is active; returning no-attach-path handoff",
+                        session_id
+                    );
+                    SessionHandoff::no_attach_path()
+                }
+            }
+        }
+
         async fn materialize_remote_session(
             &mut self,
             session_id: String,
@@ -283,6 +368,27 @@ mod remote_impl {
             title: Option<String>,
             created_at: i64,
         ) -> Result<SessionHandoff, AgentError> {
+            // ── Per-session single-flight lock ──────────────────────────────
+            // Prevents two concurrent callers from materializing the same
+            // session_id into separate SessionActor instances.  Different
+            // session IDs proceed independently.
+            let session_lock = self.materialization_lock_for(&session_id);
+            let _guard = session_lock.lock().await;
+
+            // ── Idempotency check ───────────────────────────────────────────
+            // After acquiring the per-session lock, check whether another
+            // caller already materialized this session.
+            {
+                let registry = self.registry.lock().await;
+                if let Some(existing) = registry.local_actor_ref(&session_id).cloned() {
+                    drop(registry);
+                    let handoff = self.handoff_for_local_actor(&session_id, existing).await;
+                    self.cleanup_materialization_lock(&session_id, &session_lock);
+                    return Ok(handoff);
+                }
+            }
+
+            // ── Materialize new actor ────────────────────────────────────────
             let materialization = {
                 let mut registry = self.registry.lock().await;
                 registry.set_mesh(self.mesh.clone());
@@ -292,7 +398,7 @@ mod remote_impl {
                         cwd_path.clone(),
                         &[],
                         false,
-                        SessionMaterializationOptions {
+                        &mut SessionMaterializationOptions {
                             attach_mesh_handle: true,
                             register_in_dht: true,
                         },
@@ -388,28 +494,9 @@ mod remote_impl {
                 }
             }
 
-            let handoff = match std::panic::AssertUnwindSafe(async {
-                actor_ref.into_remote_ref().await
-            })
-            .catch_unwind()
-            .await
-            {
-                Ok(remote_ref) => SessionHandoff::direct(remote_ref),
-                Err(_) if self.mesh.is_some() => {
-                    log::warn!(
-                        "RemoteNodeManager: direct remote export unavailable for session {}; returning lookup-only handoff",
-                        session_id
-                    );
-                    SessionHandoff::lookup_only()
-                }
-                Err(_) => {
-                    log::warn!(
-                        "RemoteNodeManager: direct remote export unavailable for session {} and no mesh is active; returning no-attach-path handoff",
-                        session_id
-                    );
-                    SessionHandoff::no_attach_path()
-                }
-            };
+            let handoff = self
+                .handoff_for_local_actor(&session_id, actor_ref.clone())
+                .await;
 
             log::info!(
                 "RemoteNodeManager: materialized session {} (actor_id={}, title={:?})",
@@ -417,6 +504,9 @@ mod remote_impl {
                 actor_id_raw,
                 title
             );
+
+            drop(_guard);
+            self.cleanup_materialization_lock(&session_id, &session_lock);
 
             Ok(handoff)
         }
@@ -602,92 +692,92 @@ mod remote_impl {
     }
 
     impl Message<ListRemoteSessions> for RemoteNodeManager {
-        type Reply = Result<Vec<RemoteSessionInfo>, AgentError>;
+        type Reply = Result<ListRemoteSessionsResponse, AgentError>;
 
         #[tracing::instrument(
             name = "remote.node_manager.list_sessions",
             skip(self, _ctx),
-            fields(count = tracing::field::Empty)
+            fields(count = tracing::field::Empty, total = tracing::field::Empty)
         )]
         async fn handle(
             &mut self,
-            _msg: ListRemoteSessions,
+            msg: ListRemoteSessions,
             _ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
             use crate::agent::messages::SessionRuntimeStatus;
 
-            let registry = self.registry.lock().await;
-            let session_ids = registry.session_ids();
+            let offset = msg.offset.unwrap_or(0) as usize;
+            let limit = msg.limit.unwrap_or(20).clamp(1, 100) as usize;
 
-            let hostname = get_hostname();
+            // ── 1. Load persisted sessions from SQLite ─────────────────────────
             let store = self.config.provider.history_store();
+            let all_sessions = store.list_sessions().await.map_err(|e| {
+                AgentError::Internal(format!("Failed to list persisted sessions: {}", e))
+            })?;
 
-            let mut infos = Vec::new();
-            for sid in session_ids {
-                // Prefer metadata from session_meta (for remotely-created sessions),
-                // but fall back to querying the session store for locally-created sessions.
-                let (created_at, cwd, session_name) = if let Some((ts, meta_cwd)) =
-                    self.session_meta.get(&sid)
-                {
-                    (*ts, meta_cwd.clone(), None)
-                } else {
-                    match store.get_session(&sid).await {
-                        Ok(Some(session)) => {
-                            let ts = session.created_at.map(|t| t.unix_timestamp()).unwrap_or(0);
-                            let cwd = session.cwd.map(|p| p.display().to_string());
-                            let session_name = session.name.clone();
-                            (ts, cwd, session_name)
-                        }
-                        _ => (0, None, None),
-                    }
-                };
+            // Sort by updated_at DESC (stable), falling back to public_id for determinism.
+            let mut sorted = all_sessions;
+            sorted.sort_by(|a, b| {
+                b.updated_at
+                    .cmp(&a.updated_at)
+                    .then_with(|| b.public_id.cmp(&a.public_id))
+            });
 
-                // Match local session-list title behavior: use the initial intent summary
-                // (truncated) as the display title, then fall back to session.name.
-                let title = match store.get_initial_intent_snapshot(&sid).await {
+            let total_count = sorted.len() as u32;
+
+            // ── 2. Paginate ────────────────────────────────────────────────────
+            let page: Vec<_> = sorted.into_iter().skip(offset).take(limit).collect();
+            let page_len = page.len();
+
+            // ── 3. Enrich with live registry data ──────────────────────────────
+            let registry = self.registry.lock().await;
+            let hostname = get_hostname();
+
+            let mut infos = Vec::with_capacity(page_len);
+            for session in &page {
+                // Title: prefer initial intent snapshot summary, fall back to session.name.
+                let title = match store.get_initial_intent_snapshot(&session.public_id).await {
                     Ok(Some(snapshot)) => Some(querymt_utils::str_utils::truncate_with_ellipsis(
                         &snapshot.summary,
                         80,
                     )),
-                    _ => session_name,
+                    _ => session.name.clone(),
                 };
 
-                let session_ref = registry.get(&sid).cloned();
-                let actor_id = match session_ref.as_ref() {
-                    Some(crate::agent::remote::SessionActorRef::Local(ar)) => ar.id().sequence_id(),
-                    #[cfg(feature = "remote")]
-                    Some(crate::agent::remote::SessionActorRef::Remote { .. }) | None => 0,
-                    #[cfg(not(feature = "remote"))]
-                    None => 0,
-                };
-                let runtime_state = match session_ref {
-                    Some(session_ref) => match tokio::time::timeout(
-                        std::time::Duration::from_millis(200),
-                        session_ref.get_runtime_status(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(SessionRuntimeStatus::Idle)) => Some("idle".to_string()),
-                        Ok(Ok(
-                            SessionRuntimeStatus::Running | SessionRuntimeStatus::CancelRequested,
-                        )) => Some("busy".to_string()),
-                        Ok(Err(e)) => {
-                            log::debug!(
-                                "RemoteNodeManager: failed to query runtime status for {}: {}",
-                                sid,
-                                e
-                            );
-                            Some("active".to_string())
-                        }
-                        Err(_) => Some("active".to_string()),
-                    },
-                    None => Some("active".to_string()),
+                let created_at = session.created_at.map(|t| t.unix_timestamp()).unwrap_or(0);
+
+                // Enrich with live actor_id and runtime_state from the registry.
+                let (actor_id, runtime_state) = match registry.get(&session.public_id) {
+                    Some(session_ref) => {
+                        let aid = match session_ref {
+                            crate::agent::remote::SessionActorRef::Local(ar) => {
+                                ar.id().sequence_id()
+                            }
+                            #[cfg(feature = "remote")]
+                            crate::agent::remote::SessionActorRef::Remote { .. } => 0,
+                        };
+                        let state = match tokio::time::timeout(
+                            std::time::Duration::from_millis(200),
+                            session_ref.get_runtime_status(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(SessionRuntimeStatus::Idle)) => "idle".to_string(),
+                            Ok(Ok(
+                                SessionRuntimeStatus::Running
+                                | SessionRuntimeStatus::CancelRequested,
+                            )) => "busy".to_string(),
+                            Ok(Err(_)) | Err(_) => "active".to_string(),
+                        };
+                        (aid, Some(state))
+                    }
+                    None => (0, Some("persisted".to_string())),
                 };
 
                 infos.push(RemoteSessionInfo {
-                    session_id: sid,
+                    session_id: session.public_id.clone(),
                     actor_id,
-                    cwd,
+                    cwd: session.cwd.as_ref().map(|p| p.display().to_string()),
                     created_at,
                     title,
                     peer_label: hostname.clone(),
@@ -695,22 +785,37 @@ mod remote_impl {
                 });
             }
 
-            tracing::Span::current().record("count", infos.len());
-            Ok(infos)
+            drop(registry);
+
+            let next_offset = if ((offset + page_len) as u32) < total_count {
+                Some((offset + page_len) as u32)
+            } else {
+                None
+            };
+
+            tracing::Span::current()
+                .record("count", infos.len())
+                .record("total", total_count);
+
+            Ok(ListRemoteSessionsResponse {
+                sessions: infos,
+                next_offset,
+                total_count,
+            })
         }
     }
 
-    impl Message<DestroyRemoteSession> for RemoteNodeManager {
+    impl Message<StopRemoteSessionRuntime> for RemoteNodeManager {
         type Reply = Result<(), AgentError>;
 
         #[tracing::instrument(
-            name = "remote.node_manager.destroy_session",
+            name = "remote.node_manager.stop_session_runtime",
             skip(self, _ctx),
             fields(session_id = %msg.session_id, found = tracing::field::Empty)
         )]
         async fn handle(
             &mut self,
-            msg: DestroyRemoteSession,
+            msg: StopRemoteSessionRuntime,
             _ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
             let session_ref = {
@@ -721,7 +826,7 @@ mod remote_impl {
             if let Some(session_ref) = session_ref {
                 tracing::Span::current().record("found", true);
 
-                // Bound shutdown latency so destroy requests cannot hang forever
+                // Bound shutdown latency so stop requests cannot hang forever
                 // if an actor is unresponsive.
                 let shutdown_timeout = std::time::Duration::from_secs(2);
                 match tokio::time::timeout(shutdown_timeout, session_ref.shutdown()).await {
@@ -743,14 +848,14 @@ mod remote_impl {
                 }
 
                 // Ensure this session's re-registration closure is removed from the
-                // mesh handle so repeated create/destroy cycles don't leak entries.
+                // mesh handle so repeated create/stop cycles don't leak entries.
                 if let Some(ref mesh) = self.mesh {
                     let dht_name = crate::agent::remote::dht_name::session(&msg.session_id);
                     mesh.deregister_actor(&dht_name);
                 }
 
                 log::info!(
-                    "RemoteNodeManager: destroyed runtime for session {}",
+                    "RemoteNodeManager: stopped runtime for session {}",
                     msg.session_id
                 );
                 Ok(())
@@ -1119,9 +1224,9 @@ mod remote_impl {
         REG_LIST_REMOTE_SESSIONS
     );
     remote_node_msg_impl!(
-        DestroyRemoteSession,
-        "querymt::DestroyRemoteSession",
-        REG_DESTROY_REMOTE_SESSION
+        StopRemoteSessionRuntime,
+        "querymt::StopRemoteSessionRuntime",
+        REG_STOP_REMOTE_SESSION_RUNTIME
     );
     remote_node_msg_impl!(
         ResumeRemoteSession,
