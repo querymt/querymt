@@ -62,9 +62,13 @@ mod node_manager_extended_tests {
 
         let sessions = f
             .actor_ref
-            .ask(ListRemoteSessions)
+            .ask(ListRemoteSessions {
+                offset: None,
+                limit: None,
+            })
             .await
-            .expect("list after destroy");
+            .expect("list after destroy")
+            .sessions;
 
         assert!(
             sessions.iter().all(|s| s.session_id != resp.session_id),
@@ -121,10 +125,17 @@ mod node_manager_extended_tests {
             .expect("destroy");
         }
 
-        let sessions = tokio::time::timeout(timeout, f.actor_ref.ask(ListRemoteSessions))
-            .await
-            .expect("list timed out")
-            .expect("list");
+        let sessions = tokio::time::timeout(
+            timeout,
+            f.actor_ref.ask(ListRemoteSessions {
+                offset: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("list timed out")
+        .expect("list")
+        .sessions;
         assert!(
             sessions.is_empty(),
             "after 10 create+destroy cycles the registry should be empty, got {} sessions",
@@ -240,9 +251,16 @@ mod remote_session_lifecycle_integration_tests {
 
         // Verify via Beta's local list.
         let sessions = within_timeout("ListRemoteSessions on beta", async {
-            f.beta.actor_ref.ask(ListRemoteSessions).await
+            f.beta
+                .actor_ref
+                .ask(ListRemoteSessions {
+                    offset: None,
+                    limit: None,
+                })
+                .await
         })
         .await
+        .map(|r| r.sessions)
         .expect("ListRemoteSessions on beta");
         assert!(
             sessions.iter().any(|s| s.session_id == resp.session_id),
@@ -339,10 +357,17 @@ mod remote_session_lifecycle_integration_tests {
         .expect("create 2");
 
         // Alpha lists beta's sessions.
-        let sessions: Vec<_> =
-            within_timeout("list", async { beta_ref.ask(&ListRemoteSessions).await })
+        let sessions: Vec<_> = within_timeout("list", async {
+            beta_ref
+                .ask(&ListRemoteSessions {
+                    offset: None,
+                    limit: None,
+                })
                 .await
-                .expect("list");
+        })
+        .await
+        .expect("list")
+        .sessions;
 
         assert_eq!(sessions.len(), 2, "beta should have 2 sessions");
         let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
@@ -438,10 +463,17 @@ mod remote_session_lifecycle_integration_tests {
             .expect("forked child should be directly usable");
         assert_eq!(mode, AgentMode::Build);
 
-        let sessions: Vec<_> =
-            within_timeout("list", async { beta_ref.ask(&ListRemoteSessions).await })
+        let sessions: Vec<_> = within_timeout("list", async {
+            beta_ref
+                .ask(&ListRemoteSessions {
+                    offset: None,
+                    limit: None,
+                })
                 .await
-                .expect("list");
+        })
+        .await
+        .expect("list")
+        .sessions;
         assert!(sessions.iter().any(|s| s.session_id == child.session_id));
 
         let _ = within_timeout("destroy parent", async {
@@ -495,9 +527,17 @@ mod remote_session_lifecycle_integration_tests {
         .await
         .expect("destroy");
 
-        let sessions = within_timeout("list", async { beta_ref.ask(&ListRemoteSessions).await })
-            .await
-            .expect("list");
+        let sessions = within_timeout("list", async {
+            beta_ref
+                .ask(&ListRemoteSessions {
+                    offset: None,
+                    limit: None,
+                })
+                .await
+        })
+        .await
+        .expect("list")
+        .sessions;
         assert!(
             sessions.iter().all(|s| s.session_id != resp.session_id),
             "destroyed session should be gone from beta's list"
@@ -537,9 +577,17 @@ mod remote_session_lifecycle_integration_tests {
         sorted.dedup();
         assert_eq!(sorted.len(), 3, "all session IDs should be unique");
 
-        let sessions = within_timeout("list", async { beta_ref.ask(&ListRemoteSessions).await })
-            .await
-            .expect("list");
+        let sessions = within_timeout("list", async {
+            beta_ref
+                .ask(&ListRemoteSessions {
+                    offset: None,
+                    limit: None,
+                })
+                .await
+        })
+        .await
+        .expect("list")
+        .sessions;
         assert_eq!(sessions.len(), 3);
 
         for id in ids {

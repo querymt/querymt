@@ -54,6 +54,8 @@ pub async fn handle_list_remote_nodes(state: &ServerState, tx: &mpsc::Sender<Str
 pub async fn handle_list_remote_sessions(
     state: &ServerState,
     node_id: &str,
+    offset: Option<u32>,
+    limit: Option<u32>,
     tx: &mpsc::Sender<String>,
 ) {
     #[cfg(feature = "remote")]
@@ -67,6 +69,8 @@ pub async fn handle_list_remote_sessions(
                     UiServerMessage::RemoteSessions {
                         node_id: node_id.to_string(),
                         sessions: Vec::new(),
+                        next_offset: None,
+                        total_count: Some(0),
                     },
                 )
                 .await;
@@ -74,13 +78,19 @@ pub async fn handle_list_remote_sessions(
             }
         };
 
-        match state.agent.list_remote_sessions(&node_manager_ref).await {
-            Ok(sessions) => {
+        match state
+            .agent
+            .list_remote_sessions(&node_manager_ref, offset, limit)
+            .await
+        {
+            Ok(response) => {
                 let _ = send_message(
                     tx,
                     UiServerMessage::RemoteSessions {
                         node_id: node_id.to_string(),
-                        sessions,
+                        sessions: response.sessions,
+                        next_offset: response.next_offset,
+                        total_count: Some(response.total_count),
                     },
                 )
                 .await;
@@ -99,6 +109,8 @@ pub async fn handle_list_remote_sessions(
             UiServerMessage::RemoteSessions {
                 node_id: node_id.to_string(),
                 sessions: Vec::new(),
+                next_offset: None,
+                total_count: Some(0),
             },
         )
         .await;

@@ -290,12 +290,12 @@ pub async fn handle_list_sessions(
                                 async {
                                     let nm_ref =
                                         state.agent.find_node_manager(&node_id_str).await?;
-                                    state.agent.list_remote_sessions(&nm_ref).await
+                                    state.agent.list_remote_sessions(&nm_ref, None, None).await
                                 },
                             )
                             .await
                             {
-                                Ok(Ok(s)) => s,
+                                Ok(Ok(response)) => response.sessions,
                                 Ok(Err(_)) | Err(_) => return None,
                             };
                             Some((peer_label, node_id_str, sessions))

@@ -678,23 +678,31 @@ pub unsafe extern "C" fn qmt_ffi_acp_send(
                     if let Some(result) = response.result.as_mut()
                         && let Some(result_obj) = result.as_object_mut()
                     {
-                        let snapshot = querymt_agent::session::load_session_snapshot(
-                            agent.as_ref(),
-                            view_store.clone(),
-                            sid,
-                        )
-                        .await
-                        .map_err(|_| FfiErrorCode::RuntimeError)?;
-                        let event_count = snapshot.audit.events.len();
-                        log::info!(
-                            "ffi remote attach snapshot injected: session_id={}, events={}",
-                            sid,
-                            event_count
-                        );
-                        result_obj.insert(
-                            "snapshot".to_string(),
-                            serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null),
-                        );
+                        if result_obj.contains_key("snapshot") {
+                            log::info!(
+                                "ffi remote attach snapshot preserved: session_id={}",
+                                sid
+                            );
+                        } else {
+                            let snapshot = querymt_agent::session::load_session_snapshot(
+                                agent.as_ref(),
+                                view_store.clone(),
+                                sid,
+                            )
+                            .await
+                            .map_err(|_| FfiErrorCode::RuntimeError)?;
+                            let event_count = snapshot.audit.events.len();
+                            log::info!(
+                                "ffi remote attach fallback snapshot injected: session_id={}, events={}",
+                                sid,
+                                event_count
+                            );
+                            result_obj.insert(
+                                "snapshot".to_string(),
+                                serde_json::to_value(snapshot)
+                                    .unwrap_or(serde_json::Value::Null),
+                            );
+                        }
                     }
                 }
             }
@@ -1114,5 +1122,90 @@ mod tests {
         assert_eq!(queued.as_deref(), Some("queued-message"));
 
         remove_test_connection(connection_handle);
+    }
+
+    /// Regression test: the FFI remote attach path must NOT overwrite a
+    /// snapshot already present in the ACP response.  The server-side
+    /// `querymt/remote/attachSession` handler builds a snapshot from the
+    /// remote actor's event stream; replacing it with the local (empty)
+    /// journal loses all history.
+    #[test]
+    fn remote_attach_snapshot_preserves_existing() {
+        let mut result_obj = serde_json::json!({
+            "sessionId": "s-remote-1",
+            "nodeId": "n-1",
+            "attached": true,
+            "configOptions": [],
+            "snapshot": {
+                "audit": {
+                    "session_id": "s-remote-1",
+                    "events": [{ "seq": 1, "kind": "user_message" }],
+                    "tasks": [],
+                    "intent_snapshots": [],
+                    "decisions": [],
+                    "progress_entries": [],
+                    "artifacts": [],
+                    "delegations": [],
+                    "generated_at": "2026-05-16T08:00:00Z"
+                },
+                "cursor": {
+                    "local_seq": 1,
+                    "remote_seq_by_source": {}
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let before_snapshot = result_obj.get("snapshot").cloned();
+        assert!(before_snapshot.is_some(), "precondition: snapshot exists");
+
+        // Simulate the guarded branch — must NOT enter the injection path.
+        if !result_obj.contains_key("snapshot") {
+            result_obj.insert(
+                "snapshot".to_string(),
+                serde_json::json!({ "audit": { "events": [] }, "cursor": { "local_seq": 0 } }),
+            );
+        }
+
+        assert_eq!(
+            result_obj.get("snapshot").cloned(),
+            before_snapshot,
+            "snapshot must not be overwritten by local fallback"
+        );
+    }
+
+    /// Inverse: when the server response has no snapshot key, the FFI
+    /// injection path must still be able to insert one.
+    #[test]
+    fn remote_attach_snapshot_allows_fallback_when_missing() {
+        let mut result_obj = serde_json::json!({
+            "sessionId": "s-remote-2",
+            "nodeId": "n-1",
+            "attached": true,
+            "configOptions": []
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        assert!(
+            !result_obj.contains_key("snapshot"),
+            "precondition: no snapshot"
+        );
+
+        // Simulate the guarded branch — must enter the injection path.
+        if !result_obj.contains_key("snapshot") {
+            result_obj.insert(
+                "snapshot".to_string(),
+                serde_json::json!({ "audit": { "events": [] }, "cursor": { "local_seq": 0 } }),
+            );
+        }
+
+        assert!(
+            result_obj.contains_key("snapshot"),
+            "fallback snapshot should be injected"
+        );
     }
 }

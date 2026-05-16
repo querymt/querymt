@@ -729,6 +729,22 @@ impl SessionRegistry {
                 )));
         }
 
+        // If a local actor already exists for this session, reuse it instead
+        // of spawning a duplicate.
+        if let Some(existing_ref) = self.local_actor_ref(&session_id).cloned() {
+            let current_mode = existing_ref
+                .ask(crate::agent::messages::GetMode)
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+            return Ok(agent_client_protocol::schema::LoadSessionResponse::new()
+                .modes(mode_state(current_mode))
+                .config_options(config_options(
+                    current_mode,
+                    **self.config.default_reasoning_effort.load(),
+                )));
+        }
+
         let _session = self
             .config
             .provider
@@ -891,21 +907,27 @@ impl SessionRegistry {
             Some(req.cwd.clone())
         };
 
-        let _materialization = self
-            .materialize_session_actor(
-                session_id.clone(),
-                cwd,
-                &req.mcp_servers,
-                false,
-                &mut SessionMaterializationOptions {
-                    attach_mesh_handle: true,
-                    register_in_dht: true,
-                },
-            )
-            .await?;
+        // If a local actor already exists for this session, reuse it instead
+        // of spawning a duplicate.
+        let already_materialized = self.local_actor_ref(&session_id).is_some();
 
-        self.config
-            .emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);
+        if !already_materialized {
+            let _materialization = self
+                .materialize_session_actor(
+                    session_id.clone(),
+                    cwd,
+                    &req.mcp_servers,
+                    false,
+                    &mut SessionMaterializationOptions {
+                        attach_mesh_handle: true,
+                        register_in_dht: true,
+                    },
+                )
+                .await?;
+
+            self.config
+                .emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);
+        }
 
         let current_mode = {
             let session_ref = self
