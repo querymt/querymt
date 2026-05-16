@@ -505,8 +505,8 @@ mod node_manager_tests {
     use super::*;
     use crate::agent::messages::GetMode;
     use crate::agent::remote::node_manager::{
-        CreateRemoteSession, DestroyRemoteSession, ForkRemoteSession, GetNodeInfo,
-        ListRemoteSessions, RemoteNodeManager, ResumeRemoteSession, SessionHandoff,
+        CreateRemoteSession, ForkRemoteSession, GetNodeInfo, ListRemoteSessions, RemoteNodeManager,
+        ResumeRemoteSession, SessionHandoff, StopRemoteSessionRuntime,
     };
     use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
     use crate::model::{AgentMessage, MessagePart};
@@ -753,7 +753,7 @@ mod node_manager_tests {
     }
 
     #[tokio::test]
-    async fn test_destroy_session() {
+    async fn test_stop_session_runtime() {
         let (nm_ref, config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let resp = nm_ref
@@ -762,11 +762,11 @@ mod node_manager_tests {
             .expect("create");
 
         nm_ref
-            .ask(DestroyRemoteSession {
+            .ask(StopRemoteSessionRuntime {
                 session_id: resp.session_id.clone(),
             })
             .await
-            .expect("destroy should succeed");
+            .expect("stop runtime should succeed");
 
         let sessions = nm_ref
             .ask(ListRemoteSessions {
@@ -776,7 +776,7 @@ mod node_manager_tests {
             .await
             .expect("list")
             .sessions;
-        // Destroy removes the runtime actor but the session row persists in
+        // Stop removes the runtime actor but the session row persists in
         // SQLite, so ListRemoteSessions (which now queries the session store)
         // still returns it.
         assert_eq!(sessions.len(), 1);
@@ -789,23 +789,23 @@ mod node_manager_tests {
                 .await
                 .expect("session lookup")
                 .is_some(),
-            "destroy should remove only the runtime, not persisted history"
+            "stop should remove only the runtime, not persisted history"
         );
     }
 
     #[tokio::test]
-    async fn test_destroy_nonexistent_session() {
+    async fn test_stop_nonexistent_session_runtime() {
         let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let result = nm_ref
-            .ask(DestroyRemoteSession {
+            .ask(StopRemoteSessionRuntime {
                 session_id: "does-not-exist".to_string(),
             })
             .await;
 
         assert!(
             matches!(result, Err(SendError::HandlerError(_))),
-            "destroying nonexistent session should fail with HandlerError"
+            "stopping nonexistent session should fail with HandlerError"
         );
     }
 
@@ -887,7 +887,7 @@ mod node_manager_tests {
     }
 
     #[tokio::test]
-    async fn test_destroy_then_create_reuses_slot() {
+    async fn test_stop_then_create_reuses_slot() {
         let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         // Create + destroy
@@ -897,11 +897,11 @@ mod node_manager_tests {
             .expect("create 1");
 
         nm_ref
-            .ask(DestroyRemoteSession {
+            .ask(StopRemoteSessionRuntime {
                 session_id: resp1.session_id.clone(),
             })
             .await
-            .expect("destroy");
+            .expect("stop");
 
         // Create again — should succeed and produce a different session ID
         let resp2 = nm_ref
@@ -919,13 +919,13 @@ mod node_manager_tests {
             .await
             .expect("list")
             .sessions;
-        // Both sessions appear: resp1 is destroyed but still persisted in
+        // Both sessions appear: resp1 is stopped but still persisted in
         // SQLite, resp2 is the newly created live session.
         assert_eq!(sessions.len(), 2);
         let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
         assert!(
             ids.contains(&resp1.session_id.as_str()),
-            "destroyed session should still be listed from SQLite"
+            "stopped session should still be listed from SQLite"
         );
         assert!(
             ids.contains(&resp2.session_id.as_str()),
@@ -934,7 +934,7 @@ mod node_manager_tests {
     }
 
     #[tokio::test]
-    async fn test_resume_destroyed_session() {
+    async fn test_resume_stopped_session() {
         let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let resp = nm_ref
@@ -943,11 +943,11 @@ mod node_manager_tests {
             .expect("create");
 
         nm_ref
-            .ask(DestroyRemoteSession {
+            .ask(StopRemoteSessionRuntime {
                 session_id: resp.session_id.clone(),
             })
             .await
-            .expect("destroy");
+            .expect("stop");
 
         let resumed = nm_ref
             .ask(ResumeRemoteSession {
@@ -970,7 +970,7 @@ mod node_manager_tests {
         assert_eq!(sessions[0].session_id, resp.session_id);
     }
 
-    /// Regression test: after destroying and resuming a session, the
+    /// Regression test: after stopping and resuming a session, the
     /// materialized actor's event stream should include previously persisted
     /// events.  This validates that `ResumeRemoteSession` →
     /// `materialize_remote_session` → `GetEventStream` reads from the
@@ -993,13 +993,13 @@ mod node_manager_tests {
             .await
             .expect("persist SessionCreated event");
 
-        // Destroy the live actor so the session is no longer in-memory.
+        // Stop the live actor so the session is no longer in-memory.
         nm_ref
-            .ask(DestroyRemoteSession {
+            .ask(StopRemoteSessionRuntime {
                 session_id: resp.session_id.clone(),
             })
             .await
-            .expect("destroy");
+            .expect("stop");
 
         // Resume — materializes a new actor from SQLite.
         let resumed = nm_ref

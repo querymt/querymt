@@ -1,17 +1,17 @@
 //! Modules D (extended) + G — Session lifecycle integration tests.
 //!
 //! Two logical nodes ("alpha" and "beta") share a single in-process mesh.
-//! Alpha creates, inspects, and destroys sessions on Beta.
+//! Alpha creates, inspects, and stops session runtimes on Beta.
 //!
 //! Module D: additional `RemoteNodeManager` tests (event emission, HOSTNAME
-//! env override, destroy-then-create, create-destroy loop).
+//! env override, stop-then-create, create-stop loop).
 //!
-//! Module G: full two-node lifecycle (create/list/destroy/attach/set-mode).
+//! Module G: full two-node lifecycle (create/list/stop/attach/set-mode).
 
 #[cfg(all(test, feature = "remote"))]
 mod node_manager_extended_tests {
     use crate::agent::remote::node_manager::{
-        CreateRemoteSession, DestroyRemoteSession, GetNodeInfo, ListRemoteSessions,
+        CreateRemoteSession, GetNodeInfo, ListRemoteSessions, StopRemoteSessionRuntime,
     };
     use crate::agent::remote::test_helpers::fixtures::NodeManagerFixture;
     use crate::events::AgentEventKind;
@@ -41,10 +41,10 @@ mod node_manager_extended_tests {
         );
     }
 
-    // ── D.4 — Destroy kills the session actor ─────────────────────────────────
+    // ── D.4 — Stop kills the session actor (runtime only, history persists) ───
 
     #[tokio::test]
-    async fn test_destroy_session_calls_shutdown() {
+    async fn test_stop_session_runtime_shuts_down_actor() {
         let f = NodeManagerFixture::new_with_mesh().await;
 
         let resp = f
@@ -54,11 +54,11 @@ mod node_manager_extended_tests {
             .expect("create");
 
         f.actor_ref
-            .ask(DestroyRemoteSession {
+            .ask(StopRemoteSessionRuntime {
                 session_id: resp.session_id.clone(),
             })
             .await
-            .expect("destroy");
+            .expect("stop");
 
         let sessions = f
             .actor_ref
@@ -67,12 +67,23 @@ mod node_manager_extended_tests {
                 limit: None,
             })
             .await
-            .expect("list after destroy")
+            .expect("list after stop")
             .sessions;
 
-        assert!(
-            sessions.iter().all(|s| s.session_id != resp.session_id),
-            "destroyed session should not appear in list"
+        // The session row persists in SQLite after stopping the runtime.
+        // Verify the session is still listed but no longer has a live actor.
+        let stopped = sessions
+            .iter()
+            .find(|s| s.session_id == resp.session_id)
+            .expect("stopped session should still be listed from SQLite");
+        assert_eq!(
+            stopped.actor_id, 0,
+            "stopped session should have no live actor (actor_id == 0)"
+        );
+        assert_eq!(
+            stopped.runtime_state,
+            Some("persisted".to_string()),
+            "stopped session should have runtime_state 'persisted'"
         );
     }
 
@@ -99,10 +110,10 @@ mod node_manager_extended_tests {
         );
     }
 
-    // ── D.6 — 10 create+destroy cycles leave no registry entries ─────────────
+    // ── D.6 — 10 create+stop cycles leave no live actors ─────────────────────
 
     #[tokio::test]
-    async fn test_create_destroy_create_sequence_no_leak() {
+    async fn test_create_stop_create_sequence_no_runtime_leak() {
         let f = NodeManagerFixture::new_with_mesh().await;
 
         let timeout = std::time::Duration::from_secs(3);
@@ -116,13 +127,13 @@ mod node_manager_extended_tests {
 
             tokio::time::timeout(
                 timeout,
-                f.actor_ref.ask(DestroyRemoteSession {
+                f.actor_ref.ask(StopRemoteSessionRuntime {
                     session_id: resp.session_id,
                 }),
             )
             .await
-            .unwrap_or_else(|_| panic!("destroy timed out at iteration {i}"))
-            .expect("destroy");
+            .unwrap_or_else(|_| panic!("stop timed out at iteration {i}"))
+            .expect("stop");
         }
 
         let sessions = tokio::time::timeout(
@@ -136,10 +147,20 @@ mod node_manager_extended_tests {
         .expect("list timed out")
         .expect("list")
         .sessions;
+
+        // Sessions persist in SQLite but no live actors should remain.
+        assert_eq!(
+            sessions.len(),
+            10,
+            "all 10 sessions should be listed from SQLite"
+        );
         assert!(
-            sessions.is_empty(),
-            "after 10 create+destroy cycles the registry should be empty, got {} sessions",
-            sessions.len()
+            sessions.iter().all(|s| s.actor_id == 0),
+            "all stopped sessions should have actor_id == 0, got actors: {:?}",
+            sessions
+                .iter()
+                .filter(|s| s.actor_id != 0)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -201,8 +222,8 @@ mod remote_session_lifecycle_integration_tests {
     use crate::agent::remote::SessionActorRef;
     use crate::agent::remote::node_manager::SessionHandoff;
     use crate::agent::remote::node_manager::{
-        CreateRemoteSession, DestroyRemoteSession, ForkRemoteSession, GetNodeInfo,
-        ListRemoteSessions,
+        CreateRemoteSession, ForkRemoteSession, GetNodeInfo, ListRemoteSessions,
+        StopRemoteSessionRuntime,
     };
     use crate::agent::remote::test_helpers::fixtures::{TwoNodeFixture, get_test_mesh};
     use crate::agent::session_actor::SessionActor;
@@ -269,7 +290,7 @@ mod remote_session_lifecycle_integration_tests {
 
         let _ = within_timeout("destroy created session", async {
             beta_ref
-                .ask(&DestroyRemoteSession {
+                .ask(&StopRemoteSessionRuntime {
                     session_id: resp.session_id,
                 })
                 .await
@@ -319,7 +340,7 @@ mod remote_session_lifecycle_integration_tests {
 
         let _ = within_timeout("destroy created session", async {
             beta_ref
-                .ask(&DestroyRemoteSession {
+                .ask(&StopRemoteSessionRuntime {
                     session_id: resp.session_id,
                 })
                 .await
@@ -374,17 +395,17 @@ mod remote_session_lifecycle_integration_tests {
         assert!(ids.contains(&r1.session_id.as_str()));
         assert!(ids.contains(&r2.session_id.as_str()));
 
-        let _ = within_timeout("destroy 1", async {
+        let _ = within_timeout("stop 1", async {
             beta_ref
-                .ask(&DestroyRemoteSession {
+                .ask(&StopRemoteSessionRuntime {
                     session_id: r1.session_id,
                 })
                 .await
         })
         .await;
-        let _ = within_timeout("destroy 2", async {
+        let _ = within_timeout("stop 2", async {
             beta_ref
-                .ask(&DestroyRemoteSession {
+                .ask(&StopRemoteSessionRuntime {
                     session_id: r2.session_id,
                 })
                 .await
@@ -476,17 +497,17 @@ mod remote_session_lifecycle_integration_tests {
         .sessions;
         assert!(sessions.iter().any(|s| s.session_id == child.session_id));
 
-        let _ = within_timeout("destroy parent", async {
+        let _ = within_timeout("stop parent", async {
             beta_ref
-                .ask(&DestroyRemoteSession {
+                .ask(&StopRemoteSessionRuntime {
                     session_id: parent.session_id,
                 })
                 .await
         })
         .await;
-        let _ = within_timeout("destroy child", async {
+        let _ = within_timeout("stop child", async {
             beta_ref
-                .ask(&DestroyRemoteSession {
+                .ask(&StopRemoteSessionRuntime {
                     session_id: child.session_id,
                 })
                 .await
@@ -498,7 +519,7 @@ mod remote_session_lifecycle_integration_tests {
     // ── G.4 ──────────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_alpha_destroys_betas_session() {
+    async fn test_alpha_stops_betas_session_runtime() {
         let test_id = Uuid::now_v7().to_string();
         let f = TwoNodeFixture::new(&test_id).await;
         let mesh = get_test_mesh().await;
@@ -517,15 +538,15 @@ mod remote_session_lifecycle_integration_tests {
         .await
         .expect("create");
 
-        within_timeout("destroy", async {
+        within_timeout("stop", async {
             beta_ref
-                .ask(&DestroyRemoteSession {
+                .ask(&StopRemoteSessionRuntime {
                     session_id: resp.session_id.clone(),
                 })
                 .await
         })
         .await
-        .expect("destroy");
+        .expect("stop");
 
         let sessions = within_timeout("list", async {
             beta_ref
@@ -538,9 +559,14 @@ mod remote_session_lifecycle_integration_tests {
         .await
         .expect("list")
         .sessions;
-        assert!(
-            sessions.iter().all(|s| s.session_id != resp.session_id),
-            "destroyed session should be gone from beta's list"
+        // The session row persists in SQLite after stopping the runtime.
+        let stopped = sessions
+            .iter()
+            .find(|s| s.session_id == resp.session_id)
+            .expect("stopped session should still be listed from SQLite");
+        assert_eq!(
+            stopped.actor_id, 0,
+            "stopped session should have no live actor (actor_id == 0)"
         );
         f.cleanup().await;
     }
@@ -591,8 +617,10 @@ mod remote_session_lifecycle_integration_tests {
         assert_eq!(sessions.len(), 3);
 
         for id in ids {
-            let _ = within_timeout("destroy created session", async {
-                beta_ref.ask(&DestroyRemoteSession { session_id: id }).await
+            let _ = within_timeout("stop created session", async {
+                beta_ref
+                    .ask(&StopRemoteSessionRuntime { session_id: id })
+                    .await
             })
             .await;
         }
@@ -642,9 +670,9 @@ mod remote_session_lifecycle_integration_tests {
         assert_eq!(session_ref.node_label(), "beta");
 
         // Keep the shared test mesh clean to reduce cross-test interference.
-        let _ = within_timeout("destroy remote session", async {
+        let _ = within_timeout("stop remote session", async {
             beta_ref
-                .ask(&DestroyRemoteSession {
+                .ask(&StopRemoteSessionRuntime {
                     session_id: resp.session_id,
                 })
                 .await
@@ -703,7 +731,7 @@ mod remote_session_lifecycle_integration_tests {
 
         let _ = within_timeout("destroy created session", async {
             beta_ref
-                .ask(&DestroyRemoteSession {
+                .ask(&StopRemoteSessionRuntime {
                     session_id: resp.session_id,
                 })
                 .await
@@ -800,7 +828,7 @@ mod remote_session_lifecycle_integration_tests {
 
         let _ = within_timeout("destroy created session", async {
             beta_ref
-                .ask(&DestroyRemoteSession {
+                .ask(&StopRemoteSessionRuntime {
                     session_id: resp.session_id,
                 })
                 .await
@@ -850,7 +878,7 @@ mod remote_session_lifecycle_integration_tests {
 
         let _ = within_timeout("destroy created session", async {
             beta_ref
-                .ask(&DestroyRemoteSession {
+                .ask(&StopRemoteSessionRuntime {
                     session_id: resp.session_id,
                 })
                 .await
@@ -925,8 +953,10 @@ mod remote_session_lifecycle_integration_tests {
         );
 
         for id in ids {
-            let _ = within_timeout("destroy created session", async {
-                beta_ref.ask(&DestroyRemoteSession { session_id: id }).await
+            let _ = within_timeout("stop created session", async {
+                beta_ref
+                    .ask(&StopRemoteSessionRuntime { session_id: id })
+                    .await
             })
             .await;
         }

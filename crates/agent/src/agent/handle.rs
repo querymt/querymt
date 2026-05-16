@@ -1495,7 +1495,7 @@ impl LocalAgentHandle {
 
                     let nm_ref = self.find_node_manager(&bookmark.node_id).await?;
                     nm_ref
-                        .ask(&crate::agent::remote::DestroyRemoteSession {
+                        .ask(&crate::agent::remote::StopRemoteSessionRuntime {
                             session_id: session_id.to_string(),
                         })
                         .await
