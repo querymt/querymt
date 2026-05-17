@@ -224,13 +224,15 @@ fn import_symbol(node: &Node, call_node: &Node, source: &str, parent: Option<&st
 }
 
 fn assignment_name_node<'a>(node: &'a Node<'a>) -> Option<Node<'a>> {
-    let list = direct_child_by_kind(node, "variable_list")?;
-    let mut cursor = list.walk();
-    list.named_children(&mut cursor).next()
+    first_child_in_assignment_list(node, "variable_list")
 }
 
 fn assignment_value_node<'a>(node: &'a Node<'a>) -> Option<Node<'a>> {
-    let list = direct_child_by_kind(node, "expression_list")?;
+    first_child_in_assignment_list(node, "expression_list")
+}
+
+fn first_child_in_assignment_list<'a>(node: &'a Node<'a>, list_kind: &str) -> Option<Node<'a>> {
+    let list = direct_child_by_kind(node, list_kind)?;
     let mut cursor = list.walk();
     list.named_children(&mut cursor).next()
 }
@@ -239,9 +241,7 @@ fn variable_name(node: &Node, source: &str) -> String {
     node_text(node, source)
         .trim()
         .replace('[', ".")
-        .replace(']', "")
-        .replace('"', "")
-        .replace('\'', "")
+        .replace([']', '"', '\''], "")
 }
 
 fn display_name_for_kind(raw_name: &str, kind: SymbolKind) -> String {
