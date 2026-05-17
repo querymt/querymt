@@ -615,6 +615,14 @@ fn extension_mapping_includes_elixir() {
 }
 
 #[test]
+fn extension_mapping_includes_nix() {
+    assert_eq!(
+        super::common::get_language_for_extension("nix"),
+        Some("nix")
+    );
+}
+
+#[test]
 fn ruby_exclude_tests_hides_test_functions() {
     let source = r#"
 def run(args)
@@ -637,6 +645,153 @@ end
             .entries
             .iter()
             .any(|e| e.label.contains("def run"))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Nix
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nix_basic_outline() {
+    let source = r#"{ lib, stdenv, pkgs, system }:
+{
+  imports = [ ./hardware.nix <nixpkgs/nixos/modules> ];
+  version = "1.0";
+  system = "x86_64-linux";
+  mkPackage = { pname, ... }: stdenv.mkDerivation { inherit pname; };
+  overlay = final: prev: { };
+  packages.${system}.default = { };
+  devShells = {
+    default = pkgs.mkShell { };
+    nested = x: x;
+  };
+  nixosModules.default = { config, ... }: { };
+}
+"#;
+
+    let sections = index_source(source, "nix", &default_opts()).unwrap();
+
+    let imports = find_section(&sections, "imports").unwrap();
+    assert!(
+        imports
+            .entries
+            .iter()
+            .any(|e| e.label.contains("./hardware.nix"))
+    );
+    assert!(
+        imports
+            .entries
+            .iter()
+            .any(|e| e.label.contains("<nixpkgs/nixos/modules>"))
+    );
+
+    let modules = find_section(&sections, "modules").unwrap();
+    let dev_shells = modules
+        .entries
+        .iter()
+        .find(|e| e.label.contains("devShells = {"))
+        .unwrap();
+    assert!(
+        dev_shells
+            .children
+            .iter()
+            .any(|e| e.label.contains("default = pkgs.mkShell"))
+    );
+    assert!(
+        dev_shells
+            .children
+            .iter()
+            .any(|e| e.label.contains("nested = x: x"))
+    );
+    assert!(
+        modules
+            .entries
+            .iter()
+            .any(|e| e.label.contains("packages.${system}.default = {"))
+    );
+    assert!(
+        modules
+            .entries
+            .iter()
+            .any(|e| e.label.contains("nixosModules.default = { config, ... }:"))
+    );
+
+    let functions = find_section(&sections, "functions").unwrap();
+    assert!(
+        functions
+            .entries
+            .iter()
+            .any(|e| e.label.contains("mkPackage = { pname"))
+    );
+    assert!(
+        functions
+            .entries
+            .iter()
+            .any(|e| e.label.contains("overlay = final: prev"))
+    );
+
+    let constants = find_section(&sections, "constants").unwrap();
+    assert!(
+        constants
+            .entries
+            .iter()
+            .any(|e| e.label.contains("version = \"1.0\""))
+    );
+    assert!(
+        constants
+            .entries
+            .iter()
+            .any(|e| e.label.contains("system = \"x86_64-linux\""))
+    );
+}
+
+#[test]
+fn nix_function_module_outline_includes_let_and_returned_attrset_children() {
+    let source = r#"{ pkgs, ... }:
+{
+  modules.example = { config, lib, ... }:
+    let
+      localValue = 1;
+      makeName = name: "prefix-${name}";
+    in {
+      options.example.enable = lib.mkEnableOption "example";
+      config = lib.mkIf config.example.enable {
+        environment.systemPackages = [ pkgs.hello ];
+      };
+    };
+}
+"#;
+
+    let sections = index_source(source, "nix", &default_opts()).unwrap();
+    let modules = find_section(&sections, "modules").unwrap();
+    let module = modules
+        .entries
+        .iter()
+        .find(|e| e.label.contains("modules.example = { config, lib, ... }:"))
+        .unwrap();
+
+    assert!(
+        module
+            .children
+            .iter()
+            .any(|e| e.label.contains("localValue = 1"))
+    );
+    assert!(
+        module
+            .children
+            .iter()
+            .any(|e| e.label.contains("makeName = name:"))
+    );
+    assert!(module.children.iter().any(|e| {
+        e.label
+            .contains("options.example.enable = lib.mkEnableOption")
+    }));
+    assert!(
+        module
+            .children
+            .iter()
+            .any(|e| e.label.contains("config = lib.mkIf config.example.enable"))
     );
 }
 

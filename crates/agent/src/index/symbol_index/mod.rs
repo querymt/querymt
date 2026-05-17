@@ -526,6 +526,139 @@ end
     }
 
     #[test]
+    fn nix_symbols_include_imports_modules_functions_consts_and_nested_attrs() {
+        let source = r#"{ lib, stdenv, pkgs, system }:
+{
+  imports = [ ./hardware.nix <nixpkgs/nixos/modules> ];
+  version = "1.0";
+  system = "x86_64-linux";
+  mkPackage = { pname, ... }: stdenv.mkDerivation { inherit pname; };
+  overlay = final: prev: { };
+  packages.${system}.default = { };
+  devShells = {
+    default = pkgs.mkShell { };
+    nested = x: x;
+  };
+  nixosModules.default = { config, ... }: { };
+  fromImport = import ./foo.nix;
+  fromBuiltins = builtins.import <bar>;
+}
+"#;
+        let index = SymbolIndex::from_source(source, "nix").unwrap();
+
+        assert_eq!(
+            index
+                .find_by_name("./foo.nix", Some(SymbolKind::Import))
+                .len(),
+            1
+        );
+        assert_eq!(
+            index.find_by_name("<bar>", Some(SymbolKind::Import)).len(),
+            1
+        );
+        assert_eq!(
+            index
+                .find_by_name("./hardware.nix", Some(SymbolKind::Import))
+                .len(),
+            1
+        );
+
+        let mk_package = index.find_by_name("mkPackage", Some(SymbolKind::Function));
+        assert_eq!(mk_package.len(), 1);
+        assert_eq!(mk_package[0].start_line, 6);
+        assert!(mk_package[0].signature.contains("mkPackage = { pname"));
+        assert!(mk_package[0].digest.byte_len > 0);
+
+        let overlay = index.find_by_name("overlay", Some(SymbolKind::Function));
+        assert_eq!(overlay.len(), 1);
+
+        let dev_shells = index.find_by_name("devShells", Some(SymbolKind::Module));
+        assert_eq!(dev_shells.len(), 1);
+        assert!(
+            dev_shells[0]
+                .children
+                .iter()
+                .any(|child| child.name == "default" && child.kind == SymbolKind::Field)
+        );
+        assert!(
+            dev_shells[0]
+                .children
+                .iter()
+                .any(|child| child.qualified_name == "devShells::nested"
+                    && child.kind == SymbolKind::Method)
+        );
+
+        let dynamic = index.find_by_name("packages.$system.default", Some(SymbolKind::Module));
+        assert_eq!(dynamic.len(), 1);
+
+        let nixos_module = index.find_by_name("nixosModules.default", Some(SymbolKind::Module));
+        assert_eq!(nixos_module.len(), 1);
+
+        let version = index.find_by_name("version", Some(SymbolKind::Const));
+        assert_eq!(version.len(), 1);
+        assert_eq!(version[0].start_line, 4);
+    }
+
+    #[test]
+    fn nix_function_module_children_include_let_and_returned_attrset_bindings() {
+        let source = r#"{ pkgs, ... }:
+{
+  modules.example = { config, lib, ... }:
+    let
+      localValue = 1;
+      makeName = name: "prefix-${name}";
+    in {
+      options.example.enable = lib.mkEnableOption "example";
+      config = lib.mkIf config.example.enable {
+        environment.systemPackages = [ pkgs.hello ];
+      };
+    };
+
+  packages.${system}.default = let
+    pname = "demo";
+  in pkgs.stdenv.mkDerivation {
+    inherit pname;
+    version = "1.0";
+  };
+}
+"#;
+        let index = SymbolIndex::from_source(source, "nix").unwrap();
+
+        let module = index.find_by_name("modules.example", Some(SymbolKind::Module));
+        assert_eq!(module.len(), 1);
+        assert!(
+            module[0]
+                .children
+                .iter()
+                .any(|child| child.name == "localValue" && child.kind == SymbolKind::Field)
+        );
+        assert!(
+            module[0]
+                .children
+                .iter()
+                .any(|child| child.name == "makeName" && child.kind == SymbolKind::Method)
+        );
+        assert!(module[0].children.iter().any(|child| {
+            child.name == "options.example.enable" && child.kind == SymbolKind::Field
+        }));
+        assert!(
+            module[0]
+                .children
+                .iter()
+                .any(|child| child.name == "config" && child.kind == SymbolKind::Field)
+        );
+
+        let package = index.find_by_name("packages.$system.default", Some(SymbolKind::Module));
+        assert_eq!(package.len(), 1);
+        assert!(
+            package[0]
+                .children
+                .iter()
+                .any(|child| child.name == "pname" && child.kind == SymbolKind::Field)
+        );
+    }
+
+    #[test]
     fn elixir_symbols_include_modules_functions_macros_imports_and_tests() {
         let source = r#"defmodule MyApp.ConfigTest do
   use ExUnit.Case
