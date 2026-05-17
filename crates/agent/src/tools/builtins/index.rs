@@ -37,7 +37,7 @@ impl ToolTrait for IndexTool {
             tool_type: "function".to_string(),
             function: FunctionTool {
                 name: self.name().to_string(),
-                description: "Produce a compact structural skeleton of a source file with exact line ranges per item. Use this before read_tool to understand file structure and target reads to relevant sections. Returns imports, types, classes, traits, impls, functions, tests, etc. with [start-end] line ranges. Supports Rust, Python, TypeScript, JavaScript, Go, Java, C, C++, C#, Ruby, Elixir, and Nix."
+                description: "Produce a compact structural skeleton of a source file with exact line ranges per item. Use this before read_tool to understand file structure and target reads to relevant sections. Returns imports, types, classes, traits, impls, functions, tests, etc. with [start-end] line ranges. Supports Rust, Python, TypeScript, JavaScript, Go, Java, C, C++, C#, Ruby, Elixir, Nix, and Lua."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -139,7 +139,7 @@ impl ToolTrait for IndexTool {
 
         let sections = index_file(&target, &options).map_err(|e| match e {
             OutlineError::UnsupportedLanguage(ext) => ToolError::InvalidRequest(format!(
-                "Unsupported file extension '.{}'. Supported: rs, py, ts, tsx, js, jsx, go, java, c, h, cpp, hpp, cc, cs, rb, ex, exs, nix",
+                "Unsupported file extension '.{}'. Supported: rs, py, ts, tsx, js, jsx, go, java, c, h, cpp, hpp, cc, cs, rb, ex, exs, nix, lua",
                 ext
             )),
             OutlineError::FileTooLarge { size, limit } => ToolError::InvalidRequest(format!(
@@ -282,6 +282,45 @@ def main():
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Unsupported"));
         assert!(err.contains("ex"));
+        assert!(err.contains("lua"));
+    }
+
+    #[tokio::test]
+    async fn test_index_lua_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let lua_source = r#"
+local json = require("json")
+
+local M = {}
+
+function M.run(opts)
+  return opts
+end
+"#;
+
+        let file_path = temp_dir.path().join("init.lua");
+        fs::write(&file_path, lua_source).unwrap();
+
+        let tool = IndexTool::new();
+        let args = json!({ "path": file_path.to_str().unwrap() });
+        let result = tool.call(args, &context).await.unwrap();
+        let text = first_text(&result);
+
+        assert!(text.contains("language: lua"));
+        assert!(text.contains("imports:"));
+        assert!(text.contains("modules:"));
+        assert!(text.contains("functions:"));
+        assert!(text.contains("function M.run"));
+    }
+
+    #[test]
+    fn test_index_description_mentions_lua() {
+        let tool = IndexTool::new();
+        let definition = tool.definition();
+        assert!(definition.function.description.contains("Lua"));
     }
 
     #[tokio::test]

@@ -1063,6 +1063,147 @@ end
 }
 
 // ---------------------------------------------------------------------------
+// Lua
+// ---------------------------------------------------------------------------
+
+#[test]
+fn extension_mapping_includes_lua() {
+    assert_eq!(
+        super::common::get_language_for_extension("lua"),
+        Some("lua")
+    );
+}
+
+#[test]
+fn lua_basic_outline() {
+    let source = r#"
+local json = require("json")
+require "foo"
+
+local M = {}
+local DEFAULT_TIMEOUT = 30
+
+function run(a, b)
+  return a
+end
+
+local function helper(x)
+  return x
+end
+
+function M.run(x)
+  return x
+end
+
+function M:call(x)
+  return x
+end
+
+M.configure = function(opts)
+  return opts
+end
+
+local local_helper = function(value)
+  return value
+end
+"#;
+
+    let sections = index_source(source, "lua", &default_opts()).unwrap();
+
+    let imports = find_section(&sections, "imports").unwrap();
+    assert!(imports.entries.iter().any(|e| e.label.contains("require")));
+    assert!(imports.entries.iter().any(|e| e.label.contains("json")));
+
+    let modules = find_section(&sections, "modules").unwrap();
+    assert!(modules.entries.iter().any(|e| e.label.contains("M = {}")));
+
+    let functions = find_section(&sections, "functions").unwrap();
+    assert!(
+        functions
+            .entries
+            .iter()
+            .any(|e| e.label.contains("function run"))
+    );
+    assert!(
+        functions
+            .entries
+            .iter()
+            .any(|e| e.label.contains("local function helper"))
+    );
+    assert!(
+        functions
+            .entries
+            .iter()
+            .any(|e| e.label.contains("function M.run"))
+    );
+    assert!(
+        functions
+            .entries
+            .iter()
+            .any(|e| e.label.contains("function M:call"))
+    );
+    assert!(
+        functions
+            .entries
+            .iter()
+            .any(|e| e.label.contains("M.configure = function(opts)"))
+    );
+    assert!(
+        functions
+            .entries
+            .iter()
+            .any(|e| e.label.contains("local_helper = function(value)"))
+    );
+
+    let constants = find_section(&sections, "constants").unwrap();
+    assert!(
+        constants
+            .entries
+            .iter()
+            .any(|e| e.label.contains("DEFAULT_TIMEOUT = 30"))
+    );
+}
+
+#[test]
+fn lua_exclude_tests_hides_busted_and_test_named_functions() {
+    let source = r#"
+function run()
+end
+
+function test_unit()
+end
+
+describe("feature", function()
+  it("works", function()
+  end)
+end)
+"#;
+
+    let sections = index_source(source, "lua", &default_opts()).unwrap();
+    let tests = find_section(&sections, "tests").unwrap();
+    assert!(tests.entries.iter().any(|e| e.label.contains("test_unit")));
+    assert!(tests.entries.iter().any(|e| e.label.contains("describe")));
+
+    let mut opts = default_opts();
+    opts.include_tests = false;
+    let sections = index_source(source, "lua", &opts).unwrap();
+    assert!(find_section(&sections, "tests").is_none());
+    let functions = find_section(&sections, "functions").unwrap();
+    assert!(
+        functions
+            .entries
+            .iter()
+            .any(|e| e.label.contains("function run"))
+    );
+    assert!(
+        functions
+            .entries
+            .iter()
+            .all(|e| !e.label.contains("test_unit"))
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Output formatting
 // ---------------------------------------------------------------------------
 

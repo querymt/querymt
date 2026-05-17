@@ -120,6 +120,7 @@ pub fn get_language_for_extension(ext: &str) -> Option<&'static str> {
         "rb" => Some("ruby"),
         "ex" | "exs" => Some("elixir"),
         "nix" => Some("nix"),
+        "lua" => Some("lua"),
         _ => None,
     }
 }
