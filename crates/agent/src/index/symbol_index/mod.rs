@@ -659,6 +659,138 @@ end
     }
 
     #[test]
+    fn lua_symbols_include_imports_modules_functions_methods_consts_and_tests() {
+        let source = r#"local json = require("json")
+require "foo"
+require("bar")
+
+local M = {}
+local DEFAULT_TIMEOUT = 30
+DEFAULT_LIMIT = 5
+
+function run(a, b)
+  return a
+end
+
+local function helper(x)
+  return x
+end
+
+function M.run(x)
+  return x
+end
+
+function M:call(x)
+  return x
+end
+
+M.configure = function(opts)
+  return opts
+end
+
+local local_helper = function(value)
+  return value
+end
+
+describe("feature", function()
+  it("works", function()
+  end)
+  pending("later", function()
+  end)
+end)
+
+function test_unit()
+end
+
+function integration_test()
+end
+"#;
+        let index = SymbolIndex::from_source(source, "lua").unwrap();
+
+        assert_eq!(
+            index.find_by_name("json", Some(SymbolKind::Import)).len(),
+            1
+        );
+        assert_eq!(index.find_by_name("foo", Some(SymbolKind::Import)).len(), 1);
+        assert_eq!(index.find_by_name("bar", Some(SymbolKind::Import)).len(), 1);
+
+        let module = index.find_by_name("M", Some(SymbolKind::Module));
+        assert_eq!(module.len(), 1);
+        assert_eq!(module[0].start_line, 5);
+
+        assert_eq!(
+            index.find_by_name("run", Some(SymbolKind::Function)).len(),
+            1
+        );
+        assert_eq!(
+            index
+                .find_by_name("helper", Some(SymbolKind::Function))
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .find_by_name("local_helper", Some(SymbolKind::Function))
+                .len(),
+            1
+        );
+        assert_eq!(
+            index.find_by_name("M.run", Some(SymbolKind::Method)).len(),
+            1
+        );
+        assert_eq!(
+            index.find_by_name("M:call", Some(SymbolKind::Method)).len(),
+            1
+        );
+        assert_eq!(
+            index
+                .find_by_name("M.configure", Some(SymbolKind::Method))
+                .len(),
+            1
+        );
+
+        assert_eq!(
+            index
+                .find_by_name("DEFAULT_TIMEOUT", Some(SymbolKind::Const))
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .find_by_name("DEFAULT_LIMIT", Some(SymbolKind::Const))
+                .len(),
+            1
+        );
+
+        let describe = index.find_by_name("feature", Some(SymbolKind::Test));
+        assert_eq!(describe.len(), 1);
+        assert!(
+            describe[0]
+                .children
+                .iter()
+                .any(|child| child.name == "works" && child.kind == SymbolKind::Test)
+        );
+        assert!(
+            describe[0]
+                .children
+                .iter()
+                .any(|child| child.name == "later" && child.kind == SymbolKind::Test)
+        );
+        assert_eq!(
+            index
+                .find_by_name("test_unit", Some(SymbolKind::Test))
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .find_by_name("integration_test", Some(SymbolKind::Test))
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn elixir_symbols_include_modules_functions_macros_imports_and_tests() {
         let source = r#"defmodule MyApp.ConfigTest do
   use ExUnit.Case

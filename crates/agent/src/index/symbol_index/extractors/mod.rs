@@ -3,6 +3,7 @@ pub mod csharp;
 pub mod elixir;
 pub mod go;
 pub mod java;
+pub mod lua;
 pub mod nix;
 pub mod python;
 pub mod ruby;
@@ -27,6 +28,7 @@ pub fn extract_symbols(source: &str, language: &str) -> Result<Vec<SymbolEntry>,
         "elixir" => elixir::extract(source),
         "go" => go::extract(source),
         "java" => java::extract(source),
+        "lua" => lua::extract(source),
         "nix" => nix::extract(source),
         "python" => python::extract(source),
         "ruby" => ruby::extract(source),
