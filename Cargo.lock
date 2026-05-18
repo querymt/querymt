@@ -10955,10 +10955,12 @@ dependencies = [
 name = "qmt-xai"
 version = "0.4.0"
 dependencies = [
+ "base64 0.22.1",
  "either",
  "extism-pdk",
  "futures",
  "http 1.4.0",
+ "qmt-codex",
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",

@@ -327,8 +327,8 @@ impl Default for XaiProvider {
 
 impl XaiProvider {
     const DEFAULT_CLIENT_ID: &'static str = "b1a00492-073a-47ea-816f-4c329264a828";
-    const DEFAULT_AUTH_URL: &'static str = "https://auth.x.ai/oauth/authorize";
-    const DEFAULT_TOKEN_URL: &'static str = "https://auth.x.ai/oauth/token";
+    const DEFAULT_AUTH_URL: &'static str = "https://auth.x.ai/oauth2/authorize";
+    const DEFAULT_TOKEN_URL: &'static str = "https://auth.x.ai/oauth2/token";
     const DEFAULT_REDIRECT_URI: &'static str = "http://127.0.0.1:56121/callback";
     const SCOPE: &'static str = "openid profile email offline_access grok-cli:access api:access";
 
@@ -1134,14 +1134,15 @@ mod tests {
     fn xai_authorization_url_uses_required_parameters() {
         let state = "state-value";
         let nonce = "nonce-value";
-        let challenge = "challenge-value";
+        let verifier = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
+        let challenge = XaiProvider::code_challenge(verifier);
         let url = XaiProvider::build_authorization_url(
-            "https://auth.x.ai/oauth/authorize",
+            XaiProvider::DEFAULT_AUTH_URL,
             XaiProvider::DEFAULT_CLIENT_ID,
             XaiProvider::DEFAULT_REDIRECT_URI,
             state,
             nonce,
-            challenge,
+            verifier,
         )
         .unwrap();
         let parsed = url::Url::parse(&url).unwrap();
@@ -1149,7 +1150,7 @@ mod tests {
 
         assert_eq!(
             parsed.as_str().split('?').next(),
-            Some("https://auth.x.ai/oauth/authorize")
+            Some(XaiProvider::DEFAULT_AUTH_URL)
         );
         assert_eq!(
             params.get("response_type").map(String::as_str),
@@ -1169,7 +1170,7 @@ mod tests {
         );
         assert_eq!(
             params.get("code_challenge").map(String::as_str),
-            Some(challenge)
+            Some(challenge.as_str())
         );
         assert_eq!(
             params.get("code_challenge_method").map(String::as_str),
@@ -1186,7 +1187,7 @@ mod tests {
         let snapshot = XaiFlowSnapshot {
             code_verifier: "verifier".to_string(),
             code_challenge: XaiProvider::code_challenge("verifier"),
-            token_endpoint: "https://auth.x.ai/oauth/token".to_string(),
+            token_endpoint: "https://auth.x.ai/oauth2/token".to_string(),
             redirect_uri: XaiProvider::DEFAULT_REDIRECT_URI.to_string(),
             client_id: XaiProvider::DEFAULT_CLIENT_ID.to_string(),
         };
@@ -1195,7 +1196,7 @@ mod tests {
 
         assert_eq!(decoded.code_verifier, "verifier");
         assert!(!decoded.code_challenge.is_empty());
-        assert_eq!(decoded.token_endpoint, "https://auth.x.ai/oauth/token");
+        assert_eq!(decoded.token_endpoint, "https://auth.x.ai/oauth2/token");
     }
 
     #[test]
@@ -1203,7 +1204,7 @@ mod tests {
         let snapshot = XaiFlowSnapshot {
             code_verifier: "verifier".to_string(),
             code_challenge: "challenge".to_string(),
-            token_endpoint: "https://auth.x.ai/oauth/token".to_string(),
+            token_endpoint: "https://auth.x.ai/oauth2/token".to_string(),
             redirect_uri: XaiProvider::DEFAULT_REDIRECT_URI.to_string(),
             client_id: XaiProvider::DEFAULT_CLIENT_ID.to_string(),
         };
