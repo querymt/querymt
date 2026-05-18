@@ -68,6 +68,10 @@ pub struct Xai {
     #[serde(skip)]
     #[schemars(skip)]
     pub key_resolver: Option<Arc<dyn ApiKeyResolver>>,
+    /// Conversation ID for x-grok-conv-id header (prompt caching).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub conversation_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -179,7 +183,16 @@ impl HTTPChatProvider for Xai {
         tools: Option<&[Tool]>,
     ) -> Result<Request<Vec<u8>>, LLMError> {
         let cfg = self.with_resolved_key();
-        openai_chat_request(&cfg, messages, tools)
+        let mut request = openai_chat_request(&cfg, messages, tools)?;
+        if let Some(ref conv_id) = self.conversation_id {
+            let (mut parts, body) = request.into_parts();
+            parts.headers.insert(
+                http::header::HeaderName::from_static("x-grok-conv-id"),
+                conv_id.parse().unwrap(),
+            );
+            request = Request::from_parts(parts, body);
+        }
+        Ok(request)
     }
 
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
@@ -199,7 +212,16 @@ impl HTTPChatProvider for Xai {
 impl HTTPEmbeddingProvider for Xai {
     fn embed_request(&self, inputs: &[String]) -> Result<Request<Vec<u8>>, LLMError> {
         let cfg = self.with_resolved_key();
-        openai_embed_request(&cfg, inputs)
+        let mut request = openai_embed_request(&cfg, inputs)?;
+        if let Some(ref conv_id) = self.conversation_id {
+            let (mut parts, body) = request.into_parts();
+            parts.headers.insert(
+                http::header::HeaderName::from_static("x-grok-conv-id"),
+                conv_id.parse().unwrap(),
+            );
+            request = Request::from_parts(parts, body);
+        }
+        Ok(request)
     }
 
     fn parse_embed(&self, resp: Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, LLMError> {
@@ -228,12 +250,15 @@ impl HTTPCompletionProvider for Xai {
             .join("fim/completions")
             .map_err(|e| LLMError::HttpError(e.to_string()))?;
 
-        Ok(Request::builder()
+        let mut builder = Request::builder()
             .method(Method::POST)
             .uri(url.to_string())
             .header(AUTHORIZATION, format!("Bearer {}", api_key))
-            .header(CONTENT_TYPE, "application/json")
-            .body(json_body)?)
+            .header(CONTENT_TYPE, "application/json");
+        if let Some(ref conv_id) = self.conversation_id {
+            builder = builder.header("x-grok-conv-id", conv_id);
+        }
+        Ok(builder.body(json_body)?)
     }
 
     fn parse_complete(&self, resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
@@ -286,6 +311,11 @@ impl Xai {
         cfg.api_key = self.resolved_key();
         cfg.key_resolver = None;
         cfg
+    }
+
+    /// Set the conversation ID for x-grok-conv-id header (enables prompt caching).
+    pub fn set_conversation_id(&mut self, id: impl Into<String>) {
+        self.conversation_id = Some(id.into());
     }
 }
 
