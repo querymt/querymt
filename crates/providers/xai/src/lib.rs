@@ -5,16 +5,17 @@ use http::{
 use qmt_openai::{
     AuthType,
     api::{
-        OpenAIProviderConfig, openai_chat_request, openai_embed_request,
+        OpenAIProviderConfig, OpenAIToolUseState, openai_chat_request, openai_embed_request,
         openai_list_models_request, openai_parse_chat, openai_parse_embed,
-        openai_parse_list_models, url_schema,
+        openai_parse_list_models, parse_openai_sse_chunk, url_schema,
     },
 };
 use querymt::{
     HTTPLLMProvider, ToolCall,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatResponse, StructuredOutputFormat, Tool, ToolChoice, http::HTTPChatProvider,
+        ChatMessage, ChatResponse, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
+        http::HTTPChatProvider,
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -25,7 +26,8 @@ use querymt::{
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use url::Url;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
@@ -57,6 +59,11 @@ pub struct Xai {
     pub reasoning_effort: Option<querymt::chat::ReasoningEffort>,
     /// JSON schema for structured output
     pub json_schema: Option<StructuredOutputFormat>,
+    /// Internal buffer for streaming tool state (not serialized)
+    #[serde(skip)]
+    #[schemars(skip)]
+    #[serde(default = "Xai::default_tool_state_buffer")]
+    pub tool_state_buffer: Arc<Mutex<HashMap<usize, OpenAIToolUseState>>>,
     /// Optional resolver for dynamic credential refresh (e.g., OAuth tokens).
     #[serde(skip)]
     #[schemars(skip)]
@@ -178,6 +185,15 @@ impl HTTPChatProvider for Xai {
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         openai_parse_chat(self, response)
     }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn parse_chat_stream_chunk(&self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+        let mut tool_states = self.tool_state_buffer.lock().unwrap();
+        parse_openai_sse_chunk(chunk, &mut tool_states)
+    }
 }
 
 impl HTTPEmbeddingProvider for Xai {
@@ -251,6 +267,10 @@ impl HTTPLLMProvider for Xai {
 impl Xai {
     fn default_base_url() -> Url {
         Url::parse("https://api.x.ai/v1/").unwrap()
+    }
+
+    fn default_tool_state_buffer() -> Arc<Mutex<HashMap<usize, OpenAIToolUseState>>> {
+        Arc::new(Mutex::new(HashMap::new()))
     }
 
     fn resolved_key(&self) -> String {
@@ -352,6 +372,7 @@ mod tests {
             embedding_dimensions: None,
             reasoning_effort: None,
             json_schema: None,
+            tool_state_buffer: Xai::default_tool_state_buffer(),
             key_resolver: None,
         }
     }
