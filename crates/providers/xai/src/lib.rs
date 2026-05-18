@@ -2,12 +2,17 @@ use http::{
     Method, Request, Response,
     header::{AUTHORIZATION, CONTENT_TYPE},
 };
-use qmt_openai::api::{
-    OpenAIProviderConfig, openai_chat_request, openai_embed_request, openai_list_models_request,
-    openai_parse_chat, openai_parse_embed, openai_parse_list_models, url_schema,
+use qmt_openai::{
+    AuthType,
+    api::{
+        OpenAIProviderConfig, openai_chat_request, openai_embed_request,
+        openai_list_models_request, openai_parse_chat, openai_parse_embed,
+        openai_parse_list_models, url_schema,
+    },
 };
 use querymt::{
     HTTPLLMProvider, ToolCall,
+    auth::ApiKeyResolver,
     chat::{
         ChatMessage, ChatResponse, StructuredOutputFormat, Tool, ToolChoice, http::HTTPChatProvider,
     },
@@ -29,7 +34,12 @@ pub struct Xai {
     #[schemars(schema_with = "url_schema")]
     #[serde(default = "Xai::default_base_url")]
     pub base_url: Url,
+    #[serde(default)]
     pub api_key: String,
+    /// Optional: Explicitly specify authentication type.
+    /// xAI API keys and OAuth access tokens are both sent as Bearer tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_type: Option<AuthType>,
     pub model: String,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
@@ -47,6 +57,10 @@ pub struct Xai {
     pub reasoning_effort: Option<querymt::chat::ReasoningEffort>,
     /// JSON schema for structured output
     pub json_schema: Option<StructuredOutputFormat>,
+    /// Optional resolver for dynamic credential refresh (e.g., OAuth tokens).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub key_resolver: Option<Arc<dyn ApiKeyResolver>>,
 }
 
 #[derive(Serialize)]
@@ -84,6 +98,10 @@ struct AssistantMessage {
 impl OpenAIProviderConfig for Xai {
     fn api_key(&self) -> &str {
         &self.api_key
+    }
+
+    fn auth_type(&self) -> Option<&AuthType> {
+        self.auth_type.as_ref()
     }
 
     fn base_url(&self) -> &Url {
@@ -153,7 +171,8 @@ impl HTTPChatProvider for Xai {
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
     ) -> Result<Request<Vec<u8>>, LLMError> {
-        openai_chat_request(self, messages, tools)
+        let cfg = self.with_resolved_key();
+        openai_chat_request(&cfg, messages, tools)
     }
 
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
@@ -163,7 +182,8 @@ impl HTTPChatProvider for Xai {
 
 impl HTTPEmbeddingProvider for Xai {
     fn embed_request(&self, inputs: &[String]) -> Result<Request<Vec<u8>>, LLMError> {
-        openai_embed_request(self, inputs)
+        let cfg = self.with_resolved_key();
+        openai_embed_request(&cfg, inputs)
     }
 
     fn parse_embed(&self, resp: Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, LLMError> {
@@ -173,10 +193,10 @@ impl HTTPEmbeddingProvider for Xai {
 
 impl HTTPCompletionProvider for Xai {
     fn complete_request(&self, req: &CompletionRequest) -> Result<Request<Vec<u8>>, LLMError> {
-        let api_key = match self.api_key().into() {
-            Some(key) => key,
-            None => return Err(LLMError::AuthError("Missing API key".to_string())),
-        };
+        let api_key = self.resolved_key();
+        if api_key.is_empty() {
+            return Err(LLMError::AuthError("Missing xAI auth token".to_string()));
+        }
 
         let body = XaiCompletionRequest {
             model: self.model(),
@@ -218,11 +238,34 @@ impl HTTPLLMProvider for Xai {
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }
+
+    fn key_resolver(&self) -> Option<&Arc<dyn ApiKeyResolver>> {
+        self.key_resolver.as_ref()
+    }
+
+    fn set_key_resolver(&mut self, resolver: Arc<dyn ApiKeyResolver>) {
+        self.key_resolver = Some(resolver);
+    }
 }
 
 impl Xai {
     fn default_base_url() -> Url {
         Url::parse("https://api.x.ai/v1/").unwrap()
+    }
+
+    fn resolved_key(&self) -> String {
+        if let Some(ref resolver) = self.key_resolver {
+            resolver.current()
+        } else {
+            self.api_key.clone()
+        }
+    }
+
+    fn with_resolved_key(&self) -> Self {
+        let mut cfg = self.clone();
+        cfg.api_key = self.resolved_key();
+        cfg.key_resolver = None;
+        cfg
     }
 }
 
@@ -282,5 +325,95 @@ mod extism_exports {
         config = Xai,
         factory = XaiFactory,
         name   = "xai",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use querymt::auth::static_key;
+
+    fn test_xai(api_key: &str) -> Xai {
+        Xai {
+            base_url: Xai::default_base_url(),
+            api_key: api_key.to_string(),
+            auth_type: None,
+            model: "grok-test".to_string(),
+            max_tokens: None,
+            temperature: None,
+            system: Vec::new(),
+            timeout_seconds: None,
+            stream: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            tool_choice: None,
+            embedding_encoding_format: None,
+            embedding_dimensions: None,
+            reasoning_effort: None,
+            json_schema: None,
+            key_resolver: None,
+        }
+    }
+
+    fn auth_header(req: &Request<Vec<u8>>) -> Option<&str> {
+        req.headers()
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+    }
+
+    #[test]
+    fn deserialize_oauth_auth_type_without_api_key() {
+        let cfg = serde_json::json!({
+            "auth_type": "oauth",
+            "model": "grok-test"
+        });
+
+        let xai: Xai = serde_json::from_value(cfg).expect("OAuth config should deserialize");
+        assert_eq!(xai.auth_type, Some(AuthType::OAuth));
+        assert!(xai.api_key.is_empty());
+    }
+
+    #[test]
+    fn deserialize_existing_api_key_config_still_works() {
+        let cfg = serde_json::json!({
+            "api_key": "xai-api-key",
+            "model": "grok-test"
+        });
+
+        let xai: Xai = serde_json::from_value(cfg).expect("API-key config should deserialize");
+        assert_eq!(xai.api_key, "xai-api-key");
+        assert_eq!(xai.auth_type, None);
+    }
+
+    #[test]
+    fn chat_request_uses_resolver_current_token() {
+        let mut xai = test_xai("stale-token");
+        xai.set_key_resolver(static_key("resolver-token"));
+        let messages = vec![ChatMessage::user().text("hello").build()];
+
+        let req = xai
+            .chat_request(&messages, None)
+            .expect("chat request should build");
+
+        assert_eq!(auth_header(&req), Some("Bearer resolver-token"));
+    }
+
+    #[test]
+    fn completion_request_uses_resolver_current_token() {
+        let mut xai = test_xai("stale-token");
+        xai.set_key_resolver(static_key("resolver-token"));
+        let completion = CompletionRequest {
+            prompt: "hello".to_string(),
+            suffix: None,
+            max_tokens: None,
+            temperature: None,
+        };
+
+        let req = xai
+            .complete_request(&completion)
+            .expect("completion request should build");
+
+        assert_eq!(auth_header(&req), Some("Bearer resolver-token"));
     }
 }

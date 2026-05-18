@@ -8,7 +8,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use colored::*;
-use querymt_utils::oauth::{OAuthFlowData, OAuthFlowKind, OAuthProvider, OAuthUI};
+use querymt_utils::oauth::{
+    OAuthFlowData, OAuthFlowKind, OAuthProvider, OAuthUI, openai_callback_server,
+};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -17,7 +20,7 @@ use std::time::Duration;
 /// This implementation:
 /// - Uses colored terminal output for status messages
 /// - Automatically opens the browser for authorization URLs
-/// - Supports Codex callback server for automatic code capture
+/// - Supports redirect callback servers for automatic code capture
 /// - Falls back to manual code entry if callback server fails
 pub struct ConsoleOAuthUI;
 
@@ -84,10 +87,9 @@ impl OAuthUI for ConsoleOAuthUI {
             return Ok(Some((tokens, api_key)));
         }
 
-        // Only use callback server for Codex
-        if provider.name() != "codex" {
+        let Some(port) = provider.callback_port() else {
             return Ok(None);
-        }
+        };
 
         println!(
             "\n{} Please visit this URL to authorize:",
@@ -104,8 +106,6 @@ impl OAuthUI for ConsoleOAuthUI {
             ),
         }
 
-        // Try callback server
-        let port = 1455;
         println!(
             "{} Starting callback server on port {}...",
             "🌐".bright_blue(),
@@ -114,25 +114,12 @@ impl OAuthUI for ConsoleOAuthUI {
         println!("{} Waiting for OAuth callback...", "⏳".bright_cyan());
         println!("   (The browser should redirect automatically after you authorize)\n");
 
-        match querymt_utils::oauth::openai_callback_server(
-            port,
-            &flow.state,
-            &flow.verifier,
-            Duration::from_secs(120),
-        )
-        .await
-        {
+        match oauth_callback_server(provider, port, flow, Duration::from_secs(120)).await {
             Ok((tokens, api_key)) => {
                 println!(
                     "{} Authorization and token exchange complete!",
                     "✓".bright_green()
                 );
-                // Only return API key if provider supports it
-                let api_key = if provider.api_key_name().is_some() {
-                    api_key
-                } else {
-                    None
-                };
                 Ok(Some((tokens, api_key)))
             }
             Err(e) => {
@@ -154,6 +141,106 @@ impl OAuthUI for ConsoleOAuthUI {
     fn error(&self, message: &str) {
         println!("{} {}", "⚠️".bright_yellow(), message);
     }
+}
+
+async fn oauth_callback_server(
+    provider: &dyn OAuthProvider,
+    port: u16,
+    flow: &OAuthFlowData,
+    timeout: Duration,
+) -> Result<(querymt_utils::oauth::TokenSet, Option<String>)> {
+    if provider.name() == "codex" {
+        let (tokens, api_key) =
+            openai_callback_server(port, &flow.state, &flow.verifier, timeout).await?;
+        let api_key = provider.api_key_name().and(api_key);
+        return Ok((tokens, api_key));
+    }
+
+    let code = capture_callback_code(port, &flow.state, timeout).await?;
+    let tokens = provider
+        .exchange_code(&code, &flow.state, &flow.verifier)
+        .await?;
+    let api_key = match provider.api_key_name() {
+        Some(_) => provider
+            .create_api_key(&tokens.access_token)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    Ok((tokens, api_key))
+}
+
+async fn capture_callback_code(
+    port: u16,
+    expected_state: &str,
+    timeout: Duration,
+) -> Result<String> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    let expected_state = expected_state.to_string();
+
+    let callback = async move {
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let mut buf = vec![0_u8; 8192];
+            let n = stream
+                .readable()
+                .await
+                .and_then(|_| stream.try_read(&mut buf))?;
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let Some(request_line) = request.lines().next() else {
+                continue;
+            };
+            let Some(target) = request_line.split_whitespace().nth(1) else {
+                continue;
+            };
+
+            let params = parse_callback_params(target);
+            let success = params.contains_key("code")
+                && params
+                    .get("state")
+                    .is_some_and(|state| state == &expected_state);
+            let body = if success {
+                "<html><head><title>Authorization Successful</title></head><body><h1>Authorization Successful</h1><p>You can close this window.</p></body></html>"
+            } else {
+                "<html><head><title>Authorization Failed</title></head><body><h1>Authorization Failed</h1><p>You can close this window.</p></body></html>"
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .writable()
+                .await
+                .and_then(|_| stream.try_write(response.as_bytes()))?;
+
+            if let Some(error) = params.get("error") {
+                anyhow::bail!("OAuth error: {}", error);
+            }
+            let Some(code) = params.get("code") else {
+                anyhow::bail!("No authorization code received");
+            };
+            let Some(state) = params.get("state") else {
+                anyhow::bail!("No OAuth state received");
+            };
+            if state != &expected_state {
+                anyhow::bail!("State mismatch - possible CSRF attack");
+            }
+            return Ok(code.clone());
+        }
+    };
+
+    tokio::time::timeout(timeout, callback)
+        .await
+        .map_err(|_| anyhow::anyhow!("Timeout waiting for OAuth callback"))?
+}
+
+fn parse_callback_params(target: &str) -> HashMap<String, String> {
+    let query = target.split_once('?').map(|(_, query)| query).unwrap_or("");
+    url::form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect()
 }
 
 /// Prompt user to manually enter the authorization code

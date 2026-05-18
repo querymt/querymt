@@ -148,7 +148,7 @@ const OAUTH_FLOW_TTL_SECS: u64 = 15 * 60;
 const OAUTH_CALLBACK_TIMEOUT_SECS: u64 = 5 * 60;
 
 #[cfg(feature = "oauth")]
-const OAUTH_CALLBACK_BIND_ADDR: &str = "127.0.0.1:1455";
+const OAUTH_CALLBACK_HOST: &str = "127.0.0.1";
 
 // ── OAuthService methods ──────────────────────────────────────────────────────
 
@@ -742,6 +742,16 @@ async fn run_callback_listener_task(
         (flow.state.clone(), flow.verifier.clone())
     };
 
+    let mode = oauth_mode_for_provider(&provider);
+    let callback_port = match crate::auth::get_oauth_provider(&provider, mode) {
+        Ok(oauth_provider) => oauth_provider.callback_port().unwrap_or(1455),
+        Err(err) => {
+            log::warn!("OAuth provider lookup failed for '{}': {}", provider, err);
+            return;
+        }
+    };
+    let callback_bind_addr = format!("{}:{}", OAUTH_CALLBACK_HOST, callback_port);
+
     #[derive(Clone)]
     struct CbHttpState {
         expected_state: String,
@@ -794,17 +804,18 @@ async fn run_callback_listener_task(
     };
 
     let app = Router::new()
+        .route("/", get(cb_handler))
         .route("/auth/callback", get(cb_handler))
         .route("/callback", get(cb_handler))
         .with_state(http_state);
 
-    let tcp_listener = match tokio::net::TcpListener::bind(OAUTH_CALLBACK_BIND_ADDR).await {
+    let tcp_listener = match tokio::net::TcpListener::bind(&callback_bind_addr).await {
         Ok(l) => l,
         Err(err) => {
             log::debug!(
                 "OAuth callback listener for flow '{}' failed to bind {}: {}",
                 flow_id,
-                OAUTH_CALLBACK_BIND_ADDR,
+                callback_bind_addr,
                 err
             );
             return;
@@ -815,7 +826,7 @@ async fn run_callback_listener_task(
         "OAuth callback listener started for flow '{}' (provider='{}') on {}",
         flow_id,
         provider,
-        OAUTH_CALLBACK_BIND_ADDR
+        callback_bind_addr
     );
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
