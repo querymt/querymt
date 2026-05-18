@@ -27,7 +27,6 @@ use crate::secret_store::SecretStore;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use oauth2::basic::BasicClient;
-use oauth2::reqwest;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, PkceCodeVerifier,
     RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
@@ -276,18 +275,6 @@ impl OAuthProvider for CodexProvider {
 /// `XAI_OAUTH_CLIENT_ID` to override it once xAI provides a QueryMT client.
 pub struct XaiProvider;
 
-#[derive(Debug, Clone)]
-struct XaiOidcEndpoints {
-    authorization_endpoint: String,
-    token_endpoint: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct XaiDiscoveryDocument {
-    authorization_endpoint: String,
-    token_endpoint: String,
-}
-
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct XaiFlowSnapshot {
     code_verifier: String,
@@ -299,6 +286,39 @@ struct XaiFlowSnapshot {
 
 type XaiTokenResponse = oauth2::basic::BasicTokenResponse;
 
+/// Structured error type for xAI OAuth operations.
+#[derive(Debug, Clone)]
+pub enum XaiOAuthError {
+    TokenExchangeFailed(String),
+    RefreshFailed {
+        message: String,
+        relogin_required: bool,
+    },
+    StateMismatch,
+    MissingRefreshToken,
+    Internal(String),
+}
+
+impl std::fmt::Display for XaiOAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            XaiOAuthError::TokenExchangeFailed(msg) => {
+                write!(f, "xAI token exchange failed: {}", msg)
+            }
+            XaiOAuthError::RefreshFailed { message, .. } => {
+                write!(f, "xAI token refresh failed: {}", message)
+            }
+            XaiOAuthError::StateMismatch => write!(f, "xAI OAuth state mismatch"),
+            XaiOAuthError::MissingRefreshToken => {
+                write!(f, "xAI token response did not include refresh_token")
+            }
+            XaiOAuthError::Internal(msg) => write!(f, "xAI OAuth error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for XaiOAuthError {}
+
 impl Default for XaiProvider {
     fn default() -> Self {
         Self::new()
@@ -307,70 +327,13 @@ impl Default for XaiProvider {
 
 impl XaiProvider {
     const DEFAULT_CLIENT_ID: &'static str = "b1a00492-073a-47ea-816f-4c329264a828";
-    const DEFAULT_DISCOVERY_URL: &'static str =
-        "https://auth.x.ai/.well-known/openid-configuration";
+    const DEFAULT_AUTH_URL: &'static str = "https://auth.x.ai/oauth/authorize";
+    const DEFAULT_TOKEN_URL: &'static str = "https://auth.x.ai/oauth/token";
     const DEFAULT_REDIRECT_URI: &'static str = "http://127.0.0.1:56121/callback";
     const SCOPE: &'static str = "openid profile email offline_access grok-cli:access api:access";
 
     pub fn new() -> Self {
         Self
-    }
-
-    async fn discover_endpoints() -> Result<XaiOidcEndpoints> {
-        let auth_url = std::env::var("XAI_OAUTH_AUTH_URL").ok();
-        let token_url = std::env::var("XAI_OAUTH_TOKEN_URL").ok();
-        if let (Some(authorization_endpoint), Some(token_endpoint)) =
-            (auth_url.clone(), token_url.clone())
-        {
-            return Ok(XaiOidcEndpoints {
-                authorization_endpoint,
-                token_endpoint,
-            });
-        }
-
-        let discovery: XaiDiscoveryDocument = reqwest::Client::new()
-            .get(Self::DEFAULT_DISCOVERY_URL)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-
-        Self::validate_discovered_endpoint(&discovery.authorization_endpoint)?;
-        Self::validate_discovered_endpoint(&discovery.token_endpoint)?;
-
-        Ok(XaiOidcEndpoints {
-            authorization_endpoint: auth_url.unwrap_or(discovery.authorization_endpoint),
-            token_endpoint: token_url.unwrap_or(discovery.token_endpoint),
-        })
-    }
-
-    fn client_id() -> String {
-        std::env::var("XAI_OAUTH_CLIENT_ID").unwrap_or_else(|_| Self::DEFAULT_CLIENT_ID.to_string())
-    }
-
-    fn redirect_uri() -> String {
-        std::env::var("XAI_OAUTH_REDIRECT_URI")
-            .unwrap_or_else(|_| Self::DEFAULT_REDIRECT_URI.to_string())
-    }
-
-    async fn token_endpoint() -> Result<String> {
-        if let Ok(token_url) = std::env::var("XAI_OAUTH_TOKEN_URL") {
-            return Ok(token_url);
-        }
-        Ok(Self::discover_endpoints().await?.token_endpoint)
-    }
-
-    fn validate_discovered_endpoint(endpoint: &str) -> Result<()> {
-        let url = url::Url::parse(endpoint)?;
-        let host = url.host_str().unwrap_or_default();
-        if url.scheme() != "https" || host != "auth.x.ai" {
-            return Err(anyhow!(
-                "xAI discovery returned unexpected endpoint: {}",
-                endpoint
-            ));
-        }
-        Ok(())
     }
 
     fn generate_random_urlsafe(byte_len: usize) -> Result<String> {
@@ -393,9 +356,25 @@ impl XaiProvider {
         authorization_endpoint: &str,
         token_endpoint: &str,
         client_id: &str,
-    ) -> Result<BasicClient> {
-        let auth_url = AuthUrl::new(authorization_endpoint.to_string())?;
-        let token_url = TokenUrl::new(token_endpoint.to_string())?;
+    ) -> Result<
+        oauth2::basic::BasicClient<
+            oauth2::EndpointSet,
+            oauth2::EndpointNotSet,
+            oauth2::EndpointNotSet,
+            oauth2::EndpointNotSet,
+            oauth2::EndpointSet,
+        >,
+    > {
+        let auth_url = AuthUrl::from_url(
+            authorization_endpoint
+                .parse()
+                .map_err(|_| anyhow!("invalid auth url"))?,
+        );
+        let token_url = TokenUrl::from_url(
+            token_endpoint
+                .parse()
+                .map_err(|_| anyhow!("invalid token url"))?,
+        );
 
         Ok(BasicClient::new(ClientId::new(client_id.to_string()))
             .set_auth_uri(auth_url)
@@ -414,12 +393,15 @@ impl XaiProvider {
         nonce: &str,
         code_challenge: &str,
     ) -> Result<String> {
-        let client = Self::oauth_client(authorization_endpoint, authorization_endpoint, client_id)?
-            .set_redirect_uri(Self::redirect_url(redirect_uri)?);
+        let client =
+            Self::oauth_client(authorization_endpoint, Self::DEFAULT_TOKEN_URL, client_id)?
+                .set_redirect_uri(Self::redirect_url(redirect_uri)?);
         let (authorization_url, oauth_state) = client
             .authorize_url(|| CsrfToken::new(state.to_string()))
             .add_scope(Scope::new(Self::SCOPE.to_string()))
-            .set_pkce_challenge(PkceCodeChallenge::new(code_challenge.to_string()))
+            .set_pkce_challenge(PkceCodeChallenge::from_code_verifier_sha256(
+                &PkceCodeVerifier::new(code_challenge.to_string()),
+            ))
             .add_extra_param("nonce", nonce)
             .add_extra_param("plan", "generic")
             .add_extra_param("referrer", "querymt")
@@ -486,15 +468,14 @@ impl OAuthProvider for XaiProvider {
     }
 
     async fn start_flow(&self) -> Result<OAuthFlowData> {
-        let endpoints = Self::discover_endpoints().await?;
-        let client_id = Self::client_id();
-        let redirect_uri = Self::redirect_uri();
+        let client_id = Self::DEFAULT_CLIENT_ID.to_string();
+        let redirect_uri = Self::DEFAULT_REDIRECT_URI.to_string();
         let state = Self::generate_random_urlsafe(32)?;
         let nonce = Self::generate_random_urlsafe(32)?;
         let code_verifier = PkceCodeVerifier::new(Self::generate_random_urlsafe(32)?);
         let code_challenge = Self::code_challenge(code_verifier.secret());
         let authorization_url = Self::build_authorization_url(
-            &endpoints.authorization_endpoint,
+            Self::DEFAULT_AUTH_URL,
             &client_id,
             &redirect_uri,
             &state,
@@ -504,7 +485,7 @@ impl OAuthProvider for XaiProvider {
         let verifier = serde_json::to_string(&XaiFlowSnapshot {
             code_verifier: code_verifier.secret().to_string(),
             code_challenge,
-            token_endpoint: endpoints.token_endpoint,
+            token_endpoint: Self::DEFAULT_TOKEN_URL.to_string(),
             redirect_uri,
             client_id,
         })?;
@@ -533,21 +514,26 @@ impl OAuthProvider for XaiProvider {
             .add_extra_param("code_challenge_method", "S256")
             .request_async(&http_client)
             .await
-            .map_err(|error| anyhow!("xAI token exchange failed: {}", error))?;
+            .map_err(|error| anyhow!(XaiOAuthError::TokenExchangeFailed(error.to_string())))?;
 
         Self::token_set(response, None)
     }
 
     async fn refresh_token(&self, refresh_token: &str) -> Result<TokenSet> {
-        let token_endpoint = Self::token_endpoint().await?;
-        let client_id = Self::client_id();
+        let token_endpoint = Self::DEFAULT_TOKEN_URL;
+        let client_id = Self::DEFAULT_CLIENT_ID.to_string();
         let http_client = Self::oauth_http_client()?;
-        let client = Self::oauth_client(&token_endpoint, &token_endpoint, &client_id)?;
+        let client = Self::oauth_client(token_endpoint, token_endpoint, &client_id)?;
         let response = client
             .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
             .request_async(&http_client)
             .await
-            .map_err(|error| anyhow!("xAI token refresh failed: {}", error))?;
+            .map_err(|error| {
+                anyhow!(XaiOAuthError::RefreshFailed {
+                    message: error.to_string(),
+                    relogin_required: true,
+                })
+            })?;
 
         Self::token_set(response, Some(refresh_token))
     }
