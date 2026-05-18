@@ -411,6 +411,7 @@ impl XaiProvider {
         Ok(authorization_url.to_string())
     }
 
+    #[cfg(test)]
     fn exchange_form<'a>(code: &'a str, snapshot: &'a XaiFlowSnapshot) -> Vec<(&'a str, &'a str)> {
         vec![
             ("grant_type", "authorization_code"),

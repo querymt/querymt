@@ -15,7 +15,7 @@ use qmt_openai::{
     },
 };
 use querymt::{
-    HTTPLLMProvider, ToolCall,
+    HTTPLLMProvider,
     auth::ApiKeyResolver,
     chat::{
         ChatMessage, ChatResponse, ChatRole, Content, ReasoningEffort, StreamChunk,
@@ -98,21 +98,16 @@ struct XaiCompletionRequest<'a> {
 
 #[derive(Deserialize)]
 struct XaiCompletionResponse {
-    model: String,
     choices: Vec<ChatCompletionChoice>,
 }
 
 #[derive(Deserialize)]
 struct ChatCompletionChoice {
-    index: u32,
     message: AssistantMessage,
-    finish_reason: String,
 }
 
 #[derive(Deserialize)]
 struct AssistantMessage {
-    role: String,
-    tool_calls: Option<Vec<ToolCall>>,
     content: String, //TODO: Either<String, Vec<String>>,
 }
 
@@ -703,6 +698,11 @@ fn xai_model_supports_reasoning_effort(model: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
+fn is_supported_xai_list_model(model: &str) -> bool {
+    let model = model.strip_prefix("x-ai/").unwrap_or(model);
+    model != "grok-imagine" && !model.starts_with("grok-imagine-")
+}
+
 fn xai_responses_chat_request<C: qmt_openai::api::OpenAIProviderConfig>(
     cfg: &C,
     messages: &[ChatMessage],
@@ -781,7 +781,11 @@ impl HTTPLLMProviderFactory for XaiFactory {
     }
 
     fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
-        openai_parse_list_models(&resp)
+        let models = openai_parse_list_models(&resp)?;
+        Ok(models
+            .into_iter()
+            .filter(|model| is_supported_xai_list_model(model))
+            .collect())
     }
 
     fn config_schema(&self) -> String {
@@ -878,6 +882,23 @@ mod tests {
         let xai: Xai = serde_json::from_value(cfg).expect("API-key config should deserialize");
         assert_eq!(xai.api_key, "xai-api-key");
         assert_eq!(xai.auth_type, None);
+    }
+
+    #[test]
+    fn parse_list_models_filters_grok_imagine_models() {
+        let response = Response::builder()
+            .status(200)
+            .body(
+                br#"{"data":[{"id":"grok-4"},{"id":"grok-imagine"},{"id":"grok-imagine-latest"},{"id":"grok-3-mini"}]}"#
+                    .to_vec(),
+            )
+            .expect("response should build");
+
+        let models = XaiFactory
+            .parse_list_models(response)
+            .expect("model parsing should succeed");
+
+        assert_eq!(models, vec!["grok-4", "grok-3-mini"]);
     }
 
     #[test]
