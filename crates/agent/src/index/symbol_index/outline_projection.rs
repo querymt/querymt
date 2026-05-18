@@ -65,6 +65,7 @@ pub fn symbols_to_sections(symbols: &[SymbolEntry], options: &IndexOptions) -> V
                     );
                 } else if symbol.signature.starts_with("module ")
                     || symbol.signature.starts_with("defmodule ")
+                    || is_nix_module_signature(&symbol.signature)
                 {
                     modules.push(symbol_to_entry(symbol, options));
                 } else {
@@ -129,6 +130,10 @@ fn collect_namespace_members(
             _ => {}
         }
     }
+}
+
+fn is_nix_module_signature(signature: &str) -> bool {
+    signature.contains(" = {") || signature.contains(" = rec {") || signature.contains(" = let {")
 }
 
 fn push_section(sections: &mut Vec<Section>, name: &str, entries: Vec<SkeletonEntry>) {

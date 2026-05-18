@@ -119,6 +119,7 @@ pub fn get_language_for_extension(ext: &str) -> Option<&'static str> {
         "cs" => Some("csharp"),
         "rb" => Some("ruby"),
         "ex" | "exs" => Some("elixir"),
+        "nix" => Some("nix"),
         _ => None,
     }
 }
