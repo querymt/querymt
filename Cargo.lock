@@ -11213,6 +11213,7 @@ dependencies = [
  "keyring",
  "kimi-auth",
  "log",
+ "oauth2",
  "openai-auth",
  "opentelemetry",
  "opentelemetry-appender-tracing",

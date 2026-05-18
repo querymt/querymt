@@ -26,6 +26,12 @@
 use crate::secret_store::SecretStore;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use oauth2::basic::BasicClient;
+use oauth2::reqwest;
+use oauth2::{
+    AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, PkceCodeVerifier,
+    RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use crate::OAuthFlowKind;
@@ -291,13 +297,7 @@ struct XaiFlowSnapshot {
     client_id: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct XaiTokenResponse {
-    access_token: Option<String>,
-    refresh_token: Option<String>,
-    expires_in: Option<u64>,
-    expires_at: Option<u64>,
-}
+type XaiTokenResponse = oauth2::basic::BasicTokenResponse;
 
 impl Default for XaiProvider {
     fn default() -> Self {
@@ -345,13 +345,6 @@ impl XaiProvider {
         })
     }
 
-    async fn token_endpoint() -> Result<String> {
-        if let Ok(token_url) = std::env::var("XAI_OAUTH_TOKEN_URL") {
-            return Ok(token_url);
-        }
-        Ok(Self::discover_endpoints().await?.token_endpoint)
-    }
-
     fn client_id() -> String {
         std::env::var("XAI_OAUTH_CLIENT_ID").unwrap_or_else(|_| Self::DEFAULT_CLIENT_ID.to_string())
     }
@@ -359,6 +352,13 @@ impl XaiProvider {
     fn redirect_uri() -> String {
         std::env::var("XAI_OAUTH_REDIRECT_URI")
             .unwrap_or_else(|_| Self::DEFAULT_REDIRECT_URI.to_string())
+    }
+
+    async fn token_endpoint() -> Result<String> {
+        if let Ok(token_url) = std::env::var("XAI_OAUTH_TOKEN_URL") {
+            return Ok(token_url);
+        }
+        Ok(Self::discover_endpoints().await?.token_endpoint)
     }
 
     fn validate_discovered_endpoint(endpoint: &str) -> Result<()> {
@@ -389,6 +389,23 @@ impl XaiProvider {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
     }
 
+    fn oauth_client(
+        authorization_endpoint: &str,
+        token_endpoint: &str,
+        client_id: &str,
+    ) -> Result<BasicClient> {
+        let auth_url = AuthUrl::new(authorization_endpoint.to_string())?;
+        let token_url = TokenUrl::new(token_endpoint.to_string())?;
+
+        Ok(BasicClient::new(ClientId::new(client_id.to_string()))
+            .set_auth_uri(auth_url)
+            .set_token_uri(token_url))
+    }
+
+    fn redirect_url(redirect_uri: &str) -> Result<RedirectUrl> {
+        Ok(RedirectUrl::new(redirect_uri.to_string())?)
+    }
+
     fn build_authorization_url(
         authorization_endpoint: &str,
         client_id: &str,
@@ -397,19 +414,19 @@ impl XaiProvider {
         nonce: &str,
         code_challenge: &str,
     ) -> Result<String> {
-        let mut url = url::Url::parse(authorization_endpoint)?;
-        url.query_pairs_mut()
-            .append_pair("response_type", "code")
-            .append_pair("client_id", client_id)
-            .append_pair("redirect_uri", redirect_uri)
-            .append_pair("scope", Self::SCOPE)
-            .append_pair("code_challenge", code_challenge)
-            .append_pair("code_challenge_method", "S256")
-            .append_pair("state", state)
-            .append_pair("nonce", nonce)
-            .append_pair("plan", "generic")
-            .append_pair("referrer", "querymt");
-        Ok(url.into())
+        let client = Self::oauth_client(authorization_endpoint, authorization_endpoint, client_id)?
+            .set_redirect_uri(Self::redirect_url(redirect_uri)?);
+        let (authorization_url, oauth_state) = client
+            .authorize_url(|| CsrfToken::new(state.to_string()))
+            .add_scope(Scope::new(Self::SCOPE.to_string()))
+            .set_pkce_challenge(PkceCodeChallenge::new(code_challenge.to_string()))
+            .add_extra_param("nonce", nonce)
+            .add_extra_param("plan", "generic")
+            .add_extra_param("referrer", "querymt")
+            .url();
+
+        debug_assert_eq!(oauth_state.secret(), state);
+        Ok(authorization_url.to_string())
     }
 
     fn exchange_form<'a>(code: &'a str, snapshot: &'a XaiFlowSnapshot) -> Vec<(&'a str, &'a str)> {
@@ -424,41 +441,30 @@ impl XaiProvider {
         ]
     }
 
-    fn refresh_form<'a>(client_id: &'a str, refresh_token: &'a str) -> Vec<(&'a str, &'a str)> {
-        vec![
-            ("grant_type", "refresh_token"),
-            ("client_id", client_id),
-            ("refresh_token", refresh_token),
-        ]
-    }
-
-    fn encode_form(form: &[(&str, &str)]) -> String {
-        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-        for (key, value) in form {
-            serializer.append_pair(key, value);
-        }
-        serializer.finish()
-    }
-
     fn token_set(response: XaiTokenResponse, old_refresh_token: Option<&str>) -> Result<TokenSet> {
-        let access_token = response
-            .access_token
-            .ok_or_else(|| anyhow!("xAI token response did not include access_token"))?;
+        let access_token = response.access_token().secret().to_string();
         let refresh_token = response
-            .refresh_token
+            .refresh_token()
+            .map(|token| token.secret().to_string())
             .or_else(|| old_refresh_token.map(str::to_string))
             .ok_or_else(|| anyhow!("xAI token response did not include refresh_token"))?;
-        let expires_at = response.expires_at.or_else(|| {
-            response
-                .expires_in
-                .map(|expires_in| current_epoch_seconds() + expires_in.saturating_sub(120))
-        });
+        let expires_at = response
+            .expires_in()
+            .map(|expires_in| current_epoch_seconds() + expires_in.as_secs().saturating_sub(120))
+            .unwrap_or(0);
 
         Ok(TokenSet {
             access_token,
             refresh_token,
-            expires_at: expires_at.unwrap_or(0),
+            expires_at,
         })
+    }
+
+    fn oauth_http_client() -> Result<oauth2::reqwest::Client> {
+        oauth2::reqwest::ClientBuilder::new()
+            .redirect(oauth2::reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| anyhow!("failed to build xAI OAuth HTTP client: {}", error))
     }
 }
 
@@ -485,8 +491,8 @@ impl OAuthProvider for XaiProvider {
         let redirect_uri = Self::redirect_uri();
         let state = Self::generate_random_urlsafe(32)?;
         let nonce = Self::generate_random_urlsafe(32)?;
-        let code_verifier = Self::generate_random_urlsafe(32)?;
-        let code_challenge = Self::code_challenge(&code_verifier);
+        let code_verifier = PkceCodeVerifier::new(Self::generate_random_urlsafe(32)?);
+        let code_challenge = Self::code_challenge(code_verifier.secret());
         let authorization_url = Self::build_authorization_url(
             &endpoints.authorization_endpoint,
             &client_id,
@@ -496,7 +502,7 @@ impl OAuthProvider for XaiProvider {
             &code_challenge,
         )?;
         let verifier = serde_json::to_string(&XaiFlowSnapshot {
-            code_verifier,
+            code_verifier: code_verifier.secret().to_string(),
             code_challenge,
             token_endpoint: endpoints.token_endpoint,
             redirect_uri,
@@ -513,20 +519,21 @@ impl OAuthProvider for XaiProvider {
     async fn exchange_code(&self, code: &str, _state: &str, verifier: &str) -> Result<TokenSet> {
         let snapshot: XaiFlowSnapshot = serde_json::from_str(verifier)
             .map_err(|e| anyhow!("Invalid xAI OAuth flow data: {}", e))?;
-        let body = Self::encode_form(&Self::exchange_form(code, &snapshot));
-        let response: XaiTokenResponse = reqwest::Client::new()
-            .post(&snapshot.token_endpoint)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
-            )
-            .body(body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let http_client = Self::oauth_http_client()?;
+        let client = Self::oauth_client(
+            &snapshot.token_endpoint,
+            &snapshot.token_endpoint,
+            &snapshot.client_id,
+        )?
+        .set_redirect_uri(Self::redirect_url(&snapshot.redirect_uri)?);
+        let response = client
+            .exchange_code(AuthorizationCode::new(code.to_string()))
+            .set_pkce_verifier(PkceCodeVerifier::new(snapshot.code_verifier.clone()))
+            .add_extra_param("code_challenge", snapshot.code_challenge.clone())
+            .add_extra_param("code_challenge_method", "S256")
+            .request_async(&http_client)
+            .await
+            .map_err(|error| anyhow!("xAI token exchange failed: {}", error))?;
 
         Self::token_set(response, None)
     }
@@ -534,20 +541,13 @@ impl OAuthProvider for XaiProvider {
     async fn refresh_token(&self, refresh_token: &str) -> Result<TokenSet> {
         let token_endpoint = Self::token_endpoint().await?;
         let client_id = Self::client_id();
-        let body = Self::encode_form(&Self::refresh_form(&client_id, refresh_token));
-        let response: XaiTokenResponse = reqwest::Client::new()
-            .post(&token_endpoint)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
-            )
-            .body(body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let http_client = Self::oauth_http_client()?;
+        let client = Self::oauth_client(&token_endpoint, &token_endpoint, &client_id)?;
+        let response = client
+            .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
+            .request_async(&http_client)
+            .await
+            .map_err(|error| anyhow!("xAI token refresh failed: {}", error))?;
 
         Self::token_set(response, Some(refresh_token))
     }
@@ -1240,16 +1240,13 @@ mod tests {
 
     #[test]
     fn xai_refresh_preserves_existing_refresh_token_when_omitted() {
-        let tokens = XaiProvider::token_set(
-            XaiTokenResponse {
-                access_token: Some("access".to_string()),
-                refresh_token: None,
-                expires_in: Some(3600),
-                expires_at: None,
-            },
-            Some("old-refresh"),
-        )
-        .unwrap();
+        let mut response = XaiTokenResponse::new(
+            oauth2::AccessToken::new("access".to_string()),
+            oauth2::basic::BasicTokenType::Bearer,
+            oauth2::EmptyExtraTokenFields {},
+        );
+        response.set_expires_in(Some(&Duration::from_secs(3600)));
+        let tokens = XaiProvider::token_set(response, Some("old-refresh")).unwrap();
 
         assert_eq!(tokens.access_token, "access");
         assert_eq!(tokens.refresh_token, "old-refresh");
