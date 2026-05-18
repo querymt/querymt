@@ -26,7 +26,12 @@
 use crate::secret_store::SecretStore;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use std::time::Duration;
+use oauth2::basic::BasicClient;
+use oauth2::{
+    AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, PkceCodeVerifier,
+    RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
+};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use crate::OAuthFlowKind;
 
@@ -114,6 +119,15 @@ pub trait OAuthProvider: Send + Sync {
     fn flow_kind(&self) -> OAuthFlowKind {
         OAuthFlowKind::RedirectCode
     }
+
+    /// Local loopback callback port for redirect-code flows, if supported.
+    fn callback_port(&self) -> Option<u16> {
+        if self.flow_kind() == OAuthFlowKind::RedirectCode {
+            Some(1455)
+        } else {
+            None
+        }
+    }
 }
 
 /// OAuth flow data returned when starting a flow
@@ -179,6 +193,14 @@ impl OAuthProvider for AnthropicProvider {
     }
 }
 
+fn convert_openai_tokens(tokens: openai_auth::TokenSet) -> TokenSet {
+    TokenSet {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        expires_at: tokens.expires_at,
+    }
+}
+
 /// Codex OAuth provider implementation
 ///
 /// This is intentionally separate from OpenAI so tokens are stored and looked up
@@ -228,21 +250,13 @@ impl OAuthProvider for CodexProvider {
         // Codex backend uses the OAuth access token directly.
         let tokens = self.client.exchange_code(code, verifier).await?;
 
-        Ok(TokenSet {
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token,
-            expires_at: tokens.expires_at,
-        })
+        Ok(convert_openai_tokens(tokens))
     }
 
     async fn refresh_token(&self, refresh_token: &str) -> Result<TokenSet> {
         let tokens = self.client.refresh_token(refresh_token).await?;
 
-        Ok(TokenSet {
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token,
-            expires_at: tokens.expires_at,
-        })
+        Ok(convert_openai_tokens(tokens))
     }
 
     async fn create_api_key(&self, _access_token: &str) -> Result<Option<String>> {
@@ -251,6 +265,290 @@ impl OAuthProvider for CodexProvider {
 
     fn api_key_name(&self) -> Option<&str> {
         None
+    }
+}
+
+/// xAI Grok OAuth provider implementation.
+///
+/// Uses xAI's OIDC discovery and PKCE requirements directly. The default client
+/// ID is the upstream Grok CLI client ID observed in Hermes; set
+/// `XAI_OAUTH_CLIENT_ID` to override it once xAI provides a QueryMT client.
+pub struct XaiProvider;
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct XaiFlowSnapshot {
+    code_verifier: String,
+    code_challenge: String,
+    token_endpoint: String,
+    redirect_uri: String,
+    client_id: String,
+}
+
+type XaiTokenResponse = oauth2::basic::BasicTokenResponse;
+
+/// Structured error type for xAI OAuth operations.
+#[derive(Debug, Clone)]
+pub enum XaiOAuthError {
+    TokenExchangeFailed(String),
+    RefreshFailed {
+        message: String,
+        relogin_required: bool,
+    },
+    StateMismatch,
+    MissingRefreshToken,
+    Internal(String),
+}
+
+impl std::fmt::Display for XaiOAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            XaiOAuthError::TokenExchangeFailed(msg) => {
+                write!(f, "xAI token exchange failed: {}", msg)
+            }
+            XaiOAuthError::RefreshFailed { message, .. } => {
+                write!(f, "xAI token refresh failed: {}", message)
+            }
+            XaiOAuthError::StateMismatch => write!(f, "xAI OAuth state mismatch"),
+            XaiOAuthError::MissingRefreshToken => {
+                write!(f, "xAI token response did not include refresh_token")
+            }
+            XaiOAuthError::Internal(msg) => write!(f, "xAI OAuth error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for XaiOAuthError {}
+
+impl Default for XaiProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl XaiProvider {
+    const DEFAULT_CLIENT_ID: &'static str = "b1a00492-073a-47ea-816f-4c329264a828";
+    const DEFAULT_AUTH_URL: &'static str = "https://auth.x.ai/oauth2/authorize";
+    const DEFAULT_TOKEN_URL: &'static str = "https://auth.x.ai/oauth2/token";
+    const DEFAULT_REDIRECT_URI: &'static str = "http://127.0.0.1:56121/callback";
+    const SCOPE: &'static str = "openid profile email offline_access grok-cli:access api:access";
+
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn generate_random_urlsafe(byte_len: usize) -> Result<String> {
+        use base64::Engine as _;
+
+        let mut bytes = vec![0u8; byte_len];
+        getrandom::getrandom(&mut bytes)?;
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+    }
+
+    fn code_challenge(verifier: &str) -> String {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+
+        let digest = Sha256::digest(verifier.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+    }
+
+    fn oauth_client(
+        authorization_endpoint: &str,
+        token_endpoint: &str,
+        client_id: &str,
+    ) -> Result<
+        oauth2::basic::BasicClient<
+            oauth2::EndpointSet,
+            oauth2::EndpointNotSet,
+            oauth2::EndpointNotSet,
+            oauth2::EndpointNotSet,
+            oauth2::EndpointSet,
+        >,
+    > {
+        let auth_url = AuthUrl::from_url(
+            authorization_endpoint
+                .parse()
+                .map_err(|_| anyhow!("invalid auth url"))?,
+        );
+        let token_url = TokenUrl::from_url(
+            token_endpoint
+                .parse()
+                .map_err(|_| anyhow!("invalid token url"))?,
+        );
+
+        Ok(BasicClient::new(ClientId::new(client_id.to_string()))
+            .set_auth_uri(auth_url)
+            .set_token_uri(token_url))
+    }
+
+    fn redirect_url(redirect_uri: &str) -> Result<RedirectUrl> {
+        Ok(RedirectUrl::new(redirect_uri.to_string())?)
+    }
+
+    fn build_authorization_url(
+        authorization_endpoint: &str,
+        client_id: &str,
+        redirect_uri: &str,
+        state: &str,
+        nonce: &str,
+        code_challenge: &str,
+    ) -> Result<String> {
+        let client =
+            Self::oauth_client(authorization_endpoint, Self::DEFAULT_TOKEN_URL, client_id)?
+                .set_redirect_uri(Self::redirect_url(redirect_uri)?);
+        let (authorization_url, oauth_state) = client
+            .authorize_url(|| CsrfToken::new(state.to_string()))
+            .add_scope(Scope::new(Self::SCOPE.to_string()))
+            .set_pkce_challenge(PkceCodeChallenge::from_code_verifier_sha256(
+                &PkceCodeVerifier::new(code_challenge.to_string()),
+            ))
+            .add_extra_param("nonce", nonce)
+            .add_extra_param("plan", "generic")
+            .add_extra_param("referrer", "querymt")
+            .url();
+
+        debug_assert_eq!(oauth_state.secret(), state);
+        Ok(authorization_url.to_string())
+    }
+
+    #[cfg(test)]
+    fn exchange_form<'a>(code: &'a str, snapshot: &'a XaiFlowSnapshot) -> Vec<(&'a str, &'a str)> {
+        vec![
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", snapshot.redirect_uri.as_str()),
+            ("client_id", snapshot.client_id.as_str()),
+            ("code_verifier", snapshot.code_verifier.as_str()),
+            ("code_challenge", snapshot.code_challenge.as_str()),
+            ("code_challenge_method", "S256"),
+        ]
+    }
+
+    fn token_set(response: XaiTokenResponse, old_refresh_token: Option<&str>) -> Result<TokenSet> {
+        let access_token = response.access_token().secret().to_string();
+        let refresh_token = response
+            .refresh_token()
+            .map(|token| token.secret().to_string())
+            .or_else(|| old_refresh_token.map(str::to_string))
+            .ok_or_else(|| anyhow!("xAI token response did not include refresh_token"))?;
+        let expires_at = response
+            .expires_in()
+            .map(|expires_in| current_epoch_seconds() + expires_in.as_secs().saturating_sub(120))
+            .unwrap_or(0);
+
+        Ok(TokenSet {
+            access_token,
+            refresh_token,
+            expires_at,
+        })
+    }
+
+    fn oauth_http_client() -> Result<oauth2::reqwest::Client> {
+        oauth2::reqwest::ClientBuilder::new()
+            .redirect(oauth2::reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| anyhow!("failed to build xAI OAuth HTTP client: {}", error))
+    }
+}
+
+fn current_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+#[async_trait]
+impl OAuthProvider for XaiProvider {
+    fn name(&self) -> &str {
+        "xai"
+    }
+
+    fn display_name(&self) -> &str {
+        "xAI Grok"
+    }
+
+    async fn start_flow(&self) -> Result<OAuthFlowData> {
+        let client_id = Self::DEFAULT_CLIENT_ID.to_string();
+        let redirect_uri = Self::DEFAULT_REDIRECT_URI.to_string();
+        let state = Self::generate_random_urlsafe(32)?;
+        let nonce = Self::generate_random_urlsafe(32)?;
+        let code_verifier = PkceCodeVerifier::new(Self::generate_random_urlsafe(32)?);
+        let code_challenge = Self::code_challenge(code_verifier.secret());
+        let authorization_url = Self::build_authorization_url(
+            Self::DEFAULT_AUTH_URL,
+            &client_id,
+            &redirect_uri,
+            &state,
+            &nonce,
+            &code_challenge,
+        )?;
+        let verifier = serde_json::to_string(&XaiFlowSnapshot {
+            code_verifier: code_verifier.secret().to_string(),
+            code_challenge,
+            token_endpoint: Self::DEFAULT_TOKEN_URL.to_string(),
+            redirect_uri,
+            client_id,
+        })?;
+
+        Ok(OAuthFlowData {
+            authorization_url,
+            state,
+            verifier,
+        })
+    }
+
+    async fn exchange_code(&self, code: &str, _state: &str, verifier: &str) -> Result<TokenSet> {
+        let snapshot: XaiFlowSnapshot = serde_json::from_str(verifier)
+            .map_err(|e| anyhow!("Invalid xAI OAuth flow data: {}", e))?;
+        let http_client = Self::oauth_http_client()?;
+        let client = Self::oauth_client(
+            &snapshot.token_endpoint,
+            &snapshot.token_endpoint,
+            &snapshot.client_id,
+        )?
+        .set_redirect_uri(Self::redirect_url(&snapshot.redirect_uri)?);
+        let response = client
+            .exchange_code(AuthorizationCode::new(code.to_string()))
+            .set_pkce_verifier(PkceCodeVerifier::new(snapshot.code_verifier.clone()))
+            .add_extra_param("code_challenge", snapshot.code_challenge.clone())
+            .add_extra_param("code_challenge_method", "S256")
+            .request_async(&http_client)
+            .await
+            .map_err(|error| anyhow!(XaiOAuthError::TokenExchangeFailed(error.to_string())))?;
+
+        Self::token_set(response, None)
+    }
+
+    async fn refresh_token(&self, refresh_token: &str) -> Result<TokenSet> {
+        let token_endpoint = Self::DEFAULT_TOKEN_URL;
+        let client_id = Self::DEFAULT_CLIENT_ID.to_string();
+        let http_client = Self::oauth_http_client()?;
+        let client = Self::oauth_client(token_endpoint, token_endpoint, &client_id)?;
+        let response = client
+            .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
+            .request_async(&http_client)
+            .await
+            .map_err(|error| {
+                anyhow!(XaiOAuthError::RefreshFailed {
+                    message: error.to_string(),
+                    relogin_required: true,
+                })
+            })?;
+
+        Self::token_set(response, Some(refresh_token))
+    }
+
+    async fn create_api_key(&self, _access_token: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn api_key_name(&self) -> Option<&str> {
+        Some("XAI_API_KEY")
+    }
+
+    fn callback_port(&self) -> Option<u16> {
+        Some(56121)
     }
 }
 
@@ -371,6 +669,7 @@ pub fn get_oauth_provider(
             Ok(Box::new(AnthropicProvider::new(oauth_mode)))
         }
         "codex" => Ok(Box::new(CodexProvider::new())),
+        "xai" => Ok(Box::new(XaiProvider::new())),
         "kimi-code" => Ok(Box::new(KimiCodeProvider::new())),
         _ => Err(anyhow!(
             "OAuth is not supported for provider '{}'",
@@ -549,6 +848,7 @@ pub async fn show_auth_status(
         vec![
             "anthropic".to_string(),
             "codex".to_string(),
+            "xai".to_string(),
             "kimi-code".to_string(),
         ]
     };
@@ -796,11 +1096,18 @@ mod tests {
     fn provider_flow_kinds() {
         let anthropic = AnthropicProvider::new(OAuthMode::Max);
         assert_eq!(anthropic.flow_kind(), OAuthFlowKind::RedirectCode);
+        assert_eq!(anthropic.callback_port(), Some(1455));
         assert_eq!(anthropic.name(), "anthropic");
 
         let codex = CodexProvider::new();
         assert_eq!(codex.flow_kind(), OAuthFlowKind::RedirectCode);
+        assert_eq!(codex.callback_port(), Some(1455));
         assert_eq!(codex.name(), "codex");
+
+        let xai = XaiProvider::new();
+        assert_eq!(xai.flow_kind(), OAuthFlowKind::RedirectCode);
+        assert_eq!(xai.callback_port(), Some(56121));
+        assert_eq!(xai.name(), "xai");
 
         let kimi = KimiCodeProvider::new();
         assert_eq!(kimi.flow_kind(), OAuthFlowKind::DevicePoll);
@@ -814,9 +1121,124 @@ mod tests {
 
         let codex = get_oauth_provider("codex", None).unwrap();
         assert_eq!(codex.flow_kind(), OAuthFlowKind::RedirectCode);
+        assert_eq!(codex.callback_port(), Some(1455));
+
+        let xai = get_oauth_provider("xai", None).unwrap();
+        assert_eq!(xai.flow_kind(), OAuthFlowKind::RedirectCode);
+        assert_eq!(xai.callback_port(), Some(56121));
 
         let kimi = get_oauth_provider("kimi-code", None).unwrap();
         assert_eq!(kimi.flow_kind(), OAuthFlowKind::DevicePoll);
+    }
+
+    #[test]
+    fn xai_authorization_url_uses_required_parameters() {
+        let state = "state-value";
+        let nonce = "nonce-value";
+        let verifier = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
+        let challenge = XaiProvider::code_challenge(verifier);
+        let url = XaiProvider::build_authorization_url(
+            XaiProvider::DEFAULT_AUTH_URL,
+            XaiProvider::DEFAULT_CLIENT_ID,
+            XaiProvider::DEFAULT_REDIRECT_URI,
+            state,
+            nonce,
+            verifier,
+        )
+        .unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        let params: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+
+        assert_eq!(
+            parsed.as_str().split('?').next(),
+            Some(XaiProvider::DEFAULT_AUTH_URL)
+        );
+        assert_eq!(
+            params.get("response_type").map(String::as_str),
+            Some("code")
+        );
+        assert_eq!(
+            params.get("client_id").map(String::as_str),
+            Some(XaiProvider::DEFAULT_CLIENT_ID)
+        );
+        assert_eq!(
+            params.get("scope").map(String::as_str),
+            Some(XaiProvider::SCOPE)
+        );
+        assert_eq!(
+            params.get("redirect_uri").map(String::as_str),
+            Some("http://127.0.0.1:56121/callback")
+        );
+        assert_eq!(
+            params.get("code_challenge").map(String::as_str),
+            Some(challenge.as_str())
+        );
+        assert_eq!(
+            params.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(params.get("state").map(String::as_str), Some(state));
+        assert_eq!(params.get("nonce").map(String::as_str), Some(nonce));
+        assert_eq!(params.get("plan").map(String::as_str), Some("generic"));
+        assert_eq!(params.get("referrer").map(String::as_str), Some("querymt"));
+    }
+
+    #[test]
+    fn xai_verifier_snapshot_carries_pkce_and_token_endpoint() {
+        let snapshot = XaiFlowSnapshot {
+            code_verifier: "verifier".to_string(),
+            code_challenge: XaiProvider::code_challenge("verifier"),
+            token_endpoint: "https://auth.x.ai/oauth2/token".to_string(),
+            redirect_uri: XaiProvider::DEFAULT_REDIRECT_URI.to_string(),
+            client_id: XaiProvider::DEFAULT_CLIENT_ID.to_string(),
+        };
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        let decoded: XaiFlowSnapshot = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded.code_verifier, "verifier");
+        assert!(!decoded.code_challenge.is_empty());
+        assert_eq!(decoded.token_endpoint, "https://auth.x.ai/oauth2/token");
+    }
+
+    #[test]
+    fn xai_exchange_form_echoes_pkce_challenge() {
+        let snapshot = XaiFlowSnapshot {
+            code_verifier: "verifier".to_string(),
+            code_challenge: "challenge".to_string(),
+            token_endpoint: "https://auth.x.ai/oauth2/token".to_string(),
+            redirect_uri: XaiProvider::DEFAULT_REDIRECT_URI.to_string(),
+            client_id: XaiProvider::DEFAULT_CLIENT_ID.to_string(),
+        };
+        let form: std::collections::HashMap<_, _> =
+            XaiProvider::exchange_form("auth-code", &snapshot)
+                .into_iter()
+                .collect();
+
+        assert_eq!(form.get("grant_type"), Some(&"authorization_code"));
+        assert_eq!(form.get("code"), Some(&"auth-code"));
+        assert_eq!(form.get("client_id"), Some(&XaiProvider::DEFAULT_CLIENT_ID));
+        assert_eq!(
+            form.get("redirect_uri"),
+            Some(&XaiProvider::DEFAULT_REDIRECT_URI)
+        );
+        assert_eq!(form.get("code_verifier"), Some(&"verifier"));
+        assert_eq!(form.get("code_challenge"), Some(&"challenge"));
+        assert_eq!(form.get("code_challenge_method"), Some(&"S256"));
+    }
+
+    #[test]
+    fn xai_refresh_preserves_existing_refresh_token_when_omitted() {
+        let mut response = XaiTokenResponse::new(
+            oauth2::AccessToken::new("access".to_string()),
+            oauth2::basic::BasicTokenType::Bearer,
+            oauth2::EmptyExtraTokenFields {},
+        );
+        response.set_expires_in(Some(&Duration::from_secs(3600)));
+        let tokens = XaiProvider::token_set(response, Some("old-refresh")).unwrap();
+
+        assert_eq!(tokens.access_token, "access");
+        assert_eq!(tokens.refresh_token, "old-refresh");
+        assert!(tokens.expires_at > current_epoch_seconds());
     }
 
     #[test]

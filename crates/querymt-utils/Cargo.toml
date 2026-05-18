@@ -9,7 +9,7 @@ description = "Shared utilities for querymt workspace"
 default = []
 serde = ["dep:serde"]
 secret-store = ["dep:keyring", "dep:serde_json"]
-oauth = ["secret-store", "serde", "dep:anthropic-auth", "dep:openai-auth", "dep:kimi-auth", "dep:async-trait", "dep:anyhow", "dep:url", "dep:tokio"]
+oauth = ["secret-store", "serde", "dep:anthropic-auth", "dep:openai-auth", "dep:kimi-auth", "dep:async-trait", "dep:anyhow", "dep:url", "dep:tokio", "dep:reqwest", "dep:base64", "dep:sha2", "dep:getrandom"]
 providers = ["dep:reqwest", "dep:dirs", "dep:anyhow"]
 dbus-secret-service = ["keyring/sync-secret-service"]
 
@@ -39,4 +39,8 @@ anyhow = { version = "1.0", optional = true }
 url = { workspace = true, optional = true }
 tokio = { version = "1.0", features = ["time"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
+base64 = { workspace = true, optional = true }
+sha2 = { version = "0.10", optional = true }
+getrandom = { version = "0.2", optional = true }
 dirs = { workspace = true, optional = true }
+oauth2 = { version = "5.0", default-features = false, features = ["reqwest", "rustls-tls"] }
