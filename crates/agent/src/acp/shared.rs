@@ -436,6 +436,15 @@ pub async fn handle_rpc_message<S: SendAgent>(
                 Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
             }
         },
+        m if m == AGENT_METHOD_NAMES.session_delete => match serde_json::from_value(req.params) {
+            Ok(params) => agent
+                .delete_session(params)
+                .await
+                .map(|r| serde_json::to_value(r).unwrap()),
+            Err(e) => {
+                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+            }
+        },
         m if m == AGENT_METHOD_NAMES.session_set_config_option => {
             match serde_json::from_value(req.params) {
                 Ok(params) => agent
@@ -914,6 +923,12 @@ mod tests {
             ) -> Result<agent_client_protocol::schema::CloseSessionResponse, Error> {
                 Ok(agent_client_protocol::schema::CloseSessionResponse::new())
             }
+            async fn delete_session(
+                &self,
+                _: agent_client_protocol::schema::DeleteSessionRequest,
+            ) -> Result<agent_client_protocol::schema::DeleteSessionResponse, Error> {
+                Ok(agent_client_protocol::schema::DeleteSessionResponse::new())
+            }
             async fn set_session_model(
                 &self,
                 _: agent_client_protocol::schema::SetSessionModelRequest,
@@ -1034,6 +1049,12 @@ mod tests {
                 &self,
                 _: agent_client_protocol::schema::CloseSessionRequest,
             ) -> Result<agent_client_protocol::schema::CloseSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn delete_session(
+                &self,
+                _: agent_client_protocol::schema::DeleteSessionRequest,
+            ) -> Result<agent_client_protocol::schema::DeleteSessionResponse, Error> {
                 unreachable!()
             }
             async fn set_session_model(

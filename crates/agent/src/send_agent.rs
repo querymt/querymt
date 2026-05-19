@@ -20,12 +20,13 @@
 /// - `cancel`: Cancellation support
 use agent_client_protocol::schema::{
     AuthenticateRequest, AuthenticateResponse, CancelNotification, CloseSessionRequest,
-    CloseSessionResponse, Error, ExtNotification, ExtRequest, ExtResponse, ForkSessionRequest,
-    ForkSessionResponse, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
+    CloseSessionResponse, DeleteSessionRequest, DeleteSessionResponse, Error, ExtNotification,
+    ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    ResumeSessionRequest, ResumeSessionResponse, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
+    SetSessionModelRequest, SetSessionModelResponse,
 };
 use async_trait::async_trait;
 use std::any::Any;
@@ -98,6 +99,12 @@ pub trait SendAgent: Send + Sync + Any {
 
     /// Close an active session and release associated runtime resources.
     async fn close_session(&self, req: CloseSessionRequest) -> Result<CloseSessionResponse, Error>;
+
+    /// Delete a session, stopping it if running and removing persisted history.
+    async fn delete_session(
+        &self,
+        req: DeleteSessionRequest,
+    ) -> Result<DeleteSessionResponse, Error>;
 
     /// Change the LLM model for a session.
     ///

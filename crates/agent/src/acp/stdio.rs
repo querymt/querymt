@@ -41,10 +41,10 @@ use crate::event_fanout::EventFanout;
 use crate::send_agent::SendAgent;
 use agent_client_protocol::schema::{
     AgentRequest, AuthenticateRequest, CancelNotification, ClientNotification, ClientRequest,
-    CloseSessionRequest, ExtRequest, ForkSessionRequest, InitializeRequest, ListSessionsRequest,
-    LoadSessionRequest, NewSessionRequest, PromptRequest, ResumeSessionRequest, SessionId,
-    SessionNotification, SetSessionConfigOptionRequest, SetSessionModeRequest,
-    SetSessionModelRequest,
+    CloseSessionRequest, DeleteSessionRequest, ExtRequest, ForkSessionRequest, InitializeRequest,
+    ListSessionsRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
+    ResumeSessionRequest, SessionId, SessionNotification, SetSessionConfigOptionRequest,
+    SetSessionModeRequest, SetSessionModelRequest,
 };
 use agent_client_protocol::{self as acp, ByteStreams, ConnectionTo};
 use std::sync::Arc;
@@ -422,6 +422,15 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
                 let agent = agent.clone();
                 async move |req: CloseSessionRequest, responder, _cx| {
                     responder.respond_with_result(agent.close_session(req).await)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let agent = agent.clone();
+                async move |req: DeleteSessionRequest, responder, _cx| {
+                    responder.respond_with_result(agent.delete_session(req).await)
                 }
             },
             acp::on_receive_request!(),

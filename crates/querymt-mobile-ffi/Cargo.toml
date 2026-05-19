@@ -32,8 +32,8 @@ querymt-agent = { path = "../agent", default-features = false }
 querymt-utils = { path = "../querymt-utils", features = ["providers", "serde", "secret-store"] }
 
 # Agent client protocol for session/prompt types
-agent-client-protocol = { version = "0.11", features = ["unstable"] }
-agent-client-protocol-schema = { version = "0.12", features = ["unstable"]}
+agent-client-protocol = { version = "0.12", features = ["unstable"] }
+agent-client-protocol-schema = { version = "0.13", features = ["unstable"]}
 
 # Provider crates for static registration
 qmt-anthropic = { path = "../providers/anthropic", optional = true, default-features = false, features = ["api"] }

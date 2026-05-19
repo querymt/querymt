@@ -21,11 +21,11 @@ use crate::session::store::LLMConfig;
 use crate::tools::ToolRegistry;
 use agent_client_protocol::schema::{
     AuthenticateRequest, AuthenticateResponse, CancelNotification, CloseSessionRequest,
-    CloseSessionResponse, Error, ExtNotification, ExtRequest, ExtResponse, ForkSessionRequest,
-    ForkSessionResponse, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
-    SetSessionModelRequest, SetSessionModelResponse,
+    CloseSessionResponse, DeleteSessionRequest, DeleteSessionResponse, Error, ExtNotification,
+    ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    ResumeSessionRequest, ResumeSessionResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
 use anyhow::Result;
 use arc_swap::ArcSwap;
@@ -1802,7 +1802,8 @@ impl SendAgent for LocalAgentHandle {
         use agent_client_protocol::schema::{
             AgentCapabilities, Implementation, McpCapabilities, PromptCapabilities,
             ProtocolVersion, SessionCapabilities, SessionCloseCapabilities,
-            SessionForkCapabilities, SessionListCapabilities, SessionResumeCapabilities,
+            SessionDeleteCapabilities, SessionForkCapabilities, SessionListCapabilities,
+            SessionResumeCapabilities,
         };
 
         let protocol_version = if req.protocol_version <= ProtocolVersion::LATEST {
@@ -1831,7 +1832,8 @@ impl SendAgent for LocalAgentHandle {
                     .list(SessionListCapabilities::new())
                     .fork(SessionForkCapabilities::new())
                     .resume(SessionResumeCapabilities::new())
-                    .close(SessionCloseCapabilities::new()),
+                    .close(SessionCloseCapabilities::new())
+                    .delete(SessionDeleteCapabilities::new()),
             );
 
         // Add delegation metadata if agent registry is available
@@ -1943,6 +1945,34 @@ impl SendAgent for LocalAgentHandle {
         let session_id = req.session_id.to_string();
         self.stop_session(&session_id).await?;
         Ok(CloseSessionResponse::new())
+    }
+
+    #[tracing::instrument(name = "acp.delete_session", skip_all, fields(session_id = %req.session_id))]
+    async fn delete_session(
+        &self,
+        req: DeleteSessionRequest,
+    ) -> Result<DeleteSessionResponse, Error> {
+        let session_id = req.session_id.to_string();
+
+        let is_loaded = {
+            let registry = self.registry.lock().await;
+            registry.get(&session_id).is_some()
+        };
+        if is_loaded {
+            // Closing is best-effort: deleting persisted history is the primary intent.
+            let _ = self.stop_session(&session_id).await;
+        }
+
+        self.config
+            .provider
+            .history_store()
+            .delete_session(&session_id)
+            .await
+            .map_err(|e| {
+                Error::internal_error().data(serde_json::json!({"error": e.to_string()}))
+            })?;
+
+        Ok(DeleteSessionResponse::new())
     }
 
     #[tracing::instrument(name = "acp.set_session_model", skip_all, fields(session_id = %req.session_id))]
@@ -2320,39 +2350,6 @@ impl SendAgent for LocalAgentHandle {
                 })?;
                 let result = self.oauth_service.logout("acp", &parsed.provider).await;
                 ext_json_response(&result)
-            }
-
-            "querymt/session/delete" => {
-                #[derive(serde::Deserialize)]
-                #[serde(rename_all = "camelCase")]
-                struct DeleteSessionReq {
-                    session_id: String,
-                }
-
-                let parsed: DeleteSessionReq =
-                    serde_json::from_str(req.params.get()).map_err(|e| {
-                        Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
-                    })?;
-
-                let is_loaded = {
-                    let registry = self.registry.lock().await;
-                    registry.get(&parsed.session_id).is_some()
-                };
-                if is_loaded {
-                    // Closing is best-effort: deleting persisted history is the primary intent.
-                    let _ = self.stop_session(&parsed.session_id).await;
-                }
-
-                self.config
-                    .provider
-                    .history_store()
-                    .delete_session(&parsed.session_id)
-                    .await
-                    .map_err(|e| {
-                        Error::internal_error().data(serde_json::json!({"error": e.to_string()}))
-                    })?;
-
-                ext_json_response(&serde_json::json!({"success": true}))
             }
 
             // ── querymt/mesh extensions ────────────────────────────────
@@ -2860,8 +2857,8 @@ mod tests {
         mock_plugin_registry, mock_session,
     };
     use agent_client_protocol::schema::{
-        CancelNotification, CloseSessionRequest, InitializeRequest, ListSessionsRequest,
-        ProtocolVersion, SessionId,
+        CancelNotification, CloseSessionRequest, DeleteSessionRequest, InitializeRequest,
+        ListSessionsRequest, ProtocolVersion, SessionId,
     };
     use querymt::LLMParams;
     use std::sync::Arc;
@@ -2913,6 +2910,10 @@ mod tests {
             store
                 .expect_set_session_llm_config()
                 .returning(|_, _| Ok(()))
+                .times(0..);
+            store
+                .expect_delete_session()
+                .returning(|_| Ok(()))
                 .times(0..);
 
             let store: Arc<dyn SessionStore> = Arc::new(store);
@@ -2987,6 +2988,12 @@ mod tests {
                 .is_some()
         );
         assert!(resp.agent_capabilities.session_capabilities.close.is_some());
+        assert!(
+            resp.agent_capabilities
+                .session_capabilities
+                .delete
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -3011,6 +3018,14 @@ mod tests {
         let f = HandleFixture::new().await;
         let req = CloseSessionRequest::new(SessionId::from("no-such-session".to_string()));
         let result = SendAgent::close_session(&f.handle, req).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_delete_unknown_session_is_noop() {
+        let f = HandleFixture::new().await;
+        let req = DeleteSessionRequest::new(SessionId::from("no-such-session".to_string()));
+        let result = SendAgent::delete_session(&f.handle, req).await;
         assert!(result.is_ok());
     }
 
