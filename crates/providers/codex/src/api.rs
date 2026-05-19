@@ -807,6 +807,7 @@ pub fn codex_parse_stream_chunk_with_state(
                 .unwrap()
                 .values()
                 .any(|s| s.started);
+            clear_thinking_state(tool_state_buffer);
             results.push(StreamChunk::Done {
                 finish_reason: if has_tool_calls {
                     FinishReason::ToolCalls
@@ -862,7 +863,8 @@ pub fn codex_parse_stream_chunk_with_state(
                 if let Some(item) = event.item {
                     if item.get("type").and_then(Value::as_str) == Some("reasoning") {
                         if let Some(text) = extract_reasoning_text_from_value(&item)
-                            && mark_final_thinking_emitted(tool_state_buffer, &text)
+                            && let Some(text) =
+                                mark_final_thinking_emitted(tool_state_buffer, &text)
                         {
                             results.push(StreamChunk::Thinking(text));
                         }
@@ -911,28 +913,29 @@ pub fn codex_parse_stream_chunk_with_state(
                 if let Some(response) = event.response {
                     emit_tool_calls_from_response(&response, &mut results, tool_state_buffer);
                     if let Some(text) = extract_reasoning_text_from_response(&response)
-                        && mark_final_thinking_emitted(tool_state_buffer, &text)
+                        && let Some(text) = mark_final_thinking_emitted(tool_state_buffer, &text)
                     {
                         results.push(StreamChunk::Thinking(text));
                     }
                     if let Some(usage_value) = response.get("usage")
-                        && let Ok(usage) = serde_json::from_value::<Usage>(usage_value.clone())
+                        && let Ok(usage) =
+                            serde_json::from_value::<CodexRawUsage>(usage_value.clone())
                     {
-                        results.push(StreamChunk::Usage(usage));
+                        results.push(StreamChunk::Usage(usage.into_usage()));
                     }
                 }
-                results.push(StreamChunk::Done {
-                    finish_reason: if tool_state_buffer
-                        .lock()
-                        .unwrap()
-                        .values()
-                        .any(|s| s.started)
-                    {
-                        FinishReason::ToolCalls
-                    } else {
-                        FinishReason::Stop
-                    },
-                });
+                let finish_reason = if tool_state_buffer
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|s| s.started)
+                {
+                    FinishReason::ToolCalls
+                } else {
+                    FinishReason::Stop
+                };
+                clear_thinking_state(tool_state_buffer);
+                results.push(StreamChunk::Done { finish_reason });
             }
             "response.failed" => {
                 let message = event
@@ -942,6 +945,7 @@ pub fn codex_parse_stream_chunk_with_state(
                     .and_then(|e| e.get("message"))
                     .and_then(Value::as_str)
                     .unwrap_or("Codex response failed");
+                clear_thinking_state(tool_state_buffer);
                 return Err(LLMError::ProviderError(message.to_string()));
             }
             _ => {}
@@ -965,22 +969,28 @@ fn mark_streamed_thinking_emitted(
 fn mark_final_thinking_emitted(
     tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
     text: &str,
-) -> bool {
+) -> Option<String> {
     let mut buffer = tool_state_buffer.lock().unwrap();
     let state = buffer.entry(usize::MAX).or_default();
-    if state.streamed_thinking_seen
-        && (state.emitted_thinking_text == text
-            || state.emitted_thinking_text.contains(text)
-            || text.contains(&state.emitted_thinking_text))
-    {
-        return false;
-    }
-    if state.emitted_thinking.iter().any(|emitted| emitted == text) {
-        return false;
-    }
-    state.emitted_thinking.push(text.to_string());
-    state.emitted_thinking_text.push_str(text);
-    true
+    let text_to_emit = if state.streamed_thinking_seen {
+        let emitted = state.emitted_thinking_text.as_str();
+        if emitted == text || emitted.contains(text) {
+            return None;
+        }
+        text.strip_prefix(emitted).unwrap_or(text).to_string()
+    } else {
+        if state.emitted_thinking.iter().any(|emitted| emitted == text) {
+            return None;
+        }
+        text.to_string()
+    };
+    state.emitted_thinking.push(text_to_emit.clone());
+    state.emitted_thinking_text.push_str(&text_to_emit);
+    Some(text_to_emit)
+}
+
+fn clear_thinking_state(tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>) {
+    tool_state_buffer.lock().unwrap().remove(&usize::MAX);
 }
 
 fn handle_output_item_event(
@@ -1890,10 +1900,10 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"with consideratio
         assert_eq!(completed_events.len(), 2);
         match &completed_events[0] {
             StreamChunk::Usage(usage) => {
-                assert_eq!(usage.input_tokens, 10);
-                assert_eq!(usage.output_tokens, 6);
-                assert_eq!(usage.reasoning_tokens, 0);
-                assert_eq!(usage.cache_read, 0);
+                assert_eq!(usage.input_tokens, 8);
+                assert_eq!(usage.output_tokens, 2);
+                assert_eq!(usage.reasoning_tokens, 4);
+                assert_eq!(usage.cache_read, 2);
             }
             other => panic!("expected usage chunk, got {other:?}"),
         }
@@ -1904,7 +1914,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"with consideratio
     }
 
     #[test]
-    fn codex_streaming_skips_completed_reasoning_superset_after_deltas() {
+    fn codex_streaming_emits_completed_reasoning_suffix_after_deltas() {
         let state = Arc::new(Mutex::new(HashMap::<usize, CodexToolUseState>::new()));
         let delta_chunk =
             br#"data: {"type":"response.reasoning_summary_text.delta","delta":"first part"}
@@ -1923,8 +1933,12 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"with consideratio
 
         let completed_events =
             codex_parse_stream_chunk_with_state(completed_chunk, &state).unwrap();
-        assert_eq!(completed_events.len(), 2);
+        assert_eq!(completed_events.len(), 3);
         match &completed_events[0] {
+            StreamChunk::Thinking(text) => assert_eq!(text, " plus final"),
+            other => panic!("expected thinking chunk, got {other:?}"),
+        }
+        match &completed_events[1] {
             StreamChunk::Usage(usage) => {
                 assert_eq!(usage.input_tokens, 7);
                 assert_eq!(usage.output_tokens, 5);
@@ -1933,7 +1947,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"with consideratio
             }
             other => panic!("expected usage chunk, got {other:?}"),
         }
-        match &completed_events[1] {
+        match &completed_events[2] {
             StreamChunk::Done { finish_reason } => assert_eq!(*finish_reason, FinishReason::Stop),
             other => panic!("expected done chunk, got {other:?}"),
         }
@@ -1980,6 +1994,36 @@ data: {"type":"response.completed","response":{"output":[{"type":"reasoning","su
             other => panic!("expected thinking chunk, got {other:?}"),
         }
         match &events[2] {
+            StreamChunk::Done { finish_reason } => assert_eq!(*finish_reason, FinishReason::Stop),
+            other => panic!("expected done chunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_streaming_clears_completed_reasoning_between_requests() {
+        let state = Arc::new(Mutex::new(HashMap::<usize, CodexToolUseState>::new()));
+        let chunk = br#"data: {"type":"response.completed","response":{"output":[{"type":"reasoning","summary":[{"text":"same final thought"}]}]}}
+
+"#;
+
+        let first_events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
+        assert_eq!(first_events.len(), 2);
+        match &first_events[0] {
+            StreamChunk::Thinking(text) => assert_eq!(text, "same final thought"),
+            other => panic!("expected thinking chunk, got {other:?}"),
+        }
+        match &first_events[1] {
+            StreamChunk::Done { finish_reason } => assert_eq!(*finish_reason, FinishReason::Stop),
+            other => panic!("expected done chunk, got {other:?}"),
+        }
+
+        let second_events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
+        assert_eq!(second_events.len(), 2);
+        match &second_events[0] {
+            StreamChunk::Thinking(text) => assert_eq!(text, "same final thought"),
+            other => panic!("expected thinking chunk, got {other:?}"),
+        }
+        match &second_events[1] {
             StreamChunk::Done { finish_reason } => assert_eq!(*finish_reason, FinishReason::Stop),
             other => panic!("expected done chunk, got {other:?}"),
         }
