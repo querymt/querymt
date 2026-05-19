@@ -609,7 +609,7 @@ pub enum MeshTransportConfig {
 }
 
 fn default_mesh_listen() -> Option<String> {
-    Some("/ip4/0.0.0.0/tcp/9000".to_string())
+    Some("/ip4/0.0.0.0/tcp/0".to_string())
 }
 
 fn default_mesh_request_timeout_secs() -> u64 {
@@ -626,7 +626,7 @@ fn default_mesh_stream_reconnect_grace_secs() -> u64 {
 /// ```toml
 /// [mesh]
 /// enabled = true
-/// listen = "/ip4/0.0.0.0/tcp/9000"
+/// listen = "/ip4/0.0.0.0/tcp/0"
 /// discovery = "mdns"
 ///
 /// [[mesh.peers]]
@@ -640,7 +640,7 @@ pub struct MeshTomlConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Multiaddr to listen on.  Default: `"/ip4/0.0.0.0/tcp/9000"`.
+    /// Multiaddr to listen on.  Default: `"/ip4/0.0.0.0/tcp/0"` (OS-assigned random port).
     #[serde(default = "default_mesh_listen")]
     pub listen: Option<String>,
 
@@ -699,6 +699,13 @@ pub struct MeshTomlConfig {
     /// ```
     #[serde(default)]
     pub invite: Option<String>,
+
+    /// Human-readable name advertised to mesh peers.
+    ///
+    /// When set, overrides the OS hostname in `GetNodeInfo` responses.
+    /// Useful on mobile where the OS hostname is often meaningless ("unknown").
+    #[serde(default)]
+    pub node_name: Option<String>,
 }
 
 impl Default for MeshTomlConfig {
@@ -714,6 +721,7 @@ impl Default for MeshTomlConfig {
             stream_reconnect_grace_secs: default_mesh_stream_reconnect_grace_secs(),
             identity_file: None,
             invite: None,
+            node_name: None,
         }
     }
 }

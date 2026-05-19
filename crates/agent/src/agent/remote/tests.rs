@@ -505,8 +505,8 @@ mod node_manager_tests {
     use super::*;
     use crate::agent::messages::GetMode;
     use crate::agent::remote::node_manager::{
-        CreateRemoteSession, DestroyRemoteSession, ForkRemoteSession, GetNodeInfo,
-        ListRemoteSessions, RemoteNodeManager, ResumeRemoteSession, SessionHandoff,
+        CreateRemoteSession, ForkRemoteSession, GetNodeInfo, ListRemoteSessions, RemoteNodeManager,
+        ResumeRemoteSession, SessionHandoff, StopRemoteSessionRuntime,
     };
     use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
     use crate::model::{AgentMessage, MessagePart};
@@ -572,7 +572,14 @@ mod node_manager_tests {
             "no-mesh environments must not advertise lookup-only handoff"
         );
 
-        let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
+        let sessions = nm_ref
+            .ask(ListRemoteSessions {
+                offset: None,
+                limit: None,
+            })
+            .await
+            .expect("list")
+            .sessions;
         assert!(sessions.iter().any(|s| s.session_id == resp.session_id));
     }
 
@@ -633,9 +640,13 @@ mod node_manager_tests {
         let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let sessions = nm_ref
-            .ask(ListRemoteSessions)
+            .ask(ListRemoteSessions {
+                offset: None,
+                limit: None,
+            })
             .await
-            .expect("list should succeed");
+            .expect("list should succeed")
+            .sessions;
 
         assert!(sessions.is_empty());
     }
@@ -649,7 +660,14 @@ mod node_manager_tests {
             .await
             .expect("create");
 
-        let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
+        let sessions = nm_ref
+            .ask(ListRemoteSessions {
+                offset: None,
+                limit: None,
+            })
+            .await
+            .expect("list")
+            .sessions;
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, resp.session_id);
@@ -688,7 +706,14 @@ mod node_manager_tests {
             .await
             .expect("create intent snapshot");
 
-        let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
+        let sessions = nm_ref
+            .ask(ListRemoteSessions {
+                offset: None,
+                limit: None,
+            })
+            .await
+            .expect("list")
+            .sessions;
         let listed = sessions
             .iter()
             .find(|s| s.session_id == resp.session_id)
@@ -716,12 +741,19 @@ mod node_manager_tests {
         sorted.dedup();
         assert_eq!(sorted.len(), 3, "all session IDs should be unique");
 
-        let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
+        let sessions = nm_ref
+            .ask(ListRemoteSessions {
+                offset: None,
+                limit: None,
+            })
+            .await
+            .expect("list")
+            .sessions;
         assert_eq!(sessions.len(), 3);
     }
 
     #[tokio::test]
-    async fn test_destroy_session() {
+    async fn test_stop_session_runtime() {
         let (nm_ref, config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let resp = nm_ref
@@ -730,14 +762,25 @@ mod node_manager_tests {
             .expect("create");
 
         nm_ref
-            .ask(DestroyRemoteSession {
+            .ask(StopRemoteSessionRuntime {
                 session_id: resp.session_id.clone(),
             })
             .await
-            .expect("destroy should succeed");
+            .expect("stop runtime should succeed");
 
-        let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
-        assert!(sessions.is_empty());
+        let sessions = nm_ref
+            .ask(ListRemoteSessions {
+                offset: None,
+                limit: None,
+            })
+            .await
+            .expect("list")
+            .sessions;
+        // Stop removes the runtime actor but the session row persists in
+        // SQLite, so ListRemoteSessions (which now queries the session store)
+        // still returns it.
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, resp.session_id);
         assert!(
             config
                 .provider
@@ -746,23 +789,23 @@ mod node_manager_tests {
                 .await
                 .expect("session lookup")
                 .is_some(),
-            "destroy should remove only the runtime, not persisted history"
+            "stop should remove only the runtime, not persisted history"
         );
     }
 
     #[tokio::test]
-    async fn test_destroy_nonexistent_session() {
+    async fn test_stop_nonexistent_session_runtime() {
         let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let result = nm_ref
-            .ask(DestroyRemoteSession {
+            .ask(StopRemoteSessionRuntime {
                 session_id: "does-not-exist".to_string(),
             })
             .await;
 
         assert!(
             matches!(result, Err(SendError::HandlerError(_))),
-            "destroying nonexistent session should fail with HandlerError"
+            "stopping nonexistent session should fail with HandlerError"
         );
     }
 
@@ -829,7 +872,14 @@ mod node_manager_tests {
             .await
             .expect("create");
 
-        let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
+        let sessions = nm_ref
+            .ask(ListRemoteSessions {
+                offset: None,
+                limit: None,
+            })
+            .await
+            .expect("list")
+            .sessions;
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, resp.session_id);
@@ -837,7 +887,7 @@ mod node_manager_tests {
     }
 
     #[tokio::test]
-    async fn test_destroy_then_create_reuses_slot() {
+    async fn test_stop_then_create_reuses_slot() {
         let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         // Create + destroy
@@ -847,11 +897,11 @@ mod node_manager_tests {
             .expect("create 1");
 
         nm_ref
-            .ask(DestroyRemoteSession {
+            .ask(StopRemoteSessionRuntime {
                 session_id: resp1.session_id.clone(),
             })
             .await
-            .expect("destroy");
+            .expect("stop");
 
         // Create again — should succeed and produce a different session ID
         let resp2 = nm_ref
@@ -861,13 +911,30 @@ mod node_manager_tests {
 
         assert_ne!(resp1.session_id, resp2.session_id);
 
-        let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].session_id, resp2.session_id);
+        let sessions = nm_ref
+            .ask(ListRemoteSessions {
+                offset: None,
+                limit: None,
+            })
+            .await
+            .expect("list")
+            .sessions;
+        // Both sessions appear: resp1 is stopped but still persisted in
+        // SQLite, resp2 is the newly created live session.
+        assert_eq!(sessions.len(), 2);
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert!(
+            ids.contains(&resp1.session_id.as_str()),
+            "stopped session should still be listed from SQLite"
+        );
+        assert!(
+            ids.contains(&resp2.session_id.as_str()),
+            "new session should be listed"
+        );
     }
 
     #[tokio::test]
-    async fn test_resume_destroyed_session() {
+    async fn test_resume_stopped_session() {
         let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 
         let resp = nm_ref
@@ -876,11 +943,11 @@ mod node_manager_tests {
             .expect("create");
 
         nm_ref
-            .ask(DestroyRemoteSession {
+            .ask(StopRemoteSessionRuntime {
                 session_id: resp.session_id.clone(),
             })
             .await
-            .expect("destroy");
+            .expect("stop");
 
         let resumed = nm_ref
             .ask(ResumeRemoteSession {
@@ -891,9 +958,173 @@ mod node_manager_tests {
 
         assert_eq!(resumed.session_id, resp.session_id);
 
-        let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
+        let sessions = nm_ref
+            .ask(ListRemoteSessions {
+                offset: None,
+                limit: None,
+            })
+            .await
+            .expect("list")
+            .sessions;
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, resp.session_id);
+    }
+
+    /// Regression test: after stopping and resuming a session, the
+    /// materialized actor's event stream should include previously persisted
+    /// events.  This validates that `ResumeRemoteSession` →
+    /// `materialize_remote_session` → `GetEventStream` reads from the
+    /// durable journal, not just from ephemeral actor state.
+    #[tokio::test]
+    async fn test_resume_session_exposes_persisted_event_stream() {
+        let (nm_ref, config, _td) = spawn_test_node_manager_with_mesh().await;
+
+        let resp = nm_ref
+            .ask(CreateRemoteSession { cwd: None })
+            .await
+            .expect("create");
+
+        // Persist a durable event through the agent's event sink.
+        config
+            .emit_event_persisted(
+                &resp.session_id,
+                crate::events::AgentEventKind::SessionCreated,
+            )
+            .await
+            .expect("persist SessionCreated event");
+
+        // Stop the live actor so the session is no longer in-memory.
+        nm_ref
+            .ask(StopRemoteSessionRuntime {
+                session_id: resp.session_id.clone(),
+            })
+            .await
+            .expect("stop");
+
+        // Resume — materializes a new actor from SQLite.
+        let resumed = nm_ref
+            .ask(ResumeRemoteSession {
+                session_id: resp.session_id.clone(),
+            })
+            .await
+            .expect("resume");
+
+        // Resolve the handoff to get a live actor reference.
+        let session_ref = match resumed.handoff {
+            SessionHandoff::DirectRemote { session_ref } => session_ref,
+            other => panic!("expected DirectRemote handoff, got {other:?}"),
+        };
+
+        // Ask the resumed actor for its full event stream.
+        let events: Vec<crate::events::AgentEvent> = session_ref
+            .ask(&crate::agent::messages::GetEventStream)
+            .await
+            .expect("GetEventStream RPC");
+
+        assert!(
+            !events.is_empty(),
+            "resumed session should expose at least one persisted event"
+        );
+        assert!(
+            events.iter().any(|e| e.session_id == resp.session_id),
+            "events should belong to the resumed session"
+        );
+    }
+
+    /// Sequential resume of the same session must reuse the existing actor
+    /// instead of spawning a duplicate.
+    #[tokio::test]
+    async fn test_resume_same_session_reuses_actor() {
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
+
+        let resp = nm_ref
+            .ask(CreateRemoteSession { cwd: None })
+            .await
+            .expect("create");
+
+        let first_handoff = nm_ref
+            .ask(ResumeRemoteSession {
+                session_id: resp.session_id.clone(),
+            })
+            .await
+            .expect("first resume");
+
+        let first_id = match first_handoff.handoff {
+            SessionHandoff::DirectRemote { session_ref } => session_ref.id().sequence_id(),
+            other => panic!("expected DirectRemote, got {other:?}"),
+        };
+
+        let second_handoff = nm_ref
+            .ask(ResumeRemoteSession {
+                session_id: resp.session_id.clone(),
+            })
+            .await
+            .expect("second resume");
+
+        let second_id = match second_handoff.handoff {
+            SessionHandoff::DirectRemote { session_ref } => session_ref.id().sequence_id(),
+            other => panic!("expected DirectRemote, got {other:?}"),
+        };
+
+        assert_eq!(
+            first_id, second_id,
+            "second resume must return the same actor as the first"
+        );
+
+        // Only one entry in the session list.
+        let sessions = nm_ref
+            .ask(ListRemoteSessions {
+                offset: None,
+                limit: None,
+            })
+            .await
+            .expect("list")
+            .sessions;
+        let count = sessions
+            .iter()
+            .filter(|s| s.session_id == resp.session_id)
+            .count();
+        assert_eq!(count, 1, "session should appear exactly once in the list");
+    }
+
+    /// Resuming two different sessions concurrently should succeed for both.
+    #[tokio::test]
+    async fn test_resume_different_sessions_both_succeed() {
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
+
+        let s1 = nm_ref
+            .ask(CreateRemoteSession { cwd: None })
+            .await
+            .expect("create s1");
+
+        let s2 = nm_ref
+            .ask(CreateRemoteSession { cwd: None })
+            .await
+            .expect("create s2");
+
+        // Resume both concurrently — neither should block the other.
+        let (r1, r2) = tokio::join!(
+            nm_ref.ask(ResumeRemoteSession {
+                session_id: s1.session_id.clone()
+            }),
+            nm_ref.ask(ResumeRemoteSession {
+                session_id: s2.session_id.clone()
+            }),
+        );
+
+        let h1 = r1.expect("resume s1");
+        let h2 = r2.expect("resume s2");
+
+        let id1 = match h1.handoff {
+            SessionHandoff::DirectRemote { session_ref } => session_ref.id().sequence_id(),
+            other => panic!("s1: expected DirectRemote, got {other:?}"),
+        };
+        let id2 = match h2.handoff {
+            SessionHandoff::DirectRemote { session_ref } => session_ref.id().sequence_id(),
+            other => panic!("s2: expected DirectRemote, got {other:?}"),
+        };
+
+        assert_ne!(id1, id2, "different sessions must have different actors");
     }
 
     #[tokio::test]
@@ -943,7 +1174,14 @@ mod node_manager_tests {
         };
         assert!(session_ref.ask(&GetMode).await.is_ok());
 
-        let sessions = nm_ref.ask(ListRemoteSessions).await.expect("list");
+        let sessions = nm_ref
+            .ask(ListRemoteSessions {
+                offset: None,
+                limit: None,
+            })
+            .await
+            .expect("list")
+            .sessions;
         assert!(sessions.iter().any(|s| s.session_id == resp.session_id));
     }
 }

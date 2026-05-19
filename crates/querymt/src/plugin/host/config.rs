@@ -2,11 +2,13 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::{collections::HashMap, fs, path::Path};
 
+#[cfg(feature = "extism_host")]
 use super::oci::OciDownloaderConfig;
 
 #[derive(Debug, Deserialize)]
 pub struct PluginConfig {
     pub providers: Vec<ProviderConfig>,
+    #[cfg(feature = "extism_host")]
     pub oci: Option<OciDownloaderConfig>,
 }
 

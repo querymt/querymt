@@ -5,6 +5,7 @@
 
 use crate::events::EventEnvelope;
 use crate::index::FileIndexEntry;
+pub use crate::session::load_snapshot::{SessionLoadSnapshot, StreamCursor, cursor_from_events};
 use crate::session::projection::{AuditView, SessionScope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -308,6 +309,12 @@ pub enum UiClientMessage {
         /// Stable node id (PeerId string) identifying the target node
         #[serde(alias = "node")]
         node_id: String,
+        /// Number of sessions to skip (default 0)
+        #[serde(default)]
+        offset: Option<u32>,
+        /// Maximum sessions to return (default 20, clamped to 1..100)
+        #[serde(default)]
+        limit: Option<u32>,
     },
     /// Create a new session on a specific remote node
     CreateRemoteSession {
@@ -556,17 +563,6 @@ pub struct ConsolidationInfo {
     #[typeshare(serialized_as = "number")]
     pub source_count: u32,
     pub created_at: String,
-}
-
-#[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct StreamCursor {
-    #[serde(default)]
-    #[typeshare(serialized_as = "number")]
-    pub local_seq: i64,
-    #[serde(default)]
-    #[typeshare(serialized_as = "Record<string, number>")]
-    pub remote_seq_by_source: HashMap<String, i64>,
 }
 
 /// Mesh invite DTO for the UI.
@@ -884,6 +880,12 @@ pub enum UiServerMessage {
         node_id: String,
         /// Sessions on that node
         sessions: Vec<crate::agent::remote::RemoteSessionInfo>,
+        /// Offset for the next page; omitted when there are no more pages
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_offset: Option<u32>,
+        /// Total sessions across all pages
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total_count: Option<u32>,
     },
     /// Newly created mesh invite
     MeshInviteCreated {
@@ -1187,7 +1189,11 @@ mod tests {
         .expect("node alias should deserialize to node_id with data wrapper");
 
         match msg {
-            UiClientMessage::ListRemoteSessions { node_id } => {
+            UiClientMessage::ListRemoteSessions {
+                node_id,
+                offset: _,
+                limit: _,
+            } => {
                 assert_eq!(node_id, "peer-xyz");
             }
             _ => panic!("expected ListRemoteSessions"),
@@ -1245,6 +1251,8 @@ mod tests {
         let msg = UiServerMessage::RemoteSessions {
             node_id: "peer-abc".to_string(),
             sessions: Vec::new(),
+            next_offset: None,
+            total_count: Some(0),
         };
         let json = serde_json::to_value(&msg).expect("should serialize");
         assert_eq!(json["type"], "remote_sessions");

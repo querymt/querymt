@@ -654,6 +654,34 @@ export interface KnowledgeEntryInfo {
 	created_at: string;
 }
 
+/** Metadata about a session available on a remote node. */
+export interface RemoteSessionInfo {
+	/** Session public ID (same format as local sessions) */
+	session_id: string;
+	/** kameo ActorId of the SessionActor on the remote node (raw u64) */
+	actor_id: number;
+	/** Working directory on the remote machine (if set) */
+	cwd?: string;
+	/** Unix timestamp when the session was created */
+	created_at: number;
+	/** Session title/name, if set */
+	title?: string;
+	/** Human-readable label of the peer that owns this session */
+	peer_label: string;
+	/** High-level runtime lifecycle state for UI summaries. */
+	runtime_state?: string;
+}
+
+/** Paginated response for listing sessions on a remote node. */
+export interface ListRemoteSessionsResponse {
+	/** Sessions in the requested page. */
+	sessions: RemoteSessionInfo[];
+	/** Offset for the next page; `None` when there are no more pages. */
+	next_offset?: number;
+	/** Total sessions across all pages. */
+	total_count: number;
+}
+
 /**
  * Mirror of `querymt::mcp::config::McpServerConfig` for typeshare generation.
  * Note: kept for typeshare output; may be unused in Rust code paths.
@@ -733,24 +761,6 @@ export interface RemoteNodeInfo {
 	active_sessions: number;
 }
 
-/** Metadata about a session available on a remote node. */
-export interface RemoteSessionInfo {
-	/** Session public ID (same format as local sessions) */
-	session_id: string;
-	/** kameo ActorId of the SessionActor on the remote node (raw u64) */
-	actor_id: number;
-	/** Working directory on the remote machine (if set) */
-	cwd?: string;
-	/** Unix timestamp when the session was created */
-	created_at: number;
-	/** Session title/name, if set */
-	title?: string;
-	/** Human-readable label of the peer that owns this session */
-	peer_label: string;
-	/** High-level runtime lifecycle state for UI summaries. */
-	runtime_state?: string;
-}
-
 /** Schedule information DTO for the UI. */
 export interface ScheduleInfo {
 	public_id: string;
@@ -812,8 +822,13 @@ export interface SessionLimits {
 }
 
 export interface StreamCursor {
-	local_seq?: number;
-	remote_seq_by_source?: Record<string, number>;
+	local_seq: number;
+	remote_seq_by_source: Record<string, number>;
+}
+
+export interface SessionLoadSnapshot {
+	audit: AuditView;
+	cursor: StreamCursor;
 }
 
 /**
@@ -1079,6 +1094,10 @@ export type UiClientMessage =
 	| { type: "list_remote_sessions", data: {
 	/** Stable node id (PeerId string) identifying the target node */
 	node_id: string;
+	/** Number of sessions to skip (default 0) */
+	offset?: number;
+	/** Maximum sessions to return (default 20, clamped to 1..100) */
+	limit?: number;
 }}
 	/** Create a new session on a specific remote node */
 	| { type: "create_remote_session", data: {
@@ -1379,6 +1398,10 @@ export type UiServerMessage =
 	node_id: string;
 	/** Sessions on that node */
 	sessions: RemoteSessionInfo[];
+	/** Offset for the next page; omitted when there are no more pages */
+	next_offset?: number;
+	/** Total sessions across all pages */
+	total_count?: number;
 }}
 	/** Newly created mesh invite */
 	| { type: "mesh_invite_created", data: {

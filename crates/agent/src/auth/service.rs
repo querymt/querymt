@@ -69,6 +69,7 @@ struct FlowIdentity {
 #[derive(Clone)]
 pub struct OAuthService {
     config: Arc<AgentConfig>,
+    #[cfg_attr(not(feature = "oauth"), allow(dead_code))]
     model_registry: ModelRegistry,
     flows: OAuthFlowMap,
     listener_slot: CallbackListenerSlot,

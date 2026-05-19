@@ -31,7 +31,20 @@ pub async fn fetch_providers_repository(url_override: Option<String>) -> Result<
 }
 
 pub fn config_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("No home directory found"))?;
+    if let Ok(path) = std::env::var("QMT_CONFIG_DIR")
+        && !path.trim().is_empty()
+    {
+        return Ok(PathBuf::from(path));
+    }
+
+    if let Ok(path) = std::env::var("QMT_HOME")
+        && !path.trim().is_empty()
+    {
+        return Ok(PathBuf::from(path));
+    }
+
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow!("No home directory found and QMT_HOME is not set"))?;
     Ok(home.join(".qmt"))
 }
 

@@ -17,7 +17,7 @@ service = ["dep:querymt-service-client"]
 
 [dependencies]
 anyhow = "1.0"
-querymt = { path = "../querymt", default-features = false, features = ["extism_host", "mcp", "native", "tracing"] }
+querymt = { path = "../querymt", default-features = false, features = ["desktop"] }
 querymt-utils = { path = "../querymt-utils", features = ["secret-store", "oauth", "providers"] }
 querymt-service-client = { path = "../service-client", optional = true }
 url.workspace = true

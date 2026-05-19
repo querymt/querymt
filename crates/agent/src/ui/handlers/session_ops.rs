@@ -10,22 +10,24 @@ use super::super::messages::{SessionGroup, SessionSummary, UiServerMessage};
 #[cfg(feature = "remote")]
 use super::remote::finalize_remote_session_attach;
 
-use super::super::{cursor_from_events, session::PRIMARY_AGENT_ID};
+use super::super::session::PRIMARY_AGENT_ID;
 use crate::agent::core::AgentMode;
 use crate::events::EventEnvelope;
 use crate::index::resolve_workspace_root;
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
+use crate::session::load_session_snapshot;
 use crate::session::projection::SessionScope;
+use crate::ui::cursor_from_events;
 use crate::ui::mentions::{filter_index_for_cwd, filter_index_for_cwd_entries};
 use agent_client_protocol::schema::{LoadSessionRequest, SessionId};
 use querymt::chat::ReasoningEffort;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
+#[cfg(feature = "remote")]
 use tracing::Instrument;
 
 #[cfg(feature = "remote")]
@@ -288,12 +290,12 @@ pub async fn handle_list_sessions(
                                 async {
                                     let nm_ref =
                                         state.agent.find_node_manager(&node_id_str).await?;
-                                    state.agent.list_remote_sessions(&nm_ref).await
+                                    state.agent.list_remote_sessions(&nm_ref, None, None).await
                                 },
                             )
                             .await
                             {
-                                Ok(Ok(s)) => s,
+                                Ok(Ok(response)) => response.sessions,
                                 Ok(Err(_)) | Err(_) => return None,
                             };
                             Some((peer_label, node_id_str, sessions))
@@ -593,64 +595,14 @@ pub async fn handle_load_session(
     session_id: &str,
     tx: &mpsc::Sender<String>,
 ) {
-    let is_remote_attached = {
-        let registry = state.agent.registry.lock().await;
-        registry.get(session_id).is_some_and(|r| r.is_remote())
-    };
-
-    // 1. Get audit view for this session only (child sessions loaded separately).
-    // Remote sessions may not have a local projection row yet; when attached,
-    // degrade to an empty audit payload instead of failing the load request.
-    let audit = match state.view_store.get_audit_view(session_id, false).await {
-        Ok(audit) => audit,
-        Err(e) if is_remote_attached => {
-            // Load relayed events directly from the event journal.
-            // get_audit_view fails because task/intent repos require a local
-            // `sessions` row which remote sessions don't have, but events
-            // relayed via EventRelayActor ARE persisted in the journal.
-            let events: Vec<crate::events::AgentEvent> = state
-                .agent
-                .config
-                .event_sink
-                .journal()
-                .load_session_stream(session_id, None, None)
-                .await
-                .unwrap_or_else(|je| {
-                    tracing::warn!(
-                        session_id,
-                        error = %je,
-                        "failed to load journal events for remote session"
-                    );
-                    Vec::new()
-                })
-                .into_iter()
-                .map(crate::events::AgentEvent::from)
-                .collect();
-
-            tracing::debug!(
-                session_id,
-                error = %e,
-                event_count = events.len(),
-                "remote session missing local audit projection; loaded {} events from journal",
-                events.len()
-            );
-            crate::session::projection::AuditView {
-                session_id: session_id.to_string(),
-                events,
-                tasks: Vec::new(),
-                intent_snapshots: Vec::new(),
-                decisions: Vec::new(),
-                progress_entries: Vec::new(),
-                artifacts: Vec::new(),
-                delegations: Vec::new(),
-                generated_at: OffsetDateTime::now_utc(),
+    let snapshot =
+        match load_session_snapshot(&state.agent, state.view_store.clone(), session_id).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                let _ = send_error(tx, format!("Failed to load session: {}", e)).await;
+                return;
             }
-        }
-        Err(e) => {
-            let _ = send_error(tx, format!("Failed to load session: {}", e)).await;
-            return;
-        }
-    };
+        };
 
     // 1a. Load session to get cwd and populate session_cwds
     let cwd_path = if let Ok(Some(session)) =
@@ -692,14 +644,14 @@ pub async fn handle_load_session(
 
     // 5. Send loaded audit view and persisted undo stack for UI hydration
     let undo_stack = load_undo_stack(state, session_id).await;
-    let cursor = cursor_from_events(&audit.events);
+    let cursor = snapshot.cursor.clone();
 
     let _ = send_message(
         tx,
         UiServerMessage::SessionLoaded {
             session_id: session_id.to_string(),
             agent_id,
-            audit,
+            audit: snapshot.audit,
             undo_stack,
             cursor: cursor.clone(),
         },
