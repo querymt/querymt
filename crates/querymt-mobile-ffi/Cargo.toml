@@ -51,7 +51,7 @@ opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["logs"] }
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "logs"] }
 opentelemetry-appender-tracing = { version = "0.31", features = ["log"] }
-tracing-opentelemetry = "0.32"
+tracing-opentelemetry = "0.33"
 anyhow = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "sync", "macros", "io-util", "net"] }
