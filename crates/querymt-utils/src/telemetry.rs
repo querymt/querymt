@@ -1,4 +1,6 @@
-use opentelemetry::{KeyValue, trace::TracerProvider as _};
+use std::fmt;
+
+use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
@@ -9,9 +11,11 @@ use opentelemetry_sdk::{
 use opentelemetry_semantic_conventions::{SCHEMA_URL, resource::SERVICE_VERSION};
 use tracing_log::LogTracer;
 use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::fmt as ts_fmt;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
+use tracing_subscriber::layer::Layer;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::{EnvFilter, Registry, fmt};
+use tracing_subscriber::{EnvFilter, Registry};
 
 /// Default OTLP endpoint for telemetry
 pub const DEFAULT_OTLP_ENDPOINT: &str = "http://otel.query.mt:4317";
@@ -27,50 +31,237 @@ pub fn resource(service_name: &str, service_version: &str) -> Resource {
     Resource::builder()
         .with_service_name(service_name.to_string())
         .with_schema_url(
-            [KeyValue::new(SERVICE_VERSION, service_version.to_string())],
+            [opentelemetry::KeyValue::new(
+                SERVICE_VERSION,
+                service_version.to_string(),
+            )],
             SCHEMA_URL,
         )
         .build()
 }
 
-/// Initialize an OTLP tracer provider
+// ─── Error type ────────────────────────────────────────────────────────────────
+
+/// Errors that can occur during telemetry initialization.
+#[derive(Debug)]
+pub enum TelemetryInitError {
+    /// Failed to install the `log` → `tracing` bridge (`LogTracer`).
+    LogTracer,
+    /// Failed to create the OTLP tracer provider (span exporter).
+    TracerProvider(String),
+    /// Failed to create the OTLP logger provider (log exporter).
+    LoggerProvider(String),
+    /// Failed to install the global tracing subscriber
+    /// (typically because one was already installed).
+    Subscriber,
+}
+
+impl fmt::Display for TelemetryInitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LogTracer => write!(f, "failed to install LogTracer"),
+            Self::TracerProvider(ctx) => write!(f, "failed to init OTLP tracer provider: {ctx}"),
+            Self::LoggerProvider(ctx) => write!(f, "failed to init OTLP logger provider: {ctx}"),
+            Self::Subscriber => write!(f, "failed to set global tracing subscriber"),
+        }
+    }
+}
+
+impl std::error::Error for TelemetryInitError {}
+
+// ─── Config ────────────────────────────────────────────────────────────────────
+
+/// Configuration for telemetry setup.
+///
+/// Use this together with [`try_setup_telemetry`] or [`try_setup_telemetry_with_layers`].
+pub struct TelemetryConfig<'a> {
+    /// Service name used in the OTLP resource (e.g. `"querymt-cli"`).
+    pub service_name: &'a str,
+    /// Service version used in the OTLP resource.
+    pub service_version: &'a str,
+    /// If `true`, the console `fmt` layer writes to stderr instead of stdout.
+    pub use_stderr: bool,
+    /// Whether to enable OTLP export. When `false`, only the console fmt layer
+    /// is installed (plus any extra layers supplied by the caller).
+    pub enable_otlp: bool,
+    /// Override the OTLP endpoint. When `None`, falls back to the
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` env var, then [`DEFAULT_OTLP_ENDPOINT`].
+    pub endpoint: Option<String>,
+}
+
+impl<'a> TelemetryConfig<'a> {
+    /// Resolve the effective OTLP endpoint.
+    ///
+    /// Priority: explicit override → `OTEL_EXPORTER_OTLP_ENDPOINT` env → default.
+    fn resolve_endpoint(&self) -> String {
+        self.endpoint
+            .clone()
+            .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())
+            .unwrap_or_else(|| DEFAULT_OTLP_ENDPOINT.to_string())
+    }
+}
+
+// ─── Provider construction (fallible) ──────────────────────────────────────────
+
+/// Initialize an OTLP tracer provider.
+///
+/// Returns an error instead of panicking when the exporter cannot be built.
 pub fn init_tracer_provider(
     service_name: &str,
     service_version: &str,
     endpoint: &str,
-) -> SdkTracerProvider {
+) -> Result<SdkTracerProvider, TelemetryInitError> {
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
         .build()
-        .expect("OTLP span exporter init failed");
+        .map_err(|e| TelemetryInitError::TracerProvider(e.to_string()))?;
 
-    SdkTracerProvider::builder()
+    Ok(SdkTracerProvider::builder()
         .with_id_generator(RandomIdGenerator::default())
         .with_resource(resource(service_name, service_version))
         .with_batch_exporter(exporter)
-        .build()
+        .build())
 }
 
-/// Initialize an OTLP logger provider
+/// Initialize an OTLP logger provider.
+///
+/// Returns an error instead of panicking when the exporter cannot be built.
 pub fn init_logger_provider(
     service_name: &str,
     service_version: &str,
     endpoint: &str,
-) -> SdkLoggerProvider {
+) -> Result<SdkLoggerProvider, TelemetryInitError> {
     let exporter = opentelemetry_otlp::LogExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
         .build()
-        .expect("OTLP log exporter init failed");
+        .map_err(|e| TelemetryInitError::LoggerProvider(e.to_string()))?;
 
-    SdkLoggerProvider::builder()
+    Ok(SdkLoggerProvider::builder()
         .with_resource(resource(service_name, service_version))
         .with_batch_exporter(exporter)
-        .build()
+        .build())
 }
 
-/// Setup telemetry with configurable service name and version
+// ─── Boxed layer alias ─────────────────────────────────────────────────────────
+
+/// A type-erased tracing layer suitable for dynamic subscriber composition.
+///
+/// Callers that need to inject custom layers (e.g. an FFI callback layer)
+/// should box them with `.boxed()` and pass them via
+/// [`try_setup_telemetry_with_layers`].
+pub type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
+
+// ─── Core setup (fallible, no extra layers) ────────────────────────────────────
+
+/// Try to set up telemetry with the given configuration.
+///
+/// On success, returns `Ok(Some(endpoint))` when OTLP was enabled, or
+/// `Ok(None)` when OTLP was disabled but the console subscriber was installed.
+///
+/// This is the fallible counterpart to [`setup_telemetry`].
+pub fn try_setup_telemetry(
+    config: TelemetryConfig<'_>,
+) -> Result<Option<String>, TelemetryInitError> {
+    try_setup_telemetry_with_layers(config, Vec::new())
+}
+
+// ─── Core setup (fallible, with extra layers) ──────────────────────────────────
+
+/// Try to set up telemetry, attaching extra [`Layer`]s to the subscriber.
+///
+/// On success, returns `Ok(Some(endpoint))` when OTLP was enabled, or
+/// `Ok(None)` when OTLP was disabled but the console subscriber was installed.
+///
+/// Extra layers are appended **after** the fmt and OTLP layers, so they
+/// receive every event that passes the earlier filters.
+///
+/// # Example
+///
+/// ```ignore
+/// use tracing_subscriber::prelude::*;
+///
+/// let my_layer = MyCallbackLayer.with_filter(EnvFilter::new("info")).boxed();
+///
+/// let config = querymt_utils::telemetry::TelemetryConfig { /* ... */ };
+/// querymt_utils::telemetry::try_setup_telemetry_with_layers(config, vec![my_layer])?;
+/// ```
+pub fn try_setup_telemetry_with_layers(
+    config: TelemetryConfig<'_>,
+    extra_layers: Vec<BoxedLayer>,
+) -> Result<Option<String>, TelemetryInitError> {
+    // Bridge log → tracing so `log::info!` etc. also flow through.
+    LogTracer::init().map_err(|_| TelemetryInitError::LogTracer)?;
+
+    // Console filter: default ERROR, overridden by RUST_LOG.
+    let console_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("error"));
+    let writer: BoxMakeWriter = if config.use_stderr {
+        BoxMakeWriter::new(std::io::stderr)
+    } else {
+        BoxMakeWriter::new(std::io::stdout)
+    };
+
+    let mut layers: Vec<BoxedLayer> = Vec::new();
+
+    // Always add the console fmt layer.
+    layers.push(
+        ts_fmt::layer()
+            .with_writer(writer)
+            .with_target(true)
+            .with_filter(console_filter)
+            .boxed(),
+    );
+
+    if config.enable_otlp {
+        // OTLP telemetry filter: default INFO, overridden by QMT_TELEMETRY_LEVEL.
+        // Two separate instances because EnvFilter is not Clone.
+        let telemetry_level =
+            std::env::var("QMT_TELEMETRY_LEVEL").unwrap_or_else(|_| "info".into());
+        let trace_filter = EnvFilter::new(&telemetry_level);
+        let log_filter = EnvFilter::new(&telemetry_level);
+
+        let endpoint = config.resolve_endpoint();
+
+        let tracer_provider =
+            init_tracer_provider(config.service_name, config.service_version, &endpoint)?;
+        let tracer = tracer_provider.tracer("qmt-tracer");
+
+        let logger_provider =
+            init_logger_provider(config.service_name, config.service_version, &endpoint)?;
+        let otel_log_layer = OpenTelemetryTracingBridge::new(&logger_provider);
+
+        layers.push(
+            OpenTelemetryLayer::new(tracer)
+                .with_filter(trace_filter)
+                .boxed(),
+        );
+        layers.push(otel_log_layer.with_filter(log_filter).boxed());
+
+        // Append caller-provided layers.
+        layers.extend(extra_layers);
+
+        let subscriber = Registry::default().with(layers);
+        tracing::subscriber::set_global_default(subscriber)
+            .map_err(|_| TelemetryInitError::Subscriber)?;
+
+        return Ok(Some(endpoint));
+    }
+
+    // OTLP disabled — just console + any caller layers.
+    layers.extend(extra_layers);
+
+    let subscriber = Registry::default().with(layers);
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|_| TelemetryInitError::Subscriber)?;
+
+    Ok(None)
+}
+
+// ─── Convenience wrapper (panics on failure) ───────────────────────────────────
+
+/// Setup telemetry with configurable service name and version.
 ///
 /// Uses **per-layer filtering** so that console output and OTLP telemetry
 /// can operate at independent log levels:
@@ -94,50 +285,18 @@ pub fn init_logger_provider(
 /// - `OTEL_EXPORTER_OTLP_ENDPOINT`: Custom OTLP endpoint (defaults to http://otel.query.mt:4317)
 /// - `RUST_LOG`: Controls console output filtering (defaults to `error`)
 /// - `QMT_TELEMETRY_LEVEL`: Controls OTLP telemetry filtering (defaults to `info`)
+///
+/// # Panics
+/// Panics if the global subscriber or `LogTracer` could not be installed
+/// (e.g. because another caller already set one).
 pub fn setup_telemetry(service_name: &str, service_version: &str, use_stderr: bool) {
-    // Always initialize LogTracer for log->tracing bridge
-    LogTracer::init().expect("Failed to set LogTracer");
-
-    // Console filter: default ERROR, overridden by RUST_LOG
-    let console_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("error"));
-    let writer: BoxMakeWriter = if use_stderr {
-        BoxMakeWriter::new(std::io::stderr)
-    } else {
-        BoxMakeWriter::new(std::io::stdout)
+    let config = TelemetryConfig {
+        service_name,
+        service_version,
+        use_stderr,
+        enable_otlp: std::env::var("QMT_NO_TELEMETRY").is_err(),
+        endpoint: None,
     };
-    let fmt_layer = fmt::layer()
-        .with_writer(writer)
-        .with_target(true)
-        .with_filter(console_filter);
 
-    // Check if telemetry is disabled
-    if std::env::var("QMT_NO_TELEMETRY").is_ok() {
-        let subscriber = Registry::default().with(fmt_layer);
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("Failed to set tracing subscriber");
-        return;
-    }
-
-    // Telemetry filter: default INFO, overridden by QMT_TELEMETRY_LEVEL
-    // Two separate instances needed because EnvFilter doesn't implement Clone
-    let telemetry_level = std::env::var("QMT_TELEMETRY_LEVEL").unwrap_or_else(|_| "info".into());
-    let trace_filter = EnvFilter::new(&telemetry_level);
-    let log_filter = EnvFilter::new(&telemetry_level);
-
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .unwrap_or_else(|_| DEFAULT_OTLP_ENDPOINT.to_string());
-
-    let tracer_provider = init_tracer_provider(service_name, service_version, &endpoint);
-    let tracer = tracer_provider.tracer("qmt-tracer");
-
-    let logger_provider = init_logger_provider(service_name, service_version, &endpoint);
-    let log_layer = OpenTelemetryTracingBridge::new(&logger_provider);
-
-    let subscriber = Registry::default()
-        .with(fmt_layer)
-        .with(OpenTelemetryLayer::new(tracer).with_filter(trace_filter))
-        .with(log_layer.with_filter(log_filter));
-
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
+    try_setup_telemetry(config).expect("Failed to set up telemetry");
 }

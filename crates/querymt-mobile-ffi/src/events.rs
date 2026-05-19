@@ -229,85 +229,37 @@ pub fn setup_mobile_telemetry() {
     }
 }
 
-/// Full telemetry init: tracing subscriber with OTLP + FFI callback layers.
+/// Full telemetry init: delegates subscriber assembly to `querymt_utils`
+/// with the FFI callback layer attached as an extra layer.
 fn init_telemetry() {
-    use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-    use tracing_opentelemetry::OpenTelemetryLayer;
     use tracing_subscriber::EnvFilter;
 
-    // Resolve endpoint: env var → querymt-utils default.
-    let default_endpoint = querymt_utils::telemetry::default_otlp_endpoint();
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .unwrap_or_else(|_| default_endpoint.to_string());
-
-    // Store for mesh_status diagnostics.
-    {
-        let mut active = ACTIVE_OTLP_ENDPOINT.lock().unwrap();
-        *active = Some(endpoint.clone());
-    }
-
-    // Bridge log -> tracing so log::info! etc. also flow through.
-    let _ = tracing_log::LogTracer::init();
-
-    // Console filter
-    let console_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("error"));
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_target(true)
-        .with_filter(console_filter);
-
-    // OTLP telemetry filter — read QMT_TELEMETRY_LEVEL, default info.
-    let telemetry_level = std::env::var("QMT_TELEMETRY_LEVEL").unwrap_or_else(|_| "info".into());
-    let trace_filter = EnvFilter::new(&telemetry_level);
-    let log_filter = EnvFilter::new(&telemetry_level);
+    let config = querymt_utils::telemetry::TelemetryConfig {
+        service_name: "querymt-mobile",
+        service_version: env!("CARGO_PKG_VERSION"),
+        use_stderr: true,
+        enable_otlp: true,
+        endpoint: None, // let utils resolve from env / default
+    };
 
     // FFI callback filter — forward info+ to native side.
-    let ffi_filter = EnvFilter::new("info");
+    let ffi_layer = FfiCallbackLayer.with_filter(EnvFilter::new("info")).boxed();
 
-    // Build OTLP providers using querymt-utils helpers.
-    let tracer_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        querymt_utils::telemetry::init_tracer_provider(
-            "querymt-mobile",
-            env!("CARGO_PKG_VERSION"),
-            &endpoint,
-        )
-    }));
-    let logger_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        querymt_utils::telemetry::init_logger_provider(
-            "querymt-mobile",
-            env!("CARGO_PKG_VERSION"),
-            &endpoint,
-        )
-    }));
-
-    match (tracer_result, logger_result) {
-        (Ok(tracer_provider), Ok(logger_provider)) => {
-            let tracer = tracer_provider.tracer("qmt-mobile-tracer");
-
-            let subscriber = tracing_subscriber::Registry::default()
-                .with(fmt_layer)
-                .with(OpenTelemetryLayer::new(tracer).with_filter(trace_filter))
-                .with(OpenTelemetryTracingBridge::new(&logger_provider).with_filter(log_filter))
-                .with(FfiCallbackLayer.with_filter(ffi_filter));
-
-            match tracing::subscriber::set_global_default(subscriber) {
-                Ok(()) => {
-                    log::info!("OTLP telemetry initialized, endpoint={}", endpoint);
-                }
-                Err(e) => {
-                    log::warn!("Failed to set global subscriber: {e}; OTLP will not be active");
-                }
+    match querymt_utils::telemetry::try_setup_telemetry_with_layers(config, vec![ffi_layer]) {
+        Ok(Some(endpoint)) => {
+            // Store for mesh_status diagnostics.
+            {
+                let mut active = ACTIVE_OTLP_ENDPOINT.lock().unwrap();
+                *active = Some(endpoint.clone());
             }
+            log::info!("OTLP telemetry initialized, endpoint={}", endpoint);
         }
-        (tracer_err, logger_err) => {
-            if tracer_err.is_err() {
-                log::warn!("OTLP tracer provider init failed for endpoint {endpoint}");
-            }
-            if logger_err.is_err() {
-                log::warn!("OTLP logger provider init failed for endpoint {endpoint}");
-            }
+        Ok(None) => {
+            // OTLP was not enabled (shouldn't happen here, but handle gracefully).
+            init_fallback_logger();
+        }
+        Err(e) => {
+            log::warn!("OTLP telemetry init failed: {e}");
             init_fallback_logger();
         }
     }
