@@ -1661,7 +1661,7 @@ impl SendAgent for LocalAgentHandle {
 
         if let Ok(mut state) = self.client_state.lock() {
             *state = Some(ClientState {
-                protocol_version: protocol_version.clone(),
+                protocol_version,
                 client_capabilities: req.client_capabilities.clone(),
                 client_info: req.client_info.clone(),
                 authenticated: false,
