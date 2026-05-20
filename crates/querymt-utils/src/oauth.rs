@@ -340,7 +340,7 @@ impl XaiProvider {
         use base64::Engine as _;
 
         let mut bytes = vec![0u8; byte_len];
-        getrandom::getrandom(&mut bytes)?;
+        getrandom::fill(&mut bytes)?;
         Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
     }
 
