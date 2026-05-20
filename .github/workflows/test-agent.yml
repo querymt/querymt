@@ -52,6 +52,8 @@ jobs:
       
       - name: Cache Cargo dependencies
         uses: swatinem/rust-cache@v2
+        with:
+          key: agent-clippy
       
       - name: Run Clippy
         run: cargo clippy --package querymt-agent --all-targets --features "${features}" -- -D warnings
@@ -71,6 +73,8 @@ jobs:
       
       - name: Cache Cargo dependencies
         uses: swatinem/rust-cache@v2
+        with:
+          key: agent-test
       
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
