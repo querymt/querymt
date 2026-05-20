@@ -104,9 +104,11 @@ impl ToolTrait for ShellTool {
             .ok_or_else(|| ToolError::InvalidRequest("No working directory available".into()))?;
         cmd.current_dir(dir);
 
-        // Pipe stdout/stderr so we can read them after waiting.
+        // Pipe stdout/stderr so we can read them after waiting, and detach
+        // stdin so commands that read from it receive EOF instead of the terminal.
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        cmd.stdin(std::process::Stdio::null());
 
         // Place the child in its own process group so that on cancellation we
         // can kill the entire tree (sh + any children it spawned) with a single
@@ -260,6 +262,31 @@ mod tests {
 
         assert_eq!(parsed["exit_code"], 0);
         assert!(parsed["stdout"].as_str().unwrap().contains("hello world"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shell_stdin_defaults_to_eof() {
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let tool = ShellTool::new();
+
+        let args = json!({
+            "command": "cat 2>&1 | tail -5"
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(2), tool.call(args, &context))
+            .await
+            .expect("stdin-reading command should complete with EOF")
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&first_text_block(result)).unwrap();
+
+        assert_eq!(parsed["exit_code"], 0);
+        assert_eq!(parsed["stdout"], "");
+        assert_eq!(parsed["stderr"], "");
     }
 
     /// Verify that cancelling a running shell command actually kills the
