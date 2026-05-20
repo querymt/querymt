@@ -2046,7 +2046,7 @@ output such as streaming-chunk sizes and abbreviated tool-result previews.</p>
 <h2 id="where-telemetry-is-sent">Where Telemetry Is Sent</h2>
 <p>By default, both traces and logs are exported via gRPC to the QueryMT
 project's OpenTelemetry collector:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a>http://otel.query.mt:4317
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a>https://otel.query.mt
 </code></pre></div></td></tr></table></div>
 <p>This is a standard <a href="https://opentelemetry.io/docs/specs/otlp/#otlpgrpc">OTLP/gRPC</a>
 endpoint. You can redirect telemetry to your own collector by setting the
@@ -2075,7 +2075,7 @@ endpoint. You can redirect telemetry to your own collector by setting the
 </tr>
 <tr>
 <td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td>
-<td><code>http://otel.query.mt:4317</code></td>
+<td><code>https://otel.query.mt</code></td>
 <td>OTLP collector endpoint (gRPC).</td>
 </tr>
 <tr>
