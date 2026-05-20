@@ -27,9 +27,62 @@
 
 #[cfg(feature = "oauth")]
 use anthropic_auth::TokenSet;
-use keyring::Entry;
+use keyring_core::Entry;
 use std::io;
+use std::sync::OnceLock;
 use std::time::SystemTime;
+
+/// Ensures the default keyring store is initialized exactly once.
+///
+/// On first call this sets the platform-native credential store as the default
+/// used by `keyring_core::Entry`. Subsequent calls are no-ops.
+static STORE_INIT: OnceLock<()> = OnceLock::new();
+
+fn ensure_store_initialized() {
+    STORE_INIT.get_or_init(|| {
+        init_native_store();
+    });
+}
+
+/// Platform-aware store initialization.
+///
+/// Creates the appropriate native credential store and sets it as the
+/// default for `keyring_core::Entry::new()`.
+///
+/// # Panics
+///
+/// Panics if the platform store cannot be created (e.g. keychain access failure).
+fn init_native_store() {
+    #[cfg(target_os = "macos")]
+    {
+        let store = apple_native_keyring_store::keychain::Store::new()
+            .expect("Failed to create macOS Keychain store");
+        keyring_core::set_default_store(store);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let store = windows_native_keyring_store::Store::new()
+            .expect("Failed to create Windows Credential store");
+        keyring_core::set_default_store(store);
+    }
+
+    // On Linux: use DBus Secret Service when the feature is enabled,
+    // otherwise fall back to kernel keyutils.
+    #[cfg(all(target_os = "linux", feature = "dbus-secret-service"))]
+    {
+        let store = dbus_secret_service_keyring_store::Store::new()
+            .expect("Failed to create DBus Secret Service store");
+        keyring_core::set_default_store(store);
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "dbus-secret-service")))]
+    {
+        let store = linux_keyutils_keyring_store::Store::new()
+            .expect("Failed to create Linux keyutils store");
+        keyring_core::set_default_store(store);
+    }
+}
 
 /// Key used to store the default provider in the secret store
 const DEFAULT_PROVIDER_KEY: &str = "default";
@@ -50,6 +103,7 @@ impl SecretStore {
     ///
     /// * `io::Result<Self>` - A new SecretStore instance or an IO error
     pub fn new() -> io::Result<Self> {
+        ensure_store_initialized();
         Ok(SecretStore {})
     }
 
@@ -105,7 +159,7 @@ impl SecretStore {
         let entry = Entry::new(SERVICE_NAME, key).map_err(|e| io::Error::other(e.to_string()))?;
 
         match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
             Err(e) => Err(io::Error::other(e.to_string())),
         }
     }

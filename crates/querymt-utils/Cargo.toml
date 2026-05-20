@@ -8,10 +8,18 @@ description = "Shared utilities for querymt workspace"
 [features]
 default = []
 serde = ["dep:serde"]
-secret-store = ["dep:keyring", "dep:serde_json"]
+secret-store = [
+    "dep:keyring-core",
+    "dep:serde_json",
+    # Platform-native stores
+    "dep:apple-native-keyring-store",
+    "dep:windows-native-keyring-store",
+    "dep:linux-keyutils-keyring-store",
+]
 oauth = ["secret-store", "serde", "dep:anthropic-auth", "dep:openai-auth", "dep:kimi-auth", "dep:async-trait", "dep:anyhow", "dep:url", "dep:tokio", "dep:reqwest", "dep:base64", "dep:sha2", "dep:getrandom"]
 providers = ["dep:reqwest", "dep:dirs", "dep:anyhow"]
-dbus-secret-service = ["keyring/sync-secret-service"]
+# Use DBus Secret Service backend instead of linux-keyutils on Linux.
+dbus-secret-service = ["dep:dbus-secret-service-keyring-store"]
 
 [dependencies]
 tracing.workspace = true
@@ -26,7 +34,7 @@ opentelemetry-appender-tracing = { version = "0.32", features = ["log"] }
 opentelemetry-semantic-conventions = "0.32"
 
 # Secret store dependencies (optional, behind secret-store feature)
-keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native", "crypto-rust"], optional = true }
+keyring-core = { version = "1.0", optional = true }
 serde_json = { workspace = true, optional = true }
 
 # OAuth dependencies (optional, behind oauth feature)
@@ -44,3 +52,14 @@ sha2 = { version = "0.10", optional = true }
 getrandom = { version = "0.4", optional = true }
 dirs = { workspace = true, optional = true }
 oauth2 = { version = "5.0", default-features = false, features = ["reqwest", "rustls-tls"] }
+
+# Platform-native keyring stores (optional, behind secret-store feature)
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1.0", features = ["keychain"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { version = "1.0", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-keyutils-keyring-store = { version = "1.0", optional = true }
+dbus-secret-service-keyring-store = { version = "1.0", features = ["crypto-rust"], optional = true }
