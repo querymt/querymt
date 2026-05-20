@@ -391,18 +391,22 @@ impl MembershipStore {
     }
 }
 
-/// Return the default membership store path: `~/.qmt/memberships.json`.
+/// Return the default membership store path: `<config_dir>/memberships.json`.
+///
+/// Respects `QMT_CONFIG_DIR` / `QMT_HOME` env vars, falling back to `~/.qmt`.
 pub fn default_membership_store_path() -> Result<PathBuf, InviteError> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| InviteError::StoreError("cannot determine home directory".to_string()))?;
-    Ok(home.join(".qmt").join("memberships.json"))
+    let cfg_dir = querymt_utils::providers::config_dir()
+        .map_err(|e| InviteError::StoreError(format!("cannot determine config dir: {e}")))?;
+    Ok(cfg_dir.join("memberships.json"))
 }
 
-/// Return the default admitted-peers store path: `~/.qmt/admitted_peers.json`.
+/// Return the default admitted-peers store path: `<config_dir>/admitted_peers.json`.
+///
+/// Respects `QMT_CONFIG_DIR` / `QMT_HOME` env vars, falling back to `~/.qmt`.
 pub fn default_admitted_peers_path() -> Result<PathBuf, InviteError> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| InviteError::StoreError("cannot determine home directory".to_string()))?;
-    Ok(home.join(".qmt").join("admitted_peers.json"))
+    let cfg_dir = querymt_utils::providers::config_dir()
+        .map_err(|e| InviteError::StoreError(format!("cannot determine config dir: {e}")))?;
+    Ok(cfg_dir.join("admitted_peers.json"))
 }
 
 /// Errors that can occur when working with invite tokens.
@@ -1065,11 +1069,13 @@ fn save_json_file<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), Inv
 
 // ── Default invite store path ──────────────────────────────────────────────────
 
-/// Return the default invite store path: `~/.qmt/invites.json`.
+/// Return the default invite store path: `<config_dir>/invites.json`.
+///
+/// Respects `QMT_CONFIG_DIR` / `QMT_HOME` env vars, falling back to `~/.qmt`.
 pub fn default_invite_store_path() -> Result<PathBuf, InviteError> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| InviteError::StoreError("cannot determine home directory".to_string()))?;
-    Ok(home.join(".qmt").join("invites.json"))
+    let cfg_dir = querymt_utils::providers::config_dir()
+        .map_err(|e| InviteError::StoreError(format!("cannot determine config dir: {e}")))?;
+    Ok(cfg_dir.join("invites.json"))
 }
 
 // ── Duration parsing utilities ─────────────────────────────────────────────────

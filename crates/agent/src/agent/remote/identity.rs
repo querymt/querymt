@@ -5,7 +5,7 @@
 //! `PeerId`) become invalid every time the process is restarted.
 //!
 //! The keypair is stored as a raw 64-byte ed25519 secret key file at
-//! `~/.qmt/mesh_identity.key` (or a custom path via config).  The file is
+//! `<config_dir>/mesh_identity.key` (or a custom path via config).  The file is
 //! created with `0o600` permissions on Unix.
 
 use anyhow::{Context, Result, anyhow};
@@ -14,10 +14,12 @@ use std::path::{Path, PathBuf};
 /// Default filename within the qmt config directory.
 const DEFAULT_FILENAME: &str = "mesh_identity.key";
 
-/// Return the default identity file path: `~/.qmt/mesh_identity.key`.
+/// Return the default identity file path: `<config_dir>/mesh_identity.key`.
+///
+/// Respects `QMT_CONFIG_DIR` / `QMT_HOME` env vars, falling back to `~/.qmt`.
 pub fn default_identity_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
-    Ok(home.join(".qmt").join(DEFAULT_FILENAME))
+    let cfg_dir = querymt_utils::providers::config_dir()?;
+    Ok(cfg_dir.join(DEFAULT_FILENAME))
 }
 
 /// Load an existing keypair from `path`, or generate a new one and persist it.

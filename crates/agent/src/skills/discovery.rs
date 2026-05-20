@@ -8,8 +8,10 @@ pub fn default_search_paths(project_root: &Path) -> Vec<SkillSource> {
     let mut paths = vec![];
 
     // Global paths (lowest priority)
+    if let Ok(cfg_dir) = querymt_utils::providers::config_dir() {
+        paths.push(SkillSource::Global(cfg_dir.join("skills")));
+    }
     if let Some(home) = dirs::home_dir() {
-        paths.push(SkillSource::Global(home.join(".qmt/skills")));
         paths.push(SkillSource::Global(home.join(".claude/skills")));
         paths.push(SkillSource::Global(home.join(".agents/skills")));
     }
