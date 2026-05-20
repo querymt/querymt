@@ -146,7 +146,7 @@ By default, both traces and logs are exported via gRPC to the QueryMT
 project's OpenTelemetry collector:
 
 ```
-http://otel.query.mt:4317
+https://otel.query.mt
 ```
 
 This is a standard [OTLP/gRPC](https://opentelemetry.io/docs/specs/otlp/#otlpgrpc)
@@ -163,7 +163,7 @@ endpoint. You can redirect telemetry to your own collector by setting the
 |---|---|---|
 | `QMT_NO_TELEMETRY` | *(unset)* | Set to **any value** to disable all OTLP export. Only local console logging remains active. |
 | `QMT_TELEMETRY_LEVEL` | `info` | Filter level for exported traces and logs. Accepts standard levels: `trace`, `debug`, `info`, `warn`, `error`. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://otel.query.mt:4317` | OTLP collector endpoint (gRPC). |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `https://otel.query.mt` | OTLP collector endpoint (gRPC). |
 | `RUST_LOG` | `error` | Console output filter. Independent of the OTLP telemetry level. |
 
 ### Disabling telemetry entirely

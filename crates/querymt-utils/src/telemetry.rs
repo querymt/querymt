@@ -18,7 +18,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Registry};
 
 /// Default OTLP endpoint for telemetry
-pub const DEFAULT_OTLP_ENDPOINT: &str = "http://otel.query.mt:4317";
+pub const DEFAULT_OTLP_ENDPOINT: &str = "https://otel.query.mt";
 
 /// Returns the default OTLP endpoint. Useful for callers that need the value
 /// without duplicating the constant.
@@ -271,7 +271,7 @@ pub fn try_setup_telemetry_with_layers(
 ///
 /// # Behavior
 /// - If `QMT_NO_TELEMETRY` env var is set, only sets up fmt layer (no OTLP export)
-/// - If `OTEL_EXPORTER_OTLP_ENDPOINT` is not set, defaults to `http://otel.query.mt:4317`
+/// - If `OTEL_EXPORTER_OTLP_ENDPOINT` is not set, defaults to `https://otel.query.mt`
 /// - If `OTEL_EXPORTER_OTLP_ENDPOINT` is set, uses that endpoint instead
 ///
 /// # Arguments
@@ -282,7 +282,7 @@ pub fn try_setup_telemetry_with_layers(
 ///
 /// # Environment Variables
 /// - `QMT_NO_TELEMETRY`: If set (any value), disables OTLP export
-/// - `OTEL_EXPORTER_OTLP_ENDPOINT`: Custom OTLP endpoint (defaults to http://otel.query.mt:4317)
+/// - `OTEL_EXPORTER_OTLP_ENDPOINT`: Custom OTLP endpoint (defaults to https://otel.query.mt)
 /// - `RUST_LOG`: Controls console output filtering (defaults to `error`)
 /// - `QMT_TELEMETRY_LEVEL`: Controls OTLP telemetry filtering (defaults to `info`)
 ///
