@@ -29,7 +29,9 @@ pub mod types;
 mod agent;
 mod mcp;
 
+use async_trait::async_trait;
 use ffi_helpers::{set_last_error, take_last_error_code, take_last_error_message};
+use querymt_agent::session::projection::ViewStore;
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -54,6 +56,48 @@ struct AcpConnection {
     handler: Option<(AcpMessageHandlerFn, usize)>,
 }
 
+struct MobileAcpSessionHooks {
+    agent_handle: u64,
+    view_store: Arc<dyn ViewStore>,
+}
+
+#[async_trait]
+impl querymt_agent::acp::shared::AcpSessionHooks for MobileAcpSessionHooks {
+    async fn preconnected_mcp_peers(
+        &self,
+    ) -> Result<
+        Vec<querymt_agent::agent::session_registry::PreconnectedMcpPeer>,
+        agent_client_protocol::schema::Error,
+    > {
+        mcp::collect_preconnected_mcp_servers(self.agent_handle)
+            .await
+            .map_err(|e| {
+                agent_client_protocol::schema::Error::internal_error().data(serde_json::json!({
+                    "message": "collect preconnected MCP failed",
+                    "ffiCode": e as i32,
+                }))
+            })
+    }
+
+    async fn on_session_loaded(
+        &self,
+        agent: &querymt_agent::agent::LocalAgentHandle,
+        session_id: &str,
+        response: &mut serde_json::Value,
+    ) -> Result<(), agent_client_protocol::schema::Error> {
+        inject_session_load_snapshot(agent, self.view_store.clone(), session_id, response).await
+    }
+
+    async fn on_remote_session_attached(
+        &self,
+        agent: &querymt_agent::agent::LocalAgentHandle,
+        session_id: &str,
+        response: &mut serde_json::Value,
+    ) -> Result<(), agent_client_protocol::schema::Error> {
+        ensure_remote_attach_snapshot(agent, self.view_store.clone(), session_id, response).await
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RegisterInprocMcpPipeParams {
@@ -68,6 +112,77 @@ struct UnregisterInprocMcpParams {
 
 fn default_session_cwd() -> std::path::PathBuf {
     querymt_agent::acp::cwd::no_cwd_path()
+}
+
+async fn inject_session_load_snapshot(
+    agent: &querymt_agent::agent::LocalAgentHandle,
+    view_store: Arc<dyn ViewStore>,
+    session_id: &str,
+    response: &mut serde_json::Value,
+) -> Result<(), agent_client_protocol::schema::Error> {
+    let snapshot = querymt_agent::session::load_session_snapshot(agent, view_store, session_id)
+        .await
+        .map_err(|e| agent_client_protocol::schema::Error::internal_error().data(e.to_string()))?;
+
+    let event_count = snapshot.audit.events.len();
+    log::info!(
+        "ffi session/load snapshot injected: session_id={}, events={}",
+        session_id,
+        event_count
+    );
+
+    let Some(obj) = response.as_object_mut() else {
+        return Err(agent_client_protocol::schema::Error::internal_error()
+            .data("session/load returned non-object response"));
+    };
+
+    let meta = obj
+        .entry("_meta")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(meta_obj) = meta.as_object_mut() else {
+        return Err(agent_client_protocol::schema::Error::internal_error()
+            .data("session/load returned non-object _meta"));
+    };
+    meta_obj.insert(
+        "querymt/sessionLoadSnapshot.v1".to_string(),
+        serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null),
+    );
+    Ok(())
+}
+
+async fn ensure_remote_attach_snapshot(
+    agent: &querymt_agent::agent::LocalAgentHandle,
+    view_store: Arc<dyn ViewStore>,
+    session_id: &str,
+    response: &mut serde_json::Value,
+) -> Result<(), agent_client_protocol::schema::Error> {
+    let Some(result_obj) = response.as_object_mut() else {
+        return Err(agent_client_protocol::schema::Error::internal_error()
+            .data("remote attach returned non-object response"));
+    };
+
+    if result_obj.contains_key("snapshot") {
+        log::info!(
+            "ffi remote attach snapshot preserved: session_id={}",
+            session_id
+        );
+        return Ok(());
+    }
+
+    let snapshot = querymt_agent::session::load_session_snapshot(agent, view_store, session_id)
+        .await
+        .map_err(|e| agent_client_protocol::schema::Error::internal_error().data(e.to_string()))?;
+    let event_count = snapshot.audit.events.len();
+    log::info!(
+        "ffi remote attach fallback snapshot injected: session_id={}, events={}",
+        session_id,
+        event_count
+    );
+    result_obj.insert(
+        "snapshot".to_string(),
+        serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null),
+    );
+    Ok(())
 }
 
 /// Normalize `session/new` params: fill in cwd sentinel and mcpServers if missing.
@@ -170,6 +285,47 @@ async fn push_acp_message(
     outbox.lock().await.push_back(json);
 }
 
+#[cfg(feature = "remote")]
+fn spawn_mesh_peer_event_forwarder(
+    inner: std::sync::Arc<querymt_agent::agent::LocalAgentHandle>,
+    connection_handle: u64,
+    outbox: Arc<Mutex<VecDeque<String>>>,
+) {
+    let Some(mesh) = inner.mesh() else {
+        return;
+    };
+
+    let model_registry = inner.model_registry.clone();
+    let mut rx = mesh.subscribe_peer_events();
+    runtime::global_runtime().spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(querymt_agent::agent::remote::mesh::PeerEvent::Discovered(peer_id)) => {
+                    model_registry.invalidate_remote().await;
+                    let notification = querymt_agent::acp::shared::mesh_nodes_changed_notification(
+                        &peer_id.to_string(),
+                        "discovered",
+                    );
+                    if let Ok(json) = serde_json::to_string(&notification) {
+                        push_acp_message(connection_handle, &outbox, json).await;
+                    }
+                }
+                Ok(querymt_agent::agent::remote::mesh::PeerEvent::Expired(peer_id)) => {
+                    model_registry.invalidate_remote().await;
+                    let notification = querymt_agent::acp::shared::mesh_peer_expired_notification(
+                        &peer_id.to_string(),
+                    );
+                    if let Ok(json) = serde_json::to_string(&notification) {
+                        push_acp_message(connection_handle, &outbox, json).await;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
 // ============================================================================
 // Lifecycle
 // ============================================================================
@@ -195,8 +351,8 @@ unsafe fn qmt_internal_android_init(
 /// (`[agent]`) and multi-agent/quorum (`[quorum]`/`[planner]`) configs.
 /// On success, `*out_agent` is set to an opaque handle.
 ///
-/// Telemetry is controlled via environment variables:
-/// - `QMT_MOBILE_TELEMETRY=1` or `OTEL_EXPORTER_OTLP_ENDPOINT` to enable OTLP.
+/// Telemetry is configured explicitly via `qmt_ffi_configure_telemetry`
+/// before agent init, falling back to the build-mode default when omitted.
 ///
 /// # Safety
 ///
@@ -218,7 +374,7 @@ unsafe fn qmt_internal_init_agent(
         // gRPC) and agent startup can find a reactor on this thread.
         let _rt_guard = runtime::global_runtime().enter();
 
-        // Initialize telemetry/logging from environment (idempotent).
+        // Initialize telemetry from the explicit mobile config (idempotent).
         events::setup_mobile_telemetry();
 
         let result = agent::init_agent_from_config(config, out_agent);
@@ -264,6 +420,52 @@ unsafe fn qmt_internal_shutdown(agent_handle: u64) -> i32 {
 unsafe fn qmt_internal_set_backgrounded(backgrounded: i32) -> i32 {
     ffi_helpers::set_backgrounded(backgrounded != 0);
     FfiErrorCode::Ok as i32
+}
+
+/// Configure mobile telemetry before agent init.
+///
+/// When `enabled` is non-zero, OTLP export is initialized on the next agent
+/// startup using the provided endpoint or the shared default endpoint.
+/// When disabled, Rust telemetry initialization is skipped entirely.
+///
+/// # Safety
+///
+/// - `endpoint` must be null or a valid pointer to a null-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qmt_ffi_configure_telemetry(
+    enabled: i32,
+    endpoint: *const std::ffi::c_char,
+) -> i32 {
+    ffi_panic_boundary("qmt_ffi_configure_telemetry", || {
+        let endpoint = if endpoint.is_null() {
+            None
+        } else {
+            match unsafe { std::ffi::CStr::from_ptr(endpoint).to_str() } {
+                Ok(v) if !v.is_empty() => Some(v.to_string()),
+                Ok(_) => None,
+                Err(_) => {
+                    set_last_error(
+                        FfiErrorCode::InvalidArgument,
+                        "telemetry endpoint is not valid UTF-8".into(),
+                    );
+                    return FfiErrorCode::InvalidArgument as i32;
+                }
+            }
+        };
+
+        log::debug!(
+            "configure_telemetry: enabled={} endpoint={}",
+            enabled != 0,
+            endpoint.as_deref().unwrap_or("<default>")
+        );
+
+        events::configure_mobile_telemetry(events::MobileTelemetryConfig {
+            enabled: enabled != 0,
+            endpoint,
+        });
+        ffi_helpers::clear_last_error();
+        FfiErrorCode::Ok as i32
+    })
 }
 
 // ============================================================================
@@ -317,6 +519,9 @@ pub unsafe extern "C" fn qmt_ffi_acp_open(agent_handle: u64, out_connection: *mu
             }
         });
     }
+
+    #[cfg(feature = "remote")]
+    spawn_mesh_peer_event_forwarder(inner.clone(), connection_handle, outbox.clone());
 
     runtime::global_runtime().block_on(async {
         ACP_CONNECTIONS.lock().await.insert(
@@ -423,9 +628,6 @@ pub unsafe extern "C" fn qmt_ffi_acp_send(
         let req_method = req.method.clone();
         log::debug!("ffi acp send: method={}", req_method);
 
-        // ACP core methods stay ACP-first. We only special-case:
-        // 1) querymt/mcp/* extensions for iOS in-process pipe transport registration
-        // 2) session/new + session/load to inject already-registered preconnected MCP peers
         let resp = if req.method == "querymt/mcp/registerInprocPipe" {
             let parsed: Result<RegisterInprocMcpPipeParams, _> =
                 serde_json::from_value(req.params.clone());
@@ -512,215 +714,40 @@ pub unsafe extern "C" fn qmt_ffi_acp_send(
                     id: req.id,
                 },
             }
-        } else if req.method == "session/new" {
-            let normalized = normalize_new_session_params(req.params.clone());
-            let parsed: Result<agent_client_protocol::schema::NewSessionRequest, _> =
-                serde_json::from_value(normalized);
-            match parsed {
-                Ok(params) => match mcp::collect_preconnected_mcp_servers(agent_handle).await {
-                    Ok(preconnected) => {
-                        let res = agent
-                            .new_session_with_preconnected(params, preconnected)
-                            .await;
-                        match res {
-                            Ok(r) => {
-                                let mut owners = session_owners.lock().await;
-                                owners.insert(r.session_id.to_string(), conn_id.clone());
-                                querymt_agent::acp::shared::RpcResponse {
-                                    jsonrpc: "2.0".to_string(),
-                                    result: Some(
-                                        serde_json::to_value(r).unwrap_or(serde_json::Value::Null),
-                                    ),
-                                    error: None,
-                                    id: req.id,
-                                }
-                            }
-                            Err(e) => querymt_agent::acp::shared::RpcResponse {
-                                jsonrpc: "2.0".to_string(),
-                                result: None,
-                                error: Some(
-                                    serde_json::to_value(e)
-                                        .unwrap_or_else(|_| serde_json::json!({"code": -32603})),
-                                ),
-                                id: req.id,
-                            },
-                        }
-                    }
-                    Err(e) => querymt_agent::acp::shared::RpcResponse {
-                        jsonrpc: "2.0".to_string(),
-                        result: None,
-                        error: Some(serde_json::json!({
-                            "code": -32000,
-                            "message": "collect preconnected MCP failed",
-                            "data": { "ffiCode": e as i32 }
-                        })),
-                        id: req.id,
-                    },
-                },
-                Err(e) => querymt_agent::acp::shared::RpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    result: None,
-                    error: Some(serde_json::json!({
-                        "code": -32602,
-                        "message": "invalid params",
-                        "data": { "detail": e.to_string() }
-                    })),
-                    id: req.id,
-                },
-            }
-        } else if req.method == "session/load" {
-            let normalized = normalize_load_session_params(req.params.clone());
-            let parsed: Result<agent_client_protocol::schema::LoadSessionRequest, _> =
-                serde_json::from_value(normalized);
-            match parsed {
-                Ok(params) => match mcp::collect_preconnected_mcp_servers(agent_handle).await {
-                    Ok(preconnected) => {
-                        let session_id_for_owner = params.session_id.to_string();
-                        log::debug!(
-                            "ffi session/load branch entered: session_id={}",
-                            session_id_for_owner
-                        );
-                        let res = agent
-                            .load_session_with_preconnected(params, preconnected)
-                            .await;
-                        match res {
-                            Ok(mut r) => {
-                                let mut owners = session_owners.lock().await;
-                                owners.insert(session_id_for_owner.clone(), conn_id.clone());
-
-                                let snapshot = querymt_agent::session::load_session_snapshot(
-                                    agent.as_ref(),
-                                    view_store.clone(),
-                                    &session_id_for_owner,
-                                )
-                                .await
-                                .map_err(|_| FfiErrorCode::RuntimeError)?;
-
-                                let event_count = snapshot.audit.events.len();
-                                log::info!(
-                                    "ffi session/load snapshot injected: session_id={}, events={}",
-                                    session_id_for_owner,
-                                    event_count
-                                );
-
-                                let meta = r.meta.get_or_insert_with(serde_json::Map::new);
-                                meta.insert(
-                                    "querymt/sessionLoadSnapshot.v1".to_string(),
-                                    serde_json::to_value(snapshot)
-                                        .unwrap_or(serde_json::Value::Null),
-                                );
-
-                                querymt_agent::acp::shared::RpcResponse {
-                                    jsonrpc: "2.0".to_string(),
-                                    result: Some(
-                                        serde_json::to_value(r).unwrap_or(serde_json::Value::Null),
-                                    ),
-                                    error: None,
-                                    id: req.id,
-                                }
-                            }
-                            Err(e) => querymt_agent::acp::shared::RpcResponse {
-                                jsonrpc: "2.0".to_string(),
-                                result: None,
-                                error: Some(
-                                    serde_json::to_value(e)
-                                        .unwrap_or_else(|_| serde_json::json!({"code": -32603})),
-                                ),
-                                id: req.id,
-                            },
-                        }
-                    }
-                    Err(e) => querymt_agent::acp::shared::RpcResponse {
-                        jsonrpc: "2.0".to_string(),
-                        result: None,
-                        error: Some(serde_json::json!({
-                            "code": -32000,
-                            "message": "collect preconnected MCP failed",
-                            "data": { "ffiCode": e as i32 }
-                        })),
-                        id: req.id,
-                    },
-                },
-                Err(e) => querymt_agent::acp::shared::RpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    result: None,
-                    error: Some(serde_json::json!({
-                        "code": -32602,
-                        "message": "invalid params",
-                        "data": { "detail": e.to_string() }
-                    })),
-                    id: req.id,
-                },
-            }
-        } else if req.method == "querymt/remote/attachSession" {
-            let session_id_for_owner = req
-                .params
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            let output = querymt_agent::acp::shared::handle_rpc_message(
-                agent.as_ref(),
-                &session_owners,
-                &pending_permissions,
-                &pending_elicitations,
-                &conn_id,
-                req,
-            )
-            .await;
-
-            let mut response = output.response;
-            if response.error.is_none() {
-                if let Some(sid) = &session_id_for_owner {
-                    let mut owners = session_owners.lock().await;
-                    owners.insert(sid.clone(), conn_id.clone());
-
-                    if let Some(result) = response.result.as_mut()
-                        && let Some(result_obj) = result.as_object_mut()
-                    {
-                        if result_obj.contains_key("snapshot") {
-                            log::info!(
-                                "ffi remote attach snapshot preserved: session_id={}",
-                                sid
-                            );
-                        } else {
-                            let snapshot = querymt_agent::session::load_session_snapshot(
-                                agent.as_ref(),
-                                view_store.clone(),
-                                sid,
-                            )
-                            .await
-                            .map_err(|_| FfiErrorCode::RuntimeError)?;
-                            let event_count = snapshot.audit.events.len();
-                            log::info!(
-                                "ffi remote attach fallback snapshot injected: session_id={}, events={}",
-                                sid,
-                                event_count
-                            );
-                            result_obj.insert(
-                                "snapshot".to_string(),
-                                serde_json::to_value(snapshot)
-                                    .unwrap_or(serde_json::Value::Null),
-                            );
-                        }
-                    }
-                }
-            }
-
-            for notification in output.notifications {
-                if let Ok(json) = serde_json::to_string(&notification) {
-                    push_acp_message(connection_handle, &outbox, json).await;
-                }
-            }
-            response
         } else {
-            let output = querymt_agent::acp::shared::handle_rpc_message(
+            let req = match req.method.as_str() {
+                "session/new" => querymt_agent::acp::shared::RpcRequest {
+                    jsonrpc: req.jsonrpc,
+                    method: req.method,
+                    params: normalize_new_session_params(req.params),
+                    id: req.id,
+                },
+                "session/load" => {
+                    let normalized = normalize_load_session_params(req.params);
+                    querymt_agent::acp::shared::RpcRequest {
+                        jsonrpc: req.jsonrpc,
+                        method: req.method,
+                        params: normalized,
+                        id: req.id,
+                    }
+                }
+                _ => req,
+            };
+            let hooks: Arc<dyn querymt_agent::acp::shared::AcpSessionHooks> =
+                Arc::new(MobileAcpSessionHooks {
+                    agent_handle,
+                    view_store: view_store.clone(),
+                });
+            let output = querymt_agent::acp::shared::handle_rpc_message_with_context(
                 agent.as_ref(),
                 &session_owners,
                 &pending_permissions,
                 &pending_elicitations,
                 &conn_id,
                 req,
+                querymt_agent::acp::shared::RpcDispatchContext {
+                    session_hooks: Some(hooks),
+                },
             )
             .await;
             for notification in output.notifications {
@@ -737,6 +764,30 @@ pub unsafe extern "C" fn qmt_ffi_acp_send(
             resp_json
         );
         push_acp_message(connection_handle, &outbox, resp_json).await;
+
+        if req_method == "querymt/mesh/join"
+            && resp.error.is_none()
+            && let Some(peer_id) = resp
+                .result
+                .as_ref()
+                .and_then(|result| result.get("peer_id"))
+                .and_then(serde_json::Value::as_str)
+        {
+            let notification =
+                querymt_agent::acp::shared::mesh_joined_notification(peer_id, "unknown");
+            if let Ok(json) = serde_json::to_string(&notification) {
+                push_acp_message(connection_handle, &outbox, json).await;
+            }
+        }
+
+        if req_method == "querymt/refreshModels" && resp.error.is_none() {
+            let notification =
+                querymt_agent::acp::shared::models_changed_notification("manual_refresh");
+            if let Ok(json) = serde_json::to_string(&notification) {
+                push_acp_message(connection_handle, &outbox, json).await;
+            }
+        }
+
         Ok::<(), FfiErrorCode>(())
     });
 
@@ -1142,6 +1193,20 @@ mod tests {
         remove_test_connection(connection_handle);
     }
 
+    #[test]
+    fn mesh_notification_json_shape_matches_mobile_expectations() {
+        let msg =
+            querymt_agent::acp::shared::mesh_nodes_changed_notification("peer-123", "discovered");
+        let json = serde_json::to_value(msg).expect("serialize mesh notification");
+        assert_eq!(json["jsonrpc"], serde_json::json!("2.0"));
+        assert_eq!(
+            json["method"],
+            serde_json::json!("querymt/mesh/nodesChanged")
+        );
+        assert_eq!(json["params"]["peerId"], serde_json::json!("peer-123"));
+        assert_eq!(json["params"]["change"], serde_json::json!("discovered"));
+    }
+
     /// Regression test: the FFI remote attach path must NOT overwrite a
     /// snapshot already present in the ACP response.  The server-side
     /// `querymt/remote/attachSession` handler builds a snapshot from the
@@ -1224,6 +1289,29 @@ mod tests {
         assert!(
             result_obj.contains_key("snapshot"),
             "fallback snapshot should be injected"
+        );
+    }
+
+    #[test]
+    fn normalize_load_session_params_preserves_trace_meta() {
+        let params = serde_json::json!({
+            "sessionId": "s-1",
+            "_meta": {
+                "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+            }
+        });
+
+        let normalized = normalize_load_session_params(params);
+
+        assert_eq!(
+            normalized["_meta"]["traceparent"],
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            "_meta.traceparent must survive normalization"
+        );
+        assert!(normalized.get("cwd").is_some(), "cwd should be filled in");
+        assert!(
+            normalized.get("mcpServers").is_some(),
+            "mcpServers should be filled in"
         );
     }
 }

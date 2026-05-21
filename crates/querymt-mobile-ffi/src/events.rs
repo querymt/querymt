@@ -6,18 +6,21 @@
 //!
 //! ## Telemetry
 //!
-//! Telemetry is controlled via environment variables:
-//! - `QMT_MOBILE_TELEMETRY=1` or `OTEL_EXPORTER_OTLP_ENDPOINT` — enables OTLP
-//!   traces + logs export via gRPC.
-//! - `QMT_TELEMETRY_LEVEL` — log level for telemetry (default: `info`).
-//!
-//! When telemetry is not enabled via env, only the FFI callback logger is
-//! installed (using the simpler `log` crate path).
+//! Telemetry is configured explicitly by the mobile app before agent init.
+//! When enabled, Rust exports OTLP traces + logs via gRPC using the configured
+//! endpoint or the shared default endpoint from `querymt-utils`.
+//! `QMT_TELEMETRY_LEVEL` remains an optional developer override for verbosity.
 
 use crate::types::FfiErrorCode;
 use std::sync::Mutex;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
+
+#[derive(Clone, Debug)]
+pub struct MobileTelemetryConfig {
+    pub enabled: bool,
+    pub endpoint: Option<String>,
+}
 
 // ─── Callback Function Pointer Types ────────────────────────────────────────
 
@@ -159,29 +162,14 @@ impl tracing::field::Visit for FfiEventVisitor {
     }
 }
 
-// ─── Fallback: log-crate-only logger (no telemetry) ─────────────────────────
-
-/// Log callback for the `log` crate. Registered via `log::set_boxed_logger`
-/// when telemetry is disabled.
-struct FfiLogger;
-
-impl log::Log for FfiLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool {
-        // Always enabled; filtering is the callback's responsibility.
-        true
-    }
-
-    fn log(&self, record: &log::Record) {
-        invoke_log_handler(record.level(), &record.args().to_string());
-    }
-
-    fn flush(&self) {}
-}
-
 // ─── Initialization ─────────────────────────────────────────────────────────
 
 static LOGGER_INITIALIZED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Explicit telemetry configuration supplied by the mobile app before agent init.
+static MOBILE_TELEMETRY_CONFIG: std::sync::Mutex<Option<MobileTelemetryConfig>> =
+    std::sync::Mutex::new(None);
 
 /// The OTLP endpoint that was configured (if telemetry is enabled).
 /// Stored so mesh_status can report it.
@@ -192,16 +180,33 @@ pub fn active_otlp_endpoint() -> Option<String> {
     ACTIVE_OTLP_ENDPOINT.lock().unwrap().clone()
 }
 
+pub fn configure_mobile_telemetry(config: MobileTelemetryConfig) {
+    *MOBILE_TELEMETRY_CONFIG.lock().unwrap() = Some(config);
+}
+
 /// Initialize the logging/telemetry subsystem.
 ///
-/// Checks environment variables to decide whether to enable OTLP telemetry:
-/// - `QMT_MOBILE_TELEMETRY=1` or a non-empty `OTEL_EXPORTER_OTLP_ENDPOINT`
-///   enables full telemetry (tracing subscriber with OTLP + FFI callback).
-/// - Otherwise falls back to a simple `log`-crate logger that only forwards
-///   to the FFI callback.
+/// Telemetry must be configured explicitly by the mobile app before agent init.
+/// When disabled, this function installs nothing and exports nothing.
 ///
 /// This function is idempotent; subsequent calls are no-ops.
 pub fn setup_mobile_telemetry() {
+    let configured = MOBILE_TELEMETRY_CONFIG.lock().unwrap().clone();
+    let config = configured.unwrap_or_else(|| MobileTelemetryConfig {
+        enabled: cfg!(debug_assertions),
+        endpoint: None,
+    });
+
+    log::debug!(
+        "setup_mobile_telemetry: enabled={} endpoint={}",
+        config.enabled,
+        config.endpoint.as_deref().unwrap_or("<default>")
+    );
+
+    if !config.enabled {
+        return;
+    }
+
     if LOGGER_INITIALIZED
         .compare_exchange(
             false,
@@ -215,23 +220,12 @@ pub fn setup_mobile_telemetry() {
         return;
     }
 
-    let telemetry_enabled = std::env::var("QMT_MOBILE_TELEMETRY")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-        || std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
-
-    if telemetry_enabled {
-        init_telemetry();
-    } else {
-        init_fallback_logger();
-    }
+    init_telemetry(config);
 }
 
 /// Full telemetry init: delegates subscriber assembly to `querymt_utils`
 /// with the FFI callback layer attached as an extra layer.
-fn init_telemetry() {
+fn init_telemetry(mobile_config: MobileTelemetryConfig) {
     use tracing_subscriber::EnvFilter;
 
     let config = querymt_utils::telemetry::TelemetryConfig {
@@ -239,7 +233,7 @@ fn init_telemetry() {
         service_version: env!("CARGO_PKG_VERSION"),
         use_stderr: true,
         enable_otlp: true,
-        endpoint: None, // let utils resolve from env / default
+        endpoint: mobile_config.endpoint,
     };
 
     // FFI callback filter — forward info+ to native side.
@@ -255,20 +249,12 @@ fn init_telemetry() {
             log::info!("OTLP telemetry initialized, endpoint={}", endpoint);
         }
         Ok(None) => {
-            // OTLP was not enabled (shouldn't happen here, but handle gracefully).
-            init_fallback_logger();
+            log::warn!("OTLP telemetry unexpectedly disabled during mobile init");
         }
         Err(e) => {
             log::warn!("OTLP telemetry init failed: {e}");
-            init_fallback_logger();
         }
     }
-}
-
-/// Fallback: simple log-crate logger that only forwards to FFI callback.
-fn init_fallback_logger() {
-    log::set_max_level(log::LevelFilter::Debug);
-    let _ = log::set_boxed_logger(Box::new(FfiLogger));
 }
 
 /// Backwards-compatible entry point. Equivalent to `setup_mobile_telemetry()`.

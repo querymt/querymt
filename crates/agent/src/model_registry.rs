@@ -137,10 +137,15 @@ impl ModelRegistry {
         all
     }
 
+    /// Invalidate only remote mesh model cache entries.
+    pub async fn invalidate_remote(&self) {
+        self.remote_cache.invalidate(&()).await;
+    }
+
     /// Invalidate all caches.
     pub async fn invalidate_all(&self) {
         self.local_cache.invalidate(&()).await;
-        self.remote_cache.invalidate(&()).await;
+        self.invalidate_remote().await;
     }
 
     /// Refresh local + remote caches and return fresh aggregated list.

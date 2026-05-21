@@ -11047,6 +11047,9 @@ dependencies = [
  "moka",
  "notify",
  "once_cell",
+ "opentelemetry",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
  "parking_lot",
  "qrcode",
  "querymt",
@@ -11079,6 +11082,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-log",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "tree-sitter",
  "tree-sitter-c",
@@ -11146,6 +11150,7 @@ dependencies = [
  "agent-client-protocol",
  "agent-client-protocol-schema",
  "anyhow",
+ "async-trait",
  "jni",
  "libc",
  "libp2p",
@@ -11220,6 +11225,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-log",
  "tracing-opentelemetry",
@@ -14571,6 +14577,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]

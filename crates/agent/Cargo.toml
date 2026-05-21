@@ -111,6 +111,12 @@ dirs.workspace = true
 
 # OAuth support (optional, feature-gated) - now provided by querymt-utils
 
+# OpenTelemetry trace context extraction from ACP _meta
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["trace"] }
+opentelemetry-semantic-conventions = { version = "0.32", features = ["semconv_experimental"] }
+tracing-opentelemetry = "0.33"
+
 # Code similarity detection (local fork with tree-sitter 0.26)
 similarity-core = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }
 similarity-rs = { git = "https://github.com/querymt/similarity.git", branch = "tree_sitter_update" }

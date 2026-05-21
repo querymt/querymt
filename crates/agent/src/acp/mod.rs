@@ -8,6 +8,7 @@ pub(crate) mod client_bridge;
 pub mod cwd;
 pub mod shared;
 pub(crate) mod stdio;
+pub(crate) mod trace_context;
 
 #[cfg(test)]
 mod session_load_snapshot_tests;

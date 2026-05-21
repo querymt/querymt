@@ -5,6 +5,7 @@
 //! RPC message handling.
 
 use crate::agent::LocalAgentHandle as AgentHandle;
+use crate::agent::session_registry::PreconnectedMcpPeer;
 use crate::event_fanout::EventFanout;
 use crate::events::{AgentEventKind, EventEnvelope};
 use crate::send_agent::SendAgent;
@@ -17,6 +18,7 @@ use agent_client_protocol::schema::{
 use agent_client_protocol_schema::AGENT_METHOD_NAMES;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
 
@@ -53,6 +55,85 @@ pub struct RpcResponse {
 pub struct RpcDispatchOutput {
     pub notifications: Vec<serde_json::Value>,
     pub response: RpcResponse,
+}
+
+#[derive(Clone, Default)]
+pub struct RpcDispatchContext {
+    pub session_hooks: Option<Arc<dyn AcpSessionHooks>>,
+}
+
+#[async_trait::async_trait]
+pub trait AcpSessionHooks: Send + Sync {
+    async fn preconnected_mcp_peers(&self) -> Result<Vec<PreconnectedMcpPeer>, Error>;
+
+    async fn on_session_loaded(
+        &self,
+        _agent: &AgentHandle,
+        _session_id: &str,
+        _response: &mut serde_json::Value,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn on_remote_session_attached(
+        &self,
+        _agent: &AgentHandle,
+        _session_id: &str,
+        _response: &mut serde_json::Value,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+pub const QMT_NOTIFICATION_MESH_NODES_CHANGED: &str = "querymt/mesh/nodesChanged";
+pub const QMT_NOTIFICATION_MESH_JOINED: &str = "querymt/mesh/joined";
+pub const QMT_NOTIFICATION_MESH_PEER_EXPIRED: &str = "querymt/mesh/peerExpired";
+pub const QMT_NOTIFICATION_MODELS_CHANGED: &str = "querymt/models/changed";
+
+fn ext_notification(method: &str, params: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+    })
+}
+
+pub fn mesh_nodes_changed_notification(peer_id: &str, change: &str) -> serde_json::Value {
+    ext_notification(
+        QMT_NOTIFICATION_MESH_NODES_CHANGED,
+        serde_json::json!({
+            "peerId": peer_id,
+            "change": change,
+        }),
+    )
+}
+
+pub fn mesh_joined_notification(peer_id: &str, transport: &str) -> serde_json::Value {
+    ext_notification(
+        QMT_NOTIFICATION_MESH_JOINED,
+        serde_json::json!({
+            "peerId": peer_id,
+            "transport": transport,
+        }),
+    )
+}
+
+pub fn mesh_peer_expired_notification(peer_id: &str) -> serde_json::Value {
+    ext_notification(
+        QMT_NOTIFICATION_MESH_PEER_EXPIRED,
+        serde_json::json!({
+            "peerId": peer_id,
+        }),
+    )
+}
+
+pub fn models_changed_notification(reason: &str) -> serde_json::Value {
+    ext_notification(
+        QMT_NOTIFICATION_MODELS_CHANGED,
+        serde_json::json!({
+            "reason": reason,
+        }),
+    )
 }
 
 pub fn event_envelopes_to_notifications<I>(events: I) -> Vec<serde_json::Value>
@@ -330,253 +411,354 @@ pub async fn handle_rpc_message<S: SendAgent>(
     conn_id: &str,
     req: RpcRequest,
 ) -> RpcDispatchOutput {
-    let result = match req.method.as_str() {
-        m if m == AGENT_METHOD_NAMES.initialize => match serde_json::from_value(req.params) {
-            Ok(params) => agent
-                .initialize(params)
-                .await
-                .map(|r| serde_json::to_value(r).unwrap()),
-            Err(e) => {
-                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
-            }
-        },
-        m if m == AGENT_METHOD_NAMES.authenticate => match serde_json::from_value(req.params) {
-            Ok(params) => agent
-                .authenticate(params)
-                .await
-                .map(|r| serde_json::to_value(r).unwrap()),
-            Err(e) => {
-                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
-            }
-        },
+    handle_rpc_message_with_context(
+        agent,
+        session_owners,
+        pending_permissions,
+        pending_elicitations,
+        conn_id,
+        req,
+        RpcDispatchContext::default(),
+    )
+    .await
+}
 
-        m if m == AGENT_METHOD_NAMES.session_new => match serde_json::from_value(req.params) {
-            Ok(params) => {
-                let response = agent.new_session(params).await;
-                match response {
-                    Ok(r) => {
-                        let session_id = r.session_id.to_string();
-                        let mut owners = session_owners.lock().await;
-                        owners.insert(session_id, conn_id.to_string());
-                        Ok(serde_json::to_value(r).unwrap())
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            Err(e) => Err(Error::invalid_params().data(serde_json::json!({
-                "error": e.to_string()
-            }))),
-        },
-        m if m == AGENT_METHOD_NAMES.session_prompt => match serde_json::from_value(req.params) {
-            Ok(params) => agent
-                .prompt(params)
-                .await
-                .map(|r| serde_json::to_value(r).unwrap()),
-            Err(e) => {
-                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
-            }
-        },
-
-        m if m == AGENT_METHOD_NAMES.session_cancel => match serde_json::from_value(req.params) {
-            Ok(params) => agent.cancel(params).await.map(|_| serde_json::Value::Null),
-            Err(e) => {
-                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
-            }
-        },
-        m if m == AGENT_METHOD_NAMES.session_fork => match serde_json::from_value(req.params) {
-            Ok(params) => agent
-                .fork_session(params)
-                .await
-                .map(|r| serde_json::to_value(r).unwrap()),
-            Err(e) => {
-                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
-            }
-        },
-        m if m == AGENT_METHOD_NAMES.session_list => match serde_json::from_value(req.params) {
-            Ok(params) => agent
-                .list_sessions(params)
-                .await
-                .map(|r| serde_json::to_value(r).unwrap()),
-            Err(e) => {
-                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
-            }
-        },
-        m if m == AGENT_METHOD_NAMES.session_load => {
-            match serde_json::from_value::<agent_client_protocol::schema::LoadSessionRequest>(
-                req.params,
-            ) {
-                Ok(params) => {
-                    let response = agent.load_session(params).await;
-                    match response {
-                        Ok(r) => Ok(serde_json::to_value(r).unwrap()),
-
-                        Err(e) => Err(e),
-                    }
-                }
-                Err(e) => {
-                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
-                }
-            }
-        }
-        m if m == AGENT_METHOD_NAMES.session_resume => match serde_json::from_value(req.params) {
-            Ok(params) => agent
-                .resume_session(params)
-                .await
-                .map(|r| serde_json::to_value(r).unwrap()),
-            Err(e) => {
-                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
-            }
-        },
-        m if m == AGENT_METHOD_NAMES.session_close => match serde_json::from_value(req.params) {
-            Ok(params) => agent
-                .close_session(params)
-                .await
-                .map(|r| serde_json::to_value(r).unwrap()),
-            Err(e) => {
-                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
-            }
-        },
-        m if m == AGENT_METHOD_NAMES.session_delete => match serde_json::from_value(req.params) {
-            Ok(params) => agent
-                .delete_session(params)
-                .await
-                .map(|r| serde_json::to_value(r).unwrap()),
-            Err(e) => {
-                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
-            }
-        },
-        m if m == AGENT_METHOD_NAMES.session_set_config_option => {
-            match serde_json::from_value(req.params) {
+pub async fn handle_rpc_message_with_context<S: SendAgent>(
+    agent: &S,
+    session_owners: &SessionOwnerMap,
+    pending_permissions: &PermissionMap,
+    pending_elicitations: &PendingElicitationMap,
+    conn_id: &str,
+    req: RpcRequest,
+    context: RpcDispatchContext,
+) -> RpcDispatchOutput {
+    let rpc_method = req.method.clone();
+    let rpc_params = req.params.clone();
+    let result: Result<serde_json::Value, Error> = run_with_acp_span(&rpc_method, &rpc_params, async {
+        let method = req.method.clone();
+        match method.as_str() {
+            m if m == AGENT_METHOD_NAMES.initialize => match serde_json::from_value(req.params) {
                 Ok(params) => agent
-                    .set_session_config_option(params)
+                    .initialize(params)
                     .await
                     .map(|r| serde_json::to_value(r).unwrap()),
                 Err(e) => {
                     Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
                 }
-            }
-        }
-        m if m == AGENT_METHOD_NAMES.session_set_mode => match serde_json::from_value(req.params) {
-            Ok(params) => agent
-                .set_session_mode(params)
-                .await
-                .map(|r| serde_json::to_value(r).unwrap()),
-            Err(e) => {
-                Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
-            }
-        },
-        m if m == AGENT_METHOD_NAMES.session_set_model => {
-            match serde_json::from_value(req.params) {
+            },
+            m if m == AGENT_METHOD_NAMES.authenticate => match serde_json::from_value(req.params) {
                 Ok(params) => agent
-                    .set_session_model(params)
+                    .authenticate(params)
                     .await
                     .map(|r| serde_json::to_value(r).unwrap()),
                 Err(e) => {
                     Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
                 }
-            }
-        }
+            },
 
-        "permission_result" => {
-            #[derive(Deserialize)]
-            struct PermissionResultParams {
-                tool_call_id: String,
-                outcome: RequestPermissionOutcome,
-            }
-            match serde_json::from_value::<PermissionResultParams>(req.params) {
+            m if m == AGENT_METHOD_NAMES.session_new => match serde_json::from_value(req.params) {
                 Ok(params) => {
-                    let mut pending = pending_permissions.lock().await;
-                    if let Some(tx) = pending.remove(&params.tool_call_id) {
-                        let _ = tx.send(params.outcome);
-                        Ok(serde_json::Value::Null)
+                    let preconnected = if let Some(hooks) = &context.session_hooks {
+                        hooks.preconnected_mcp_peers().await?
                     } else {
-                        Err(Error::internal_error()
-                            .data("No pending permission for this tool_call_id"))
-                    }
-                }
-                Err(e) => {
-                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
-                }
-            }
-        }
-
-        "elicitation_result" => {
-            #[derive(Deserialize)]
-            struct ElicitationResultParams {
-                elicitation_id: String,
-                action: String,
-                content: Option<serde_json::Value>,
-            }
-            match serde_json::from_value::<ElicitationResultParams>(req.params) {
-                Ok(params) => {
-                    // Parse action string to enum
-                    let action_result = match params.action.as_str() {
-                        "accept" => Ok(crate::elicitation::ElicitationAction::Accept),
-                        "decline" => Ok(crate::elicitation::ElicitationAction::Decline),
-                        "cancel" => Ok(crate::elicitation::ElicitationAction::Cancel),
-                        _ => Err(Error::invalid_params().data(serde_json::json!({
-                            "error": format!("Invalid action: {}", params.action)
-                        }))),
+                        Vec::new()
                     };
-
-                    match action_result {
-                        Ok(action) => {
-                            let response = crate::elicitation::ElicitationResponse {
-                                action,
-                                content: params.content,
-                            };
-
-                            let mut tx = {
-                                let mut pending = pending_elicitations.lock().await;
-                                pending.remove(&params.elicitation_id)
-                            };
-
-                            if tx.is_none()
-                                && let Some(query_agent) =
-                                    agent.as_any().downcast_ref::<AgentHandle>()
-                            {
-                                tx = crate::elicitation::take_pending_elicitation_sender(
-                                    query_agent,
-                                    &params.elicitation_id,
-                                )
-                                .await;
-                            }
-
-                            if let Some(tx) = tx {
-                                let _ = tx.send(response);
-                                Ok(serde_json::Value::Null)
-                            } else {
-                                Err(Error::internal_error()
-                                    .data("No pending elicitation for this elicitation_id"))
-                            }
+                    let response = agent
+                        .new_session_with_preconnected(params, preconnected)
+                        .await;
+                    match response {
+                        Ok(r) => {
+                            let session_id = r.session_id.to_string();
+                            let mut owners = session_owners.lock().await;
+                            owners.insert(session_id, conn_id.to_string());
+                            Ok(serde_json::to_value(r).unwrap())
                         }
                         Err(e) => Err(e),
                     }
                 }
+                Err(e) => Err(Error::invalid_params().data(serde_json::json!({
+                    "error": e.to_string()
+                }))),
+            },
+            m if m == AGENT_METHOD_NAMES.session_prompt => match serde_json::from_value(req.params)
+            {
+                Ok(params) => agent
+                    .prompt(params)
+                    .await
+                    .map(|r| serde_json::to_value(r).unwrap()),
                 Err(e) => {
                     Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
                 }
+            },
+
+            m if m == AGENT_METHOD_NAMES.session_cancel => match serde_json::from_value(req.params)
+            {
+                Ok(params) => agent.cancel(params).await.map(|_| serde_json::Value::Null),
+                Err(e) => {
+                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+                }
+            },
+            m if m == AGENT_METHOD_NAMES.session_fork => match serde_json::from_value(req.params) {
+                Ok(params) => agent
+                    .fork_session(params)
+                    .await
+                    .map(|r| serde_json::to_value(r).unwrap()),
+                Err(e) => {
+                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+                }
+            },
+            m if m == AGENT_METHOD_NAMES.session_list => match serde_json::from_value(req.params) {
+                Ok(params) => agent
+                    .list_sessions(params)
+                    .await
+                    .map(|r| serde_json::to_value(r).unwrap()),
+                Err(e) => {
+                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+                }
+            },
+            m if m == AGENT_METHOD_NAMES.session_load => {
+                match serde_json::from_value::<agent_client_protocol::schema::LoadSessionRequest>(
+                    req.params,
+                ) {
+                    Ok(params) => {
+                        let session_id = params.session_id.to_string();
+                        let preconnected = if let Some(hooks) = &context.session_hooks {
+                            hooks.preconnected_mcp_peers().await?
+                        } else {
+                            Vec::new()
+                        };
+                        let response = agent
+                            .load_session_with_preconnected(params, preconnected)
+                            .await;
+                        match response {
+                            Ok(r) => {
+                                let mut value = serde_json::to_value(r).unwrap();
+                                if let (Some(hooks), Some(local_agent)) = (
+                                    context.session_hooks.as_ref(),
+                                    agent.as_any().downcast_ref::<AgentHandle>(),
+                                ) {
+                                    hooks
+                                        .on_session_loaded(local_agent, &session_id, &mut value)
+                                        .await?;
+                                }
+                                Ok(value)
+                            }
+
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => {
+                        Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()})))
+                    }
+                }
             }
-        }
+            m if m == AGENT_METHOD_NAMES.session_resume => match serde_json::from_value(req.params)
+            {
+                Ok(params) => agent
+                    .resume_session(params)
+                    .await
+                    .map(|r| serde_json::to_value(r).unwrap()),
+                Err(e) => {
+                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+                }
+            },
+            m if m == AGENT_METHOD_NAMES.session_close => {
+                match serde_json::from_value(req.params) {
+                    Ok(params) => agent
+                        .close_session(params)
+                        .await
+                        .map(|r| serde_json::to_value(r).unwrap()),
+                    Err(e) => {
+                        Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()})))
+                    }
+                }
+            }
+            m if m == AGENT_METHOD_NAMES.session_delete => match serde_json::from_value(req.params)
+            {
+                Ok(params) => agent
+                    .delete_session(params)
+                    .await
+                    .map(|r| serde_json::to_value(r).unwrap()),
+                Err(e) => {
+                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+                }
+            },
+            m if m == AGENT_METHOD_NAMES.session_set_config_option => {
+                match serde_json::from_value(req.params) {
+                    Ok(params) => agent
+                        .set_session_config_option(params)
+                        .await
+                        .map(|r| serde_json::to_value(r).unwrap()),
+                    Err(e) => {
+                        Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()})))
+                    }
+                }
+            }
+            m if m == AGENT_METHOD_NAMES.session_set_mode => {
+                match serde_json::from_value(req.params) {
+                    Ok(params) => agent
+                        .set_session_mode(params)
+                        .await
+                        .map(|r| serde_json::to_value(r).unwrap()),
+                    Err(e) => {
+                        Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()})))
+                    }
+                }
+            }
+            m if m == AGENT_METHOD_NAMES.session_set_model => {
+                match serde_json::from_value(req.params) {
+                    Ok(params) => agent
+                        .set_session_model(params)
+                        .await
+                        .map(|r| serde_json::to_value(r).unwrap()),
+                    Err(e) => {
+                        Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()})))
+                    }
+                }
+            }
 
-        // Forward _querymt/* extension methods to the agent's ext_method handler.
-        m if m.starts_with("_querymt/") || m.starts_with("querymt/") => {
-            let raw_params = serde_json::value::RawValue::from_string(
-                serde_json::to_string(&req.params).unwrap_or_else(|_| "null".to_string()),
-            )
-            .unwrap_or_else(|_| {
-                serde_json::value::RawValue::from_string("null".to_string()).unwrap()
-            });
-            let ext_req =
-                agent_client_protocol::schema::ExtRequest::new(m, std::sync::Arc::from(raw_params));
-            agent
-                .ext_method(ext_req)
-                .await
-                .map(|r| serde_json::from_str(r.0.get()).unwrap_or(serde_json::Value::Null))
-        }
+            "permission_result" => {
+                #[derive(Deserialize)]
+                struct PermissionResultParams {
+                    tool_call_id: String,
+                    outcome: RequestPermissionOutcome,
+                }
+                match serde_json::from_value::<PermissionResultParams>(req.params) {
+                    Ok(params) => {
+                        let mut pending = pending_permissions.lock().await;
+                        if let Some(tx) = pending.remove(&params.tool_call_id) {
+                            let _ = tx.send(params.outcome);
+                            Ok(serde_json::Value::Null)
+                        } else {
+                            Err(Error::internal_error()
+                                .data("No pending permission for this tool_call_id"))
+                        }
+                    }
+                    Err(e) => {
+                        Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()})))
+                    }
+                }
+            }
 
-        _ => Err(Error::method_not_found()),
-    };
+            "elicitation_result" => {
+                #[derive(Deserialize)]
+                struct ElicitationResultParams {
+                    elicitation_id: String,
+                    action: String,
+                    content: Option<serde_json::Value>,
+                }
+                match serde_json::from_value::<ElicitationResultParams>(req.params) {
+                    Ok(params) => {
+                        // Parse action string to enum
+                        let action_result = match params.action.as_str() {
+                            "accept" => Ok(crate::elicitation::ElicitationAction::Accept),
+                            "decline" => Ok(crate::elicitation::ElicitationAction::Decline),
+                            "cancel" => Ok(crate::elicitation::ElicitationAction::Cancel),
+                            _ => Err(Error::invalid_params().data(serde_json::json!({
+                                "error": format!("Invalid action: {}", params.action)
+                            }))),
+                        };
+
+                        match action_result {
+                            Ok(action) => {
+                                let response = crate::elicitation::ElicitationResponse {
+                                    action,
+                                    content: params.content,
+                                };
+
+                                let mut tx = {
+                                    let mut pending = pending_elicitations.lock().await;
+                                    pending.remove(&params.elicitation_id)
+                                };
+
+                                if tx.is_none()
+                                    && let Some(query_agent) =
+                                        agent.as_any().downcast_ref::<AgentHandle>()
+                                {
+                                    tx = crate::elicitation::take_pending_elicitation_sender(
+                                        query_agent,
+                                        &params.elicitation_id,
+                                    )
+                                    .await;
+                                }
+
+                                if let Some(tx) = tx {
+                                    let _ = tx.send(response);
+                                    Ok(serde_json::Value::Null)
+                                } else {
+                                    Err(Error::internal_error()
+                                        .data("No pending elicitation for this elicitation_id"))
+                                }
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(e) => {
+                        Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()})))
+                    }
+                }
+            }
+
+            // Forward _querymt/* extension methods to the agent's ext_method handler.
+            m if m.starts_with("_querymt/") || m.starts_with("querymt/") => {
+                let session_id_for_owner = req
+                    .params
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let raw_params = serde_json::value::RawValue::from_string(
+                    serde_json::to_string(&req.params).unwrap_or_else(|_| "null".to_string()),
+                )
+                .unwrap_or_else(|_| {
+                    serde_json::value::RawValue::from_string("null".to_string()).unwrap()
+                });
+                let ext_req = agent_client_protocol::schema::ExtRequest::new(
+                    m,
+                    std::sync::Arc::from(raw_params),
+                );
+                let response = agent
+                    .ext_method(ext_req)
+                    .await
+                    .map(|r| serde_json::from_str(r.0.get()).unwrap_or(serde_json::Value::Null));
+                match response {
+                    Ok(mut value) => {
+                        if m == "querymt/remote/attachSession"
+                            && let Some(session_id) = session_id_for_owner
+                        {
+                            let mut owners = session_owners.lock().await;
+                            owners.insert(session_id.clone(), conn_id.to_string());
+                            drop(owners);
+
+                            if let (Some(hooks), Some(local_agent)) = (
+                                context.session_hooks.as_ref(),
+                                agent.as_any().downcast_ref::<AgentHandle>(),
+                            ) {
+                                hooks
+                                    .on_remote_session_attached(
+                                        local_agent,
+                                        &session_id,
+                                        &mut value,
+                                    )
+                                    .await?;
+                            }
+                        }
+                        Ok(value)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+
+            _ => Err(Error::method_not_found()),
+        }
+    })
+    .await;
 
     let response = match result {
         Ok(res) => RpcResponse {
@@ -599,15 +781,108 @@ pub async fn handle_rpc_message<S: SendAgent>(
     }
 }
 
+/// Create a method-specific ACP span, set remote parent if present, and
+/// run the future inside it.
+///
+/// Core ACP methods get individual span names (e.g. `acp.load_session`);
+/// everything else uses the existing `#[instrument]` inside the handler,
+/// so we only create a generic context span here.
+async fn run_with_acp_span<T, F>(method: &str, params: &serde_json::Value, fut: F) -> T
+where
+    F: Future<Output = T>,
+{
+    use tracing::Instrument;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    let span = acp_method_span(method);
+
+    if let Some(meta) = params.get("_meta")
+        && let Some(parent_cx) = super::trace_context::extract_acp_trace_context(meta)
+    {
+        let _ = span.set_parent(parent_cx);
+    }
+
+    fut.instrument(span).await
+}
+
+/// Map an ACP method string to a named tracing span.
+///
+/// Core ACP methods (defined in `AGENT_METHOD_NAMES`) get individual span
+/// names for direct readability in Grafana.  Extension and unknown methods
+/// get a single `acp.ext_method` span with the method name as attribute.
+fn acp_method_span(method: &str) -> tracing::Span {
+    use opentelemetry_semantic_conventions::attribute::{RPC_METHOD, RPC_SYSTEM};
+
+    let names = &AGENT_METHOD_NAMES;
+
+    match method {
+        m if m == names.initialize => tracing::info_span!(
+            "acp.initialize",
+            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_METHOD } = %method,
+        ),
+        m if m == names.authenticate => tracing::info_span!(
+            "acp.authenticate",
+            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_METHOD } = %method,
+        ),
+        m if m == names.session_new => tracing::info_span!(
+            "acp.new_session",
+            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_METHOD } = %method,
+        ),
+        m if m == names.session_prompt => tracing::info_span!(
+            "acp.prompt",
+            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_METHOD } = %method,
+        ),
+        m if m == names.session_cancel => tracing::info_span!(
+            "acp.cancel",
+            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_METHOD } = %method,
+        ),
+        m if m == names.session_load => tracing::info_span!(
+            "acp.load_session",
+            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_METHOD } = %method,
+        ),
+        m if m == names.session_list => tracing::info_span!(
+            "acp.list_sessions",
+            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_METHOD } = %method,
+        ),
+        m if m == names.session_close => tracing::info_span!(
+            "acp.close_session",
+            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_METHOD } = %method,
+        ),
+        m if m == names.session_resume => tracing::info_span!(
+            "acp.resume_session",
+            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_METHOD } = %method,
+        ),
+        // Extension methods and everything else: single acp.ext_method span
+        // with the method name as attribute.  The #[instrument] was removed
+        // from ext_method so this is the only span for extension requests.
+        _ => tracing::info_span!(
+            "acp.ext_method",
+            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_METHOD } = %method,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::core::AgentMode;
+    use crate::agent::session_registry::PreconnectedMcpPeer;
     use crate::elicitation::ElicitationAction;
     use crate::events::{AgentEventKind, DurableEvent, EventEnvelope, EventOrigin};
     use crate::test_utils::DelegateTestFixture;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::Mutex;
     use tokio::sync::oneshot;
 
@@ -681,6 +956,43 @@ mod tests {
         let value = serde_json::to_value(response).expect("serialize rpc response");
         assert!(value.get("result").is_none());
         assert_eq!(value["error"]["code"], serde_json::json!(-32602));
+    }
+
+    #[test]
+    fn mesh_notification_builders_use_expected_methods() {
+        let nodes_changed = mesh_nodes_changed_notification("peer-1", "discovered");
+        assert_eq!(
+            nodes_changed["method"],
+            serde_json::json!(QMT_NOTIFICATION_MESH_NODES_CHANGED)
+        );
+        assert_eq!(
+            nodes_changed["params"]["peerId"],
+            serde_json::json!("peer-1")
+        );
+        assert_eq!(
+            nodes_changed["params"]["change"],
+            serde_json::json!("discovered")
+        );
+
+        let peer_expired = mesh_peer_expired_notification("peer-2");
+        assert_eq!(
+            peer_expired["method"],
+            serde_json::json!(QMT_NOTIFICATION_MESH_PEER_EXPIRED)
+        );
+        assert_eq!(
+            peer_expired["params"]["peerId"],
+            serde_json::json!("peer-2")
+        );
+
+        let models_changed = models_changed_notification("manual_refresh");
+        assert_eq!(
+            models_changed["method"],
+            serde_json::json!(QMT_NOTIFICATION_MODELS_CHANGED)
+        );
+        assert_eq!(
+            models_changed["params"]["reason"],
+            serde_json::json!("manual_refresh")
+        );
     }
 
     #[test]
@@ -851,6 +1163,283 @@ mod tests {
             _ => panic!("expected select config option"),
         };
         assert_eq!(select.current_value.0.as_ref(), "auto");
+    }
+
+    struct HookProbe {
+        called: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl AcpSessionHooks for HookProbe {
+        async fn preconnected_mcp_peers(&self) -> Result<Vec<PreconnectedMcpPeer>, Error> {
+            self.called.store(true, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn session_new_rpc_uses_dispatch_hooks_for_preconnected_peers() {
+        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let hook = Arc::new(HookProbe {
+            called: AtomicBool::new(false),
+        });
+
+        struct Dummy;
+
+        #[async_trait::async_trait]
+        impl SendAgent for Dummy {
+            async fn initialize(
+                &self,
+                _: agent_client_protocol::schema::InitializeRequest,
+            ) -> Result<agent_client_protocol::schema::InitializeResponse, Error> {
+                unreachable!()
+            }
+            async fn authenticate(
+                &self,
+                _: agent_client_protocol::schema::AuthenticateRequest,
+            ) -> Result<agent_client_protocol::schema::AuthenticateResponse, Error> {
+                unreachable!()
+            }
+            async fn new_session(
+                &self,
+                _: agent_client_protocol::schema::NewSessionRequest,
+            ) -> Result<agent_client_protocol::schema::NewSessionResponse, Error> {
+                unreachable!("dispatcher should prefer new_session_with_preconnected")
+            }
+            async fn new_session_with_preconnected(
+                &self,
+                _: agent_client_protocol::schema::NewSessionRequest,
+                _: Vec<PreconnectedMcpPeer>,
+            ) -> Result<agent_client_protocol::schema::NewSessionResponse, Error> {
+                Ok(agent_client_protocol::schema::NewSessionResponse::new(
+                    "s-hooked",
+                ))
+            }
+            async fn prompt(
+                &self,
+                _: agent_client_protocol::schema::PromptRequest,
+            ) -> Result<agent_client_protocol::schema::PromptResponse, Error> {
+                unreachable!()
+            }
+            async fn cancel(
+                &self,
+                _: agent_client_protocol::schema::CancelNotification,
+            ) -> Result<(), Error> {
+                unreachable!()
+            }
+            async fn load_session(
+                &self,
+                _: agent_client_protocol::schema::LoadSessionRequest,
+            ) -> Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn list_sessions(
+                &self,
+                _: agent_client_protocol::schema::ListSessionsRequest,
+            ) -> Result<agent_client_protocol::schema::ListSessionsResponse, Error> {
+                unreachable!()
+            }
+            async fn fork_session(
+                &self,
+                _: agent_client_protocol::schema::ForkSessionRequest,
+            ) -> Result<agent_client_protocol::schema::ForkSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn resume_session(
+                &self,
+                _: agent_client_protocol::schema::ResumeSessionRequest,
+            ) -> Result<agent_client_protocol::schema::ResumeSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn close_session(
+                &self,
+                _: agent_client_protocol::schema::CloseSessionRequest,
+            ) -> Result<agent_client_protocol::schema::CloseSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn delete_session(
+                &self,
+                _: agent_client_protocol::schema::DeleteSessionRequest,
+            ) -> Result<agent_client_protocol::schema::DeleteSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn set_session_model(
+                &self,
+                _: agent_client_protocol::schema::SetSessionModelRequest,
+            ) -> Result<agent_client_protocol::schema::SetSessionModelResponse, Error> {
+                unreachable!()
+            }
+            async fn ext_method(
+                &self,
+                _: agent_client_protocol::schema::ExtRequest,
+            ) -> Result<agent_client_protocol::schema::ExtResponse, Error> {
+                unreachable!()
+            }
+            async fn ext_notification(
+                &self,
+                _: agent_client_protocol::schema::ExtNotification,
+            ) -> Result<(), Error> {
+                unreachable!()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let output = handle_rpc_message_with_context(
+            &Dummy,
+            &session_owners,
+            &pending_permissions,
+            &pending_elicitations,
+            "conn-1",
+            RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: AGENT_METHOD_NAMES.session_new.to_string(),
+                params: serde_json::json!({"cwd": "/tmp", "mcpServers": []}),
+                id: serde_json::json!(1),
+            },
+            RpcDispatchContext {
+                session_hooks: Some(hook.clone()),
+            },
+        )
+        .await;
+
+        assert!(hook.called.load(Ordering::SeqCst));
+        assert!(output.response.error.is_none());
+        assert_eq!(
+            output.response.result,
+            Some(serde_json::json!({"sessionId": "s-hooked"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_attach_extension_records_session_owner_without_ffi_branch() {
+        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+
+        struct Dummy;
+
+        #[async_trait::async_trait]
+        impl SendAgent for Dummy {
+            async fn initialize(
+                &self,
+                _: agent_client_protocol::schema::InitializeRequest,
+            ) -> Result<agent_client_protocol::schema::InitializeResponse, Error> {
+                unreachable!()
+            }
+            async fn authenticate(
+                &self,
+                _: agent_client_protocol::schema::AuthenticateRequest,
+            ) -> Result<agent_client_protocol::schema::AuthenticateResponse, Error> {
+                unreachable!()
+            }
+            async fn new_session(
+                &self,
+                _: agent_client_protocol::schema::NewSessionRequest,
+            ) -> Result<agent_client_protocol::schema::NewSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn prompt(
+                &self,
+                _: agent_client_protocol::schema::PromptRequest,
+            ) -> Result<agent_client_protocol::schema::PromptResponse, Error> {
+                unreachable!()
+            }
+            async fn cancel(
+                &self,
+                _: agent_client_protocol::schema::CancelNotification,
+            ) -> Result<(), Error> {
+                unreachable!()
+            }
+            async fn load_session(
+                &self,
+                _: agent_client_protocol::schema::LoadSessionRequest,
+            ) -> Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn list_sessions(
+                &self,
+                _: agent_client_protocol::schema::ListSessionsRequest,
+            ) -> Result<agent_client_protocol::schema::ListSessionsResponse, Error> {
+                unreachable!()
+            }
+            async fn fork_session(
+                &self,
+                _: agent_client_protocol::schema::ForkSessionRequest,
+            ) -> Result<agent_client_protocol::schema::ForkSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn resume_session(
+                &self,
+                _: agent_client_protocol::schema::ResumeSessionRequest,
+            ) -> Result<agent_client_protocol::schema::ResumeSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn close_session(
+                &self,
+                _: agent_client_protocol::schema::CloseSessionRequest,
+            ) -> Result<agent_client_protocol::schema::CloseSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn delete_session(
+                &self,
+                _: agent_client_protocol::schema::DeleteSessionRequest,
+            ) -> Result<agent_client_protocol::schema::DeleteSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn set_session_model(
+                &self,
+                _: agent_client_protocol::schema::SetSessionModelRequest,
+            ) -> Result<agent_client_protocol::schema::SetSessionModelResponse, Error> {
+                unreachable!()
+            }
+            async fn ext_method(
+                &self,
+                _: agent_client_protocol::schema::ExtRequest,
+            ) -> Result<agent_client_protocol::schema::ExtResponse, Error> {
+                let raw = serde_json::value::RawValue::from_string(
+                    serde_json::json!({"attached": true}).to_string(),
+                )
+                .unwrap();
+                Ok(agent_client_protocol::schema::ExtResponse::new(Arc::from(
+                    raw,
+                )))
+            }
+            async fn ext_notification(
+                &self,
+                _: agent_client_protocol::schema::ExtNotification,
+            ) -> Result<(), Error> {
+                unreachable!()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let output = handle_rpc_message_with_context(
+            &Dummy,
+            &session_owners,
+            &pending_permissions,
+            &pending_elicitations,
+            "conn-9",
+            RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "querymt/remote/attachSession".to_string(),
+                params: serde_json::json!({"sessionId": "s-remote", "nodeId": "n-1"}),
+                id: serde_json::json!(1),
+            },
+            RpcDispatchContext::default(),
+        )
+        .await;
+
+        assert!(output.response.error.is_none());
+        assert_eq!(
+            session_owners.lock().await.get("s-remote").cloned(),
+            Some("conn-9".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1157,5 +1746,182 @@ mod tests {
             delivered.content,
             Some(serde_json::json!({"selection": "allow_once"}))
         );
+    }
+
+    // ─── OTel in-memory test harness ──────────────────────────────────────────
+
+    mod otel_trace_tests {
+        use super::*;
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::error::OTelSdkResult;
+        use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
+        use std::sync::{Arc, Mutex};
+        use tracing::Subscriber;
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default, Debug)]
+        struct TestExporter(Arc<Mutex<Vec<SpanData>>>);
+
+        impl SpanExporter for TestExporter {
+            async fn export(&self, mut batch: Vec<SpanData>) -> OTelSdkResult {
+                self.0.lock().unwrap().append(&mut batch);
+                Ok(())
+            }
+        }
+
+        fn test_tracer() -> (SdkTracerProvider, TestExporter, impl Subscriber) {
+            let exporter = TestExporter::default();
+            let provider = SdkTracerProvider::builder()
+                .with_simple_exporter(exporter.clone())
+                .build();
+            let tracer = provider.tracer("acp-test");
+            let subscriber = tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(tracer));
+            (provider, exporter, subscriber)
+        }
+
+        /// Helper: run a closure with the test subscriber, flush, return exported spans.
+        fn with_test_spans<F, T>(f: F) -> Vec<SpanData>
+        where
+            F: FnOnce() -> T,
+        {
+            let (_provider, exporter, subscriber) = test_tracer();
+            tracing::subscriber::with_default(subscriber, f);
+            drop(_provider); // flush
+            exporter.0.lock().unwrap().clone()
+        }
+
+        // ─── Tests ──────────────────────────────────────────────────────────
+
+        #[test]
+        fn run_with_acp_span_load_session() {
+            let spans = with_test_spans(|| {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let params = serde_json::json!({});
+                    run_with_acp_span(AGENT_METHOD_NAMES.session_load, &params, async {}).await
+                });
+            });
+
+            assert_eq!(
+                spans.len(),
+                1,
+                "expected exactly one span, got {}",
+                spans.len()
+            );
+            assert_eq!(spans[0].name, "acp.load_session");
+        }
+
+        #[test]
+        fn run_with_acp_span_new_session() {
+            let spans = with_test_spans(|| {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let params = serde_json::json!({});
+                    run_with_acp_span(AGENT_METHOD_NAMES.session_new, &params, async {}).await
+                });
+            });
+
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].name, "acp.new_session");
+        }
+
+        #[test]
+        fn run_with_acp_span_extension() {
+            let spans = with_test_spans(|| {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let params = serde_json::json!({});
+                    run_with_acp_span("querymt/models", &params, async {}).await
+                });
+            });
+
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].name, "acp.ext_method");
+        }
+
+        #[test]
+        fn run_with_acp_span_traceparent_sets_parent() {
+            let spans = with_test_spans(|| {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let params = serde_json::json!({
+                        "_meta": {
+                            "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+                        }
+                    });
+                    run_with_acp_span(AGENT_METHOD_NAMES.session_load, &params, async {}).await
+                });
+            });
+
+            assert_eq!(spans.len(), 1, "expected exactly one span");
+            let span = &spans[0];
+
+            // Trace ID must match the remote parent.
+            assert_eq!(
+                span.span_context.trace_id().to_string(),
+                "0af7651916cd43dd8448eb211c80319c",
+                "trace ID should match remote parent"
+            );
+
+            // Parent span ID must match the remote parent's span ID.
+            assert_eq!(
+                span.parent_span_id.to_string(),
+                "b7ad6b7169203331",
+                "parent span ID should match remote parent"
+            );
+        }
+
+        #[test]
+        fn run_with_acp_span_no_traceparent_creates_root_span() {
+            let spans = with_test_spans(|| {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let params = serde_json::json!({});
+                    run_with_acp_span(AGENT_METHOD_NAMES.session_new, &params, async {}).await
+                });
+            });
+
+            assert_eq!(spans.len(), 1);
+            let span = &spans[0];
+            assert_eq!(span.name, "acp.new_session");
+
+            // Parent span ID should be all zeros (root).
+            let parent_id = span.parent_span_id.to_string();
+            let all_zeros = parent_id.chars().all(|c| c == '0');
+            assert!(
+                all_zeros,
+                "expected zero parent span ID for root span, got {parent_id}"
+            );
+        }
+
+        #[test]
+        fn run_with_acp_span_has_rpc_attributes() {
+            let spans = with_test_spans(|| {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let params = serde_json::json!({});
+                    run_with_acp_span(AGENT_METHOD_NAMES.session_prompt, &params, async {}).await
+                });
+            });
+
+            assert_eq!(spans.len(), 1);
+            let span = &spans[0];
+
+            let attrs: std::collections::HashMap<&str, &opentelemetry::Value> = span
+                .attributes
+                .iter()
+                .map(|kv| (kv.key.as_str(), &kv.value))
+                .collect();
+
+            assert!(attrs.contains_key("rpc.system"), "missing rpc.system");
+            assert!(attrs.contains_key("rpc.method"), "missing rpc.method");
+
+            assert_eq!(attrs["rpc.system"].as_str(), "jsonrpc");
+            assert_eq!(
+                attrs["rpc.method"].as_str(),
+                AGENT_METHOD_NAMES.session_prompt
+            );
+        }
     }
 }

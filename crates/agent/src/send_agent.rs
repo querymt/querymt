@@ -18,6 +18,7 @@
 /// - `new_session`: Session creation with CWD and MCP servers
 /// - `prompt`: The main interaction method
 /// - `cancel`: Cancellation support
+use crate::agent::session_registry::PreconnectedMcpPeer;
 use agent_client_protocol::schema::{
     AuthenticateRequest, AuthenticateResponse, CancelNotification, CloseSessionRequest,
     CloseSessionResponse, DeleteSessionRequest, DeleteSessionResponse, Error, ExtNotification,
@@ -59,6 +60,20 @@ pub trait SendAgent: Send + Sync + Any {
     /// - Permission state
     async fn new_session(&self, req: NewSessionRequest) -> Result<NewSessionResponse, Error>;
 
+    /// Create a new session with already-connected MCP peers when the transport
+    /// has pre-initialized mobile/in-process MCP servers.
+    async fn new_session_with_preconnected(
+        &self,
+        req: NewSessionRequest,
+        preconnected: Vec<PreconnectedMcpPeer>,
+    ) -> Result<NewSessionResponse, Error> {
+        if preconnected.is_empty() {
+            self.new_session(req).await
+        } else {
+            Err(Error::method_not_found())
+        }
+    }
+
     /// Execute a prompt within a session.
     ///
     /// This is the core method for agent interaction. The agent processes the prompt,
@@ -75,6 +90,20 @@ pub trait SendAgent: Send + Sync + Any {
     /// This method loads a previously created session and streams its complete
     /// message history to the client for reconstruction.
     async fn load_session(&self, req: LoadSessionRequest) -> Result<LoadSessionResponse, Error>;
+
+    /// Load an existing session with already-connected MCP peers when the transport
+    /// has pre-initialized mobile/in-process MCP servers.
+    async fn load_session_with_preconnected(
+        &self,
+        req: LoadSessionRequest,
+        preconnected: Vec<PreconnectedMcpPeer>,
+    ) -> Result<LoadSessionResponse, Error> {
+        if preconnected.is_empty() {
+            self.load_session(req).await
+        } else {
+            Err(Error::method_not_found())
+        }
+    }
 
     /// List all available sessions.
     ///

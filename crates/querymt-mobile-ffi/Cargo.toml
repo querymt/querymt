@@ -43,6 +43,7 @@ qmt-deepseek = { path = "../providers/deepseek", optional = true, default-featur
 
 serde.workspace = true
 serde_json.workspace = true
+async-trait = "0.1"
 log.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

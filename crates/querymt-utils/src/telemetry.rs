@@ -111,9 +111,11 @@ pub fn init_tracer_provider(
     service_version: &str,
     endpoint: &str,
 ) -> Result<SdkTracerProvider, TelemetryInitError> {
+    use opentelemetry_otlp::WithTonicConfig;
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
+        .with_tls_config(tonic::transport::ClientTlsConfig::new().with_enabled_roots())
         .build()
         .map_err(|e| TelemetryInitError::TracerProvider(e.to_string()))?;
 
@@ -132,9 +134,11 @@ pub fn init_logger_provider(
     service_version: &str,
     endpoint: &str,
 ) -> Result<SdkLoggerProvider, TelemetryInitError> {
+    use opentelemetry_otlp::WithTonicConfig;
     let exporter = opentelemetry_otlp::LogExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
+        .with_tls_config(tonic::transport::ClientTlsConfig::new().with_enabled_roots())
         .build()
         .map_err(|e| TelemetryInitError::LoggerProvider(e.to_string()))?;
 

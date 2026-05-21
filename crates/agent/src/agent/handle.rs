@@ -1797,7 +1797,6 @@ impl AgentHandle for LocalAgentHandle {
 /// This replaces the `impl SendAgent for QueryMTAgent` from protocol.rs.
 #[async_trait]
 impl SendAgent for LocalAgentHandle {
-    #[tracing::instrument(name = "acp.initialize", skip_all)]
     async fn initialize(&self, req: InitializeRequest) -> Result<InitializeResponse, Error> {
         use agent_client_protocol::schema::{
             AgentCapabilities, Implementation, McpCapabilities, PromptCapabilities,
@@ -1850,7 +1849,6 @@ impl SendAgent for LocalAgentHandle {
             ))
     }
 
-    #[tracing::instrument(name = "acp.authenticate", skip_all)]
     async fn authenticate(&self, req: AuthenticateRequest) -> Result<AuthenticateResponse, Error> {
         let auth_methods = &self.config.auth_methods;
 
@@ -1869,25 +1867,18 @@ impl SendAgent for LocalAgentHandle {
         Ok(AuthenticateResponse::new())
     }
 
-    #[tracing::instrument(name = "acp.new_session", skip_all)]
     async fn new_session(&self, req: NewSessionRequest) -> Result<NewSessionResponse, Error> {
-        // Auth check stays on LocalAgentHandle (connection-level concern)
-        if let Ok(state) = self.client_state.lock()
-            && let Some(state) = state.as_ref()
-        {
-            let auth_required = !self.config.auth_methods.is_empty();
-
-            if auth_required && !state.authenticated {
-                return Err(Error::auth_required());
-            }
-        }
-
-        // Delegate to kameo SessionRegistry
-        let mut registry = self.registry.lock().await;
-        registry.new_session(req).await
+        self.new_session_with_preconnected(req, Vec::new()).await
     }
 
-    #[tracing::instrument(name = "acp.prompt", skip_all, fields(session_id = %req.session_id))]
+    async fn new_session_with_preconnected(
+        &self,
+        req: NewSessionRequest,
+        preconnected: Vec<crate::agent::session_registry::PreconnectedMcpPeer>,
+    ) -> Result<NewSessionResponse, Error> {
+        LocalAgentHandle::new_session_with_preconnected(self, req, preconnected).await
+    }
+
     async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, Error> {
         let session_id = req.session_id.to_string();
         let session_ref = {
@@ -1903,34 +1894,35 @@ impl SendAgent for LocalAgentHandle {
         session_ref.prompt(req).await
     }
 
-    #[tracing::instrument(name = "acp.cancel", skip_all, fields(session_id = %notif.session_id))]
     async fn cancel(&self, notif: CancelNotification) -> Result<(), Error> {
         let session_id = notif.session_id.to_string();
         self.stop_session(&session_id).await
     }
 
-    #[tracing::instrument(name = "acp.load_session", skip_all, fields(session_id = %req.session_id))]
     async fn load_session(&self, req: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
-        // Delegate to kameo SessionRegistry
-        let mut registry = self.registry.lock().await;
-        registry.load_session(req).await
+        self.load_session_with_preconnected(req, Vec::new()).await
     }
 
-    #[tracing::instrument(name = "acp.list_sessions", skip_all)]
+    async fn load_session_with_preconnected(
+        &self,
+        req: LoadSessionRequest,
+        preconnected: Vec<crate::agent::session_registry::PreconnectedMcpPeer>,
+    ) -> Result<LoadSessionResponse, Error> {
+        LocalAgentHandle::load_session_with_preconnected(self, req, preconnected).await
+    }
+
     async fn list_sessions(&self, req: ListSessionsRequest) -> Result<ListSessionsResponse, Error> {
         // Delegate to kameo SessionRegistry
         let registry = self.registry.lock().await;
         registry.list_sessions(req).await
     }
 
-    #[tracing::instrument(name = "acp.fork_session", skip_all, fields(session_id = %req.session_id))]
     async fn fork_session(&self, req: ForkSessionRequest) -> Result<ForkSessionResponse, Error> {
         // Delegate to kameo SessionRegistry
         let registry = self.registry.lock().await;
         registry.fork_session(req).await
     }
 
-    #[tracing::instrument(name = "acp.resume_session", skip_all, fields(session_id = %req.session_id))]
     async fn resume_session(
         &self,
         req: ResumeSessionRequest,
@@ -1940,14 +1932,12 @@ impl SendAgent for LocalAgentHandle {
         registry.resume_session(req).await
     }
 
-    #[tracing::instrument(name = "acp.close_session", skip_all, fields(session_id = %req.session_id))]
     async fn close_session(&self, req: CloseSessionRequest) -> Result<CloseSessionResponse, Error> {
         let session_id = req.session_id.to_string();
         self.stop_session(&session_id).await?;
         Ok(CloseSessionResponse::new())
     }
 
-    #[tracing::instrument(name = "acp.delete_session", skip_all, fields(session_id = %req.session_id))]
     async fn delete_session(
         &self,
         req: DeleteSessionRequest,
@@ -1975,7 +1965,6 @@ impl SendAgent for LocalAgentHandle {
         Ok(DeleteSessionResponse::new())
     }
 
-    #[tracing::instrument(name = "acp.set_session_model", skip_all, fields(session_id = %req.session_id))]
     async fn set_session_model(
         &self,
         req: SetSessionModelRequest,
@@ -1994,7 +1983,6 @@ impl SendAgent for LocalAgentHandle {
         session_ref.set_session_model(req).await
     }
 
-    #[tracing::instrument(name = "acp.set_session_mode", skip_all, fields(session_id = %req.session_id))]
     async fn set_session_mode(
         &self,
         req: agent_client_protocol::schema::SetSessionModeRequest,
@@ -2020,7 +2008,6 @@ impl SendAgent for LocalAgentHandle {
         Ok(agent_client_protocol::schema::SetSessionModeResponse::new())
     }
 
-    #[tracing::instrument(name = "acp.set_session_config_option", skip_all, fields(session_id = %req.session_id))]
     async fn set_session_config_option(
         &self,
         req: agent_client_protocol::schema::SetSessionConfigOptionRequest,
@@ -2176,7 +2163,6 @@ impl SendAgent for LocalAgentHandle {
         }
     }
 
-    #[tracing::instrument(name = "acp.ext_method", skip_all, fields(method = %req.method))]
     async fn ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
         match req.method.as_ref() {
             "querymt/models" => {
