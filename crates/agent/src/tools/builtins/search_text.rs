@@ -40,6 +40,7 @@ struct InternalSearchResults {
 struct SearchOptions {
     pattern: String,
     root: PathBuf,
+    filter_root: PathBuf,
     include: Option<String>,
     exclude: Option<Vec<String>>,
     max_results: usize,
@@ -123,6 +124,18 @@ impl SearchTextTool {
         Self
     }
 
+    /// Helper to compute relative path for include/exclude filtering
+    /// Falls back to file name if strip_prefix fails
+    fn relative_path_for_filter<'a>(path: &'a Path, filter_root: &Path) -> &'a Path {
+        path.strip_prefix(filter_root)
+            .unwrap_or_else(|_| {
+                // Fallback to file name when strip_prefix fails
+                path.file_name()
+                    .map(|f| Path::new(f))
+                    .unwrap_or(path)
+            })
+    }
+
     /// Perform grep-style search with include/exclude patterns
     fn grep_search(
         opts: SearchOptions,
@@ -184,19 +197,17 @@ impl SearchTextTool {
             let path = entry.path();
 
             // Apply include filter
-            if let Some(ref include_pat) = include_pattern
-                && let Ok(relative) = path.strip_prefix(&opts.root)
-                && !include_pat.matches_path(relative)
-            {
-                continue;
+            if let Some(ref include_pat) = include_pattern {
+                let relative = Self::relative_path_for_filter(path, &opts.filter_root);
+                if !include_pat.matches_path(relative) {
+                    continue;
+                }
             }
 
             // Apply exclude filters
             let should_exclude = exclude_patterns.iter().any(|pat| {
-                path.strip_prefix(&opts.root)
-                    .ok()
-                    .map(|rel| pat.matches_path(rel))
-                    .unwrap_or(false)
+                let relative = Self::relative_path_for_filter(path, &opts.filter_root);
+                pat.matches_path(relative)
             });
 
             if should_exclude {
@@ -385,7 +396,7 @@ impl ToolTrait for SearchTextTool {
                         },
                         "path": {
                             "type": "string",
-                            "description": "The directory to search in. Defaults to the current working directory."
+                            "description": "The directory or file to search in. Defaults to the current working directory."
                         },
                         "include": {
                             "type": "string",
@@ -517,11 +528,26 @@ impl ToolTrait for SearchTextTool {
             .map(|s| s.to_string());
 
         let has_context = before_context > 0 || after_context > 0;
-        let root_for_format = root.clone();
+
+        // Determine filter_root based on whether root is a file or directory
+        // When root is a file:
+        // - If under cwd: use cwd for include/exclude and output paths (e.g., src/mod.rs)
+        // - If outside cwd: use file's parent directory as fallback
+        let filter_root = if root.is_file() {
+            context.cwd()
+                .filter(|cwd| root.starts_with(cwd))
+                .map(|p| p.to_path_buf())
+                .or_else(|| root.parent().map(|p| p.to_path_buf()))
+                .unwrap_or_else(|| PathBuf::from("."))
+        } else {
+            root.clone()
+        };
+        let root_for_format = filter_root.clone();
 
         let opts = SearchOptions {
             pattern,
             root,
+            filter_root,
             include,
             exclude,
             max_results,
@@ -822,5 +848,154 @@ match again",
 
         let result = first_text_block(tool.call(args, &context).await.unwrap());
         assert!(result.ends_with(", truncated)"));
+    }
+
+    #[tokio::test]
+    async fn test_search_text_path_can_be_file_without_include() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let tool = SearchTextTool::new();
+
+        // Create a nested file structure
+        let src_dir = temp_dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("mod.rs"), "fn main() {\n    println!(\"@@marker\");\n}").unwrap();
+        fs::write(src_dir.join("other.rs"), "fn other() {}").unwrap();
+
+        // Search specific file by path
+        let args = json!({
+            "pattern": "@@",
+            "path": "src/mod.rs"
+        });
+
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
+
+        assert!(result.contains("src/mod.rs"));
+        assert!(result.contains("2:"));
+        assert!(result.contains("@@marker"));
+        assert_eq!(file_count(&result), 1);
+        assert_eq!(match_count(&result), 1);
+        // Should NOT contain other.rs
+        assert!(!result.contains("other.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_search_text_path_can_be_file_with_include() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let tool = SearchTextTool::new();
+
+        // Create a nested file structure
+        let src_dir = temp_dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("mod.rs"), "fn main() {\n    println!(\"@@marker\");\n}").unwrap();
+
+        // Search specific file with include pattern
+        let args = json!({
+            "pattern": "@@",
+            "path": "src/mod.rs",
+            "include": "*.rs",
+            "before_context": 1,
+            "after_context": 1
+        });
+
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
+
+        assert!(result.contains("src/mod.rs"));
+        assert!(result.contains("@@marker"));
+        assert_eq!(file_count(&result), 1);
+        assert_eq!(match_count(&result), 1);
+        // Verify context lines are included
+        assert!(result.contains("1-fn main()"));
+        assert!(result.contains("3-}"));
+    }
+
+    #[tokio::test]
+    async fn test_search_text_file_path_respects_exclude() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let tool = SearchTextTool::new();
+
+        // Create a nested file structure
+        let src_dir = temp_dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("mod.rs"), "fn main() {\n    println!(\"@@marker\");\n}").unwrap();
+
+        // Search specific file with exclude pattern matching the file
+        let args = json!({
+            "pattern": "@@",
+            "path": "src/mod.rs",
+            "exclude": ["*.rs"]
+        });
+
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
+
+        // Should return no matches because file is excluded
+        assert_eq!(file_count(&result), 0);
+        assert_eq!(match_count(&result), 0);
+    }
+
+    #[tokio::test]
+    async fn test_search_text_file_outside_cwd_with_include() {
+        // Test that include works for files outside the cwd
+        let cwd_dir = TempDir::new().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(cwd_dir.path().to_path_buf()));
+        let tool = SearchTextTool::new();
+
+        // Create file outside cwd
+        fs::write(
+            outside_dir.path().join("mod.rs"),
+            "fn main() {\n    println!(\"@@marker\");\n}",
+        )
+        .unwrap();
+        fs::write(outside_dir.path().join("test.txt"), "not a rust file").unwrap();
+
+        // Search with include that matches the file
+        let args = json!({
+            "pattern": "@@",
+            "path": outside_dir.path().join("mod.rs").to_str().unwrap(),
+            "include": "*.rs"
+        });
+
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
+
+        assert_eq!(file_count(&result), 1);
+        assert_eq!(match_count(&result), 1);
+        assert!(result.contains("@@marker"));
+    }
+
+    #[tokio::test]
+    async fn test_search_text_file_outside_cwd_with_exclude() {
+        // Test that exclude works for files outside the cwd
+        let cwd_dir = TempDir::new().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(cwd_dir.path().to_path_buf()));
+        let tool = SearchTextTool::new();
+
+        // Create file outside cwd
+        fs::write(
+            outside_dir.path().join("mod.rs"),
+            "fn main() {\n    println!(\"@@marker\");\n}",
+        )
+        .unwrap();
+
+        // Search with exclude that matches the file
+        let args = json!({
+            "pattern": "@@",
+            "path": outside_dir.path().join("mod.rs").to_str().unwrap(),
+            "exclude": ["*.rs"]
+        });
+
+        let result = first_text_block(tool.call(args, &context).await.unwrap());
+
+        // Should return no matches because file is excluded
+        assert_eq!(file_count(&result), 0);
+        assert_eq!(match_count(&result), 0);
     }
 }
