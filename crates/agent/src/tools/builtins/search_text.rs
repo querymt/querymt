@@ -127,13 +127,10 @@ impl SearchTextTool {
     /// Helper to compute relative path for include/exclude filtering
     /// Falls back to file name if strip_prefix fails
     fn relative_path_for_filter<'a>(path: &'a Path, filter_root: &Path) -> &'a Path {
-        path.strip_prefix(filter_root)
-            .unwrap_or_else(|_| {
-                // Fallback to file name when strip_prefix fails
-                path.file_name()
-                    .map(|f| Path::new(f))
-                    .unwrap_or(path)
-            })
+        path.strip_prefix(filter_root).unwrap_or_else(|_| {
+            // Fallback to file name when strip_prefix fails
+            path.file_name().map(Path::new).unwrap_or(path)
+        })
     }
 
     /// Perform grep-style search with include/exclude patterns
@@ -534,7 +531,8 @@ impl ToolTrait for SearchTextTool {
         // - If under cwd: use cwd for include/exclude and output paths (e.g., src/mod.rs)
         // - If outside cwd: use file's parent directory as fallback
         let filter_root = if root.is_file() {
-            context.cwd()
+            context
+                .cwd()
                 .filter(|cwd| root.starts_with(cwd))
                 .map(|p| p.to_path_buf())
                 .or_else(|| root.parent().map(|p| p.to_path_buf()))
@@ -860,7 +858,11 @@ match again",
         // Create a nested file structure
         let src_dir = temp_dir.path().join("src");
         fs::create_dir_all(&src_dir).unwrap();
-        fs::write(src_dir.join("mod.rs"), "fn main() {\n    println!(\"@@marker\");\n}").unwrap();
+        fs::write(
+            src_dir.join("mod.rs"),
+            "fn main() {\n    println!(\"@@marker\");\n}",
+        )
+        .unwrap();
         fs::write(src_dir.join("other.rs"), "fn other() {}").unwrap();
 
         // Search specific file by path
@@ -890,7 +892,11 @@ match again",
         // Create a nested file structure
         let src_dir = temp_dir.path().join("src");
         fs::create_dir_all(&src_dir).unwrap();
-        fs::write(src_dir.join("mod.rs"), "fn main() {\n    println!(\"@@marker\");\n}").unwrap();
+        fs::write(
+            src_dir.join("mod.rs"),
+            "fn main() {\n    println!(\"@@marker\");\n}",
+        )
+        .unwrap();
 
         // Search specific file with include pattern
         let args = json!({
@@ -922,7 +928,11 @@ match again",
         // Create a nested file structure
         let src_dir = temp_dir.path().join("src");
         fs::create_dir_all(&src_dir).unwrap();
-        fs::write(src_dir.join("mod.rs"), "fn main() {\n    println!(\"@@marker\");\n}").unwrap();
+        fs::write(
+            src_dir.join("mod.rs"),
+            "fn main() {\n    println!(\"@@marker\");\n}",
+        )
+        .unwrap();
 
         // Search specific file with exclude pattern matching the file
         let args = json!({
