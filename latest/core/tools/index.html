@@ -1804,8 +1804,8 @@
 <a id="__codelineno-0-32" name="__codelineno-0-32"></a><span class="p">}</span>
 <a id="__codelineno-0-33" name="__codelineno-0-33"></a>
 <a id="__codelineno-0-34" name="__codelineno-0-34"></a><span class="c1">// To use it:</span>
-<a id="__codelineno-0-35" name="__codelineno-0-35"></a><span class="c1">// let builder = LLMBuilder::new().provider(&quot;some_provider&quot;).add_tool(GetWeatherTool);</span>
-<a id="__codelineno-0-36" name="__codelineno-0-36"></a><span class="c1">// let llm = builder.build(&amp;registry)?;</span>
+<a id="__codelineno-0-35" name="__codelineno-0-35"></a><span class="c1">// let builder = registry.builder(&quot;some_provider&quot;).add_tool(GetWeatherTool);</span>
+<a id="__codelineno-0-36" name="__codelineno-0-36"></a><span class="c1">// let llm = builder.build().await?;</span>
 <a id="__codelineno-0-37" name="__codelineno-0-37"></a><span class="c1">// ... then use llm.chat_with_tools(...) ...</span>
 </code></pre></div></td></tr></table></div>
 <p>Tool usage significantly enhances the capabilities of LLMs, allowing them to perform complex tasks that require external information or actions. QueryMT's system provides a structured way to integrate these tools into your LLM applications.</p>

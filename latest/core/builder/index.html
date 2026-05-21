@@ -1656,16 +1656,24 @@
 </ul>
 <h3 id="building-the-provider">Building the Provider</h3>
 <ul>
-<li><strong><code>build(self, registry: &amp;PluginRegistry) -&gt; Result&lt;Box&lt;dyn LLMProvider&gt;, LLMError&gt;</code></strong>:
-    This is the final step. It takes a reference to a <code>querymt::plugin::host::PluginRegistry</code> (which knows how to create different providers).<ol>
-<li>It serializes the builder's configuration into a JSON <code>Value</code>.</li>
-<li>It retrieves the appropriate <code>LLMProviderFactory</code> from the <code>registry</code> based on the <code>provider</code> name set earlier.</li>
-<li>It prunes the full configuration based on the schema provided by the factory, so only relevant options are passed.</li>
+<li>
+<p><strong><code>build(self) -&gt; Result&lt;Box&lt;dyn LLMProvider&gt;, LLMError&gt;</code></strong> on a registry-bound builder:
+    This is the final step when the builder came from <code>registry.builder(...)</code>.</p>
+<ol>
+<li>It retrieves the appropriate <code>LLMProviderFactory</code> from the bound <code>PluginRegistry</code> based on the <code>provider</code> name set earlier.</li>
+<li>It loads provider defaults from <code>[providers.config]</code> for that provider.</li>
+<li>It injects an environment API key when the provider advertises one via <code>api_key_name()</code> and no explicit <code>api_key</code> was set.</li>
+<li>It overlays explicit builder settings on top of those defaults, so builder setters win.</li>
+<li>It prunes the merged configuration based on the schema provided by the factory, so only relevant options are passed.</li>
 <li>It calls <code>factory.from_config()</code> with the pruned configuration to get a base <code>LLMProvider</code>.</li>
 <li>If tools were added via <code>add_tool()</code>, it wraps the base provider in a <code>querymt::tool_decorator::ToolEnabledProvider</code>.</li>
 <li>If a <code>validator</code> was set, it further wraps the provider in a <code>querymt::validated_llm::ValidatedLLM</code>.</li>
 <li>Returns the fully configured <code>LLMProvider</code> instance, boxed as a trait object.</li>
 </ol>
+</li>
+<li>
+<p><strong><code>build_with(self, registry: &amp;PluginRegistry) -&gt; Result&lt;Box&lt;dyn LLMProvider&gt;, LLMError&gt;</code></strong> on an unbound builder:
+    This is the equivalent final step for builders created via <code>querymt::provider(...)</code> or <code>LLMBuilder::new()</code>.</p>
 </li>
 </ul>
 <h2 id="example-usage-conceptual">Example Usage (Conceptual)</h2>
@@ -1692,38 +1700,30 @@
 <span class="normal"><a href="#__codelineno-0-21">21</a></span>
 <span class="normal"><a href="#__codelineno-0-22">22</a></span>
 <span class="normal"><a href="#__codelineno-0-23">23</a></span>
-<span class="normal"><a href="#__codelineno-0-24">24</a></span>
-<span class="normal"><a href="#__codelineno-0-25">25</a></span>
-<span class="normal"><a href="#__codelineno-0-26">26</a></span>
-<span class="normal"><a href="#__codelineno-0-27">27</a></span>
-<span class="normal"><a href="#__codelineno-0-28">28</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt</span><span class="p">::</span><span class="n">builder</span><span class="p">::</span><span class="n">LLMBuilder</span><span class="p">;</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt</span><span class="p">::</span><span class="n">chat</span><span class="p">::</span><span class="n">ToolChoice</span><span class="p">;</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt</span><span class="p">::</span><span class="n">plugin</span><span class="p">::</span><span class="n">host</span><span class="p">::</span><span class="n">PluginRegistry</span><span class="p">;</span><span class="w"> </span><span class="c1">// Assuming you have a registry instance</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4"></a><span class="c1">// Assume GetWeatherTool is an impl CallFunctionTool</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5"></a><span class="c1">// use my_tools::GetWeatherTool;</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6"></a>
-<a id="__codelineno-0-7" name="__codelineno-0-7"></a><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">setup_llm_provider</span><span class="p">(</span><span class="n">registry</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">PluginRegistry</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="nb">Box</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">querymt</span><span class="p">::</span><span class="n">LLMProvider</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">querymt</span><span class="p">::</span><span class="n">error</span><span class="p">::</span><span class="n">LLMError</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">llm</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LLMBuilder</span><span class="p">::</span><span class="n">new</span><span class="p">()</span>
-<a id="__codelineno-0-9" name="__codelineno-0-9"></a><span class="w">        </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">&quot;openai&quot;</span><span class="p">)</span><span class="w"> </span><span class="c1">// Or your plugin&#39;s name</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10"></a><span class="w">        </span><span class="p">.</span><span class="n">model</span><span class="p">(</span><span class="s">&quot;gpt-4-turbo&quot;</span><span class="p">)</span>
-<a id="__codelineno-0-11" name="__codelineno-0-11"></a><span class="w">        </span><span class="p">.</span><span class="n">api_key</span><span class="p">(</span><span class="s">&quot;YOUR_OPENAI_API_KEY&quot;</span><span class="p">)</span>
-<a id="__codelineno-0-12" name="__codelineno-0-12"></a><span class="w">        </span><span class="p">.</span><span class="n">temperature</span><span class="p">(</span><span class="mf">0.7</span><span class="p">)</span>
-<a id="__codelineno-0-13" name="__codelineno-0-13"></a><span class="w">        </span><span class="p">.</span><span class="n">max_tokens</span><span class="p">(</span><span class="mi">500</span><span class="p">)</span>
-<a id="__codelineno-0-14" name="__codelineno-0-14"></a><span class="w">        </span><span class="p">.</span><span class="n">system</span><span class="p">(</span><span class="s">&quot;You are a helpful assistant.&quot;</span><span class="p">)</span>
-<a id="__codelineno-0-15" name="__codelineno-0-15"></a><span class="w">        </span><span class="c1">// .add_tool(GetWeatherTool) // Example of adding a tool</span>
-<a id="__codelineno-0-16" name="__codelineno-0-16"></a><span class="w">        </span><span class="c1">// .tool_choice(ToolChoice::Auto)</span>
-<a id="__codelineno-0-17" name="__codelineno-0-17"></a><span class="w">        </span><span class="p">.</span><span class="n">validator</span><span class="p">(</span><span class="o">|</span><span class="n">response_text</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-18" name="__codelineno-0-18"></a><span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="n">response_text</span><span class="p">.</span><span class="n">to_lowercase</span><span class="p">().</span><span class="n">contains</span><span class="p">(</span><span class="s">&quot;sorry&quot;</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-19" name="__codelineno-0-19"></a><span class="w">                </span><span class="nb">Err</span><span class="p">(</span><span class="s">&quot;Response should not be apologetic.&quot;</span><span class="p">.</span><span class="n">to_string</span><span class="p">())</span>
-<a id="__codelineno-0-20" name="__codelineno-0-20"></a><span class="w">            </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-21" name="__codelineno-0-21"></a><span class="w">                </span><span class="nb">Ok</span><span class="p">(())</span>
-<a id="__codelineno-0-22" name="__codelineno-0-22"></a><span class="w">            </span><span class="p">}</span>
-<a id="__codelineno-0-23" name="__codelineno-0-23"></a><span class="w">        </span><span class="p">})</span>
-<a id="__codelineno-0-24" name="__codelineno-0-24"></a><span class="w">        </span><span class="p">.</span><span class="n">validator_attempts</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
-<a id="__codelineno-0-25" name="__codelineno-0-25"></a><span class="w">        </span><span class="p">.</span><span class="n">build</span><span class="p">(</span><span class="n">registry</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-0-26" name="__codelineno-0-26"></a>
-<a id="__codelineno-0-27" name="__codelineno-0-27"></a><span class="w">    </span><span class="nb">Ok</span><span class="p">(</span><span class="n">llm</span><span class="p">)</span>
-<a id="__codelineno-0-28" name="__codelineno-0-28"></a><span class="p">}</span>
+<span class="normal"><a href="#__codelineno-0-24">24</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt</span><span class="p">::</span><span class="n">plugin</span><span class="p">::</span><span class="n">host</span><span class="p">::</span><span class="n">PluginRegistry</span><span class="p">;</span><span class="w"> </span><span class="c1">// Assuming you have a registry instance</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2"></a><span class="c1">// Assume GetWeatherTool is an impl CallFunctionTool</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3"></a><span class="c1">// use my_tools::GetWeatherTool;</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4"></a>
+<a id="__codelineno-0-5" name="__codelineno-0-5"></a><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">setup_llm_provider</span><span class="p">(</span><span class="n">registry</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">PluginRegistry</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="nb">Box</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">querymt</span><span class="p">::</span><span class="n">LLMProvider</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">querymt</span><span class="p">::</span><span class="n">error</span><span class="p">::</span><span class="n">LLMError</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">llm</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">registry</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7"></a><span class="w">        </span><span class="p">.</span><span class="n">builder</span><span class="p">(</span><span class="s">&quot;openai&quot;</span><span class="p">)</span><span class="w"> </span><span class="c1">// Or your plugin&#39;s name</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8"></a><span class="w">        </span><span class="p">.</span><span class="n">model</span><span class="p">(</span><span class="s">&quot;gpt-4-turbo&quot;</span><span class="p">)</span>
+<a id="__codelineno-0-9" name="__codelineno-0-9"></a><span class="w">        </span><span class="p">.</span><span class="n">api_key</span><span class="p">(</span><span class="s">&quot;YOUR_OPENAI_API_KEY&quot;</span><span class="p">)</span>
+<a id="__codelineno-0-10" name="__codelineno-0-10"></a><span class="w">        </span><span class="p">.</span><span class="n">temperature</span><span class="p">(</span><span class="mf">0.7</span><span class="p">)</span>
+<a id="__codelineno-0-11" name="__codelineno-0-11"></a><span class="w">        </span><span class="p">.</span><span class="n">max_tokens</span><span class="p">(</span><span class="mi">500</span><span class="p">)</span>
+<a id="__codelineno-0-12" name="__codelineno-0-12"></a><span class="w">        </span><span class="p">.</span><span class="n">system</span><span class="p">(</span><span class="s">&quot;You are a helpful assistant.&quot;</span><span class="p">)</span>
+<a id="__codelineno-0-13" name="__codelineno-0-13"></a><span class="w">        </span><span class="c1">// .add_tool(GetWeatherTool) // Example of adding a tool</span>
+<a id="__codelineno-0-14" name="__codelineno-0-14"></a><span class="w">        </span><span class="c1">// .tool_choice(ToolChoice::Auto)</span>
+<a id="__codelineno-0-15" name="__codelineno-0-15"></a><span class="w">        </span><span class="p">.</span><span class="n">validator</span><span class="p">(</span><span class="o">|</span><span class="n">response_text</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-0-16" name="__codelineno-0-16"></a><span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="n">response_text</span><span class="p">.</span><span class="n">to_lowercase</span><span class="p">().</span><span class="n">contains</span><span class="p">(</span><span class="s">&quot;sorry&quot;</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-0-17" name="__codelineno-0-17"></a><span class="w">                </span><span class="nb">Err</span><span class="p">(</span><span class="s">&quot;Response should not be apologetic.&quot;</span><span class="p">.</span><span class="n">to_string</span><span class="p">())</span>
+<a id="__codelineno-0-18" name="__codelineno-0-18"></a><span class="w">            </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-0-19" name="__codelineno-0-19"></a><span class="w">                </span><span class="nb">Ok</span><span class="p">(())</span>
+<a id="__codelineno-0-20" name="__codelineno-0-20"></a><span class="w">            </span><span class="p">}</span>
+<a id="__codelineno-0-21" name="__codelineno-0-21"></a><span class="w">        </span><span class="p">})</span>
+<a id="__codelineno-0-22" name="__codelineno-0-22"></a><span class="w">        </span><span class="p">.</span><span class="n">validator_attempts</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+<a id="__codelineno-0-23" name="__codelineno-0-23"></a><span class="w">        </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
+<a id="__codelineno-0-24" name="__codelineno-0-24"></a><span class="w">        </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
 <p>The <code>LLMBuilder</code> provides a convenient and type-safe way to configure diverse LLM providers with a wide range of options, abstracting away the underlying factory and wrapping logic.</p>
 

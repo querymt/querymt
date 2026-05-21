@@ -1708,14 +1708,15 @@
 <p><strong><code>querymt::plugin::http::HTTPLLMProviderFactory</code></strong>: A specialized factory for plugins that expose an <code>HTTPLLMProvider</code>.</p>
 </li>
 <li>
-<p><strong><code>querymt::plugin::host::PluginRegistry</code></strong>: A central registry that discovers, loads, and manages <code>LLMProviderFactory</code> instances from a configuration file. It uses different loaders for different plugin types.</p>
+<p><strong><code>querymt::plugin::host::PluginRegistry</code></strong>: A central registry that discovers, loads, and manages <code>LLMProviderFactory</code> instances from a configuration file. The registry itself is loader-agnostic; it stores <code>PluginLoader</code> trait objects and uses them to resolve provider entries.</p>
 <ul>
 <li><strong><code>querymt::plugin::host::PluginLoader</code></strong>: A trait for systems that can load a specific <code>querymt::plugin::host::PluginType</code>. QueryMT provides implementations for:<ul>
 <li><strong>Native Plugins:</strong> (<code>querymt::plugin::host::native::NativeLoader</code>) Loads plugins from shared libraries (<code>.so</code>, <code>.dll</code>, <code>.dylib</code>).</li>
 <li><strong>WASM Plugins via Extism:</strong> (<code>querymt::plugin::extism_impl::host::ExtismLoader</code>) Loads plugins compiled to WebAssembly and executed via Extism, offering sandboxing and portability.</li>
 </ul>
 </li>
-<li>Sources: <code>crates/querymt/src/plugin/host/mod.rs</code>, <code>crates/querymt/src/plugin/host/native.rs</code>, <code>crates/querymt/src/plugin/extism_impl/host/loader.rs</code></li>
+<li><strong><code>querymt::dynamic::PluginRegistryDynamicExt</code></strong>: A convenience extension layer that registers the built-in dynamic loaders for common applications.</li>
+<li>Sources: <code>crates/querymt/src/plugin/host/mod.rs</code>, <code>crates/querymt/src/dynamic.rs</code>, <code>crates/querymt/src/plugin/host/native.rs</code>, <code>crates/querymt/src/plugin/extism_impl/host/loader.rs</code></li>
 </ul>
 </li>
 </ul>
@@ -1735,13 +1736,13 @@
 </ul>
 <h2 id="high-level-flow">High-Level Flow</h2>
 <ol>
-<li>An application initializes a <code>querymt::plugin::host::PluginRegistry</code> from a configuration file (e.g., <code>plugins.toml</code>).</li>
-<li>The application registers the desired loaders (e.g., <code>NativeLoader</code>, <code>ExtismLoader</code>) with the registry.</li>
+<li>An application initializes a <code>querymt::plugin::host::PluginRegistry</code> from a configuration file (e.g., <code>providers.toml</code>).</li>
+<li>For the common dynamic-plugin path, it attaches the built-in loaders with <code>querymt::dynamic::PluginRegistryDynamicExt::with_dynamic_loaders()</code>.</li>
 <li>The registry calls <code>load_all_plugins()</code>, which iterates through the configured providers. For each provider, it determines its type (e.g., local Wasm, OCI image, native library) and uses the appropriate <code>PluginLoader</code> to load it and create an <code>LLMProviderFactory</code>.</li>
-<li>The application uses <code>querymt::builder::LLMBuilder</code> to configure a desired LLM provider by name (e.g., "openai", "custom-plugin").</li>
-<li>The builder's <code>build()</code> method is called, passing a reference to the <code>PluginRegistry</code>.</li>
+<li>The application uses <code>registry.builder("openai")</code> to create a registry-bound builder, or <code>querymt::provider("openai")</code> to create an unbound builder.</li>
+<li>The registry-bound builder finishes with <code>build()</code>, while the unbound builder finishes with <code>build_with(&amp;registry)</code>.</li>
 <li>The builder looks up the <code>LLMProviderFactory</code> from the registry using the provider name.</li>
-<li>The factory's <code>from_config()</code> method is called, which instantiates an <code>LLMProvider</code> (possibly an <code>HTTPLLMProvider</code> wrapped by <code>LLMProviderFromHTTP</code>).</li>
+<li>The builder merges defaults from <code>[providers.config]</code>, overlays explicit builder settings, prunes the merged config by schema, and then calls the factory's <code>from_config()</code> method.</li>
 <li>If tools were added via <code>add_tool()</code>, the base provider is wrapped in a <code>querymt::tool_decorator::ToolEnabledProvider</code>.</li>
 <li>If a validator is set, the provider is further wrapped in a <code>querymt::validated_llm::ValidatedLLM</code>.</li>
 <li>The application can then use the resulting <code>Box&lt;dyn LLMProvider&gt;</code> instance to perform chat, completion, or embedding operations.</li>
