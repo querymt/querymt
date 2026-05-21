@@ -1,4 +1,4 @@
-use crate::{error::LLMError, plugin::LLMProviderFactory};
+use crate::{LLMBuilder, builder::BoundRegistry, error::LLMError, plugin::LLMProviderFactory};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::path::Path;
@@ -54,6 +54,13 @@ impl PluginRegistry {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, LLMError> {
         let config =
             PluginConfig::from_path(path).map_err(|e| LLMError::PluginError(e.to_string()))?;
+        Self::from_config(config)
+    }
+
+    /// Creates a registry from the default QueryMT provider config location.
+    pub fn from_default_config() -> Result<Self, LLMError> {
+        let config =
+            PluginConfig::from_default_path().map_err(|e| LLMError::PluginError(e.to_string()))?;
         Self::from_config(config)
     }
 
@@ -289,6 +296,31 @@ impl PluginRegistry {
                 None
             }
         }
+    }
+
+    pub fn builder(&self, provider: impl Into<String>) -> LLMBuilder<BoundRegistry<'_>> {
+        LLMBuilder::new().provider(provider).bind(self)
+    }
+
+    pub fn list_provider_names(&self) -> Vec<&str> {
+        self.config
+            .providers
+            .iter()
+            .map(|cfg| cfg.name.as_str())
+            .collect()
+    }
+
+    pub async fn list_models(&self, provider: &str) -> Result<Vec<String>, LLMError> {
+        let factory = self
+            .get(provider)
+            .await
+            .ok_or_else(|| LLMError::InvalidRequest(format!("Unknown provider: {}", provider)))?;
+        let cfg = crate::provider_config::resolve_registry_provider_config(
+            self,
+            provider,
+            factory.as_ref(),
+        )?;
+        factory.list_models(&cfg.pruned_config_str).await
     }
 
     pub fn list(&self) -> Vec<Arc<dyn LLMProviderFactory>> {

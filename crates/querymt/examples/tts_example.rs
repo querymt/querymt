@@ -1,14 +1,11 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-#[cfg(feature = "extism_host")]
-use querymt::plugin::extism_impl::host::ExtismLoader;
-#[cfg(feature = "native")]
-use querymt::plugin::host::native::NativeLoader;
 use querymt::{
-    builder::LLMBuilder,
-    plugin::host::{PluginRegistry, ProviderConfig},
+    dynamic::PluginRegistryDynamicExt,
+    plugin::{host::PluginRegistry, host::config::ProviderConfig},
     tts::{TtsRequest, VoiceConfig},
 };
+
 use std::{env, path::Path, path::PathBuf, time::Instant};
 
 #[derive(Debug, Parser)]
@@ -85,13 +82,9 @@ struct Args {
 }
 
 fn build_registry(cfg_file: &Path) -> Result<PluginRegistry> {
-    let mut registry = PluginRegistry::from_path(cfg_file)
-        .with_context(|| format!("failed to load provider config '{}'", cfg_file.display()))?;
-
-    #[cfg(feature = "extism_host")]
-    registry.register_loader(Box::new(ExtismLoader));
-    #[cfg(feature = "native")]
-    registry.register_loader(Box::new(NativeLoader));
+    let registry = PluginRegistry::from_path(cfg_file)
+        .with_context(|| format!("failed to load provider config '{}'", cfg_file.display()))?
+        .with_dynamic_loaders();
 
     #[cfg(not(any(feature = "extism_host", feature = "native")))]
     anyhow::bail!(
@@ -115,33 +108,6 @@ fn ensure_loader_support(registry: &PluginRegistry, provider: &str) -> Result<()
     ensure_wasm_loader(cfg, provider)?;
 
     Ok(())
-}
-
-fn apply_provider_config(
-    mut builder: LLMBuilder,
-    registry: &PluginRegistry,
-    provider: &str,
-) -> Result<LLMBuilder> {
-    let provider_cfg = registry
-        .config
-        .providers
-        .iter()
-        .find(|cfg| cfg.name == provider);
-    let Some(provider_cfg) = provider_cfg else {
-        return Ok(builder);
-    };
-
-    let Some(config) = &provider_cfg.config else {
-        return Ok(builder);
-    };
-
-    for (key, value) in config {
-        let json = serde_json::to_value(value)
-            .with_context(|| format!("failed to serialize provider config key '{key}'"))?;
-        builder = builder.parameter(key.clone(), json);
-    }
-
-    Ok(builder)
 }
 
 #[cfg(feature = "native")]
@@ -198,11 +164,7 @@ async fn main() -> Result<()> {
 
     let model = resolved_model(args.model.clone());
 
-    let mut builder = apply_provider_config(
-        LLMBuilder::new().provider(args.provider.clone()),
-        &registry,
-        &args.provider,
-    )?;
+    let mut builder = registry.builder(args.provider.clone());
     if let Some(model) = model.clone() {
         builder = builder.model(model);
     }
@@ -215,7 +177,7 @@ async fn main() -> Result<()> {
 
     let init_start = Instant::now();
     let llm = builder
-        .build(&registry)
+        .build()
         .await
         .context("failed to initialize provider")?;
     let init_elapsed = init_start.elapsed();

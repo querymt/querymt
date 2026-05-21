@@ -8,16 +8,16 @@
 //! Optional: set `PROVIDER_CONFIG` to a custom providers file path.
 
 use querymt::{
-    builder::LLMBuilder,
     chat::{ChatMessage, ReasoningEffort},
-    plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
+    dynamic::PluginRegistryDynamicExt,
+    plugin::host::PluginRegistry,
 };
 
 fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
     let cfg_path =
         std::env::var("PROVIDER_CONFIG").unwrap_or_else(|_| "providers.toml".to_string());
-    let mut registry = PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?;
-    registry.register_loader(Box::new(ExtismLoader));
+    let registry =
+        PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?.with_dynamic_loaders();
     Ok(registry)
 }
 
@@ -29,15 +29,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = build_registry()?;
 
     // Initialize and configure the LLM client
-    let llm = LLMBuilder::new()
-        .provider("anthropic") // Use Anthropic (Claude) as the LLM provider
+    let llm = registry
+        .builder("anthropic") // Use Anthropic (Claude) as the LLM provider
         .api_key(api_key) // Set the API key
         .model("claude-sonnet-4-6") // Use Claude Sonnet model
         .max_tokens(1500) // Limit response length
         .temperature(1.0) // Control response randomness (0.0-1.0)
         .reasoning_effort(ReasoningEffort::High)
         .reasoning_budget_tokens(1024)
-        .build(&registry)
+        .build()
         .await?;
 
     // Prepare conversation history with a reasoning puzzle

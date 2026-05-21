@@ -3,6 +3,7 @@ pub use error::{SessionError, SessionResult};
 
 pub mod domain;
 pub mod provider;
+pub mod provider_config;
 pub use provider::{SessionHandle, SessionProvider};
 pub mod repository;
 pub mod schema;

@@ -11,17 +11,17 @@
 //! Optional: set `PROVIDER_CONFIG` to a custom providers file path.
 
 use querymt::{
-    builder::LLMBuilder,
     chat::ChatMessage,
+    dynamic::PluginRegistryDynamicExt,
     evaluator::{EvalResult, LLMEvaluator},
-    plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
+    plugin::host::PluginRegistry,
 };
 
 fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
     let cfg_path =
         std::env::var("PROVIDER_CONFIG").unwrap_or_else(|_| "providers.toml".to_string());
-    let mut registry = PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?;
-    registry.register_loader(Box::new(ExtismLoader));
+    let registry =
+        PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?.with_dynamic_loaders();
     Ok(registry)
 }
 
@@ -30,32 +30,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = build_registry()?;
 
     // Initialize OpenAI provider
-    let openai = LLMBuilder::new()
-        .provider("openai")
+    let openai = registry
+        .builder("openai")
         .api_key(std::env::var("OPENAI_API_KEY").expect("Set OPENAI_API_KEY to run this example"))
         .model("gpt-4o")
         .max_tokens(700)
-        .build(&registry)
+        .build()
         .await?;
 
     // Initialize Anthropic provider
-    let anthropic = LLMBuilder::new()
-        .provider("anthropic")
+    let anthropic = registry
+        .builder("anthropic")
         .api_key(
             std::env::var("ANTHROPIC_API_KEY").expect("Set ANTHROPIC_API_KEY to run this example"),
         )
         .model("claude-sonnet-4-6")
         .max_tokens(700)
-        .build(&registry)
+        .build()
         .await?;
 
     // Initialize Groq provider
-    let groq = LLMBuilder::new()
-        .provider("groq")
+    let groq = registry
+        .builder("groq")
         .api_key(std::env::var("GROQ_API_KEY").expect("Set GROQ_API_KEY to run this example"))
         .model("openai/gpt-oss-20b")
         .max_tokens(700)
-        .build(&registry)
+        .build()
         .await?;
 
     // Create evaluator with multiple scoring functions

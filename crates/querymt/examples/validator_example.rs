@@ -7,17 +7,13 @@
 //!
 //! Optional: set `PROVIDER_CONFIG` to a custom providers file path.
 
-use querymt::{
-    builder::LLMBuilder,
-    chat::ChatMessage,
-    plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
-};
+use querymt::{chat::ChatMessage, dynamic::PluginRegistryDynamicExt, plugin::host::PluginRegistry};
 
 fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
     let cfg_path =
         std::env::var("PROVIDER_CONFIG").unwrap_or_else(|_| "providers.toml".to_string());
-    let mut registry = PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?;
-    registry.register_loader(Box::new(ExtismLoader));
+    let registry =
+        PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?.with_dynamic_loaders();
     Ok(registry)
 }
 
@@ -29,8 +25,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = build_registry()?;
 
     // Initialize and configure the LLM client with validation
-    let llm = LLMBuilder::new()
-        .provider("anthropic") // Use Anthropic's Claude model
+    let llm = registry
+        .builder("anthropic") // Use Anthropic's Claude model
         .model("claude-sonnet-4-6") // Use Claude Sonnet model
         .api_key(api_key) // Set API credentials
         .max_tokens(512) // Limit response length
@@ -43,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| e.to_string())
         })
         .validator_attempts(3) // Allow up to 3 retries on validation failure
-        .build(&registry)
+        .build()
         .await?;
 
     // Prepare the chat message requesting JSON output

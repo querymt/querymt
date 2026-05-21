@@ -19,7 +19,7 @@ runtime = ["http-client", "plugin_host", "model-registry", "mcp", "tracing"]
 # Full desktop runtime with dynamic plugin loading.
 desktop = ["runtime", "dynamic-plugins"]
 # Dynamic provider loading only.
-dynamic-plugins = ["extism_host", "native"]
+dynamic-plugins = ["extism_host", "native", "model-registry"]
 http-client = ["reqwest", "tokio", "once_cell", "http-serde-ext"]
 reqwest-client = ["http-client"]
 plugin_host = ["dirs", "toml", "serde_yaml"]
@@ -72,7 +72,7 @@ httpdate = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.0", features = ["full"], optional = true }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true}
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"], optional = true}
 once_cell = { version = "1.21.3", optional = true}
 
 #[target.'cfg(target_arch = "wasm32")'.dependencies]

@@ -8,17 +8,18 @@
 //! Optional: set `PROVIDER_CONFIG` to a custom providers file path.
 
 use querymt::{
-    builder::{FunctionBuilder, LLMBuilder, ParamBuilder},
+    builder::{FunctionBuilder, ParamBuilder},
     chat::{ChatMessage, Content, Tool},
-    plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
+    dynamic::PluginRegistryDynamicExt,
+    plugin::host::PluginRegistry,
 };
 use serde_json::{Value, json};
 
 fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
     let cfg_path =
         std::env::var("PROVIDER_CONFIG").unwrap_or_else(|_| "providers.toml".to_string());
-    let mut registry = PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?;
-    registry.register_loader(Box::new(ExtismLoader));
+    let registry =
+        PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?.with_dynamic_loaders();
     Ok(registry)
 }
 
@@ -57,14 +58,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("OPENAI_API_KEY").expect("Set OPENAI_API_KEY to run this example");
     let registry = build_registry()?;
 
-    let llm = LLMBuilder::new()
-        .provider("openai")
+    let llm = registry
+        .builder("openai")
         .api_key(api_key)
         .model("gpt-4o")
         .max_tokens(512)
         .temperature(0.2)
         .stream(false)
-        .build(&registry)
+        .build()
         .await?;
 
     let tools = vec![weather_tool()];

@@ -11029,6 +11029,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "hex",
+ "http 1.4.0",
  "iana-time-zone",
  "ignore",
  "imagesize",

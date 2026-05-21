@@ -11,17 +11,13 @@
 use std::fs;
 use std::path::Path;
 
-use querymt::{
-    builder::LLMBuilder,
-    chat::ChatMessage,
-    plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
-};
+use querymt::{chat::ChatMessage, dynamic::PluginRegistryDynamicExt, plugin::host::PluginRegistry};
 
 fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
     let cfg_path =
         std::env::var("PROVIDER_CONFIG").unwrap_or_else(|_| "providers.toml".to_string());
-    let mut registry = PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?;
-    registry.register_loader(Box::new(ExtismLoader));
+    let registry =
+        PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?.with_dynamic_loaders();
     Ok(registry)
 }
 
@@ -32,14 +28,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = build_registry()?;
 
     // Initialize and configure the LLM client
-    let llm = LLMBuilder::new()
-        .provider("openai") // Use OpenAI as the LLM provider
+    let llm = registry
+        .builder("openai") // Use OpenAI as the LLM provider
         .api_key(api_key) // Set the API key
         .model("gpt-4o") // Use GPT-4o model
         .max_tokens(1024) // Limit response length
         .temperature(0.7) // Control response randomness (0.0-1.0)
         .stream(false) // Disable streaming responses
-        .build(&registry)
+        .build()
         .await?;
 
     let image_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/image001.jpg");

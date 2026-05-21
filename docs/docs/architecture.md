@@ -38,11 +38,12 @@ A core strength of QueryMT is its plugin system, enabling easy addition of new L
 *   **`querymt::plugin::LLMProviderFactory`**: A trait that plugin authors implement. Its primary role is to create an `LLMProvider` instance from a given configuration. It also provides metadata like the plugin name and configuration schema.
 *   **`querymt::plugin::http::HTTPLLMProviderFactory`**: A specialized factory for plugins that expose an `HTTPLLMProvider`.
 
-*   **`querymt::plugin::host::PluginRegistry`**: A central registry that discovers, loads, and manages `LLMProviderFactory` instances from a configuration file. It uses different loaders for different plugin types.
+*   **`querymt::plugin::host::PluginRegistry`**: A central registry that discovers, loads, and manages `LLMProviderFactory` instances from a configuration file. The registry itself is loader-agnostic; it stores `PluginLoader` trait objects and uses them to resolve provider entries.
     *   **`querymt::plugin::host::PluginLoader`**: A trait for systems that can load a specific `querymt::plugin::host::PluginType`. QueryMT provides implementations for:
         *   **Native Plugins:** (`querymt::plugin::host::native::NativeLoader`) Loads plugins from shared libraries (`.so`, `.dll`, `.dylib`).
         *   **WASM Plugins via Extism:** (`querymt::plugin::extism_impl::host::ExtismLoader`) Loads plugins compiled to WebAssembly and executed via Extism, offering sandboxing and portability.
-    *   Sources: `crates/querymt/src/plugin/host/mod.rs`, `crates/querymt/src/plugin/host/native.rs`, `crates/querymt/src/plugin/extism_impl/host/loader.rs`
+    *   **`querymt::dynamic::PluginRegistryDynamicExt`**: A convenience extension layer that registers the built-in dynamic loaders for common applications.
+    *   Sources: `crates/querymt/src/plugin/host/mod.rs`, `crates/querymt/src/dynamic.rs`, `crates/querymt/src/plugin/host/native.rs`, `crates/querymt/src/plugin/extism_impl/host/loader.rs`
 
 ## Outbound HTTP Communication
 
@@ -56,13 +57,13 @@ A core strength of QueryMT is its plugin system, enabling easy addition of new L
 
 ## High-Level Flow
 
-1.  An application initializes a `querymt::plugin::host::PluginRegistry` from a configuration file (e.g., `plugins.toml`).
-2.  The application registers the desired loaders (e.g., `NativeLoader`, `ExtismLoader`) with the registry.
+1.  An application initializes a `querymt::plugin::host::PluginRegistry` from a configuration file (e.g., `providers.toml`).
+2.  For the common dynamic-plugin path, it attaches the built-in loaders with `querymt::dynamic::PluginRegistryDynamicExt::with_dynamic_loaders()`.
 3.  The registry calls `load_all_plugins()`, which iterates through the configured providers. For each provider, it determines its type (e.g., local Wasm, OCI image, native library) and uses the appropriate `PluginLoader` to load it and create an `LLMProviderFactory`.
-4.  The application uses `querymt::builder::LLMBuilder` to configure a desired LLM provider by name (e.g., "openai", "custom-plugin").
-5.  The builder's `build()` method is called, passing a reference to the `PluginRegistry`.
+4.  The application uses `registry.builder("openai")` to create a registry-bound builder, or `querymt::provider("openai")` to create an unbound builder.
+5.  The registry-bound builder finishes with `build()`, while the unbound builder finishes with `build_with(&registry)`.
 6.  The builder looks up the `LLMProviderFactory` from the registry using the provider name.
-7.  The factory's `from_config()` method is called, which instantiates an `LLMProvider` (possibly an `HTTPLLMProvider` wrapped by `LLMProviderFromHTTP`).
+7.  The builder merges defaults from `[providers.config]`, overlays explicit builder settings, prunes the merged config by schema, and then calls the factory's `from_config()` method.
 8.  If tools were added via `add_tool()`, the base provider is wrapped in a `querymt::tool_decorator::ToolEnabledProvider`.
 9.  If a validator is set, the provider is further wrapped in a `querymt::validated_llm::ValidatedLLM`.
 10. The application can then use the resulting `Box<dyn LLMProvider>` instance to perform chat, completion, or embedding operations.

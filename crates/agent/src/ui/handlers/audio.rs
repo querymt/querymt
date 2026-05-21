@@ -8,29 +8,8 @@ use super::super::ServerState;
 use super::super::connection::{send_binary, send_error, send_message};
 use super::super::messages::{AudioModelInfo, UiServerMessage};
 use querymt::LLMProvider;
-use serde_json::{Map, Value};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-
-fn prune_config_by_schema(cfg: &Value, schema: &Value) -> Value {
-    match (cfg, schema.get("properties")) {
-        (Value::Object(cfg_map), Some(Value::Object(props))) => {
-            let mut out = Map::with_capacity(cfg_map.len());
-            for (k, v) in cfg_map {
-                if let Some(prop_schema) = props.get(k) {
-                    let pruned_val = if prop_schema.get("properties").is_some() {
-                        prune_config_by_schema(v, prop_schema)
-                    } else {
-                        v.clone()
-                    };
-                    out.insert(k.clone(), pruned_val);
-                }
-            }
-            Value::Object(out)
-        }
-        _ => cfg.clone(),
-    }
-}
 
 // ── Provider resolution ────────────────────────────────────────────────────────
 
@@ -42,46 +21,14 @@ async fn build_provider(
     model: &str,
 ) -> Result<Arc<dyn LLMProvider>, String> {
     let registry = state.agent.config.provider().plugin_registry();
-    let factory = registry
-        .get(provider_name)
+    let provider = registry
+        .builder(provider_name)
+        .model(model)
+        .build()
         .await
-        .ok_or_else(|| format!("Unknown audio provider: {provider_name}"))?;
+        .map_err(|e| format!("Failed to build provider '{provider_name}': {e}"))?;
 
-    // Build a config JSON from the static provider config (providers.toml
-    // `[providers.config]` section) merged with the model field.
-    // This is necessary for providers like mistralrs that require a model path
-    // at construction time, unlike izwi which has self-contained defaults.
-    let mut config_json = serde_json::json!({ "model": model });
-    if let Some(provider_cfg) = registry
-        .config
-        .providers
-        .iter()
-        .find(|p| p.name == provider_name)
-        && let Some(ref static_config) = provider_cfg.config
-    {
-        for (key, value) in static_config {
-            if config_json.get(key).is_none_or(|v| v.is_null())
-                && let Ok(json_val) = serde_json::to_value(value)
-            {
-                config_json[key] = json_val;
-            }
-        }
-    }
-    let schema: Value = serde_json::from_str(&factory.config_schema())
-        .map_err(|e| format!("Failed to parse provider schema for '{provider_name}': {e}"))?;
-    let config_json = prune_config_by_schema(&config_json, &schema).to_string();
-
-    let provider: Arc<dyn LLMProvider> = Arc::from(
-        factory
-            .from_config(&config_json)
-            .map_err(|e| format!("Failed to build provider '{provider_name}': {e}"))?,
-    );
-
-    // Verify the provider name is plausible by checking it loaded at all.
-    // The `model` is passed per-request via SttRequest/TtsRequest, not at
-    // construction time, so no model validation here.
-    let _ = model; // used by callers below
-    Ok(provider)
+    Ok(Arc::from(provider))
 }
 
 /// Classify a model name as STT, TTS, or both using naming conventions.

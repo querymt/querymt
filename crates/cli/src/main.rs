@@ -2,9 +2,9 @@ use anyhow::{Result, anyhow};
 use clap::{CommandFactory, Parser};
 use colored::*;
 use querymt::{
-    builder::LLMBuilder,
     mcp::{adapter::McpToolAdapter, config::Config as MCPConfig},
     plugin::host::{OciDownloadPhase, OciDownloadProgress, OciProgressCallback},
+    provider_config::ProviderConfigBuilder,
 };
 
 use spinners::{Spinner, Spinners};
@@ -33,9 +33,7 @@ use cli_args::{
 #[cfg(not(feature = "service"))]
 use cli_args::{AuthCommands, CliArgs, Commands, SecretsCommands, ToolConfig, ToolPolicyState};
 use embed::embed_pipe;
-use provider::{
-    apply_provider_config, get_api_key, get_provider_info, get_provider_registry, split_provider,
-};
+use provider::{get_api_key, get_provider_info, get_provider_registry, split_provider};
 use secret_store::SecretStore;
 use tracing::setup_logging;
 use utils::{ToolLoadingStats, get_provider_api_key, parse_tool_names};
@@ -379,20 +377,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 registry.load_all_plugins().await;
                 for factory in registry.list() {
                     print!("{}: ", factory.name());
-                    let cfg = match factory.as_http() {
-                        Some(http_factory) => {
-                            if let Some(api_key) =
-                                get_provider_api_key(factory.name(), http_factory)
-                            {
-                                serde_json::json!({"api_key": api_key})
-                            } else {
-                                serde_json::json!({})
-                            }
-                        }
-                        None => serde_json::json!({}),
-                    };
-                    let cfg_str = serde_json::to_string(&cfg)?;
-                    let models = factory.list_models(&cfg_str).await;
+                    let mut cfg =
+                        ProviderConfigBuilder::from_registry_provider(&registry, factory.name())?;
+                    if let Some(http_factory) = factory.as_http()
+                        && !cfg.contains_non_empty_str("api_key")
+                        && let Some(api_key) = get_provider_api_key(factory.name(), http_factory)
+                    {
+                        cfg.set("api_key", api_key.into());
+                    }
+                    let resolved_cfg = cfg.prune_for_factory(factory.as_ref())?;
+                    if !resolved_cfg.pruned_keys.is_empty() {
+                        log::debug!(
+                            "qmt models pruned unsupported config keys for provider '{}': {}",
+                            factory.name(),
+                            resolved_cfg.pruned_keys.join(", ")
+                        );
+                    }
+                    let models = factory.list_models(&resolved_cfg.pruned_config_str).await;
 
                     match models {
                         Ok(models) if !models.is_empty() => {
@@ -441,8 +442,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _span = ::tracing::info_span!("cli.embed").entered();
                 let (prov_name, opt_model) =
                     resolve_provider_and_model(&args, sc_provider.as_ref(), sc_model.as_ref())?;
-                let mut builder = LLMBuilder::new().provider(prov_name.clone());
-                builder = apply_provider_config(builder, &registry, &prov_name)?;
+                let mut builder = registry.builder(prov_name.clone());
                 if let Some(m) = opt_model {
                     builder = builder.model(m);
                 }
@@ -459,7 +459,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     builder = builder.embedding_dimensions(*dim);
                 }
 
-                let provider = builder.build(&registry).await?;
+                let provider = builder.build().await?;
                 let embeddings = embed_pipe(&provider, text.as_ref(), separator.as_ref()).await?;
 
                 // pretty-print as JSON
@@ -564,8 +564,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build provider + LLMBuilder
     let (prov_name, opt_model) = resolve_provider_and_model(&args, None, None)?;
-    let mut builder = LLMBuilder::new().provider(prov_name.clone());
-    builder = apply_provider_config(builder, &registry, &prov_name)?;
+    let mut builder = registry.builder(prov_name.clone());
     if let Some(m) = opt_model.or(args.model.clone()) {
         builder = builder.model(m);
     }
@@ -677,7 +676,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     tool_stats.log_summary();
-    let provider = builder.build(&registry).await?;
+    let provider = builder.build().await?;
     let is_pipe = !io::stdin().is_terminal();
 
     if is_pipe || args.prompt.is_some() {
