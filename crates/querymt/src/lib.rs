@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 pub mod adapters;
 
 /// Builder pattern for configuring and instantiating LLM providers
-#[cfg(any(feature = "http-client", feature = "extism_host"))]
+#[cfg(feature = "plugin_host")]
 pub mod builder;
 
 /// Chain multiple LLM providers together for complex workflows
@@ -55,6 +55,8 @@ pub mod outbound;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
+#[cfg(feature = "dynamic-plugins")]
+pub mod dynamic;
 pub mod plugin;
 
 pub mod tool_decorator;
@@ -63,16 +65,28 @@ pub mod tool_decorator;
 pub mod params;
 
 /// Validation wrapper for LLM providers with retry capabilities
-#[cfg(any(feature = "http-client", feature = "extism_host"))]
+#[cfg(feature = "plugin_host")]
 pub mod validated_llm;
 
 /// Evaluator for LLM providers
 pub mod evaluator;
 
+#[cfg(feature = "plugin_host")]
+pub mod provider_config;
 pub mod providers;
+
+#[cfg(feature = "plugin_host")]
+pub use builder::{BoundRegistry, LLMBuilder, Unbound};
+#[cfg(feature = "plugin_host")]
+pub use plugin::host::PluginRegistry;
 
 // Re-export LLMParams for convenience
 pub use params::LLMParams;
+
+#[cfg(feature = "plugin_host")]
+pub fn provider(name: impl Into<String>) -> LLMBuilder {
+    LLMBuilder::new().provider(name)
+}
 
 /// Core trait that all LLM providers must implement, combining chat, completion
 /// and embedding capabilities into a unified interface

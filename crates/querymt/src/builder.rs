@@ -11,10 +11,11 @@ use crate::{
     },
     error::LLMError,
     plugin::{LLMProviderFactory, host::PluginRegistry},
+    provider_config::prune_config_by_schema,
     tool_decorator::{CallFunctionTool, ToolEnabledProvider},
 };
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
 #[cfg(feature = "tracing")]
 use tracing::instrument;
@@ -23,26 +24,19 @@ use tracing::instrument;
 /// Takes a response string and returns Ok(()) if valid, or Err with an error message if invalid.
 pub type ValidatorFn = dyn Fn(&str) -> Result<(), String> + Send + Sync + 'static;
 
-fn prune_config_by_schema(cfg: &Value, schema: &Value) -> Value {
-    match (cfg, schema.get("properties")) {
-        (Value::Object(cfg_map), Some(Value::Object(props))) => {
-            // Build a new object only with keys in props
-            let mut out = Map::with_capacity(cfg_map.len());
-            for (k, v) in cfg_map {
-                if let Some(prop_schema) = props.get(k) {
-                    // If the subschema has its own nested properties, recurse
-                    let pruned_val = if prop_schema.get("properties").is_some() {
-                        prune_config_by_schema(v, prop_schema)
-                    } else {
-                        v.clone()
-                    };
-                    out.insert(k.clone(), pruned_val);
-                }
-            }
-            Value::Object(out)
-        }
-        // Not an object or no properties defined → return as-is
-        _ => cfg.clone(),
+#[derive(Default, Serialize)]
+pub struct Unbound;
+
+pub struct BoundRegistry<'a> {
+    registry: &'a PluginRegistry,
+}
+
+impl Serialize for BoundRegistry<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_unit_struct("BoundRegistry")
     }
 }
 
@@ -50,8 +44,10 @@ fn prune_config_by_schema(cfg: &Value, schema: &Value) -> Value {
 ///
 /// Provides a fluent interface for setting various configuration options
 /// like model selection, API keys, generation parameters, etc.
-#[derive(Default, Serialize)]
-pub struct LLMBuilder {
+#[derive(Serialize)]
+pub struct LLMBuilder<State = Unbound> {
+    #[serde(skip_serializing)]
+    state: State,
     /// Selected backend provider
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<String>,
@@ -96,9 +92,6 @@ pub struct LLMBuilder {
     validator: Option<Box<ValidatorFn>>,
     /// Number of retry attempts when validation fails
     validator_attempts: usize,
-    /// Function tools
-    //    #[serde(skip_serializing_if = "Option::is_none")]
-    //    tools: Option<Vec<Tool>>,
     /// Tool choice
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ToolChoice>,
@@ -120,10 +113,84 @@ pub struct LLMBuilder {
     custom_options: Option<HashMap<String, Value>>,
 }
 
-impl LLMBuilder {
+impl Default for LLMBuilder<Unbound> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LLMBuilder<Unbound> {
     /// Creates a new empty builder instance with default values.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            state: Unbound,
+            provider: None,
+            api_key: None,
+            base_url: None,
+            model: None,
+            max_tokens: None,
+            temperature: None,
+            system: Vec::new(),
+            timeout_seconds: None,
+            stream: None,
+            top_p: None,
+            top_k: None,
+            embedding_encoding_format: None,
+            embedding_dimensions: None,
+            validator: None,
+            validator_attempts: 0,
+            tool_choice: None,
+            enable_parallel_tool_use: None,
+            reasoning_effort: None,
+            reasoning_budget_tokens: None,
+            json_schema: None,
+            tool_registry: HashMap::new(),
+            custom_options: None,
+        }
+    }
+
+    pub async fn build_with(
+        self,
+        registry: &PluginRegistry,
+    ) -> Result<Box<dyn LLMProvider>, LLMError> {
+        self.build_with_registry(registry).await
+    }
+}
+
+impl<'a> LLMBuilder<BoundRegistry<'a>> {
+    pub async fn build(self) -> Result<Box<dyn LLMProvider>, LLMError> {
+        let registry = self.state.registry;
+        self.build_with_registry(registry).await
+    }
+}
+
+impl<State> LLMBuilder<State> {
+    pub(crate) fn bind(self, registry: &PluginRegistry) -> LLMBuilder<BoundRegistry<'_>> {
+        LLMBuilder {
+            state: BoundRegistry { registry },
+            provider: self.provider,
+            api_key: self.api_key,
+            base_url: self.base_url,
+            model: self.model,
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+            system: self.system,
+            timeout_seconds: self.timeout_seconds,
+            stream: self.stream,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            embedding_encoding_format: self.embedding_encoding_format,
+            embedding_dimensions: self.embedding_dimensions,
+            validator: self.validator,
+            validator_attempts: self.validator_attempts,
+            tool_choice: self.tool_choice,
+            enable_parallel_tool_use: self.enable_parallel_tool_use,
+            reasoning_effort: self.reasoning_effort,
+            reasoning_budget_tokens: self.reasoning_budget_tokens,
+            json_schema: self.json_schema,
+            tool_registry: self.tool_registry,
+            custom_options: self.custom_options,
+        }
     }
 
     /// Sets the backend provider to use.
@@ -227,10 +294,6 @@ impl LLMBuilder {
     }
 
     /// Sets a validation function to verify LLM responses.
-    ///
-    /// # Arguments
-    ///
-    /// * `f` - Function that takes a response string and returns Ok(()) if valid, or Err with error message if invalid
     pub fn validator<F>(mut self, f: F) -> Self
     where
         F: Fn(&str) -> Result<(), String> + Send + Sync + 'static,
@@ -240,45 +303,18 @@ impl LLMBuilder {
     }
 
     /// Sets the number of retry attempts for validation failures.
-    ///
-    /// # Arguments
-    ///
-    /// * `attempts` - Maximum number of times to retry generating a valid response
     pub fn validator_attempts(mut self, attempts: usize) -> Self {
         self.validator_attempts = attempts;
         self
     }
 
-    /*
-        /// Adds a function tool to the builder
-        pub fn function(mut self, function_builder: FunctionBuilder) -> Self {
-            if self.tools.is_none() {
-                self.tools = Some(Vec::new());
-            }
-            if let Some(tools) = &mut self.tools {
-                tools.push(function_builder.build());
-            }
-            self
-        }
-
-        pub fn tools(mut self, mut new_tools: Vec<Tool>) -> Self {
-            if self.tools.is_none() {
-                self.tools = Some(new_tools.clone());
-            }
-            if let Some(tools) = &mut self.tools {
-                tools.append(new_tools.as_mut());
-            }
-            println!("did it set {:?}", self.tools);
-            self
-        }
-    */
     /// Enable parallel tool use
     pub fn enable_parallel_tool_use(mut self, enable: bool) -> Self {
         self.enable_parallel_tool_use = Some(enable);
         self
     }
 
-    /// Set tool choice.  Note that if the choice is given as Tool(name), and that
+    /// Set tool choice. Note that if the choice is given as Tool(name), and that
     /// tool isn't available, the builder will fail.
     pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
         self.tool_choice = Some(choice);
@@ -304,23 +340,26 @@ impl LLMBuilder {
     where
         K: Into<String>,
     {
-        let map = self.custom_options.get_or_insert_with(HashMap::new);
-        map.insert(key.into(), value);
+        self.custom_options
+            .get_or_insert_with(HashMap::new)
+            .insert(key.into(), value);
         self
     }
 
-    /// Builds and returns a configured LLM provider instance.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - No backend is specified
-    /// - Required backend feature is not enabled
-    /// - Required configuration like API keys are missing
-    #[cfg_attr(feature = "tracing", instrument(name = "llm_builder.build", skip(self, registry), fields(provider = self.provider.as_deref().unwrap_or("unknown"))))]
-    pub async fn build(self, registry: &PluginRegistry) -> Result<Box<dyn LLMProvider>, LLMError> {
-        //        let (tools, tool_choice) = self.validate_tool_config()?;
+    pub fn parameters_from_value(mut self, value: &Value) -> Self {
+        if let Some(obj) = value.as_object() {
+            for (key, value) in obj {
+                self = self.parameter(key.clone(), value.clone());
+            }
+        }
+        self
+    }
 
+    #[cfg_attr(feature = "tracing", instrument(name = "llm_builder.build", skip(self, registry), fields(provider = self.provider.as_deref().unwrap_or("unknown"))))]
+    async fn build_with_registry(
+        self,
+        registry: &PluginRegistry,
+    ) -> Result<Box<dyn LLMProvider>, LLMError> {
         let provider_name = self
             .provider
             .clone()
@@ -336,8 +375,26 @@ impl LLMBuilder {
             .map(|t| t.descriptor())
             .collect();
 
-        let full_cfg: Value = serde_json::to_value(&self)?;
+        let resolved_cfg = crate::provider_config::resolve_registry_provider_config(
+            registry,
+            &provider_name,
+            factory.as_ref(),
+        )?;
+
+        let mut full_cfg = match resolved_cfg.full_config {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        let builder_cfg = match serde_json::to_value(&self)? {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        for (key, value) in builder_cfg {
+            full_cfg.insert(key, value);
+        }
+
         let schema: Value = serde_json::from_str(&factory.config_schema())?;
+        let full_cfg = Value::Object(full_cfg);
         let pruned_cfg = prune_config_by_schema(&full_cfg, &schema);
         let pruned_cfg_str = serde_json::to_string(&pruned_cfg)?;
         let base = factory.from_config(&pruned_cfg_str)?;

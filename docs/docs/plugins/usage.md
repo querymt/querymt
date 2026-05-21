@@ -4,24 +4,17 @@ Once plugins are developed, QueryMT's `querymt::plugin::host::PluginRegistry` is
 
 ## Initialization
 
-The registry is typically initialized at application startup by pointing it to a configuration file. You must also register `PluginLoader` implementations for the types of plugins you want to support (e.g., native shared libraries, Extism/Wasm).
+The registry is typically initialized at application startup by pointing it to a configuration file. For the common dynamic-plugin setup, use the feature-gated `dynamic` extension layer instead of wiring `PluginLoader` implementations manually.
 
 ```rust
-use querymt::plugin::host::{PluginRegistry, native::NativeLoader};
-use querymt::plugin::extism_impl::host::ExtismLoader;
-use querymt::error::LLMError;
+use querymt::{PluginRegistry, dynamic::PluginRegistryDynamicExt, error::LLMError};
 
 # async fn example() -> Result<(), LLMError> {
-// 1. Create a registry from a config file path.
-let mut registry = PluginRegistry::from_path("plugins.toml")?;
+// 1. Create a registry from a config file path and attach the built-in loaders.
+let registry = PluginRegistry::from_path("providers.toml")?
+    .with_dynamic_loaders();
 
-// 2. Register loaders for the plugin types you want to support.
-#[cfg(feature = "native")]
-registry.register_loader(Box::new(NativeLoader));
-#[cfg(feature = "extism_host")]
-registry.register_loader(Box::new(ExtismLoader));
-
-// 3. Load all plugins defined in the config file.
+// 2. Load all plugins defined in the config file.
 registry.load_all_plugins().await;
 # Ok(())
 # }
@@ -38,23 +31,21 @@ This process will:
 
 ## Accessing Provider Factories
 
-Once loaded, you can use the `PluginRegistry` with `LLMBuilder` to create provider instances. The builder will use the registry to find the correct factory.
+Once loaded, you can use `registry.builder(...)` to create provider instances. The builder will use the registry to find the correct factory and automatically merge defaults from `[providers.config]` before pruning the final config by schema.
 
 ```rust
-use querymt::builder::LLMBuilder;
-use querymt::plugin::host::PluginRegistry;
 use querymt::LLMProvider;
+use querymt::PluginRegistry;
 use serde_json::json;
 # async fn example(registry: PluginRegistry) -> anyhow::Result<()> {
 
 // Use the builder to configure a provider by its name from the config file.
-let provider: Box<dyn LLMProvider> = LLMBuilder::new()
-    .provider("my_openai_plugin") // This name must match a name in plugins.toml
+let provider: Box<dyn LLMProvider> = registry
+    .builder("my_openai_plugin") // This name must match a name in providers.toml
     .model("gpt-4-turbo")
-    // The builder automatically sets provider-specific config like api_key
-    // from its own fields. Here we set a custom one.
     .parameter("custom_param", json!(true))
-    .build(&registry)?;
+    .build()
+    .await?;
 
 // Now you have an LLMProvider instance and can use it.
 println!("Successfully created provider instance for 'my_openai_plugin'");

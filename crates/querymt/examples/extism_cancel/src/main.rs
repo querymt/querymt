@@ -19,9 +19,9 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use log::{debug, info, warn};
 use querymt::{
-    builder::LLMBuilder,
     chat::{ChatMessage, StreamChunk},
-    plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
+    dynamic::PluginRegistryDynamicExt,
+    plugin::host::PluginRegistry,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -99,8 +99,7 @@ fn resolve_base_url(args: &Args) -> Option<String> {
 }
 
 fn build_registry(cfg_file: PathBuf) -> Result<PluginRegistry> {
-    let mut registry = PluginRegistry::from_path(cfg_file)?;
-    registry.register_loader(Box::new(ExtismLoader));
+    let registry = PluginRegistry::from_path(cfg_file)?.with_dynamic_loaders();
     Ok(registry)
 }
 
@@ -135,7 +134,7 @@ async fn main() -> Result<()> {
 
     let registry = build_registry(args.provider_config.clone())?;
 
-    let mut builder = LLMBuilder::new().provider(args.provider.clone());
+    let mut builder = registry.builder(args.provider.clone());
 
     if let Some(model) = &args.model {
         builder = builder.model(model.clone());
@@ -153,7 +152,7 @@ async fn main() -> Result<()> {
     match args.cmd {
         Cmd::Stream => {
             builder = builder.stream(true);
-            let llm = builder.build(&registry).await?;
+            let llm = builder.build().await?;
 
             let mut stream = llm.chat_stream_with_tools(&messages, llm.tools()).await?;
 
@@ -199,7 +198,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Chat => {
             builder = builder.stream(false);
-            let llm = builder.build(&registry).await?;
+            let llm = builder.build().await?;
 
             info!("starting non-streaming chat request (will cancel via timeout)");
             let res = tokio::time::timeout(

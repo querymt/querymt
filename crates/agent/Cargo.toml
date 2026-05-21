@@ -157,6 +157,7 @@ clap = { version = "4.5", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
 criterion = { version = "0.8", features = ["async_tokio"] }
+http.workspace = true
 
 [[bench]]
 name = "agent_startup"

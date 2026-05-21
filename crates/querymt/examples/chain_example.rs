@@ -8,16 +8,16 @@
 //! Optional: set `PROVIDER_CONFIG` to a custom providers file path.
 
 use querymt::{
-    builder::LLMBuilder,
     chain::{ChainStepBuilder, ChainStepMode, PromptChain},
-    plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
+    dynamic::PluginRegistryDynamicExt,
+    plugin::host::PluginRegistry,
 };
 
 fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
     let cfg_path =
         std::env::var("PROVIDER_CONFIG").unwrap_or_else(|_| "providers.toml".to_string());
-    let mut registry = PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?;
-    registry.register_loader(Box::new(ExtismLoader));
+    let registry =
+        PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?.with_dynamic_loaders();
     Ok(registry)
 }
 
@@ -26,13 +26,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = build_registry()?;
 
     // Initialize the LLM with OpenAI provider and configuration
-    let llm = LLMBuilder::new()
-        .provider("openai")
+    let llm = registry
+        .builder("openai")
         .api_key(std::env::var("OPENAI_API_KEY").expect("Set OPENAI_API_KEY to run this example"))
         .model("gpt-4o")
         .max_tokens(200)
         .temperature(0.7)
-        .build(&registry)
+        .build()
         .await?;
 
     // Create and execute a 4-step prompt chain

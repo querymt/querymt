@@ -38,9 +38,8 @@
 //! - Compare the delegate's inputs with what a working REPL session would use
 
 use querymt::chat::ChatMessage;
-use querymt::plugin::extism_impl::host::ExtismLoader;
+use querymt::dynamic::PluginRegistryDynamicExt;
 use querymt::plugin::host::PluginRegistry;
-use querymt::plugin::host::native::NativeLoader;
 use querymt_agent::events::AgentEvent;
 use querymt_agent::model::MessagePart;
 use querymt_agent::session::projection::EventJournal;
@@ -288,9 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Initialize plugin registry
         let cfg_path = querymt_utils::providers::get_providers_config(None).await?;
-        let mut registry = PluginRegistry::from_path(cfg_path)?;
-        registry.register_loader(Box::new(ExtismLoader));
-        registry.register_loader(Box::new(NativeLoader));
+        let registry = PluginRegistry::from_path(cfg_path)?.with_dynamic_loaders();
 
         // Build provider from config
         let session_provider = SessionProvider::new(

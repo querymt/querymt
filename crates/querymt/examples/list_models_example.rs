@@ -1,10 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-#[cfg(feature = "extism_host")]
-use querymt::plugin::extism_impl::host::ExtismLoader;
-use querymt::plugin::host::PluginRegistry;
-#[cfg(feature = "native")]
-use querymt::plugin::host::native::NativeLoader;
+use querymt::{dynamic::PluginRegistryDynamicExt, plugin::host::PluginRegistry};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
@@ -29,13 +25,9 @@ struct Args {
 }
 
 fn build_registry(cfg_file: &Path) -> Result<PluginRegistry> {
-    let mut registry = PluginRegistry::from_path(cfg_file)
-        .with_context(|| format!("failed to load provider config '{}'", cfg_file.display()))?;
-
-    #[cfg(feature = "extism_host")]
-    registry.register_loader(Box::new(ExtismLoader));
-    #[cfg(feature = "native")]
-    registry.register_loader(Box::new(NativeLoader));
+    let registry = PluginRegistry::from_path(cfg_file)
+        .with_context(|| format!("failed to load provider config '{}'", cfg_file.display()))?
+        .with_dynamic_loaders();
 
     #[cfg(not(any(feature = "extism_host", feature = "native")))]
     anyhow::bail!(
@@ -43,21 +35,6 @@ fn build_registry(cfg_file: &Path) -> Result<PluginRegistry> {
     );
 
     Ok(registry)
-}
-
-/// Serialize a provider's config section to JSON for the factory `list_models` call.
-fn provider_config_json(registry: &PluginRegistry, provider: &str) -> String {
-    let cfg = registry
-        .config
-        .providers
-        .iter()
-        .find(|c| c.name == provider)
-        .and_then(|c| c.config.as_ref());
-
-    match cfg {
-        Some(map) => serde_json::to_string(map).unwrap_or_else(|_| "{}".to_string()),
-        None => "{}".to_string(),
-    }
 }
 
 #[tokio::main]
@@ -68,21 +45,14 @@ async fn main() -> Result<()> {
     let provider_names: Vec<String> = match &args.provider {
         Some(name) => vec![name.clone()],
         None => registry
-            .config
-            .providers
-            .iter()
-            .map(|c| c.name.clone())
+            .list_provider_names()
+            .into_iter()
+            .map(str::to_string)
             .collect(),
     };
 
     for name in &provider_names {
-        let factory = registry
-            .get(name)
-            .await
-            .with_context(|| format!("failed to load provider '{name}'"))?;
-
-        let cfg_json = provider_config_json(&registry, name);
-        match factory.list_models(&cfg_json).await {
+        match registry.list_models(name).await {
             Ok(models) => {
                 println!("{name} ({} models):", models.len());
                 for model in &models {

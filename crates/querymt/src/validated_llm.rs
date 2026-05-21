@@ -9,8 +9,9 @@
 //! ```no_run
 //! use llm::builder::{LLMBuilder, LLMBackend};
 //!
-//! let llm = LLMBuilder::new()
-//!     .backend(LLMBackend::OpenAI)
+//! let registry = querymt::PluginRegistry::from_default_config()?.with_dynamic_loaders();
+//! let llm = registry
+//!     .builder("openai")
 //!     .validator(|response| {
 //!         if response.contains("unsafe content") {
 //!             Err("Response contains unsafe content".to_string())
@@ -20,7 +21,7 @@
 //!     })
 //!     .validator_attempts(3)
 //!     .build()
-//!     .unwrap();
+//!     .await?;
 //! ```
 
 use async_trait::async_trait;

@@ -8,9 +8,9 @@ use anyhow::{Result, anyhow};
 use once_cell::sync::Lazy;
 use querymt::LLMParams;
 use querymt::chat::ChatRole;
-use querymt::plugin::host::PluginRegistry;
 #[cfg(feature = "plugin-loaders")]
-use querymt::plugin::{extism_impl::host::ExtismLoader, host::native::NativeLoader};
+use querymt::dynamic::PluginRegistryDynamicExt;
+use querymt::plugin::host::PluginRegistry;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -37,11 +37,9 @@ pub(super) async fn default_registry() -> Result<PluginRegistry> {
     let cfg_path = querymt_utils::providers::get_providers_config(None).await?;
     #[cfg(feature = "plugin-loaders")]
     {
-        let mut registry = PluginRegistry::from_path(&cfg_path)
-            .map_err(|e| anyhow!("Failed to load plugin registry: {}", e))?;
-        registry.register_loader(Box::new(ExtismLoader));
-        registry.register_loader(Box::new(NativeLoader));
-        Ok(registry)
+        PluginRegistry::from_path(&cfg_path)
+            .map(|registry| registry.with_dynamic_loaders())
+            .map_err(|e| anyhow!("Failed to load plugin registry: {}", e))
     }
 
     #[cfg(not(feature = "plugin-loaders"))]

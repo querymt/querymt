@@ -9,15 +9,15 @@
 
 use futures_util::future;
 use moka::future::Cache;
-use querymt::plugin::{HTTPLLMProviderFactory, LLMProviderFactory};
+use querymt::plugin::LLMProviderFactory;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use typeshare::typeshare;
 
 use crate::agent::agent_config::AgentConfig;
+use crate::session::provider_config::{ProviderConfigMode, resolve_provider_config};
 
 /// TTL for local provider model listings (relatively stable).
 const LOCAL_TTL: Duration = Duration::from_secs(300); // 5 min
@@ -236,58 +236,6 @@ pub(crate) async fn enumerate_local_models(config: &AgentConfig) -> Vec<ModelEnt
     all
 }
 
-// ── Provider config helpers ───────────────────────────────────────────────────
-
-pub(crate) fn resolve_base_url_for_provider(
-    config: &AgentConfig,
-    provider: &str,
-) -> Option<String> {
-    let cfg: &querymt::LLMParams = config.provider.initial_config();
-    if cfg.provider.as_deref()? != provider {
-        return None;
-    }
-    if let Some(base_url) = &cfg.base_url {
-        return Some(base_url.clone());
-    }
-    cfg.custom
-        .as_ref()
-        .and_then(|m| m.get("base_url"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
-pub(crate) fn resolve_model_for_provider(config: &AgentConfig, provider: &str) -> Option<String> {
-    let cfg: &querymt::LLMParams = config.provider.initial_config();
-    if cfg.provider.as_deref()? != provider {
-        return None;
-    }
-
-    cfg.model.clone().or_else(|| {
-        cfg.custom
-            .as_ref()
-            .and_then(|m| m.get("model"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    })
-}
-
-/// Resolve API key for a provider from OAuth token store, stored API key, or environment variable.
-async fn resolve_provider_api_key(
-    provider: &str,
-    factory: &dyn HTTPLLMProviderFactory,
-) -> Option<String> {
-    let preferred_method = crate::session::provider::preferred_auth_method(provider);
-    let mut use_oauth_resolver = false;
-
-    crate::session::provider::resolve_api_key_with_preference(
-        provider,
-        factory.api_key_name().as_deref(),
-        preferred_method.as_ref(),
-        &mut use_oauth_resolver,
-    )
-    .await
-}
-
 // ── Provider-level helpers ────────────────────────────────────────────────────
 
 async fn fetch_catalog_models(
@@ -295,35 +243,28 @@ async fn fetch_catalog_models(
     factory: &Arc<dyn LLMProviderFactory>,
     provider_name: &str,
 ) -> Vec<ModelEntry> {
-    let mut cfg = if let Some(http_factory) = factory.as_http() {
-        if let Some(api_key) = resolve_provider_api_key(provider_name, http_factory).await {
-            serde_json::json!({"api_key": api_key})
-        } else {
-            return Vec::new();
-        }
-    } else {
-        serde_json::json!({})
-    };
-
-    if let Some(base_url) = resolve_base_url_for_provider(config, provider_name) {
-        cfg["base_url"] = base_url.into();
-    }
-
-    // Non-HTTP providers like llama_cpp require `model` in config even for list_models.
-    if factory.as_http().is_none() {
-        if let Some(model) = resolve_model_for_provider(config, provider_name) {
-            cfg["model"] = model.into();
-        } else {
+    let registry = config.provider.plugin_registry();
+    let resolved = match resolve_provider_config(
+        &registry,
+        config.provider.initial_config(),
+        factory,
+        provider_name,
+        ProviderConfigMode::CatalogListing,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(err) => {
             log::debug!(
-                "fetch_catalog_models: skipping provider='{}' catalog list because no configured model was found",
-                provider_name
+                "fetch_catalog_models: skipping provider='{}' because config resolution failed: {}",
+                provider_name,
+                err
             );
             return Vec::new();
         }
-    }
+    };
 
-    let cfg_str = serde_json::to_string(&cfg).unwrap_or_else(|_| "{}".to_string());
-    match factory.list_models(&cfg_str).await {
+    match factory.list_models(&resolved.pruned_config_str).await {
         Ok(model_list) => model_list
             .into_iter()
             .map(|model| ModelEntry {

@@ -75,11 +75,12 @@ Key components for MCP integration are found in the `crates/querymt/src/mcp/` di
         "my_calculator_service".to_string()
     )?;
 
-    let llm = LLMBuilder::new()
-        .provider("some_provider")
+    let llm = provider_registry
+        .builder("some_provider")
         // ... other configs ...
         .add_tool(adapted_calc_tool) // Register the MCP tool adapter
-        .build(&provider_registry)?;
+        .build()
+        .await?;
     ```
 
 6.  **LLM Interaction:**

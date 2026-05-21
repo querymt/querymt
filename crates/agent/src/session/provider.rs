@@ -1,9 +1,9 @@
 #[cfg(feature = "remote")]
 use crate::agent::remote::NodeId;
 use crate::model::{AgentMessage, MessagePart};
-use crate::model_heuristics::ModelDefaults;
 use crate::model_info::get_model_info;
 use crate::session::error::{SessionError, SessionResult};
+use crate::session::provider_config::{ProviderConfigMode, resolve_provider_config};
 use crate::session::store::{LLMConfig, Session, SessionExecutionConfig, SessionStore};
 use arc_swap::ArcSwap;
 use querymt::LLMParams;
@@ -14,50 +14,9 @@ use querymt::{
     chat::{ChatMessage, ChatResponse, ChatRole, Content},
     error::LLMError,
 };
-use serde_json::{Map, Value};
 use std::sync::Arc;
 #[cfg(feature = "remote")]
 use std::sync::atomic::{AtomicBool, Ordering};
-
-fn prune_config_by_schema(cfg: &Value, schema: &Value) -> Value {
-    match (cfg, schema.get("properties")) {
-        (Value::Object(cfg_map), Some(Value::Object(props))) => {
-            // Build a new object only with keys in `properties`.
-            let mut out = Map::with_capacity(cfg_map.len());
-            for (k, v) in cfg_map {
-                if let Some(prop_schema) = props.get(k) {
-                    // If the subschema has its own nested properties, recurse.
-                    let pruned_val = if prop_schema.get("properties").is_some() {
-                        prune_config_by_schema(v, prop_schema)
-                    } else {
-                        v.clone()
-                    };
-                    out.insert(k.clone(), pruned_val);
-                }
-            }
-            Value::Object(out)
-        }
-        // Not an object or no properties defined -> return as-is.
-        _ => cfg.clone(),
-    }
-}
-
-fn pruned_top_level_keys(before: &Value, after: &Value) -> Vec<String> {
-    let Some(before_obj) = before.as_object() else {
-        return Vec::new();
-    };
-    let Some(after_obj) = after.as_object() else {
-        return Vec::new();
-    };
-
-    let mut removed: Vec<String> = before_obj
-        .keys()
-        .filter(|k| !after_obj.contains_key(*k))
-        .cloned()
-        .collect();
-    removed.sort();
-    removed
-}
 
 /// Cached provider entry: `(config_id, provider_node_id, allow_mesh_fallback, provider)`.
 ///
@@ -550,125 +509,25 @@ impl SessionProvider {
             }
         };
 
-        // Build config JSON, starting with model
-        let mut builder_config = serde_json::json!({ "model": model });
+        let resolved_cfg = resolve_provider_config(
+            plugin_registry,
+            &self.initial_config,
+            &factory,
+            provider_name,
+            ProviderConfigMode::Runtime {
+                model,
+                params,
+                api_key_override,
+                session_id,
+            },
+        )
+        .await?;
 
-        // Merge params if provided
-        if let Some(params_value) = params
-            && let Some(obj) = params_value.as_object()
-        {
-            for (key, value) in obj {
-                builder_config[key] = value.clone();
-            }
-        }
+        let builder_config = resolved_cfg.builder_config;
+        let pruned_config_str = resolved_cfg.pruned_config_str;
+        let pruned_keys = resolved_cfg.pruned_keys;
+        let _use_oauth_resolver = resolved_cfg.use_oauth_resolver;
 
-        // Merge static provider config from providers.toml [providers.config] as
-        // lowest-priority defaults. This allows provider-level settings such as
-        // `fast_download` to reach the provider's from_config() without requiring
-        // the caller to pass them as params every time.
-        // Params (above) and model always take precedence over these defaults.
-        if let Some(provider_cfg) = plugin_registry
-            .config
-            .providers
-            .iter()
-            .find(|p| p.name == provider_name)
-            && let Some(ref static_config) = provider_cfg.config
-        {
-            for (key, value) in static_config {
-                if builder_config.get(key).is_none_or(|v| v.is_null())
-                    && let Ok(json_val) = serde_json::to_value(value)
-                {
-                    builder_config[key] = json_val;
-                }
-            }
-        }
-
-        // Apply model/provider heuristic defaults (only fills keys not already present)
-        let defaults = ModelDefaults::for_model(provider_name, model);
-        defaults.apply_to(&mut builder_config, session_id);
-
-        // Track whether we should attach an OAuth key resolver after construction.
-        // The resolver enables transparent token refresh without rebuilding the provider.
-        let mut _use_oauth_resolver = false;
-
-        // Get API key — respects user's preferred auth method if set.
-        //
-        // Resolution order (when no preference):
-        //   1. api_key_override (explicit caller param — always wins)
-        //   2. OAuth token (if oauth feature enabled)
-        //   3. Stored API key from keyring (set via dashboard UI)
-        //   4. Environment variable
-        //
-        // When the user has set a preferred_method via the dashboard:
-        //   - "oauth":   OAuth → stored key → env
-        //   - "api_key": stored key → env → OAuth
-        //   - "env_var": env → stored key → OAuth
-        //
-        // Note: `api_key_name()` may return `None` for OAuth-only providers
-        // (e.g. Codex). The OAuth path does not depend on an env var name,
-        // so it runs regardless.
-        if let Some(http_factory) = factory.as_http() {
-            let env_var_name = http_factory.api_key_name();
-
-            let api_key = if let Some(key) = api_key_override {
-                Some(key.to_string())
-            } else if let Some(serde_json::Value::String(key)) = builder_config
-                .get("api_key")
-                .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
-            {
-                // API key already present in builder_config from params or
-                // static provider config — use it directly.
-                log::debug!(
-                    "Using inline API key from config for provider '{}'",
-                    provider_name
-                );
-                Some(key.clone())
-            } else {
-                let preferred_method = preferred_auth_method(provider_name);
-
-                log::debug!(
-                    "Resolving API key for provider '{}' (preferred: {:?}, env_var: {:?})",
-                    provider_name,
-                    preferred_method,
-                    env_var_name
-                );
-
-                resolve_api_key_with_preference(
-                    provider_name,
-                    env_var_name.as_deref(),
-                    preferred_method.as_ref(),
-                    &mut _use_oauth_resolver,
-                )
-                .await
-            };
-
-            if let Some(key) = api_key {
-                builder_config["api_key"] = key.into();
-            } else {
-                // All credential sources failed — return a descriptive error
-                // instead of letting `from_config` fail with a cryptic serde
-                // "missing field `api_key`" message.
-                let msg = if let Some(ref env_name) = env_var_name {
-                    format!(
-                        "No API key found for provider '{}'. Set {} or run 'qmt auth login {}'",
-                        provider_name, env_name, provider_name
-                    )
-                } else {
-                    format!(
-                        "No credentials found for provider '{}'. Run 'qmt auth login {}'",
-                        provider_name, provider_name
-                    )
-                };
-                return Err(SessionError::ProviderError(LLMError::AuthError(msg)));
-            }
-        }
-
-        // Prune config by provider schema to avoid providers with
-        // `deny_unknown_fields` rejecting unrelated parameters.
-        let schema: Value = serde_json::from_str(&factory.config_schema())?;
-        let pruned_config = prune_config_by_schema(&builder_config, &schema);
-
-        let pruned_keys = pruned_top_level_keys(&builder_config, &pruned_config);
         if !pruned_keys.is_empty() {
             const MAX_KEYS_TO_LOG: usize = 50;
             let shown = pruned_keys.len().min(MAX_KEYS_TO_LOG);
@@ -685,8 +544,6 @@ impl SessionProvider {
                 suffix
             );
         }
-
-        let pruned_config_str = serde_json::to_string(&pruned_config)?;
 
         // If OAuth was used, attach a resolver so expired tokens are refreshed
         // transparently on each request.

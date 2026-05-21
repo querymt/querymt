@@ -10,16 +10,16 @@
 //! Optional: set `PROVIDER_CONFIG` to a custom providers file path.
 
 use querymt::{
-    builder::LLMBuilder,
     chain::{LLMRegistryBuilder, MultiChainStepBuilder, MultiChainStepMode, MultiPromptChain},
-    plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
+    dynamic::PluginRegistryDynamicExt,
+    plugin::host::PluginRegistry,
 };
 
 fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
     let cfg_path =
         std::env::var("PROVIDER_CONFIG").unwrap_or_else(|_| "providers.toml".to_string());
-    let mut registry = PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?;
-    registry.register_loader(Box::new(ExtismLoader));
+    let registry =
+        PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?.with_dynamic_loaders();
     Ok(registry)
 }
 
@@ -28,23 +28,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let plugin_registry = build_registry()?;
 
     // Initialize Claude model with API key and current model version
-    let anthropic_llm = LLMBuilder::new()
-        .provider("anthropic")
+    let anthropic_llm = plugin_registry
+        .builder("anthropic")
         .api_key(
             std::env::var("ANTHROPIC_API_KEY").expect("Set ANTHROPIC_API_KEY to run this example"),
         )
         .model("claude-sonnet-4-6")
         .max_tokens(4096)
-        .build(&plugin_registry)
+        .build()
         .await?;
 
     // Initialize Groq model with the current default reasoning-capable model
-    let groq_llm = LLMBuilder::new()
-        .provider("groq")
+    let groq_llm = plugin_registry
+        .builder("groq")
         .api_key(std::env::var("GROQ_API_KEY").expect("Set GROQ_API_KEY to run this example"))
         .model("qwen/qwen3-32b")
         .max_tokens(4096)
-        .build(&plugin_registry)
+        .build()
         .await?;
 
     // Create chain registry with both models

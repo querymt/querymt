@@ -24,9 +24,10 @@
 
 use querymt::{
     LLMProvider, ToolCall,
-    builder::{FunctionBuilder, LLMBuilder, ParamBuilder},
+    builder::{FunctionBuilder, ParamBuilder},
     chat::{ChatMessage, Content, Tool, ToolChoice},
-    plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
+    dynamic::PluginRegistryDynamicExt,
+    plugin::host::PluginRegistry,
 };
 use serde_json::{Value, json};
 use std::{env, error::Error};
@@ -35,8 +36,8 @@ type ExampleResult<T> = Result<T, Box<dyn Error>>;
 
 fn build_registry() -> ExampleResult<PluginRegistry> {
     let cfg_path = env::var("PROVIDER_CONFIG").unwrap_or_else(|_| "providers.toml".to_string());
-    let mut registry = PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?;
-    registry.register_loader(Box::new(ExtismLoader));
+    let registry =
+        PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?.with_dynamic_loaders();
     Ok(registry)
 }
 
@@ -84,8 +85,8 @@ async fn create_llm(
     let provider = provider_name.to_lowercase();
     let registry = build_registry()?;
 
-    let mut builder = LLMBuilder::new()
-        .provider(provider.clone())
+    let mut builder = registry
+        .builder(provider.clone())
         .max_tokens(1024)
         .temperature(0.2)
         .stream(false);
@@ -127,7 +128,7 @@ async fn create_llm(
         builder = builder.tool_choice(choice);
     }
 
-    Ok(builder.build(&registry).await?)
+    Ok(builder.build().await?)
 }
 
 fn parse_args(arguments: &str) -> Value {

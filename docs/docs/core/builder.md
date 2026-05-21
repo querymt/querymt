@@ -34,28 +34,31 @@ The `LLMBuilder` allows you to set various common and provider-specific paramete
 
 ### Building the Provider
 
-*   **`build(self, registry: &PluginRegistry) -> Result<Box<dyn LLMProvider>, LLMError>`**:
-    This is the final step. It takes a reference to a `querymt::plugin::host::PluginRegistry` (which knows how to create different providers).
-    1.  It serializes the builder's configuration into a JSON `Value`.
-    2.  It retrieves the appropriate `LLMProviderFactory` from the `registry` based on the `provider` name set earlier.
-    3.  It prunes the full configuration based on the schema provided by the factory, so only relevant options are passed.
-    4.  It calls `factory.from_config()` with the pruned configuration to get a base `LLMProvider`.
-    5.  If tools were added via `add_tool()`, it wraps the base provider in a `querymt::tool_decorator::ToolEnabledProvider`.
-    6.  If a `validator` was set, it further wraps the provider in a `querymt::validated_llm::ValidatedLLM`.
-    7.  Returns the fully configured `LLMProvider` instance, boxed as a trait object.
+*   **`build(self) -> Result<Box<dyn LLMProvider>, LLMError>`** on a registry-bound builder:
+    This is the final step when the builder came from `registry.builder(...)`.
+    1.  It retrieves the appropriate `LLMProviderFactory` from the bound `PluginRegistry` based on the `provider` name set earlier.
+    2.  It loads provider defaults from `[providers.config]` for that provider.
+    3.  It injects an environment API key when the provider advertises one via `api_key_name()` and no explicit `api_key` was set.
+    4.  It overlays explicit builder settings on top of those defaults, so builder setters win.
+    5.  It prunes the merged configuration based on the schema provided by the factory, so only relevant options are passed.
+    6.  It calls `factory.from_config()` with the pruned configuration to get a base `LLMProvider`.
+    7.  If tools were added via `add_tool()`, it wraps the base provider in a `querymt::tool_decorator::ToolEnabledProvider`.
+    8.  If a `validator` was set, it further wraps the provider in a `querymt::validated_llm::ValidatedLLM`.
+    9.  Returns the fully configured `LLMProvider` instance, boxed as a trait object.
+
+*   **`build_with(self, registry: &PluginRegistry) -> Result<Box<dyn LLMProvider>, LLMError>`** on an unbound builder:
+    This is the equivalent final step for builders created via `querymt::provider(...)` or `LLMBuilder::new()`.
 
 ## Example Usage (Conceptual)
 
 ```rust
-use querymt::builder::LLMBuilder;
-use querymt::chat::ToolChoice;
 use querymt::plugin::host::PluginRegistry; // Assuming you have a registry instance
 // Assume GetWeatherTool is an impl CallFunctionTool
 // use my_tools::GetWeatherTool;
 
 async fn setup_llm_provider(registry: &PluginRegistry) -> Result<Box<dyn querymt::LLMProvider>, querymt::error::LLMError> {
-    let llm = LLMBuilder::new()
-        .provider("openai") // Or your plugin's name
+    let llm = registry
+        .builder("openai") // Or your plugin's name
         .model("gpt-4-turbo")
         .api_key("YOUR_OPENAI_API_KEY")
         .temperature(0.7)
@@ -71,10 +74,9 @@ async fn setup_llm_provider(registry: &PluginRegistry) -> Result<Box<dyn querymt
             }
         })
         .validator_attempts(2)
-        .build(registry)?;
-
-    Ok(llm)
-}
+        .build()
+        .await?;
 ```
+
 
 The `LLMBuilder` provides a convenient and type-safe way to configure diverse LLM providers with a wide range of options, abstracting away the underlying factory and wrapping logic.

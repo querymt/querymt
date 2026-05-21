@@ -117,6 +117,7 @@ pub struct ExtismFactory {
     plugin: Arc<Mutex<Plugin>>,
     name: String,
     user_data: Option<extism::UserData<functions::HostState>>,
+    allowed_hosts: Vec<String>,
 }
 
 fn call_plugin_str(plugin: Arc<Mutex<Plugin>>, func: &str, arg: &Value) -> anyhow::Result<String> {
@@ -126,6 +127,73 @@ fn call_plugin_str(plugin: Arc<Mutex<Plugin>>, func: &str, arg: &Value) -> anyho
     let mut plug = plugin.lock().unwrap();
     let output_bytes: Vec<u8> = plug.call(func, &input_bytes)?;
     Ok(std::str::from_utf8(&output_bytes)?.to_string())
+}
+
+fn add_allowed_host(allowed_hosts: &mut Vec<String>, host: String) {
+    if !host.is_empty() && !allowed_hosts.iter().any(|h| h == &host) {
+        allowed_hosts.push(host);
+    }
+}
+
+fn host_from_base_url(base_url: &str) -> Option<String> {
+    Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+}
+
+fn configured_base_url(config: &Option<HashMap<String, toml::Value>>) -> Option<String> {
+    config
+        .as_ref()
+        .and_then(|runtime_cfg| runtime_cfg.get("base_url"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_string)
+}
+
+fn configured_allowed_hosts(
+    config: &Option<HashMap<String, toml::Value>>,
+) -> Result<Vec<String>, LLMError> {
+    let Some(runtime_cfg) = config else {
+        return Ok(Vec::new());
+    };
+    let Some(hosts) = runtime_cfg.get("allowed_hosts") else {
+        return Ok(Vec::new());
+    };
+
+    hosts
+        .clone()
+        .try_into()
+        .map_err(|e| LLMError::GenericError(format!("{:#}", e)))
+}
+
+fn build_allowed_hosts(
+    config: &Option<HashMap<String, toml::Value>>,
+    plugin_default_base_url: Option<&str>,
+) -> Result<Vec<String>, LLMError> {
+    let mut allowed_hosts = Vec::new();
+
+    for host in configured_allowed_hosts(config)? {
+        add_allowed_host(&mut allowed_hosts, host);
+    }
+
+    if let Some(base_url) = configured_base_url(config) {
+        if let Some(host) = host_from_base_url(&base_url) {
+            add_allowed_host(&mut allowed_hosts, host);
+        } else {
+            log::warn!(
+                "Ignoring invalid configured base_url while deriving allowed hosts: {}",
+                base_url
+            );
+        }
+        return Ok(allowed_hosts);
+    }
+
+    if let Some(base_url) = plugin_default_base_url
+        && let Some(host) = host_from_base_url(base_url)
+    {
+        add_allowed_host(&mut allowed_hosts, host);
+    }
+
+    Ok(allowed_hosts)
 }
 
 impl ExtismFactory {
@@ -164,18 +232,6 @@ impl ExtismFactory {
                 .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?,
         ));
 
-        let mut allowed_hosts: Vec<String> = Vec::new();
-        if let Some(runtime_cfg) = config
-            && let Some(hosts) = runtime_cfg.get("allowed_hosts")
-        {
-            allowed_hosts.append(
-                &mut hosts
-                    .clone()
-                    .try_into()
-                    .map_err(|e| LLMError::GenericError(format!("{:#}", e)))?,
-            );
-        }
-
         let plugin_name = call_plugin_str(init_plugin.clone(), "name", &Value::Null)
             .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
         let name = if let Some(cfg_name) = config_name {
@@ -190,14 +246,16 @@ impl ExtismFactory {
         } else {
             plugin_name
         };
-        if let Some(base_url) = call_plugin_str(init_plugin.clone(), "base_url", &Value::Null)
-            .ok()
-            .and_then(|v| Url::parse(&v).ok())
-            .and_then(|url| url.host_str().map(|s| s.to_string()))
-        {
-            allowed_hosts.push(base_url);
-        }
+        let plugin_default_base_url =
+            call_plugin_str(init_plugin.clone(), "base_url", &Value::Null).ok();
+        let allowed_hosts = build_allowed_hosts(config, plugin_default_base_url.as_deref())?;
         drop(init_plugin);
+
+        log::debug!(
+            "Extism provider '{}' allowed hosts: {}",
+            name,
+            allowed_hosts.join(", ")
+        );
 
         let manifest = Manifest::new([Wasm::data(wasm_content.clone())])
             .with_allowed_hosts(allowed_hosts.clone().into_iter())
@@ -205,7 +263,7 @@ impl ExtismFactory {
 
         let user_data = extism::UserData::new(functions::HostState::new(
             name.clone(),
-            allowed_hosts,
+            allowed_hosts.clone(),
             tokio_handle,
         ));
         let builder = with_host_functions!(PluginBuilder::new(manifest), user_data);
@@ -237,12 +295,41 @@ impl ExtismFactory {
             plugin,
             name,
             user_data: Some(user_data),
+            allowed_hosts,
         })
     }
 
     fn call(&self, func: &str, arg: &Value) -> anyhow::Result<String> {
         call_plugin_str(self.plugin.clone(), func, arg)
     }
+
+    fn validate_runtime_base_url(&self, cfg: &Value) -> Result<(), LLMError> {
+        validate_runtime_base_url(&self.name, &self.allowed_hosts, cfg)
+    }
+}
+
+fn validate_runtime_base_url(
+    provider_name: &str,
+    allowed_hosts: &[String],
+    cfg: &Value,
+) -> Result<(), LLMError> {
+    let Some(base_url) = cfg.get("base_url").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some(host) = host_from_base_url(base_url) else {
+        return Err(LLMError::InvalidRequest(format!(
+            "Invalid base_url for provider '{}': {}",
+            provider_name, base_url
+        )));
+    };
+    if allowed_hosts.is_empty() || allowed_hosts.iter().any(|h| h == &host) {
+        return Ok(());
+    }
+
+    Err(LLMError::InvalidRequest(format!(
+        "Provider '{}' base_url host '{}' is not allowed by the loaded plugin manifest. Add it to [providers.config].allowed_hosts or set [providers.config].base_url before building.",
+        provider_name, host
+    )))
 }
 
 impl LLMProviderFactory for ExtismFactory {
@@ -258,6 +345,7 @@ impl LLMProviderFactory for ExtismFactory {
     fn from_config(&self, cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
         let cfg_value: Value = serde_json::from_str(cfg)
             .map_err(|e| LLMError::PluginError(format!("Invalid JSON config: {:#}", e)))?;
+        self.validate_runtime_base_url(&cfg_value)?;
 
         let _from_cfg = self
             .call("from_config", &cfg_value)
@@ -351,6 +439,7 @@ impl HTTPLLMProviderFactory for ExtismFactory {
     fn from_config(&self, cfg: &str) -> Result<Box<dyn crate::HTTPLLMProvider>, LLMError> {
         let cfg_value: Value = serde_json::from_str(cfg)
             .map_err(|e| LLMError::PluginError(format!("Invalid JSON config: {:#}", e)))?;
+        self.validate_runtime_base_url(&cfg_value)?;
 
         let _from_cfg = self
             .call("from_config", &cfg_value)
@@ -951,6 +1040,71 @@ impl HTTPLLMProvider for ExtismProvider {
 mod tests {
     use super::*;
     use crate::chat::StreamChunk;
+
+    #[test]
+    fn build_allowed_hosts_prefers_configured_base_url_over_plugin_default() {
+        let config = Some(HashMap::from([(
+            "base_url".to_string(),
+            toml::Value::String("https://token-plan-sgp.xiaomimimo.com/v1".to_string()),
+        )]));
+
+        let allowed_hosts =
+            build_allowed_hosts(&config, Some("https://api.openai.com/v1")).expect("allowed hosts");
+
+        assert_eq!(
+            allowed_hosts,
+            vec!["token-plan-sgp.xiaomimimo.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_allowed_hosts_uses_plugin_default_without_configured_base_url() {
+        let allowed_hosts =
+            build_allowed_hosts(&None, Some("https://api.openai.com/v1")).expect("allowed hosts");
+
+        assert_eq!(allowed_hosts, vec!["api.openai.com".to_string()]);
+    }
+
+    #[test]
+    fn build_allowed_hosts_merges_explicit_hosts_with_configured_base_url() {
+        let config = Some(HashMap::from([
+            (
+                "allowed_hosts".to_string(),
+                toml::Value::Array(vec![toml::Value::String("foo.example.com".to_string())]),
+            ),
+            (
+                "base_url".to_string(),
+                toml::Value::String("https://token-plan-sgp.xiaomimimo.com/v1".to_string()),
+            ),
+        ]));
+
+        let allowed_hosts =
+            build_allowed_hosts(&config, Some("https://api.openai.com/v1")).expect("allowed hosts");
+
+        assert_eq!(
+            allowed_hosts,
+            vec![
+                "foo.example.com".to_string(),
+                "token-plan-sgp.xiaomimimo.com".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_base_url_validation_rejects_hosts_outside_allowlist() {
+        let err = validate_runtime_base_url(
+            "openai",
+            &["api.openai.com".to_string()],
+            &serde_json::json!({
+                "base_url": "https://example.invalid/v1"
+            }),
+        )
+        .expect_err("host should be rejected");
+
+        assert!(
+            matches!(err, LLMError::InvalidRequest(message) if message.contains("allowed_hosts"))
+        );
+    }
 
     #[test]
     fn decode_stream_item_returns_chunk_for_valid_payload() {

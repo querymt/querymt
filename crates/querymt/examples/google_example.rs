@@ -7,17 +7,13 @@
 //!
 //! Optional: set `PROVIDER_CONFIG` to a custom providers file path.
 
-use querymt::{
-    builder::LLMBuilder,
-    chat::ChatMessage,
-    plugin::{extism_impl::host::ExtismLoader, host::PluginRegistry},
-};
+use querymt::{chat::ChatMessage, dynamic::PluginRegistryDynamicExt, plugin::host::PluginRegistry};
 
 fn build_registry() -> Result<PluginRegistry, Box<dyn std::error::Error>> {
     let cfg_path =
         std::env::var("PROVIDER_CONFIG").unwrap_or_else(|_| "providers.toml".to_string());
-    let mut registry = PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?;
-    registry.register_loader(Box::new(ExtismLoader));
+    let registry =
+        PluginRegistry::from_path(std::path::PathBuf::from(cfg_path))?.with_dynamic_loaders();
     Ok(registry)
 }
 
@@ -28,8 +24,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = build_registry()?;
 
     // Initialize and configure the LLM client
-    let llm = LLMBuilder::new()
-        .provider("google") // Use Google as the LLM provider
+    let llm = registry
+        .builder("google") // Use Google as the LLM provider
         .api_key(api_key) // Set the API key
         .model("gemini-3-flash-preview") // Use Gemini Flash model
         .max_tokens(8512) // Limit response length
@@ -37,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .stream(false) // Disable streaming responses
         // Optional: Set system prompt
         .system("You are a helpful AI assistant specialized in programming.")
-        .build(&registry)
+        .build()
         .await?;
 
     // Prepare conversation history with example messages

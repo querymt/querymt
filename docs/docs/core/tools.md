@@ -113,8 +113,8 @@ impl CallFunctionTool for GetWeatherTool {
 }
 
 // To use it:
-// let builder = LLMBuilder::new().provider("some_provider").add_tool(GetWeatherTool);
-// let llm = builder.build(&registry)?;
+// let builder = registry.builder("some_provider").add_tool(GetWeatherTool);
+// let llm = builder.build().await?;
 // ... then use llm.chat_with_tools(...) ...
 ```
 
