@@ -323,16 +323,25 @@ mod remote_impl {
                 session_materializer.set_mesh(mesh_handle.clone());
             }
 
+            let shared_state = RemoteNodeManagerState {
+                config,
+                registry,
+                session_materializer,
+                session_meta: Arc::new(Mutex::new(HashMap::new())),
+                mesh,
+                materialization_locks: Arc::new(Mutex::new(HashMap::new())),
+                model_inventory,
+            };
+
+            // Prewarm model inventory in the background so first remote model
+            // advertisements are less likely to return an indistinguishable empty snapshot.
+            let inventory = shared_state.model_inventory.clone();
+            tokio::spawn(async move {
+                let _ = inventory.trigger_refresh().await;
+            });
+
             Self {
-                shared_state: RemoteNodeManagerState {
-                    config,
-                    registry,
-                    session_materializer,
-                    session_meta: Arc::new(Mutex::new(HashMap::new())),
-                    mesh,
-                    materialization_locks: Arc::new(Mutex::new(HashMap::new())),
-                    model_inventory,
-                },
+                shared_state,
                 node_name: None,
             }
         }
@@ -719,115 +728,124 @@ mod remote_impl {
     }
 
     impl Message<ListRemoteSessions> for RemoteNodeManager {
-        type Reply = Result<ListRemoteSessionsResponse, AgentError>;
+        type Reply = kameo::reply::DelegatedReply<Result<ListRemoteSessionsResponse, AgentError>>;
 
         #[tracing::instrument(
             name = "remote.node_manager.list_sessions",
-            skip(self, _ctx),
+            skip(self, ctx),
             fields(count = tracing::field::Empty, total = tracing::field::Empty)
         )]
         async fn handle(
             &mut self,
             msg: ListRemoteSessions,
-            _ctx: &mut Context<Self, Self::Reply>,
+            ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
             use crate::agent::messages::SessionRuntimeStatus;
 
-            let offset = msg.offset.unwrap_or(0) as usize;
-            let limit = msg.limit.unwrap_or(20).clamp(1, 100) as usize;
+            let shared_state = self.shared_state.clone();
+            let hostname = self.node_name.clone().unwrap_or_else(get_hostname);
 
-            // ── 1. Load persisted sessions from SQLite ─────────────────────────
-            let store = self.shared_state.config.provider.history_store();
-            let all_sessions = store.list_sessions().await.map_err(|e| {
-                AgentError::Internal(format!("Failed to list persisted sessions: {}", e))
-            })?;
+            ctx.spawn(async move {
+                let offset = msg.offset.unwrap_or(0) as usize;
+                let limit = msg.limit.unwrap_or(20).clamp(1, 100) as usize;
 
-            // Sort by updated_at DESC (stable), falling back to public_id for determinism.
-            let mut sorted = all_sessions;
-            sorted.sort_by(|a, b| {
-                b.updated_at
-                    .cmp(&a.updated_at)
-                    .then_with(|| b.public_id.cmp(&a.public_id))
-            });
+                let store = shared_state.config.provider.history_store();
+                let all_sessions = store.list_sessions().await.map_err(|e| {
+                    AgentError::Internal(format!("Failed to list persisted sessions: {}", e))
+                })?;
 
-            let total_count = sorted.len() as u32;
-
-            // ── 2. Paginate ────────────────────────────────────────────────────
-            let page: Vec<_> = sorted.into_iter().skip(offset).take(limit).collect();
-            let page_len = page.len();
-
-            // ── 3. Enrich with live registry data ──────────────────────────────
-            let registry = self.shared_state.registry.lock().await;
-            let hostname = get_hostname();
-
-            let mut infos = Vec::with_capacity(page_len);
-            for session in &page {
-                // Title: prefer initial intent snapshot summary, fall back to session.name.
-                let title = match store.get_initial_intent_snapshot(&session.public_id).await {
-                    Ok(Some(snapshot)) => Some(querymt_utils::str_utils::truncate_with_ellipsis(
-                        &snapshot.summary,
-                        80,
-                    )),
-                    _ => session.name.clone(),
-                };
-
-                let created_at = session.created_at.map(|t| t.unix_timestamp()).unwrap_or(0);
-
-                // Enrich with live actor_id and runtime_state from the registry.
-                let (actor_id, runtime_state) = match registry.get(&session.public_id) {
-                    Some(session_ref) => {
-                        let aid = match session_ref {
-                            crate::agent::remote::SessionActorRef::Local(ar) => {
-                                ar.id().sequence_id()
-                            }
-                            #[cfg(feature = "remote")]
-                            crate::agent::remote::SessionActorRef::Remote { .. } => 0,
-                        };
-                        let state = match tokio::time::timeout(
-                            std::time::Duration::from_millis(200),
-                            session_ref.get_runtime_status(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(SessionRuntimeStatus::Idle)) => "idle".to_string(),
-                            Ok(Ok(
-                                SessionRuntimeStatus::Running
-                                | SessionRuntimeStatus::CancelRequested,
-                            )) => "busy".to_string(),
-                            Ok(Err(_)) | Err(_) => "active".to_string(),
-                        };
-                        (aid, Some(state))
-                    }
-                    None => (0, Some("persisted".to_string())),
-                };
-
-                infos.push(RemoteSessionInfo {
-                    session_id: session.public_id.clone(),
-                    actor_id,
-                    cwd: session.cwd.as_ref().map(|p| p.display().to_string()),
-                    created_at,
-                    title,
-                    peer_label: hostname.clone(),
-                    runtime_state,
+                let mut sorted = all_sessions;
+                sorted.sort_by(|a, b| {
+                    b.updated_at
+                        .cmp(&a.updated_at)
+                        .then_with(|| b.public_id.cmp(&a.public_id))
                 });
-            }
 
-            drop(registry);
+                let total_count = sorted.len() as u32;
+                let page: Vec<_> = sorted.into_iter().skip(offset).take(limit).collect();
+                let page_len = page.len();
 
-            let next_offset = if ((offset + page_len) as u32) < total_count {
-                Some((offset + page_len) as u32)
-            } else {
-                None
-            };
+                let registry_live: std::collections::HashMap<
+                    String,
+                    crate::agent::remote::SessionActorRef,
+                > = {
+                    let registry = shared_state.registry.lock().await;
+                    page.iter()
+                        .filter_map(|s| {
+                            registry
+                                .get(&s.public_id)
+                                .map(|r| (s.public_id.clone(), r.clone()))
+                        })
+                        .collect()
+                };
 
-            tracing::Span::current()
-                .record("count", infos.len())
-                .record("total", total_count);
+                let mut infos = Vec::with_capacity(page_len);
+                for session in &page {
+                    let title = store
+                        .get_initial_intent_snapshot(&session.public_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|snapshot| {
+                            querymt_utils::str_utils::truncate_with_ellipsis(&snapshot.summary, 80)
+                        })
+                        .or_else(|| session.name.clone());
 
-            Ok(ListRemoteSessionsResponse {
-                sessions: infos,
-                next_offset,
-                total_count,
+                    let created_at = session.created_at.map(|t| t.unix_timestamp()).unwrap_or(0);
+
+                    let (actor_id, runtime_state) = match registry_live.get(&session.public_id) {
+                        Some(session_ref) => {
+                            let aid = match session_ref {
+                                crate::agent::remote::SessionActorRef::Local(ar) => {
+                                    ar.id().sequence_id()
+                                }
+                                #[cfg(feature = "remote")]
+                                crate::agent::remote::SessionActorRef::Remote { .. } => 0,
+                            };
+                            let state = match tokio::time::timeout(
+                                std::time::Duration::from_millis(200),
+                                session_ref.get_runtime_status(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(SessionRuntimeStatus::Idle)) => "idle".to_string(),
+                                Ok(Ok(
+                                    SessionRuntimeStatus::Running
+                                    | SessionRuntimeStatus::CancelRequested,
+                                )) => "busy".to_string(),
+                                Ok(Err(_)) | Err(_) => "active".to_string(),
+                            };
+                            (aid, Some(state))
+                        }
+                        None => (0, Some("persisted".to_string())),
+                    };
+
+                    infos.push(RemoteSessionInfo {
+                        session_id: session.public_id.clone(),
+                        actor_id,
+                        cwd: session.cwd.as_ref().map(|p| p.display().to_string()),
+                        created_at,
+                        title,
+                        peer_label: hostname.clone(),
+                        runtime_state,
+                    });
+                }
+
+                let next_offset = if ((offset + page_len) as u32) < total_count {
+                    Some((offset + page_len) as u32)
+                } else {
+                    None
+                };
+
+                tracing::Span::current()
+                    .record("count", infos.len())
+                    .record("total", total_count);
+
+                Ok(ListRemoteSessionsResponse {
+                    sessions: infos,
+                    next_offset,
+                    total_count,
+                })
             })
         }
     }
@@ -1015,15 +1033,15 @@ mod remote_impl {
             // This keeps the actor mailbox responsive even when providers are slow.
             let (local_models, meta) = self.shared_state.model_inventory.get_snapshot().await;
 
-            // If cache is stale, trigger a background refresh
+            // Prewarming on actor startup handles the first-query empty snapshot case.
+            // If cache is stale, refresh in the background and return the latest snapshot.
             if meta.is_stale && !meta.refresh_in_progress {
                 let inventory = self.shared_state.model_inventory.clone();
                 tokio::spawn(async move {
-                    inventory.trigger_refresh().await;
+                    let _ = inventory.trigger_refresh().await;
                 });
             }
 
-            // Filter to only local models (no node_id means local)
             let local_only: Vec<AvailableModel> = local_models
                 .into_iter()
                 .filter(|entry| entry.node_id.is_none())

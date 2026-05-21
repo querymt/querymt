@@ -4,9 +4,10 @@
 //! immediately and refreshing data in the background.
 
 use arc_swap::ArcSwap;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, watch};
 
 use crate::agent::agent_config::AgentConfig;
 use crate::model_registry::{ModelEntry, enumerate_local_models};
@@ -42,10 +43,15 @@ struct RefreshState {
     remote_timeout_count: usize,
     /// Total remote nodes attempted
     remote_node_count: usize,
-    /// Notification when refresh completes
-    notify: Arc<Notify>,
+    /// Completion state for the current refresh cycle.
+    /// `false` means still running; `true` means completed.
+    /// A watch channel retains the latest state so late waiters cannot miss completion.
+    refresh_done_tx: watch::Sender<bool>,
     /// Last time a refresh was triggered (for debouncing).
     last_triggered_at: Option<Instant>,
+    /// When invalidation happens during an active refresh, request an immediate
+    /// follow-up refresh after the current cycle completes.
+    refresh_requested_after_current: bool,
 }
 
 /// Describes what happened when a refresh was triggered.
@@ -71,15 +77,15 @@ impl RefreshTriggerDisposition {
 
 /// Handle to track refresh completion.
 pub struct RefreshHandle {
-    notify: Option<Arc<Notify>>,
+    wait_rx: Option<watch::Receiver<bool>>,
     disposition: RefreshTriggerDisposition,
 }
 
 impl RefreshHandle {
     /// Create a handle that waits on an active or expected completion.
-    fn pending(notify: Arc<Notify>, disposition: RefreshTriggerDisposition) -> Self {
+    fn pending(wait_rx: watch::Receiver<bool>, disposition: RefreshTriggerDisposition) -> Self {
         Self {
-            notify: Some(notify),
+            wait_rx: Some(wait_rx),
             disposition,
         }
     }
@@ -87,7 +93,7 @@ impl RefreshHandle {
     /// Create a handle that completes immediately (debounced or no-op).
     fn completed(disposition: RefreshTriggerDisposition) -> Self {
         Self {
-            notify: None,
+            wait_rx: None,
             disposition,
         }
     }
@@ -104,7 +110,7 @@ impl RefreshHandle {
 
     /// Returns true when waiting would block on an in-flight refresh.
     pub fn waits_for_completion(&self) -> bool {
-        self.notify.is_some()
+        self.wait_rx.is_some()
     }
 
     /// Wait for the refresh to complete.
@@ -112,8 +118,17 @@ impl RefreshHandle {
     /// Returns immediately when there is nothing to wait for
     /// (e.g. the request was debounced and no refresh was started).
     pub async fn wait(&self) {
-        if let Some(notify) = &self.notify {
-            notify.notified().await;
+        let mut wait_rx = match &self.wait_rx {
+            Some(rx) => rx.clone(),
+            None => return,
+        };
+        if *wait_rx.borrow() {
+            return;
+        }
+        while wait_rx.changed().await.is_ok() {
+            if *wait_rx.borrow() {
+                return;
+            }
         }
     }
 }
@@ -201,8 +216,9 @@ impl ModelInventory {
                     remote_updated_at: None,
                     remote_timeout_count: 0,
                     remote_node_count: 0,
-                    notify: Arc::new(Notify::new()),
+                    refresh_done_tx: watch::channel(true).0,
                     last_triggered_at: None,
+                    refresh_requested_after_current: false,
                 }),
                 config,
                 #[cfg(feature = "remote")]
@@ -268,6 +284,13 @@ impl ModelInventory {
         local_stale || remote_stale
     }
 
+    fn spawn_refresh_task(&self) {
+        let inventory = self.clone();
+        tokio::spawn(async move {
+            inventory.run_refresh().await;
+        });
+    }
+
     /// Trigger a background refresh. Returns immediately.
     /// Uses debouncing to avoid triggering too frequently.
     #[tracing::instrument(
@@ -282,7 +305,7 @@ impl ModelInventory {
         // Return a handle that waits on the active cycle.
         if state.local_refreshing || state.remote_refreshing {
             let handle = RefreshHandle::pending(
-                state.notify.clone(),
+                state.refresh_done_tx.subscribe(),
                 RefreshTriggerDisposition::AlreadyInProgress,
             );
             tracing::Span::current()
@@ -311,19 +334,16 @@ impl ModelInventory {
         state.last_triggered_at = Some(now);
         state.local_refreshing = true;
         state.remote_refreshing = true;
+        state.refresh_requested_after_current = false;
 
-        // Replace the notify so new callers get a fresh signalling channel.
-        let notify = Arc::new(Notify::new());
-        state.notify = notify.clone();
+        // Replace the completion channel so new waiters observe this cycle.
+        let (refresh_done_tx, refresh_done_rx) = watch::channel(false);
+        state.refresh_done_tx = refresh_done_tx;
 
         drop(state); // release lock before spawn
+        self.spawn_refresh_task();
 
-        let inventory = self.clone();
-        tokio::spawn(async move {
-            inventory.run_refresh().await;
-        });
-
-        let handle = RefreshHandle::pending(notify, RefreshTriggerDisposition::Started);
+        let handle = RefreshHandle::pending(refresh_done_rx, RefreshTriggerDisposition::Started);
         tracing::Span::current()
             .record("disposition", handle.disposition().as_str())
             .record("wait_for_completion", handle.waits_for_completion());
@@ -336,6 +356,11 @@ impl ModelInventory {
         {
             let mut state = self.inner.refresh_state.lock().await;
             state.local_updated_at = None;
+            // Clear debounce timestamp so the triggered refresh is not suppressed.
+            state.last_triggered_at = None;
+            if state.local_refreshing || state.remote_refreshing {
+                state.refresh_requested_after_current = true;
+            }
         }
         self.trigger_refresh().await;
     }
@@ -346,6 +371,11 @@ impl ModelInventory {
         {
             let mut state = self.inner.refresh_state.lock().await;
             state.remote_updated_at = None;
+            // Clear debounce timestamp so the triggered refresh is not suppressed.
+            state.last_triggered_at = None;
+            if state.local_refreshing || state.remote_refreshing {
+                state.refresh_requested_after_current = true;
+            }
         }
         self.trigger_refresh().await;
     }
@@ -358,6 +388,11 @@ impl ModelInventory {
             let mut state = self.inner.refresh_state.lock().await;
             state.local_updated_at = None;
             state.remote_updated_at = None;
+            // Clear debounce timestamp so the triggered refresh is not suppressed.
+            state.last_triggered_at = None;
+            if state.local_refreshing || state.remote_refreshing {
+                state.refresh_requested_after_current = true;
+            }
         }
         self.trigger_refresh().await;
     }
@@ -442,14 +477,32 @@ impl ModelInventory {
             }
         }
 
-        // Mark refresh complete
+        // Mark refresh complete. If invalidation requested a follow-up refresh
+        // while this cycle was running, immediately start a new cycle with the
+        // latest state after signalling current waiters.
         let mut state = self.inner.refresh_state.lock().await;
         state.local_refreshing = false;
         state.remote_refreshing = false;
-        state.notify.notify_waiters();
+        let rerun = state.refresh_requested_after_current;
+        state.refresh_requested_after_current = false;
+        let _ = state.refresh_done_tx.send(true);
+
+        if rerun {
+            state.last_triggered_at = Some(Instant::now());
+            state.local_refreshing = true;
+            state.remote_refreshing = true;
+            let (refresh_done_tx, _refresh_done_rx) = watch::channel(false);
+            state.refresh_done_tx = refresh_done_tx;
+        }
+        drop(state);
+
+        if rerun {
+            self.spawn_refresh_task();
+        }
 
         tracing::debug!(
             total_duration_ms = start.elapsed().as_millis(),
+            rerun,
             "Model inventory refresh completed"
         );
     }
@@ -472,7 +525,6 @@ impl ModelInventory {
     )]
     async fn refresh_remote(&self) -> Result<(Vec<ModelEntry>, usize, usize), ()> {
         use crate::agent::remote::{GetNodeInfo, ListAvailableModels, RemoteNodeManager};
-        use futures_util::StreamExt;
         use tokio::time::timeout;
 
         let start = Instant::now();
@@ -572,8 +624,7 @@ impl ModelInventory {
             handles.push(handle);
         }
 
-        // Use FuturesUnordered for partial results with deadline polling
-        use futures_util::stream::FuturesUnordered;
+        // Use FuturesUnordered for partial results with deadline polling.
         let mut futures = FuturesUnordered::new();
         for handle in handles {
             futures.push(handle);
@@ -591,6 +642,9 @@ impl ModelInventory {
                     global_timeout,
                     futures.len()
                 );
+                for handle in futures.iter() {
+                    handle.abort();
+                }
                 break;
             }
 
@@ -608,12 +662,15 @@ impl ModelInventory {
                 }
                 Ok(None) => break, // No more futures
                 Err(_) => {
-                    // Timeout waiting for next future
+                    // Timeout waiting for next future.
                     tracing::warn!(
                         "Remote model refresh timed out globally (timeout: {:?}), {} futures remaining",
                         global_timeout,
                         futures.len()
                     );
+                    for handle in futures.iter() {
+                        handle.abort();
+                    }
                     break;
                 }
             }
@@ -826,11 +883,10 @@ mod tests {
         assert!(!still_debounced.waits_for_completion());
     }
 
-    /// Test that demonstrates the bug: Clone creates independent snapshots
+    /// Test that clones share refresh state with the original inventory.
     ///
-    /// This test verifies that refreshing on a clone updates the original's state.
-    /// With the current implementation (independent clones), this will FAIL because
-    /// each clone has its own ArcSwap and Mutex instances.
+    /// Refreshing or mutating a clone must be visible through every handle because
+    /// `ModelInventory` clones share a single `ModelInventoryInner`.
     #[tokio::test]
     async fn test_clone_shares_state_with_original() {
         let config = make_test_config().await;
@@ -857,29 +913,19 @@ mod tests {
         let (_, original_meta) = original.get_snapshot().await;
         let (_, cloned_meta) = cloned.get_snapshot().await;
 
-        // BUG: Cloned's refresh updates only cloned's state
-        // Original should see the refresh too, but it won't with current implementation!
-        println!(
-            "Original local_updated_at: {:?}",
-            original_meta.local_updated_at
-        );
-        println!(
-            "Cloned local_updated_at: {:?}",
-            cloned_meta.local_updated_at
+        assert_eq!(
+            original_meta.local_updated_at.is_some(),
+            cloned_meta.local_updated_at.is_some(),
+            "Original and clone should agree about shared refresh state"
         );
 
-        // This assertion will FAIL with current implementation
-        // because cloned refresh doesn't update original
         assert!(
             original_meta.local_updated_at.is_some(),
-            "Original should see cloned's refresh state, but it doesn't! \
-             This proves Clone creates independent snapshots."
+            "Original should see the refresh state written through a clone."
         );
     }
 
-    /// Test that cloned snapshots share the same underlying model data
-    ///
-    /// With independent clones, storing data in one doesn't affect the other.
+    /// Test that clones share the same underlying model snapshot data.
     #[tokio::test]
     async fn test_clone_shares_snapshots() {
         let config = make_test_config().await;
@@ -909,14 +955,16 @@ mod tests {
         let (original_models, _) = original.get_snapshot().await;
         let (cloned_models, _) = cloned.get_snapshot().await;
 
-        println!("Original models: {}", original_models.len());
-        println!("Cloned models: {}", cloned_models.len());
-
-        // This assertion will FAIL with current implementation
         assert_eq!(
             original_models.len(),
             cloned_models.len(),
-            "Original should see cloned's models, but they have independent snapshots!"
+            "Original and clone should observe the same snapshot length"
+        );
+
+        assert_eq!(
+            original_models.first().map(|entry| entry.id.as_str()),
+            cloned_models.first().map(|entry| entry.id.as_str()),
+            "Original should see model entries stored through a clone."
         );
     }
 
@@ -956,5 +1004,56 @@ mod tests {
             !meta.is_stale,
             "Should not be stale after successful refresh"
         );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_handle_wait_returns_after_completion_even_if_wait_starts_late() {
+        let config = make_test_config().await;
+        let inventory = ModelInventory::new(config);
+
+        let handle = inventory.trigger_refresh().await;
+
+        // Let the refresh complete before we begin waiting on the handle.
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (_, meta) = inventory.get_snapshot().await;
+                if !meta.refresh_in_progress {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        let waited = tokio::time::timeout(Duration::from_millis(250), handle.wait()).await;
+        assert!(
+            waited.is_ok(),
+            "late waiters should observe retained completion state and return promptly"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalidation_during_active_refresh_requests_follow_up_cycle() {
+        let config = make_test_config().await;
+        let inventory = ModelInventory::new(config);
+
+        let _handle = inventory.trigger_refresh().await;
+
+        {
+            let state = inventory.inner.refresh_state.lock().await;
+            assert!(state.local_refreshing || state.remote_refreshing);
+        }
+
+        inventory.invalidate_all().await;
+
+        {
+            let state = inventory.inner.refresh_state.lock().await;
+            assert!(
+                state.refresh_requested_after_current
+                    || state.local_refreshing
+                    || state.remote_refreshing,
+                "invalidation during an active refresh should queue or immediately run a follow-up cycle"
+            );
+        }
     }
 }

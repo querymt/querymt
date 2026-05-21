@@ -26,7 +26,8 @@ use agent_client_protocol::schema::{
     ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
     LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    ResumeSessionRequest, ResumeSessionResponse, SetSessionModelRequest, SetSessionModelResponse,
+    ResumeSessionRequest, ResumeSessionResponse, SessionInfo, SetSessionModelRequest,
+    SetSessionModelResponse,
 };
 use anyhow::Result;
 use arc_swap::ArcSwap;
@@ -219,11 +220,10 @@ impl LocalAgentHandle {
 
     /// Acquire the registry lock with tracing for wait and hold durations.
     ///
-    /// Returns a timed guard that records:
-    /// - `registry.lock.wait_ms`: Time spent waiting to acquire the lock
-    /// - `registry.lock.hold_ms`: Time the lock was held when guard drops
+    /// Returns a guard after recording `registry.lock.wait_ms` for lock acquisition.
     ///
-    /// This helps identify registry lock contention in traces.
+    /// Hold duration is not instrumented here because the plain mutex guard does not
+    /// provide a drop hook for recording `registry.lock.hold_ms`.
     pub async fn registry_lock(&self) -> tokio::sync::MutexGuard<'_, SessionRegistry> {
         let start = std::time::Instant::now();
         let guard = self.registry.lock().await;
@@ -1889,10 +1889,12 @@ impl AgentHandle for LocalAgentHandle {
             serde_json::Value::String(parent_session_id),
         );
         let req = NewSessionRequest::new(cwd_path).meta(meta);
-        let mut reg = self.registry.lock().await;
-        let resp = reg.new_session(req).await?;
+
+        // Use the 3-phase materialization pattern (no registry lock held during DB/actor work)
+        let resp = LocalAgentHandle::new_session_with_preconnected(self, req, Vec::new()).await?;
         let session_id = resp.session_id.to_string();
-        let session_ref = reg.get(&session_id).cloned().ok_or_else(|| {
+        let session_ref = self.registry.lock().await;
+        let session_ref = session_ref.get(&session_id).cloned().ok_or_else(|| {
             Error::internal_error().data("Session created but not found in registry")
         })?;
 
@@ -2046,9 +2048,56 @@ impl SendAgent for LocalAgentHandle {
     }
 
     async fn list_sessions(&self, req: ListSessionsRequest) -> Result<ListSessionsResponse, Error> {
-        // Delegate to kameo SessionRegistry
-        let registry = self.registry.lock().await;
-        registry.list_sessions(req).await
+        // Use the history store directly without holding the registry lock.
+        // The registry lock is only needed for in-memory mutations; listing
+        // sessions is a pure DB read that shouldn't be serialized on the lock.
+        let store = self.config.provider.history_store();
+        let sessions = store
+            .list_sessions()
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        let requested_cwd = req.cwd.as_ref().map(std::path::PathBuf::from);
+        let filtered_infos: Vec<SessionInfo> = sessions
+            .into_iter()
+            .filter(|s| match requested_cwd.as_ref() {
+                Some(cwd) => s.cwd.as_ref() == Some(cwd),
+                None => true,
+            })
+            .map(|s| {
+                let mut info = SessionInfo::new(
+                    agent_client_protocol::schema::SessionId::from(s.public_id),
+                    s.cwd.unwrap_or_default(),
+                );
+                if let Some(name) = s.name {
+                    info.title = Some(name);
+                }
+                if let Some(updated_at) = s.updated_at {
+                    info.updated_at = Some(
+                        updated_at
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_default(),
+                    );
+                }
+                info
+            })
+            .collect();
+
+        let start_idx = req
+            .cursor
+            .as_ref()
+            .and_then(|c| c.parse::<usize>().ok())
+            .unwrap_or(0);
+        let limit = 100;
+        let end_idx = (start_idx + limit).min(filtered_infos.len());
+        let paginated = filtered_infos[start_idx..end_idx].to_vec();
+        let next_cursor = if end_idx < filtered_infos.len() {
+            Some(end_idx.to_string())
+        } else {
+            None
+        };
+
+        Ok(ListSessionsResponse::new(paginated).next_cursor(next_cursor))
     }
 
     /// Fork an existing session at the latest message.
@@ -3080,6 +3129,10 @@ mod tests {
 
     impl HandleFixture {
         async fn new() -> Self {
+            Self::with_list_sessions(vec![]).await
+        }
+
+        async fn with_list_sessions(listed_sessions: Vec<crate::session::store::Session>) -> Self {
             let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
             let shared = SharedLlmProvider {
                 inner: provider.clone(),
@@ -3108,7 +3161,7 @@ mod tests {
                 .times(0..);
             store
                 .expect_list_sessions()
-                .returning(|| Ok(vec![]))
+                .returning(move || Ok(listed_sessions.clone()))
                 .times(0..);
             store
                 .expect_create_or_get_llm_config()
@@ -3209,6 +3262,28 @@ mod tests {
         let req = ListSessionsRequest::new();
         let resp = f.handle.list_sessions(req).await.expect("list_sessions");
         assert!(resp.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_filters_by_cwd() {
+        let cwd_a = std::env::temp_dir().join("querymt-list-sessions-a");
+        let cwd_b = std::env::temp_dir().join("querymt-list-sessions-b");
+
+        let mut session_a = mock_session("session-a");
+        session_a.cwd = Some(cwd_a.clone());
+        let mut session_b = mock_session("session-b");
+        session_b.cwd = Some(cwd_b.clone());
+
+        let f = HandleFixture::with_list_sessions(vec![session_a, session_b]).await;
+
+        let resp = f
+            .handle
+            .list_sessions(ListSessionsRequest::new().cwd(cwd_a.clone()))
+            .await
+            .expect("list_sessions filtered by cwd");
+
+        assert_eq!(resp.sessions.len(), 1);
+        assert_eq!(resp.sessions[0].cwd, cwd_a);
     }
 
     #[tokio::test]

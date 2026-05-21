@@ -31,14 +31,37 @@ use agent_client_protocol::schema::{
     NewSessionRequest, ResumeSessionRequest,
 };
 use kameo::actor::{ActorRef, Spawn};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 /// Prepared session data ready to be registered in the SessionRegistry.
 ///
 /// Contains everything needed to insert into the registry's in-memory maps,
 /// but hasn't been registered yet.
+struct SessionSingleFlightGuard {
+    session_id: String,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    inflight: Arc<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    _guard: OwnedMutexGuard<()>,
+}
+
+impl Drop for SessionSingleFlightGuard {
+    fn drop(&mut self) {
+        // Remove the per-session lock once the last materialization waiter finishes.
+        if Arc::strong_count(&self.lock) == 3 {
+            let mut inflight = self.inflight.lock().unwrap();
+            if inflight
+                .get(&self.session_id)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &self.lock))
+            {
+                inflight.remove(&self.session_id);
+            }
+        }
+    }
+}
+
 pub struct PreparedSession {
     /// The public session ID
     pub session_id: String,
@@ -54,7 +77,7 @@ pub struct PreparedSession {
     pub register_in_dht: bool,
     /// Keeps the per-session single-flight guard alive until the caller finishes
     /// registration/finalization.
-    _single_flight_guard: Option<OwnedMutexGuard<()>>,
+    _single_flight_guard: Option<SessionSingleFlightGuard>,
 }
 
 pub enum PreparedSessionResult {
@@ -84,7 +107,7 @@ pub struct SessionMaterializer {
     config: Arc<AgentConfig>,
     /// Per-session locks preventing concurrent materialization of the same session ID.
     /// Different session IDs proceed independently.
-    inflight: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    inflight: Arc<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Mesh handle for remote operations (DHT registration, remote actor export).
     #[cfg(feature = "remote")]
     mesh: parking_lot::RwLock<Option<crate::agent::remote::MeshHandle>>,
@@ -94,7 +117,7 @@ impl SessionMaterializer {
     pub fn new(config: Arc<AgentConfig>) -> Self {
         Self {
             config,
-            inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
+            inflight: Arc::new(StdMutex::new(HashMap::new())),
             #[cfg(feature = "remote")]
             mesh: parking_lot::RwLock::new(None),
         }
@@ -116,7 +139,7 @@ impl SessionMaterializer {
     ///
     /// Returns a guard that must be held during the entire materialization.
     /// This prevents concurrent materialization of the same session ID.
-    async fn acquire_session_lock(&self, session_id: &str) -> OwnedMutexGuard<()> {
+    async fn acquire_session_lock(&self, session_id: &str) -> SessionSingleFlightGuard {
         let lock = {
             let mut inflight = self.inflight.lock().unwrap();
             inflight
@@ -124,7 +147,13 @@ impl SessionMaterializer {
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         };
-        lock.lock_owned().await
+        let guard = lock.clone().lock_owned().await;
+        SessionSingleFlightGuard {
+            session_id: session_id.to_string(),
+            lock,
+            inflight: self.inflight.clone(),
+            _guard: guard,
+        }
     }
 
     /// Prepare a new session: create in DB, initialize MCP, spawn actor.

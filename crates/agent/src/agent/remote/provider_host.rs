@@ -749,55 +749,78 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                 );
             }
 
+            // ── Setup guard: remove active_stream on any setup error ─────────
+            // The OpeningUpstream record was inserted above; if any setup step
+            // fails, we MUST clean it up. Use a owned clone for the cleanup closure.
+            // This guard is "defused" after all setup steps succeed; on error it
+            // removes the stale entry before the error propagates.
+            let cleanup_request_id = request_id.clone();
+            let cleanup_streams = Arc::clone(&active_streams);
+
             // Heavy setup work: provider build, stream setup, receiver lookup
             // This happens AFTER the OpeningUpstream record is inserted for responsiveness
-            let provider = build_provider_for_request(
-                &config,
-                &msg.provider,
-                &msg.model,
-                msg.params.as_ref(),
-            )
-            .await?;
-
-            let tools_slice = msg.tools.as_deref();
-
-            let mut stream = provider
-                .chat_stream_with_tools(&msg.messages, tools_slice)
-                .await
-                .map_err(|e| AgentError::ProviderChat {
-                    operation: "chat_stream_with_tools".to_string(),
-                    reason: serde_json::to_string(&e.to_payload()).unwrap_or_else(|_| e.to_string()),
-                })?;
-
-            // Look up the StreamReceiverActor on the requesting node.
-            let receiver_ref = {
-                let lookup_span = tracing::info_span!(
-                    "remote.provider_host.stream.lookup_receiver",
-                    session_id = %msg.session_id,
-                    request_id = %msg.request_id,
-                    receiver_name = %msg.stream_receiver_name,
-                    found = tracing::field::Empty,
-                );
-                let result = kameo::actor::RemoteActorRef::<StreamReceiverActor>::lookup(
-                    msg.stream_receiver_name.clone(),
+            let setup_result: Result<_, AgentError> = async {
+                let provider = build_provider_for_request(
+                    &config,
+                    &msg.provider,
+                    &msg.model,
+                    msg.params.as_ref(),
                 )
-                .instrument(lookup_span.clone())
-                .await
-                .map_err(|e| AgentError::SwarmLookupFailed {
-                    key: msg.stream_receiver_name.clone(),
-                    reason: e.to_string(),
-                })
-                .and_then(|opt| {
-                    opt.ok_or_else(|| AgentError::RemoteSessionNotFound {
-                        details: format!(
-                            "ProviderHostActor: stream receiver '{}' not found in DHT",
-                            msg.stream_receiver_name
-                        ),
+                .await?;
+
+                let tools_slice = msg.tools.as_deref();
+
+                let stream = provider
+                    .chat_stream_with_tools(&msg.messages, tools_slice)
+                    .await
+                    .map_err(|e| AgentError::ProviderChat {
+                        operation: "chat_stream_with_tools".to_string(),
+                        reason: serde_json::to_string(&e.to_payload())
+                            .unwrap_or_else(|_| e.to_string()),
+                    })?;
+
+                // Look up the StreamReceiverActor on the requesting node.
+                let receiver_ref = {
+                    let lookup_span = tracing::info_span!(
+                        "remote.provider_host.stream.lookup_receiver",
+                        session_id = %msg.session_id,
+                        request_id = %msg.request_id,
+                        receiver_name = %msg.stream_receiver_name,
+                        found = tracing::field::Empty,
+                    );
+                    let result = kameo::actor::RemoteActorRef::<StreamReceiverActor>::lookup(
+                        msg.stream_receiver_name.clone(),
+                    )
+                    .instrument(lookup_span.clone())
+                    .await
+                    .map_err(|e| AgentError::SwarmLookupFailed {
+                        key: msg.stream_receiver_name.clone(),
+                        reason: e.to_string(),
                     })
-                });
-                lookup_span.record("found", result.is_ok());
-                result
-            }?;
+                    .and_then(|opt| {
+                        opt.ok_or_else(|| AgentError::RemoteSessionNotFound {
+                            details: format!(
+                                "ProviderHostActor: stream receiver '{}' not found in DHT",
+                                msg.stream_receiver_name
+                            ),
+                        })
+                    });
+                    lookup_span.record("found", result.is_ok());
+                    result
+                }?;
+
+                Ok::<_, AgentError>((provider, stream, receiver_ref))
+            }
+            .await;
+
+            let (_provider, mut stream, receiver_ref) = match setup_result {
+                Ok(tuple) => tuple,
+                Err(e) => {
+                    // Clean up the stale OpeningUpstream entry before returning the error.
+                    remove_active_stream(&cleanup_streams, &cleanup_request_id);
+                    return Err(e);
+                }
+            };
 
             tracing::Span::current().record("receiver_found", true);
 
@@ -906,6 +929,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                         let mut finish_reason = None;
                                         match chunk_result {
                                             Ok(chunk) => {
+                                                let chunk_is_done = matches!(chunk, StreamChunk::Done { .. });
                                                 if let StreamChunk::Done { finish_reason: reason } = &chunk {
                                                     finish_reason = Some(*reason);
                                                     upstream_done = true;
@@ -914,7 +938,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                                 if upstream_done || pending_batch.len() >= MAX_BATCH_SIZE {
                                                     flush_batch(&mut buffered, &mut pending_batch, &mut batch_count, &mut max_batch_size);
                                                 }
-                                                let chunk_delta = if matches!(pending_batch.last(), Some(StreamChunk::Done { .. })) { 0 } else { 1 };
+                                                let chunk_delta = if chunk_is_done { 0 } else { 1 };
                                                 update_active_stream(&active_streams, &request_id, |stream| {
                                                     stream.phase = ProviderStreamPhase::Streaming;
                                                     stream.last_progress_at = Instant::now();
