@@ -295,13 +295,13 @@ fn spawn_mesh_peer_event_forwarder(
         return;
     };
 
-    let model_registry = inner.model_registry.clone();
+    let model_inventory = inner.model_inventory.clone();
     let mut rx = mesh.subscribe_peer_events();
     runtime::global_runtime().spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(querymt_agent::agent::remote::mesh::PeerEvent::Discovered(peer_id)) => {
-                    model_registry.invalidate_remote().await;
+                    model_inventory.invalidate_remote().await;
                     let notification = querymt_agent::acp::shared::mesh_nodes_changed_notification(
                         &peer_id.to_string(),
                         "discovered",
@@ -311,7 +311,7 @@ fn spawn_mesh_peer_event_forwarder(
                     }
                 }
                 Ok(querymt_agent::agent::remote::mesh::PeerEvent::Expired(peer_id)) => {
-                    model_registry.invalidate_remote().await;
+                    model_inventory.invalidate_remote().await;
                     let notification = querymt_agent::acp::shared::mesh_peer_expired_notification(
                         &peer_id.to_string(),
                     );

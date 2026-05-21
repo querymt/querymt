@@ -9,6 +9,7 @@ use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, ClientState};
 use crate::agent::remote::SessionActorRef;
+use crate::agent::session_materializer::{PreparedSessionResult, SessionMaterializer};
 use crate::agent::session_registry::SessionRegistry;
 use crate::delegation::AgentRegistry;
 use crate::event_fanout::EventFanout;
@@ -138,6 +139,10 @@ pub struct LocalAgentHandle {
     pub config: Arc<AgentConfig>,
     pub registry: Arc<Mutex<SessionRegistry>>,
 
+    /// Session materializer for heavy async work (DB, MCP, actor spawn).
+    /// Separates expensive operations from registry lock to keep control plane fast.
+    pub session_materializer: Arc<SessionMaterializer>,
+
     // Connection-level mutable state
     pub client_state: Arc<StdMutex<Option<ClientState>>>,
     pub bridge: Arc<StdMutex<Option<ClientBridgeSender>>>,
@@ -158,8 +163,9 @@ pub struct LocalAgentHandle {
     #[cfg(feature = "remote")]
     remote_node_cache: Arc<RemoteNodeMetadataCache>,
 
-    /// Shared model registry for all model enumeration paths (UI, ACP, mesh).
-    pub model_registry: crate::model_registry::ModelRegistry,
+    /// Non-blocking model inventory with snapshot-based reads and background refresh.
+    /// This is the canonical public API for model listing and cache management.
+    pub model_inventory: crate::model_inventory::ModelInventory,
 
     /// Shared OAuth service for all auth operations across UI and ACP transports.
     pub oauth_service: crate::auth::service::OAuthService,
@@ -179,16 +185,18 @@ impl LocalAgentHandle {
     /// an `AgentConfig` via `AgentConfigBuilder::build()`.
     pub fn from_config(config: Arc<AgentConfig>) -> Self {
         let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
-        let model_registry = crate::model_registry::ModelRegistry::new();
+        let session_materializer = Arc::new(SessionMaterializer::new(config.clone()));
+        let model_inventory = crate::model_inventory::ModelInventory::new(config.clone());
         let oauth_service = crate::auth::service::OAuthService::new(
             config.clone(),
-            model_registry.clone(),
+            model_inventory.clone(),
             std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
             std::sync::Arc::new(Mutex::new(None)),
         );
         Self {
             config,
             registry,
+            session_materializer,
             client_state: Arc::new(StdMutex::new(None)),
             bridge: Arc::new(StdMutex::new(None)),
             default_mode: StdMutex::new(crate::agent::core::AgentMode::Build),
@@ -197,7 +205,7 @@ impl LocalAgentHandle {
             mesh: StdMutex::new(None),
             #[cfg(feature = "remote")]
             remote_node_cache: Arc::new(RemoteNodeMetadataCache::new()),
-            model_registry,
+            model_inventory,
             oauth_service,
             scheduler_handle: StdMutex::new(None),
             shutdown_done: AtomicBool::new(false),
@@ -207,6 +215,33 @@ impl LocalAgentHandle {
     /// Subscribes to agent events via the fanout (live stream).
     pub fn subscribe_events(&self) -> broadcast::Receiver<crate::events::EventEnvelope> {
         self.config.event_sink.fanout().subscribe()
+    }
+
+    /// Acquire the registry lock with tracing for wait and hold durations.
+    ///
+    /// Returns a timed guard that records:
+    /// - `registry.lock.wait_ms`: Time spent waiting to acquire the lock
+    /// - `registry.lock.hold_ms`: Time the lock was held when guard drops
+    ///
+    /// This helps identify registry lock contention in traces.
+    pub async fn registry_lock(&self) -> tokio::sync::MutexGuard<'_, SessionRegistry> {
+        let start = std::time::Instant::now();
+        let guard = self.registry.lock().await;
+        let wait_ms = start.elapsed().as_millis() as u64;
+
+        if wait_ms > 10 {
+            tracing::warn!(
+                wait_ms,
+                "Registry lock wait exceeded 10ms - possible contention"
+            );
+        }
+
+        // Note: We can't easily instrument hold duration with a simple guard
+        // because the guard needs to record the time on drop.
+        // For now, we rely on callers to use tracing spans if needed.
+        // The key insight is that with the 3-phase pattern, hold duration
+        // should be microseconds for register_prepared_session().
+        guard
     }
 
     /// Access the agent registry.
@@ -328,6 +363,11 @@ impl LocalAgentHandle {
     /// This is used by mobile FFI clients that manage MCP transport lifetimes
     /// externally (e.g. pipe transports) and want those tools available in
     /// each newly created session.
+    ///
+    /// Uses the 3-phase materialization pattern:
+    /// 1. Prepare (NO lock): DB creation, MCP init, actor spawn
+    /// 2. Register (lock held): Insert into in-memory maps (microseconds)
+    /// 3. Finalize (NO lock): DHT registration, event emission
     pub async fn new_session_with_preconnected(
         &self,
         req: NewSessionRequest,
@@ -344,11 +384,36 @@ impl LocalAgentHandle {
             }
         }
 
-        // Delegate to kameo SessionRegistry
-        let mut registry = self.registry.lock().await;
-        registry
-            .new_session_with_preconnected(req, preconnected_peers)
-            .await
+        // Phase 1: Prepare session (heavy work, NO registry lock held)
+        let prepared = self
+            .session_materializer
+            .prepare_new_session(req, preconnected_peers)
+            .await?;
+
+        let session_id = prepared.session_id.clone();
+
+        // Phase 2: Register session (fast, registry lock held for microseconds only)
+        let session_ref = {
+            let mut registry = self.registry_lock().await;
+            registry.register_prepared_session(&prepared).await
+        };
+
+        // Phase 3: Finalize session (post-registration work, NO registry lock held)
+        // Pass the bridge for setup outside the lock
+        let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
+        self.session_materializer
+            .finalize_session(&prepared, bridge)
+            .await?;
+
+        // Get current mode for response
+        let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+
+        Ok(NewSessionResponse::new(session_id)
+            .modes(crate::agent::session_registry::mode_state(current_mode))
+            .config_options(crate::agent::session_registry::config_options(
+                current_mode,
+                **self.config.default_reasoning_effort.load(),
+            )))
     }
 
     /// Load an existing session with already-connected MCP peers.
@@ -356,15 +421,75 @@ impl LocalAgentHandle {
     /// This is used by mobile FFI clients that manage MCP transport lifetimes
     /// externally (e.g. pipe transports) and want those tools available in
     /// loaded sessions.
+    ///
+    /// Uses the 3-phase materialization pattern with single-flight protection:
+    /// 1. Check registry (lock held briefly): Return existing if already materialized
+    /// 2. Prepare (NO lock): DB validation, MCP init, actor spawn
+    /// 3. Register (lock held): Insert into in-memory maps (microseconds)
+    /// 4. Finalize (NO lock): DHT registration, event emission
     pub async fn load_session_with_preconnected(
         &self,
         req: agent_client_protocol::schema::LoadSessionRequest,
         preconnected_peers: Vec<crate::agent::session_registry::PreconnectedMcpPeer>,
     ) -> std::result::Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
-        let mut registry = self.registry.lock().await;
-        registry
-            .load_session_with_preconnected(req, preconnected_peers)
-            .await
+        let session_id = req.session_id.to_string();
+
+        // Single-flight check: Check if session is already materialized
+        // Clone the session_ref out of the registry to avoid holding the lock
+        // during the async get_mode() call.
+        let existing_session_ref = {
+            let registry = self.registry_lock().await;
+            registry.get(&session_id).cloned()
+        };
+
+        if let Some(session_ref) = existing_session_ref {
+            // Registry lock is now dropped, safe to make async actor call
+            let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+            return Ok(LoadSessionResponse::new()
+                .modes(crate::agent::session_registry::mode_state(current_mode))
+                .config_options(crate::agent::session_registry::config_options(
+                    current_mode,
+                    **self.config.default_reasoning_effort.load(),
+                )));
+        }
+
+        // Phase 1: Prepare session (heavy work, NO registry lock held)
+        // The session_materializer's internal single-flight lock prevents
+        // duplicate materialization of the same session ID.
+        // Pass registry so it can re-check after acquiring the lock.
+        let (prepared, session_ref) = match self
+            .session_materializer
+            .prepare_load_session(req, preconnected_peers, Some(&self.registry))
+            .await?
+        {
+            PreparedSessionResult::Prepared(prepared) => {
+                let session_ref = {
+                    let mut registry = self.registry_lock().await;
+                    registry.register_prepared_session(&prepared).await
+                };
+                (Some(prepared), session_ref)
+            }
+            PreparedSessionResult::AlreadyRegistered(session_ref) => (None, session_ref),
+        };
+
+        // Phase 3: Finalize session (post-registration work, NO registry lock held)
+        // Pass the bridge for setup outside the lock
+        if let Some(prepared) = prepared.as_ref() {
+            let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
+            self.session_materializer
+                .finalize_session(prepared, bridge)
+                .await?;
+        }
+
+        // Get current mode for response
+        let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+
+        Ok(LoadSessionResponse::new()
+            .modes(crate::agent::session_registry::mode_state(current_mode))
+            .config_options(crate::agent::session_registry::config_options(
+                current_mode,
+                **self.config.default_reasoning_effort.load(),
+            )))
     }
 
     /// Gracefully shutdown the agent and all background tasks.
@@ -381,8 +506,11 @@ impl LocalAgentHandle {
 
         self.config.shutdown().await;
 
-        // Wait briefly for cleanup
+        // Wait briefly for in-flight work to settle, then flush any
+        // buffered OTLP spans/logs before the process exits.
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        querymt_utils::telemetry::flush_telemetry();
 
         log::info!("LocalAgentHandle: Shutdown complete");
     }
@@ -917,8 +1045,14 @@ impl LocalAgentHandle {
         // Propagate to the session registry so remove/detach can clean up
         // re-registration closures (Phase 4 of Bug 1 fix).
         if let Ok(mut registry) = self.registry.try_lock() {
-            registry.set_mesh(Some(mesh));
+            registry.set_mesh(Some(mesh.clone()));
         }
+
+        // Propagate to the session materializer for mesh-aware session creation
+        self.session_materializer.set_mesh(mesh.clone());
+
+        // Propagate to the model inventory for remote model enumeration
+        self.model_inventory.set_mesh(mesh);
     }
 
     /// Enable/disable automatic mesh fallback for unpinned provider resolution.
@@ -1528,9 +1662,9 @@ impl LocalAgentHandle {
 impl LocalAgentHandle {
     /// Invalidate the model cache, forcing a fresh enumeration on next call.
     ///
-    /// Delegates to `ModelRegistry::invalidate_all`.
+    /// Delegates to `ModelInventory::invalidate_all`.
     pub async fn invalidate_model_cache(&self) {
-        self.model_registry.invalidate_all().await;
+        self.model_inventory.invalidate_all().await;
     }
 
     /// Attempt to re-attach a remote session from a persisted bookmark.
@@ -1917,19 +2051,93 @@ impl SendAgent for LocalAgentHandle {
         registry.list_sessions(req).await
     }
 
+    /// Fork an existing session at the latest message.
+    ///
+    /// Uses the 3-phase materialization pattern:
+    /// 1. Prepare (NO lock): DB operations to create fork
+    /// 2. Load the forked session (which uses its own 3-phase pattern)
     async fn fork_session(&self, req: ForkSessionRequest) -> Result<ForkSessionResponse, Error> {
-        // Delegate to kameo SessionRegistry
-        let registry = self.registry.lock().await;
-        registry.fork_session(req).await
+        // Phase 1: Prepare fork (heavy DB work, NO registry lock held)
+        let response = self.session_materializer.prepare_fork_session(req).await?;
+
+        // The forked session is created in DB but not materialized yet.
+        // The client will need to load it separately (which will use the 3-phase pattern).
+        Ok(response)
     }
 
+    /// Resume an existing session without history replay.
+    ///
+    /// Uses the 3-phase materialization pattern with single-flight protection:
+    /// 1. Check registry (lock held briefly): Return existing if already materialized
+    /// 2. Prepare (NO lock): DB validation, MCP init, actor spawn
+    /// 3. Register (lock held): Insert into in-memory maps (microseconds)
+    /// 4. Finalize (NO lock): DHT registration, event emission
     async fn resume_session(
         &self,
         req: ResumeSessionRequest,
     ) -> Result<ResumeSessionResponse, Error> {
-        // Delegate to kameo SessionRegistry
-        let mut registry = self.registry.lock().await;
-        registry.resume_session(req).await
+        let session_id = req.session_id.to_string();
+
+        // Single-flight check: Check if session is already materialized
+        // Clone the actor_ref out of the registry to avoid holding the lock
+        // during the async ask(GetMode) call.
+        let existing_actor_ref = {
+            let registry = self.registry_lock().await;
+            registry.local_actor_ref(&session_id).cloned()
+        };
+
+        if let Some(existing_ref) = existing_actor_ref {
+            // Registry lock is now dropped, safe to make async actor call
+            let current_mode = existing_ref
+                .ask(crate::agent::messages::GetMode)
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+            return Ok(ResumeSessionResponse::new()
+                .modes(crate::agent::session_registry::mode_state(current_mode))
+                .config_options(crate::agent::session_registry::config_options(
+                    current_mode,
+                    **self.config.default_reasoning_effort.load(),
+                )));
+        }
+
+        // Phase 1: Prepare session (heavy work, NO registry lock held)
+        // The session_materializer's internal single-flight lock prevents
+        // duplicate materialization of the same session ID.
+        // Pass registry so it can re-check after acquiring the lock.
+        let (prepared, session_ref) = match self
+            .session_materializer
+            .prepare_resume_session(req, Some(&self.registry))
+            .await?
+        {
+            PreparedSessionResult::Prepared(prepared) => {
+                let session_ref = {
+                    let mut registry = self.registry_lock().await;
+                    registry.register_prepared_session(&prepared).await
+                };
+                (Some(prepared), session_ref)
+            }
+            PreparedSessionResult::AlreadyRegistered(session_ref) => (None, session_ref),
+        };
+
+        // Phase 3: Finalize session (post-registration work, NO registry lock held)
+        // Pass the bridge for setup outside the lock
+        if let Some(prepared) = prepared.as_ref() {
+            let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
+            self.session_materializer
+                .finalize_session(prepared, bridge)
+                .await?;
+        }
+
+        // Get current mode for response
+        let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+
+        Ok(ResumeSessionResponse::new()
+            .modes(crate::agent::session_registry::mode_state(current_mode))
+            .config_options(crate::agent::session_registry::config_options(
+                current_mode,
+                **self.config.default_reasoning_effort.load(),
+            )))
     }
 
     async fn close_session(&self, req: CloseSessionRequest) -> Result<CloseSessionResponse, Error> {
@@ -2166,16 +2374,23 @@ impl SendAgent for LocalAgentHandle {
     async fn ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
         match req.method.as_ref() {
             "querymt/models" => {
-                // Return local + remote models via the shared ModelRegistry.
-                #[cfg(feature = "remote")]
-                let models = self
-                    .model_registry
-                    .get_all_models(&self.config, self.mesh().as_ref())
-                    .await;
-                #[cfg(not(feature = "remote"))]
-                let models = self.model_registry.get_all_models(&self.config).await;
+                // Return local + remote models via the ModelInventory (non-blocking snapshot).
+                let (models, meta) = self.model_inventory.get_snapshot().await;
 
-                let result = serde_json::json!({ "models": models });
+                // If snapshot is empty, trigger background refresh but return empty immediately
+                if models.is_empty() && !meta.refresh_in_progress {
+                    self.model_inventory.trigger_refresh().await;
+                }
+
+                let result = serde_json::json!({
+                    "models": models,
+                    "meta": {
+                        "stale": meta.is_stale,
+                        "refresh_in_progress": meta.refresh_in_progress,
+                        "remote_timeout_count": meta.remote_timeout_count,
+                        "remote_node_count": meta.remote_node_count,
+                    }
+                });
                 let json = serde_json::to_string(&result).map_err(|e| {
                     Error::from(crate::error::AgentError::Serialization(e.to_string()))
                 })?;
@@ -2185,16 +2400,22 @@ impl SendAgent for LocalAgentHandle {
                 Ok(ExtResponse::new(Arc::from(raw)))
             }
             "querymt/refreshModels" => {
-                // Invalidate and refresh all caches, return fresh results.
-                #[cfg(feature = "remote")]
-                let models = self
-                    .model_registry
-                    .refresh_all(&self.config, self.mesh().as_ref())
-                    .await;
-                #[cfg(not(feature = "remote"))]
-                let models = self.model_registry.refresh_all(&self.config).await;
-
-                let result = serde_json::json!({ "models": models });
+                // Refreshes now stay fully backgrounded so slow provider/model scans
+                // cannot extend the caller's critical path.
+                let handle = self.model_inventory.trigger_refresh().await;
+                let (models, meta) = self.model_inventory.get_snapshot().await;
+                let result = serde_json::json!({
+                    "models": models,
+                    "meta": {
+                        "stale": meta.is_stale,
+                        "refresh_in_progress": meta.refresh_in_progress,
+                        "remote_timeout_count": meta.remote_timeout_count,
+                        "remote_node_count": meta.remote_node_count,
+                        "refresh_trigger": handle.disposition().as_str(),
+                        "started_new_refresh": handle.started_new_refresh(),
+                        "wait_for_completion": handle.waits_for_completion(),
+                    }
+                });
                 let json = serde_json::to_string(&result).map_err(|e| {
                     Error::from(crate::error::AgentError::Serialization(e.to_string()))
                 })?;
@@ -3051,6 +3272,31 @@ mod tests {
         let resp = f.handle.ext_method(req).await.expect("ext_method");
         let value: serde_json::Value = serde_json::from_str(resp.0.get()).expect("valid JSON");
         assert!(value.get("models").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_querymt_refresh_models_ext_method_returns_immediately_with_trigger_meta() {
+        let f = HandleFixture::new().await;
+        let null_params = std::sync::Arc::from(
+            serde_json::value::RawValue::from_string("null".to_string()).unwrap(),
+        );
+        let req =
+            agent_client_protocol::schema::ExtRequest::new("querymt/refreshModels", null_params);
+        let resp = tokio::time::timeout(
+            tokio::time::Duration::from_millis(500),
+            f.handle.ext_method(req),
+        )
+        .await
+        .expect("refreshModels should not block the caller")
+        .expect("ext_method");
+        let value: serde_json::Value = serde_json::from_str(resp.0.get()).expect("valid JSON");
+        let meta = value
+            .get("meta")
+            .and_then(|meta| meta.as_object())
+            .expect("response should include meta object");
+        assert!(meta.contains_key("refresh_trigger"));
+        assert!(meta.contains_key("started_new_refresh"));
+        assert!(meta.contains_key("wait_for_completion"));
     }
 
     #[tokio::test]

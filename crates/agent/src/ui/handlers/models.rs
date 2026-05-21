@@ -117,7 +117,7 @@ pub async fn handle_set_api_token(
         Some(name) => match crate::SecretStore::new() {
             Ok(mut store) => match store.set(&name, api_key) {
                 Ok(()) => {
-                    state.agent.model_registry.invalidate_all().await;
+                    state.agent.invalidate_model_cache().await;
                     Ok(format!("API key stored for {} ({})", provider, name))
                 }
                 Err(e) => Err(format!("Failed to store API key: {}", e)),
@@ -143,7 +143,7 @@ pub async fn handle_clear_api_token(
         Some(name) => match crate::SecretStore::new() {
             Ok(mut store) => match store.delete(&name) {
                 Ok(()) => {
-                    state.agent.model_registry.invalidate_all().await;
+                    state.agent.invalidate_model_cache().await;
                     Ok(format!("API key cleared for {} ({})", provider, name))
                 }
                 Err(e) => Err(format!("Failed to clear API key: {}", e)),
@@ -179,24 +179,25 @@ pub async fn handle_set_auth_method(
     finish_auth_op(state, provider, result, tx).await;
 }
 
-/// Handle model listing request using the shared `ModelRegistry`.
+/// Handle model listing request using the shared `ModelInventory`.
+///
+/// When `refresh` is requested or the snapshot is empty, triggers a background
+/// refresh and **waits** for it to complete (up to 5 s) so the UI receives
+/// populated data instead of a transiently-empty snapshot.
 pub async fn handle_list_all_models(state: &ServerState, refresh: bool, tx: &mpsc::Sender<String>) {
-    if refresh {
-        state.agent.model_registry.invalidate_all().await;
+    let (models, _meta) = state.agent.model_inventory.get_snapshot().await;
+
+    let needs_refresh = refresh || models.is_empty();
+
+    if needs_refresh {
+        // trigger_refresh() is idempotent — if a refresh is already in progress
+        // it returns a handle to the *existing* cycle, so we never duplicate work.
+        let handle = state.agent.model_inventory.trigger_refresh().await;
+        let timeout = std::time::Duration::from_secs(5);
+        let _ = tokio::time::timeout(timeout, handle.wait()).await;
     }
 
-    #[cfg(feature = "remote")]
-    let models = state
-        .agent
-        .model_registry
-        .get_all_models(&state.agent.config, state.agent.mesh().as_ref())
-        .await;
-    #[cfg(not(feature = "remote"))]
-    let models = state
-        .agent
-        .model_registry
-        .get_all_models(&state.agent.config)
-        .await;
+    let models = state.agent.model_inventory.get_all_models().await;
 
     let _ = send_message(tx, UiServerMessage::AllModelsList { models }).await;
     let capabilities = fetch_provider_capabilities(state).await;
@@ -364,7 +365,7 @@ pub async fn handle_add_custom_model_from_hf(
                     .await;
                     return;
                 }
-                state_clone.agent.model_registry.invalidate_all().await;
+                state_clone.agent.invalidate_model_cache().await;
             }
             Err(err) => {
                 let _ = send_message(
@@ -435,7 +436,7 @@ pub async fn handle_add_custom_model_from_file(
         .upsert_custom_model(&custom)
         .await
         .map_err(|e| e.to_string())?;
-    state.agent.model_registry.invalidate_all().await;
+    state.agent.invalidate_model_cache().await;
     Ok(())
 }
 
@@ -460,7 +461,7 @@ pub async fn handle_delete_custom_model(
         .delete_custom_model(provider, bare_model_id)
         .await
         .map_err(|e| e.to_string())?;
-    state.agent.model_registry.invalidate_all().await;
+    state.agent.invalidate_model_cache().await;
     Ok(())
 }
 
@@ -529,7 +530,7 @@ pub async fn handle_set_session_model(
         .set_session_model_with_node(msg)
         .await
         .map_err(|e| e.to_string())?;
-
+    state.agent.invalidate_model_cache().await;
     Ok(())
 }
 

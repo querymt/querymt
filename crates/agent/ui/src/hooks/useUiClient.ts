@@ -289,7 +289,7 @@ export function useUiClient() {
 
         // (Re-)initialise: fetch full state from backend
         sendOnSocket(socket, { type: 'init' });
-        sendOnSocket(socket, { type: 'list_all_models', data: { refresh: false } });
+        sendOnSocket(socket, { type: 'list_all_models', data: { refresh: true } });
         sendOnSocket(socket, { type: 'get_recent_models', data: { limit_per_workspace: 10 } });
         sendOnSocket(socket, { type: 'list_remote_nodes' });
         sendOnSocket(socket, { type: 'list_mesh_invites' } as UiClientMessage);

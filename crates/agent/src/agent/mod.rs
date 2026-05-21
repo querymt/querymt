@@ -24,6 +24,7 @@ pub mod messages;
 pub mod protocol;
 pub mod remote;
 pub mod session_actor;
+pub mod session_materializer;
 pub mod session_registry;
 pub mod snapshots;
 pub mod tools;
@@ -44,12 +45,17 @@ pub use agent_config::AgentConfig;
 pub use handle::{AgentHandle, LocalAgentHandle};
 pub use remote::SessionActorRef;
 pub use session_actor::SessionActor;
+pub use session_materializer::{PreparedSession, SessionMaterializer};
 pub use session_registry::SessionRegistry;
 
 #[cfg(test)]
 mod delegation_loop_tests;
 #[cfg(test)]
 mod execution_tests;
+#[cfg(test)]
+mod local_session_concurrency_tests;
+#[cfg(test)]
+mod registry_lock_tests;
 #[cfg(test)]
 mod undo_integration_tests;
 #[cfg(test)]

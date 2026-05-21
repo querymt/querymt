@@ -376,8 +376,10 @@ impl LLMProviderFactory for ExtismFactory {
         };
         let plugin = self.plugin.clone();
         let user_data = self.user_data.clone();
+        let caller_span = tracing::Span::current();
         async move {
             tokio::task::spawn_blocking(move || {
+                let _guard = caller_span.enter();
                 let mut plug = plugin.lock().unwrap();
 
                 // Reset any stale cancellation state left over from a previously dropped future
@@ -539,7 +541,15 @@ impl ExtismProvider {
         let started_for_call = started.clone();
         let cancelled_for_call = cancelled.clone();
 
+        // Capture the current tracing span so host function callbacks
+        // (e.g. `host_reqwest_http`) inside `spawn_blocking` are parented
+        // under `extism_provider.chat_stream_with_tools` rather than
+        // appearing as orphaned root spans.
+        let caller_span = tracing::Span::current();
+
         let join = tokio::task::spawn_blocking(move || {
+            let _guard = caller_span.enter();
+
             let mut plug = plugin.lock().unwrap();
 
             // Reset cancellation for this call (must happen only after acquiring the plugin mutex
@@ -681,7 +691,10 @@ impl ChatProvider for ExtismProvider {
             tools: tools.map(|v| v.to_vec()),
         };
 
+        let caller_span = tracing::Span::current();
+
         tokio::task::spawn_blocking(move || {
+            let _guard = caller_span.enter();
             log::debug!("Extism plugin chat_stream thread started");
             let mut plug = plugin.lock().unwrap();
             let res: Result<(), (extism::Error, i32)> =

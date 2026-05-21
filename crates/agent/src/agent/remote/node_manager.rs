@@ -74,8 +74,8 @@ pub struct AvailableModel {
 pub use remote_impl::{
     AdmissionRequest, AdmissionResponse, CreateRemoteSession, CreateRemoteSessionResponse,
     ForkRemoteSession, ForkRemoteSessionResponse, GetNodeInfo, ListAvailableModels,
-    ListRemoteSessions, RemoteNodeManager, ResumeRemoteSession, SessionHandoff,
-    StopRemoteSessionRuntime,
+    ListRemoteSessions, RemoteNodeManager, RemoteNodeManagerState, ResumeRemoteSession,
+    SessionHandoff, StopRemoteSessionRuntime,
 };
 
 #[cfg(feature = "remote")]
@@ -85,7 +85,7 @@ mod remote_impl {
     use crate::agent::remote::NodeId;
     use crate::agent::remote::mesh::MeshHandle;
     use crate::agent::session_actor::SessionActor;
-    use crate::agent::session_registry::{SessionMaterializationOptions, SessionRegistry};
+    use crate::agent::session_registry::SessionRegistry;
     use crate::error::AgentError;
     use futures_util::FutureExt;
     use kameo::Actor;
@@ -97,7 +97,6 @@ mod remote_impl {
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::Mutex;
-    use tracing::Instrument;
 
     // ── Messages ──────────────────────────────────────────────────────────────
 
@@ -248,6 +247,39 @@ mod remote_impl {
         Rejected { reason: String },
     }
 
+    // ── Shared State ──────────────────────────────────────────────────────────
+
+    /// Shared mutable state for `RemoteNodeManager` that can be safely accessed
+    /// from delegated (spawned) tasks.
+    ///
+    /// This state is separated from the actor itself to enable the DelegatedReply
+    /// Type alias for session metadata storage.
+    /// Maps session_id to (created_at_timestamp, optional_cwd).
+    pub type SessionMetaMap = Arc<Mutex<HashMap<String, (i64, Option<String>)>>>;
+
+    /// pattern: heavyweight operations (create/resume/fork) spawn background tasks
+    /// that capture cheap clones of this shared state, keeping the actor mailbox
+    /// responsive for lightweight control-plane messages (GetNodeInfo, ListAvailableModels).
+    #[derive(Clone)]
+    pub struct RemoteNodeManagerState {
+        /// Configuration and provider access.
+        pub config: Arc<AgentConfig>,
+        /// Local session registry — we manage sessions via this.
+        pub registry: Arc<Mutex<SessionRegistry>>,
+        /// Session materializer for heavy async work (DB, MCP, actor spawn).
+        /// Separates expensive operations from registry lock to keep control plane fast.
+        pub session_materializer: Arc<crate::agent::session_materializer::SessionMaterializer>,
+        /// Tracks created_at timestamps and cwds per session_id.
+        pub session_meta: SessionMetaMap,
+        /// Mesh handle for DHT registration of newly created sessions.
+        pub mesh: Option<MeshHandle>,
+        /// Per-session async locks preventing concurrent materialization of the
+        /// same `session_id`.  Different sessions are independent.
+        pub materialization_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+        /// Cached model inventory for fast model listing without blocking the actor mailbox.
+        pub model_inventory: crate::model_inventory::ModelInventory,
+    }
+
     // ── Actor ─────────────────────────────────────────────────────────────────
 
     /// Per-node actor that manages session lifecycle for remote peers.
@@ -255,18 +287,14 @@ mod remote_impl {
     /// Every node in the mesh runs one `RemoteNodeManager`. Remote peers send
     /// it `CreateRemoteSession` / `ListRemoteSessions` / etc. to interact with
     /// sessions on this machine.
+    ///
+    /// Heavy operations (create/resume/fork) use the DelegatedReply pattern:
+    /// they spawn background tasks that capture cheap clones of `shared_state`,
+    /// keeping the actor mailbox responsive for lightweight control-plane messages.
     #[derive(Actor)]
     pub struct RemoteNodeManager {
-        config: Arc<AgentConfig>,
-        /// Local session registry — we manage sessions via this.
-        registry: Arc<Mutex<SessionRegistry>>,
-        /// Tracks created_at timestamps and cwds per session_id.
-        session_meta: HashMap<String, (i64, Option<String>)>,
-        /// Mesh handle for DHT registration of newly created sessions.
-        mesh: Option<MeshHandle>,
-        /// Per-session async locks preventing concurrent materialization of the
-        /// same `session_id`.  Different sessions are independent.
-        materialization_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+        /// Shared state accessible from spawned tasks.
+        shared_state: RemoteNodeManagerState,
         /// Optional fixed node name returned by `GetNodeInfo`.
         ///
         /// When `Some`, `GetNodeInfo` returns this value directly as `hostname`
@@ -283,12 +311,28 @@ mod remote_impl {
             registry: Arc<Mutex<SessionRegistry>>,
             mesh: Option<MeshHandle>,
         ) -> Self {
+            let model_inventory = crate::model_inventory::ModelInventory::new(config.clone());
+            let session_materializer = Arc::new(
+                crate::agent::session_materializer::SessionMaterializer::new(config.clone()),
+            );
+
+            // Set mesh on model inventory and session materializer if provided
+            #[cfg(feature = "remote")]
+            if let Some(ref mesh_handle) = mesh {
+                model_inventory.set_mesh(mesh_handle.clone());
+                session_materializer.set_mesh(mesh_handle.clone());
+            }
+
             Self {
-                config,
-                registry,
-                session_meta: HashMap::new(),
-                mesh,
-                materialization_locks: HashMap::new(),
+                shared_state: RemoteNodeManagerState {
+                    config,
+                    registry,
+                    session_materializer,
+                    session_meta: Arc::new(Mutex::new(HashMap::new())),
+                    mesh,
+                    materialization_locks: Arc::new(Mutex::new(HashMap::new())),
+                    model_inventory,
+                },
                 node_name: None,
             }
         }
@@ -304,27 +348,9 @@ mod remote_impl {
             self.node_name = Some(name);
             self
         }
+    }
 
-        /// Get (or create) the per-session materialization lock.
-        fn materialization_lock_for(&mut self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-            self.materialization_locks
-                .entry(session_id.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        }
-
-        /// Best-effort cleanup of a per-session lock map entry when no other
-        /// task is waiting on it.
-        fn cleanup_materialization_lock(
-            &mut self,
-            session_id: &str,
-            lock: &Arc<tokio::sync::Mutex<()>>,
-        ) {
-            if Arc::strong_count(lock) == 2 {
-                self.materialization_locks.remove(session_id);
-            }
-        }
-
+    impl RemoteNodeManagerState {
         /// Build a `SessionHandoff` from an already-spawned local actor ref.
         async fn handoff_for_local_actor(
             &self,
@@ -360,8 +386,18 @@ mod remote_impl {
             }
         }
 
-        async fn materialize_remote_session(
-            &mut self,
+        /// Materialize a remote session from a spawned task.
+        ///
+        /// This method is called from background tasks spawned by DelegatedReply
+        /// handlers. It uses the shared state to perform the heavy materialization
+        /// work without blocking the actor mailbox.
+        ///
+        /// Uses the 3-phase pattern:
+        /// 1. Prepare (NO lock): DB creation, MCP init, actor spawn
+        /// 2. Register (lock held): Insert into in-memory maps (microseconds)
+        /// 3. Finalize (NO lock): DHT registration, event emission
+        pub async fn materialize_remote_session(
+            &self,
             session_id: String,
             cwd_path: Option<PathBuf>,
             cwd: Option<String>,
@@ -372,7 +408,13 @@ mod remote_impl {
             // Prevents two concurrent callers from materializing the same
             // session_id into separate SessionActor instances.  Different
             // session IDs proceed independently.
-            let session_lock = self.materialization_lock_for(&session_id);
+            let session_lock = {
+                let mut locks = self.materialization_locks.lock().await;
+                locks
+                    .entry(session_id.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                    .clone()
+            };
             let _guard = session_lock.lock().await;
 
             // ── Idempotency check ───────────────────────────────────────────
@@ -383,115 +425,70 @@ mod remote_impl {
                 if let Some(existing) = registry.local_actor_ref(&session_id).cloned() {
                     drop(registry);
                     let handoff = self.handoff_for_local_actor(&session_id, existing).await;
-                    self.cleanup_materialization_lock(&session_id, &session_lock);
+                    self.cleanup_materialization_lock(&session_id, &session_lock)
+                        .await;
                     return Ok(handoff);
                 }
             }
 
-            // ── Materialize new actor ────────────────────────────────────────
-            let materialization = {
-                let mut registry = self.registry.lock().await;
-                registry.set_mesh(self.mesh.clone());
-                registry
-                    .materialize_session_actor(
-                        session_id.clone(),
-                        cwd_path.clone(),
-                        &[],
-                        false,
-                        &mut SessionMaterializationOptions {
-                            attach_mesh_handle: true,
-                            register_in_dht: true,
-                        },
-                    )
-                    .await
-                    .map_err(|e| AgentError::Internal(e.to_string()))?
+            // ── Phase 1: Prepare (NO lock held) ─────────────────────────────
+            // Initialize MCP, spawn actor for EXISTING session.
+            // This is the heavy work that should NOT hold the registry lock.
+            let req = agent_client_protocol::schema::LoadSessionRequest::new(
+                agent_client_protocol::schema::SessionId::from(session_id.clone()),
+                cwd_path.clone().unwrap_or_default(),
+            );
+
+            let (prepared, actor_ref) = match self
+                .session_materializer
+                .prepare_load_session(req, vec![], Some(&self.registry))
+                .await
+                .map_err(|e| AgentError::Internal(e.to_string()))?
+            {
+                crate::agent::session_materializer::PreparedSessionResult::Prepared(prepared) => {
+                    let actor_ref = prepared.actor_ref.clone();
+                    (Some(prepared), actor_ref)
+                }
+                crate::agent::session_materializer::PreparedSessionResult::AlreadyRegistered(
+                    session_ref,
+                ) => (
+                    None,
+                    match session_ref {
+                        crate::agent::remote::SessionActorRef::Local(actor_ref) => actor_ref,
+                        #[cfg(feature = "remote")]
+                        crate::agent::remote::SessionActorRef::Remote { .. } => {
+                            return Err(AgentError::Internal(format!(
+                                "Session {} was registered without a local actor",
+                                session_id
+                            )));
+                        }
+                    },
+                ),
             };
-            let actor_ref = materialization.actor_ref;
-            let runtime = materialization.runtime;
+
             let actor_id_raw = actor_ref.id().sequence_id();
 
             tracing::Span::current()
                 .record("session_id", &session_id)
                 .record("actor_id", actor_id_raw);
 
-            self.session_meta
-                .insert(session_id.clone(), (created_at, cwd.clone()));
-
-            if let Err(e) = self
-                .config
-                .emit_event_persisted(&session_id, crate::events::AgentEventKind::SessionCreated)
-                .await
-            {
-                log::warn!(
-                    "RemoteNodeManager: failed to emit SessionCreated for {}: {}",
-                    session_id,
-                    e
-                );
-            }
-
-            if let Ok(Some(llm_config)) = self
-                .config
-                .provider
-                .history_store()
-                .get_session_llm_config(&session_id)
-                .await
-            {
-                let context_limit =
-                    crate::model_info::get_model_info(&llm_config.provider, &llm_config.model)
-                        .and_then(|m| m.context_limit());
-                self.config.emit_event(
-                    &session_id,
-                    crate::events::AgentEventKind::ProviderChanged {
-                        provider: llm_config.provider.clone(),
-                        model: llm_config.model.clone(),
-                        config_id: llm_config.id,
-                        context_limit,
-                        provider_node_id: None,
-                    },
-                );
-            }
-
-            if let Some(ref cwd_path) = cwd_path {
-                if cwd_path.exists() {
-                    let manager_actor = self.config.workspace_manager_actor.clone();
-                    let runtime_clone = runtime.clone();
-                    let cwd_owned = cwd_path.clone();
-                    let config_clone = self.config.clone();
-                    let session_id_for_index = session_id.clone();
-                    let index_span = tracing::info_span!(
-                        "remote.node_manager.init_workspace_index",
-                        session_id = %session_id,
-                        cwd = %cwd_owned.display(),
-                    );
-                    tokio::spawn(
-                        async move {
-                            let root = crate::index::resolve_workspace_root(&cwd_owned);
-                            match manager_actor
-                                .ask(crate::index::GetOrCreate { root: root.clone() })
-                                .await
-                            {
-                                Ok(handle) => {
-                                    let _ = runtime_clone.workspace_handle.set(handle);
-                                    config_clone.emit_event(
-                                        &session_id_for_index,
-                                        crate::events::AgentEventKind::WorkspaceIndexReady {
-                                            workspace_root: root.display().to_string(),
-                                        },
-                                    );
-                                }
-                                Err(e) => {
-                                    log::warn!("Failed to initialize workspace index: {}", e)
-                                }
-                            }
-                        }
-                        .instrument(index_span),
-                    );
-                } else {
-                    log::debug!(
-                        "RemoteNodeManager: cwd {:?} does not exist on this node, skipping workspace index",
-                        cwd_path
-                    );
+            if let Some(prepared) = prepared.as_ref() {
+                // ── Phase 2: Register (lock held for microseconds) ──────────────
+                {
+                    let mut registry = self.registry.lock().await;
+                    registry.register_prepared_session(prepared).await;
                 }
+
+                // ── Phase 3: Finalize (NO lock held) ────────────────────────────
+                self.session_materializer
+                    .finalize_session(prepared, None)
+                    .await
+                    .map_err(|e| AgentError::Internal(e.to_string()))?;
+            }
+
+            {
+                let mut session_meta = self.session_meta.lock().await;
+                session_meta.insert(session_id.clone(), (created_at, cwd.clone()));
             }
 
             let handoff = self
@@ -506,9 +503,23 @@ mod remote_impl {
             );
 
             drop(_guard);
-            self.cleanup_materialization_lock(&session_id, &session_lock);
+            self.cleanup_materialization_lock(&session_id, &session_lock)
+                .await;
 
             Ok(handoff)
+        }
+
+        /// Best-effort cleanup of a per-session lock map entry when no other
+        /// task is waiting on it.
+        async fn cleanup_materialization_lock(
+            &self,
+            session_id: &str,
+            lock: &Arc<tokio::sync::Mutex<()>>,
+        ) {
+            let mut locks = self.materialization_locks.lock().await;
+            if Arc::strong_count(lock) == 2 {
+                locks.remove(session_id);
+            }
         }
     }
 
@@ -535,11 +546,11 @@ mod remote_impl {
     // ── Message handlers ──────────────────────────────────────────────────────
 
     impl Message<CreateRemoteSession> for RemoteNodeManager {
-        type Reply = Result<CreateRemoteSessionResponse, AgentError>;
+        type Reply = kameo::reply::DelegatedReply<Result<CreateRemoteSessionResponse, AgentError>>;
 
         #[tracing::instrument(
             name = "remote.node_manager.create_session",
-            skip(self, _ctx),
+            skip(self, ctx),
             fields(
                 cwd = msg.cwd.as_deref().unwrap_or("<none>"),
                 session_id = tracing::field::Empty,
@@ -549,69 +560,77 @@ mod remote_impl {
         async fn handle(
             &mut self,
             msg: CreateRemoteSession,
-            _ctx: &mut Context<Self, Self::Reply>,
+            ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
             let cwd_path: Option<PathBuf> = msg.cwd.as_ref().map(PathBuf::from);
 
-            if let Some(ref path) = cwd_path
-                && !path.is_absolute()
-            {
-                return Err(AgentError::Internal(format!(
-                    "cwd must be an absolute path, got: {}",
-                    path.display()
-                )));
-            }
+            // Capture shared state for the spawned task
+            let shared_state = self.shared_state.clone();
 
-            let session_context = self
-                .config
-                .provider
-                .create_session(
-                    cwd_path.clone(),
-                    None,
-                    &self.config.execution_config_snapshot(),
-                )
-                .await
-                .map_err(|e| AgentError::Internal(e.to_string()))?;
+            // Spawn the work as a background task
+            ctx.spawn(async move {
+                if let Some(ref path) = cwd_path
+                    && !path.is_absolute()
+                {
+                    return Err(AgentError::Internal(format!(
+                        "cwd must be an absolute path, got: {}",
+                        path.display()
+                    )));
+                }
 
-            let session = session_context.session();
-            let session_id = session.public_id.clone();
-            let title = session.name.clone();
-            let created_at = session
-                .created_at
-                .map(|ts| ts.unix_timestamp())
-                .unwrap_or_else(|| {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0)
-                });
+                let session_context = shared_state
+                    .config
+                    .provider
+                    .create_session(
+                        cwd_path.clone(),
+                        None,
+                        &shared_state.config.execution_config_snapshot(),
+                    )
+                    .await
+                    .map_err(|e| AgentError::Internal(e.to_string()))?;
 
-            let handoff = self
-                .materialize_remote_session(
-                    session_id.clone(),
-                    cwd_path,
-                    msg.cwd.clone(),
-                    title.clone(),
+                let session = session_context.session();
+                let session_id = session.public_id.clone();
+                let title = session.name.clone();
+                let created_at = session
+                    .created_at
+                    .map(|ts| ts.unix_timestamp())
+                    .unwrap_or_else(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0)
+                    });
+
+                tracing::Span::current().record("session_id", &session_id);
+
+                let handoff = shared_state
+                    .materialize_remote_session(
+                        session_id.clone(),
+                        cwd_path,
+                        msg.cwd.clone(),
+                        title.clone(),
+                        created_at,
+                    )
+                    .await?;
+
+                Ok(CreateRemoteSessionResponse {
+                    session_id,
+                    handoff,
+                    cwd: msg.cwd,
+                    title,
                     created_at,
-                )
-                .await?;
-
-            Ok(CreateRemoteSessionResponse {
-                session_id,
-                handoff,
-                cwd: msg.cwd,
-                title,
-                created_at,
+                })
             })
         }
     }
 
     impl Message<ForkRemoteSession> for RemoteNodeManager {
-        type Reply = Result<ForkRemoteSessionResponse, AgentError>;
+        type Reply = kameo::reply::DelegatedReply<Result<ForkRemoteSessionResponse, AgentError>>;
 
         #[tracing::instrument(
             name = "remote.node_manager.fork_session",
-            skip(self, _ctx),
+            skip(self, ctx),
             fields(
                 source_session_id = %msg.source_session_id,
                 message_id = %msg.message_id,
@@ -622,71 +641,79 @@ mod remote_impl {
         async fn handle(
             &mut self,
             msg: ForkRemoteSession,
-            _ctx: &mut Context<Self, Self::Reply>,
+            ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
-            let session = self
-                .config
-                .provider
-                .history_store()
-                .get_session(&msg.source_session_id)
-                .await
-                .map_err(|e| AgentError::Internal(e.to_string()))?
-                .ok_or_else(|| AgentError::SessionNotFound {
-                    session_id: msg.source_session_id.clone(),
-                })?;
+            // Capture shared state for the spawned task
+            let shared_state = self.shared_state.clone();
 
-            let forked_session_id = self
-                .config
-                .provider
-                .history_store()
-                .fork_session(
-                    &msg.source_session_id,
-                    &msg.message_id,
-                    crate::session::domain::ForkOrigin::User,
-                )
-                .await
-                .map_err(|e| AgentError::Internal(e.to_string()))?;
+            // Spawn the heavy work as a background task
+            ctx.spawn(async move {
+                let session = shared_state
+                    .config
+                    .provider
+                    .history_store()
+                    .get_session(&msg.source_session_id)
+                    .await
+                    .map_err(|e| AgentError::Internal(e.to_string()))?
+                    .ok_or_else(|| AgentError::SessionNotFound {
+                        session_id: msg.source_session_id.clone(),
+                    })?;
 
-            let forked_session = self
-                .config
-                .provider
-                .history_store()
-                .get_session(&forked_session_id)
-                .await
-                .map_err(|e| AgentError::Internal(e.to_string()))?
-                .ok_or_else(|| AgentError::SessionNotFound {
-                    session_id: forked_session_id.clone(),
-                })?;
+                let forked_session_id = shared_state
+                    .config
+                    .provider
+                    .history_store()
+                    .fork_session(
+                        &msg.source_session_id,
+                        &msg.message_id,
+                        crate::session::domain::ForkOrigin::User,
+                    )
+                    .await
+                    .map_err(|e| AgentError::Internal(e.to_string()))?;
 
-            let cwd_path = forked_session.cwd.clone();
-            let cwd = cwd_path.as_ref().map(|path| path.display().to_string());
-            let title = forked_session.name.clone().or(session.name.clone());
-            let created_at = forked_session
-                .created_at
-                .map(|ts| ts.unix_timestamp())
-                .unwrap_or_else(|| {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0)
-                });
+                let forked_session = shared_state
+                    .config
+                    .provider
+                    .history_store()
+                    .get_session(&forked_session_id)
+                    .await
+                    .map_err(|e| AgentError::Internal(e.to_string()))?
+                    .ok_or_else(|| AgentError::SessionNotFound {
+                        session_id: forked_session_id.clone(),
+                    })?;
 
-            let handoff = self
-                .materialize_remote_session(
-                    forked_session_id.clone(),
-                    cwd_path,
-                    cwd.clone(),
-                    title.clone(),
+                let cwd_path = forked_session.cwd.clone();
+                let cwd = cwd_path.as_ref().map(|path| path.display().to_string());
+                let title = forked_session.name.clone().or(session.name.clone());
+                let created_at = forked_session
+                    .created_at
+                    .map(|ts| ts.unix_timestamp())
+                    .unwrap_or_else(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0)
+                    });
+
+                tracing::Span::current().record("session_id", &forked_session_id);
+
+                let handoff = shared_state
+                    .materialize_remote_session(
+                        forked_session_id.clone(),
+                        cwd_path,
+                        cwd.clone(),
+                        title.clone(),
+                        created_at,
+                    )
+                    .await?;
+
+                Ok(ForkRemoteSessionResponse {
+                    session_id: forked_session_id,
+                    handoff,
+                    cwd,
+                    title,
                     created_at,
-                )
-                .await?;
-
-            Ok(ForkRemoteSessionResponse {
-                session_id: forked_session_id,
-                handoff,
-                cwd,
-                title,
-                created_at,
+                })
             })
         }
     }
@@ -710,7 +737,7 @@ mod remote_impl {
             let limit = msg.limit.unwrap_or(20).clamp(1, 100) as usize;
 
             // ── 1. Load persisted sessions from SQLite ─────────────────────────
-            let store = self.config.provider.history_store();
+            let store = self.shared_state.config.provider.history_store();
             let all_sessions = store.list_sessions().await.map_err(|e| {
                 AgentError::Internal(format!("Failed to list persisted sessions: {}", e))
             })?;
@@ -730,7 +757,7 @@ mod remote_impl {
             let page_len = page.len();
 
             // ── 3. Enrich with live registry data ──────────────────────────────
-            let registry = self.registry.lock().await;
+            let registry = self.shared_state.registry.lock().await;
             let hostname = get_hostname();
 
             let mut infos = Vec::with_capacity(page_len);
@@ -819,7 +846,7 @@ mod remote_impl {
             _ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
             let session_ref = {
-                let mut registry = self.registry.lock().await;
+                let mut registry = self.shared_state.registry.lock().await;
                 registry.remove(&msg.session_id)
             };
 
@@ -849,7 +876,7 @@ mod remote_impl {
 
                 // Ensure this session's re-registration closure is removed from the
                 // mesh handle so repeated create/stop cycles don't leak entries.
-                if let Some(ref mesh) = self.mesh {
+                if let Some(ref mesh) = self.shared_state.mesh {
                     let dht_name = crate::agent::remote::dht_name::session(&msg.session_id);
                     mesh.deregister_actor(&dht_name);
                 }
@@ -869,58 +896,64 @@ mod remote_impl {
     }
 
     impl Message<ResumeRemoteSession> for RemoteNodeManager {
-        type Reply = Result<CreateRemoteSessionResponse, AgentError>;
+        type Reply = kameo::reply::DelegatedReply<Result<CreateRemoteSessionResponse, AgentError>>;
 
         #[tracing::instrument(
             name = "remote.node_manager.resume_session",
-            skip(self, _ctx),
+            skip(self, ctx),
             fields(session_id = %msg.session_id)
         )]
         async fn handle(
             &mut self,
             msg: ResumeRemoteSession,
-            _ctx: &mut Context<Self, Self::Reply>,
+            ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
-            let session = self
-                .config
-                .provider
-                .history_store()
-                .get_session(&msg.session_id)
-                .await
-                .map_err(|e| AgentError::Internal(e.to_string()))?
-                .ok_or_else(|| AgentError::SessionNotFound {
-                    session_id: msg.session_id.clone(),
-                })?;
+            // Capture shared state for the spawned task
+            let shared_state = self.shared_state.clone();
 
-            let cwd_path = session.cwd.clone();
-            let cwd = cwd_path.as_ref().map(|p| p.display().to_string());
-            let title = session.name.clone();
-            let created_at = session
-                .created_at
-                .map(|ts| ts.unix_timestamp())
-                .unwrap_or_else(|| {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0)
-                });
+            // Spawn the heavy work as a background task
+            ctx.spawn(async move {
+                let session = shared_state
+                    .config
+                    .provider
+                    .history_store()
+                    .get_session(&msg.session_id)
+                    .await
+                    .map_err(|e| AgentError::Internal(e.to_string()))?
+                    .ok_or_else(|| AgentError::SessionNotFound {
+                        session_id: msg.session_id.clone(),
+                    })?;
 
-            let handoff = self
-                .materialize_remote_session(
-                    msg.session_id.clone(),
-                    cwd_path,
-                    cwd.clone(),
-                    title.clone(),
+                let cwd_path = session.cwd.clone();
+                let cwd = cwd_path.as_ref().map(|p| p.display().to_string());
+                let title = session.name.clone();
+                let created_at = session
+                    .created_at
+                    .map(|ts| ts.unix_timestamp())
+                    .unwrap_or_else(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0)
+                    });
+
+                let handoff = shared_state
+                    .materialize_remote_session(
+                        msg.session_id.clone(),
+                        cwd_path,
+                        cwd.clone(),
+                        title.clone(),
+                        created_at,
+                    )
+                    .await?;
+
+                Ok(CreateRemoteSessionResponse {
+                    session_id: msg.session_id,
+                    handoff,
+                    cwd,
+                    title,
                     created_at,
-                )
-                .await?;
-
-            Ok(CreateRemoteSessionResponse {
-                session_id: msg.session_id,
-                handoff,
-                cwd,
-                title,
-                created_at,
+                })
             })
         }
     }
@@ -941,7 +974,7 @@ mod remote_impl {
             let hostname = self.node_name.clone().unwrap_or_else(get_hostname);
 
             let active_sessions = {
-                let registry = self.registry.lock().await;
+                let registry = self.shared_state.registry.lock().await;
                 registry.len()
             };
 
@@ -950,6 +983,7 @@ mod remote_impl {
                 .record("active_sessions", active_sessions);
 
             let node_id = self
+                .shared_state
                 .mesh
                 .as_ref()
                 .map(|m| NodeId::from_peer_id(*m.peer_id()))
@@ -970,27 +1004,38 @@ mod remote_impl {
         #[tracing::instrument(
             name = "remote.node_manager.list_models",
             skip(self, _ctx),
-            fields(model_count = tracing::field::Empty)
+            fields(model_count = tracing::field::Empty, cache_hit = tracing::field::Empty)
         )]
         async fn handle(
             &mut self,
             _msg: ListAvailableModels,
             _ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
-            // Delegate to the shared local enumerator from model_registry.
-            let local_models = crate::model_registry::enumerate_local_models(&self.config).await;
+            // Use the cached model inventory instead of synchronously enumerating models.
+            // This keeps the actor mailbox responsive even when providers are slow.
+            let (local_models, meta) = self.shared_state.model_inventory.get_snapshot().await;
 
-            // Convert ModelEntry -> AvailableModel for the mesh response payload.
-            let models: Vec<AvailableModel> = local_models
+            // If cache is stale, trigger a background refresh
+            if meta.is_stale && !meta.refresh_in_progress {
+                let inventory = self.shared_state.model_inventory.clone();
+                tokio::spawn(async move {
+                    inventory.trigger_refresh().await;
+                });
+            }
+
+            // Filter to only local models (no node_id means local)
+            let local_only: Vec<AvailableModel> = local_models
                 .into_iter()
+                .filter(|entry| entry.node_id.is_none())
                 .map(|entry| AvailableModel {
                     provider: entry.provider,
                     model: entry.model,
                 })
                 .collect();
 
-            tracing::Span::current().record("model_count", models.len());
-            Ok(models)
+            tracing::Span::current().record("model_count", local_only.len());
+            tracing::Span::current().record("cache_hit", !meta.is_stale);
+            Ok(local_only)
         }
     }
 
@@ -1016,7 +1061,7 @@ mod remote_impl {
                         .record("variant", "Invite")
                         .record("peer_id", &peer_id);
 
-                    let Some(ref mesh) = self.mesh else {
+                    let Some(ref mesh) = self.shared_state.mesh else {
                         return Ok(AdmissionResponse::Rejected {
                             reason: "host has no mesh handle".to_string(),
                         });
@@ -1098,6 +1143,7 @@ mod remote_impl {
                                 membership_token.admitted_by
                             );
                             let existing_peers: Vec<String> = self
+                                .shared_state
                                 .mesh
                                 .as_ref()
                                 .map(|m| {

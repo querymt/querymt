@@ -6,7 +6,7 @@
 //! that the core auth logic lives in exactly one place.
 
 use crate::agent::agent_config::AgentConfig;
-use crate::model_registry::ModelRegistry;
+use crate::model_inventory::ModelInventory;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -63,14 +63,13 @@ struct FlowIdentity {
 
 /// Shared OAuth service dependencies. Cheaply cloneable (all fields are `Arc`-backed).
 ///
-/// Groups the four shared dependencies (`AgentConfig`, `ModelRegistry`,
+/// Groups the shared dependencies (`AgentConfig`, `ModelInventory`,
 /// `OAuthFlowMap`, `CallbackListenerSlot`) that every auth operation needs,
 /// providing a single entry point for all OAuth service methods.
 #[derive(Clone)]
 pub struct OAuthService {
     config: Arc<AgentConfig>,
-    #[cfg_attr(not(feature = "oauth"), allow(dead_code))]
-    model_registry: ModelRegistry,
+    model_inventory: ModelInventory,
     flows: OAuthFlowMap,
     listener_slot: CallbackListenerSlot,
 }
@@ -79,13 +78,13 @@ impl OAuthService {
     /// Construct a new `OAuthService` from the shared dependencies.
     pub fn new(
         config: Arc<AgentConfig>,
-        model_registry: ModelRegistry,
+        model_inventory: ModelInventory,
         flows: OAuthFlowMap,
         listener_slot: CallbackListenerSlot,
     ) -> Self {
         Self {
             config,
-            model_registry,
+            model_inventory,
             flows,
             listener_slot,
         }
@@ -441,7 +440,7 @@ impl OAuthService {
 
                     stop_listener_for_flow(&self.listener_slot, &self.flows, flow_id, false).await;
                     self.config.invalidate_provider_cache().await;
-                    self.model_registry.invalidate_all().await;
+                    self.model_inventory.invalidate_all().await;
 
                     CompleteFlowResult {
                         provider: flow.provider.clone(),
@@ -543,7 +542,7 @@ impl OAuthService {
                     stop_listener_for_owner_provider(&self.listener_slot, owner, &provider_name)
                         .await;
                     self.config.invalidate_provider_cache().await;
-                    self.model_registry.invalidate_all().await;
+                    self.model_inventory.invalidate_all().await;
 
                     LogoutResult {
                         provider: provider_name,
@@ -932,7 +931,7 @@ async fn run_callback_listener_task(
             }
 
             svc.config.invalidate_provider_cache().await;
-            svc.model_registry.invalidate_all().await;
+            svc.model_inventory.invalidate_all().await;
 
             let completion = CompleteFlowResult {
                 provider: provider.clone(),

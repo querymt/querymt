@@ -34,13 +34,11 @@ tracing = ["dep:tracing"]
 anyhow = "1.0"
 serde.workspace = true
 serde_json.workspace = true
-serde-value.workspace = true
 async-trait.workspace = true
 uuid = { version = "1.0", optional = true, features = ["v4"] }
 schemars.workspace = true
 base64.workspace = true
 futures = "0.3"
-either.workspace = true
 url.workspace = true
 http.workspace = true
 libloading = { version = "0.9", optional = true}

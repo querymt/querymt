@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Mutex;
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
@@ -250,6 +251,10 @@ pub fn try_setup_telemetry_with_layers(
         tracing::subscriber::set_global_default(subscriber)
             .map_err(|_| TelemetryInitError::Subscriber)?;
 
+        // Store the providers so [`flush_telemetry`] can flush them on shutdown.
+        // The providers are kept alive for the entire process lifetime.
+        store_providers(tracer_provider, logger_provider);
+
         return Ok(Some(endpoint));
     }
 
@@ -264,35 +269,55 @@ pub fn try_setup_telemetry_with_layers(
 }
 
 // ─── Convenience wrapper (panics on failure) ───────────────────────────────────
+// ─── Provider storage for shutdown flush ──────────────────────────────────────
 
-/// Setup telemetry with configurable service name and version.
+/// Global storage for the OTLP providers so they can be flushed on shutdown.
+static PROVIDERS: Mutex<Option<(SdkTracerProvider, SdkLoggerProvider)>> = Mutex::new(None);
+
+fn store_providers(tracer: SdkTracerProvider, logger: SdkLoggerProvider) {
+    match PROVIDERS.lock() {
+        Ok(mut guard) => *guard = Some((tracer, logger)),
+        Err(e) => {
+            // Mutex poisoned — unlikely, but don't panic during init.
+            log::warn!("Failed to store OTLP providers for later flush: {e}");
+        }
+    }
+}
+
+/// Flush pending OTLP spans and logs to the collector.
 ///
-/// Uses **per-layer filtering** so that console output and OTLP telemetry
-/// can operate at independent log levels:
+/// Call this during graceful shutdown (after all instrumented work is done)
+/// to ensure the batch exporters have sent any buffered telemetry.
 ///
-/// - Console (`fmt` layer): defaults to `ERROR`, overridden by `RUST_LOG`
-/// - OTLP layers (traces + logs): defaults to `INFO`, overridden by `QMT_TELEMETRY_LEVEL`
-///
-/// # Behavior
-/// - If `QMT_NO_TELEMETRY` env var is set, only sets up fmt layer (no OTLP export)
-/// - If `OTEL_EXPORTER_OTLP_ENDPOINT` is not set, defaults to `https://otel.query.mt`
-/// - If `OTEL_EXPORTER_OTLP_ENDPOINT` is set, uses that endpoint instead
-///
-/// # Arguments
-/// - `service_name`: The name of the service (e.g., "querymt-cli")
-/// - `service_version`: The version of the service (e.g., "0.2.0")
-/// - `use_stderr`: If `true`, the console `fmt` layer writes to stderr instead of stdout.
-///   Useful for ACP/stdio mode where stdout is reserved for JSON-RPC.
-///
-/// # Environment Variables
-/// - `QMT_NO_TELEMETRY`: If set (any value), disables OTLP export
-/// - `OTEL_EXPORTER_OTLP_ENDPOINT`: Custom OTLP endpoint (defaults to https://otel.query.mt)
-/// - `RUST_LOG`: Controls console output filtering (defaults to `error`)
-/// - `QMT_TELEMETRY_LEVEL`: Controls OTLP telemetry filtering (defaults to `info`)
-///
-/// # Panics
-/// Panics if the global subscriber or `LogTracer` could not be installed
-/// (e.g. because another caller already set one).
+/// This is a best-effort operation: errors are logged but not propagated.
+pub fn flush_telemetry() {
+    let providers = PROVIDERS.lock().ok().and_then(|mut g| g.take());
+    match providers {
+        Some((tracer_provider, logger_provider)) => {
+            log::info!("Flushing OTLP telemetry providers…");
+            if let Err(e) = tracer_provider.force_flush() {
+                log::warn!("OTLP tracer provider force_flush failed: {e}");
+            }
+            if let Err(e) = logger_provider.force_flush() {
+                log::warn!("OTLP logger provider force_flush failed: {e}");
+            }
+            // shutdown() internally flushes then releases resources.
+            if let Err(e) = tracer_provider.shutdown() {
+                log::warn!("OTLP tracer provider shutdown failed: {e}");
+            }
+            if let Err(e) = logger_provider.shutdown() {
+                log::warn!("OTLP logger provider shutdown failed: {e}");
+            }
+            log::info!("OTLP telemetry providers flushed and shut down.");
+        }
+        None => {
+            // Either OTLP was never enabled or already flushed.
+        }
+    }
+}
+
+// ─── Convenience wrapper (panics on failure) ───────────────────────────────────
+
 pub fn setup_telemetry(service_name: &str, service_version: &str, use_stderr: bool) {
     let config = TelemetryConfig {
         service_name,
