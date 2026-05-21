@@ -26,7 +26,6 @@
 //! | `ProviderHostActor`    | `provider_host::peer::{peer_id}`    |
 //! | `SessionActor`         | `session::{session_id}`             |
 //! | `EventRelayActor`      | `event_relay::{session_id}::{peer_id}` |
-//! | `StreamReceiverActor`  | `stream_rx::{session_id}::{request_id}` |
 //! | `RemoteNodeManager`    | `node_manager`                      |
 
 use std::fmt;
@@ -83,15 +82,6 @@ pub fn event_relay(session_id: &str, peer_id: &impl fmt::Display) -> String {
     format!("event_relay::{}::{}", session_id, peer_id)
 }
 
-/// DHT name for an ephemeral `StreamReceiverActor`.
-///
-/// Registered by `MeshChatProvider` for the duration of a single streaming
-/// LLM request.  The remote `ProviderHostActor` sends `StreamChunkRelay`
-/// messages to this actor.
-pub fn stream_receiver(session_id: &str, request_id: &str) -> String {
-    format!("stream_rx::{}::{}", session_id, request_id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,14 +128,6 @@ mod tests {
         assert_ne!(
             name_a, name_b,
             "different peers must produce different relay names"
-        );
-    }
-
-    #[test]
-    fn stream_receiver_format() {
-        assert_eq!(
-            stream_receiver("session-1", "req-42"),
-            "stream_rx::session-1::req-42"
         );
     }
 

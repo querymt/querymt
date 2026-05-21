@@ -44,6 +44,9 @@ pub mod cached_transport;
 pub mod provider_host;
 
 #[cfg(feature = "remote")]
+pub mod session_stream_router;
+
+#[cfg(feature = "remote")]
 pub mod remote_handle;
 
 #[cfg(feature = "remote")]
@@ -129,6 +132,11 @@ pub use routing::{
     ClearRoute, ListRoutes, ResolvePeer, RouteConfirmation, RouteTarget, RoutingActor,
     RoutingPolicy, RoutingSnapshot, RoutingSnapshotHandle, SetProviderTarget, SetSessionTarget,
     UnresolvePeer, new_routing_snapshot_handle,
+};
+#[cfg(feature = "remote")]
+pub use session_stream_router::{
+    AttachStreamConsumer, DetachStreamConsumer, GetRouterStatus, RequestPhase, RoutedRequestStatus,
+    RoutedStreamRelayMessage, SessionStreamRouterActor,
 };
 #[cfg(feature = "remote")]
 pub use transport::{DynMeshTransport, MeshTransport};

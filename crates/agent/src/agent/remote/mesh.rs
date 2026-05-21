@@ -2169,7 +2169,7 @@ mod tests {
         use crate::agent::remote::provider_host::StreamReceiverActor;
         use kameo::actor::Spawn;
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let actor = StreamReceiverActor::new(tx, test_name.clone(), None);
+        let actor = StreamReceiverActor::new(tx);
         let actor_ref = StreamReceiverActor::spawn(actor);
         mesh.register_actor(actor_ref, test_name.clone()).await;
 

@@ -20,9 +20,7 @@ mod provider_routing_integration_tests {
     use crate::agent::remote::RemoteNodeManager;
     use crate::agent::remote::mesh_provider::MeshChatProvider;
     use crate::agent::remote::node_manager::CreateRemoteSession;
-    use crate::agent::remote::provider_host::{
-        ProviderChatRequest, ProviderStreamRequest, StreamReceiverActor,
-    };
+    use crate::agent::remote::provider_host::{ProviderChatRequest, ProviderStreamRequest};
     use crate::agent::remote::test_helpers::fixtures::{
         AgentConfigFixture, ProviderHostFixture, ProviderRoutingFixture, get_test_mesh,
     };
@@ -327,26 +325,22 @@ mod provider_routing_integration_tests {
         );
     }
 
-    // ── H.9 — ProviderHostActor streaming sends chunks to receiver ────────────
+    // ── H.9 — ProviderHostActor streaming sends chunks to router ──────────────
 
     #[tokio::test]
-    async fn test_provider_host_actor_streaming_sends_chunks_to_receiver() {
+    async fn test_provider_host_actor_streaming_sends_chunks_to_router() {
+        use crate::agent::remote::session_stream_router::SessionStreamRouterActor;
+
         let test_id = Uuid::now_v7().to_string();
         let f = ProviderHostFixture::new().await;
-        let mesh = get_test_mesh().await;
 
-        let (tx, _rx) = mpsc::channel(16);
         let session_id = format!("session-h9-{}", test_id);
         let request_id = format!("h9-{}", test_id);
-        let stream_rx_name =
-            crate::agent::remote::dht_name::stream_receiver(&session_id, &request_id);
-        let receiver_actor = StreamReceiverActor::new(tx, stream_rx_name.clone(), None);
-        let receiver_ref = StreamReceiverActor::spawn(receiver_actor);
-        mesh.register_actor(receiver_ref.clone(), stream_rx_name.clone())
-            .await;
-        let _ = receiver_ref;
 
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Create a session stream router (Phase 3: stable per-session router)
+        let router = SessionStreamRouterActor::new(None, None);
+        let router_ref = SessionStreamRouterActor::spawn(router);
+        let remote_router_ref = router_ref.into_remote_ref().await;
 
         let stream_req = ProviderStreamRequest {
             provider: "nonexistent-h9".to_string(),
@@ -355,7 +349,7 @@ mod provider_routing_integration_tests {
             tools: None,
             session_id,
             request_id,
-            stream_receiver_name: stream_rx_name,
+            stream_router_ref: remote_router_ref,
             reconnect_grace_secs: 120,
             heartbeat_interval_secs: 10,
             lease_ttl_secs: 60,

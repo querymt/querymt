@@ -30,6 +30,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use super::session_stream_router::RoutedStreamRelayMessage;
+
 // ── Wire types ────────────────────────────────────────────────────────────────
 
 /// The concrete, serializable representation of an LLM response.
@@ -149,8 +151,9 @@ pub struct ProviderChatRequest {
 /// Streaming provider call message (use `tell()`).
 ///
 /// The `ProviderHostActor` streams chunks back to the requesting node by
-/// looking up the `StreamReceiverActor` registered under `stream_receiver_name`
-/// in the DHT and sending `StreamChunkRelay` messages to it.
+/// sending `RoutedStreamRelayMessage` messages to the `SessionStreamRouterActor`
+/// via the `stream_router_ref` remote actor reference. The router then forwards
+/// chunks to the appropriate local consumer based on `request_id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderStreamRequest {
     /// Provider name.
@@ -165,9 +168,11 @@ pub struct ProviderStreamRequest {
     pub session_id: String,
     /// Unique request id within the session.
     pub request_id: String,
-    /// DHT name of the `StreamReceiverActor` on the requesting node.
-    /// Format: `"stream_rx::{session_id}::{request_id}"`.
-    pub stream_receiver_name: String,
+    /// Remote actor reference to the `SessionStreamRouterActor` on the requesting node.
+    /// This is a stable per-session router that routes chunks to local consumers
+    /// based on `request_id`, enabling iroh/mobile resilience.
+    pub stream_router_ref:
+        kameo::actor::RemoteActorRef<super::session_stream_router::SessionStreamRouterActor>,
     /// Grace period in seconds to wait for stream reconnection before failing.
     pub reconnect_grace_secs: u64,
     /// How often the provider host should emit liveness heartbeats while waiting.
@@ -197,6 +202,11 @@ pub enum ProviderStreamPhase {
     WaitingFirstChunk,
     Streaming,
     ReceiverDisconnected,
+    /// Reconnect grace period expired — the receiver did not come back in time.
+    GraceExpired,
+    /// Stream lease expired — the requester stopped renewing.
+    LeaseExpired,
+    /// Cancelled by explicit requester action.
     Cancelling,
     Completed,
     Failed,
@@ -240,7 +250,7 @@ pub struct GetProviderStreamStatus {
     pub request_id: Option<String>,
 }
 
-fn keep_stream_message_buffered(message: &StreamRelayMessage) -> bool {
+pub(crate) fn keep_stream_message_buffered(message: &StreamRelayMessage) -> bool {
     !matches!(
         message,
         StreamRelayMessage::Heartbeat { .. }
@@ -249,7 +259,7 @@ fn keep_stream_message_buffered(message: &StreamRelayMessage) -> bool {
     )
 }
 
-fn relay_message_is_terminal(message: &StreamRelayMessage) -> bool {
+pub(crate) fn relay_message_is_terminal(message: &StreamRelayMessage) -> bool {
     matches!(
         message,
         StreamRelayMessage::Chunk(StreamChunk::Done { .. })
@@ -283,21 +293,13 @@ fn remove_active_stream(
 
 /// Ephemeral actor spawned on the **requesting** node for each streaming call.
 ///
-/// Registered in the DHT as `"stream_rx::{request_id}"`. Receives
-/// `StreamChunkRelay` messages from the `ProviderHostActor` on the owning node
-/// and feeds them into an `mpsc` channel. The consumer wraps the channel
-/// receiver as a `Stream<Item = Result<StreamChunk, LLMError>>`.
+/// Receives `StreamChunkRelay` messages from the `ProviderHostActor` via a
+/// direct `RemoteActorRef` and feeds them into an `mpsc` channel. The consumer
+/// wraps the channel receiver as a `Stream<Item = Result<StreamChunk, LLMError>>`.
 ///
 /// Self-destructs when it receives `StreamChunk::Done` or an error relay.
-/// On stop, it deregisters itself from the Kademlia DHT so the name entry
-/// does not linger after the stream is complete.
 pub struct StreamReceiverActor {
     tx: mpsc::Sender<StreamRelayMessage>,
-    /// The name this actor is registered under in the Kademlia DHT.
-    /// Used to deregister on stop so the entry doesn't linger.
-    dht_name: String,
-    /// Optional mesh handle for cleaning up re-registration closures on stop.
-    mesh: Option<super::mesh::MeshHandle>,
 }
 
 impl kameo::Actor for StreamReceiverActor {
@@ -316,36 +318,15 @@ impl kameo::Actor for StreamReceiverActor {
         _actor_ref: kameo::actor::WeakActorRef<Self>,
         _reason: kameo::error::ActorStopReason,
     ) -> Result<(), Self::Error> {
-        // Remove the re-registration closure so dead actors don't accumulate
-        // in the MeshHandle's re_register_fns map (Bug 1 fix).
-        if let Some(ref mesh) = self.mesh {
-            mesh.deregister_actor(&self.dht_name);
-        }
-
-        // Deregister from the Kademlia DHT so the ephemeral name entry is cleaned up.
-        if let Err(e) = kameo::remote::unregister(self.dht_name.clone()).await {
-            log::debug!(
-                "StreamReceiverActor: failed to unregister '{}' from DHT: {}",
-                self.dht_name,
-                e
-            );
-        } else {
-            log::debug!(
-                "StreamReceiverActor: deregistered '{}' from DHT",
-                self.dht_name
-            );
-        }
+        // No cleanup needed - receiver is not registered in DHT.
+        // The direct RemoteActorRef is used for communication.
         Ok(())
     }
 }
 
 impl StreamReceiverActor {
-    pub fn new(
-        tx: mpsc::Sender<StreamRelayMessage>,
-        dht_name: String,
-        mesh: Option<super::mesh::MeshHandle>,
-    ) -> Self {
-        Self { tx, dht_name, mesh }
+    pub fn new(tx: mpsc::Sender<StreamRelayMessage>) -> Self {
+        Self { tx }
     }
 }
 
@@ -694,7 +675,6 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
             message_count = msg.messages.len(),
             has_tools = msg.tools.is_some(),
             has_params = msg.params.is_some(),
-            receiver_name = %msg.stream_receiver_name,
             receiver_found = tracing::field::Empty,
         )
     )]
@@ -757,7 +737,10 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
             let cleanup_request_id = request_id.clone();
             let cleanup_streams = Arc::clone(&active_streams);
 
-            // Heavy setup work: provider build, stream setup, receiver lookup
+            // Extract the router ref before setup so it is available in the error path.
+            let stream_router_ref = msg.stream_router_ref;
+
+            // Heavy setup work: provider build, stream setup
             // This happens AFTER the OpeningUpstream record is inserted for responsiveness
             let setup_result: Result<_, AgentError> = async {
                 let provider = build_provider_for_request(
@@ -779,44 +762,35 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                             .unwrap_or_else(|_| e.to_string()),
                     })?;
 
-                // Look up the StreamReceiverActor on the requesting node.
-                let receiver_ref = {
-                    let lookup_span = tracing::info_span!(
-                        "remote.provider_host.stream.lookup_receiver",
-                        session_id = %msg.session_id,
-                        request_id = %msg.request_id,
-                        receiver_name = %msg.stream_receiver_name,
-                        found = tracing::field::Empty,
-                    );
-                    let result = kameo::actor::RemoteActorRef::<StreamReceiverActor>::lookup(
-                        msg.stream_receiver_name.clone(),
-                    )
-                    .instrument(lookup_span.clone())
-                    .await
-                    .map_err(|e| AgentError::SwarmLookupFailed {
-                        key: msg.stream_receiver_name.clone(),
-                        reason: e.to_string(),
-                    })
-                    .and_then(|opt| {
-                        opt.ok_or_else(|| AgentError::RemoteSessionNotFound {
-                            details: format!(
-                                "ProviderHostActor: stream receiver '{}' not found in DHT",
-                                msg.stream_receiver_name
-                            ),
-                        })
-                    });
-                    lookup_span.record("found", result.is_ok());
-                    result
-                }?;
-
-                Ok::<_, AgentError>((provider, stream, receiver_ref))
+                Ok::<_, AgentError>((provider, stream))
             }
             .await;
 
-            let (_provider, mut stream, receiver_ref) = match setup_result {
+            let (_provider, mut stream) = match setup_result {
                 Ok(tuple) => tuple,
                 Err(e) => {
-                    // Clean up the stale OpeningUpstream entry before returning the error.
+                    tracing::error!(
+                        target: "remote::provider_host::stream",
+                        session_id = %session_id,
+                        request_id = %cleanup_request_id,
+                        error = %e,
+                        "provider setup failed, routing terminal error to requester"
+                    );
+                    // Route a terminal error back to the requester's router so the
+                    // mobile consumer does not spin forever.
+                    let error_payload = match &e {
+                        AgentError::ProviderChat { reason, .. } => {
+                            querymt::error::LLMError::ProviderError(reason.clone()).to_payload()
+                        }
+                        other => {
+                            querymt::error::LLMError::ProviderError(other.to_string()).to_payload()
+                        }
+                    };
+                    let _ = stream_router_ref.tell(&RoutedStreamRelayMessage {
+                        request_id: cleanup_request_id.clone(),
+                        message: StreamRelayMessage::ProviderError { error: error_payload },
+                    }).send();
+                    // Clean up the stale OpeningUpstream entry.
                     remove_active_stream(&cleanup_streams, &cleanup_request_id);
                     return Err(e);
                 }
@@ -824,15 +798,12 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
 
             tracing::Span::current().record("receiver_found", true);
 
-            let receiver_name = msg.stream_receiver_name.clone();
-
             // Relay chunks asynchronously so this handler returns promptly.
             let relay_span = tracing::info_span!(
                 "remote.provider_host.stream.relay",
                 provider = %provider_name,
                 model = %model,
                 session_id = %session_id,
-                receiver_name = %receiver_name,
                 request_id = %request_id,
                 chunk_count = tracing::field::Empty,
                 batch_count = tracing::field::Empty,
@@ -840,7 +811,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
             );
             tokio::spawn(
                 async move {
-                    let mut receiver_ref = receiver_ref;
+                    let stream_router_ref = stream_router_ref;
                     let mut chunk_count = 0usize;
                     let mut batch_count = 0usize;
                     let mut max_batch_size = 0usize;
@@ -897,7 +868,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                 update_active_stream(&active_streams, &request_id, |stream| {
                                     if now >= stream.lease_expires_at {
                                         lease_expired = true;
-                                        stream.phase = ProviderStreamPhase::Cancelling;
+                                        stream.phase = ProviderStreamPhase::LeaseExpired;
                                         stream.last_error = Some("stream lease expired".to_string());
                                         stream.cancel_token.cancel();
                                         return;
@@ -906,6 +877,14 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                     status = Some(stream.status());
                                 });
                                 if lease_expired {
+                                    tracing::warn!(
+                                        target: "remote::provider_host::stream::lease",
+                                        session_id = %session_id,
+                                        request_id = %request_id,
+                                        provider = %provider_name,
+                                        model = %model,
+                                        "stream lease expired, cancelling"
+                                    );
                                     continue;
                                 }
                                 if let Some(status) = status {
@@ -960,23 +939,21 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                             }
                                         }
 
-                                        if let Some(reason) = finish_reason {
-                                            tracing::debug!(
-                                                target: "remote::provider_host::stream",
-                                                session_id = %session_id,
-                                                request_id = %request_id,
-                                                provider = %provider_name,
-                                                model = %model,
-                                                receiver_name = %receiver_name,
-                                                finish_reason = ?reason,
-                                                chunk_index = chunk_count + pending_batch.len(),
-                                                "stream done from upstream provider"
-                                            );
-                                            update_active_stream(&active_streams, &request_id, |stream| {
-                                                stream.phase = ProviderStreamPhase::Completed;
-                                                stream.last_progress_at = Instant::now();
-                                            });
-                                        }
+                        if let Some(_reason) = finish_reason {
+                                tracing::debug!(
+                                    target: "remote::provider_host::stream",
+                                    session_id = %session_id,
+                                    request_id = %request_id,
+                                    provider = %provider_name,
+                                    model = %model,
+                                    chunk_count = chunk_count,
+                                    "stream done from upstream provider"
+                                );
+                                update_active_stream(&active_streams, &request_id, |stream| {
+                                    stream.phase = ProviderStreamPhase::Completed;
+                                    stream.last_progress_at = Instant::now();
+                                });
+                            }
                                     }
                                     None => {
                                         if pending_batch.is_empty() {
@@ -999,71 +976,98 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
 
                         loop {
                             if disconnected_since.is_some() {
-                                match kameo::actor::RemoteActorRef::<StreamReceiverActor>::lookup(receiver_name.clone()).await {
-                                    Ok(Some(found)) => {
-                                        receiver_ref = found;
-                                        let replay_count = buffered.iter().filter(|msg| keep_stream_message_buffered(msg)).count();
-                                        let _ = receiver_ref.tell(&StreamChunkRelay {
-                                            message: StreamRelayMessage::TransportReconnected {
-                                                buffered_chunks: replay_count,
-                                            },
-                                        }).send();
-                                        disconnected_since = None;
-                                        update_active_stream(&active_streams, &request_id, |stream| {
-                                            stream.phase = if stream.chunk_count == 0 {
-                                                ProviderStreamPhase::WaitingFirstChunk
-                                            } else {
-                                                ProviderStreamPhase::Streaming
-                                            };
-                                            stream.receiver_connected = true;
+                                // Retry the same stream router ref (no DHT lookup).
+                                let replay_count = buffered.iter().filter(|msg| keep_stream_message_buffered(msg)).count();
+                                let reconnect_result = stream_router_ref.tell(&RoutedStreamRelayMessage {
+                                    request_id: request_id.clone(),
+                                    message: StreamRelayMessage::TransportReconnected {
+                                        buffered_chunks: replay_count,
+                                    },
+                                }).send_ack().await;
+                                if reconnect_result.is_ok() {
+                                    // Send succeeded, receiver is back online.
+                                    let disconnected_duration = disconnected_since.take().map(|s| s.elapsed());
+                                    update_active_stream(&active_streams, &request_id, |stream| {
+                                        stream.phase = if stream.chunk_count == 0 {
+                                            ProviderStreamPhase::WaitingFirstChunk
+                                        } else {
+                                            ProviderStreamPhase::Streaming
+                                        };
+                                        stream.receiver_connected = true;
+                                    });
+                                    tracing::info!(
+                                        target: "remote::provider_host::stream::reconnect",
+                                        session_id = %session_id,
+                                        request_id = %request_id,
+                                        provider = %provider_name,
+                                        model = %model,
+                                        buffered_chunks = replay_count,
+                                        disconnected_duration_ms = disconnected_duration
+                                            .map(|d| d.as_millis() as u64)
+                                            .unwrap_or(0),
+                                        "receiver reconnected (direct ref)"
+                                    );
+                                } else {
+                                    let since = disconnected_since.get_or_insert_with(tokio::time::Instant::now);
+                                    update_active_stream(&active_streams, &request_id, |stream| {
+                                        stream.phase = ProviderStreamPhase::ReceiverDisconnected;
+                                        stream.receiver_connected = false;
+                                    });
+                                    if since.elapsed() >= reconnect_grace {
+                                        let grace_elapsed = since.elapsed();
+                                        buffered.push_back(StreamRelayMessage::TransportFailed {
+                                            error: querymt::error::LLMError::Transport {
+                                                kind: querymt::error::TransportErrorKind::Timeout,
+                                                message: format!("reconnect grace expired after {:?}", reconnect_grace),
+                                            }.to_payload(),
                                         });
-                                    }
-                                    Ok(None) | Err(_) => {
-                                        let since = disconnected_since.get_or_insert_with(tokio::time::Instant::now);
                                         update_active_stream(&active_streams, &request_id, |stream| {
-                                            stream.phase = ProviderStreamPhase::ReceiverDisconnected;
-                                            stream.receiver_connected = false;
+                                            stream.phase = ProviderStreamPhase::GraceExpired;
+                                            stream.last_error = Some("reconnect grace expired".to_string());
                                         });
-                                        if since.elapsed() >= reconnect_grace {
-                                            buffered.push_back(StreamRelayMessage::TransportFailed {
-                                                error: querymt::error::LLMError::Transport {
-                                                    kind: querymt::error::TransportErrorKind::Timeout,
-                                                    message: format!("reconnect grace expired after {:?}", reconnect_grace),
-                                                }.to_payload(),
-                                            });
-                                            update_active_stream(&active_streams, &request_id, |stream| {
-                                                stream.phase = ProviderStreamPhase::Failed;
-                                                stream.last_error = Some("reconnect grace expired".to_string());
-                                            });
-                                            upstream_done = true;
-                                        }
-                                        tokio::time::sleep(Duration::from_millis(250)).await;
-                                        if upstream_done {
-                                            break 'outer;
-                                        }
-                                        continue;
+                                        tracing::warn!(
+                                            target: "remote::provider_host::stream::reconnect",
+                                            session_id = %session_id,
+                                            request_id = %request_id,
+                                            provider = %provider_name,
+                                            model = %model,
+                                            reconnect_grace_secs = reconnect_grace.as_secs(),
+                                            grace_elapsed_ms = grace_elapsed.as_millis() as u64,
+                                            buffered_chunks = buffered.iter().filter(|msg| keep_stream_message_buffered(msg)).count(),
+                                            "reconnect grace expired (direct ref)"
+                                        );
+                                        upstream_done = true;
                                     }
+                                    tokio::time::sleep(Duration::from_millis(250)).await;
+                                    if upstream_done {
+                                        break 'outer;
+                                    }
+                                    continue;
                                 }
                             }
 
                             let Some(front) = buffered.front().cloned() else {
                                 break;
                             };
-                            let relay = StreamChunkRelay { message: front };
-                            if let Err(e) = receiver_ref.tell(&relay).send() {
+                            let relay = RoutedStreamRelayMessage {
+                                request_id: request_id.clone(),
+                                message: front,
+                            };
+                            let relay_result = stream_router_ref.tell(&relay).send_ack().await;
+                            if let Err(e) = relay_result {
                                 tracing::warn!(
                                     target: "remote::provider_host::stream",
                                     session_id = %session_id,
                                     request_id = %request_id,
                                     provider = %provider_name,
                                     model = %model,
-                                    receiver_name = %receiver_name,
                                     error = %e,
                                     "failed to relay chunk to receiver"
                                 );
                                 if disconnected_since.is_none() {
                                     disconnected_since = Some(tokio::time::Instant::now());
-                                    let _ = receiver_ref.tell(&StreamChunkRelay {
+                                    let _ = stream_router_ref.tell(&RoutedStreamRelayMessage {
+                                        request_id: request_id.clone(),
                                         message: StreamRelayMessage::TransportDisconnected {
                                             reason: e.to_string(),
                                         },
@@ -1073,6 +1077,16 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                         stream.receiver_connected = false;
                                         stream.last_error = Some(e.to_string());
                                     });
+                                    tracing::warn!(
+                                        target: "remote::provider_host::stream::reconnect",
+                                        session_id = %session_id,
+                                        request_id = %request_id,
+                                        provider = %provider_name,
+                                        model = %model,
+                                        error = %e,
+                                        reconnect_grace_secs = reconnect_grace.as_secs(),
+                                        "receiver disconnected, entering reconnect grace (direct ref)"
+                                    );
                                 }
                                 tokio::time::sleep(Duration::from_millis(250)).await;
                                 continue;
@@ -1103,7 +1117,6 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                 request_id = %request_id,
                                 provider = %provider_name,
                                 model = %model,
-                                receiver_name = %receiver_name,
                                 chunk_index = chunk_count,
                                 relayed_chunks,
                                 elapsed_ms,
@@ -1127,17 +1140,16 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                     tracing::Span::current().record("chunk_count", chunk_count);
                     tracing::Span::current().record("batch_count", batch_count);
                     tracing::Span::current().record("max_batch_size", max_batch_size);
-                    tracing::trace!(
+                    tracing::debug!(
                         target: "remote::provider_host::stream",
                         session_id = %session_id,
                         request_id = %request_id,
                         provider = %provider_name,
                         model = %model,
-                        receiver_name = %receiver_name,
-                        chunk_count,
-                        batch_count,
-                        max_batch_size,
-                        "stream relay complete"
+                        chunk_count = chunk_count,
+                        batch_count = batch_count,
+                        max_batch_size = max_batch_size,
+                        "stream relay task completed"
                     );
                 }
                 .instrument(relay_span),
