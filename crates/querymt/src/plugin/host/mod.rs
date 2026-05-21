@@ -1,5 +1,6 @@
 use crate::{LLMBuilder, builder::BoundRegistry, error::LLMError, plugin::LLMProviderFactory};
 use async_trait::async_trait;
+use futures::lock::Mutex;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::path::Path;
 use std::sync::Arc;
@@ -44,6 +45,10 @@ pub mod native;
 pub struct PluginRegistry {
     loaders: HashMap<PluginType, Box<dyn PluginLoader>>,
     factories: RwLock<HashMap<String, Arc<dyn LLMProviderFactory>>>,
+    /// Serialises concurrent calls to [`load_all_plugins`](Self::load_all_plugins)
+    /// so the idempotency check actually works.  Without this guard, fast concurrent
+    /// callers all see an empty registry and redundantly load the same providers.
+    load_all_plugins_lock: Mutex<()>,
     #[cfg(feature = "extism_host")]
     pub oci_downloader: Arc<oci::OciDownloader>,
     pub config: config::PluginConfig,
@@ -90,6 +95,7 @@ impl PluginRegistry {
         Ok(PluginRegistry {
             loaders: HashMap::new(),
             factories: RwLock::new(HashMap::new()),
+            load_all_plugins_lock: Mutex::new(()),
             #[cfg(feature = "extism_host")]
             oci_downloader: Arc::new(oci::OciDownloader::new(config.oci.clone())),
             config,
@@ -105,6 +111,7 @@ impl PluginRegistry {
         PluginRegistry {
             loaders: HashMap::new(),
             factories: RwLock::new(HashMap::new()),
+            load_all_plugins_lock: Mutex::new(()),
             #[cfg(feature = "extism_host")]
             oci_downloader: Arc::new(oci::OciDownloader::new(None)),
             config: config::PluginConfig {
@@ -148,8 +155,13 @@ impl PluginRegistry {
         instrument(name = "plugin_registry.load_all_plugins", skip_all)
     )]
     pub async fn load_all_plugins(&self) {
-        // Skip providers that are already loaded (idempotency)
-        // We need to collect loaded provider names to avoid holding the lock
+        // Serialise concurrent callers so the idempotency check is correct.
+        // Without this guard, fast concurrent callers all see an empty registry
+        // and redundantly load the same providers (especially expensive for WASM).
+        let _guard = self.load_all_plugins_lock.lock().await;
+
+        // Re-check after acquiring the guard — the first caller may have just
+        // loaded everything.
         let loaded_names: std::collections::HashSet<String> = {
             let already_loaded = self.factories.read().unwrap();
             already_loaded.keys().cloned().collect()

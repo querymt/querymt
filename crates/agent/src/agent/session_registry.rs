@@ -29,7 +29,7 @@ use std::sync::Arc;
 /// reused across multiple sessions without re-initializing.
 pub type PreconnectedMcpPeer = (String, Peer<RoleClient>);
 
-fn all_session_modes() -> Vec<SessionMode> {
+pub fn all_session_modes() -> Vec<SessionMode> {
     vec![
         SessionMode::new("build", "Build").description("Full read/write mode"),
         SessionMode::new("plan", "Plan").description("Read-only planning mode"),
@@ -37,7 +37,7 @@ fn all_session_modes() -> Vec<SessionMode> {
     ]
 }
 
-fn mode_state(mode: AgentMode) -> SessionModeState {
+pub fn mode_state(mode: AgentMode) -> SessionModeState {
     SessionModeState::new(mode.as_str(), all_session_modes())
 }
 
@@ -45,7 +45,7 @@ fn mode_state(mode: AgentMode) -> SessionModeState {
 ///
 /// This is the single source of truth for config option shape — used by session creation,
 /// set_session_config_option responses, and config_option_update notifications.
-pub(crate) fn config_options(
+pub fn config_options(
     mode: AgentMode,
     reasoning_effort: Option<querymt::chat::ReasoningEffort>,
 ) -> Vec<SessionConfigOption> {
@@ -207,6 +207,44 @@ impl SessionRegistry {
     pub fn insert(&mut self, session_id: String, actor_ref: impl Into<SessionActorRef>) {
         self.sessions.insert(session_id.clone(), actor_ref.into());
         self.local_actor_refs.remove(&session_id);
+    }
+
+    /// Register a prepared session actor into the registry (fast, map-only operation).
+    ///
+    /// This is the "Register" phase of the 3-phase materialization pattern.
+    /// It performs ONLY in-memory HashMap operations and should complete in microseconds.
+    ///
+    /// This does NOT:
+    /// - Query the database
+    /// - Initialize MCP servers
+    /// - Spawn actors (already done in Prepare phase)
+    /// - Register with DHT (done in Finalize phase)
+    /// - Emit events (done in Finalize phase)
+    /// - Set bridge (done in Finalize phase to avoid holding lock during await)
+    ///
+    /// # Arguments
+    ///
+    /// * `prepared` - The prepared session from `SessionMaterializer::prepare_*()` methods
+    ///
+    /// # Returns
+    ///
+    /// The `SessionActorRef` for routing to the session actor.
+    pub async fn register_prepared_session(
+        &mut self,
+        prepared: &crate::agent::session_materializer::PreparedSession,
+    ) -> SessionActorRef {
+        let session_ref = SessionActorRef::from(prepared.actor_ref.clone());
+
+        // Insert into in-memory maps (microseconds)
+        // This is the ONLY operation that should happen under the lock.
+        // Bridge setup is deferred to finalize_session to avoid holding
+        // the lock during an async actor call.
+        self.sessions
+            .insert(prepared.session_id.clone(), session_ref.clone());
+        self.local_actor_refs
+            .insert(prepared.session_id.clone(), prepared.actor_ref.clone());
+
+        session_ref
     }
 
     pub fn local_actor_ref(&self, session_id: &str) -> Option<&ActorRef<SessionActor>> {

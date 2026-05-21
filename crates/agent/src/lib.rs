@@ -31,6 +31,7 @@ pub mod middleware;
 pub mod model;
 pub mod model_heuristics;
 pub mod model_info;
+pub mod model_inventory;
 pub mod model_registry;
 #[cfg(feature = "plugin-loaders")]
 pub mod plugin_update;

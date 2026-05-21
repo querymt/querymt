@@ -1395,6 +1395,12 @@ impl Message<Prompt> for SessionActor {
         let actor_ref = ctx.actor_ref().clone();
         let span_session_id = session_id.clone();
 
+        // Capture the current span (kameo's `actor.handle_message`) so the
+        // spawned task's span tree remains a child of the actor message span.
+        // Without this, `tokio::spawn` breaks the tracing context and the
+        // entire execution trace appears as an orphaned root.
+        let parent_span = tracing::Span::current();
+
         ctx.spawn(
             async move {
                 let result = execute_prompt_detached(DetachedPromptExecution {
@@ -1430,6 +1436,7 @@ impl Message<Prompt> for SessionActor {
                 result
             }
             .instrument(info_span!(
+                parent: &parent_span,
                 "agent.prompt.task",
                 session_id = %span_session_id,
                 prompt_generation,
@@ -1500,61 +1507,76 @@ impl Message<ScheduledPrompt> for SessionActor {
         let tool_config = self.tool_config.clone();
         let schedule_public_id = msg.schedule_public_id.clone();
         let actor_ref = ctx.actor_ref().clone();
+        let span_session_id = session_id.clone();
 
-        ctx.spawn(async move {
-            let result = execute_prompt_detached(DetachedPromptExecution {
-                req: prompt_request,
-                session_id: session_id.clone(),
-                runtime,
-                config: config.clone(),
-                cancel_token,
-                bridge,
-                mode,
-                tool_config,
-                execution_origin: crate::agent::execution_context::ExecutionOrigin::Scheduled {
-                    schedule_public_id: schedule_public_id.clone(),
-                },
-            })
-            .await;
+        // Capture the current span (kameo's `actor.handle_message`) so the
+        // spawned task's span tree remains a child of the actor message span.
+        let parent_span = tracing::Span::current();
 
-            // Emit explicit scheduled terminal events for SchedulerActor correlation
-            let turn_id = Uuid::new_v4().to_string();
-            match &result {
-                Ok(_) => {
-                    config.emit_event(
-                        &session_id,
-                        AgentEventKind::ScheduledExecutionCompleted {
-                            schedule_public_id,
-                            turn_id,
-                        },
-                    );
-                }
-                Err(e) => {
-                    config.emit_event(
-                        &session_id,
-                        AgentEventKind::ScheduledExecutionFailed {
-                            schedule_public_id,
-                            turn_id: None,
-                            error: e.to_string(),
-                        },
-                    );
-                }
-            }
-
-            if let Err(e) = actor_ref
-                .tell(PromptFinished {
-                    generation: prompt_generation,
+        ctx.spawn(
+            async move {
+                let result = execute_prompt_detached(DetachedPromptExecution {
+                    req: prompt_request,
+                    session_id: session_id.clone(),
+                    runtime,
+                    config: config.clone(),
+                    cancel_token,
+                    bridge,
+                    mode,
+                    tool_config,
+                    execution_origin: crate::agent::execution_context::ExecutionOrigin::Scheduled {
+                        schedule_public_id: schedule_public_id.clone(),
+                    },
                 })
-                .await
-            {
-                warn!(
-                    "Failed to send PromptFinished after scheduled execution: {:?}",
-                    e
-                );
-            }
+                .await;
 
-            result
-        })
+                // Emit explicit scheduled terminal events for SchedulerActor correlation
+                let turn_id = Uuid::new_v4().to_string();
+                match &result {
+                    Ok(_) => {
+                        config.emit_event(
+                            &session_id,
+                            AgentEventKind::ScheduledExecutionCompleted {
+                                schedule_public_id,
+                                turn_id,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        config.emit_event(
+                            &session_id,
+                            AgentEventKind::ScheduledExecutionFailed {
+                                schedule_public_id,
+                                turn_id: None,
+                                error: e.to_string(),
+                            },
+                        );
+                    }
+                }
+
+                if let Err(e) = actor_ref
+                    .tell(PromptFinished {
+                        generation: prompt_generation,
+                    })
+                    .await
+                {
+                    warn!(
+                        "Failed to send PromptFinished after scheduled execution: {:?}",
+                        e
+                    );
+                }
+
+                result
+            }
+            .instrument(info_span!(
+                parent: &parent_span,
+                "agent.scheduled_prompt.task",
+                session_id = %span_session_id,
+                prompt_generation,
+                execution_origin = "scheduled",
+                mode = %mode,
+            )),
+        )
     }
 }
 

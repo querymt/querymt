@@ -5776,12 +5776,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "http-range-header"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9171a2ea8a68358193d15dd5d70c1c10a2afc3e7e4c5bc92bc9f025cebd7359c"
-
-[[package]]
 name = "http-serde-ext"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10664,7 +10658,6 @@ name = "qmt-alibaba"
 version = "0.4.0"
 dependencies = [
  "extism-pdk",
- "futures",
  "http 1.4.0",
  "qmt-openai",
  "querymt",
@@ -10684,7 +10677,6 @@ dependencies = [
  "http 1.4.0",
  "querymt",
  "querymt-extism-macros",
- "regex",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -10742,9 +10734,7 @@ dependencies = [
 name = "qmt-groq"
 version = "0.4.0"
 dependencies = [
- "either",
  "extism-pdk",
- "futures",
  "http 1.4.0",
  "qmt-openai",
  "querymt",
@@ -10812,9 +10802,7 @@ dependencies = [
 name = "qmt-mistral"
 version = "0.4.0"
 dependencies = [
- "either",
  "extism-pdk",
- "futures",
  "http 1.4.0",
  "qmt-openai",
  "querymt",
@@ -10829,9 +10817,7 @@ dependencies = [
 name = "qmt-moonshot"
 version = "0.4.0"
 dependencies = [
- "either",
  "extism-pdk",
- "futures",
  "http 1.4.0",
  "qmt-openai",
  "querymt",
@@ -10867,7 +10853,6 @@ version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "extism-pdk",
- "futures",
  "http 1.4.0",
  "querymt",
  "querymt-extism-macros",
@@ -10898,7 +10883,6 @@ name = "qmt-openrouter"
 version = "0.4.0"
 dependencies = [
  "extism-pdk",
- "futures",
  "http 1.4.0",
  "qmt-openai",
  "querymt",
@@ -10914,9 +10898,7 @@ name = "qmt-xai"
 version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
- "either",
  "extism-pdk",
- "futures",
  "http 1.4.0",
  "qmt-codex",
  "qmt-openai",
@@ -10972,7 +10954,6 @@ dependencies = [
  "clap",
  "dirs 6.0.0",
  "docker_credential",
- "either",
  "extism",
  "flate2",
  "futures",
@@ -10990,7 +10971,6 @@ dependencies = [
  "rmcp",
  "schemars 1.2.1",
  "serde",
- "serde-value",
  "serde_json",
  "serde_yaml",
  "sha2 0.11.0-rc.5",
@@ -11080,7 +11060,6 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "toml 1.1.2+spec-1.1.0",
- "tower-http",
  "tracing",
  "tracing-log",
  "tracing-opentelemetry",
@@ -11112,7 +11091,6 @@ dependencies = [
  "clap",
  "clap_complete",
  "colored",
- "dirs 6.0.0",
  "futures",
  "log",
  "open",
@@ -11149,12 +11127,10 @@ name = "querymt-mobile-ffi"
 version = "0.4.0"
 dependencies = [
  "agent-client-protocol",
- "agent-client-protocol-schema",
  "anyhow",
  "async-trait",
  "jni",
  "libc",
- "libp2p",
  "log",
  "once_cell",
  "parking_lot",
@@ -11169,7 +11145,6 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -14671,11 +14646,6 @@ dependencies = [
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
- "http-range-header",
- "httpdate",
- "mime",
- "mime_guess",
- "percent-encoding",
  "pin-project-lite",
  "tokio",
  "tokio-util",

@@ -81,6 +81,12 @@ mod integration_tests;
 #[cfg(all(test, feature = "remote"))]
 mod provider_routing_tests;
 
+#[cfg(all(test, feature = "remote"))]
+mod concurrent_materialization_tests;
+
+#[cfg(all(test, feature = "remote"))]
+mod provider_host_responsiveness_tests;
+
 pub use actor_ref::SessionActorRef;
 #[cfg(feature = "remote")]
 pub use cached_transport::{CachedDynMeshTransport, CachedMeshTransport};
