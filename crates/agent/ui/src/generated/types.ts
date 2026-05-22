@@ -850,6 +850,16 @@ export interface UiAgentInfo {
 	capabilities: string[];
 }
 
+export interface UiProfileInfo {
+	id: string;
+	name: string;
+	description?: string;
+	tags: string[];
+	config_kind?: string;
+	source: string;
+	fingerprint?: string;
+}
+
 export interface UndoStackFrame {
 	message_id: string;
 }
@@ -928,16 +938,6 @@ export enum OAuthFlowKindTs {
 	RedirectCode = "redirect_code",
 	/** Device flow where the backend polls the provider's token endpoint. */
 	DevicePoll = "device_poll",
-}
-
-export interface UiProfileInfo {
-	id: string;
-	name: string;
-	description?: string;
-	tags: string[];
-	config_kind?: string;
-	source: string;
-	fingerprint?: string;
 }
 
 /** Routing mode for message distribution. */

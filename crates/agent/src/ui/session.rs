@@ -21,16 +21,6 @@ use tokio::sync::mpsc;
 pub const PRIMARY_AGENT_ID: &str = "primary";
 
 /// Ensure sessions exist for the current routing mode.
-pub async fn ensure_sessions_for_mode(
-    state: &ServerState,
-    conn_id: &str,
-    cwd: Option<&PathBuf>,
-    tx: &mpsc::Sender<String>,
-    request_id: Option<&str>,
-) -> Result<(), String> {
-    ensure_sessions_for_mode_with_profile(state, conn_id, cwd, tx, request_id, None).await
-}
-
 pub async fn ensure_sessions_for_mode_with_profile(
     state: &ServerState,
     conn_id: &str,
@@ -355,10 +345,10 @@ pub async fn resolve_profile_id_for_session(
     requested_profile_id: Option<&str>,
 ) -> Result<Option<String>, String> {
     if let Some(profiles) = &state.profiles {
-        if let Some(session_id) = session_id {
-            if let Some(binding) = profiles.session_binding(session_id).await {
-                return Ok(Some(binding.profile_id));
-            }
+        if let Some(session_id) = session_id
+            && let Some(binding) = profiles.session_binding(session_id).await
+        {
+            return Ok(Some(binding.profile_id));
         }
 
         if let Some(id) = requested_profile_id {

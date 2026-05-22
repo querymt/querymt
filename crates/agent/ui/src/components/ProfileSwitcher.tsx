@@ -1,7 +1,7 @@
 import type { UiProfileInfo } from '../types';
 
 interface ProfileSwitcherProps {
-  profiles: UiProfileInfo[];
+  profiles?: UiProfileInfo[];
   activeProfileId: string | null;
   currentSessionProfileId?: string;
   connected: boolean;
@@ -23,7 +23,7 @@ function profileTags(profile: UiProfileInfo | undefined): string | undefined {
 }
 
 export function ProfileSwitcher({
-  profiles,
+  profiles = [],
   activeProfileId,
   currentSessionProfileId,
   connected,
