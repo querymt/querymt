@@ -118,7 +118,7 @@ impl SessionProvider {
     #[cfg(feature = "remote")]
     pub fn with_mesh(self, mesh: Option<crate::agent::remote::MeshHandle>) -> Self {
         match mesh {
-            Some(m) => self.mesh.store(Some(Arc::new(m.into()))),
+            Some(m) => self.mesh.store(Some(Arc::new(m))),
             None => self.mesh.store(None),
         }
         self
@@ -138,7 +138,7 @@ impl SessionProvider {
     #[cfg(feature = "remote")]
     pub fn set_mesh(&self, mesh: Option<crate::agent::remote::MeshHandle>) {
         match mesh {
-            Some(m) => self.mesh.store(Some(Arc::new(m.into()))),
+            Some(m) => self.mesh.store(Some(Arc::new(m))),
             None => self.mesh.store(None),
         }
     }

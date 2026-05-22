@@ -365,13 +365,15 @@ impl LocalAgentHandle {
     /// each newly created session.
     ///
     /// Uses the 3-phase materialization pattern:
+    /// Create a new session.
+    ///
+    /// Uses the 3-phase materialization pattern:
     /// 1. Prepare (NO lock): DB creation, MCP init, actor spawn
     /// 2. Register (lock held): Insert into in-memory maps (microseconds)
     /// 3. Finalize (NO lock): DHT registration, event emission
-    pub async fn new_session_with_preconnected(
+    pub async fn new_session(
         &self,
         req: NewSessionRequest,
-        preconnected_peers: Vec<crate::agent::session_registry::PreconnectedMcpPeer>,
     ) -> std::result::Result<NewSessionResponse, Error> {
         // Auth check stays on LocalAgentHandle (connection-level concern)
         if let Ok(state) = self.client_state.lock()
@@ -385,10 +387,7 @@ impl LocalAgentHandle {
         }
 
         // Phase 1: Prepare session (heavy work, NO registry lock held)
-        let prepared = self
-            .session_materializer
-            .prepare_new_session(req, preconnected_peers)
-            .await?;
+        let prepared = self.session_materializer.prepare_new_session(req).await?;
 
         let session_id = prepared.session_id.clone();
 
@@ -416,21 +415,17 @@ impl LocalAgentHandle {
             )))
     }
 
-    /// Load an existing session with already-connected MCP peers.
-    ///
-    /// This is used by mobile FFI clients that manage MCP transport lifetimes
-    /// externally (e.g. pipe transports) and want those tools available in
-    /// loaded sessions.
+    /// Load an existing session. MCP attachments are resolved internally by
+    /// the [`SessionMaterializer`] via the runtime attachment source.
     ///
     /// Uses the 3-phase materialization pattern with single-flight protection:
     /// 1. Check registry (lock held briefly): Return existing if already materialized
     /// 2. Prepare (NO lock): DB validation, MCP init, actor spawn
     /// 3. Register (lock held): Insert into in-memory maps (microseconds)
     /// 4. Finalize (NO lock): DHT registration, event emission
-    pub async fn load_session_with_preconnected(
+    pub async fn load_session(
         &self,
         req: agent_client_protocol::schema::LoadSessionRequest,
-        preconnected_peers: Vec<crate::agent::session_registry::PreconnectedMcpPeer>,
     ) -> std::result::Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
         let session_id = req.session_id.to_string();
 
@@ -459,7 +454,7 @@ impl LocalAgentHandle {
         // Pass registry so it can re-check after acquiring the lock.
         let (prepared, session_ref) = match self
             .session_materializer
-            .prepare_load_session(req, preconnected_peers, Some(&self.registry))
+            .prepare_load_session(req, Some(&self.registry))
             .await?
         {
             PreparedSessionResult::Prepared(prepared) => {
@@ -1928,7 +1923,7 @@ impl AgentHandle for LocalAgentHandle {
         let req = NewSessionRequest::new(cwd_path).meta(meta);
 
         // Use the 3-phase materialization pattern (no registry lock held during DB/actor work)
-        let resp = LocalAgentHandle::new_session_with_preconnected(self, req, Vec::new()).await?;
+        let resp = self.new_session(req).await?;
         let session_id = resp.session_id.to_string();
         let session_ref = self.registry.lock().await;
         let session_ref = session_ref.get(&session_id).cloned().ok_or_else(|| {
@@ -2041,15 +2036,7 @@ impl SendAgent for LocalAgentHandle {
     }
 
     async fn new_session(&self, req: NewSessionRequest) -> Result<NewSessionResponse, Error> {
-        self.new_session_with_preconnected(req, Vec::new()).await
-    }
-
-    async fn new_session_with_preconnected(
-        &self,
-        req: NewSessionRequest,
-        preconnected: Vec<crate::agent::session_registry::PreconnectedMcpPeer>,
-    ) -> Result<NewSessionResponse, Error> {
-        LocalAgentHandle::new_session_with_preconnected(self, req, preconnected).await
+        self.new_session(req).await
     }
 
     async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, Error> {
@@ -2073,15 +2060,7 @@ impl SendAgent for LocalAgentHandle {
     }
 
     async fn load_session(&self, req: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
-        self.load_session_with_preconnected(req, Vec::new()).await
-    }
-
-    async fn load_session_with_preconnected(
-        &self,
-        req: LoadSessionRequest,
-        preconnected: Vec<crate::agent::session_registry::PreconnectedMcpPeer>,
-    ) -> Result<LoadSessionResponse, Error> {
-        LocalAgentHandle::load_session_with_preconnected(self, req, preconnected).await
+        self.load_session(req).await
     }
 
     async fn list_sessions(&self, req: ListSessionsRequest) -> Result<ListSessionsResponse, Error> {

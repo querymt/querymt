@@ -1,5 +1,6 @@
 //! Agent Client Protocol helper functions for MCP server management
 use crate::agent::core::McpToolState;
+use crate::agent::session_mcp::ConnectedMcpPeer;
 use crate::error::AgentError;
 use agent_client_protocol::schema::{Error, McpServer, McpServerHttp, McpServerStdio};
 use log::warn;
@@ -87,15 +88,13 @@ pub(crate) async fn build_mcp_state(
 
 /// Merge tools from already-connected MCP peers into an existing tool state.
 ///
-/// This is used by embedders that manage MCP transport lifetimes externally
-/// (for example mobile FFI pipe transports) and want those tools available in
-/// each newly created or loaded session. The peers are already initialized and
-/// can be reused across sessions without re-initializing.
-pub(crate) async fn merge_preconnected_mcp_peers(
+/// The peers are already initialized and can be reused across sessions without
+/// re-initializing.
+pub(crate) async fn merge_connected_mcp_peers(
     tool_state: Arc<McpToolState>,
-    preconnected_peers: &[(String, rmcp::service::Peer<RoleClient>)],
+    connected_peers: &[ConnectedMcpPeer],
 ) -> Result<(), Error> {
-    if preconnected_peers.is_empty() {
+    if connected_peers.is_empty() {
         return Ok(());
     }
 
@@ -103,8 +102,9 @@ pub(crate) async fn merge_preconnected_mcp_peers(
     let mut tools = current.tools.clone();
     let mut tool_defs = current.tool_defs.clone();
 
-    for (server_name, peer) in preconnected_peers {
-        let tool_list = peer
+    for connected in connected_peers {
+        let tool_list = connected
+            .peer
             .list_all_tools()
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
@@ -112,8 +112,8 @@ pub(crate) async fn merge_preconnected_mcp_peers(
         for tool in tool_list {
             let adapter = querymt::mcp::adapter::McpToolAdapter::try_new(
                 tool,
-                peer.clone(),
-                server_name.clone(),
+                connected.peer.clone(),
+                connected.server_name.clone(),
             )
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
             let name = adapter.descriptor().function.name.clone();

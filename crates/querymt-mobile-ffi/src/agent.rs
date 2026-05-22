@@ -101,9 +101,18 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
 
     let storage = create_storage_backend(db_path).await?;
 
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let agent_handle_cell = Arc::new(AtomicU64::new(0));
+
+    let session_mcp_source: Arc<dyn querymt_agent::agent::session_mcp::SessionMcpAttachmentSource> =
+        Arc::new(crate::MobileSessionMcpAttachmentSource {
+            agent_handle_cell: agent_handle_cell.clone(),
+        });
+
     let infra = querymt_agent::api::AgentInfra {
         plugin_registry: plugin_registry.clone(),
         storage: Some(storage.clone()),
+        session_mcp_attachment_source: Some(session_mcp_source),
     };
 
     let agent = match config {
@@ -141,6 +150,9 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
     } else {
         log::info!("ffi.runtime.init: initialized process runtime (agent_handle={handle})");
     }
+
+    // Update the MCP attachment source with the now-known agent handle.
+    agent_handle_cell.store(handle, Ordering::Release);
 
     // Store mesh config diagnostics so mesh_status can report them.
     #[cfg(feature = "remote")]

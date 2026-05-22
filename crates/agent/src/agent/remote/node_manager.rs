@@ -450,7 +450,7 @@ mod remote_impl {
 
             let (prepared, actor_ref) = match self
                 .session_materializer
-                .prepare_load_session(req, vec![], Some(&self.registry))
+                .prepare_load_session(req, Some(&self.registry))
                 .await
                 .map_err(|e| AgentError::Internal(e.to_string()))?
             {

@@ -258,10 +258,10 @@ impl RoutedRequest {
 
         // Check if terminal — update phase and note that consumer should
         // be detached when/if it re-attaches.
-        if relay_message_is_terminal(self.replay_buffer.back().unwrap()) {
-            if let Some(phase) = terminal_phase {
-                self.phase = phase;
-            }
+        if relay_message_is_terminal(self.replay_buffer.back().unwrap())
+            && let Some(phase) = terminal_phase
+        {
+            self.phase = phase;
         }
     }
 
@@ -448,11 +448,7 @@ impl Message<AttachStreamConsumer> for SessionStreamRouterActor {
         if has_buffered {
             let mut last_was_terminal = false;
             for message in &buffered {
-                if relay_message_is_terminal(message) {
-                    last_was_terminal = true;
-                } else {
-                    last_was_terminal = false;
-                }
+                last_was_terminal = relay_message_is_terminal(message);
             }
             for message in buffered {
                 if consumer_tx.send(message).await.is_err() {
@@ -1085,7 +1081,7 @@ mod tests {
             .tell(RoutedStreamRelayMessage {
                 request_id: request_id.clone(),
                 message: StreamRelayMessage::ChunkBatch(vec![
-                    StreamChunk::Text("thinking...".to_string().into()),
+                    StreamChunk::Text("thinking...".to_string()),
                     StreamChunk::Done {
                         finish_reason: FinishReason::ToolCalls,
                     },
@@ -1132,7 +1128,7 @@ mod tests {
 
         // Deliver a ChunkBatch containing Done
         let msg = StreamRelayMessage::ChunkBatch(vec![
-            StreamChunk::Text("hello".to_string().into()),
+            StreamChunk::Text("hello".to_string()),
             StreamChunk::Done {
                 finish_reason: FinishReason::Stop,
             },
@@ -1183,7 +1179,7 @@ mod tests {
         router_ref
             .tell(RoutedStreamRelayMessage {
                 request_id: request_id.clone(),
-                message: StreamRelayMessage::Chunk(StreamChunk::Text("hello".to_string().into())),
+                message: StreamRelayMessage::Chunk(StreamChunk::Text("hello".to_string())),
             })
             .send()
             .await;

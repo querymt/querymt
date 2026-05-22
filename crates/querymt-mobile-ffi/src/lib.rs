@@ -57,28 +57,11 @@ struct AcpConnection {
 }
 
 struct MobileAcpSessionHooks {
-    agent_handle: u64,
     view_store: Arc<dyn ViewStore>,
 }
 
 #[async_trait]
 impl querymt_agent::acp::shared::AcpSessionHooks for MobileAcpSessionHooks {
-    async fn preconnected_mcp_peers(
-        &self,
-    ) -> Result<
-        Vec<querymt_agent::agent::session_registry::PreconnectedMcpPeer>,
-        agent_client_protocol::schema::Error,
-    > {
-        mcp::collect_preconnected_mcp_servers(self.agent_handle)
-            .await
-            .map_err(|e| {
-                agent_client_protocol::schema::Error::internal_error().data(serde_json::json!({
-                    "message": "collect preconnected MCP failed",
-                    "ffiCode": e as i32,
-                }))
-            })
-    }
-
     async fn on_session_loaded(
         &self,
         agent: &querymt_agent::agent::LocalAgentHandle,
@@ -95,6 +78,42 @@ impl querymt_agent::acp::shared::AcpSessionHooks for MobileAcpSessionHooks {
         response: &mut serde_json::Value,
     ) -> Result<(), agent_client_protocol::schema::Error> {
         ensure_remote_attach_snapshot(agent, self.view_store.clone(), session_id, response).await
+    }
+}
+
+/// Runtime MCP attachment source that collects the mobile device's in-process
+/// MCP peers (e.g., contacts, calendar) and makes them available to every
+/// session materialized on this node.
+pub(crate) struct MobileSessionMcpAttachmentSource {
+    pub(crate) agent_handle_cell: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[async_trait]
+impl querymt_agent::agent::session_mcp::SessionMcpAttachmentSource
+    for MobileSessionMcpAttachmentSource
+{
+    async fn attachments(
+        &self,
+        _context: &querymt_agent::agent::session_mcp::SessionMcpAttachmentContext,
+    ) -> Result<
+        Vec<querymt_agent::agent::session_mcp::SessionMcpAttachment>,
+        agent_client_protocol::schema::Error,
+    > {
+        let agent_handle = self
+            .agent_handle_cell
+            .load(std::sync::atomic::Ordering::Acquire);
+        let peers = mcp::collect_connected_mcp_peers(agent_handle)
+            .await
+            .map_err(|e| {
+                agent_client_protocol::schema::Error::internal_error().data(serde_json::json!({
+                    "message": "collect connected MCP peers failed",
+                    "ffiCode": e as i32,
+                }))
+            })?;
+        Ok(peers
+            .into_iter()
+            .map(querymt_agent::agent::session_mcp::SessionMcpAttachment::ConnectedPeer)
+            .collect())
     }
 }
 
@@ -747,7 +766,6 @@ pub unsafe extern "C" fn qmt_ffi_acp_send(
             };
             let hooks: Arc<dyn querymt_agent::acp::shared::AcpSessionHooks> =
                 Arc::new(MobileAcpSessionHooks {
-                    agent_handle,
                     view_store: view_store.clone(),
                 });
             let output = querymt_agent::acp::shared::handle_rpc_message_with_context(

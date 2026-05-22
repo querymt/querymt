@@ -14,7 +14,6 @@ use super::super::session::PRIMARY_AGENT_ID;
 use crate::agent::core::AgentMode;
 use crate::events::EventEnvelope;
 use crate::index::resolve_workspace_root;
-use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
 use crate::session::load_session_snapshot;
 use crate::session::projection::SessionScope;

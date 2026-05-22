@@ -5,7 +5,6 @@
 //! RPC message handling.
 
 use crate::agent::LocalAgentHandle as AgentHandle;
-use crate::agent::session_registry::PreconnectedMcpPeer;
 use crate::event_fanout::EventFanout;
 use crate::events::{AgentEventKind, EventEnvelope};
 use crate::send_agent::SendAgent;
@@ -64,8 +63,6 @@ pub struct RpcDispatchContext {
 
 #[async_trait::async_trait]
 pub trait AcpSessionHooks: Send + Sync {
-    async fn preconnected_mcp_peers(&self) -> Result<Vec<PreconnectedMcpPeer>, Error>;
-
     async fn on_session_loaded(
         &self,
         _agent: &AgentHandle,
@@ -458,14 +455,9 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
 
             m if m == AGENT_METHOD_NAMES.session_new => match serde_json::from_value(req.params) {
                 Ok(params) => {
-                    let preconnected = if let Some(hooks) = &context.session_hooks {
-                        hooks.preconnected_mcp_peers().await?
-                    } else {
-                        Vec::new()
-                    };
-                    let response = agent
-                        .new_session_with_preconnected(params, preconnected)
-                        .await;
+                    // MCP attachments are now resolved internally by the
+                    // materializer via the runtime attachment source.
+                    let response = agent.new_session(params).await;
                     match response {
                         Ok(r) => {
                             let session_id = r.session_id.to_string();
@@ -522,14 +514,9 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                 ) {
                     Ok(params) => {
                         let session_id = params.session_id.to_string();
-                        let preconnected = if let Some(hooks) = &context.session_hooks {
-                            hooks.preconnected_mcp_peers().await?
-                        } else {
-                            Vec::new()
-                        };
-                        let response = agent
-                            .load_session_with_preconnected(params, preconnected)
-                            .await;
+                        // MCP attachments are now resolved internally by the
+                        // materializer via the runtime attachment source.
+                        let response = agent.load_session(params).await;
                         match response {
                             Ok(r) => {
                                 let mut value = serde_json::to_value(r).unwrap();
@@ -883,13 +870,12 @@ fn acp_method_span(method: &str) -> tracing::Span {
 mod tests {
     use super::*;
     use crate::agent::core::AgentMode;
-    use crate::agent::session_registry::PreconnectedMcpPeer;
     use crate::elicitation::ElicitationAction;
     use crate::events::{AgentEventKind, DurableEvent, EventEnvelope, EventOrigin};
     use crate::test_utils::DelegateTestFixture;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use tokio::sync::Mutex;
     use tokio::sync::oneshot;
 
@@ -1177,21 +1163,13 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl AcpSessionHooks for HookProbe {
-        async fn preconnected_mcp_peers(&self) -> Result<Vec<PreconnectedMcpPeer>, Error> {
-            self.called.store(true, Ordering::SeqCst);
-            Ok(Vec::new())
-        }
-    }
+    impl AcpSessionHooks for HookProbe {}
 
     #[tokio::test]
-    async fn session_new_rpc_uses_dispatch_hooks_for_preconnected_peers() {
+    async fn session_new_rpc_dispatches_to_agent_new_session() {
         let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
-        let hook = Arc::new(HookProbe {
-            called: AtomicBool::new(false),
-        });
 
         struct Dummy;
 
@@ -1213,15 +1191,8 @@ mod tests {
                 &self,
                 _: agent_client_protocol::schema::NewSessionRequest,
             ) -> Result<agent_client_protocol::schema::NewSessionResponse, Error> {
-                unreachable!("dispatcher should prefer new_session_with_preconnected")
-            }
-            async fn new_session_with_preconnected(
-                &self,
-                _: agent_client_protocol::schema::NewSessionRequest,
-                _: Vec<PreconnectedMcpPeer>,
-            ) -> Result<agent_client_protocol::schema::NewSessionResponse, Error> {
                 Ok(agent_client_protocol::schema::NewSessionResponse::new(
-                    "s-hooked",
+                    "s-plain",
                 ))
             }
             async fn prompt(
@@ -1308,16 +1279,15 @@ mod tests {
                 id: serde_json::json!(1),
             },
             RpcDispatchContext {
-                session_hooks: Some(hook.clone()),
+                session_hooks: None,
             },
         )
         .await;
 
-        assert!(hook.called.load(Ordering::SeqCst));
         assert!(output.response.error.is_none());
         assert_eq!(
             output.response.result,
-            Some(serde_json::json!({"sessionId": "s-hooked"}))
+            Some(serde_json::json!({"sessionId": "s-plain"}))
         );
     }
 
@@ -2061,7 +2031,6 @@ mod tests {
     }
 
     mod prompt_response_json {
-        use super::*;
         use agent_client_protocol::schema::{PromptResponse, StopReason};
 
         #[test]
