@@ -762,8 +762,8 @@ pub(super) async fn ensure_session_loaded(
         if let Some(binding) = profiles.session_binding(session_id).await {
             Some(binding.profile_id)
         } else {
-            // Sessions without a cache entry or with an unavailable cached profile
-            // load into the active profile runtime.
+            // Only explicit/cache-backed bindings are sticky: fallback loads use the active profile
+            // without binding provenance unless first-open claiming becomes policy later.
             resolve_profile_id(state, None).await?
         }
     } else {
