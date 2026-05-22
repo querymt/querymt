@@ -12,7 +12,9 @@ use super::super::messages::{
     AuthMethod, AuthProviderEntry, OAuthStatus, ProviderCapabilityEntry, UiServerMessage,
 };
 use super::session_ops::ensure_session_loaded;
+use crate::agent::remote::SessionActorRef;
 use crate::session::store::CustomModel;
+use crate::ui::session::{resolve_profile_id_for_session, session_ref_for_profile};
 use querymt_provider_common::{
     DownloadProgress, DownloadStatus, HfModelRef, canonical_id_from_file, canonical_id_from_hf,
     download_hf_gguf_with_progress, parse_gguf_metadata,
@@ -486,13 +488,7 @@ pub async fn handle_set_session_model(
 
     ensure_session_loaded(state, session_id, None, "set_session_model").await?;
 
-    // Look up the session actor ref through the registry so remote sessions work too.
-    let session_ref = {
-        let registry = state.agent.registry.lock().await;
-        registry.get(session_id).cloned()
-    };
-
-    let Some(session_ref) = session_ref else {
+    let Some(session_ref) = session_ref_for_set_model(state, session_id).await? else {
         return Err(format!("Session not found: {}", session_id));
     };
 
@@ -532,6 +528,21 @@ pub async fn handle_set_session_model(
         .map_err(|e| e.to_string())?;
     state.agent.invalidate_model_cache().await;
     Ok(())
+}
+
+async fn session_ref_for_set_model(
+    state: &ServerState,
+    session_id: &str,
+) -> Result<Option<SessionActorRef>, String> {
+    let profile_id = resolve_profile_id_for_session(state, Some(session_id), None).await?;
+    if let Some(session_ref) =
+        session_ref_for_profile(state, profile_id.as_deref(), session_id).await
+    {
+        return Ok(Some(session_ref));
+    }
+
+    let registry = state.agent.registry.lock().await;
+    Ok(registry.get(session_id).cloned())
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

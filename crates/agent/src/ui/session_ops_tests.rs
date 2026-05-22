@@ -538,3 +538,83 @@ async fn handle_load_session_prefers_existing_bound_profile_after_active_profile
 
     Ok(())
 }
+
+#[tokio::test]
+async fn handle_set_session_model_uses_bound_profile_after_active_profile_changes() -> Result<()> {
+    let mut f = crate::test_utils::TestServerState::new().await;
+    let dir = TempDir::new()?;
+    write_profile(dir.path(), "alpha.toml");
+    write_profile(dir.path(), "beta.toml");
+    let profiles = attach_profiles(&mut f, "alpha", dir.path()).await;
+    let (tx, mut rx) = f.add_connection("conn-set-model-profile").await;
+    let (bin_tx, _bin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+
+    handle_ui_message(
+        &f.state,
+        "conn-set-model-profile",
+        &tx,
+        &bin_tx,
+        UiClientMessage::NewSession {
+            cwd: None,
+            request_id: Some("req-set-model-profile".to_string()),
+            profile_id: Some("alpha".to_string()),
+        },
+    )
+    .await;
+
+    let created = next_message_of_type(&mut rx, "session_created").await;
+    let session_id = created["data"]["session_id"]
+        .as_str()
+        .expect("session id should be a string")
+        .to_string();
+    assert_eq!(created["data"]["profile_id"], "alpha");
+
+    profiles
+        .set_active_profile("beta")
+        .await
+        .expect("active profile should switch for future sessions");
+
+    handle_ui_message(
+        &f.state,
+        "conn-set-model-profile",
+        &tx,
+        &bin_tx,
+        UiClientMessage::SetSessionModel {
+            session_id: session_id.clone(),
+            model_id: "mock/new-model".to_string(),
+            node_id: None,
+        },
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let mut errors = Vec::new();
+    while let Ok(Some(msg_str)) = tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+        let parsed: Value = serde_json::from_str(&msg_str)?;
+        if parsed["type"] == "error" {
+            errors.push(
+                parsed["data"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "set_session_model should not emit error for profile-backed session: {errors:?}"
+    );
+
+    let llm_cfg = f
+        .agent
+        .storage
+        .session_store()
+        .get_session_llm_config(&session_id)
+        .await?;
+    let llm_cfg = llm_cfg.expect("session llm config should be set");
+    assert_eq!(llm_cfg.provider, "mock");
+    assert_eq!(llm_cfg.model, "new-model");
+
+    Ok(())
+}
