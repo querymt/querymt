@@ -626,8 +626,7 @@ pub async fn handle_load_session(
         cwds.get(session_id).cloned()
     };
 
-    // 2. Determine profile/agent IDs. The profile binding is MVP process-local;
-    // after restart, old sessions have no binding until a durable design is approved.
+    // 2. Determine profile/agent IDs from the memory/cache binding, or fall back active.
     let profile_id = if let Some(profiles) = &state.profiles {
         if let Some(binding) = profiles.session_binding(session_id).await {
             Some(binding.profile_id)
@@ -743,6 +742,10 @@ pub async fn handle_delete_session(
         cwds.remove(session_id);
     }
 
+    if let Some(profiles) = &state.profiles {
+        profiles.forget_session_binding(session_id).await;
+    }
+
     send_state(state, conn_id, tx).await;
     handle_list_sessions(state, tx, ListSessionsRequest::root_browse()).await;
 }
@@ -759,8 +762,8 @@ pub(super) async fn ensure_session_loaded(
         if let Some(binding) = profiles.session_binding(session_id).await {
             Some(binding.profile_id)
         } else {
-            // MVP fallback after restart: without durable session/profile persistence,
-            // unbound sessions load into the active profile runtime.
+            // Sessions without a cache entry or with an unavailable cached profile
+            // load into the active profile runtime.
             resolve_profile_id(state, None).await?
         }
     } else {

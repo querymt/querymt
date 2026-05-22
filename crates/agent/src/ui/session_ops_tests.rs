@@ -129,6 +129,15 @@ async fn attach_profiles(
     active_profile_id: &str,
     profile_dir: &Path,
 ) -> Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>> {
+    attach_profiles_with_cache_root(fixture, active_profile_id, profile_dir, None).await
+}
+
+async fn attach_profiles_with_cache_root(
+    fixture: &mut crate::test_utils::TestServerState,
+    active_profile_id: &str,
+    profile_dir: &Path,
+    cache_root: Option<&Path>,
+) -> Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>> {
     let (registry, _config_dir) = empty_plugin_registry().expect("empty plugin registry");
     let infra = AgentInfra {
         plugin_registry: Arc::new(registry),
@@ -140,11 +149,11 @@ async fn attach_profiles(
             .local_dir(profile_dir)
             .build(),
     );
-    let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
-        catalog,
-        active_profile_id,
-        infra,
-    ));
+    let mut manager = ProfileRuntimeManager::with_infra_boxed(catalog, active_profile_id, infra);
+    if let Some(cache_root) = cache_root {
+        manager = manager.with_session_binding_cache_root(cache_root);
+    }
+    let profiles = Arc::new(manager);
     fixture.state.profiles = Some(profiles.clone());
     profiles
 }
@@ -535,6 +544,61 @@ async fn handle_load_session_prefers_existing_bound_profile_after_active_profile
 
     let state_msg = next_message_of_type(&mut rx, "state").await;
     assert_eq!(state_msg["data"]["active_profile_id"], "beta");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn handle_load_session_uses_cached_profile_binding_after_manager_rebuild() -> Result<()> {
+    let mut f = crate::test_utils::TestServerState::new().await;
+    let dir = TempDir::new()?;
+    let cache_dir = TempDir::new()?;
+    write_profile(dir.path(), "alpha.toml");
+    write_profile(dir.path(), "beta.toml");
+    let profiles =
+        attach_profiles_with_cache_root(&mut f, "alpha", dir.path(), Some(cache_dir.path())).await;
+    let session_id = f.agent.create_session().await;
+    profiles
+        .bind_session_to_profile(session_id.clone(), "alpha")
+        .await
+        .expect("session should bind to alpha");
+    profiles.shutdown().await;
+    attach_profiles_with_cache_root(&mut f, "beta", dir.path(), Some(cache_dir.path())).await;
+    let (tx, mut rx) = f.add_connection("conn-load-cached-profile").await;
+
+    handle_load_session(&f.state, "conn-load-cached-profile", &session_id, &tx).await;
+
+    let loaded = next_message_of_type(&mut rx, "session_loaded").await;
+    assert_eq!(loaded["data"]["session_id"], session_id);
+    assert_eq!(loaded["data"]["profile_id"], "alpha");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn handle_load_session_falls_back_active_when_cached_profile_unavailable() -> Result<()> {
+    let mut f = crate::test_utils::TestServerState::new().await;
+    let dir = TempDir::new()?;
+    let cache_dir = TempDir::new()?;
+    write_profile(dir.path(), "beta.toml");
+    let session_id = f.agent.create_session().await;
+    let session_profiles_dir = cache_dir.path().join("querymt").join("session-profiles");
+    std::fs::create_dir_all(&session_profiles_dir)?;
+    std::fs::write(session_profiles_dir.join(&session_id), "alpha")?;
+    attach_profiles_with_cache_root(&mut f, "beta", dir.path(), Some(cache_dir.path())).await;
+    let (tx, mut rx) = f.add_connection("conn-load-missing-cached-profile").await;
+
+    handle_load_session(
+        &f.state,
+        "conn-load-missing-cached-profile",
+        &session_id,
+        &tx,
+    )
+    .await;
+
+    let loaded = next_message_of_type(&mut rx, "session_loaded").await;
+    assert_eq!(loaded["data"]["session_id"], session_id);
+    assert_eq!(loaded["data"]["profile_id"], "beta");
 
     Ok(())
 }
