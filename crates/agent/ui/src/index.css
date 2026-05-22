@@ -1,6 +1,9 @@
 /* Glitch effects - must come before tailwind import */
 @import './styles/glitch-effects.css';
 
+/* Performance mode — toggled via .perf-mode class on <html> */
+@import './styles/perf-mode.css';
+
 @import "tailwindcss";
 
 @plugin "@tailwindcss/typography";

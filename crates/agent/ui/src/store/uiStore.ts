@@ -120,6 +120,11 @@ export interface UiState {
   getSessionTimer: (sessionId: string) => SessionTimerState | undefined;
   clearSessionTimer: (sessionId: string) => void;
   
+  // Performance mode — disables GPU-intensive CSS animations and effects
+  perfMode: boolean;
+  setPerfMode: (enabled: boolean) => void;
+  togglePerfMode: () => void;
+
   // Utility actions
   resetChatView: () => void; // Reset view state when switching sessions
   
@@ -159,6 +164,7 @@ export const useUiStore = create<UiState>((set, get) => ({
   rateLimitBySession: new Map(),
   compactingBySession: new Map(),
   sessionTimerCache: new Map(),
+  perfMode: false,
   
   // Actions
   setMainInputRef: (ref) => set({ mainInputRef: ref }),
@@ -328,6 +334,19 @@ export const useUiStore = create<UiState>((set, get) => ({
     return { sessionTimerCache: updated };
   }),
   
+  // Performance mode — disable GPU-intensive CSS
+
+  setPerfMode: (enabled) => {
+    set({ perfMode: enabled });
+    localStorage.setItem('perfMode', enabled.toString());
+    document.documentElement.classList.toggle('perf-mode', enabled);
+  },
+
+  togglePerfMode: () => {
+    const { perfMode, setPerfMode } = get();
+    setPerfMode(!perfMode);
+  },
+
   // Load persisted state from localStorage
   loadPersistedState: () => {
     const todoRailCollapsed = localStorage.getItem('todoRailCollapsed') === 'true';
@@ -335,10 +354,16 @@ export const useUiStore = create<UiState>((set, get) => ({
     const modeModelPreferencesRaw = localStorage.getItem('modeModelPreferences');
     const modeModelPreferences = modeModelPreferencesRaw ? JSON.parse(modeModelPreferencesRaw) : {};
     const followNewMessages = localStorage.getItem('followNewMessages') !== 'false';
+    const perfMode = localStorage.getItem('perfMode') === 'true';
     const selectedThemeRaw = localStorage.getItem('dashboardTheme');
     const selectedTheme = selectedThemeRaw
       ? (normalizeDashboardThemeId(selectedThemeRaw) ?? DEFAULT_DASHBOARD_THEME_ID)
       : DEFAULT_DASHBOARD_THEME_ID;
     set({ todoRailCollapsed, schedulePanelCollapsed, modeModelPreferences, followNewMessages, selectedTheme });
+    // Apply perf-mode class after loading persisted state
+    if (perfMode) {
+      document.documentElement.classList.add('perf-mode');
+    }
+    set({ perfMode });
   },
 }));
