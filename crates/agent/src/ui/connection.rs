@@ -15,13 +15,13 @@
 //!
 //! All other messages use JSON text frames as before.
 
-use crate::agent::core::AgentMode;
 #[cfg(feature = "remote")]
 use crate::agent::utils::u32_from_usize;
 
 use super::messages::{RoutingMode, UiClientMessage, UiServerMessage};
 use super::session::{
-    PRIMARY_AGENT_ID, active_profile_id, build_agent_list, list_profiles, session_ref_for_profile,
+    PRIMARY_AGENT_ID, active_profile_id, build_agent_list, list_profiles, mode_for_session,
+    reasoning_effort_for_session, session_ref_for_profile,
 };
 use super::{ConnectionState, ServerState};
 use axum::extract::ws::{Message, WebSocket};
@@ -233,55 +233,8 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
         .as_ref()
         .map(|path| path.to_string_lossy().to_string());
 
-    // Try to get mode from active session actor, fall back to default_mode
-    let agent_mode = if let Some(ref session_id) = active_session_id {
-        let session_ref = {
-            let registry = state.agent.registry.lock().await;
-            registry.get(session_id).cloned()
-        };
-
-        if let Some(session_ref) = session_ref {
-            match session_ref.get_mode().await {
-                Ok(m) => m,
-                Err(_) => state
-                    .agent
-                    .default_mode
-                    .lock()
-                    .map(|guard| *guard)
-                    .unwrap_or(AgentMode::Build),
-            }
-        } else {
-            state
-                .agent
-                .default_mode
-                .lock()
-                .map(|guard| *guard)
-                .unwrap_or(AgentMode::Build)
-        }
-    } else {
-        state
-            .agent
-            .default_mode
-            .lock()
-            .map(|guard| *guard)
-            .unwrap_or(AgentMode::Build)
-    };
-
-    // Try to get reasoning effort from active session actor, fall back to default
-    let reasoning_effort = if let Some(ref session_id) = active_session_id {
-        let session_ref = {
-            let registry = state.agent.registry.lock().await;
-            registry.get(session_id).cloned()
-        };
-
-        if let Some(session_ref) = session_ref {
-            session_ref.get_reasoning_effort().await.ok().flatten()
-        } else {
-            **state.agent.default_reasoning_effort.load()
-        }
-    } else {
-        **state.agent.default_reasoning_effort.load()
-    };
+    let agent_mode = mode_for_session(state, active_session_id.as_deref()).await;
+    let reasoning_effort = reasoning_effort_for_session(state, active_session_id.as_deref()).await;
 
     let _ = send_message(
         tx,

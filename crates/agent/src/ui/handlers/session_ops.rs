@@ -10,7 +10,11 @@ use super::super::messages::{SessionGroup, SessionSummary, UiServerMessage};
 #[cfg(feature = "remote")]
 use super::remote::finalize_remote_session_attach;
 
-use super::super::session::{PRIMARY_AGENT_ID, agent_for_profile_and_id, resolve_profile_id};
+use super::super::session::{
+    PRIMARY_AGENT_ID, agent_for_profile_and_id, local_agent_for_session, mode_for_session,
+    reasoning_effort_for_session, resolve_profile_id, resolve_profile_id_for_session,
+    session_ref_for_session,
+};
 use crate::agent::core::AgentMode;
 use crate::events::EventEnvelope;
 use crate::index::resolve_workspace_root;
@@ -842,7 +846,15 @@ pub async fn handle_cancel_session(state: &ServerState, conn_id: &str, tx: &mpsc
         return;
     };
 
-    if let Err(e) = state.agent.stop_session(&session_id).await {
+    let agent = match local_agent_for_session(state, Some(&session_id), None).await {
+        Ok(agent) => agent,
+        Err(e) => {
+            let _ = send_error(tx, format!("Failed to resolve session runtime: {}", e)).await;
+            return;
+        }
+    };
+
+    if let Err(e) = agent.stop_session(&session_id).await {
         let _ = send_error(tx, format!("Failed to stop session: {}", e)).await;
     }
 }
@@ -958,7 +970,26 @@ pub async fn handle_undo(
         return;
     };
 
-    match state.agent.undo(&session_id, message_id).await {
+    let session_ref = match session_ref_for_session(state, &session_id).await {
+        Some(session_ref) => session_ref,
+        None => {
+            let undo_stack = load_undo_stack(state, &session_id).await;
+            let _ = send_message(
+                tx,
+                UiServerMessage::UndoResult {
+                    success: false,
+                    message: Some(format!("Session not found: {}", session_id)),
+                    reverted_files: vec![],
+                    message_id: None,
+                    undo_stack,
+                },
+            )
+            .await;
+            return;
+        }
+    };
+
+    match session_ref.undo(message_id.to_string()).await {
         Ok(result) => {
             let undo_stack = load_undo_stack(state, &session_id).await;
             let _ = send_message(
@@ -1004,7 +1035,24 @@ pub async fn handle_redo(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<S
         return;
     };
 
-    match state.agent.redo(&session_id).await {
+    let session_ref = match session_ref_for_session(state, &session_id).await {
+        Some(session_ref) => session_ref,
+        None => {
+            let undo_stack = load_undo_stack(state, &session_id).await;
+            let _ = send_message(
+                tx,
+                UiServerMessage::RedoResult {
+                    success: false,
+                    message: Some(format!("Session not found: {}", session_id)),
+                    undo_stack,
+                },
+            )
+            .await;
+            return;
+        }
+    };
+
+    match session_ref.redo().await {
         Ok(_result) => {
             let undo_stack = load_undo_stack(state, &session_id).await;
             let _ = send_message(
@@ -1060,10 +1108,27 @@ pub async fn handle_fork_session(
         return;
     };
 
-    let source_session_ref = {
-        let registry = state.agent.registry.lock().await;
-        registry.get(&source_session_id).cloned()
+    let source_profile_id = resolve_profile_id_for_session(state, Some(&source_session_id), None)
+        .await
+        .unwrap_or_default();
+    #[cfg(feature = "remote")]
+    let source_agent = match local_agent_for_session(state, Some(&source_session_id), None).await {
+        Ok(agent) => agent,
+        Err(err) => {
+            let _ = send_message(
+                tx,
+                UiServerMessage::ForkResult {
+                    success: false,
+                    source_session_id: Some(source_session_id),
+                    forked_session_id: None,
+                    message: Some(format!("Failed to resolve source session runtime: {err}")),
+                },
+            )
+            .await;
+            return;
+        }
     };
+    let source_session_ref = session_ref_for_session(state, &source_session_id).await;
 
     #[cfg(feature = "remote")]
     if let Some(crate::agent::remote::SessionActorRef::Remote { .. }) = source_session_ref.as_ref()
@@ -1096,7 +1161,7 @@ pub async fn handle_fork_session(
             return;
         };
 
-        let node_manager_ref = match state.agent.find_node_manager(&node_id).await {
+        let node_manager_ref = match source_agent.find_node_manager(&node_id).await {
             Ok(r) => r,
             Err(err) => {
                 let _ = send_message(
@@ -1116,8 +1181,7 @@ pub async fn handle_fork_session(
             }
         };
 
-        match state
-            .agent
+        match source_agent
             .fork_remote_session(
                 &node_manager_ref,
                 source_session_id.clone(),
@@ -1224,8 +1288,32 @@ pub async fn handle_fork_session(
                 agents.insert(forked_session_id.clone(), parent_agent);
             }
 
-            if let Err(err) =
-                ensure_session_loaded(state, &forked_session_id, None, "fork_session").await
+            if let (Some(profiles), Some(profile_id)) =
+                (&state.profiles, source_profile_id.as_deref())
+                && let Err(err) = profiles
+                    .bind_session_to_profile(forked_session_id.clone(), profile_id)
+                    .await
+            {
+                let _ = send_message(
+                    tx,
+                    UiServerMessage::ForkResult {
+                        success: false,
+                        source_session_id: Some(source_session_id),
+                        forked_session_id: Some(forked_session_id),
+                        message: Some(format!("Fork created but failed to bind profile: {err}")),
+                    },
+                )
+                .await;
+                return;
+            }
+
+            if let Err(err) = ensure_session_loaded(
+                state,
+                &forked_session_id,
+                source_profile_id.as_deref(),
+                "fork_session",
+            )
+            .await
             {
                 let _ = send_message(
                     tx,
@@ -1334,38 +1422,23 @@ pub async fn handle_set_agent_mode(
                     .and_then(|conn| conn.sessions.get(&conn.active_agent_id).cloned())
             };
 
-            let previous_mode = if let Some(ref session_id) = session_id {
-                let session_ref = {
-                    let registry = state.agent.registry.lock().await;
-                    registry.get(session_id).cloned()
-                };
-                if let Some(session_ref) = session_ref {
-                    session_ref.get_mode().await.ok()
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-            .unwrap_or_else(|| {
-                state
-                    .agent
-                    .default_mode
-                    .lock()
-                    .map(|m| *m)
-                    .unwrap_or(AgentMode::Build)
-            });
+            let previous_mode = mode_for_session(state, session_id.as_deref()).await;
 
-            if let Ok(mut default_mode) = state.agent.default_mode.lock() {
-                *default_mode = new_mode;
+            match local_agent_for_session(state, session_id.as_deref(), None).await {
+                Ok(agent) => {
+                    if let Ok(mut default_mode) = agent.default_mode.lock() {
+                        *default_mode = new_mode;
+                    }
+                }
+                Err(e) => {
+                    let _ =
+                        send_error(tx, format!("Failed to resolve session runtime: {}", e)).await;
+                    return;
+                }
             }
 
             let mode_set_on_actor = if let Some(ref session_id) = session_id {
-                let session_ref = {
-                    let registry = state.agent.registry.lock().await;
-                    registry.get(session_id).cloned()
-                };
-                if let Some(session_ref) = session_ref {
+                if let Some(session_ref) = session_ref_for_session(state, session_id).await {
                     match session_ref.set_mode(new_mode).await {
                         Ok(_) => {
                             log::debug!(
@@ -1431,38 +1504,7 @@ pub async fn handle_get_agent_mode(state: &ServerState, conn_id: &str, tx: &mpsc
             .and_then(|conn| conn.sessions.get(&conn.active_agent_id).cloned())
     };
 
-    let mode = if let Some(session_id) = session_id {
-        let session_ref = {
-            let registry = state.agent.registry.lock().await;
-            registry.get(&session_id).cloned()
-        };
-
-        if let Some(session_ref) = session_ref {
-            match session_ref.get_mode().await {
-                Ok(m) => m,
-                Err(_) => state
-                    .agent
-                    .default_mode
-                    .lock()
-                    .map(|m| *m)
-                    .unwrap_or(AgentMode::Build),
-            }
-        } else {
-            state
-                .agent
-                .default_mode
-                .lock()
-                .map(|m| *m)
-                .unwrap_or(AgentMode::Build)
-        }
-    } else {
-        state
-            .agent
-            .default_mode
-            .lock()
-            .map(|m| *m)
-            .unwrap_or(AgentMode::Build)
-    };
+    let mode = mode_for_session(state, session_id.as_deref()).await;
 
     let _ = send_message(
         tx,
@@ -1501,9 +1543,6 @@ pub async fn handle_set_reasoning_effort(
         }
     };
 
-    // Update default for new sessions (lock-free store via ArcSwap)
-    state.agent.default_reasoning_effort.store(Arc::new(effort));
-
     let session_id = {
         let connections = state.connections.lock().await;
         connections
@@ -1511,14 +1550,21 @@ pub async fn handle_set_reasoning_effort(
             .and_then(|conn| conn.sessions.get(&conn.active_agent_id).cloned())
     };
 
+    match local_agent_for_session(state, session_id.as_deref(), None).await {
+        Ok(agent) => {
+            // Update default for new sessions in the session's profile runtime.
+            agent.default_reasoning_effort.store(Arc::new(effort));
+        }
+        Err(e) => {
+            let _ = send_error(tx, format!("Failed to resolve session runtime: {}", e)).await;
+            return;
+        }
+    }
+
     if let Some(ref session_id) = session_id {
-        let session_ref = {
-            let registry = state.agent.registry.lock().await;
-            registry.get(session_id).cloned()
-        };
         // Always send to the actor — including None (auto) so the LLM config
         // row is updated and the next turn uses provider/model defaults.
-        if let Some(session_ref) = session_ref {
+        if let Some(session_ref) = session_ref_for_session(state, session_id).await {
             match session_ref.set_reasoning_effort(effort).await {
                 Ok(_) => {
                     log::debug!(
@@ -1560,20 +1606,7 @@ pub async fn handle_get_reasoning_effort(
             .and_then(|conn| conn.sessions.get(&conn.active_agent_id).cloned())
     };
 
-    let effort = if let Some(session_id) = session_id {
-        let session_ref = {
-            let registry = state.agent.registry.lock().await;
-            registry.get(&session_id).cloned()
-        };
-
-        if let Some(session_ref) = session_ref {
-            session_ref.get_reasoning_effort().await.ok().flatten()
-        } else {
-            **state.agent.default_reasoning_effort.load()
-        }
-    } else {
-        **state.agent.default_reasoning_effort.load()
-    };
+    let effort = reasoning_effort_for_session(state, session_id.as_deref()).await;
 
     let _ = send_message(
         tx,
@@ -1601,43 +1634,35 @@ pub async fn handle_get_file_index(state: &ServerState, conn_id: &str, tx: &mpsc
     };
 
     // For remote sessions, proxy the file index request to the remote SessionActor.
+    if let Some(actor_ref) = session_ref_for_session(state, &session_id).await
+        && actor_ref.is_remote()
     {
-        let registry = state.agent.registry.lock().await;
-        if let Some(actor_ref) = registry.get(&session_id)
-            && actor_ref.is_remote()
-        {
-            let actor_ref = actor_ref.clone();
-            drop(registry);
+        let cwd = {
+            let cwds = state.session_cwds.lock().await;
+            cwds.get(&session_id).cloned()
+        };
 
-            let cwd = {
-                let cwds = state.session_cwds.lock().await;
-                cwds.get(&session_id).cloned()
-            };
-
-            match actor_ref.get_file_index().await {
-                Ok(resp) => {
-                    let root = std::path::PathBuf::from(&resp.workspace_root);
-                    let files = match cwd.as_ref().and_then(|c| c.strip_prefix(&root).ok()) {
-                        Some(relative_cwd) => {
-                            filter_index_for_cwd_entries(&resp.files, relative_cwd)
-                        }
-                        None => resp.files,
-                    };
-                    let _ = send_message(
-                        tx,
-                        UiServerMessage::FileIndex {
-                            files,
-                            generated_at: resp.generated_at,
-                        },
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    let _ = send_error(tx, format!("Remote file index: {e}")).await;
-                }
+        match actor_ref.get_file_index().await {
+            Ok(resp) => {
+                let root = std::path::PathBuf::from(&resp.workspace_root);
+                let files = match cwd.as_ref().and_then(|c| c.strip_prefix(&root).ok()) {
+                    Some(relative_cwd) => filter_index_for_cwd_entries(&resp.files, relative_cwd),
+                    None => resp.files,
+                };
+                let _ = send_message(
+                    tx,
+                    UiServerMessage::FileIndex {
+                        files,
+                        generated_at: resp.generated_at,
+                    },
+                )
+                .await;
             }
-            return;
+            Err(e) => {
+                let _ = send_error(tx, format!("Remote file index: {e}")).await;
+            }
         }
+        return;
     }
 
     let cwd = {

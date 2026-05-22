@@ -7,13 +7,15 @@ use super::error::format_prefixed_error_chain;
 use super::messages::{RoutingMode, UiAgentInfo, UiProfileInfo, UiPromptBlock, UiServerMessage};
 use super::{ServerState, cursor_from_events};
 use crate::agent::LocalAgentHandle as AgentHandle;
+use crate::agent::core::AgentMode;
 use crate::agent::handle::AgentHandle as AgentHandleTrait;
 use crate::agent::remote::SessionActorRef;
 use crate::events::EventEnvelope;
 use crate::index::{normalize_cwd, resolve_workspace_root};
 use agent_client_protocol::schema::{
-    ContentBlock, LoadSessionRequest, NewSessionRequest, PromptRequest,
+    ContentBlock, LoadSessionRequest, NewSessionRequest, PromptRequest, SessionId,
 };
+use querymt::chat::ReasoningEffort;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -167,7 +169,10 @@ pub async fn ensure_session(
             agent_for_profile_and_id(state, existing_profile_id.as_deref(), agent_id).await
         {
             agent
-                .load_session(LoadSessionRequest::new(session_id.clone(), PathBuf::new()))
+                .load_session(LoadSessionRequest::new(
+                    SessionId::from(session_id.clone()),
+                    PathBuf::new(),
+                ))
                 .await
                 .is_ok()
         } else {
@@ -395,17 +400,98 @@ pub async fn agent_for_profile_and_id(
     }
 }
 
+pub async fn local_agent_for_profile(
+    state: &ServerState,
+    profile_id: Option<&str>,
+) -> Result<Arc<AgentHandle>, String> {
+    let Some(profiles) = &state.profiles else {
+        return Ok(state.agent.clone());
+    };
+
+    let profile_id = match profile_id {
+        Some(id) => id.to_string(),
+        None => profiles.active_profile_id().await,
+    };
+    let runtime = profiles
+        .runtime_for_profile(&profile_id)
+        .await
+        .map_err(|err| {
+            format_prefixed_error_chain(&format!("Failed to load profile '{profile_id}'"), &err)
+        })?;
+    Ok(runtime.agent().handle())
+}
+
+pub async fn local_agent_for_session(
+    state: &ServerState,
+    session_id: Option<&str>,
+    requested_profile_id: Option<&str>,
+) -> Result<Arc<AgentHandle>, String> {
+    let profile_id =
+        resolve_profile_id_for_session(state, session_id, requested_profile_id).await?;
+    local_agent_for_profile(state, profile_id.as_deref()).await
+}
+
 pub async fn session_ref_for_profile(
     state: &ServerState,
     profile_id: Option<&str>,
     session_id: &str,
 ) -> Option<SessionActorRef> {
-    let agent = agent_for_profile_and_id(state, profile_id, PRIMARY_AGENT_ID)
-        .await
-        .ok()?;
-    let local_agent = agent.as_any().downcast_ref::<AgentHandle>()?;
+    let local_agent = local_agent_for_profile(state, profile_id).await.ok()?;
     let registry = local_agent.registry.lock().await;
     registry.get(session_id).cloned()
+}
+
+pub async fn session_ref_for_session(
+    state: &ServerState,
+    session_id: &str,
+) -> Option<SessionActorRef> {
+    let profile_id = resolve_profile_id_for_session(state, Some(session_id), None)
+        .await
+        .ok()?;
+    session_ref_for_profile(state, profile_id.as_deref(), session_id).await
+}
+
+pub async fn default_mode_for_session(state: &ServerState, session_id: Option<&str>) -> AgentMode {
+    local_agent_for_session(state, session_id, None)
+        .await
+        .ok()
+        .and_then(|agent| agent.default_mode.lock().map(|mode| *mode).ok())
+        .unwrap_or(AgentMode::Build)
+}
+
+pub async fn default_reasoning_effort_for_session(
+    state: &ServerState,
+    session_id: Option<&str>,
+) -> Option<ReasoningEffort> {
+    local_agent_for_session(state, session_id, None)
+        .await
+        .ok()
+        .and_then(|agent| **agent.default_reasoning_effort.load())
+}
+
+pub async fn mode_for_session(state: &ServerState, session_id: Option<&str>) -> AgentMode {
+    if let Some(session_id) = session_id
+        && let Some(session_ref) = session_ref_for_session(state, session_id).await
+        && let Ok(mode) = session_ref.get_mode().await
+    {
+        return mode;
+    }
+
+    default_mode_for_session(state, session_id).await
+}
+
+pub async fn reasoning_effort_for_session(
+    state: &ServerState,
+    session_id: Option<&str>,
+) -> Option<ReasoningEffort> {
+    if let Some(session_id) = session_id
+        && let Some(session_ref) = session_ref_for_session(state, session_id).await
+        && let Ok(effort) = session_ref.get_reasoning_effort().await
+    {
+        return effort;
+    }
+
+    default_reasoning_effort_for_session(state, session_id).await
 }
 
 pub async fn list_profiles(state: &ServerState) -> Vec<UiProfileInfo> {
@@ -498,7 +584,11 @@ pub fn collect_event_sources(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_prompt_error, resolve_profile_id_for_session};
+    use super::{
+        default_mode_for_session, default_reasoning_effort_for_session, format_prompt_error,
+        resolve_profile_id_for_session,
+    };
+    use crate::agent::core::AgentMode;
     use crate::profiles::{LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager};
     use crate::test_utils::TestServerState;
     use std::path::Path;
@@ -532,8 +622,11 @@ system = "inline"
         assert!(msg.ends_with(raw));
     }
 
-    #[tokio::test]
-    async fn resolve_profile_for_session_prefers_existing_binding_over_active_or_requested() {
+    async fn profile_fixture() -> (
+        TestServerState,
+        Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>,
+        tempfile::TempDir,
+    ) {
         let mut fixture = TestServerState::new().await;
         let dir = tempfile::TempDir::new().expect("temp profile dir");
         write_profile(dir.path(), "alpha.toml");
@@ -550,6 +643,12 @@ system = "inline"
                 .expect("profiles manager should initialize"),
         );
         fixture.state.profiles = Some(profiles.clone());
+        (fixture, profiles, dir)
+    }
+
+    #[tokio::test]
+    async fn resolve_profile_for_session_prefers_existing_binding_over_active_or_requested() {
+        let (fixture, profiles, _dir) = profile_fixture().await;
 
         profiles
             .bind_session_to_profile("session-1", "alpha")
@@ -566,5 +665,49 @@ system = "inline"
                 .expect("bound profile should resolve");
 
         assert_eq!(resolved.as_deref(), Some("alpha"));
+    }
+
+    #[tokio::test]
+    async fn session_defaults_follow_bound_profile_runtime() {
+        let (fixture, profiles, _dir) = profile_fixture().await;
+
+        profiles
+            .bind_session_to_profile("session-1", "alpha")
+            .await
+            .expect("session should bind to alpha profile");
+        profiles
+            .set_active_profile("beta")
+            .await
+            .expect("beta should become active for new sessions");
+
+        let beta = profiles
+            .runtime_for_profile("beta")
+            .await
+            .expect("beta runtime should load")
+            .agent()
+            .handle();
+        *beta.default_mode.lock().expect("mode lock") = AgentMode::Review;
+        beta.default_reasoning_effort
+            .store(Arc::new(Some(querymt::chat::ReasoningEffort::High)));
+
+        let alpha = profiles
+            .runtime_for_profile("alpha")
+            .await
+            .expect("alpha runtime should load")
+            .agent()
+            .handle();
+        *alpha.default_mode.lock().expect("mode lock") = AgentMode::Plan;
+        alpha
+            .default_reasoning_effort
+            .store(Arc::new(Some(querymt::chat::ReasoningEffort::Low)));
+
+        assert_eq!(
+            default_mode_for_session(&fixture.state, Some("session-1")).await,
+            AgentMode::Plan
+        );
+        assert_eq!(
+            default_reasoning_effort_for_session(&fixture.state, Some("session-1")).await,
+            Some(querymt::chat::ReasoningEffort::Low)
+        );
     }
 }
