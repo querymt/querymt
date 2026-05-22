@@ -374,6 +374,24 @@ impl MembershipStore {
         self.memberships.iter().map(|(k, v)| (k.as_str(), v))
     }
 
+    /// Remove the membership for a mesh ID.
+    ///
+    /// Returns `true` when an entry was removed.
+    pub fn remove_membership(&mut self, mesh_id: &str) -> Result<bool, InviteError> {
+        let removed = self.memberships.remove(mesh_id).is_some();
+        if removed {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+
+    /// Return all joined mesh IDs in deterministic order.
+    pub fn mesh_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.memberships.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
     fn save(&self) -> Result<(), InviteError> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {

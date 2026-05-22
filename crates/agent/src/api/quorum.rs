@@ -587,6 +587,7 @@ impl QuorumBuilder {
                                     );
                                 }
                             }
+                            Ok(_) => {}
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 log::warn!(

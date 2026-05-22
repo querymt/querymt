@@ -225,6 +225,7 @@ impl CachedMeshTransport {
                             peer_id
                         );
                     }
+                    Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }

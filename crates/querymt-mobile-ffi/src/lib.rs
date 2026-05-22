@@ -319,6 +319,7 @@ fn spawn_mesh_peer_event_forwarder(
                         push_acp_message(connection_handle, &outbox, json).await;
                     }
                 }
+                Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
@@ -363,6 +364,7 @@ unsafe fn qmt_internal_init_agent(
     out_agent: *mut u64,
 ) -> i32 {
     ffi_panic_boundary("qmt_internal_init_agent", || {
+        log::info!("ffi.agent.init: requested attach/init");
         // Parse config using the shared querymt-agent parser.
         let config_result = agent::parse_config(config_toml);
         let config = match config_result {
@@ -399,6 +401,7 @@ unsafe fn qmt_internal_init_agent(
 ///
 /// - `agent_handle` must be a valid handle returned by `qmt_internal_init_agent`.
 unsafe fn qmt_internal_shutdown(agent_handle: u64) -> i32 {
+    log::info!("ffi.agent.shutdown: requested detach (agent_handle={agent_handle})");
     let result = agent::shutdown_agent_inner(agent_handle);
     match result {
         Ok(()) => {
@@ -418,7 +421,16 @@ unsafe fn qmt_internal_shutdown(agent_handle: u64) -> i32 {
 ///
 /// No additional safety requirements beyond calling from a valid thread context.
 unsafe fn qmt_internal_set_backgrounded(backgrounded: i32) -> i32 {
-    ffi_helpers::set_backgrounded(backgrounded != 0);
+    let is_backgrounded = backgrounded != 0;
+    ffi_helpers::set_backgrounded(is_backgrounded);
+    log::info!(
+        "ffi.lifecycle.state: {}",
+        if is_backgrounded {
+            "backgrounded"
+        } else {
+            "foregrounded"
+        }
+    );
     FfiErrorCode::Ok as i32
 }
 
@@ -591,7 +603,7 @@ pub unsafe extern "C" fn qmt_ffi_acp_send(
                 .get(&connection_handle)
                 .ok_or(FfiErrorCode::NotFound)?;
             let (agent, view_store) = state::with_agent_read(conn.agent_handle, |r| {
-                let view_store = r.storage.view_store().ok_or(FfiErrorCode::RuntimeError)?;
+                let view_store = r.view_store.clone().ok_or(FfiErrorCode::RuntimeError)?;
                 Ok((r.agent.inner(), view_store))
             })
             .map_err(|_| FfiErrorCode::NotFound)?;
@@ -924,6 +936,36 @@ pub unsafe extern "C" fn qmt_ffi_shutdown(agent_handle: u64) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_ffi_set_lifecycle_state(_agent_handle: u64, backgrounded: i32) -> i32 {
     unsafe { qmt_internal_set_backgrounded(backgrounded) }
+}
+
+/// Explicit developer reset hook for mobile debug/dev workflows.
+///
+/// This does not attempt to reset kameo's global OnceLock and therefore only
+/// succeeds when no logical agents are attached.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qmt_ffi_shutdown_runtime_if_idle() -> i32 {
+    ffi_panic_boundary(
+        "qmt_ffi_shutdown_runtime_if_idle",
+        || match state::shutdown_runtime_if_idle() {
+            Ok(true) => {
+                log::info!("ffi.runtime.shutdown: process runtime released (idle)");
+                ffi_helpers::clear_last_error();
+                FfiErrorCode::Ok as i32
+            }
+            Ok(false) => {
+                ffi_helpers::clear_last_error();
+                FfiErrorCode::Ok as i32
+            }
+            Err(FfiErrorCode::Busy) => {
+                set_last_error(
+                    FfiErrorCode::Busy,
+                    "Runtime still has attached agents".into(),
+                );
+                FfiErrorCode::Busy as i32
+            }
+            Err(code) => code as i32,
+        },
+    )
 }
 
 #[unsafe(no_mangle)]

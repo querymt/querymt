@@ -566,7 +566,7 @@ pub async fn handle_create_mesh_invite(
             return;
         };
 
-        if !mesh.is_iroh_transport() {
+        if !mesh.is_iroh_transport_internal() {
             let _ = send_error(
                 tx,
                 "Mesh invites require iroh transport. Restart host with --mesh --mesh-invite (or set transport=iroh).".to_string(),

@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, watch};
 
 use crate::agent::agent_config::AgentConfig;
+#[cfg(feature = "remote")]
+use crate::agent::remote::runtime_handle::MeshRuntimeHandle;
+#[cfg(feature = "remote")]
+use crate::agent::remote::scope::scoped_node_manager;
 use crate::model_registry::{ModelEntry, enumerate_local_models};
 
 /// Metadata about the current snapshot
@@ -175,7 +179,7 @@ struct ModelInventoryInner {
     config: Arc<AgentConfig>,
     /// Optional mesh handle for remote operations
     #[cfg(feature = "remote")]
-    mesh: parking_lot::RwLock<Option<crate::agent::remote::MeshHandle>>,
+    mesh: parking_lot::RwLock<Option<MeshRuntimeHandle>>,
     /// Inventory configuration
     inv_config: ModelInventoryConfig,
 }
@@ -230,8 +234,11 @@ impl ModelInventory {
 
     /// Set the mesh handle for remote operations
     #[cfg(feature = "remote")]
-    pub fn set_mesh(&self, mesh: crate::agent::remote::MeshHandle) {
-        *self.inner.mesh.write() = Some(mesh);
+    pub fn set_mesh<M>(&self, mesh: M)
+    where
+        M: Into<MeshRuntimeHandle>,
+    {
+        *self.inner.mesh.write() = Some(mesh.into());
     }
 
     /// Get current model snapshot immediately (never blocks).
@@ -408,7 +415,7 @@ impl ModelInventory {
 
     /// Get the current mesh handle (if any).
     #[cfg(feature = "remote")]
-    pub fn mesh(&self) -> Option<crate::agent::remote::MeshHandle> {
+    pub fn mesh(&self) -> Option<MeshRuntimeHandle> {
         self.inner.mesh.read().clone()
     }
 
@@ -534,21 +541,28 @@ impl ModelInventory {
         };
 
         let local_peer_id = *mesh.peer_id();
-        let mut stream = mesh
-            .lookup_all_actors::<RemoteNodeManager>(crate::agent::remote::dht_name::NODE_MANAGER);
+        let scopes = mesh.active_scopes();
+        let mut node_refs = Vec::new();
+
+        for scope in scopes {
+            let node_manager_name = scoped_node_manager(&scope);
+            let mut stream =
+                mesh.lookup_all_actors_scoped::<RemoteNodeManager>(&scope, &node_manager_name);
+
+            while let Some(result) = stream.next().await {
+                if let Ok(node_ref) = result
+                    && node_ref.id().peer_id() != Some(&local_peer_id)
+                {
+                    node_refs.push(node_ref);
+                }
+            }
+        }
+
+        node_refs.sort_by_key(|node_ref| node_ref.id().peer_id().copied());
+        node_refs.dedup_by(|a, b| a.id().peer_id() == b.id().peer_id());
 
         let mut all_remote = Vec::new();
         let mut timeout_count = 0usize;
-
-        // Collect all node refs first
-        let mut node_refs = Vec::new();
-        while let Some(result) = stream.next().await {
-            if let Ok(node_ref) = result
-                && node_ref.id().peer_id() != Some(&local_peer_id)
-            {
-                node_refs.push(node_ref);
-            }
-        }
 
         let node_count = node_refs.len();
         tracing::Span::current().record("node_count", node_count);

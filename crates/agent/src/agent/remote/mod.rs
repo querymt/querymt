@@ -24,12 +24,19 @@ pub mod node_manager;
 #[cfg(feature = "remote-internet")]
 pub mod qr;
 pub mod routing;
+pub mod scope;
 
 #[cfg(feature = "remote")]
 pub mod mesh;
 
 #[cfg(feature = "remote")]
 pub mod mesh_provider;
+
+#[cfg(feature = "remote")]
+pub mod mesh_runtime_config;
+
+#[cfg(feature = "remote")]
+pub mod runtime_handle;
 
 #[cfg(feature = "remote")]
 pub mod transport;
@@ -100,7 +107,7 @@ pub use mesh::join_mesh_via_invite;
 #[cfg(feature = "remote")]
 pub use mesh::{
     DirectoryMode, MeshConfig, MeshDiscovery, MeshError, MeshHandle, MeshTransportMode, PeerEvent,
-    bootstrap_mesh, bootstrap_mesh_default,
+    bootstrap_mesh, bootstrap_mesh_default, bootstrap_mesh_runtime,
 };
 #[cfg(feature = "remote")]
 pub use mesh_provider::MeshChatProvider;
@@ -133,6 +140,9 @@ pub use routing::{
     RoutingPolicy, RoutingSnapshot, RoutingSnapshotHandle, SetProviderTarget, SetSessionTarget,
     UnresolvePeer, new_routing_snapshot_handle,
 };
+#[cfg(feature = "remote")]
+pub use runtime_handle::{MeshRuntimeHandle, MeshScopeHandle};
+pub use scope::{MeshScopeId, MeshTransportKind};
 #[cfg(feature = "remote")]
 pub use session_stream_router::{
     AttachStreamConsumer, DetachStreamConsumer, GetRouterStatus, RequestPhase, RoutedRequestStatus,

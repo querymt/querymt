@@ -26,6 +26,7 @@ use crate::agent::remote::provider_host::{
     CancelProviderStreamRequest, GetProviderStreamStatus, ProviderChatRequest, ProviderHostActor,
     ProviderStreamRequest, ProviderStreamStatus, RenewProviderStreamLease, StreamRelayMessage,
 };
+use crate::agent::remote::scope::{MeshScopeId, scoped_node_manager, scoped_provider_host};
 use crate::agent::remote::session_stream_router::{AttachStreamConsumer, SessionStreamRouterActor};
 use futures_util::StreamExt;
 use kameo::actor::Spawn;
@@ -74,7 +75,7 @@ pub struct MeshChatProvider {
     model: String,
     /// Mesh handle used for DHT lookups and actor registration.
     mesh: MeshHandle,
-    /// DHT name of the target `ProviderHostActor`, e.g. `"provider_host::peer::<peer_id>"`.
+    /// DHT name of the target `ProviderHostActor` within the selected scope.
     target_dht_name: String,
     /// Per-session LLM parameters (system prompt, temperature, etc.) to forward
     /// to the remote `ProviderHostActor`.
@@ -88,7 +89,8 @@ pub struct MeshChatProvider {
 impl MeshChatProvider {
     fn target_peer_id(&self) -> Option<PeerId> {
         self.target_dht_name
-            .strip_prefix("provider_host::peer::")
+            .rsplit("::peer::")
+            .next()
             .and_then(|s| s.parse::<PeerId>().ok())
     }
 
@@ -157,11 +159,17 @@ impl MeshChatProvider {
     /// * `provider_name`  — provider plugin name (e.g. `"anthropic"`).
     /// * `model`          — model name (e.g. `"claude-sonnet-4-20250514"`).
     pub fn new(mesh: &MeshHandle, target_node_id: &str, provider_name: &str, model: &str) -> Self {
+        let peer_id = target_node_id.parse::<PeerId>().ok();
+        let target_scope = peer_id
+            .as_ref()
+            .and_then(|pid| mesh.best_route_for_peer(pid).map(|route| route.scope))
+            .unwrap_or(MeshScopeId::Lan);
+
         Self {
             provider_name: provider_name.to_string(),
             model: model.to_string(),
             mesh: mesh.clone(),
-            target_dht_name: super::dht_name::provider_host(&target_node_id),
+            target_dht_name: scoped_provider_host(&target_scope, &target_node_id),
             params: None,
             heartbeat_interval_secs: 10,
             lease_ttl_secs: 60,
@@ -1012,58 +1020,80 @@ pub(crate) async fn find_provider_on_mesh(
     use crate::agent::remote::node_manager::{GetNodeInfo, RemoteNodeManager};
     use crate::agent::remote::{ListAvailableModels, NodeInfo};
 
-    let mut stream = mesh.lookup_all_actors::<RemoteNodeManager>(super::dht_name::NODE_MANAGER);
     let mut peers_checked: u32 = 0;
+    let mut candidates: Vec<(PeerId, NodeId)> = Vec::new();
 
-    while let Some(node_ref_result) = stream.next().await {
-        let node_ref = match node_ref_result {
-            Ok(r) => r,
-            Err(e) => {
-                log::debug!("find_provider_on_mesh: DHT stream error: {}", e);
+    for scope in mesh.active_scopes() {
+        let node_manager_name = scoped_node_manager(&scope);
+        let mut stream = mesh.lookup_all_actors::<RemoteNodeManager>(node_manager_name);
+
+        while let Some(node_ref_result) = stream.next().await {
+            let node_ref = match node_ref_result {
+                Ok(r) => r,
+                Err(e) => {
+                    log::debug!("find_provider_on_mesh: DHT stream error: {}", e);
+                    continue;
+                }
+            };
+
+            peers_checked += 1;
+            tracing::Span::current().record("peers_checked", peers_checked);
+
+            let Some(peer_id) = node_ref.id().peer_id().copied() else {
+                continue;
+            };
+
+            // Ask for available models first (cheaper filter).
+            let models = match node_ref
+                .ask::<ListAvailableModels>(&ListAvailableModels)
+                .await
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    log::debug!("find_provider_on_mesh: ListAvailableModels failed: {}", e);
+                    continue;
+                }
+            };
+
+            if !models.iter().any(|m| m.provider == provider_name) {
                 continue;
             }
-        };
 
-        peers_checked += 1;
-        tracing::Span::current().record("peers_checked", peers_checked);
+            // This peer has the provider — ask for its stable node identity.
+            let node_info: NodeInfo = match node_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
+                Ok(info) => info,
+                Err(e) => {
+                    log::debug!(
+                        "find_provider_on_mesh: GetNodeInfo failed for peer with provider '{}': {}",
+                        provider_name,
+                        e
+                    );
+                    continue;
+                }
+            };
 
-        // Ask for available models first (cheaper filter).
-        let models = match node_ref
-            .ask::<ListAvailableModels>(&ListAvailableModels)
-            .await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                log::debug!("find_provider_on_mesh: ListAvailableModels failed: {}", e);
-                continue;
-            }
-        };
-
-        if !models.iter().any(|m| m.provider == provider_name) {
-            continue;
+            candidates.push((peer_id, node_info.node_id));
         }
+    }
 
-        // This peer has the provider — ask for its stable node identity.
-        let node_info: NodeInfo = match node_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
-            Ok(info) => info,
-            Err(e) => {
-                log::debug!(
-                    "find_provider_on_mesh: GetNodeInfo failed for peer with provider '{}': {}",
-                    provider_name,
-                    e
-                );
-                continue;
-            }
-        };
+    candidates.sort_by_key(|(peer_id, node_id)| {
+        let priority = mesh
+            .best_route_for_peer(peer_id)
+            .map(|route| route.priority)
+            .unwrap_or(0);
+        (std::cmp::Reverse(priority), node_id.to_string())
+    });
+    candidates.dedup_by(|a, b| a.0 == b.0);
 
+    if let Some((peer_id, node_id)) = candidates.first() {
         log::info!(
-            "find_provider_on_mesh: provider '{}' found on mesh peer '{}' ({}) (mesh fallback)",
+            "find_provider_on_mesh: provider '{}' selected mesh peer '{}' ({}) (mesh fallback)",
             provider_name,
-            node_info.hostname,
-            node_info.node_id
+            peer_id,
+            node_id
         );
         tracing::Span::current().record("found", true);
-        return Some(node_info.node_id);
+        return Some(node_id.clone());
     }
 
     tracing::Span::current().record("found", false);

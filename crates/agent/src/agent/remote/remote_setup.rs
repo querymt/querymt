@@ -10,11 +10,14 @@
 //!
 //! All functionality is feature-gated behind `#[cfg(feature = "remote")]`.
 
-use crate::agent::remote::mesh::{
-    MeshConfig, MeshDiscovery, MeshHandle, MeshTransportMode, bootstrap_mesh,
-};
+use crate::agent::remote::mesh::{MeshHandle, bootstrap_mesh_runtime};
+use crate::agent::remote::mesh_runtime_config::MeshRuntimeConfig;
 use crate::agent::remote::provider_host::ProviderHostActor;
-use crate::config::{MeshDiscoveryConfig, MeshTomlConfig, MeshTransportConfig, RemoteAgentConfig};
+use crate::agent::remote::runtime_handle::MeshRuntimeHandle;
+use crate::agent::remote::scope::{
+    scoped_node_manager, scoped_node_manager_for_peer, scoped_provider_host,
+};
+use crate::config::{MeshTomlConfig, RemoteAgentConfig};
 use crate::delegation::{AgentInfo, DefaultAgentRegistry};
 use anyhow::Result;
 use std::sync::Arc;
@@ -62,7 +65,6 @@ pub async fn spawn_and_register_local_mesh_actors_with_name(
     node_name: Option<String>,
 ) -> LocalMeshActorRefs {
     use crate::agent::remote::RemoteNodeManager;
-    use crate::agent::remote::dht_name;
     use kameo::actor::Spawn;
 
     let node_manager = RemoteNodeManager::new(
@@ -75,28 +77,34 @@ pub async fn spawn_and_register_local_mesh_actors_with_name(
         None => node_manager,
     };
     let node_manager_ref = RemoteNodeManager::spawn(node_manager);
+    let runtime = MeshRuntimeHandle::from(mesh.clone());
 
-    mesh.register_actor(node_manager_ref.clone(), dht_name::NODE_MANAGER)
-        .await;
-    log::info!(
-        "RemoteNodeManager registered in DHT as '{}'",
-        dht_name::NODE_MANAGER
-    );
+    for scope in runtime.active_scopes() {
+        let node_name = scoped_node_manager(&scope);
+        runtime
+            .register_actor(node_manager_ref.clone(), node_name.clone())
+            .await;
+        log::info!("RemoteNodeManager registered in DHT as '{}'", node_name);
 
-    let per_peer_name = dht_name::node_manager_for_peer(mesh.peer_id());
-    mesh.register_actor(node_manager_ref.clone(), per_peer_name.clone())
-        .await;
-    log::info!(
-        "RemoteNodeManager also registered in DHT as '{}'",
-        per_peer_name
-    );
+        let per_peer_name = scoped_node_manager_for_peer(&scope, mesh.peer_id());
+        runtime
+            .register_actor(node_manager_ref.clone(), per_peer_name.clone())
+            .await;
+        log::info!(
+            "RemoteNodeManager also registered in DHT as '{}'",
+            per_peer_name
+        );
+    }
 
     let provider_host = ProviderHostActor::new(handle.config.clone());
     let provider_host_ref = ProviderHostActor::spawn(provider_host);
-    let ph_dht_name = dht_name::provider_host(mesh.peer_id());
-    mesh.register_actor(provider_host_ref.clone(), ph_dht_name.clone())
-        .await;
-    log::info!("ProviderHostActor registered in DHT as '{}'", ph_dht_name);
+    for scope in runtime.active_scopes() {
+        let ph_dht_name = scoped_provider_host(&scope, mesh.peer_id());
+        runtime
+            .register_actor(provider_host_ref.clone(), ph_dht_name.clone())
+            .await;
+        log::info!("ProviderHostActor registered in DHT as '{}'", ph_dht_name);
+    }
 
     LocalMeshActorRefs {
         node_manager: node_manager_ref,
@@ -141,128 +149,80 @@ pub async fn setup_mesh_from_config(
     node_manager_ref: Option<kameo::actor::ActorRef<crate::agent::remote::RemoteNodeManager>>,
     agent_config: Option<Arc<crate::agent::agent_config::AgentConfig>>,
 ) -> Result<MeshSetupResult> {
-    // ── 1. Translate TOML discovery config to mesh::MeshDiscovery ────────────
+    // ── 1. Normalize TOML mesh config into MeshRuntimeConfig ─────────────────
 
-    let peers: Vec<String> = mesh_cfg.peers.iter().map(|p| p.addr.clone()).collect();
+    let runtime_config = MeshRuntimeConfig::from_toml_config(
+        mesh_cfg.enabled,
+        mesh_cfg.transport.clone(),
+        mesh_cfg.discovery.clone(),
+        mesh_cfg.listen.clone(),
+        mesh_cfg.peers.iter().map(|p| p.addr.clone()).collect(),
+        mesh_cfg.request_timeout_secs,
+        mesh_cfg.stream_reconnect_grace_secs,
+        mesh_cfg.identity_file.clone(),
+        mesh_cfg.invite.clone(),
+        mesh_cfg.node_name.clone(),
+        mesh_cfg.auto_fallback,
+        mesh_cfg.lan.clone(),
+        mesh_cfg.iroh.clone(),
+    )
+    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-    let discovery = match &mesh_cfg.discovery {
-        MeshDiscoveryConfig::Mdns => MeshDiscovery::Mdns,
-        MeshDiscoveryConfig::None => MeshDiscovery::None,
-        MeshDiscoveryConfig::Kademlia => MeshDiscovery::Kademlia {
-            bootstrap: peers.clone(),
-        },
-    };
-
-    // ── 1b. Parse invite token (if provided) ─────────────────────────────────
-    let invite = if let Some(ref invite_str) = mesh_cfg.invite {
-        let parsed = crate::agent::remote::invite::SignedInviteGrant::decode(invite_str)
-            .map_err(|e| anyhow::anyhow!("invalid mesh invite token: {e}"))?;
-        log::info!(
-            "Parsed mesh invite: inviter={}, name={:?}",
-            parsed.grant.inviter_peer_id,
-            parsed.grant.mesh_name
-        );
-        Some(parsed)
-    } else {
-        None
-    };
-
-    // When an invite is present, force iroh transport regardless of the
-    // explicit `transport` setting — invites only work over iroh.
-    let transport = if invite.is_some() {
-        MeshTransportMode::Iroh
-    } else {
-        match &mesh_cfg.transport {
-            MeshTransportConfig::Lan => MeshTransportMode::Lan,
-            MeshTransportConfig::Iroh => MeshTransportMode::Iroh,
-        }
-    };
-
-    let config = MeshConfig {
-        listen: mesh_cfg.listen.clone(),
-        discovery,
-        bootstrap_peers: if matches!(mesh_cfg.discovery, MeshDiscoveryConfig::Kademlia) {
-            // Already used as Kademlia bootstrap peers above.
-            vec![]
-        } else {
-            peers
-        },
-        directory: crate::agent::remote::mesh::DirectoryMode::default(),
-        request_timeout: std::time::Duration::from_secs(mesh_cfg.request_timeout_secs),
-        stream_reconnect_grace: std::time::Duration::from_secs(
-            mesh_cfg.stream_reconnect_grace_secs,
-        ),
-        transport,
-        identity_file: mesh_cfg
-            .identity_file
-            .as_ref()
-            .map(std::path::PathBuf::from),
-        invite,
-    };
-    let listen_addr_str = config.listen.as_deref().unwrap_or("<auto>").to_string();
+    let listen_addr_str = runtime_config
+        .lan
+        .as_ref()
+        .and_then(|l| l.listen.as_deref())
+        .unwrap_or("<auto>")
+        .to_string();
 
     // ── 2. Bootstrap the libp2p swarm ─────────────────────────────────────────
 
-    let mesh = if let Some(ref _invite) = config.invite {
-        #[cfg(feature = "remote-internet")]
-        {
-            let bootstrap_span = tracing::info_span!(
-                "remote.setup.join_mesh_via_invite",
-                inviter = %_invite.grant.inviter_peer_id,
-                mesh_name = ?_invite.grant.mesh_name,
-            );
-            super::mesh::join_mesh_via_invite(_invite, config.identity_file.clone())
-                .instrument(bootstrap_span)
-                .await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?
-        }
-        #[cfg(not(feature = "remote-internet"))]
-        {
-            return Err(anyhow::anyhow!(
-                "mesh invite requires the 'remote-internet' feature"
-            ));
-        }
-    } else {
+    let runtime = {
         let bootstrap_span = tracing::info_span!(
-            "remote.setup.bootstrap_mesh",
+            "remote.setup.bootstrap_mesh_runtime",
             listen = %listen_addr_str,
-            discovery = ?mesh_cfg.discovery,
+            transports = ?runtime_config.enabled_transports(),
+            scopes = ?runtime_config.active_scopes(),
         );
-        bootstrap_mesh(&config)
+        bootstrap_mesh_runtime(&runtime_config)
             .instrument(bootstrap_span)
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?
     };
+    let mesh = runtime.as_mesh_handle().clone();
     tracing::Span::current().record("peer_id", mesh.peer_id().to_string());
     log::info!("Kameo mesh bootstrapped (peer_id={})", mesh.peer_id());
 
     // ── 3. Register the local RemoteNodeManager in the DHT (if provided) ──────
 
     if let Some(nm_ref) = node_manager_ref {
-        // Register under the global name so lookup_all_actors (used by
-        // list_remote_nodes) can discover this node alongside all others.
-        let reg_span = tracing::info_span!(
-            "remote.setup.register_node_manager",
-            dht_name = super::dht_name::NODE_MANAGER
-        );
-        mesh.register_actor(nm_ref.clone(), super::dht_name::NODE_MANAGER)
-            .instrument(reg_span)
-            .await;
-        log::info!(
-            "Local RemoteNodeManager registered in DHT as '{}'",
-            super::dht_name::NODE_MANAGER
-        );
+        for scope in runtime.active_scopes() {
+            let dht_name = scoped_node_manager(&scope);
+            let reg_span = tracing::info_span!(
+                "remote.setup.register_node_manager",
+                dht_name = %dht_name,
+                scope = %scope,
+            );
+            runtime
+                .register_actor(nm_ref.clone(), dht_name.clone())
+                .instrument(reg_span)
+                .await;
+            log::info!(
+                "Local RemoteNodeManager registered in DHT as '{}'",
+                dht_name
+            );
 
-        // Also register under the per-peer name so find_node_manager can do a
-        // direct O(1) lookup by peer_id, bypassing the is_peer_alive gate that
-        // guards the lookup_all_actors scan. This makes create_remote_session
-        // robust against mDNS TTL expiry (30 s) on cross-machine setups.
-        let per_peer_name = super::dht_name::node_manager_for_peer(mesh.peer_id());
-        mesh.register_actor(nm_ref, per_peer_name.clone()).await;
-        log::info!(
-            "Local RemoteNodeManager also registered in DHT as '{}'",
-            per_peer_name
-        );
+            // Also register under the per-peer name so find_node_manager can do a
+            // direct O(1) lookup by peer_id.
+            let per_peer_name = scoped_node_manager_for_peer(&scope, mesh.peer_id());
+            runtime
+                .register_actor(nm_ref.clone(), per_peer_name.clone())
+                .await;
+            log::info!(
+                "Local RemoteNodeManager also registered in DHT as '{}'",
+                per_peer_name
+            );
+        }
     }
 
     // ── 3b. Spawn and register ProviderHostActor (if agent_config provided) ──
@@ -271,21 +231,23 @@ pub async fn setup_mesh_from_config(
         use kameo::actor::Spawn;
 
         let hostname = get_hostname();
-        let dht_name = super::dht_name::provider_host(mesh.peer_id());
 
         let actor = ProviderHostActor::new(config);
         let actor_ref = ProviderHostActor::spawn(actor);
-        {
+        for scope in runtime.active_scopes() {
+            let dht_name = scoped_provider_host(&scope, mesh.peer_id());
             let reg_span = tracing::info_span!(
                 "remote.setup.spawn_provider_host",
                 hostname = %hostname,
                 dht_name = %dht_name,
+                scope = %scope,
             );
-            mesh.register_actor(actor_ref.clone(), dht_name.clone())
+            runtime
+                .register_actor(actor_ref.clone(), dht_name.clone())
                 .instrument(reg_span)
                 .await;
+            log::info!("ProviderHostActor registered in DHT as '{}'", dht_name);
         }
-        log::info!("ProviderHostActor registered in DHT as '{}'", dht_name);
         Some(actor_ref)
     } else {
         None

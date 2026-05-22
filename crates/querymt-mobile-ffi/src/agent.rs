@@ -71,6 +71,13 @@ pub fn init_agent_from_config(config: Config, out_agent: *mut u64) -> Result<(),
 }
 
 async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
+    if let Some(handle) = state::attach_existing_runtime_agent() {
+        log::info!(
+            "ffi.agent.attach: attached to existing process runtime (agent_handle={handle})"
+        );
+        return Ok(handle);
+    }
+
     // Bootstrap providers metadata cache (models.dev.json) so that
     // get_model_info() can resolve context limits, pricing, etc.
     // Best-effort: if the device is offline on first launch the cache
@@ -125,7 +132,15 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
         }
     };
 
-    let handle = state::insert_agent(agent, storage, plugin_registry.clone());
+    let (handle, reused_runtime) = state::attach_or_insert_runtime_agent(agent, storage);
+
+    if reused_runtime {
+        log::info!(
+            "ffi.agent.attach: attached to existing process runtime (agent_handle={handle})"
+        );
+    } else {
+        log::info!("ffi.runtime.init: initialized process runtime (agent_handle={handle})");
+    }
 
     // Store mesh config diagnostics so mesh_status can report them.
     #[cfg(feature = "remote")]
@@ -160,15 +175,19 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
 }
 
 pub fn shutdown_agent_inner(agent_handle: u64) -> Result<(), FfiErrorCode> {
-    let mut record = state::remove_agent(agent_handle)?;
-    if record.call_tracker.has_active_calls(agent_handle) {
-        let _ = state::insert_agent(record.agent, record.storage, record.plugin_registry);
+    let has_active_calls = state::with_agent_read(agent_handle, |record| {
+        Ok(record.call_tracker.has_active_calls(agent_handle))
+    })?;
+    if has_active_calls {
         set_last_error(FfiErrorCode::Busy, "Agent has active FFI calls".into());
         return Err(FfiErrorCode::Busy);
     }
+
+    let mut record = state::remove_agent(agent_handle)?;
     mcp::unregister_all_mcp_for_agent(agent_handle);
     record.sessions.clear();
     drop(record);
+    log::info!("ffi.agent.detach: detached logical agent (agent_handle={agent_handle})");
     Ok(())
 }
 

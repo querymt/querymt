@@ -7,6 +7,10 @@ use crate::acp::cwd::acp_cwd_to_optional;
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, SessionRuntime};
 use crate::agent::remote::SessionActorRef;
+#[cfg(feature = "remote")]
+use crate::agent::remote::runtime_handle::MeshRuntimeHandle;
+#[cfg(feature = "remote")]
+use crate::agent::remote::scope::{scoped_event_relay, scoped_session};
 use crate::agent::session_actor::SessionActor;
 use crate::error::AgentError;
 use crate::events::AgentEventKind;
@@ -150,15 +154,19 @@ impl SessionRegistry {
     /// and attach to them.
     #[cfg(feature = "remote")]
     pub fn set_mesh(&mut self, mesh: Option<crate::agent::remote::MeshHandle>) {
-        // Register all existing local sessions in DHT so remote peers can attach.
+        // Register all existing local sessions in each active scope so remote peers can attach.
         if let Some(ref mesh) = mesh {
+            let runtime = MeshRuntimeHandle::from(mesh.clone());
+            let scopes = runtime.active_scopes();
             for (session_id, actor_ref) in &self.local_actor_refs {
-                let dht_name = crate::agent::remote::dht_name::session(session_id);
-                let mesh = mesh.clone();
-                let actor_ref = actor_ref.clone();
-                tokio::spawn(async move {
-                    mesh.register_actor(actor_ref, dht_name).await;
-                });
+                for scope in &scopes {
+                    let dht_name = scoped_session(scope, session_id);
+                    let runtime = runtime.clone();
+                    let actor_ref = actor_ref.clone();
+                    tokio::spawn(async move {
+                        runtime.register_actor(actor_ref, dht_name).await;
+                    });
+                }
             }
         }
         self.mesh = mesh;
@@ -335,12 +343,15 @@ impl SessionRegistry {
         if options.register_in_dht
             && let Some(ref mesh) = self.mesh
         {
-            let dht_name = crate::agent::remote::dht_name::session(&session_id);
-            let mesh = mesh.clone();
-            let actor_ref = actor_ref.clone();
-            tokio::spawn(async move {
-                mesh.register_actor(actor_ref, dht_name).await;
-            });
+            let runtime = MeshRuntimeHandle::from(mesh.clone());
+            for scope in runtime.active_scopes() {
+                let dht_name = scoped_session(&scope, &session_id);
+                let runtime = runtime.clone();
+                let actor_ref = actor_ref.clone();
+                tokio::spawn(async move {
+                    runtime.register_actor(actor_ref, dht_name).await;
+                });
+            }
         }
 
         Ok(SessionMaterialization { actor_ref, runtime })
@@ -445,9 +456,22 @@ impl SessionRegistry {
         //    session without overwriting each other's relay (Bug 3 fix).
         let mesh_active = mesh.is_some();
         let relay_dht_name = if let Some(ref mesh) = mesh {
-            let name = crate::agent::remote::dht_name::event_relay(&session_id, mesh.peer_id());
-            mesh.register_actor(relay_ref.clone(), name.clone()).await;
-            name
+            let runtime = MeshRuntimeHandle::from(mesh.clone());
+            let mut names = Vec::new();
+            for scope in runtime.active_scopes() {
+                let name = scoped_event_relay(&scope, &session_id, mesh.peer_id());
+                runtime
+                    .register_actor(relay_ref.clone(), name.clone())
+                    .await;
+                names.push(name);
+            }
+            names.into_iter().next().unwrap_or_else(|| {
+                scoped_event_relay(
+                    &crate::agent::remote::scope::MeshScopeId::Lan,
+                    &session_id,
+                    mesh.peer_id(),
+                )
+            })
         } else {
             log::debug!(
                 "attach_remote_session: no mesh, DHT registration skipped for relay (session {})",
@@ -559,11 +583,13 @@ impl SessionRegistry {
         // Deregister the session and relay actors from the re-registration map
         // so dead closures don't accumulate (Phase 4 of Bug 1 fix).
         if let Some(ref mesh) = self.mesh {
-            let session_dht_name = crate::agent::remote::dht_name::session(session_id);
-            mesh.deregister_actor(&session_dht_name);
+            let runtime = MeshRuntimeHandle::from(mesh.clone());
+            for scope in runtime.active_scopes() {
+                let session_dht_name = scoped_session(&scope, session_id);
+                runtime.deregister_actor(&session_dht_name);
 
-            if let Some((_, relay_name)) = self.relay_actor_ids.get(session_id) {
-                mesh.deregister_actor(relay_name);
+                let relay_name = scoped_event_relay(&scope, session_id, mesh.peer_id());
+                runtime.deregister_actor(&relay_name);
             }
         }
 

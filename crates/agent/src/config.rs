@@ -608,6 +608,64 @@ pub enum MeshTransportConfig {
     Iroh,
 }
 
+/// LAN mesh sub-configuration for multi-transport setups.
+///
+/// In TOML:
+/// ```toml
+/// [mesh.lan]
+/// enabled = true
+/// discovery = "mdns"
+/// listen = "/ip4/0.0.0.0/tcp/0"
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct LanMeshTomlConfig {
+    /// Whether the LAN transport is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Multiaddr to listen on for LAN connections.
+    ///
+    /// Falls back to `[mesh] listen` when absent.
+    #[serde(default)]
+    pub listen: Option<String>,
+
+    /// Discovery strategy for LAN peers.
+    #[serde(default)]
+    pub discovery: MeshDiscoveryConfig,
+}
+
+/// Iroh mesh scope sub-configuration for multi-transport setups.
+///
+/// In TOML (array of tables):
+/// ```toml
+/// [[mesh.iroh]]
+/// enabled = true
+/// invite = "..."
+/// name = "personal"
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IrohMeshTomlConfig {
+    /// Whether this Iroh scope is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Invite token string to join an existing Iroh mesh.
+    ///
+    /// When set, the `mesh_id` is derived from the invite grant.
+    /// Supports `${VAR}` interpolation.
+    #[serde(default)]
+    pub invite: Option<String>,
+
+    /// Human-readable name for this Iroh scope.
+    ///
+    /// Used as the `mesh_id` when `invite` is absent, or as a display
+    /// label alongside the invite-derived mesh_id.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 fn default_mesh_listen() -> Option<String> {
     Some("/ip4/0.0.0.0/tcp/0".to_string())
 }
@@ -706,6 +764,22 @@ pub struct MeshTomlConfig {
     /// Useful on mobile where the OS hostname is often meaningless ("unknown").
     #[serde(default)]
     pub node_name: Option<String>,
+
+    /// LAN transport sub-configuration (new multi-transport syntax).
+    ///
+    /// When present and `enabled = true`, the LAN transport is activated
+    /// alongside any Iroh scopes.  Takes precedence over the legacy
+    /// `transport` and `discovery` fields for LAN configuration.
+    #[serde(default)]
+    pub lan: Option<LanMeshTomlConfig>,
+
+    /// Iroh mesh scopes (new multi-transport syntax).
+    ///
+    /// Each entry represents a logical Iroh mesh scope.  When present and
+    /// at least one entry has `enabled = true`, the Iroh transport is
+    /// activated alongside LAN (if also enabled).
+    #[serde(default)]
+    pub iroh: Vec<IrohMeshTomlConfig>,
 }
 
 impl Default for MeshTomlConfig {
@@ -722,6 +796,8 @@ impl Default for MeshTomlConfig {
             identity_file: None,
             invite: None,
             node_name: None,
+            lan: None,
+            iroh: Vec::new(),
         }
     }
 }
@@ -2658,5 +2734,122 @@ system = ["You are powered by {{ provider }}/{{ model }}."]
             first.get("agent").and_then(|a| a.get("model")).is_some(),
             "First example must have agent.model"
         );
+    }
+
+    // ── Multi-transport mesh config TOML parsing ────────────────────────────
+
+    #[test]
+    fn test_old_mesh_config_parses_without_new_fields() {
+        let toml = r#"
+[agent]
+provider = "anthropic"
+model = "claude-3-5-sonnet"
+
+[mesh]
+enabled = true
+transport = "lan"
+discovery = "mdns"
+"#;
+        let config: SingleAgentConfig = toml::from_str(toml).expect("TOML should parse");
+        assert!(config.mesh.enabled);
+        assert_eq!(config.mesh.transport, MeshTransportConfig::Lan);
+        assert_eq!(config.mesh.discovery, MeshDiscoveryConfig::Mdns);
+        assert!(config.mesh.lan.is_none());
+        assert!(config.mesh.iroh.is_empty());
+    }
+
+    #[test]
+    fn test_new_mesh_config_with_lan_subtable() {
+        let toml = r#"
+[agent]
+provider = "anthropic"
+model = "claude-3-5-sonnet"
+
+[mesh]
+enabled = true
+
+[mesh.lan]
+enabled = true
+listen = "/ip4/0.0.0.0/tcp/0"
+discovery = "mdns"
+"#;
+        let config: SingleAgentConfig = toml::from_str(toml).expect("TOML should parse");
+        assert!(config.mesh.enabled);
+        let lan = config.mesh.lan.as_ref().expect("lan should be present");
+        assert!(lan.enabled);
+        assert_eq!(lan.listen.as_deref(), Some("/ip4/0.0.0.0/tcp/0"));
+        assert_eq!(lan.discovery, MeshDiscoveryConfig::Mdns);
+    }
+
+    #[test]
+    fn test_new_mesh_config_with_iroh_array() {
+        let toml = r#"
+[agent]
+provider = "anthropic"
+model = "claude-3-5-sonnet"
+
+[mesh]
+enabled = true
+
+[[mesh.iroh]]
+enabled = true
+name = "personal"
+invite = "test-invite-token"
+"#;
+        let config: SingleAgentConfig = toml::from_str(toml).expect("TOML should parse");
+        assert!(config.mesh.enabled);
+        assert_eq!(config.mesh.iroh.len(), 1);
+        assert!(config.mesh.iroh[0].enabled);
+        assert_eq!(config.mesh.iroh[0].name.as_deref(), Some("personal"));
+        assert_eq!(
+            config.mesh.iroh[0].invite.as_deref(),
+            Some("test-invite-token")
+        );
+    }
+
+    #[test]
+    fn test_new_mesh_config_lan_plus_iroh() {
+        let toml = r#"
+[agent]
+provider = "anthropic"
+model = "claude-3-5-sonnet"
+
+[mesh]
+enabled = true
+
+[mesh.lan]
+enabled = true
+discovery = "mdns"
+
+[[mesh.iroh]]
+enabled = true
+name = "team-a"
+
+[[mesh.iroh]]
+enabled = true
+name = "team-b"
+"#;
+        let config: SingleAgentConfig = toml::from_str(toml).expect("TOML should parse");
+        assert!(config.mesh.enabled);
+        assert!(config.mesh.lan.as_ref().unwrap().enabled);
+        assert_eq!(config.mesh.iroh.len(), 2);
+        assert_eq!(config.mesh.iroh[0].name.as_deref(), Some("team-a"));
+        assert_eq!(config.mesh.iroh[1].name.as_deref(), Some("team-b"));
+    }
+
+    #[test]
+    fn test_mesh_config_defaults_no_new_fields() {
+        let toml = r#"
+[agent]
+provider = "anthropic"
+model = "claude-3-5-sonnet"
+
+[mesh]
+enabled = false
+"#;
+        let config: SingleAgentConfig = toml::from_str(toml).expect("TOML should parse");
+        assert!(!config.mesh.enabled);
+        assert!(config.mesh.lan.is_none());
+        assert!(config.mesh.iroh.is_empty());
     }
 }

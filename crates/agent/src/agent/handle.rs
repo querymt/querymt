@@ -1157,6 +1157,7 @@ impl LocalAgentHandle {
                         let key = format!("peer:{peer_id}");
                         cache.by_label.write().remove(&key);
                     }
+                    Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         cache
@@ -1300,30 +1301,34 @@ impl LocalAgentHandle {
         // name (for this O(1) lookup). The per-peer lookup bypasses the
         // is_peer_alive gate that guards the fallback scan, so it works even
         // when mDNS has temporarily expired the peer's heartbeat.
-        let direct_dht_name = crate::agent::remote::dht_name::node_manager_for_peer(&node_id);
-        match mesh
-            .lookup_actor::<RemoteNodeManager>(direct_dht_name.clone())
-            .await
-        {
-            Ok(Some(node_manager_ref)) => {
-                log::debug!(
-                    "find_node_manager: fast-path DHT hit for '{}'",
-                    direct_dht_name
-                );
-                return Ok(node_manager_ref);
-            }
-            Ok(None) => {
-                log::debug!(
-                    "find_node_manager: no direct DHT entry for '{}', falling back to scan",
-                    direct_dht_name
-                );
-            }
-            Err(e) => {
-                log::debug!(
-                    "find_node_manager: direct DHT lookup error for '{}': {}, falling back to scan",
-                    direct_dht_name,
-                    e
-                );
+        let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+        for scope in runtime.active_scopes() {
+            let direct_dht_name =
+                crate::agent::remote::scope::scoped_node_manager_for_peer(&scope, &node_id);
+            match runtime
+                .lookup_actor::<RemoteNodeManager>(direct_dht_name.clone())
+                .await
+            {
+                Ok(Some(node_manager_ref)) => {
+                    log::debug!(
+                        "find_node_manager: fast-path DHT hit for '{}'",
+                        direct_dht_name
+                    );
+                    return Ok(node_manager_ref);
+                }
+                Ok(None) => {
+                    log::debug!(
+                        "find_node_manager: no direct DHT entry for '{}', trying next scope",
+                        direct_dht_name
+                    );
+                }
+                Err(e) => {
+                    log::debug!(
+                        "find_node_manager: direct DHT lookup error for '{}': {}, trying next scope",
+                        direct_dht_name,
+                        e
+                    );
+                }
             }
         }
 
@@ -1337,43 +1342,46 @@ impl LocalAgentHandle {
         let timeout = Self::remote_node_info_timeout();
         let concurrency = Self::remote_node_lookup_parallelism();
         let semaphore = Arc::new(Semaphore::new(concurrency));
-        let mut stream = mesh
-            .lookup_all_actors::<RemoteNodeManager>(crate::agent::remote::dht_name::NODE_MANAGER);
         let mut lookups = FuturesUnordered::new();
 
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(node_manager_ref) => {
-                    let peer_id = node_manager_ref.id().peer_id().copied();
-                    if peer_id == Some(local_peer_id) {
-                        continue;
-                    }
-                    // No is_peer_alive check here — we contact the peer
-                    // directly and let the GetNodeInfo timeout decide.
-
-                    let cache_key =
-                        Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
-                    if let Some(info) = self.get_cached_remote_node(&cache_key) {
-                        if info.node_id.to_string() == node_id {
-                            return Ok(node_manager_ref);
+        for scope in runtime.active_scopes() {
+            let mut stream = runtime.lookup_all_actors::<RemoteNodeManager>(
+                crate::agent::remote::scope::scoped_node_manager(&scope),
+            );
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(node_manager_ref) => {
+                        let peer_id = node_manager_ref.id().peer_id().copied();
+                        if peer_id == Some(local_peer_id) {
+                            continue;
                         }
-                        continue;
-                    }
+                        // No is_peer_alive check here — we contact the peer
+                        // directly and let the GetNodeInfo timeout decide.
 
-                    let semaphore = Arc::clone(&semaphore);
-                    lookups.push(async move {
-                        let permit = semaphore.acquire_owned().await.ok();
-                        let res = tokio::time::timeout(
-                            timeout,
-                            node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
-                        )
-                        .await;
-                        drop(permit);
-                        (node_manager_ref, cache_key, peer_id, res)
-                    });
-                }
-                Err(e) => {
-                    log::warn!("find_node_manager: lookup error: {}", e);
+                        let cache_key =
+                            Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
+                        if let Some(info) = self.get_cached_remote_node(&cache_key) {
+                            if info.node_id.to_string() == node_id {
+                                return Ok(node_manager_ref);
+                            }
+                            continue;
+                        }
+
+                        let semaphore = Arc::clone(&semaphore);
+                        lookups.push(async move {
+                            let permit = semaphore.acquire_owned().await.ok();
+                            let res = tokio::time::timeout(
+                                timeout,
+                                node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
+                            )
+                            .await;
+                            drop(permit);
+                            (node_manager_ref, cache_key, peer_id, res)
+                        });
+                    }
+                    Err(e) => {
+                        log::warn!("find_node_manager: lookup error: {}", e);
+                    }
                 }
             }
         }
@@ -1683,15 +1691,25 @@ impl LocalAgentHandle {
             .mesh()
             .ok_or(crate::error::AgentError::MeshNotBootstrapped)?;
 
-        let dht_name = crate::agent::remote::dht_name::session(&bookmark.session_id);
-        let remote_ref = mesh
-            .lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name.clone())
-            .await
-            .map_err(|e| crate::error::AgentError::SwarmLookupFailed {
-                key: dht_name.clone(),
-                reason: e.to_string(),
-            })?
-            .ok_or_else(|| crate::error::AgentError::RemoteSessionNotFound {
+        let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+        let mut remote_ref = None;
+        for scope in runtime.active_scopes() {
+            let dht_name =
+                crate::agent::remote::scope::scoped_session(&scope, &bookmark.session_id);
+            let lookup = runtime
+                .lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name.clone())
+                .await
+                .map_err(|e| crate::error::AgentError::SwarmLookupFailed {
+                    key: dht_name.clone(),
+                    reason: e.to_string(),
+                })?;
+            if lookup.is_some() {
+                remote_ref = lookup;
+                break;
+            }
+        }
+        let remote_ref =
+            remote_ref.ok_or_else(|| crate::error::AgentError::RemoteSessionNotFound {
                 details: format!(
                     "bookmarked session {} not found in DHT",
                     bookmark.session_id
@@ -1726,15 +1744,27 @@ impl LocalAgentHandle {
             .mesh()
             .ok_or(crate::error::AgentError::MeshNotBootstrapped)?;
 
-        let dht_name = crate::agent::remote::dht_name::session(&bookmark.session_id);
-        let remote_ref = mesh
-            .lookup_actor_no_retry::<crate::agent::session_actor::SessionActor>(dht_name.clone())
-            .await
-            .map_err(|e| crate::error::AgentError::SwarmLookupFailed {
-                key: dht_name.clone(),
-                reason: e.to_string(),
-            })?
-            .ok_or_else(|| crate::error::AgentError::RemoteSessionNotFound {
+        let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+        let mut remote_ref = None;
+        for scope in runtime.active_scopes() {
+            let dht_name =
+                crate::agent::remote::scope::scoped_session(&scope, &bookmark.session_id);
+            let lookup = runtime
+                .lookup_actor_no_retry::<crate::agent::session_actor::SessionActor>(
+                    dht_name.clone(),
+                )
+                .await
+                .map_err(|e| crate::error::AgentError::SwarmLookupFailed {
+                    key: dht_name.clone(),
+                    reason: e.to_string(),
+                })?;
+            if lookup.is_some() {
+                remote_ref = lookup;
+                break;
+            }
+        }
+        let remote_ref =
+            remote_ref.ok_or_else(|| crate::error::AgentError::RemoteSessionNotFound {
                 details: format!(
                     "bookmarked session {} not found in DHT",
                     bookmark.session_id
@@ -1779,23 +1809,30 @@ impl LocalAgentHandle {
                 let mesh = self.mesh().ok_or_else(|| {
                     agent_client_protocol::Error::from(AgentError::MeshNotBootstrapped)
                 })?;
-                let dht_name = crate::agent::remote::dht_name::session(session_id);
-                mesh.lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name)
-                    .await
-                    .map_err(|e| {
-                        agent_client_protocol::Error::from(AgentError::SwarmLookupFailed {
-                            key: session_id.to_string(),
-                            reason: e.to_string(),
-                        })
-                    })?
-                    .ok_or_else(|| {
-                        agent_client_protocol::Error::from(AgentError::RemoteSessionNotFound {
-                            details: format!(
-                                "session {} registered but not found in DHT after lookup",
-                                session_id
-                            ),
-                        })
-                    })
+                let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+                for scope in runtime.active_scopes() {
+                    let dht_name = crate::agent::remote::scope::scoped_session(&scope, session_id);
+                    if let Some(found) = runtime
+                        .lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name)
+                        .await
+                        .map_err(|e| {
+                            agent_client_protocol::Error::from(AgentError::SwarmLookupFailed {
+                                key: session_id.to_string(),
+                                reason: e.to_string(),
+                            })
+                        })?
+                    {
+                        return Ok(found);
+                    }
+                }
+                Err(agent_client_protocol::Error::from(
+                    AgentError::RemoteSessionNotFound {
+                        details: format!(
+                            "session {} registered but not found in DHT after lookup",
+                            session_id
+                        ),
+                    },
+                ))
             }
             crate::agent::remote::node_manager::SessionHandoff::NoAttachPath => Err(
                 agent_client_protocol::Error::from(AgentError::RemoteSessionNotFound {
@@ -2616,7 +2653,7 @@ impl SendAgent for LocalAgentHandle {
                         let result = serde_json::json!({
                             "enabled": true,
                             "peer_id": mesh.peer_id().to_string(),
-                            "transport": if mesh.is_iroh_transport() { "iroh" } else { "lan" },
+                            "transport": if mesh.is_iroh_transport_internal() { "iroh" } else { "lan" },
                             "known_peer_count": mesh.known_peer_ids().len(),
                             "has_invite_store": mesh.invite_store().is_some(),
                             "has_membership_store": mesh.membership_store().is_some(),
@@ -2757,28 +2794,14 @@ impl SendAgent for LocalAgentHandle {
                         .create_remote_session(&nm_ref, parsed.cwd.clone())
                         .await?;
 
-                    let remote_ref = self.resolve_handoff(&resp.session_id, resp.handoff).await?;
-
-                    let peer_label = self
-                        .list_remote_nodes()
-                        .await
-                        .into_iter()
-                        .find(|n| n.node_id.to_string() == parsed.node_id)
-                        .map(|n| n.hostname)
-                        .unwrap_or_else(|| parsed.node_id.clone());
-
-                    self.attach_remote_session(
-                        resp.session_id.clone(),
-                        remote_ref,
-                        peer_label,
-                        Some(parsed.node_id.clone()),
-                    )
-                    .await;
-
+                    // Session is created on the remote node but NOT attached
+                    // to the local registry here. The caller must call
+                    // querymt/remote/attachSession to subscribe to session
+                    // events and hydrate the local view.
                     return ext_json_response(&serde_json::json!({
                         "sessionId": resp.session_id,
                         "nodeId": parsed.node_id,
-                        "attached": true,
+                        "attached": false,
                         "configOptions": [],
                     }));
                 }
@@ -2926,7 +2949,7 @@ impl SendAgent for LocalAgentHandle {
                         ));
                     };
 
-                    if !mesh.is_iroh_transport() {
+                    if !mesh.is_iroh_transport_internal() {
                         return ext_json_response(&serde_json::json!({
                             "error": "mesh invites require iroh transport; restart host with --mesh --mesh-invite (or set transport=iroh)"
                         }));

@@ -21,6 +21,10 @@ use crate::acp::cwd::acp_cwd_to_optional;
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::SessionRuntime;
 use crate::agent::remote::SessionActorRef;
+#[cfg(feature = "remote")]
+use crate::agent::remote::runtime_handle::MeshRuntimeHandle;
+#[cfg(feature = "remote")]
+use crate::agent::remote::scope::scoped_session;
 use crate::agent::session_actor::SessionActor;
 use crate::agent::session_registry::{
     PreconnectedMcpPeer, SessionMaterialization, SessionMaterializationOptions, SessionRegistry,
@@ -456,12 +460,15 @@ impl SessionMaterializer {
         if prepared.register_in_dht
             && let Some(mesh) = self.mesh()
         {
-            let dht_name = crate::agent::remote::dht_name::session(&prepared.session_id);
-            let mesh = mesh.clone();
-            let actor_ref = prepared.actor_ref.clone();
-            tokio::spawn(async move {
-                mesh.register_actor(actor_ref, dht_name).await;
-            });
+            let runtime = MeshRuntimeHandle::from(mesh.clone());
+            for scope in runtime.active_scopes() {
+                let dht_name = scoped_session(&scope, &prepared.session_id);
+                let runtime = runtime.clone();
+                let actor_ref = prepared.actor_ref.clone();
+                tokio::spawn(async move {
+                    runtime.register_actor(actor_ref, dht_name).await;
+                });
+            }
         }
 
         // Emit SessionCreated event

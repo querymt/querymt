@@ -18,26 +18,31 @@ static HANDLE_STATE: once_cell::sync::Lazy<Mutex<HandleMap>> =
 /// The inner handle map.
 struct HandleMap {
     agents: HashMap<AgentHandle, AgentRecord>,
+    runtime: Option<RuntimeRecord>,
 }
 
 impl HandleMap {
     fn new() -> Self {
         Self {
             agents: HashMap::new(),
+            runtime: None,
         }
     }
 }
 
+struct RuntimeRecord {
+    agent: Arc<querymt_agent::api::Agent>,
+    storage: Arc<dyn querymt_agent::session::backend::StorageBackend>,
+    attached_agents: usize,
+}
+
 /// All state tracked per-agent handle.
 pub struct AgentRecord {
-    /// The constructed QueryMT Agent.
-    pub agent: querymt_agent::api::Agent,
+    /// Shared process-wide QueryMT Agent runtime.
+    pub agent: Arc<querymt_agent::api::Agent>,
 
-    /// The storage backend (kept alive so sessions persist).
-    pub storage: Arc<dyn querymt_agent::session::backend::StorageBackend>,
-
-    /// The plugin registry (kept alive for model listing).
-    pub plugin_registry: Arc<querymt::plugin::host::PluginRegistry>,
+    /// View store shared from the process runtime storage.
+    pub view_store: Option<Arc<dyn querymt_agent::session::projection::ViewStore>>,
 
     /// Keepalive refs for local mesh actors registered by the mobile FFI.
     #[cfg(feature = "remote")]
@@ -73,19 +78,36 @@ pub struct SessionRecord {
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 /// Insert a new agent record, returning its opaque handle.
-pub fn insert_agent(
+pub fn attach_or_insert_runtime_agent(
     agent: querymt_agent::api::Agent,
     storage: Arc<dyn querymt_agent::session::backend::StorageBackend>,
-    plugin_registry: Arc<querymt::plugin::host::PluginRegistry>,
-) -> AgentHandle {
+) -> (AgentHandle, bool) {
     let handle = new_agent_handle();
     let mut state = HANDLE_STATE.lock();
+
+    if state.runtime.is_none() {
+        state.runtime = Some(RuntimeRecord {
+            agent: Arc::new(agent),
+            storage,
+            attached_agents: 0,
+        });
+    }
+
+    let (agent_arc, view_store, reused) = {
+        let runtime = state.runtime.as_mut().expect("runtime initialized above");
+        runtime.attached_agents = runtime.attached_agents.saturating_add(1);
+        (
+            Arc::clone(&runtime.agent),
+            runtime.storage.view_store(),
+            runtime.attached_agents > 1,
+        )
+    };
+
     state.agents.insert(
         handle,
         AgentRecord {
-            agent,
-            storage,
-            plugin_registry,
+            agent: agent_arc,
+            view_store,
             #[cfg(feature = "remote")]
             local_mesh_actors: None,
             mesh_listen: None,
@@ -96,7 +118,56 @@ pub fn insert_agent(
             shutdown: false,
         },
     );
-    handle
+    (handle, reused)
+}
+
+pub fn attach_existing_runtime_agent() -> Option<AgentHandle> {
+    let handle = new_agent_handle();
+    let mut state = HANDLE_STATE.lock();
+    let (agent_arc, view_store) = {
+        let runtime = state.runtime.as_mut()?;
+        runtime.attached_agents = runtime.attached_agents.saturating_add(1);
+        (Arc::clone(&runtime.agent), runtime.storage.view_store())
+    };
+
+    state.agents.insert(
+        handle,
+        AgentRecord {
+            agent: agent_arc,
+            view_store,
+            #[cfg(feature = "remote")]
+            local_mesh_actors: None,
+            mesh_listen: None,
+            mesh_discovery: None,
+            call_tracker: Arc::new(ActiveCallTracker::new()),
+            sessions: HashMap::new(),
+            event_callbacks: None,
+            shutdown: false,
+        },
+    );
+    Some(handle)
+}
+
+pub fn runtime_attached_agents() -> usize {
+    let state = HANDLE_STATE.lock();
+    state
+        .runtime
+        .as_ref()
+        .map_or(0, |runtime| runtime.attached_agents)
+}
+
+pub fn shutdown_runtime_if_idle() -> Result<bool, FfiErrorCode> {
+    let mut state = HANDLE_STATE.lock();
+    let Some(runtime) = state.runtime.as_ref() else {
+        return Ok(false);
+    };
+
+    if runtime.attached_agents > 0 || !state.agents.is_empty() {
+        return Err(FfiErrorCode::Busy);
+    }
+
+    state.runtime = None;
+    Ok(true)
 }
 
 /// Look up an agent record by handle. Returns `None` if not found or shut down.
@@ -147,6 +218,11 @@ pub fn remove_agent(handle: AgentHandle) -> Result<AgentRecord, FfiErrorCode> {
     let mut state = HANDLE_STATE.lock();
     let mut record = state.agents.remove(&handle).ok_or(FfiErrorCode::NotFound)?;
     record.shutdown = true;
+
+    if let Some(runtime) = state.runtime.as_mut() {
+        runtime.attached_agents = runtime.attached_agents.saturating_sub(1);
+    }
+
     Ok(record)
 }
 

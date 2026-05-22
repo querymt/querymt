@@ -601,6 +601,9 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                             );
                             false
                         }
+                        _ => {
+                            continue;
+                        }
                     };
 
                     if tx.is_closed() {
