@@ -940,7 +940,6 @@ export enum OAuthFlowKindTs {
 	DevicePoll = "device_poll",
 }
 
-/** Routing mode for message distribution. */
 export enum RoutingMode {
 	Single = "single",
 	Broadcast = "broadcast",
