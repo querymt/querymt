@@ -53,6 +53,7 @@ use std::sync::{Arc, Mutex};
 ///     .unwrap();
 /// # }
 /// ```
+#[derive(Clone)]
 pub struct AgentInfra {
     /// Pre-built plugin registry.
     /// Required for iOS/embedded where default loaders are unavailable.
@@ -62,6 +63,18 @@ pub struct AgentInfra {
     pub storage: Option<Arc<dyn StorageBackend>>,
     /// Optional runtime MCP attachment source (e.g., for mobile in-process MCP peers).
     pub session_mcp_attachment_source: Option<Arc<dyn SessionMcpAttachmentSource>>,
+}
+
+impl AgentInfra {
+    /// Build the default shared infrastructure used by profile runtimes.
+    pub async fn default_shared() -> Result<Self> {
+        let registry = Arc::new(default_registry().await?);
+        let storage = Arc::new(SqliteStorage::connect(default_agent_db_path()?).await?);
+        Ok(Self {
+            plugin_registry: registry,
+            storage: Some(storage),
+        })
+    }
 }
 
 /// Type alias for middleware factory closures
@@ -564,6 +577,11 @@ impl Agent {
     /// the kameo mesh (e.g., bootstrapping `RemoteNodeManager`).
     pub fn handle(&self) -> Arc<AgentHandle> {
         self.inner.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage_backend(&self) -> Arc<dyn StorageBackend> {
+        self.storage.clone()
     }
 
     pub async fn chat(&self, prompt: &str) -> Result<String> {

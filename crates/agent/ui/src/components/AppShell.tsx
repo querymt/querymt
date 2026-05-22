@@ -37,6 +37,7 @@ export function AppShell() {
     setAuthMethodPref,
     clearApiTokenResult,
     setSessionModel,
+    setActiveProfile,
     addCustomModelFromHf,
     addCustomModelFromFile,
     deleteCustomModel,
@@ -62,6 +63,9 @@ export function AppShell() {
     thinkingAgentIds,
     sessionId,
     agents,
+    profiles,
+    activeProfileId,
+    sessionProfiles,
     agentModels,
     sessionLimits,
     isConversationComplete,
@@ -222,6 +226,8 @@ export function AppShell() {
     [agentModels, activeAgentId, visibleSessionId],
   );
 
+  const currentSessionProfileId = visibleSessionId ? sessionProfiles[visibleSessionId] : undefined;
+
   // --- Callbacks ---
 
   const handleSelectSession = useCallback((sid: string) => {
@@ -271,6 +277,10 @@ export function AppShell() {
         reconnecting={reconnecting}
         isSessionActive={isSessionActive}
         isConversationComplete={isConversationComplete}
+        profiles={profiles}
+        activeProfileId={activeProfileId}
+        currentSessionProfileId={currentSessionProfileId}
+        onSelectProfile={setActiveProfile}
         agentMode={agentMode}
         cycleAgentMode={cycleAgentMode}
         setSessionSwitcherOpen={setSessionSwitcherOpen}

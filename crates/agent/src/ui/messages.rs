@@ -5,6 +5,7 @@
 
 use crate::events::EventEnvelope;
 use crate::index::FileIndexEntry;
+use crate::profiles::ProfileMetadata;
 pub use crate::session::load_snapshot::{SessionLoadSnapshot, StreamCursor, cursor_from_events};
 use crate::session::projection::{AuditView, SessionScope};
 use serde::{Deserialize, Serialize};
@@ -49,7 +50,37 @@ pub struct UiAgentInfo {
     pub capabilities: Vec<String>,
 }
 
-/// Routing mode for message distribution.
+#[typeshare]
+#[derive(Clone, Debug, Serialize)]
+pub struct UiProfileInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_kind: Option<String>,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+}
+
+impl From<ProfileMetadata> for UiProfileInfo {
+    fn from(metadata: ProfileMetadata) -> Self {
+        Self {
+            id: metadata.id,
+            name: metadata.name,
+            description: metadata.description,
+            tags: metadata.tags,
+            config_kind: metadata
+                .config_kind
+                .map(|kind| kind.storage_label().to_string()),
+            source: metadata.source.storage_label(),
+            fingerprint: metadata.fingerprint,
+        }
+    }
+}
+
 #[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -171,6 +202,10 @@ pub enum UiClientMessage {
     SetActiveAgent {
         agent_id: String,
     },
+    SetActiveProfile {
+        profile_id: String,
+    },
+    ListProfiles,
     SetRoutingMode {
         mode: RoutingMode,
     },
@@ -178,6 +213,8 @@ pub enum UiClientMessage {
         cwd: Option<String>,
         #[serde(default)]
         request_id: Option<String>,
+        #[serde(default)]
+        profile_id: Option<String>,
     },
     Prompt {
         prompt: Vec<UiPromptBlock>,
@@ -747,6 +784,8 @@ pub enum UiServerMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         default_cwd: Option<String>,
         agents: Vec<UiAgentInfo>,
+        profiles: Vec<UiProfileInfo>,
+        active_profile_id: Option<String>,
         sessions_by_agent: HashMap<String, String>,
         agent_mode: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -754,18 +793,21 @@ pub enum UiServerMessage {
     },
     SessionCreated {
         agent_id: String,
+        profile_id: Option<String>,
         session_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
     },
     Event {
         agent_id: String,
+        profile_id: Option<String>,
         session_id: String,
         event: EventEnvelope,
     },
     SessionEvents {
         session_id: String,
         agent_id: String,
+        profile_id: Option<String>,
         events: Vec<EventEnvelope>,
         #[typeshare(serialized_as = "StreamCursor")]
         cursor: StreamCursor,
@@ -791,6 +833,7 @@ pub enum UiServerMessage {
     SessionLoaded {
         session_id: String,
         agent_id: String,
+        profile_id: Option<String>,
         audit: AuditView,
         undo_stack: Vec<UndoStackFrame>,
         #[typeshare(serialized_as = "StreamCursor")]
@@ -1064,14 +1107,133 @@ impl UiServerMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioModelInfo, OAuthFlowKind, PluginUpdateResult, UiClientMessage, UiServerMessage,
+        AudioModelInfo, OAuthFlowKind, PluginUpdateResult, RoutingMode, UiClientMessage,
+        UiProfileInfo, UiServerMessage,
     };
+    use crate::session::load_snapshot::StreamCursor;
+    use crate::session::projection::AuditView;
     use serde_json::json;
 
     // Note: All UiClientMessage and UiServerMessage tests use adjacently tagged serde format:
     //   client sends: {"type": "variant_name", "data": { ...fields... }}
     //   server sends: {"type": "variant_name", "data": { ...fields... }}
     // Unit variants (no fields) serialize as: {"type": "variant_name"}
+
+    fn empty_audit(session_id: &str) -> AuditView {
+        AuditView {
+            session_id: session_id.to_string(),
+            events: Vec::new(),
+            tasks: Vec::new(),
+            intent_snapshots: Vec::new(),
+            decisions: Vec::new(),
+            progress_entries: Vec::new(),
+            artifacts: Vec::new(),
+            delegations: Vec::new(),
+            generated_at: time::OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn deserializes_set_active_profile_tag() {
+        let current: UiClientMessage = serde_json::from_value(json!({
+            "type": "set_active_profile",
+            "data": { "profile_id": "coder" }
+        }))
+        .expect("set_active_profile should deserialize with data wrapper");
+
+        match current {
+            UiClientMessage::SetActiveProfile { profile_id } => assert_eq!(profile_id, "coder"),
+            _ => panic!("expected SetActiveProfile variant"),
+        }
+    }
+
+    #[test]
+    fn deserializes_new_session_optional_profile_id() {
+        let current: UiClientMessage = serde_json::from_value(json!({
+            "type": "new_session",
+            "data": { "cwd": "/tmp/project", "request_id": "req-1", "profile_id": "coder" }
+        }))
+        .expect("new_session should accept profile_id");
+
+        match current {
+            UiClientMessage::NewSession {
+                cwd,
+                request_id,
+                profile_id,
+            } => {
+                assert_eq!(cwd.as_deref(), Some("/tmp/project"));
+                assert_eq!(request_id.as_deref(), Some("req-1"));
+                assert_eq!(profile_id.as_deref(), Some("coder"));
+            }
+            _ => panic!("expected NewSession variant"),
+        }
+    }
+
+    #[test]
+    fn deserializes_new_session_without_profile_id() {
+        let current: UiClientMessage = serde_json::from_value(json!({
+            "type": "new_session",
+            "data": { "cwd": null }
+        }))
+        .expect("new_session should keep profile_id optional");
+
+        match current {
+            UiClientMessage::NewSession { profile_id, .. } => assert!(profile_id.is_none()),
+            _ => panic!("expected NewSession variant"),
+        }
+    }
+
+    #[test]
+    fn state_serializes_profiles_and_active_profile() {
+        let msg = UiServerMessage::State {
+            routing_mode: RoutingMode::Single,
+            active_agent_id: "primary".to_string(),
+            active_session_id: None,
+            default_cwd: None,
+            agents: Vec::new(),
+            profiles: vec![UiProfileInfo {
+                id: "coder".to_string(),
+                name: "Coder".to_string(),
+                description: Some("Coding profile".to_string()),
+                tags: vec!["coding".to_string(), "delegation".to_string()],
+                config_kind: Some("single".to_string()),
+                source: "local:/profiles/coder.toml".to_string(),
+                fingerprint: Some("abc".to_string()),
+            }],
+            active_profile_id: Some("coder".to_string()),
+            sessions_by_agent: Default::default(),
+            agent_mode: "build".to_string(),
+            reasoning_effort: None,
+        };
+
+        let value = serde_json::to_value(msg).expect("state should serialize");
+        assert_eq!(value["data"]["active_profile_id"], "coder");
+        assert_eq!(value["data"]["profiles"][0]["id"], "coder");
+        assert_eq!(value["data"]["profiles"][0]["tags"][0], "coding");
+    }
+
+    #[test]
+    fn session_created_and_loaded_serialize_profile_id() {
+        let created = serde_json::to_value(UiServerMessage::SessionCreated {
+            agent_id: "primary".to_string(),
+            profile_id: Some("coder".to_string()),
+            session_id: "session-1".to_string(),
+            request_id: None,
+        })
+        .expect("session_created should serialize");
+        assert_eq!(created["data"]["profile_id"], "coder");
+
+        let loaded = serde_json::to_value(UiServerMessage::SessionLoaded {
+            session_id: "session-1".to_string(),
+            agent_id: "primary".to_string(),
+            profile_id: Some("coder".to_string()),
+            audit: empty_audit("session-1"),
+            undo_stack: Vec::new(),
+            cursor: StreamCursor::default(),
+        })
+        .expect("session_loaded should serialize");
+        assert_eq!(loaded["data"]["profile_id"], "coder");
+    }
 
     #[test]
     fn deserializes_start_oauth_login_tag() {

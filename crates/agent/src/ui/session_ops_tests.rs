@@ -1,15 +1,21 @@
 //! Focused tests for session list UI handlers and dispatch.
 
+use crate::api::AgentInfra;
+use crate::profiles::{LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager};
 use crate::session::backend::StorageBackend;
 use crate::session::domain::ForkOrigin;
 use crate::session::projection::SessionScope;
+use crate::test_utils::empty_plugin_registry;
 use crate::ui::handlers::{
-    ListSessionsRequest, handle_list_session_children, handle_list_sessions, handle_ui_message,
+    ListSessionsRequest, handle_list_session_children, handle_list_sessions, handle_load_session,
+    handle_ui_message,
 };
 use crate::ui::messages::UiClientMessage;
 use anyhow::Result;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tempfile::TempDir;
 use tokio::time::{Duration, timeout};
 
 struct SeededSessions {
@@ -99,6 +105,60 @@ fn find_session<'a>(msg: &'a Value, session_id: &str) -> &'a Value {
         .into_iter()
         .find(|session| session["session_id"] == session_id)
         .expect("session should be present")
+}
+
+fn write_profile(dir: &Path, name: &str) {
+    write_profile_with_content(
+        dir,
+        name,
+        r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "inline"
+"#,
+    );
+}
+
+fn write_profile_with_content(dir: &Path, name: &str, content: &str) {
+    std::fs::write(dir.join(name), content).expect("profile should be written");
+}
+
+async fn attach_profiles(
+    fixture: &mut crate::test_utils::TestServerState,
+    active_profile_id: &str,
+    profile_dir: &Path,
+) -> Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>> {
+    let (registry, _config_dir) = empty_plugin_registry().expect("empty plugin registry");
+    let infra = AgentInfra {
+        plugin_registry: Arc::new(registry),
+        storage: Some(fixture.agent.storage.clone()),
+    };
+    let catalog: Arc<dyn ProfileCatalog> = Arc::new(
+        LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(profile_dir)
+            .build(),
+    );
+    let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+        catalog,
+        active_profile_id,
+        infra,
+    ));
+    fixture.state.profiles = Some(profiles.clone());
+    profiles
+}
+
+async fn next_message_of_type(
+    rx: &mut tokio::sync::mpsc::Receiver<String>,
+    expected_type: &str,
+) -> Value {
+    loop {
+        let msg = next_json(rx).await;
+        if msg["type"] == expected_type {
+            return msg;
+        }
+    }
 }
 
 #[tokio::test]
@@ -307,6 +367,174 @@ async fn handle_ui_message_dispatches_list_session_children() -> Result<()> {
     assert_eq!(msg["data"]["parent_session_id"], seeded.root);
     assert_eq!(msg["data"]["sessions"][0]["session_id"], seeded.user_fork);
     assert_eq!(msg["data"]["total_count"], 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn handle_ui_message_set_active_profile_updates_state() -> Result<()> {
+    let mut f = crate::test_utils::TestServerState::new().await;
+    let dir = TempDir::new()?;
+    write_profile(dir.path(), "alpha.toml");
+    write_profile(dir.path(), "beta.toml");
+    let profiles = attach_profiles(&mut f, "alpha", dir.path()).await;
+    let (tx, mut rx) = f.add_connection("conn-set-profile").await;
+    let (bin_tx, _bin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+
+    handle_ui_message(
+        &f.state,
+        "conn-set-profile",
+        &tx,
+        &bin_tx,
+        UiClientMessage::SetActiveProfile {
+            profile_id: "beta".to_string(),
+        },
+    )
+    .await;
+
+    let msg = next_json(&mut rx).await;
+    assert_eq!(msg["type"], "state");
+    assert_eq!(msg["data"]["active_profile_id"], "beta");
+    let profile_ids: Vec<&str> = msg["data"]["profiles"]
+        .as_array()
+        .expect("profiles should be an array")
+        .iter()
+        .map(|profile| {
+            profile["id"]
+                .as_str()
+                .expect("profile id should be a string")
+        })
+        .collect();
+    assert_eq!(profile_ids, vec!["alpha", "beta"]);
+    assert_eq!(profiles.active_profile_id().await, "beta");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn handle_ui_message_set_active_profile_reports_missing_prompt_file_cause() -> Result<()> {
+    let mut f = crate::test_utils::TestServerState::new().await;
+    let dir = TempDir::new()?;
+    let missing_prompt = dir.path().join("missing-system-prompt.txt");
+    write_profile(dir.path(), "alpha.toml");
+    write_profile_with_content(
+        dir.path(),
+        "broken.toml",
+        r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = [{ file = "missing-system-prompt.txt" }]
+"#,
+    );
+    attach_profiles(&mut f, "alpha", dir.path()).await;
+    let (tx, mut rx) = f.add_connection("conn-set-broken-profile").await;
+    let (bin_tx, _bin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+
+    handle_ui_message(
+        &f.state,
+        "conn-set-broken-profile",
+        &tx,
+        &bin_tx,
+        UiClientMessage::SetActiveProfile {
+            profile_id: "broken".to_string(),
+        },
+    )
+    .await;
+
+    let msg = next_json(&mut rx).await;
+    assert_eq!(msg["type"], "error");
+    let message = msg["data"]["message"]
+        .as_str()
+        .expect("error message should be a string");
+    assert!(
+        message.contains("Failed to set active profile"),
+        "message was: {message}"
+    );
+    assert!(
+        message.contains("Failed to load agent prompt"),
+        "message was: {message}"
+    );
+    assert!(
+        message.contains(&missing_prompt.display().to_string()),
+        "message was: {message}"
+    );
+    assert!(
+        message.contains("No such file or directory") || message.contains("os error 2"),
+        "message was: {message}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn handle_ui_message_new_session_binds_explicit_profile_and_reports_it() -> Result<()> {
+    let mut f = crate::test_utils::TestServerState::new().await;
+    let dir = TempDir::new()?;
+    write_profile(dir.path(), "alpha.toml");
+    write_profile(dir.path(), "beta.toml");
+    let profiles = attach_profiles(&mut f, "alpha", dir.path()).await;
+    let (tx, mut rx) = f.add_connection("conn-new-session-profile").await;
+    let (bin_tx, _bin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+
+    handle_ui_message(
+        &f.state,
+        "conn-new-session-profile",
+        &tx,
+        &bin_tx,
+        UiClientMessage::NewSession {
+            cwd: None,
+            request_id: Some("req-profile".to_string()),
+            profile_id: Some("beta".to_string()),
+        },
+    )
+    .await;
+
+    let created = next_message_of_type(&mut rx, "session_created").await;
+    let session_id = created["data"]["session_id"]
+        .as_str()
+        .expect("session id should be a string")
+        .to_string();
+    assert_eq!(created["data"]["agent_id"], "primary");
+    assert_eq!(created["data"]["profile_id"], "beta");
+    assert_eq!(created["data"]["request_id"], "req-profile");
+
+    let binding = profiles
+        .session_binding(&session_id)
+        .await
+        .expect("new session should bind to requested profile");
+    assert_eq!(binding.profile_id, "beta");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn handle_load_session_prefers_existing_bound_profile_after_active_profile_changes()
+-> Result<()> {
+    let mut f = crate::test_utils::TestServerState::new().await;
+    let dir = TempDir::new()?;
+    write_profile(dir.path(), "alpha.toml");
+    write_profile(dir.path(), "beta.toml");
+    let profiles = attach_profiles(&mut f, "alpha", dir.path()).await;
+    let session_id = f.agent.create_session().await;
+    profiles
+        .bind_session_to_profile(session_id.clone(), "alpha")
+        .await
+        .expect("session should bind to alpha");
+    profiles
+        .set_active_profile("beta")
+        .await
+        .expect("active profile should switch for future sessions");
+    let (tx, mut rx) = f.add_connection("conn-load-profile").await;
+
+    handle_load_session(&f.state, "conn-load-profile", &session_id, &tx).await;
+
+    let loaded = next_message_of_type(&mut rx, "session_loaded").await;
+    assert_eq!(loaded["data"]["session_id"], session_id);
+    assert_eq!(loaded["data"]["profile_id"], "alpha");
+
+    let state_msg = next_message_of_type(&mut rx, "state").await;
+    assert_eq!(state_msg["data"]["active_profile_id"], "beta");
 
     Ok(())
 }

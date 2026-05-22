@@ -1527,9 +1527,15 @@ fn ensure_inline_system_parts(parts: &[SystemPart], context: &str) -> Result<()>
 
 /// Build typed config from a parsed TOML value.
 async fn build_config_from_toml_value(
-    value: toml::Value,
+    mut value: toml::Value,
     resolution: PromptResolution,
 ) -> Result<Config> {
+    // Top-level [profile] is catalog-only metadata. Strip it before strict runtime
+    // deserialization so it cannot affect agent behavior; all other unknown fields stay rejected.
+    if let Some(table) = value.as_table_mut() {
+        table.remove("profile");
+    }
+
     let config = if value.get("agent").is_some() {
         // Single agent config
         let mut config: SingleAgentConfig = value
@@ -2140,6 +2146,93 @@ system = ["You are a test agent"]
             }
             Config::Multi(_) => panic!("expected single-agent config"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_load_config_accepts_profile_metadata_for_single_and_quorum() {
+        let single = r#"
+[profile]
+id = "friendly-single"
+name = "Friendly Single"
+tags = ["coding"]
+
+[agent]
+provider = "test"
+model = "test-model"
+tools = []
+system = ["You are a test agent"]
+"#;
+        let cfg = load_config(ConfigSource::Toml(single.to_string()))
+            .await
+            .expect("single config with profile metadata should load");
+        assert!(matches!(cfg, Config::Single(_)));
+
+        let quorum = r#"
+[profile]
+id = "friendly-quorum"
+
+[quorum]
+
+[planner]
+provider = "test"
+model = "planner-model"
+system = "plan"
+"#;
+        let cfg = load_config(ConfigSource::Toml(quorum.to_string()))
+            .await
+            .expect("quorum config with profile metadata should load");
+        assert!(matches!(cfg, Config::Multi(_)));
+    }
+
+    #[tokio::test]
+    async fn test_load_config_rejects_unknown_agent_fields_with_profile_metadata() {
+        let inline = r#"
+[profile]
+id = "friendly-single"
+
+[agent]
+provider = "test"
+model = "test-model"
+tools = []
+system = ["You are a test agent"]
+unknown = true
+"#;
+
+        let err = load_config(ConfigSource::Toml(inline.to_string()))
+            .await
+            .expect_err("unknown runtime fields should stay rejected");
+        assert!(
+            err.to_string()
+                .contains("Failed to deserialize single agent config"),
+            "message was: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_config_path_with_profile_metadata_resolves_file_references() {
+        let (prompt_dir, prompt_file) = make_temp_prompt("Prompt from profile file");
+        let prompt_path = prompt_dir.join(prompt_file);
+        let config_path = temp_config_path("profile-single");
+        let config = format!(
+            "[profile]\nid = \"file-profile\"\n\n[agent]\nprovider = \"test\"\nmodel = \"test-model\"\ntools = []\nsystem = [{{ file = \"{}\" }}]\n",
+            prompt_path.display()
+        );
+        std::fs::write(&config_path, config).expect("failed to write temp config");
+
+        let cfg = load_config(&config_path)
+            .await
+            .expect("file config with profile metadata should load");
+        match cfg {
+            Config::Single(single) => {
+                assert!(matches!(
+                    &single.agent.system[0],
+                    SystemPart::Inline(s) if s == "Prompt from profile file"
+                ));
+            }
+            Config::Multi(_) => panic!("expected single-agent config"),
+        }
+
+        let _ = std::fs::remove_file(&config_path);
     }
 
     #[tokio::test]

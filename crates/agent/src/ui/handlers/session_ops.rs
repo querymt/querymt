@@ -10,7 +10,7 @@ use super::super::messages::{SessionGroup, SessionSummary, UiServerMessage};
 #[cfg(feature = "remote")]
 use super::remote::finalize_remote_session_attach;
 
-use super::super::session::PRIMARY_AGENT_ID;
+use super::super::session::{PRIMARY_AGENT_ID, agent_for_profile_and_id, resolve_profile_id};
 use crate::agent::core::AgentMode;
 use crate::events::EventEnvelope;
 use crate::index::resolve_workspace_root;
@@ -622,10 +622,22 @@ pub async fn handle_load_session(
         cwds.get(session_id).cloned()
     };
 
-    // 2. Determine agent ID (default to primary)
+    // 2. Determine profile/agent IDs. The profile binding is MVP process-local;
+    // after restart, old sessions have no binding until a durable design is approved.
+    let profile_id = if let Some(profiles) = &state.profiles {
+        if let Some(binding) = profiles.session_binding(session_id).await {
+            Some(binding.profile_id)
+        } else {
+            resolve_profile_id(state, None).await.unwrap_or_default()
+        }
+    } else {
+        None
+    };
     let agent_id = PRIMARY_AGENT_ID.to_string();
 
-    if let Err(e) = ensure_session_loaded(state, session_id, "load_session").await {
+    if let Err(e) =
+        ensure_session_loaded(state, session_id, profile_id.as_deref(), "load_session").await
+    {
         let _ = send_error(tx, e).await;
         return;
     }
@@ -655,6 +667,7 @@ pub async fn handle_load_session(
         UiServerMessage::SessionLoaded {
             session_id: session_id.to_string(),
             agent_id,
+            profile_id,
             audit: snapshot.audit,
             undo_stack,
             cursor: cursor.clone(),
@@ -733,24 +746,22 @@ pub async fn handle_delete_session(
 pub(super) async fn ensure_session_loaded(
     state: &ServerState,
     session_id: &str,
+    profile_id: Option<&str>,
     op_name: &'static str,
 ) -> Result<(), String> {
-    let registry_hit = {
-        let registry = state.agent.registry.lock().await;
-        registry.get(session_id).is_some()
+    let selected_profile_id = if let Some(profile_id) = profile_id {
+        Some(profile_id.to_string())
+    } else if let Some(profiles) = &state.profiles {
+        if let Some(binding) = profiles.session_binding(session_id).await {
+            Some(binding.profile_id)
+        } else {
+            // MVP fallback after restart: without durable session/profile persistence,
+            // unbound sessions load into the active profile runtime.
+            resolve_profile_id(state, None).await?
+        }
+    } else {
+        None
     };
-
-    if registry_hit {
-        tracing::debug!(
-            op_name,
-            session_id,
-            registry_hit,
-            store_exists = true,
-            actor_loaded = true,
-            "session already hydrated"
-        );
-        return Ok(());
-    }
 
     let stored_session = state
         .agent
@@ -765,7 +776,6 @@ pub(super) async fn ensure_session_loaded(
         tracing::warn!(
             op_name,
             session_id,
-            registry_hit,
             store_exists = false,
             actor_loaded = false,
             "session hydration failed: missing from store"
@@ -778,36 +788,23 @@ pub(super) async fn ensure_session_loaded(
         cwds.insert(session_id.to_string(), cwd);
     }
 
-    let store_exists = true;
+    let agent =
+        agent_for_profile_and_id(state, selected_profile_id.as_deref(), PRIMARY_AGENT_ID).await?;
     let req = LoadSessionRequest::new(
         SessionId::from(session_id.to_string()),
         session.cwd.unwrap_or_else(PathBuf::new),
     );
-    state
-        .agent
-        .load_session(req)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let actor_loaded = {
-        let registry = state.agent.registry.lock().await;
-        registry.get(session_id).is_some()
-    };
+    agent.load_session(req).await.map_err(|e| e.to_string())?;
 
     tracing::info!(
         op_name,
         session_id,
-        registry_hit,
-        store_exists,
-        actor_loaded,
+        store_exists = true,
+        actor_loaded = true,
         "session lazy hydration evaluated"
     );
 
-    if actor_loaded {
-        Ok(())
-    } else {
-        Err(format!("Session not found: {}", session_id))
-    }
+    Ok(())
 }
 
 pub(super) async fn load_undo_stack(
@@ -910,11 +907,20 @@ pub async fn handle_subscribe_session(
         }
     }
 
+    let profile_id = match &state.profiles {
+        Some(profiles) => profiles
+            .session_binding(session_id)
+            .await
+            .map(|binding| binding.profile_id),
+        None => None,
+    };
+
     let _ = send_message(
         tx,
         UiServerMessage::SessionEvents {
             session_id: session_id.to_string(),
             agent_id: resolved_agent_id,
+            profile_id,
             events,
             cursor,
         },
@@ -1218,7 +1224,8 @@ pub async fn handle_fork_session(
                 agents.insert(forked_session_id.clone(), parent_agent);
             }
 
-            if let Err(err) = ensure_session_loaded(state, &forked_session_id, "fork_session").await
+            if let Err(err) =
+                ensure_session_loaded(state, &forked_session_id, None, "fork_session").await
             {
                 let _ = send_message(
                     tx,

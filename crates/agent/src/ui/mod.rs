@@ -12,6 +12,7 @@
 //! - [`mentions`]: @ mention expansion for file/directory references
 
 mod connection;
+mod error;
 mod handlers;
 mod mentions;
 mod messages;
@@ -35,6 +36,7 @@ mod undo_handler_tests;
 use crate::auth::service::OAuthService;
 use crate::event_fanout::EventFanout;
 use crate::index::WorkspaceIndexManagerActor;
+use crate::profiles::{ProfileCatalog, ProfileRuntimeManager};
 use crate::session::projection::ViewStore;
 use crate::session::store::SessionStore;
 use axum::{
@@ -60,6 +62,7 @@ pub struct UiServer {
     session_store: Arc<dyn SessionStore>,
     default_cwd: Option<PathBuf>,
     event_sources: Vec<Arc<EventFanout>>,
+    profiles: Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>>,
     connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
     session_agents: Arc<Mutex<HashMap<String, String>>>,
     session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
@@ -103,6 +106,7 @@ pub(crate) struct ServerState {
     pub session_store: Arc<dyn SessionStore>,
     pub default_cwd: Option<PathBuf>,
     pub event_sources: Vec<Arc<EventFanout>>,
+    pub profiles: Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>>,
     pub connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
     pub session_agents: Arc<Mutex<HashMap<String, String>>>,
     pub session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
@@ -165,6 +169,33 @@ impl UiServer {
         session_store: Arc<dyn SessionStore>,
         default_cwd: Option<PathBuf>,
     ) -> Self {
+        Self::build(agent, view_store, session_store, default_cwd, None)
+    }
+
+    /// Create a UI server backed by a profile runtime manager.
+    pub fn with_profiles(
+        agent: Arc<crate::agent::LocalAgentHandle>,
+        view_store: Arc<dyn ViewStore>,
+        session_store: Arc<dyn SessionStore>,
+        default_cwd: Option<PathBuf>,
+        profiles: Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>,
+    ) -> Self {
+        Self::build(
+            agent,
+            view_store,
+            session_store,
+            default_cwd,
+            Some(profiles),
+        )
+    }
+
+    fn build(
+        agent: Arc<crate::agent::LocalAgentHandle>,
+        view_store: Arc<dyn ViewStore>,
+        session_store: Arc<dyn SessionStore>,
+        default_cwd: Option<PathBuf>,
+        profiles: Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>>,
+    ) -> Self {
         let event_sources = collect_event_sources(&agent);
 
         Self {
@@ -173,6 +204,7 @@ impl UiServer {
             session_store,
             default_cwd: default_cwd.or_else(|| std::env::current_dir().ok()),
             event_sources,
+            profiles,
             connections: Arc::new(Mutex::new(HashMap::new())),
             session_agents: Arc::new(Mutex::new(HashMap::new())),
             session_cwds: Arc::new(Mutex::new(HashMap::new())),
@@ -189,6 +221,7 @@ impl UiServer {
             session_store: self.session_store,
             default_cwd: self.default_cwd,
             event_sources: self.event_sources,
+            profiles: self.profiles,
             connections: self.connections,
             session_agents: self.session_agents,
             session_cwds: self.session_cwds,

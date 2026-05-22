@@ -484,7 +484,7 @@ pub async fn handle_set_session_model(
 ) -> Result<(), String> {
     use crate::agent::messages::SetSessionModel;
 
-    ensure_session_loaded(state, session_id, "set_session_model").await?;
+    ensure_session_loaded(state, session_id, None, "set_session_model").await?;
 
     // Look up the session actor ref through the registry so remote sessions work too.
     let session_ref = {

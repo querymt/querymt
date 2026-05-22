@@ -1,3 +1,4 @@
+use crate::profiles::{ProfileCatalog, ProfileRuntimeManager};
 use crate::ui::UiServer;
 use crate::{acp::AcpServer, session::StorageBackend};
 use axum::Router;
@@ -21,6 +22,7 @@ pub struct AgentServer {
     agent: Arc<crate::agent::LocalAgentHandle>,
     storage: Arc<dyn StorageBackend>,
     default_cwd: Option<PathBuf>,
+    profiles: Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,7 +42,16 @@ impl AgentServer {
             agent,
             storage,
             default_cwd,
+            profiles: None,
         }
+    }
+
+    pub fn with_profiles(
+        mut self,
+        profiles: Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>,
+    ) -> Self {
+        self.profiles = Some(profiles);
+        self
     }
 
     pub async fn run(self, addr: &str, mode: ServerMode) -> anyhow::Result<()> {
@@ -71,13 +82,22 @@ impl AgentServer {
         let view_store = self.storage.view_store().ok_or_else(|| {
             anyhow::anyhow!("ViewStore is required to serve the UI websocket API")
         })?;
-        let ui_router = UiServer::new(
-            self.agent.clone(),
-            view_store,
-            self.storage.session_store().clone(),
-            self.default_cwd.clone(),
-        )
-        .router();
+        let ui_server = match self.profiles.clone() {
+            Some(profiles) => UiServer::with_profiles(
+                self.agent.clone(),
+                view_store,
+                self.storage.session_store().clone(),
+                self.default_cwd.clone(),
+                profiles,
+            ),
+            None => UiServer::new(
+                self.agent.clone(),
+                view_store,
+                self.storage.session_store().clone(),
+                self.default_cwd.clone(),
+            ),
+        };
+        let ui_router = ui_server.router();
 
         let export_storage = self.storage.clone();
         let app = Router::new()

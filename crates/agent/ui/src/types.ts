@@ -52,6 +52,7 @@ export type {
   ProviderCapabilityEntry,
   RecentModelEntry,
   RemoteNodeInfo,
+  UiProfileInfo,
   // AuditView sub-types (generated with richer fields than prior manual definitions)
   Task,
   IntentSnapshot,

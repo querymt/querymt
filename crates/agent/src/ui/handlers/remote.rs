@@ -169,6 +169,7 @@ pub async fn handle_create_remote_session(
                     tx,
                     UiServerMessage::SessionCreated {
                         agent_id: super::super::session::PRIMARY_AGENT_ID.to_string(),
+                        profile_id: None,
                         session_id: session_id.clone(),
                         request_id: request_id.map(|s| s.to_string()),
                     },
@@ -341,6 +342,7 @@ pub(crate) async fn finalize_remote_session_attach(
         UiServerMessage::SessionLoaded {
             session_id: session_id.to_string(),
             agent_id,
+            profile_id: None,
             audit,
             undo_stack: Vec::new(),
             cursor,

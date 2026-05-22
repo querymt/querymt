@@ -658,6 +658,22 @@ impl super::agent::Agent {
         builder.build().await
     }
 
+    /// Build a quorum with both remote registry/mesh wiring and injected infrastructure.
+    #[cfg(feature = "remote")]
+    pub async fn from_quorum_config_with_registry_and_infra(
+        config: QuorumConfig,
+        initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
+        mesh: Option<crate::agent::remote::MeshHandle>,
+        mesh_auto_fallback: bool,
+        infra: super::agent::AgentInfra,
+    ) -> Result<Self> {
+        let mut builder = Self::builder_from_quorum_config(config, initial_registry)?;
+        builder.mesh = mesh;
+        builder.mesh_auto_fallback = mesh_auto_fallback;
+        builder = builder.infra(infra);
+        builder.build().await
+    }
+
     /// Configure a `QuorumBuilder` from a `QuorumConfig`.
     ///
     /// Returns the builder before `build()` is called, allowing further

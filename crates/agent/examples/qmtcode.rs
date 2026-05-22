@@ -35,14 +35,19 @@
 //! ./qmtcode --mesh
 //! ```
 
-#[cfg(feature = "api")]
+use clap::ArgAction;
 use clap::ArgGroup;
 use clap::Parser;
 use querymt_agent::prelude::*;
+use querymt_agent::profiles::{
+    DEFAULT_EMBEDDED_PROFILE_KEY, LocalProfileCatalog, ProfileCatalog, ProfileConfigKind,
+    ProfileMetadata, ProfileRuntimeManager, ProfileSource, ensure_unique_profile_ids,
+};
 #[cfg(feature = "api")]
 use querymt_agent::server::ServerMode;
 use rust_embed::RustEmbed;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(feature = "api")]
 const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:3000";
@@ -76,6 +81,18 @@ struct Cli {
     ///
     /// If omitted, uses an embedded copy of `examples/confs/single_coder.toml`.
     config_file: Option<PathBuf>,
+
+    /// Directory containing local TOML profiles.
+    #[arg(long, value_name = "path", action = ArgAction::Append)]
+    profiles_dir: Vec<PathBuf>,
+
+    /// Profile id to load from the local profile catalog.
+    #[arg(long, value_name = "id")]
+    profile: Option<String>,
+
+    /// List local profiles and exit.
+    #[arg(long)]
+    list_profiles: bool,
 
     /// Run as ACP stdio server (for subprocess spawning)
     #[arg(long)]
@@ -217,6 +234,153 @@ fn embedded_prompt_asset_key(file_ref: &str) -> Option<String> {
     normalized.strip_prefix("prompts/").map(str::to_owned)
 }
 
+fn qmtcode_profile_catalog(profiles_dirs: &[PathBuf]) -> anyhow::Result<LocalProfileCatalog> {
+    qmtcode_profile_catalog_with_user_dir(profiles_dirs, None)
+}
+
+fn qmtcode_profile_catalog_with_user_dir(
+    profiles_dirs: &[PathBuf],
+    user_profiles_dir: Option<PathBuf>,
+) -> anyhow::Result<LocalProfileCatalog> {
+    let embedded_config = embedded_single_coder_config()?;
+    let mut builder = LocalProfileCatalog::builder()
+        .include_embedded_default(false)
+        .embedded_config_toml(
+            DEFAULT_EMBEDDED_PROFILE_KEY,
+            "Default",
+            Some("Default single coder profile".to_string()),
+            embedded_config,
+        );
+
+    // ~/.qmt/profiles is the conventional user-local profile directory; missing dirs are ignored.
+    builder = match user_profiles_dir {
+        Some(dir) => builder.default_user_dir(dir),
+        None => builder.include_default_user_dir(true),
+    };
+
+    for dir in profiles_dirs {
+        builder = builder.local_dir(dir.clone());
+    }
+
+    Ok(builder.build())
+}
+
+fn validate_profile_args(cli: &Cli) -> anyhow::Result<()> {
+    if cli.config_file.is_some() && cli.profile.is_some() {
+        anyhow::bail!("--profile cannot be used with explicit config path");
+    }
+    Ok(())
+}
+
+fn selected_profile_id(cli: &Cli) -> &str {
+    cli.profile
+        .as_deref()
+        .unwrap_or(DEFAULT_EMBEDDED_PROFILE_KEY)
+}
+
+fn profile_kind_label(kind: Option<ProfileConfigKind>) -> &'static str {
+    match kind {
+        Some(ProfileConfigKind::Single) => "single",
+        Some(ProfileConfigKind::Quorum) => "quorum",
+        None => "unknown",
+    }
+}
+
+fn profile_source_label(source: &ProfileSource) -> String {
+    match source {
+        ProfileSource::Embedded { key } | ProfileSource::EmbeddedToml { key } => {
+            format!("embedded:{key}")
+        }
+        ProfileSource::LocalPath { path } => format!("local:{}", path.display()),
+    }
+}
+
+const PROFILE_LIST_HEADERS: [&str; 5] = ["ID", "Name", "Kind", "Source", "Tags"];
+const PROFILE_LIST_CAPS: [usize; 5] = [24, 28, 8, 64, 40];
+
+fn truncate_cell(value: &str, max_chars: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_string();
+    }
+
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let prefix: String = value.chars().take(max_chars - 3).collect();
+    format!("{prefix}...")
+}
+
+fn padded_cell(value: &str, width: usize) -> String {
+    format!("{value:<width$}")
+}
+
+fn compact_table(headers: &[&str], rows: &[Vec<String>], caps: &[usize]) -> String {
+    let truncated_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .zip(caps.iter())
+                .map(|(value, cap)| truncate_cell(value, *cap))
+                .collect()
+        })
+        .collect();
+
+    let widths: Vec<usize> = headers
+        .iter()
+        .enumerate()
+        .map(|(column, header)| {
+            let row_width = truncated_rows
+                .iter()
+                .filter_map(|row| row.get(column))
+                .map(|value| value.chars().count())
+                .max()
+                .unwrap_or(0);
+            header.chars().count().max(row_width).min(caps[column])
+        })
+        .collect();
+
+    let format_row = |cells: Vec<String>| -> String {
+        cells
+            .into_iter()
+            .enumerate()
+            .map(|(column, value)| {
+                if column + 1 == widths.len() {
+                    value
+                } else {
+                    format!("{}  ", padded_cell(&value, widths[column]))
+                }
+            })
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    };
+
+    let mut lines = vec![format_row(
+        headers.iter().map(|header| header.to_string()).collect(),
+    )];
+    lines.extend(truncated_rows.into_iter().map(format_row));
+    lines.join("\n")
+}
+
+fn format_profile_list(profiles: &[querymt_agent::profiles::ProfileMetadata]) -> String {
+    let rows: Vec<Vec<String>> = profiles
+        .iter()
+        .map(|profile| {
+            vec![
+                profile.id.clone(),
+                profile.name.clone(),
+                profile_kind_label(profile.config_kind).to_string(),
+                profile_source_label(&profile.source),
+                profile.tags.join(", "),
+            ]
+        })
+        .collect();
+
+    compact_table(&PROFILE_LIST_HEADERS, &rows, &PROFILE_LIST_CAPS)
+}
+
 /// Register the standard mesh actors (RemoteNodeManager, ProviderHostActor)
 /// on a bootstrapped mesh using scoped DHT names.
 #[cfg(feature = "remote")]
@@ -256,6 +420,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "remote"))]
     let has_mesh = has_mesh_join || has_mesh_invite;
 
+    validate_profile_args(&cli)?;
+
+    let profile_catalog = qmtcode_profile_catalog(&cli.profiles_dir)?;
+    if cli.list_profiles {
+        let mut profiles = profile_catalog.list_profiles().await?;
+        if let Some(config_path) = &cli.config_file {
+            let config = querymt_agent::config::load_config(config_path).await?;
+            let config_kind = match &config {
+                Config::Single(_) => ProfileConfigKind::Single,
+                Config::Multi(_) => ProfileConfigKind::Quorum,
+            };
+            profiles.push(ProfileMetadata {
+                id: "config-file".to_string(),
+                name: config_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("Config File")
+                    .to_string(),
+                description: Some("Explicit config path".to_string()),
+                tags: Vec::new(),
+                source: ProfileSource::LocalPath {
+                    path: config_path.clone(),
+                },
+                config_kind: Some(config_kind),
+                fingerprint: None,
+            });
+        }
+        ensure_unique_profile_ids(&profiles)?;
+        println!("{}", format_profile_list(&profiles));
+        return Ok(());
+    }
+
     if !is_acp && !is_api && !is_dashboard && !has_mesh {
         return Err(
             "No mode selected. Use --acp, --api, --dashboard, or --mesh, or --mesh-join.".into(),
@@ -267,13 +463,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // OTLP export (traces + logs over gRPC) is active in all modes.
     querymt_utils::telemetry::setup_telemetry("qmtcode", env!("QMT_BUILD_VERSION"), is_acp);
 
+    let mut profile_manager: Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>> = None;
     let runner = if let Some(config_path) = &cli.config_file {
         eprintln!("Loading agent from: {}", config_path.display());
         from_config(config_path).await?
     } else {
-        eprintln!("Loading agent from embedded default config: single_coder.toml");
-        let embedded_config = embedded_single_coder_config()?;
-        from_config(ConfigSource::Toml(embedded_config)).await?
+        let selected_profile = selected_profile_id(&cli).to_string();
+        eprintln!("Loading agent from profile: {selected_profile}");
+        let document = profile_catalog.load_profile(&selected_profile).await?;
+        let runner = match &document.metadata.source {
+            ProfileSource::EmbeddedToml { .. } => {
+                from_config(ConfigSource::Toml(embedded_single_coder_config()?)).await?
+            }
+            ProfileSource::Embedded { .. } => {
+                from_config(ConfigSource::Toml(embedded_single_coder_config()?)).await?
+            }
+            ProfileSource::LocalPath { path } => from_config(path).await?,
+        };
+        let catalog: Arc<dyn ProfileCatalog> = Arc::new(profile_catalog);
+        profile_manager = Some(Arc::new(
+            ProfileRuntimeManager::with_default_infra_boxed(catalog, selected_profile.clone())
+                .await?,
+        ));
+        runner
     };
 
     eprintln!("Agent loaded successfully!\n");
@@ -460,7 +672,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let addr = cli.api.as_deref().unwrap_or(DEFAULT_SERVER_ADDR);
             eprintln!("Starting API server at http://{}", addr);
-            runner.server().run(addr, ServerMode::Api).await?;
+            let server = runner.server();
+            let server = if let Some(manager) = profile_manager.clone() {
+                server.with_profiles(manager)
+            } else {
+                server
+            };
+            server.run(addr, ServerMode::Api).await?;
         }
         #[cfg(not(feature = "api"))]
         {
@@ -471,7 +689,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let addr = cli.dashboard.as_deref().unwrap_or(DEFAULT_SERVER_ADDR);
             eprintln!("Starting dashboard at http://{}", addr);
-            runner.server().run(addr, ServerMode::Dashboard).await?;
+            let server = runner.server();
+            let server = if let Some(manager) = profile_manager.clone() {
+                server.with_profiles(manager)
+            } else {
+                server
+            };
+            server.run(addr, ServerMode::Dashboard).await?;
         }
         #[cfg(not(feature = "dashboard"))]
         {
@@ -493,6 +717,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn embedded_config_inlines_system_prompts_exactly() {
@@ -532,5 +757,152 @@ mod tests {
             Some("code_meta.jinja2")
         );
         assert!(embedded_prompt_asset_key("../../outside.txt").is_none());
+    }
+
+    #[test]
+    fn profile_args_reject_explicit_config_and_profile() {
+        let cli = Cli::try_parse_from([
+            "qmtcode",
+            "agent.toml",
+            "--profile",
+            "default",
+            "--dashboard",
+        ])
+        .expect("CLI args should parse");
+
+        let err = validate_profile_args(&cli).expect_err("combination should be rejected");
+        assert!(
+            err.to_string()
+                .contains("--profile cannot be used with explicit config path")
+        );
+    }
+
+    #[test]
+    fn profile_list_format_includes_required_columns() {
+        let output = format_profile_list(&[querymt_agent::profiles::ProfileMetadata {
+            id: "default".to_string(),
+            name: "Default".to_string(),
+            description: None,
+            tags: vec!["coding".to_string(), "planner".to_string()],
+            source: ProfileSource::EmbeddedToml {
+                key: "default".to_string(),
+            },
+            config_kind: Some(ProfileConfigKind::Single),
+            fingerprint: None,
+        }]);
+
+        let header = output.lines().next().expect("header line");
+        assert!(header.contains("ID"));
+        assert!(header.contains("Name"));
+        assert!(header.contains("Kind"));
+        assert!(header.contains("Source"));
+        assert!(header.contains("Tags"));
+        assert!(!output.contains('\t'));
+    }
+
+    #[test]
+    fn profile_list_format_aligns_rows_and_spaces_tags() {
+        let output = format_profile_list(&[
+            querymt_agent::profiles::ProfileMetadata {
+                id: "default".to_string(),
+                name: "Default".to_string(),
+                description: None,
+                tags: Vec::new(),
+                source: ProfileSource::EmbeddedToml {
+                    key: "default".to_string(),
+                },
+                config_kind: Some(ProfileConfigKind::Single),
+                fingerprint: None,
+            },
+            querymt_agent::profiles::ProfileMetadata {
+                id: "coder-delegate".to_string(),
+                name: "Coder Delegate".to_string(),
+                description: None,
+                tags: vec!["coding".to_string(), "planner".to_string()],
+                source: ProfileSource::LocalPath {
+                    path: PathBuf::from("/home/me/.qmt/profiles/coder.toml"),
+                },
+                config_kind: Some(ProfileConfigKind::Quorum),
+                fingerprint: None,
+            },
+        ]);
+
+        assert_eq!(
+            output,
+            "ID              Name            Kind    Source                                   Tags\n\
+             default         Default         single  embedded:default\n\
+             coder-delegate  Coder Delegate  quorum  local:/home/me/.qmt/profiles/coder.toml  coding, planner"
+        );
+    }
+
+    #[test]
+    fn profile_list_format_truncates_wide_cells() {
+        let output = format_profile_list(&[querymt_agent::profiles::ProfileMetadata {
+            id: "profile-id-that-is-far-too-wide-for-the-list".to_string(),
+            name: "Profile name that is also far too wide for the list".to_string(),
+            description: None,
+            tags: vec!["tag".repeat(20)],
+            source: ProfileSource::LocalPath {
+                path: PathBuf::from(format!("/{}", "very-long-segment/".repeat(8))),
+            },
+            config_kind: Some(ProfileConfigKind::Single),
+            fingerprint: None,
+        }]);
+
+        let row = output.lines().nth(1).expect("profile row");
+        assert!(row.contains("..."));
+        assert!(row.len() <= 24 + 28 + 8 + 64 + 40 + (4 * 2));
+    }
+
+    #[tokio::test]
+    async fn qmtcode_catalog_uses_inline_embedded_default() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let missing_user_dir = temp.path().join("missing");
+        let catalog = qmtcode_profile_catalog_with_user_dir(&[], Some(missing_user_dir))
+            .expect("catalog should build");
+        let profiles = catalog.list_profiles().await.expect("profiles should list");
+
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, DEFAULT_EMBEDDED_PROFILE_KEY);
+        assert!(matches!(
+            profiles[0].source,
+            ProfileSource::EmbeddedToml { .. }
+        ));
+
+        let document = catalog
+            .load_profile(DEFAULT_EMBEDDED_PROFILE_KEY)
+            .await
+            .expect("inline embedded profile should load");
+        assert!(matches!(document.config, Config::Single(_)));
+    }
+
+    #[tokio::test]
+    async fn qmtcode_catalog_lists_default_user_dir_profiles() {
+        let user_dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            user_dir.path().join("user-coder.toml"),
+            r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "inline"
+"#,
+        )
+        .expect("write profile");
+        let catalog =
+            qmtcode_profile_catalog_with_user_dir(&[], Some(user_dir.path().to_path_buf()))
+                .expect("catalog should build");
+
+        let profiles = catalog.list_profiles().await.expect("profiles should list");
+        assert!(profiles.iter().any(|profile| profile.id == "user-coder"));
+    }
+
+    #[test]
+    fn profile_flags_are_exposed_without_remote_service_flags() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--profiles-dir"));
+        assert!(help.contains("--profile"));
+        assert!(help.contains("--list-profiles"));
+        assert!(!help.contains("--profiles-url"));
     }
 }

@@ -67,6 +67,12 @@ pub trait AgentHandle: Send + Sync {
     /// Cancel an ongoing prompt.
     async fn cancel(&self, notif: CancelNotification) -> std::result::Result<(), Error>;
 
+    /// Load an existing session into this agent runtime.
+    async fn load_session(
+        &self,
+        req: LoadSessionRequest,
+    ) -> std::result::Result<LoadSessionResponse, Error>;
+
     /// Create a session for delegation. Returns both session_id and a
     /// SessionActorRef for direct kameo messaging (planning context, history).
     async fn create_delegation_session(
@@ -1974,6 +1980,13 @@ impl AgentHandle for LocalAgentHandle {
 
     async fn cancel(&self, notif: CancelNotification) -> std::result::Result<(), Error> {
         SendAgent::cancel(self, notif).await
+    }
+
+    async fn load_session(
+        &self,
+        req: LoadSessionRequest,
+    ) -> std::result::Result<LoadSessionResponse, Error> {
+        SendAgent::load_session(self, req).await
     }
 
     async fn create_delegation_session(

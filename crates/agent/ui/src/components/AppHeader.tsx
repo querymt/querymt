@@ -11,10 +11,11 @@ import { Menu, X } from 'lucide-react';
 import { ModelPickerPopover } from './ModelPickerPopover';
 import { HeaderStatsBar } from './HeaderStatsBar';
 import { RemoteNodeIndicator } from './RemoteNodeIndicator';
+import { ProfileSwitcher } from './ProfileSwitcher';
 import { getModeDisplayName } from '../utils/modeColors';
 import { copyToClipboard } from '../utils/clipboard';
 import type { ReactNode } from 'react';
-import type { UiAgentInfo, SessionLimits, RoutingMode } from '../types';
+import type { UiAgentInfo, SessionLimits, RoutingMode, UiProfileInfo } from '../types';
 
 interface AppHeaderProps {
   isHomePage: boolean;
@@ -24,6 +25,10 @@ interface AppHeaderProps {
   reconnecting: boolean;
   isSessionActive: boolean;
   isConversationComplete: boolean;
+  profiles: UiProfileInfo[];
+  activeProfileId: string | null;
+  currentSessionProfileId?: string;
+  onSelectProfile: (profileId: string) => void;
   agentMode: string;
   cycleAgentMode: () => void;
   setSessionSwitcherOpen: (open: boolean) => void;
@@ -74,6 +79,10 @@ export function AppHeader(props: AppHeaderProps) {
     reconnecting,
     isSessionActive,
     isConversationComplete,
+    profiles,
+    activeProfileId,
+    currentSessionProfileId,
+    onSelectProfile,
     agentMode,
     cycleAgentMode,
     setSessionSwitcherOpen,
@@ -213,6 +222,14 @@ export function AppHeader(props: AppHeaderProps) {
                 onDeleteCustomModel={props.deleteCustomModel}
               />
             )}
+
+            <ProfileSwitcher
+              profiles={profiles}
+              activeProfileId={activeProfileId}
+              currentSessionProfileId={currentSessionProfileId}
+              connected={connected}
+              onSelectProfile={onSelectProfile}
+            />
 
             <RemoteNodeIndicator remoteNodes={remoteNodes} />
             {props.desktopActions}

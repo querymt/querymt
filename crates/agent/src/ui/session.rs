@@ -3,13 +3,17 @@
 //! Handles session creation, agent lookup, routing modes (single/broadcast),
 //! and session-related state management.
 
-use super::messages::{RoutingMode, UiAgentInfo, UiPromptBlock, UiServerMessage};
+use super::error::format_prefixed_error_chain;
+use super::messages::{RoutingMode, UiAgentInfo, UiProfileInfo, UiPromptBlock, UiServerMessage};
 use super::{ServerState, cursor_from_events};
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::handle::AgentHandle as AgentHandleTrait;
+use crate::agent::remote::SessionActorRef;
 use crate::events::EventEnvelope;
 use crate::index::{normalize_cwd, resolve_workspace_root};
-use agent_client_protocol::schema::{ContentBlock, NewSessionRequest, PromptRequest};
+use agent_client_protocol::schema::{
+    ContentBlock, LoadSessionRequest, NewSessionRequest, PromptRequest,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -24,18 +28,29 @@ pub async fn ensure_sessions_for_mode(
     tx: &mpsc::Sender<String>,
     request_id: Option<&str>,
 ) -> Result<(), String> {
+    ensure_sessions_for_mode_with_profile(state, conn_id, cwd, tx, request_id, None).await
+}
+
+pub async fn ensure_sessions_for_mode_with_profile(
+    state: &ServerState,
+    conn_id: &str,
+    cwd: Option<&PathBuf>,
+    tx: &mpsc::Sender<String>,
+    request_id: Option<&str>,
+    profile_id: Option<&str>,
+) -> Result<(), String> {
     let mode = current_mode(state, conn_id).await?;
     match mode {
         RoutingMode::Single => {
             let agent_id = current_active_agent(state, conn_id).await?;
-            ensure_session(state, conn_id, &agent_id, cwd, tx, request_id).await?;
+            ensure_session(state, conn_id, &agent_id, cwd, tx, request_id, profile_id).await?;
         }
         RoutingMode::Broadcast => {
             let agent_ids = list_agent_ids(state);
             for (i, agent_id) in agent_ids.iter().enumerate() {
                 // Only pass request_id to the first agent in broadcast mode
                 let req_id = if i == 0 { request_id } else { None };
-                ensure_session(state, conn_id, agent_id, cwd, tx, req_id).await?;
+                ensure_session(state, conn_id, agent_id, cwd, tx, req_id, profile_id).await?;
             }
         }
     }
@@ -54,14 +69,12 @@ pub async fn prompt_for_mode(
     match mode {
         RoutingMode::Single => {
             let agent_id = current_active_agent(state, conn_id).await?;
-            let session_id = ensure_session(state, conn_id, &agent_id, cwd, tx, None).await?;
-            let agent = agent_for_id(state, &agent_id)
-                .ok_or_else(|| format!("Unknown agent: {}", agent_id))?;
+            let session_id = ensure_session(state, conn_id, &agent_id, cwd, tx, None, None).await?;
+            let profile_id = resolve_profile_id_for_session(state, Some(&session_id), None).await?;
+            let agent = agent_for_profile_and_id(state, profile_id.as_deref(), &agent_id).await?;
             let session_cwd = session_cwd_for(state, &session_id).await.or(cwd.cloned());
-            let session_ref = {
-                let registry = state.agent.registry.lock().await;
-                registry.get(&session_id).cloned()
-            };
+            let session_ref =
+                session_ref_for_profile(state, profile_id.as_deref(), &session_id).await;
             let prompt_blocks = super::mentions::build_prompt_blocks(
                 &state.workspace_manager,
                 session_cwd.as_ref(),
@@ -84,14 +97,15 @@ pub async fn prompt_for_mode(
         RoutingMode::Broadcast => {
             let agent_ids = list_agent_ids(state);
             for agent_id in agent_ids {
-                let session_id = ensure_session(state, conn_id, &agent_id, cwd, tx, None).await?;
-                let agent = agent_for_id(state, &agent_id)
-                    .ok_or_else(|| format!("Unknown agent: {}", agent_id))?;
+                let session_id =
+                    ensure_session(state, conn_id, &agent_id, cwd, tx, None, None).await?;
+                let profile_id =
+                    resolve_profile_id_for_session(state, Some(&session_id), None).await?;
+                let agent =
+                    agent_for_profile_and_id(state, profile_id.as_deref(), &agent_id).await?;
                 let session_cwd = session_cwd_for(state, &session_id).await.or(cwd.cloned());
-                let session_ref = {
-                    let registry = state.agent.registry.lock().await;
-                    registry.get(&session_id).cloned()
-                };
+                let session_ref =
+                    session_ref_for_profile(state, profile_id.as_deref(), &session_id).await;
                 let prompt_blocks = super::mentions::build_prompt_blocks(
                     &state.workspace_manager,
                     session_cwd.as_ref(),
@@ -146,6 +160,7 @@ pub async fn ensure_session(
     cwd: Option<&PathBuf>,
     tx: &mpsc::Sender<String>,
     request_id: Option<&str>,
+    profile_id: Option<&str>,
 ) -> Result<String, String> {
     let existing = {
         let connections = state.connections.lock().await;
@@ -156,9 +171,17 @@ pub async fn ensure_session(
     if let Some(session_id) = &existing {
         // Verify the session still exists in the registry.
         // After a force-stop the session is removed, making the binding stale.
-        let still_alive = {
-            let registry = state.agent.registry.lock().await;
-            registry.get(session_id).is_some()
+        let existing_profile_id =
+            resolve_profile_id_for_session(state, Some(session_id), profile_id).await?;
+        let still_alive = if let Ok(agent) =
+            agent_for_profile_and_id(state, existing_profile_id.as_deref(), agent_id).await
+        {
+            agent
+                .load_session(LoadSessionRequest::new(session_id.clone(), PathBuf::new()))
+                .await
+                .is_ok()
+        } else {
+            false
         };
         if still_alive {
             return Ok(session_id.clone());
@@ -173,8 +196,8 @@ pub async fn ensure_session(
         }
     }
 
-    let agent =
-        agent_for_id(state, agent_id).ok_or_else(|| format!("Unknown agent: {}", agent_id))?;
+    let selected_profile_id = resolve_profile_id(state, profile_id).await?;
+    let agent = agent_for_profile_and_id(state, selected_profile_id.as_deref(), agent_id).await?;
 
     // Use empty PathBuf as sentinel for "no cwd" to work with ACP protocol
     let cwd_for_request = cwd.cloned().unwrap_or_else(PathBuf::new);
@@ -202,6 +225,13 @@ pub async fn ensure_session(
         agents.insert(session_id.clone(), agent_id.to_string());
     }
 
+    if let (Some(profiles), Some(profile_id)) = (&state.profiles, selected_profile_id.as_deref()) {
+        profiles
+            .bind_session_to_profile(session_id.clone(), profile_id)
+            .await
+            .map_err(|err| format!("Failed to bind session to profile: {err}"))?;
+    }
+
     // Auto-subscribe the connection to this session
     {
         let mut connections = state.connections.lock().await;
@@ -214,6 +244,7 @@ pub async fn ensure_session(
         tx,
         UiServerMessage::SessionCreated {
             agent_id: agent_id.to_string(),
+            profile_id: selected_profile_id.clone(),
             session_id: session_id.clone(),
             request_id: request_id.map(|s| s.to_string()),
         },
@@ -239,6 +270,7 @@ pub async fn ensure_session(
             UiServerMessage::SessionEvents {
                 session_id: session_id.clone(),
                 agent_id: agent_id.to_string(),
+                profile_id: selected_profile_id.clone(),
                 events,
                 cursor,
             },
@@ -310,6 +342,104 @@ pub fn agent_for_id(state: &ServerState, agent_id: &str) -> Option<Arc<dyn Agent
     registry.get_handle(agent_id)
 }
 
+pub async fn resolve_profile_id(
+    state: &ServerState,
+    profile_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    resolve_profile_id_for_session(state, None, profile_id).await
+}
+
+pub async fn resolve_profile_id_for_session(
+    state: &ServerState,
+    session_id: Option<&str>,
+    requested_profile_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(profiles) = &state.profiles {
+        if let Some(session_id) = session_id {
+            if let Some(binding) = profiles.session_binding(session_id).await {
+                return Ok(Some(binding.profile_id));
+            }
+        }
+
+        if let Some(id) = requested_profile_id {
+            return Ok(Some(id.to_string()));
+        }
+
+        return Ok(Some(profiles.active_profile_id().await));
+    }
+
+    match requested_profile_id {
+        Some("default") => Ok(Some("default".to_string())),
+        Some(id) => Err(format!("Unknown profile: {id}")),
+        None => Ok(None),
+    }
+}
+
+pub async fn agent_for_profile_and_id(
+    state: &ServerState,
+    profile_id: Option<&str>,
+    agent_id: &str,
+) -> Result<Arc<dyn AgentHandleTrait>, String> {
+    let Some(profiles) = &state.profiles else {
+        return agent_for_id(state, agent_id).ok_or_else(|| format!("Unknown agent: {agent_id}"));
+    };
+
+    let profile_id = match profile_id {
+        Some(id) => id.to_string(),
+        None => profiles.active_profile_id().await,
+    };
+    let runtime = profiles
+        .runtime_for_profile(&profile_id)
+        .await
+        .map_err(|err| {
+            format_prefixed_error_chain(&format!("Failed to load profile '{profile_id}'"), &err)
+        })?;
+    let handle = runtime.agent().handle();
+    if agent_id == PRIMARY_AGENT_ID {
+        Ok(handle as Arc<dyn AgentHandleTrait>)
+    } else {
+        handle
+            .agent_registry()
+            .get_handle(agent_id)
+            .ok_or_else(|| format!("Unknown agent: {agent_id}"))
+    }
+}
+
+pub async fn session_ref_for_profile(
+    state: &ServerState,
+    profile_id: Option<&str>,
+    session_id: &str,
+) -> Option<SessionActorRef> {
+    let agent = agent_for_profile_and_id(state, profile_id, PRIMARY_AGENT_ID)
+        .await
+        .ok()?;
+    let local_agent = agent.as_any().downcast_ref::<AgentHandle>()?;
+    let registry = local_agent.registry.lock().await;
+    registry.get(session_id).cloned()
+}
+
+pub async fn list_profiles(state: &ServerState) -> Vec<UiProfileInfo> {
+    if let Some(profiles) = &state.profiles {
+        profiles
+            .list_profiles()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+pub async fn active_profile_id(state: &ServerState) -> Option<String> {
+    if let Some(profiles) = &state.profiles {
+        Some(profiles.active_profile_id().await)
+    } else {
+        None
+    }
+}
+
 /// Get the current active agent ID for a connection.
 pub async fn current_active_agent(state: &ServerState, conn_id: &str) -> Result<String, String> {
     let connections = state.connections.lock().await;
@@ -378,7 +508,24 @@ pub fn collect_event_sources(
 
 #[cfg(test)]
 mod tests {
-    use super::format_prompt_error;
+    use super::{format_prompt_error, resolve_profile_id_for_session};
+    use crate::profiles::{LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager};
+    use crate::test_utils::TestServerState;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn write_profile(dir: &Path, name: &str) {
+        std::fs::write(
+            dir.join(name),
+            r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "inline"
+"#,
+        )
+        .expect("profile should be written");
+    }
 
     #[test]
     fn format_prompt_error_includes_session_and_target() {
@@ -393,5 +540,41 @@ mod tests {
         let raw = "session not found";
         let msg = format_prompt_error("sess-9", "local session", raw);
         assert!(msg.ends_with(raw));
+    }
+
+    #[tokio::test]
+    async fn resolve_profile_for_session_prefers_existing_binding_over_active_or_requested() {
+        let mut fixture = TestServerState::new().await;
+        let dir = tempfile::TempDir::new().expect("temp profile dir");
+        write_profile(dir.path(), "alpha.toml");
+        write_profile(dir.path(), "beta.toml");
+        let catalog: Arc<dyn ProfileCatalog> = Arc::new(
+            LocalProfileCatalog::builder()
+                .include_embedded_default(false)
+                .local_dir(dir.path())
+                .build(),
+        );
+        let profiles = Arc::new(
+            ProfileRuntimeManager::with_default_infra_boxed(catalog, "alpha")
+                .await
+                .expect("profiles manager should initialize"),
+        );
+        fixture.state.profiles = Some(profiles.clone());
+
+        profiles
+            .bind_session_to_profile("session-1", "alpha")
+            .await
+            .expect("session should bind to alpha profile");
+        profiles
+            .set_active_profile("beta")
+            .await
+            .expect("beta should become active for new sessions");
+
+        let resolved =
+            resolve_profile_id_for_session(&fixture.state, Some("session-1"), Some("beta"))
+                .await
+                .expect("bound profile should resolve");
+
+        assert_eq!(resolved.as_deref(), Some("alpha"));
     }
 }
