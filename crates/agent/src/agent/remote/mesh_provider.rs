@@ -27,7 +27,9 @@ use crate::agent::remote::provider_host::{
     ProviderStreamRequest, ProviderStreamStatus, RenewProviderStreamLease, StreamRelayMessage,
 };
 use crate::agent::remote::scope::{MeshScopeId, scoped_node_manager, scoped_provider_host};
-use crate::agent::remote::session_stream_router::{AttachStreamConsumer, SessionStreamRouterActor};
+use crate::agent::remote::session_stream_router::{
+    AttachStreamConsumer, RegisterRequest, SessionStreamRouterActor,
+};
 use futures_util::StreamExt;
 use kameo::actor::Spawn;
 use libp2p::PeerId;
@@ -163,7 +165,7 @@ impl MeshChatProvider {
         let target_scope = peer_id
             .as_ref()
             .and_then(|pid| mesh.best_route_for_peer(pid).map(|route| route.scope))
-            .unwrap_or(MeshScopeId::Lan);
+            .unwrap_or(MeshScopeId::lan_default());
 
         Self {
             provider_name: provider_name.to_string(),
@@ -439,6 +441,18 @@ impl ChatProvider for MeshChatProvider {
         // Get or create the stable per-session router
         let router_ref = self.get_or_create_stream_router(&session_id).await;
 
+        // Pre-register the request ID so the router does not auto-create
+        // entries for unsolicited relay messages. Await completion to avoid a
+        // race where attach arrives before registration is visible.
+        router_ref
+            .ask(RegisterRequest {
+                request_id: request_id.clone(),
+            })
+            .await
+            .map_err(|e| {
+                LLMError::ProviderError(format!("failed to register stream request: {}", e))
+            })?;
+
         // Convert to remote ref so the provider host can send to it
         let remote_router_ref = router_ref.clone().into_remote_ref().await;
 
@@ -534,7 +548,7 @@ impl ChatProvider for MeshChatProvider {
             ),
             move |(
                 mut raw_stream,
-                disconnected_since,
+                mut disconnected_since,
                 mut chunk_index,
                 mut pending_chunks,
                 mut first_chunk_recorded,
@@ -551,21 +565,14 @@ impl ChatProvider for MeshChatProvider {
                 let setup_span = setup_span.clone();
                 let provider_handle = provider_handle.clone();
                 async move {
-                    if tokio::time::Instant::now() >= renew_due {
-                        let _ = provider_handle
-                            .renew_remote_stream_lease(
-                                &session_id_for_stream,
-                                &request_id_for_stream,
-                            )
-                            .await;
-                        renew_due = tokio::time::Instant::now() + lease_renew_every;
-                    }
-
+                    // ── Pending chunks are always yielded immediately ────────
                     if let Some(chunk) = pending_chunks.pop_front() {
                         chunk_index += 1;
-                        let elapsed_ms = stream_start.elapsed().as_millis();
                         if !first_chunk_recorded {
-                            setup_span.record("first_chunk_ms", elapsed_ms as u64);
+                            setup_span.record(
+                                "first_chunk_ms",
+                                stream_start.elapsed().as_millis() as u64,
+                            );
                             first_chunk_recorded = true;
                         }
                         return Some((
@@ -582,6 +589,27 @@ impl ChatProvider for MeshChatProvider {
                     }
 
                     loop {
+                        // ── Renew lease while waiting for the next chunk ────
+                        // Lease renewal runs concurrently with stream polling so
+                        // that a long-waiting `raw_stream.next()` (e.g. slow
+                        // provider setup or first-token latency) cannot starve
+                        // renewal.  The provider host independently expires
+                        // unused leases on heartbeat ticks.
+                        let now = tokio::time::Instant::now();
+                        let sleep = if now >= renew_due {
+                            // Overdue — renew now without waiting.
+                            let _ = provider_handle
+                                .renew_remote_stream_lease(
+                                    &session_id_for_stream,
+                                    &request_id_for_stream,
+                                )
+                                .await;
+                            renew_due = tokio::time::Instant::now() + lease_renew_every;
+                            tokio::time::sleep(std::time::Duration::ZERO)
+                        } else {
+                            tokio::time::sleep_until(renew_due)
+                        };
+
                         let next = if let Some(since) = disconnected_since {
                             let elapsed = since.elapsed();
                             let remaining = reconnect_grace.saturating_sub(elapsed);
@@ -604,9 +632,21 @@ impl ChatProvider for MeshChatProvider {
                                     ),
                                 ));
                             }
-                            match tokio::time::timeout(remaining, raw_stream.next()).await {
-                                Ok(item) => item,
-                                Err(_) => {
+                            tokio::select! {
+                                item = raw_stream.next() => item,
+                                _ = sleep => {
+                                    // Renew lease while waiting for reconnect.
+                                    let _ = provider_handle
+                                        .renew_remote_stream_lease(
+                                            &session_id_for_stream,
+                                            &request_id_for_stream,
+                                        )
+                                        .await;
+                                    renew_due = tokio::time::Instant::now()
+                                        + lease_renew_every;
+                                    continue;
+                                }
+                                _ = tokio::time::sleep(remaining) => {
                                     return Some((
                                         Err(LLMError::Transport {
                                             kind: TransportErrorKind::Timeout,
@@ -627,7 +667,21 @@ impl ChatProvider for MeshChatProvider {
                                 }
                             }
                         } else {
-                            raw_stream.next().await
+                            tokio::select! {
+                                item = raw_stream.next() => item,
+                                _ = sleep => {
+                                    // Renew lease while waiting for next chunk.
+                                    let _ = provider_handle
+                                        .renew_remote_stream_lease(
+                                            &session_id_for_stream,
+                                            &request_id_for_stream,
+                                        )
+                                        .await;
+                                    renew_due = tokio::time::Instant::now()
+                                        + lease_renew_every;
+                                    continue;
+                                }
+                            }
                         };
 
                         match next {
@@ -672,7 +726,7 @@ impl ChatProvider for MeshChatProvider {
                                     Ok(chunk),
                                     (
                                         raw_stream,
-                                        None,
+                                        disconnected_since,
                                         chunk_index,
                                         pending_chunks,
                                         first_chunk_recorded,
@@ -716,7 +770,7 @@ impl ChatProvider for MeshChatProvider {
                                     Ok(chunk),
                                     (
                                         raw_stream,
-                                        None,
+                                        disconnected_since,
                                         chunk_index,
                                         pending_chunks,
                                         first_chunk_recorded,
@@ -771,19 +825,12 @@ impl ChatProvider for MeshChatProvider {
                                     model = %model_for_stream,
                                     target_node = %target_for_stream,
                                     reason,
-                                    "stream transport disconnected"
+                                    "stream transport disconnected (internal state, continuing)"
                                 );
-                                break Some((
-                                    Err(LLMError::RemoteStreamDisconnected { message: reason }),
-                                    (
-                                        raw_stream,
-                                        None,
-                                        chunk_index,
-                                        pending_chunks,
-                                        first_chunk_recorded,
-                                        renew_due,
-                                    ),
-                                ));
+                                // Track disconnect time internally; do NOT expose
+                                // as a stream error.
+                                disconnected_since.get_or_insert_with(tokio::time::Instant::now);
+                                continue;
                             }
                             Some(StreamRelayMessage::TransportReconnected { buffered_chunks }) => {
                                 tracing::info!(
@@ -796,21 +843,11 @@ impl ChatProvider for MeshChatProvider {
                                     model = %model_for_stream,
                                     target_node = %target_for_stream,
                                     buffered_chunks,
-                                    "stream transport reconnected"
+                                    "stream transport reconnected (internal state update)"
                                 );
-                                break Some((
-                                    Err(LLMError::RemoteStreamReconnected {
-                                        message: format!("buffered_chunks={}", buffered_chunks),
-                                    }),
-                                    (
-                                        raw_stream,
-                                        None,
-                                        chunk_index,
-                                        pending_chunks,
-                                        first_chunk_recorded,
-                                        renew_due,
-                                    ),
-                                ));
+                                // Reset disconnect tracking.
+                                disconnected_since = None;
+                                continue;
                             }
                             Some(StreamRelayMessage::TransportFailed { error }) => {
                                 break Some((

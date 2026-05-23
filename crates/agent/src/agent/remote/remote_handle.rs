@@ -53,12 +53,19 @@ impl RemoteAgentHandle {
         let Some(node_id) = self.mesh.resolve_peer_node_id(&self.peer_label).await else {
             return;
         };
-        let provider_host_name = crate::agent::remote::dht_name::provider_host(&node_id);
-        let Ok(Some(provider_host)) = self
-            .mesh
-            .lookup_actor::<ProviderHostActor>(&provider_host_name)
-            .await
-        else {
+        let mut provider_host = None;
+        for scope in self.mesh.active_scopes() {
+            let provider_host_name = crate::agent::remote::scope::scoped_provider_host(&scope, &node_id);
+            if let Ok(Some(found)) = self
+                .mesh
+                .lookup_actor::<ProviderHostActor>(&provider_host_name)
+                .await
+            {
+                provider_host = Some(found);
+                break;
+            }
+        }
+        let Some(provider_host) = provider_host else {
             return;
         };
 
@@ -115,25 +122,36 @@ impl RemoteAgentHandle {
         let span = tracing::Span::current();
 
         let t0 = std::time::Instant::now();
-        let node_manager = self
-            .mesh
-            .lookup_actor::<RemoteNodeManager>(crate::agent::remote::dht_name::NODE_MANAGER)
-            .await
-            .map_err(|e| {
-                Error::from(AgentError::SwarmLookupFailed {
-                    key: "node_manager".to_string(),
-                    reason: e.to_string(),
-                })
-            })?
-            .ok_or_else(|| {
-                Error::new(
-                    -32001,
-                    format!(
-                        "Remote peer '{}' not found in DHT (is the mesh running on that machine?)",
-                        self.peer_label
-                    ),
-                )
-            })?;
+        let mut node_manager = None;
+        for scope in self.mesh.active_scopes() {
+            let dht_name = crate::agent::remote::scope::scoped_node_manager(&scope);
+            match self
+                .mesh
+                .lookup_actor::<RemoteNodeManager>(dht_name.clone())
+                .await
+            {
+                Ok(Some(found)) => {
+                    node_manager = Some(found);
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(Error::from(AgentError::SwarmLookupFailed {
+                        key: dht_name,
+                        reason: e.to_string(),
+                    }));
+                }
+            }
+        }
+        let node_manager = node_manager.ok_or_else(|| {
+            Error::new(
+                -32001,
+                format!(
+                    "Remote peer '{}' not found in scoped DHT (is the mesh running on that machine?)",
+                    self.peer_label
+                ),
+            )
+        })?;
         span.record("dht_lookup_node_ms", t0.elapsed().as_millis() as u64);
 
         let t1 = std::time::Instant::now();
@@ -151,7 +169,6 @@ impl RemoteAgentHandle {
                 SessionActorRef::remote(session_ref, self.peer_label.clone())
             }
             SessionHandoff::LookupOnly => {
-                let dht_name = crate::agent::remote::dht_name::session(&session_id);
                 let lookup_backoff_ms: [u64; 4] = [0, 120, 300, 700];
                 let mut remote_ref = None;
                 let mut last_error = None;
@@ -161,36 +178,39 @@ impl RemoteAgentHandle {
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     }
 
-                    match self
-                        .mesh
-                        .lookup_actor_no_retry::<crate::agent::session_actor::SessionActor>(
-                            dht_name.clone(),
-                        )
-                        .await
-                    {
-                        Ok(Some(found)) => {
-                            remote_ref = Some(found);
-                            break;
+                    for scope in self.mesh.active_scopes() {
+                        let dht_name = crate::agent::remote::scope::scoped_session(&scope, &session_id);
+                        match self
+                            .mesh
+                            .lookup_actor_no_retry::<crate::agent::session_actor::SessionActor>(
+                                dht_name,
+                            )
+                            .await
+                        {
+                            Ok(Some(r)) => {
+                                remote_ref = Some(r);
+                                break;
+                            }
+                            Ok(None) => {}
+                            Err(e) => last_error = Some(e.to_string()),
                         }
-                        Ok(None) => {}
-                        Err(e) => last_error = Some(e.to_string()),
+                    }
+                    if remote_ref.is_some() {
+                        break;
                     }
                 }
 
                 let remote_ref = remote_ref.ok_or_else(|| {
-                    if let Some(reason) = last_error {
-                        Error::from(AgentError::SwarmLookupFailed {
-                            key: dht_name.clone(),
-                            reason,
-                        })
-                    } else {
-                        Error::from(AgentError::RemoteSessionNotFound {
-                            details: format!(
-                                "remote session {} created but not yet discoverable via lookup",
-                                session_id
-                            ),
-                        })
-                    }
+                    let detail = last_error
+                        .map(|e| format!("last error: {e}"))
+                        .unwrap_or_else(|| "session was not visible in scoped DHT yet".to_string());
+                    Error::new(
+                        -32001,
+                        format!(
+                            "Session '{}' not attachable from peer '{}': looked up scoped session names with backoff, {}",
+                            session_id, self.peer_label, detail
+                        ),
+                    )
                 })?;
                 SessionActorRef::remote(remote_ref, self.peer_label.clone())
             }

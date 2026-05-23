@@ -875,7 +875,6 @@ mod tests {
     use crate::test_utils::DelegateTestFixture;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
     use tokio::sync::Mutex;
     use tokio::sync::oneshot;
 
@@ -1157,13 +1156,6 @@ mod tests {
         };
         assert_eq!(select.current_value.0.as_ref(), "auto");
     }
-
-    struct HookProbe {
-        called: AtomicBool,
-    }
-
-    #[async_trait::async_trait]
-    impl AcpSessionHooks for HookProbe {}
 
     #[tokio::test]
     async fn session_new_rpc_dispatches_to_agent_new_session() {

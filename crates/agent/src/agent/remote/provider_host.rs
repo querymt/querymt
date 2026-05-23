@@ -273,20 +273,24 @@ pub(crate) fn relay_message_is_terminal(message: &StreamRelayMessage) -> bool {
 }
 
 fn update_active_stream(
-    active_streams: &Arc<Mutex<HashMap<String, ActiveProviderStream>>>,
+    active_streams: &Arc<Mutex<HashMap<(String, String), ActiveProviderStream>>>,
+    session_id: &str,
     request_id: &str,
     f: impl FnOnce(&mut ActiveProviderStream),
 ) {
-    if let Some(stream) = active_streams.lock().get_mut(request_id) {
+    let key = (session_id.to_string(), request_id.to_string());
+    if let Some(stream) = active_streams.lock().get_mut(&key) {
         f(stream);
     }
 }
 
 fn remove_active_stream(
-    active_streams: &Arc<Mutex<HashMap<String, ActiveProviderStream>>>,
+    active_streams: &Arc<Mutex<HashMap<(String, String), ActiveProviderStream>>>,
+    session_id: &str,
     request_id: &str,
 ) {
-    active_streams.lock().remove(request_id);
+    let key = (session_id.to_string(), request_id.to_string());
+    active_streams.lock().remove(&key);
 }
 
 // ── StreamReceiverActor ───────────────────────────────────────────────────────
@@ -408,7 +412,9 @@ impl ActiveProviderStream {
 #[derive(Actor)]
 pub struct ProviderHostActor {
     config: Arc<AgentConfig>,
-    active_streams: Arc<Mutex<HashMap<String, ActiveProviderStream>>>,
+    /// Keyed by `(session_id, request_id)` so that duplicate/replayed
+    /// request IDs from different sessions cannot overwrite each other.
+    active_streams: Arc<Mutex<HashMap<(String, String), ActiveProviderStream>>>,
 }
 
 impl ProviderHostActor {
@@ -426,16 +432,14 @@ impl ProviderHostActor {
     ) -> Option<ProviderStreamStatus> {
         let streams = self.active_streams.lock();
         if let Some(request_id) = request_id {
-            return streams
-                .get(request_id)
-                .filter(|stream| stream.session_id == session_id)
-                .map(ActiveProviderStream::status);
+            let key = (session_id.to_string(), request_id.to_string());
+            return streams.get(&key).map(ActiveProviderStream::status);
         }
 
         streams
-            .values()
-            .find(|stream| stream.session_id == session_id)
-            .map(ActiveProviderStream::status)
+            .iter()
+            .find(|((s, _), _)| s == session_id)
+            .map(|(_, stream)| stream.status())
     }
 
     fn cancel_streams(
@@ -447,31 +451,29 @@ impl ProviderHostActor {
         let reason = reason.unwrap_or("cancel requested").to_string();
         let mut streams = self.active_streams.lock();
         let mut cancelled = 0usize;
-        for stream in streams.values_mut() {
-            if stream.session_id != session_id {
-                continue;
+        // Collect keys first to avoid borrow issues while mutating.
+        let to_cancel: Vec<(String, String)> = streams
+            .keys()
+            .filter(|(s, r)| s == session_id && request_id.is_none_or(|rid| r == rid))
+            .cloned()
+            .collect();
+        for key in to_cancel {
+            if let Some(stream) = streams.get_mut(&key) {
+                stream.phase = ProviderStreamPhase::Cancelling;
+                stream.last_error = Some(reason.clone());
+                stream.cancel_token.cancel();
+                cancelled += 1;
             }
-            if let Some(request_id) = request_id
-                && stream.request_id != request_id
-            {
-                continue;
-            }
-            stream.phase = ProviderStreamPhase::Cancelling;
-            stream.last_error = Some(reason.clone());
-            stream.cancel_token.cancel();
-            cancelled += 1;
         }
         cancelled
     }
 
     fn renew_stream_lease(&self, session_id: &str, request_id: &str, lease_ttl_secs: u64) -> bool {
         let mut streams = self.active_streams.lock();
-        let Some(stream) = streams.get_mut(request_id) else {
+        let key = (session_id.to_string(), request_id.to_string());
+        let Some(stream) = streams.get_mut(&key) else {
             return false;
         };
-        if stream.session_id != session_id {
-            return false;
-        }
         stream.lease_expires_at = Instant::now() + Duration::from_secs(lease_ttl_secs.max(1));
         true
     }
@@ -710,7 +712,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
             {
                 let mut streams = active_streams.lock();
                 streams.insert(
-                    request_id.clone(),
+                    (session_id.clone(), request_id.clone()),
                     ActiveProviderStream {
                         session_id: session_id.clone(),
                         request_id: request_id.clone(),
@@ -735,6 +737,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
             // This guard is "defused" after all setup steps succeed; on error it
             // removes the stale entry before the error propagates.
             let cleanup_request_id = request_id.clone();
+            let cleanup_session_id = session_id.clone();
             let cleanup_streams = Arc::clone(&active_streams);
 
             // Extract the router ref before setup so it is available in the error path.
@@ -791,7 +794,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                         message: StreamRelayMessage::ProviderError { error: error_payload },
                     }).send();
                     // Clean up the stale OpeningUpstream entry.
-                    remove_active_stream(&cleanup_streams, &cleanup_request_id);
+                    remove_active_stream(&cleanup_streams, &cleanup_session_id, &cleanup_request_id);
                     return Err(e);
                 }
             };
@@ -824,7 +827,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                     let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
                     heartbeat_tick.tick().await;
 
-                    update_active_stream(&active_streams, &request_id, |stream| {
+                    update_active_stream(&active_streams, &session_id, &request_id, |stream| {
                         stream.phase = ProviderStreamPhase::WaitingFirstChunk;
                     });
 
@@ -850,7 +853,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                             _ = cancel_token.cancelled(), if !upstream_done => {
                                 upstream_done = true;
                                 flush_batch(&mut buffered, &mut pending_batch, &mut batch_count, &mut max_batch_size);
-                                update_active_stream(&active_streams, &request_id, |stream| {
+                                update_active_stream(&active_streams, &session_id, &request_id, |stream| {
                                     stream.phase = ProviderStreamPhase::Cancelling;
                                     stream.last_error.get_or_insert_with(|| "cancelled".to_string());
                                 });
@@ -865,7 +868,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                 let now = Instant::now();
                                 let mut lease_expired = false;
                                 let mut status = None;
-                                update_active_stream(&active_streams, &request_id, |stream| {
+                                update_active_stream(&active_streams, &session_id, &request_id, |stream| {
                                     if now >= stream.lease_expires_at {
                                         lease_expired = true;
                                         stream.phase = ProviderStreamPhase::LeaseExpired;
@@ -918,7 +921,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                                     flush_batch(&mut buffered, &mut pending_batch, &mut batch_count, &mut max_batch_size);
                                                 }
                                                 let chunk_delta = if chunk_is_done { 0 } else { 1 };
-                                                update_active_stream(&active_streams, &request_id, |stream| {
+                                                update_active_stream(&active_streams, &session_id, &request_id, |stream| {
                                                     stream.phase = ProviderStreamPhase::Streaming;
                                                     stream.last_progress_at = Instant::now();
                                                     stream.receiver_connected = disconnected_since.is_none();
@@ -930,7 +933,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                                 upstream_done = true;
                                                 let payload = e.to_payload();
                                                 let message = e.to_string();
-                                                update_active_stream(&active_streams, &request_id, |stream| {
+                                                update_active_stream(&active_streams, &session_id, &request_id, |stream| {
                                                     stream.phase = ProviderStreamPhase::Failed;
                                                     stream.last_error = Some(message);
                                                     stream.last_progress_at = Instant::now();
@@ -949,7 +952,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                     chunk_count = chunk_count,
                                     "stream done from upstream provider"
                                 );
-                                update_active_stream(&active_streams, &request_id, |stream| {
+                                update_active_stream(&active_streams, &session_id, &request_id, |stream| {
                                     stream.phase = ProviderStreamPhase::Completed;
                                     stream.last_progress_at = Instant::now();
                                 });
@@ -958,7 +961,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                     None => {
                                         if pending_batch.is_empty() {
                                             upstream_done = true;
-                                            update_active_stream(&active_streams, &request_id, |stream| {
+                                            update_active_stream(&active_streams, &session_id, &request_id, |stream| {
                                                 stream.phase = ProviderStreamPhase::Completed;
                                                 stream.last_progress_at = Instant::now();
                                             });
@@ -987,7 +990,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                 if reconnect_result.is_ok() {
                                     // Send succeeded, receiver is back online.
                                     let disconnected_duration = disconnected_since.take().map(|s| s.elapsed());
-                                    update_active_stream(&active_streams, &request_id, |stream| {
+                                    update_active_stream(&active_streams, &session_id, &request_id, |stream| {
                                         stream.phase = if stream.chunk_count == 0 {
                                             ProviderStreamPhase::WaitingFirstChunk
                                         } else {
@@ -1009,7 +1012,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                     );
                                 } else {
                                     let since = disconnected_since.get_or_insert_with(tokio::time::Instant::now);
-                                    update_active_stream(&active_streams, &request_id, |stream| {
+                                    update_active_stream(&active_streams, &session_id, &request_id, |stream| {
                                         stream.phase = ProviderStreamPhase::ReceiverDisconnected;
                                         stream.receiver_connected = false;
                                     });
@@ -1021,7 +1024,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                                 message: format!("reconnect grace expired after {:?}", reconnect_grace),
                                             }.to_payload(),
                                         });
-                                        update_active_stream(&active_streams, &request_id, |stream| {
+                                        update_active_stream(&active_streams, &session_id, &request_id, |stream| {
                                             stream.phase = ProviderStreamPhase::GraceExpired;
                                             stream.last_error = Some("reconnect grace expired".to_string());
                                         });
@@ -1072,7 +1075,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                             reason: e.to_string(),
                                         },
                                     }).send();
-                                    update_active_stream(&active_streams, &request_id, |stream| {
+                                    update_active_stream(&active_streams, &session_id, &request_id, |stream| {
                                         stream.phase = ProviderStreamPhase::ReceiverDisconnected;
                                         stream.receiver_connected = false;
                                         stream.last_error = Some(e.to_string());
@@ -1104,7 +1107,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                             };
                             chunk_count += relayed_chunks;
                             if relayed_chunks > 0 {
-                                update_active_stream(&active_streams, &request_id, |stream| {
+                                update_active_stream(&active_streams, &session_id, &request_id, |stream| {
                                     stream.chunk_count = chunk_count as u64;
                                     stream.last_progress_at = Instant::now();
                                 });
@@ -1136,7 +1139,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                         }
                     }
 
-                    remove_active_stream(&active_streams, &request_id);
+                    remove_active_stream(&active_streams, &session_id, &request_id);
                     tracing::Span::current().record("chunk_count", chunk_count);
                     tracing::Span::current().record("batch_count", batch_count);
                     tracing::Span::current().record("max_batch_size", max_batch_size);

@@ -383,7 +383,7 @@ async fn lookup_remote_session_actor(
         .mesh()
         .ok_or_else(|| "mesh not bootstrapped — start with --mesh".to_string())?;
 
-    let dht_name = crate::agent::remote::dht_name::session(session_id);
+    let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
     let lookup_backoff_ms: [u64; 4] = [0, 120, 300, 700];
     let mut last_lookup_error = None;
 
@@ -392,51 +392,59 @@ async fn lookup_remote_session_actor(
             tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
         }
 
-        match mesh
-            .lookup_actor_no_retry::<SessionActor>(dht_name.clone())
-            .await
-        {
-            Ok(Some(r)) => {
-                if attempt_idx > 0 {
-                    log::info!(
-                        "handle_attach_remote_session: DHT lookup for {} succeeded on retry {}",
+        let mut found = None;
+        for scope in runtime.active_scopes() {
+            let dht_name = crate::agent::remote::scope::scoped_session(&scope, session_id);
+            match runtime
+                .lookup_actor_no_retry::<SessionActor>(dht_name.clone())
+                .await
+            {
+                Ok(Some(r)) => {
+                    found = Some(r);
+                    break;
+                }
+                Ok(None) => {
+                    log::debug!(
+                        "handle_attach_remote_session: DHT lookup miss for {} under '{}' (attempt {}/{})",
                         session_id,
-                        attempt_idx + 1
+                        dht_name,
+                        attempt_idx + 1,
+                        lookup_backoff_ms.len()
                     );
                 }
-                return Ok(r);
+                Err(e) => {
+                    last_lookup_error = Some(e.to_string());
+                    log::warn!(
+                        "handle_attach_remote_session: DHT lookup error for {} under '{}' (attempt {}/{}): {}",
+                        session_id,
+                        dht_name,
+                        attempt_idx + 1,
+                        lookup_backoff_ms.len(),
+                        e
+                    );
+                }
             }
-            Ok(None) => {
-                log::debug!(
-                    "handle_attach_remote_session: DHT lookup miss for {} under '{}' (attempt {}/{})",
+        }
+
+        if let Some(r) = found {
+            if attempt_idx > 0 {
+                log::info!(
+                    "handle_attach_remote_session: DHT lookup for {} succeeded on retry {}",
                     session_id,
-                    dht_name,
-                    attempt_idx + 1,
-                    lookup_backoff_ms.len()
+                    attempt_idx + 1
                 );
             }
-            Err(e) => {
-                last_lookup_error = Some(e.to_string());
-                log::warn!(
-                    "handle_attach_remote_session: DHT lookup error for {} under '{}' (attempt {}/{}): {}",
-                    session_id,
-                    dht_name,
-                    attempt_idx + 1,
-                    lookup_backoff_ms.len(),
-                    e
-                );
-            }
+            return Ok(r);
         }
     }
 
     let detail = last_lookup_error
         .map(|e| format!("last error: {e}"))
-        .unwrap_or_else(|| "session was not visible in DHT yet".to_string());
+        .unwrap_or_else(|| "session was not visible in scoped DHT yet".to_string());
     Err(format!(
-        "Session '{}' not attachable from node '{}': looked up '{}' {} times, {}",
+        "Session '{}' not attachable from node '{}': looked up scoped session names {} times, {}",
         session_id,
         node_id,
-        dht_name,
         lookup_backoff_ms.len(),
         detail
     ))

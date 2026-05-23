@@ -183,7 +183,7 @@ impl MeshRuntimeHandle {
     /// Register a local actor in the DHT under a scope-prefixed name.
     ///
     /// The DHT name is composed as `{scope.dht_prefix()}{name}`.
-    /// For [`MeshScopeId::Lan`] this produces the same name as
+    /// For [`MeshScopeId::lan_default()`] this produces the same name as
     /// [`register_actor`](Self::register_actor).
     pub async fn register_actor_scoped<A>(
         &self,
@@ -200,7 +200,7 @@ impl MeshRuntimeHandle {
     /// Look up a remote actor by scope-prefixed name (with retry backoff).
     ///
     /// The DHT name is composed as `{scope.dht_prefix()}{name}`.
-    /// For [`MeshScopeId::Lan`] this produces the same result as
+    /// For [`MeshScopeId::lan_default()`] this produces the same result as
     /// [`lookup_actor`](Self::lookup_actor).
     pub async fn lookup_actor_scoped<A>(
         &self,
@@ -572,7 +572,7 @@ mod tests {
 
     #[test]
     fn mesh_scope_id_display_roundtrip() {
-        let lan = MeshScopeId::Lan;
+        let lan = MeshScopeId::lan_default();
         assert_eq!(format!("{}", lan), "lan");
 
         let iroh = MeshScopeId::Iroh {

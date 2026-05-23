@@ -1182,13 +1182,17 @@ impl LocalAgentHandle {
         let concurrency = Self::remote_node_lookup_parallelism();
         let semaphore = Arc::new(Semaphore::new(concurrency));
 
-        let mut stream = mesh
-            .lookup_all_actors::<RemoteNodeManager>(crate::agent::remote::dht_name::NODE_MANAGER);
+        let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
         let mut lookups = FuturesUnordered::new();
         let mut cached_nodes = Vec::new();
 
-        while let Some(result) = stream.next().await {
-            match result {
+        for scope in runtime.active_scopes() {
+            let mut stream = runtime.lookup_all_actors::<RemoteNodeManager>(
+                crate::agent::remote::scope::scoped_node_manager(&scope),
+            );
+
+            while let Some(result) = stream.next().await {
+                match result {
                 Ok(node_manager_ref) => {
                     let peer_id = node_manager_ref.id().peer_id().copied();
                     if peer_id == Some(local_peer_id) {
@@ -1226,6 +1230,7 @@ impl LocalAgentHandle {
                 }
                 Err(e) => log::warn!("list_remote_nodes: lookup error: {}", e),
             }
+            }
         }
 
         let mut fetched_nodes = Vec::new();
@@ -1255,9 +1260,9 @@ impl LocalAgentHandle {
     ///
     /// ## Fast path
     ///
-    /// Tries a direct DHT lookup under `node_manager::peer::{node_id}` first.
-    /// This succeeds whenever the remote node registered under the per-peer name
-    /// (see [`dht_name::node_manager_for_peer`]) and is **not** gated on
+    /// Tries a direct DHT lookup under the scoped per-peer node-manager name first.
+    /// This succeeds whenever the remote node registered under the same scope
+    /// (see [`crate::agent::remote::scope::scoped_node_manager_for_peer`]) and is **not** gated on
     /// `is_peer_alive`, so it works even when mDNS has transiently expired the
     /// peer (TTL = 30 s) while the TCP connection is still alive.
     ///
@@ -1579,7 +1584,10 @@ impl LocalAgentHandle {
                 if let Some(bookmark) = bookmark {
                     if let Some(mesh) = self.mesh() {
                         let provider_host_name =
-                            crate::agent::remote::dht_name::provider_host(&bookmark.node_id);
+                            crate::agent::remote::scope::scoped_provider_host(
+                                &crate::agent::remote::scope::MeshScopeId::lan_default(),
+                                &bookmark.node_id,
+                            );
                         if let Ok(Some(provider_host)) = mesh
                             .lookup_actor::<crate::agent::remote::provider_host::ProviderHostActor>(
                                 &provider_host_name,
@@ -2809,14 +2817,36 @@ impl SendAgent for LocalAgentHandle {
                         .mesh()
                         .ok_or_else(|| Error::invalid_request().data("mesh not bootstrapped"))?;
 
-                    // Try DHT lookup first — works for already-hydrated sessions.
-                    let dht_name = crate::agent::remote::dht_name::session(&parsed.session_id);
-                    let remote_ref = match mesh
-                        .lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name)
-                        .await
-                    {
-                        Ok(Some(r)) => r,
-                        _ => {
+                    // Try scoped DHT lookup first — works for already-hydrated sessions.
+                    let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+                    let mut remote_ref = None;
+                    let mut lookup_err = None;
+                    for scope in runtime.active_scopes() {
+                        let dht_name = crate::agent::remote::scope::scoped_session(
+                            &scope,
+                            &parsed.session_id,
+                        );
+                        match runtime
+                            .lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name)
+                            .await
+                        {
+                            Ok(Some(found)) => {
+                                remote_ref = Some(found);
+                                break;
+                            }
+                            Ok(None) => {}
+                            Err(e) => lookup_err = Some(e),
+                        }
+                    }
+                    let remote_ref = match remote_ref {
+                        Some(r) => r,
+                        None => {
+                            if let Some(err) = lookup_err {
+                                log::debug!(
+                                    "remote attach scoped lookup error before resume fallback: {}",
+                                    err
+                                );
+                            }
                             // Session not in DHT — ask the remote node to
                             // resume (materialize) it from persistence, then
                             // resolve the handoff into a remote actor ref.
@@ -3669,37 +3699,23 @@ mod tests {
 
     // ── Registration contract tests ───────────────────────────────────────────
     //
-    // These tests verify that the per-peer DHT names produced by the
-    // registration sites match what find_node_manager uses for fast-path
-    // lookup, and that the global NODE_MANAGER name is still used so
-    // list_remote_nodes continues to work via lookup_all_actors.
+    // These tests verify that remote node/session discovery uses scoped names
+    // (including LAN default scope) consistently between registration and lookup.
 
     #[cfg(feature = "remote")]
     #[test]
-    fn registration_uses_both_global_and_per_peer_dht_names() {
-        // The registration sites must register under BOTH names:
-        //   1. NODE_MANAGER  — for lookup_all_actors (list_remote_nodes)
-        //   2. node_manager_for_peer(peer_id) — for find_node_manager fast path
-        //
-        // This test verifies the two names are distinct and non-empty.
+    fn registration_uses_scoped_lan_global_and_per_peer_dht_names() {
         let peer_id = "12D3KooWCMGRXFFXJynyAG9dsgq9dukbVXRv5RofzbTXVEQaUsZv";
-        let global_name = crate::agent::remote::dht_name::NODE_MANAGER;
-        let per_peer_name = crate::agent::remote::dht_name::node_manager_for_peer(&peer_id);
+        let lan = crate::agent::remote::scope::MeshScopeId::lan_default();
+        let global_name = crate::agent::remote::scope::scoped_node_manager(&lan);
+        let per_peer_name = crate::agent::remote::scope::scoped_node_manager_for_peer(&lan, &peer_id);
 
-        assert!(!global_name.is_empty());
-        assert!(!per_peer_name.is_empty());
-        assert_ne!(
-            global_name, per_peer_name,
-            "per-peer name must differ from global name so lookup_all_actors \
-             and direct lookup remain independent"
-        );
-        // The per-peer name must embed the peer_id so it is unique per node.
-        assert!(
-            per_peer_name.contains(peer_id),
-            "per-peer name '{}' must contain peer_id '{}'",
+        assert_eq!(global_name, "scope::lan::default::node_manager");
+        assert_eq!(
             per_peer_name,
-            peer_id
+            format!("scope::lan::default::node_manager::peer::{}", peer_id)
         );
+        assert_ne!(global_name, per_peer_name);
     }
 
     // ── find_node_manager behavioral contract tests ───────────────────────────
@@ -3724,20 +3740,15 @@ mod tests {
     #[cfg(feature = "remote")]
     #[test]
     fn find_node_manager_fast_path_dht_name_matches_registration_name() {
-        // The DHT name used in find_node_manager's fast path must be exactly
-        // the same string that qmtcode/remote_setup registers the actor
-        // under. Any mismatch here would cause the fast path to always miss.
         let peer_id = "12D3KooWCMGRXFFXJynyAG9dsgq9dukbVXRv5RofzbTXVEQaUsZv";
-        let fast_path_name = crate::agent::remote::dht_name::node_manager_for_peer(&peer_id);
-        let registration_name = crate::agent::remote::dht_name::node_manager_for_peer(&peer_id);
-        assert_eq!(
-            fast_path_name, registration_name,
-            "fast-path lookup name must equal registration name"
-        );
+        let lan = crate::agent::remote::scope::MeshScopeId::lan_default();
+        let fast_path_name = crate::agent::remote::scope::scoped_node_manager_for_peer(&lan, &peer_id);
+        let registration_name = crate::agent::remote::scope::scoped_node_manager_for_peer(&lan, &peer_id);
+        assert_eq!(fast_path_name, registration_name);
         assert_eq!(
             fast_path_name,
-            format!("node_manager::peer::{}", peer_id),
-            "name must follow node_manager::peer::{{peer_id}} convention"
+            format!("scope::lan::default::node_manager::peer::{}", peer_id),
+            "name must follow scoped lan per-peer convention"
         );
     }
 

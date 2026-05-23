@@ -164,6 +164,7 @@ impl MeshRuntimeConfig {
     /// - the old `invite` field is present without `transport = "iroh"` or
     ///   `[mesh.iroh]` (ambiguous intent)
     /// - duplicate `mesh_id`s are found in Iroh scopes
+    #[allow(clippy::too_many_arguments)]
     pub fn from_toml_config(
         enabled: bool,
         transport: crate::config::MeshTransportConfig,
@@ -368,7 +369,7 @@ impl MeshRuntimeConfig {
     pub fn active_scopes(&self) -> Vec<super::scope::MeshScopeId> {
         let mut scopes = Vec::new();
         if self.lan.is_some() {
-            scopes.push(super::scope::MeshScopeId::Lan);
+            scopes.push(super::scope::MeshScopeId::lan_default());
         }
         for iroh in &self.iroh_scopes {
             scopes.push(super::scope::MeshScopeId::Iroh {
@@ -467,7 +468,7 @@ mod tests {
         );
         assert_eq!(
             config.active_scopes(),
-            vec![super::super::scope::MeshScopeId::Lan]
+            vec![super::super::scope::MeshScopeId::lan_default()]
         );
     }
 
@@ -727,18 +728,6 @@ mod tests {
             self.0.transport = v;
             self
         }
-        fn discovery(mut self, v: crate::config::MeshDiscoveryConfig) -> Self {
-            self.0.discovery = v;
-            self
-        }
-        fn listen(mut self, v: Option<String>) -> Self {
-            self.0.listen = v;
-            self
-        }
-        fn peers(mut self, v: Vec<String>) -> Self {
-            self.0.peers = v;
-            self
-        }
         fn request_timeout_secs(mut self, v: u64) -> Self {
             self.0.request_timeout_secs = v;
             self
@@ -749,10 +738,6 @@ mod tests {
         }
         fn identity_file(mut self, v: Option<String>) -> Self {
             self.0.identity_file = v;
-            self
-        }
-        fn invite(mut self, v: Option<String>) -> Self {
-            self.0.invite = v;
             self
         }
         fn node_name(mut self, v: Option<String>) -> Self {

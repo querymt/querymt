@@ -14,10 +14,8 @@
 //!
 //! ## Scoped DHT helpers
 //!
-//! The `scoped_*` functions mirror the existing helpers in
-//! [`super::dht_name`] but accept a [`MeshScopeId`] parameter.  For
-//! [`MeshScopeId::Lan`] they produce byte-for-byte identical output to the
-//! unscoped versions, preserving full backward compatibility.
+//! The `scoped_*` functions produce scope-prefixed DHT names for every scope,
+//! including LAN (`scope::lan::{lan_id}::...`).
 
 use std::fmt;
 
@@ -37,28 +35,49 @@ use std::fmt;
 /// necessary for real security.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MeshScopeId {
-    /// Ambient LAN scope — maps to no DHT prefix.
-    Lan,
+    /// LAN scope identified by a stable LAN ID.
+    Lan { lan_id: String },
     /// An Iroh mesh scope identified by a stable mesh identifier derived
     /// from invite grants.
     Iroh { mesh_id: String },
 }
 
 impl MeshScopeId {
+    fn encode_mesh_id(mesh_id: &str) -> String {
+        mesh_id
+            .bytes()
+            .map(|b| match b {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{:02X}", b),
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    pub const DEFAULT_LAN_ID: &'static str = "default";
+
+    pub fn lan_default() -> Self {
+        Self::Lan {
+            lan_id: Self::DEFAULT_LAN_ID.to_string(),
+        }
+    }
+
     /// Return the DHT key prefix for this scope.
     ///
-    /// - [`Lan`](MeshScopeId::Lan) → `""` (empty string, backward compatible)
-    /// - [`Iroh`](MeshScopeId::Iroh) → `"scope::{mesh_id}::"`
+    /// - [`Lan`](MeshScopeId::lan_default()) → `"scope::lan::{lan_id}::"`
+    /// - [`Iroh`](MeshScopeId::Iroh) → `"scope::iroh::{mesh_id}::"`
     pub fn dht_prefix(&self) -> String {
         match self {
-            Self::Lan => String::new(),
-            Self::Iroh { mesh_id } => format!("scope::{}::", mesh_id),
+            Self::Lan { lan_id } => format!("scope::lan::{}::", Self::encode_mesh_id(lan_id)),
+            Self::Iroh { mesh_id } => format!("scope::iroh::{}::", Self::encode_mesh_id(mesh_id)),
         }
     }
 
     /// Returns `true` if this is the LAN ambient scope.
     pub fn is_lan(&self) -> bool {
-        matches!(self, Self::Lan)
+        matches!(self, Self::Lan { .. })
     }
 
     /// Returns `true` if this is an Iroh scope.
@@ -69,7 +88,7 @@ impl MeshScopeId {
     /// Return the `mesh_id` if this is an Iroh scope, `None` otherwise.
     pub fn iroh_mesh_id(&self) -> Option<&str> {
         match self {
-            Self::Lan => None,
+            Self::Lan { .. } => None,
             Self::Iroh { mesh_id } => Some(mesh_id),
         }
     }
@@ -78,7 +97,7 @@ impl MeshScopeId {
 impl fmt::Display for MeshScopeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Lan => write!(f, "lan"),
+            Self::Lan { lan_id } => write!(f, "lan:{}", lan_id),
             Self::Iroh { mesh_id } => write!(f, "iroh:{}", mesh_id),
         }
     }
@@ -112,40 +131,40 @@ impl fmt::Display for MeshTransportKind {
 
 /// Scoped DHT name for the global `RemoteNodeManager` singleton.
 ///
-/// For [`MeshScopeId::Lan`] this returns `"node_manager"` — identical to
-/// [`super::dht_name::NODE_MANAGER`].
+/// For [`MeshScopeId::lan_default()`] this returns
+/// `"scope::lan::default::node_manager"`.
 pub fn scoped_node_manager(scope: &MeshScopeId) -> String {
     format!("{}node_manager", scope.dht_prefix())
 }
 
 /// Scoped DHT name for a per-peer `RemoteNodeManager`.
 ///
-/// For [`MeshScopeId::Lan`] this returns `"node_manager::peer::{peer_id}"` —
-/// identical to [`super::dht_name::node_manager_for_peer`].
+/// For [`MeshScopeId::lan_default()`] this returns
+/// `"scope::lan::default::node_manager::peer::{peer_id}"`.
 pub fn scoped_node_manager_for_peer(scope: &MeshScopeId, peer_id: &impl fmt::Display) -> String {
     format!("{}node_manager::peer::{}", scope.dht_prefix(), peer_id)
 }
 
 /// Scoped DHT name for a `ProviderHostActor`.
 ///
-/// For [`MeshScopeId::Lan`] this returns `"provider_host::peer::{peer_id}"` —
-/// identical to [`super::dht_name::provider_host`].
+/// For [`MeshScopeId::lan_default()`] this returns
+/// `"scope::lan::default::provider_host::peer::{peer_id}"`.
 pub fn scoped_provider_host(scope: &MeshScopeId, peer_id: &impl fmt::Display) -> String {
     format!("{}provider_host::peer::{}", scope.dht_prefix(), peer_id)
 }
 
 /// Scoped DHT name for a remote `SessionActor`.
 ///
-/// For [`MeshScopeId::Lan`] this returns `"session::{session_id}"` —
-/// identical to [`super::dht_name::session`].
+/// For [`MeshScopeId::lan_default()`] this returns
+/// `"scope::lan::default::session::{session_id}"`.
 pub fn scoped_session(scope: &MeshScopeId, session_id: &str) -> String {
     format!("{}session::{}", scope.dht_prefix(), session_id)
 }
 
 /// Scoped DHT name for an `EventRelayActor`.
 ///
-/// For [`MeshScopeId::Lan`] this returns `"event_relay::{session_id}::{peer_id}"` —
-/// identical to [`super::dht_name::event_relay`].
+/// For [`MeshScopeId::lan_default()`] this returns
+/// `"scope::lan::default::event_relay::{session_id}::{peer_id}"`.
 pub fn scoped_event_relay(
     scope: &MeshScopeId,
     session_id: &str,
@@ -162,13 +181,15 @@ pub fn scoped_event_relay(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::remote::dht_name;
 
     // ── MeshScopeId ─────────────────────────────────────────────────────────
 
     #[test]
-    fn lan_dht_prefix_is_empty() {
-        assert_eq!(MeshScopeId::Lan.dht_prefix(), "");
+    fn lan_dht_prefix_is_scoped_default() {
+        assert_eq!(
+            MeshScopeId::lan_default().dht_prefix(),
+            "scope::lan::default::"
+        );
     }
 
     #[test]
@@ -176,13 +197,21 @@ mod tests {
         let scope = MeshScopeId::Iroh {
             mesh_id: "personal".to_string(),
         };
-        assert_eq!(scope.dht_prefix(), "scope::personal::");
+        assert_eq!(scope.dht_prefix(), "scope::iroh::personal::");
+    }
+
+    #[test]
+    fn iroh_dht_prefix_encodes_reserved_chars() {
+        let scope = MeshScopeId::Iroh {
+            mesh_id: "team::alpha/1".to_string(),
+        };
+        assert_eq!(scope.dht_prefix(), "scope::iroh::team%3A%3Aalpha%2F1::");
     }
 
     #[test]
     fn lan_is_lan() {
-        assert!(MeshScopeId::Lan.is_lan());
-        assert!(!MeshScopeId::Lan.is_iroh());
+        assert!(MeshScopeId::lan_default().is_lan());
+        assert!(!MeshScopeId::lan_default().is_iroh());
     }
 
     #[test]
@@ -200,12 +229,12 @@ mod tests {
             mesh_id: "my-mesh".to_string(),
         };
         assert_eq!(scope.iroh_mesh_id(), Some("my-mesh"));
-        assert_eq!(MeshScopeId::Lan.iroh_mesh_id(), None);
+        assert_eq!(MeshScopeId::lan_default().iroh_mesh_id(), None);
     }
 
     #[test]
     fn display_lan() {
-        assert_eq!(format!("{}", MeshScopeId::Lan), "lan");
+        assert_eq!(format!("{}", MeshScopeId::lan_default()), "lan:default");
     }
 
     #[test]
@@ -216,52 +245,50 @@ mod tests {
         assert_eq!(format!("{}", scope), "iroh:personal");
     }
 
-    // ── Scoped DHT names: LAN backward compatibility ────────────────────────
-    // These tests verify that scoped_* helpers with MeshScopeId::Lan produce
-    // byte-for-byte identical output to the existing dht_name functions.
+    // ── Scoped DHT names: explicit LAN scope ────────────────────────────────
 
     #[test]
-    fn scoped_node_manager_lan_equals_unscoped() {
+    fn scoped_node_manager_lan_is_prefixed() {
         assert_eq!(
-            scoped_node_manager(&MeshScopeId::Lan),
-            dht_name::NODE_MANAGER
+            scoped_node_manager(&MeshScopeId::lan_default()),
+            "scope::lan::default::node_manager"
         );
     }
 
     #[test]
-    fn scoped_node_manager_for_peer_lan_equals_unscoped() {
+    fn scoped_node_manager_for_peer_lan_is_prefixed() {
         let peer_id = "12D3KooWABC";
         assert_eq!(
-            scoped_node_manager_for_peer(&MeshScopeId::Lan, &peer_id),
-            dht_name::node_manager_for_peer(&peer_id)
+            scoped_node_manager_for_peer(&MeshScopeId::lan_default(), &peer_id),
+            "scope::lan::default::node_manager::peer::12D3KooWABC"
         );
     }
 
     #[test]
-    fn scoped_provider_host_lan_equals_unscoped() {
+    fn scoped_provider_host_lan_is_prefixed() {
         let peer_id = "12D3KooWABC";
         assert_eq!(
-            scoped_provider_host(&MeshScopeId::Lan, &peer_id),
-            dht_name::provider_host(&peer_id)
+            scoped_provider_host(&MeshScopeId::lan_default(), &peer_id),
+            "scope::lan::default::provider_host::peer::12D3KooWABC"
         );
     }
 
     #[test]
-    fn scoped_session_lan_equals_unscoped() {
+    fn scoped_session_lan_is_prefixed() {
         let sid = "abc-123";
         assert_eq!(
-            scoped_session(&MeshScopeId::Lan, sid),
-            dht_name::session(sid)
+            scoped_session(&MeshScopeId::lan_default(), sid),
+            "scope::lan::default::session::abc-123"
         );
     }
 
     #[test]
-    fn scoped_event_relay_lan_equals_unscoped() {
+    fn scoped_event_relay_lan_is_prefixed() {
         let sid = "abc-123";
         let peer_id = "12D3KooWABC";
         assert_eq!(
-            scoped_event_relay(&MeshScopeId::Lan, sid, &peer_id),
-            dht_name::event_relay(sid, &peer_id)
+            scoped_event_relay(&MeshScopeId::lan_default(), sid, &peer_id),
+            "scope::lan::default::event_relay::abc-123::12D3KooWABC"
         );
     }
 
@@ -272,7 +299,7 @@ mod tests {
         let scope = MeshScopeId::Iroh {
             mesh_id: "team-a".to_string(),
         };
-        assert_eq!(scoped_node_manager(&scope), "scope::team-a::node_manager");
+        assert_eq!(scoped_node_manager(&scope), "scope::iroh::team-a::node_manager");
     }
 
     #[test]
@@ -282,7 +309,7 @@ mod tests {
         };
         assert_eq!(
             scoped_node_manager_for_peer(&scope, &"12D3KooWABC"),
-            "scope::team-a::node_manager::peer::12D3KooWABC"
+            "scope::iroh::team-a::node_manager::peer::12D3KooWABC"
         );
     }
 
@@ -293,7 +320,7 @@ mod tests {
         };
         assert_eq!(
             scoped_provider_host(&scope, &"12D3KooWABC"),
-            "scope::team-a::provider_host::peer::12D3KooWABC"
+            "scope::iroh::team-a::provider_host::peer::12D3KooWABC"
         );
     }
 
@@ -304,7 +331,7 @@ mod tests {
         };
         assert_eq!(
             scoped_session(&scope, "sess-1"),
-            "scope::team-a::session::sess-1"
+            "scope::iroh::team-a::session::sess-1"
         );
     }
 
@@ -315,7 +342,7 @@ mod tests {
         };
         assert_eq!(
             scoped_event_relay(&scope, "sess-1", &"12D3KooWABC"),
-            "scope::team-a::event_relay::sess-1::12D3KooWABC"
+            "scope::iroh::team-a::event_relay::sess-1::12D3KooWABC"
         );
     }
 
@@ -349,19 +376,19 @@ mod tests {
 
         // All scoped names must differ between LAN and Iroh
         assert_ne!(
-            scoped_node_manager(&MeshScopeId::Lan),
+            scoped_node_manager(&MeshScopeId::lan_default()),
             scoped_node_manager(&iroh_scope)
         );
         assert_ne!(
-            scoped_session(&MeshScopeId::Lan, "sess-1"),
+            scoped_session(&MeshScopeId::lan_default(), "sess-1"),
             scoped_session(&iroh_scope, "sess-1")
         );
         assert_ne!(
-            scoped_provider_host(&MeshScopeId::Lan, &"12D3KooWABC"),
+            scoped_provider_host(&MeshScopeId::lan_default(), &"12D3KooWABC"),
             scoped_provider_host(&iroh_scope, &"12D3KooWABC")
         );
         assert_ne!(
-            scoped_event_relay(&MeshScopeId::Lan, "sess-1", &"12D3KooWABC"),
+            scoped_event_relay(&MeshScopeId::lan_default(), "sess-1", &"12D3KooWABC"),
             scoped_event_relay(&iroh_scope, "sess-1", &"12D3KooWABC")
         );
     }
@@ -381,7 +408,7 @@ mod tests {
         );
         // Also distinct from LAN
         assert_ne!(
-            scoped_node_manager_for_peer(&MeshScopeId::Lan, &peer_id),
+            scoped_node_manager_for_peer(&MeshScopeId::lan_default(), &peer_id),
             scoped_node_manager_for_peer(&scope_a, &peer_id)
         );
     }

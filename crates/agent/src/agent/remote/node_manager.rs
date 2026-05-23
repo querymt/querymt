@@ -895,8 +895,14 @@ mod remote_impl {
                 // Ensure this session's re-registration closure is removed from the
                 // mesh handle so repeated create/stop cycles don't leak entries.
                 if let Some(ref mesh) = self.shared_state.mesh {
-                    let dht_name = crate::agent::remote::dht_name::session(&msg.session_id);
-                    mesh.deregister_actor(&dht_name);
+                    let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+                    for scope in runtime.active_scopes() {
+                        let dht_name = crate::agent::remote::scope::scoped_session(
+                            &scope,
+                            &msg.session_id,
+                        );
+                        runtime.deregister_actor(&dht_name);
+                    }
                 }
 
                 log::info!(

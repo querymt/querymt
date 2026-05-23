@@ -68,6 +68,16 @@ pub struct AttachStreamConsumer {
     pub consumer_tx: mpsc::Sender<StreamRelayMessage>,
 }
 
+/// Pre-register a request ID before any relay messages arrive.
+///
+/// This creates an `AwaitingStream` entry so that future relay messages
+/// for this request ID are accepted. Without pre-registration, unsolicited
+/// relay messages are dropped (they cannot auto-create entries).
+#[derive(Debug, Clone)]
+pub struct RegisterRequest {
+    pub request_id: String,
+}
+
 /// Detach the current consumer for a request.
 ///
 /// Messages will continue to be buffered (up to the replay buffer limit)
@@ -303,22 +313,48 @@ impl SessionStreamRouterActor {
     ///
     /// This should be called when sending a `ProviderStreamRequest` to pre-register
     /// the request in the router.
-    pub fn register_request(&self, request_id: String) {
+    ///
+    /// Duplicate registrations are rejected to avoid resetting state for an
+    /// already-active request (which could be abused by replayed request IDs).
+    pub fn register_request(&self, request_id: String) -> Result<(), AgentError> {
         let mut requests = self.requests.lock();
+        if requests.contains_key(&request_id) {
+            return Err(AgentError::Internal(format!(
+                "request {} already registered",
+                request_id
+            )));
+        }
         requests.insert(
             request_id.clone(),
             RoutedRequest::new(request_id, self.replay_buffer_size),
         );
+        Ok(())
     }
 
     /// Remove terminal requests older than the TTL.
     fn cleanup_expired_requests(&self) {
         let mut requests = self.requests.lock();
+        let _now = Instant::now();
         requests.retain(|_, req| {
-            if !req.is_terminal() {
-                return true;
+            // Terminal entries: keep for TTL-based buffered replay support,
+            // then remove.
+            if req.is_terminal() {
+                return req.last_message_at.elapsed() < self.request_ttl;
             }
-            req.last_message_at.elapsed() < self.request_ttl
+            // Non-terminal abandoned entries (no consumer, idle for > 2*TTL):
+            // remove to prevent unbounded leak.  A well-behaved producer
+            // registers before relaying and a consumer attaches promptly.
+            if req.consumer_tx.is_none() && req.last_message_at.elapsed() > self.request_ttl * 2 {
+                tracing::warn!(
+                    target: "remote::session_router",
+                    request_id = %req.request_id,
+                    phase = %req.phase,
+                    idle_secs = req.last_message_at.elapsed().as_secs(),
+                    "pruning abandoned non-terminal request"
+                );
+                return false;
+            }
+            true
         });
     }
 
@@ -367,10 +403,16 @@ impl Message<RoutedStreamRelayMessage> for SessionStreamRouterActor {
 
         let mut requests = self.requests.lock();
 
-        // Get or create the routed request
-        let request = requests
-            .entry(msg.request_id.clone())
-            .or_insert_with(|| RoutedRequest::new(msg.request_id.clone(), self.replay_buffer_size));
+        // Get the routed request; drop unsolicited request IDs.
+        let Some(request) = requests.get_mut(&msg.request_id) else {
+            tracing::warn!(
+                target: "remote::session_router",
+                request_id = %msg.request_id,
+                message_type = message_type,
+                "dropped relay message for unknown request id (no consumer attached yet)"
+            );
+            return;
+        };
 
         // Deliver or buffer the message
         request.deliver_or_buffer(msg.message);
@@ -383,6 +425,11 @@ impl Message<RoutedStreamRelayMessage> for SessionStreamRouterActor {
             buffered = request.replay_buffer.len(),
             "routed message delivered or buffered"
         );
+        // Drop the lock before cleanup to avoid deadlock.
+        drop(requests);
+
+        // Periodically prune abandoned entries on each relay.
+        self.cleanup_expired_requests();
     }
 }
 
@@ -405,79 +452,89 @@ impl Message<AttachStreamConsumer> for SessionStreamRouterActor {
         // Cleanup expired requests before attaching new consumer
         self.cleanup_expired_requests();
 
-        // Phase 1: Attach the consumer and extract buffered messages (under lock)
-        let (buffered, has_buffered) = {
-            let mut requests = self.requests.lock();
-
-            let request = requests
-                .entry(request_id.clone())
-                .or_insert_with(|| RoutedRequest::new(request_id.clone(), self.replay_buffer_size));
-
-            // Attach the consumer
-            request.consumer_tx = Some(consumer_tx.clone());
-
-            // If we're in consumer disconnected state, go back to streaming
-            if request.phase == RequestPhase::ConsumerDisconnected {
-                request.phase = if request.replay_buffer.is_empty() {
-                    RequestPhase::AwaitingStream
-                } else {
-                    RequestPhase::Streaming
-                };
+        // Phase 0: Reject attach for unregistered request IDs.
+        // Registration must happen before attach (caller calls
+        // register_request first).  This prevents unsolicited or
+        // replayed request IDs from creating unbounded entries.
+        {
+            let requests = self.requests.lock();
+            if !requests.contains_key(&request_id) {
+                tracing::warn!(
+                    target: "remote::session_router",
+                    request_id = %request_id,
+                    "rejecting attach for unregistered request id"
+                );
+                return Err(AgentError::Internal(format!(
+                    "request {} not pre-registered",
+                    request_id
+                )));
             }
+        }
 
-            tracing::info!(
-                target: "remote::session_router",
-                request_id = %request_id,
-                buffered_messages = request.replay_buffer.len(),
-                "consumer attached"
-            );
+        // Phase 1+2: Attach and flush buffered messages while holding the lock
+        // to preserve strict ordering: replay must be delivered before any newly
+        // relayed messages for this request can interleave.
+        let mut requests = self.requests.lock();
 
-            // Extract buffered messages
-            let buffered: Vec<_> = request.replay_buffer.drain(..).collect();
-            let has_buffered = !buffered.is_empty();
+        let Some(request) = requests.get_mut(&request_id) else {
+            // Raced with cleanup; treat as unregistered.
+            return Err(AgentError::Internal(format!(
+                "request {} disappeared before attach",
+                request_id
+            )));
+        };
 
-            // Update phase based on what we're flushing
-            if has_buffered {
-                request.phase = RequestPhase::Streaming;
-            }
+        // Attach the consumer first so try_send can deliver replay chunks.
+        request.consumer_tx = Some(consumer_tx.clone());
 
-            (buffered, has_buffered)
-        }; // Lock released here
+        // If we're in consumer disconnected state, go back to streaming but
+        // preserve terminal phase.
+        let terminal_state = request.is_terminal();
+        if request.phase == RequestPhase::ConsumerDisconnected {
+            request.phase = if request.replay_buffer.is_empty() {
+                RequestPhase::AwaitingStream
+            } else {
+                RequestPhase::Streaming
+            };
+        }
 
-        // Phase 2: Send buffered messages outside the lock
-        if has_buffered {
-            let mut last_was_terminal = false;
-            for message in &buffered {
-                last_was_terminal = relay_message_is_terminal(message);
-            }
-            for message in buffered {
-                if consumer_tx.send(message).await.is_err() {
-                    tracing::warn!(
-                        target: "remote::session_router",
-                        request_id = %request_id,
-                        "consumer dropped during buffer flush"
-                    );
-                    // Re-lock and update state
-                    let mut requests = self.requests.lock();
-                    if let Some(req) = requests.get_mut(&request_id) {
-                        req.consumer_tx = None;
-                        req.phase = RequestPhase::ConsumerDisconnected;
-                    }
-                    return Err(AgentError::Internal(
-                        "consumer dropped during attach".to_string(),
-                    ));
+        tracing::info!(
+            target: "remote::session_router",
+            request_id = %request_id,
+            buffered_messages = request.replay_buffer.len(),
+            phase = %request.phase,
+            "consumer attached"
+        );
+
+        // Non-blocking replay flush using try_send to avoid actor starvation.
+        // Keep remaining messages buffered if the consumer is full.
+        let mut terminal_replayed = false;
+        while let Some(message) = request.replay_buffer.pop_front() {
+            terminal_replayed = relay_message_is_terminal(&message);
+            match consumer_tx.try_send(message) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(msg)) => {
+                    request.replay_buffer.push_front(msg);
+                    request.phase = RequestPhase::ConsumerDisconnected;
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(msg)) => {
+                    request.replay_buffer.push_front(msg);
+                    request.consumer_tx = None;
+                    request.phase = RequestPhase::ConsumerDisconnected;
+                    break;
                 }
             }
-            // If the last replayed message was terminal, drop the consumer
-            // sender so the receiver sees EOF — same lifecycle as direct
-            // terminal delivery in deliver_or_buffer.
-            if last_was_terminal {
-                let mut requests = self.requests.lock();
-                if let Some(req) = requests.get_mut(&request_id) {
-                    req.consumer_tx = None;
-                    // Phase was already set correctly during buffering.
-                }
-            }
+        }
+
+        if request.replay_buffer.is_empty() && !terminal_state {
+            request.phase = RequestPhase::Streaming;
+        }
+
+        // If terminal was replayed successfully (no leftover replay), close
+        // the consumer sender so the receiver observes EOF.
+        if terminal_replayed && request.replay_buffer.is_empty() {
+            request.consumer_tx = None;
         }
 
         Ok(())
@@ -516,6 +573,23 @@ impl Message<DetachStreamConsumer> for SessionStreamRouterActor {
                 "consumer detached"
             );
         }
+    }
+}
+
+impl Message<RegisterRequest> for SessionStreamRouterActor {
+    type Reply = Result<(), AgentError>;
+
+    #[tracing::instrument(
+        name = "remote.session_router.register",
+        skip(self, _ctx),
+        fields(request_id = %msg.request_id)
+    )]
+    async fn handle(
+        &mut self,
+        msg: RegisterRequest,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.register_request(msg.request_id)
     }
 }
 
@@ -645,7 +719,9 @@ mod tests {
         let router = create_test_router();
         let request_id = "test-request-1".to_string();
 
-        router.register_request(request_id.clone());
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
 
         let status = router.get_status(Some(&request_id));
         assert_eq!(status.len(), 1);
@@ -659,7 +735,9 @@ mod tests {
     async fn test_attach_consumer_to_registered_request() {
         let router = create_test_router();
         let request_id = "test-request-2".to_string();
-        router.register_request(request_id.clone());
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
 
         let (tx, _rx) = mpsc::channel(100);
         router
@@ -712,7 +790,9 @@ mod tests {
     async fn test_buffer_message_when_no_consumer() {
         let router = create_test_router();
         let request_id = "test-request-4".to_string();
-        router.register_request(request_id.clone());
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
 
         let message = StreamRelayMessage::Chunk(StreamChunk::Text("buffered".to_string()));
         router
@@ -731,7 +811,9 @@ mod tests {
     async fn test_buffer_overflow_evicts_oldest() {
         let router = SessionStreamRouterActor::new(Some(3), Some(60)); // Small buffer
         let request_id = "test-request-5".to_string();
-        router.register_request(request_id.clone());
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
 
         // Fill buffer to capacity
         for i in 0..3 {
@@ -800,7 +882,9 @@ mod tests {
     async fn test_terminal_message_sets_completed_phase() {
         let router = create_test_router();
         let request_id = "test-request-6".to_string();
-        router.register_request(request_id.clone());
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
 
         let message = StreamRelayMessage::Chunk(StreamChunk::Done {
             finish_reason: querymt::chat::FinishReason::Stop,
@@ -820,7 +904,9 @@ mod tests {
     async fn test_error_message_sets_failed_phase() {
         let router = create_test_router();
         let request_id = "test-request-7".to_string();
-        router.register_request(request_id.clone());
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
 
         let message = StreamRelayMessage::ProviderError {
             error: querymt::error::LLMErrorPayload::ProviderError {
@@ -842,7 +928,9 @@ mod tests {
     async fn test_detach_sets_consumer_disconnected_phase() {
         let router = create_test_router();
         let request_id = "test-request-8".to_string();
-        router.register_request(request_id.clone());
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
 
         let (tx, _rx) = mpsc::channel(100);
         router
@@ -871,7 +959,9 @@ mod tests {
     async fn test_cleanup_removes_expired_terminal_requests() {
         let router = SessionStreamRouterActor::new(Some(10), Some(0)); // 0s TTL = immediate expiry
         let request_id = "test-request-9".to_string();
-        router.register_request(request_id.clone());
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
 
         // Make it terminal
         let message = StreamRelayMessage::Chunk(StreamChunk::Done {
@@ -898,7 +988,9 @@ mod tests {
     async fn test_cleanup_preserves_non_terminal_requests() {
         let router = SessionStreamRouterActor::new(Some(10), Some(0)); // 0s TTL
         let request_id = "test-request-10".to_string();
-        router.register_request(request_id.clone());
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
 
         // Keep it in AwaitingStream (non-terminal)
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -914,7 +1006,9 @@ mod tests {
     async fn test_consumer_slow_sets_consumer_disconnected() {
         let router = create_test_router();
         let request_id = "test-request-11".to_string();
-        router.register_request(request_id.clone());
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
 
         // Create a tiny channel that will fill up
         let (tx, _rx) = mpsc::channel(1);
@@ -952,9 +1046,15 @@ mod tests {
     async fn test_get_status_returns_all_requests() {
         let router = create_test_router();
 
-        router.register_request("req-1".to_string());
-        router.register_request("req-2".to_string());
-        router.register_request("req-3".to_string());
+        router
+            .register_request("req-1".to_string())
+            .expect("register req-1");
+        router
+            .register_request("req-2".to_string())
+            .expect("register req-2");
+        router
+            .register_request("req-3".to_string())
+            .expect("register req-3");
 
         let all_status = router.get_status(None);
         assert_eq!(all_status.len(), 3);
@@ -964,7 +1064,9 @@ mod tests {
     async fn test_request_phase_transitions() {
         let router = create_test_router();
         let request_id = "test-request-12".to_string();
-        router.register_request(request_id.clone());
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
 
         // Initial: AwaitingStream
         assert_eq!(
@@ -1033,7 +1135,8 @@ mod tests {
                 }),
             })
             .send()
-            .await;
+            .await
+            .expect("send terminal chunk");
 
         // Consumer should receive the Done message
         let first = tokio::time::timeout(Duration::from_millis(500), rx.recv())
@@ -1088,7 +1191,8 @@ mod tests {
                 ]),
             })
             .send()
-            .await;
+            .await
+            .expect("send terminal batch");
 
         // Consumer should receive the batch
         let first = tokio::time::timeout(Duration::from_millis(500), rx.recv())
@@ -1117,7 +1221,9 @@ mod tests {
 
         let router = create_test_router();
         let request_id = "req-batch-phase".to_string();
-        router.register_request(request_id.clone());
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
 
         let (tx, mut rx) = mpsc::channel(8);
         {
@@ -1182,7 +1288,8 @@ mod tests {
                 message: StreamRelayMessage::Chunk(StreamChunk::Text("hello".to_string())),
             })
             .send()
-            .await;
+            .await
+            .expect("send buffered text");
 
         router_ref
             .tell(RoutedStreamRelayMessage {
@@ -1192,7 +1299,8 @@ mod tests {
                 }),
             })
             .send()
-            .await;
+            .await
+            .expect("send buffered done");
 
         // Now attach a consumer — buffered messages should be replayed
         let (tx, mut rx) = mpsc::channel(8);

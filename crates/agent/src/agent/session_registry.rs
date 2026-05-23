@@ -330,8 +330,11 @@ impl SessionRegistry {
     pub fn remove(&mut self, session_id: &str) -> Option<SessionActorRef> {
         #[cfg(feature = "remote")]
         if let Some(ref mesh) = self.mesh {
-            let session_dht_name = crate::agent::remote::dht_name::session(session_id);
-            mesh.deregister_actor(&session_dht_name);
+            let runtime = MeshRuntimeHandle::from(mesh.clone());
+            for scope in runtime.active_scopes() {
+                let session_dht_name = scoped_session(&scope, session_id);
+                runtime.deregister_actor(&session_dht_name);
+            }
         }
         self.local_actor_refs.remove(session_id);
         self.sessions.remove(session_id)
@@ -433,7 +436,7 @@ impl SessionRegistry {
             }
             names.into_iter().next().unwrap_or_else(|| {
                 scoped_event_relay(
-                    &crate::agent::remote::scope::MeshScopeId::Lan,
+                    &crate::agent::remote::scope::MeshScopeId::lan_default(),
                     &session_id,
                     mesh.peer_id(),
                 )

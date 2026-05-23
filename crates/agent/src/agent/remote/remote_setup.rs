@@ -330,18 +330,39 @@ async fn register_remote_agent(
 ) -> Result<AgentInfo> {
     use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
 
-    // Look up the remote node's manager via the DHT.
-    // The peer publishes itself under "node_manager".
+    // Look up the remote node's manager via scoped DHT names.
     // Give up after a short timeout if the peer is not yet discoverable.
     let lookup_timeout = std::time::Duration::from_secs(5);
-    let lookup_result = tokio::time::timeout(
-        lookup_timeout,
-        mesh.lookup_actor::<RemoteNodeManager>(super::dht_name::NODE_MANAGER),
-    )
-    .await;
+    let runtime = super::runtime_handle::MeshRuntimeHandle::from(mesh.clone());
+    let mut found_ref = None;
 
-    match lookup_result {
-        Ok(Ok(Some(node_manager_ref))) => {
+    for scope in runtime.active_scopes() {
+        let lookup_result = tokio::time::timeout(
+            lookup_timeout,
+            runtime.lookup_actor::<RemoteNodeManager>(super::scope::scoped_node_manager(&scope)),
+        )
+        .await;
+
+        match lookup_result {
+            Ok(Ok(Some(node_manager_ref))) => {
+                found_ref = Some(node_manager_ref);
+                break;
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => {
+                log::debug!(
+                    "DHT lookup error for peer '{}' in scope '{}': {}",
+                    remote.peer,
+                    scope,
+                    e
+                );
+            }
+            Err(_timeout) => {}
+        }
+    }
+
+    match found_ref {
+        Some(node_manager_ref) => {
             // Confirm the peer is reachable by calling GetNodeInfo.
             match node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
                 Ok(node_info) => {
@@ -364,27 +385,12 @@ async fn register_remote_agent(
                 }
             }
         }
-        Ok(Ok(None)) => {
+        None => {
             tracing::Span::current().record("reachable", false);
             log::debug!(
-                "Peer '{}' not yet in DHT; registering remote agent '{}' speculatively",
+                "Peer '{}' not yet in scoped DHT; registering remote agent '{}' speculatively",
                 remote.peer,
                 remote.id
-            );
-        }
-        Ok(Err(e)) => {
-            tracing::Span::current().record("reachable", false);
-            log::debug!(
-                "DHT lookup error for peer '{}': {} (registering speculatively)",
-                remote.peer,
-                e
-            );
-        }
-        Err(_timeout) => {
-            tracing::Span::current().record("reachable", false);
-            log::debug!(
-                "DHT lookup timed out for peer '{}' (registering speculatively)",
-                remote.peer,
             );
         }
     }

@@ -395,15 +395,23 @@ async fn enumerate_remote_models(mesh: &crate::agent::remote::MeshHandle) -> Vec
     use futures_util::StreamExt;
 
     let local_peer_id = *mesh.peer_id();
-    let mut stream =
-        mesh.lookup_all_actors::<RemoteNodeManager>(crate::agent::remote::dht_name::NODE_MANAGER);
     let mut all_remote = Vec::new();
+    let mut seen_peers = std::collections::HashSet::new();
 
-    while let Some(result) = stream.next().await {
-        match result {
+    for scope in mesh.active_scopes() {
+        let mut stream =
+            mesh.lookup_all_actors::<RemoteNodeManager>(crate::agent::remote::scope::scoped_node_manager(&scope));
+
+        while let Some(result) = stream.next().await {
+            match result {
             Ok(node_manager_ref) => {
                 // Skip local node — its models are already fetched via enumerate_local_models.
                 if node_manager_ref.id().peer_id() == Some(&local_peer_id) {
+                    continue;
+                }
+                if let Some(pid) = node_manager_ref.id().peer_id().copied()
+                    && !seen_peers.insert(pid)
+                {
                     continue;
                 }
 
@@ -461,6 +469,7 @@ async fn enumerate_remote_models(mesh: &crate::agent::remote::MeshHandle) -> Vec
             }
             Err(e) => log::warn!("enumerate_remote_models: lookup error: {}", e),
         }
+    }
     }
 
     all_remote

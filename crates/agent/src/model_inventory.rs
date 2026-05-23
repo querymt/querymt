@@ -12,8 +12,6 @@ use tokio::sync::{Mutex, watch};
 use crate::agent::agent_config::AgentConfig;
 #[cfg(feature = "remote")]
 use crate::agent::remote::runtime_handle::MeshRuntimeHandle;
-#[cfg(feature = "remote")]
-use crate::agent::remote::scope::scoped_node_manager;
 use crate::model_registry::{ModelEntry, enumerate_local_models};
 
 /// Metadata about the current snapshot
@@ -545,9 +543,8 @@ impl ModelInventory {
         let mut node_refs = Vec::new();
 
         for scope in scopes {
-            let node_manager_name = scoped_node_manager(&scope);
             let mut stream =
-                mesh.lookup_all_actors_scoped::<RemoteNodeManager>(&scope, &node_manager_name);
+                mesh.lookup_all_actors_scoped::<RemoteNodeManager>(&scope, "node_manager");
 
             while let Some(result) = stream.next().await {
                 if let Ok(node_ref) = result
