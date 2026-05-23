@@ -1186,14 +1186,27 @@ impl LocalAgentHandle {
         let mut lookups = FuturesUnordered::new();
         let mut cached_nodes = Vec::new();
 
-        for scope in runtime.active_scopes() {
-            let mut stream = runtime.lookup_all_actors::<RemoteNodeManager>(
-                crate::agent::remote::scope::scoped_node_manager(&scope),
-            );
+        let scopes = runtime.active_scopes();
+        let alive_peers: Vec<_> = mesh.known_peer_ids();
+        log::info!(
+            "list_remote_nodes: querying {} scope(s) {:?}, {} known peer(s) {:?}, local_peer_id={}",
+            scopes.len(),
+            scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            alive_peers.len(),
+            alive_peers.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+            local_peer_id,
+        );
+
+        for scope in &scopes {
+            let dht_name = crate::agent::remote::scope::scoped_node_manager(scope);
+            log::info!("list_remote_nodes: querying DHT name '{}'", dht_name);
+            let mut stream = runtime.lookup_all_actors::<RemoteNodeManager>(dht_name.clone());
+            let mut found_count = 0usize;
 
             while let Some(result) = stream.next().await {
                 match result {
                 Ok(node_manager_ref) => {
+                    found_count += 1;
                     let peer_id = node_manager_ref.id().peer_id().copied();
                     if peer_id == Some(local_peer_id) {
                         log::debug!("list_remote_nodes: skipping local node");
@@ -1205,17 +1218,31 @@ impl LocalAgentHandle {
                     {
                         let key = format!("peer:{pid}");
                         self.remote_node_cache.by_label.write().remove(&key);
-                        log::debug!("list_remote_nodes: skipping stale DHT record for peer {pid}");
+                        log::warn!(
+                            "list_remote_nodes: skipping stale DHT record for peer {pid} \
+                             (is_peer_alive=false, dht_name='{}')",
+                            dht_name
+                        );
                         continue;
                     }
 
                     let cache_key =
                         Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
                     if let Some(info) = self.get_cached_remote_node(&cache_key) {
+                        log::debug!(
+                            "list_remote_nodes: cache hit for peer {:?} under '{}'",
+                            peer_id,
+                            dht_name
+                        );
                         cached_nodes.push(info);
                         continue;
                     }
 
+                    log::debug!(
+                        "list_remote_nodes: enqueuing GetNodeInfo for peer {:?} under '{}'",
+                        peer_id,
+                        dht_name
+                    );
                     let semaphore = Arc::clone(&semaphore);
                     lookups.push(async move {
                         let permit = semaphore.acquire_owned().await.ok();
@@ -1228,9 +1255,19 @@ impl LocalAgentHandle {
                         (cache_key, peer_id, res)
                     });
                 }
-                Err(e) => log::warn!("list_remote_nodes: lookup error: {}", e),
+                Err(e) => log::warn!("list_remote_nodes: lookup error for '{}': {}", dht_name, e),
             }
             }
+
+            log::info!(
+                "list_remote_nodes: DHT name '{}' yielded {} actor(s)",
+                dht_name,
+                found_count
+            );
+        }
+
+        if scopes.is_empty() {
+            log::warn!("list_remote_nodes: active_scopes() returned empty — no DHT queries issued");
         }
 
         let mut fetched_nodes = Vec::new();

@@ -250,6 +250,13 @@ pub enum MeshTransportMode {
     Composite,
 }
 
+impl MeshTransportMode {
+    /// Returns `true` when the LAN transport is active (Lan or Composite).
+    pub fn has_lan(&self) -> bool {
+        matches!(self, Self::Lan | Self::Composite)
+    }
+}
+
 /// How actor lookups are performed in the mesh.
 ///
 /// Set via `MeshConfig::directory`.
@@ -796,8 +803,20 @@ impl MeshHandle {
             }
         }
 
-        // Legacy backward compat: when no scopes are configured at all (e.g.
-        // bootstrap_lan_mesh with no MeshRuntimeConfig), fall back to Lan.
+        // Include LAN scope whenever the LAN transport is active.
+        // This is NOT gated on emptiness — a node with both LAN + Iroh
+        // transports must register/lookup under the LAN scope too, since
+        // mDNS-discovered peers are reachable via LAN routes.
+        if self.transport_mode.has_lan() {
+            let lan = MeshScopeId::lan_default();
+            if !scopes.contains(&lan) {
+                scopes.push(lan);
+            }
+        }
+
+        // Legacy backward compat: when no scopes are configured at all AND
+        // transport_mode doesn't advertise LAN (shouldn't happen in practice),
+        // fall back to Lan.
         if scopes.is_empty() {
             scopes.push(MeshScopeId::lan_default());
         }

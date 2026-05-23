@@ -106,6 +106,39 @@ pub async fn spawn_and_register_local_mesh_actors_with_name(
         log::info!("ProviderHostActor registered in DHT as '{}'", ph_dht_name);
     }
 
+    // ── Re-publish DHT records to already-connected peers ──────────────────
+    //
+    // The mesh swarm may have connected to peers during bootstrap (before this
+    // function was called).  The `re_register_fns` stored by `register_actor`
+    // only fire on *future* connections, so peers already connected at this
+    // point never receive the DHT records.  Re-registering pushes the records
+    // into the kameo DHT, making them visible to already-connected peers
+    // through standard Kademlia replication.
+    let connected_count = mesh.known_peer_ids().len();
+    if connected_count > 0 {
+        log::info!(
+            "Re-publishing DHT records to {} already-connected peer(s)",
+            connected_count
+        );
+        for scope in runtime.active_scopes() {
+            let nm_name = scoped_node_manager(&scope);
+            runtime
+                .register_actor(node_manager_ref.clone(), nm_name.clone())
+                .await;
+            log::info!("Re-published RemoteNodeManager as '{}'", nm_name);
+
+            let pp_name = scoped_node_manager_for_peer(&scope, mesh.peer_id());
+            runtime
+                .register_actor(node_manager_ref.clone(), pp_name.clone())
+                .await;
+
+            let ph_name = scoped_provider_host(&scope, mesh.peer_id());
+            runtime
+                .register_actor(provider_host_ref.clone(), ph_name.clone())
+                .await;
+        }
+    }
+
     LocalMeshActorRefs {
         node_manager: node_manager_ref,
         provider_host: provider_host_ref,

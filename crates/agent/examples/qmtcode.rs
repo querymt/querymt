@@ -218,49 +218,17 @@ fn embedded_prompt_asset_key(file_ref: &str) -> Option<String> {
 }
 
 /// Register the standard mesh actors (RemoteNodeManager, ProviderHostActor)
-/// on a bootstrapped mesh.
+/// on a bootstrapped mesh using scoped DHT names.
 #[cfg(feature = "remote")]
 async fn register_mesh_actors(
     runner: &querymt_agent::prelude::AgentRunner,
     mesh: &querymt_agent::agent::remote::MeshHandle,
 ) {
-    use kameo::actor::Spawn;
-    use querymt_agent::agent::remote::{ProviderHostActor, RemoteNodeManager, dht_name};
-
-    let agent_handle = runner.handle();
-
-    // Spawn RemoteNodeManager so remote peers can create sessions here.
-    let node_manager = RemoteNodeManager::new(
-        agent_handle.config.clone(),
-        agent_handle.registry.clone(),
-        Some(mesh.clone()),
-    );
-    let node_manager_ref = RemoteNodeManager::spawn(node_manager);
-
-    // Register under the global name.
-    mesh.register_actor(node_manager_ref.clone(), dht_name::NODE_MANAGER)
-        .await;
-    eprintln!(
-        "RemoteNodeManager registered in kameo DHT as '{}'",
-        dht_name::NODE_MANAGER
-    );
-
-    // Also register under the per-peer name for direct O(1) lookup.
-    let per_peer_name = dht_name::node_manager_for_peer(mesh.peer_id());
-    mesh.register_actor(node_manager_ref, per_peer_name.clone())
-        .await;
-    eprintln!(
-        "RemoteNodeManager also registered in kameo DHT as '{}'",
-        per_peer_name
-    );
-
-    // Spawn ProviderHostActor so remote peers can proxy LLM calls.
-    let provider_host = ProviderHostActor::new(agent_handle.config.clone());
-    let provider_host_ref = ProviderHostActor::spawn(provider_host);
-    let provider_dht_name = dht_name::provider_host(mesh.peer_id());
-    mesh.register_actor(provider_host_ref, provider_dht_name.clone())
-        .await;
-    eprintln!("ProviderHostActor registered in kameo DHT as '{provider_dht_name}'");
+    querymt_agent::agent::remote::spawn_and_register_local_mesh_actors(
+        &runner.handle(),
+        mesh,
+    )
+    .await;
 }
 
 #[tokio::main]
