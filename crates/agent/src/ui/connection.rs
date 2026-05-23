@@ -593,12 +593,16 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                             log::debug!(
                                 "spawn_peer_event_watcher: peer discovered {peer_id}, will poll until actor is visible"
                             );
+                            // Invalidate cache — topology changed.
+                            state.invalidate_remote_node_cache().await;
                             true
                         }
                         PeerEvent::Expired(peer_id) => {
                             log::debug!(
                                 "spawn_peer_event_watcher: peer expired {peer_id}, refreshing remote nodes"
                             );
+                            // Invalidate cache — topology changed.
+                            state.invalidate_remote_node_cache().await;
                             false
                         }
                         _ => {
@@ -614,6 +618,9 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                         // Exponential back-off: 500 ms, 1 s, 2 s, 4 s, 8 s.
                         // We stop as soon as the newly discovered peer shows up
                         // in list_remote_nodes(), giving up after ~15 s total.
+                        //
+                        // Invalidate cache before each retry so we always get a
+                        // fresh DHT snapshot.
                         const DELAYS_MS: &[u64] = &[500, 1_000, 2_000, 4_000, 8_000];
                         let mut pushed = false;
                         for &delay_ms in DELAYS_MS {
@@ -623,7 +630,9 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                                 break;
                             }
 
-                            let nodes = state.agent.list_remote_nodes().await;
+                            state.invalidate_remote_node_cache().await;
+                            let nodes = state.get_remote_nodes_cached().await;
+
                             let msg = UiServerMessage::RemoteNodes {
                                 nodes: nodes
                                     .iter()
@@ -664,8 +673,7 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                             );
                         }
                     } else {
-                        // Expired: push the updated (node-removed) list immediately.
-                        let nodes = state.agent.list_remote_nodes().await;
+                        let nodes = state.get_remote_nodes_cached().await;
 
                         // Clear provider_node_id for any session that was using the
                         // expired peer. We detect stale sessions by comparing the
@@ -750,7 +758,7 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                             if tx_delayed.is_closed() {
                                 return;
                             }
-                            let nodes = state_delayed.agent.list_remote_nodes().await;
+                            let nodes = state_delayed.get_remote_nodes_cached().await;
                             let msg = UiServerMessage::RemoteNodes {
                                 nodes: nodes
                                     .into_iter()
@@ -773,7 +781,8 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     // We missed some events — re-query immediately to catch up.
                     log::warn!("spawn_peer_event_watcher: lagged by {n} events, re-querying");
-                    let nodes = state.agent.list_remote_nodes().await;
+                    state.invalidate_remote_node_cache().await;
+                    let nodes = state.get_remote_nodes_cached().await;
                     let msg = UiServerMessage::RemoteNodes {
                         nodes: nodes
                             .into_iter()

@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 pub async fn handle_list_remote_nodes(state: &ServerState, tx: &mpsc::Sender<String>) {
     #[cfg(feature = "remote")]
     {
-        let nodes = state.agent.list_remote_nodes().await;
+        let nodes = state.get_remote_nodes_cached().await;
         let _ = send_message(
             tx,
             UiServerMessage::RemoteNodes {
@@ -215,8 +215,7 @@ pub(crate) async fn finalize_remote_session_attach(
     tx: &mpsc::Sender<String>,
 ) -> Result<(), String> {
     let peer_label = state
-        .agent
-        .list_remote_nodes()
+        .get_remote_nodes_cached()
         .await
         .into_iter()
         .find(|n| n.node_id.to_string() == node_id)

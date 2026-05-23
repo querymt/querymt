@@ -140,6 +140,8 @@ async fn forwarder_drops_event_when_seq_is_at_or_below_cursor() -> Result<()> {
             crate::index::WorkspaceIndexManagerConfig::default(),
         ),
         oauth_service: agent.handle.oauth_service.clone(),
+        #[cfg(feature = "remote")]
+        remote_node_cache: Arc::new(tokio::sync::Mutex::new(None)),
     };
 
     {
@@ -270,6 +272,8 @@ async fn forwarder_does_not_drop_ephemeral_events_despite_cursor() -> Result<()>
             crate::index::WorkspaceIndexManagerConfig::default(),
         ),
         oauth_service: agent.handle.oauth_service.clone(),
+        #[cfg(feature = "remote")]
+        remote_node_cache: Arc::new(tokio::sync::Mutex::new(None)),
     };
 
     // Set cursor to 10 — any durable event with seq <= 10 would be dropped.

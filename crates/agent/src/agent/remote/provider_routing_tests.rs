@@ -629,7 +629,10 @@ mod build_provider_for_session_tests {
         let actor = ProviderHostActor::new(f.config.clone());
         let actor_ref = ProviderHostActor::spawn(actor);
         let alpha_node_id = random_node_id();
-        let alpha_dht = crate::agent::remote::dht_name::provider_host(&alpha_node_id);
+        let alpha_dht = crate::agent::remote::scope::scoped_provider_host(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &alpha_node_id,
+        );
         mesh.register_actor(actor_ref, alpha_dht.clone()).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -1050,7 +1053,10 @@ mod mesh_setup_config_tests {
         let actor_ref = ProviderHostActor::spawn(actor);
 
         let hostname = format!("test-host-i5-{}", test_id);
-        let dht_name = crate::agent::remote::dht_name::provider_host(&hostname);
+        let dht_name = crate::agent::remote::scope::scoped_provider_host(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &hostname,
+        );
         mesh.register_actor(actor_ref.clone(), dht_name.clone())
             .await;
         let _ = actor_ref;
@@ -1086,7 +1092,7 @@ mod mesh_setup_config_tests {
         let nm = RemoteNodeManager::new(f.config.clone(), registry, Some(mesh.clone()));
         let nm_ref = RemoteNodeManager::spawn(nm);
 
-        let dht_name = format!("node_manager::i6-{}", test_id);
+        let dht_name = format!("scope::lan::default::node_manager::i6-{}", test_id);
         mesh.register_actor(nm_ref.clone(), dht_name.clone()).await;
         let _ = nm_ref;
 
@@ -1184,7 +1190,7 @@ mod peer_delegate_routing_tests {
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::handle::{AgentHandle, LocalAgentHandle};
     use crate::agent::remote::RemoteNodeManager;
-    use crate::agent::remote::dht_name;
+    use crate::agent::remote::scope::{MeshScopeId, scoped_node_manager_for_peer};
     use crate::agent::remote::test_helpers::fixtures::{AgentConfigFixture, get_test_mesh};
     use crate::agent::session_registry::SessionRegistry;
     use crate::session::backend::StorageBackend as _;
@@ -1266,7 +1272,10 @@ mod peer_delegate_routing_tests {
         // Use a freshly generated keypair to get a unique PeerId for alice.
         let alice_keypair = libp2p::identity::Keypair::generate_ed25519();
         let alice_peer_id = alice_keypair.public().to_peer_id();
-        let per_peer_dht = dht_name::node_manager_for_peer(&alice_peer_id.to_string());
+        let per_peer_dht = crate::agent::remote::scope::scoped_node_manager_for_peer(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &alice_peer_id.to_string(),
+        );
         mesh.register_actor(alice_nm_ref, per_peer_dht).await;
 
         // Inject into known_peers to simulate mDNS Discovered.
@@ -1313,7 +1322,8 @@ mod peer_delegate_routing_tests {
 
         let bob_keypair = libp2p::identity::Keypair::generate_ed25519();
         let bob_peer_id = bob_keypair.public().to_peer_id();
-        let bob_per_peer_dht = dht_name::node_manager_for_peer(&bob_peer_id.to_string());
+        let bob_per_peer_dht =
+            scoped_node_manager_for_peer(&MeshScopeId::lan_default(), &bob_peer_id.to_string());
         mesh.register_actor(bob_nm_ref, bob_per_peer_dht).await;
 
         mesh.inject_known_peer_for_test(bob_peer_id);

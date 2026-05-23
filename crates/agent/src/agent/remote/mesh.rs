@@ -3688,14 +3688,20 @@ mod tests {
         };
         let plan = connection_route_plan(true, true, Some(&scope));
         assert_eq!(plan.len(), 2);
-        assert_eq!(plan[0], (MeshTransportKind::Lan, MeshScopeId::lan_default(), 100));
+        assert_eq!(
+            plan[0],
+            (MeshTransportKind::Lan, MeshScopeId::lan_default(), 100)
+        );
         assert_eq!(plan[1], (MeshTransportKind::Iroh, scope, 70));
     }
 
     #[test]
     fn connection_route_plan_iroh_only_without_scope_adds_no_lan() {
         let plan = connection_route_plan(false, true, None);
-        assert!(plan.is_empty(), "iroh-only without known scope should not synthesize lan route");
+        assert!(
+            plan.is_empty(),
+            "iroh-only without known scope should not synthesize lan route"
+        );
     }
 
     #[test]
@@ -3712,12 +3718,28 @@ mod tests {
         };
 
         let iroh_addr: Multiaddr = format!("/p2p/{peer}").parse().unwrap();
-        let lan_addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/12345/p2p/{peer}").parse().unwrap();
+        let lan_addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/12345/p2p/{peer}")
+            .parse()
+            .unwrap();
 
-        routes.upsert_addrs(peer, MeshTransportKind::Iroh, iroh_scope.clone(), [iroh_addr], 70);
-        routes.upsert_addrs(peer, MeshTransportKind::Lan, MeshScopeId::lan_default(), [lan_addr], 100);
+        routes.upsert_addrs(
+            peer,
+            MeshTransportKind::Iroh,
+            iroh_scope.clone(),
+            [iroh_addr],
+            70,
+        );
+        routes.upsert_addrs(
+            peer,
+            MeshTransportKind::Lan,
+            MeshScopeId::lan_default(),
+            [lan_addr],
+            100,
+        );
 
-        let best = routes.best_route_for_peer(&peer).expect("best route exists");
+        let best = routes
+            .best_route_for_peer(&peer)
+            .expect("best route exists");
         assert_eq!(best.transport, MeshTransportKind::Lan);
         assert_eq!(best.scope, MeshScopeId::lan_default());
         assert_eq!(best.priority, 100);

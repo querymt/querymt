@@ -224,11 +224,8 @@ async fn register_mesh_actors(
     runner: &querymt_agent::prelude::AgentRunner,
     mesh: &querymt_agent::agent::remote::MeshHandle,
 ) {
-    querymt_agent::agent::remote::spawn_and_register_local_mesh_actors(
-        &runner.handle(),
-        mesh,
-    )
-    .await;
+    querymt_agent::agent::remote::spawn_and_register_local_mesh_actors(&runner.handle(), mesh)
+        .await;
 }
 
 #[tokio::main]

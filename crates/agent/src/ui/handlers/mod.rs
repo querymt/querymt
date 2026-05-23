@@ -87,7 +87,11 @@ pub async fn handle_ui_message(
             send_state(state, conn_id, tx).await;
             let send_state_ms = started.elapsed().as_millis() as u64;
 
-            handle_list_sessions(state, tx, ListSessionsRequest::root_browse()).await;
+            // NOTE: We intentionally do NOT call handle_list_sessions here.
+            // The frontend sends its own `list_sessions` request immediately
+            // after `init` (see useUiClient.ts onopen handler), so calling
+            // it here would duplicate work and — worse — block the init
+            // response on remote mesh discovery.
             audio::handle_audio_capabilities(state, tx).await;
             tracing::info!(
                 target: "querymt_agent::ui::handlers",
@@ -174,6 +178,7 @@ pub async fn handle_ui_message(
             cwd,
             query,
             session_scope,
+            include_remote,
         } => {
             handle_list_sessions(
                 state,
@@ -185,6 +190,7 @@ pub async fn handle_ui_message(
                     cwd,
                     query,
                     session_scope,
+                    include_remote: include_remote.unwrap_or(false),
                 },
             )
             .await;

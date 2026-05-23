@@ -141,7 +141,10 @@ pub fn scoped_node_manager(scope: &MeshScopeId) -> String {
 ///
 /// For [`MeshScopeId::lan_default()`] this returns
 /// `"scope::lan::default::node_manager::peer::{peer_id}"`.
-pub fn scoped_node_manager_for_peer(scope: &MeshScopeId, peer_id: &impl fmt::Display) -> String {
+pub fn scoped_node_manager_for_peer(
+    scope: &MeshScopeId,
+    peer_id: &(impl fmt::Display + ?Sized),
+) -> String {
     format!("{}node_manager::peer::{}", scope.dht_prefix(), peer_id)
 }
 
@@ -149,7 +152,7 @@ pub fn scoped_node_manager_for_peer(scope: &MeshScopeId, peer_id: &impl fmt::Dis
 ///
 /// For [`MeshScopeId::lan_default()`] this returns
 /// `"scope::lan::default::provider_host::peer::{peer_id}"`.
-pub fn scoped_provider_host(scope: &MeshScopeId, peer_id: &impl fmt::Display) -> String {
+pub fn scoped_provider_host(scope: &MeshScopeId, peer_id: &(impl fmt::Display + ?Sized)) -> String {
     format!("{}provider_host::peer::{}", scope.dht_prefix(), peer_id)
 }
 
@@ -168,7 +171,7 @@ pub fn scoped_session(scope: &MeshScopeId, session_id: &str) -> String {
 pub fn scoped_event_relay(
     scope: &MeshScopeId,
     session_id: &str,
-    peer_id: &impl fmt::Display,
+    peer_id: &(impl fmt::Display + ?Sized),
 ) -> String {
     format!(
         "{}event_relay::{}::{}",
@@ -299,7 +302,10 @@ mod tests {
         let scope = MeshScopeId::Iroh {
             mesh_id: "team-a".to_string(),
         };
-        assert_eq!(scoped_node_manager(&scope), "scope::iroh::team-a::node_manager");
+        assert_eq!(
+            scoped_node_manager(&scope),
+            "scope::iroh::team-a::node_manager"
+        );
     }
 
     #[test]

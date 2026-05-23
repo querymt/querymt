@@ -55,7 +55,8 @@ impl RemoteAgentHandle {
         };
         let mut provider_host = None;
         for scope in self.mesh.active_scopes() {
-            let provider_host_name = crate::agent::remote::scope::scoped_provider_host(&scope, &node_id);
+            let provider_host_name =
+                crate::agent::remote::scope::scoped_provider_host(&scope, &node_id);
             if let Ok(Some(found)) = self
                 .mesh
                 .lookup_actor::<ProviderHostActor>(&provider_host_name)
@@ -179,7 +180,8 @@ impl RemoteAgentHandle {
                     }
 
                     for scope in self.mesh.active_scopes() {
-                        let dht_name = crate::agent::remote::scope::scoped_session(&scope, &session_id);
+                        let dht_name =
+                            crate::agent::remote::scope::scoped_session(&scope, &session_id);
                         match self
                             .mesh
                             .lookup_actor_no_retry::<crate::agent::session_actor::SessionActor>(

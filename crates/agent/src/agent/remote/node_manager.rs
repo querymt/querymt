@@ -897,10 +897,8 @@ mod remote_impl {
                 if let Some(ref mesh) = self.shared_state.mesh {
                     let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
                     for scope in runtime.active_scopes() {
-                        let dht_name = crate::agent::remote::scope::scoped_session(
-                            &scope,
-                            &msg.session_id,
-                        );
+                        let dht_name =
+                            crate::agent::remote::scope::scoped_session(&scope, &msg.session_id);
                         runtime.deregister_actor(&dht_name);
                     }
                 }

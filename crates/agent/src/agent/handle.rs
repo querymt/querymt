@@ -1188,78 +1188,78 @@ impl LocalAgentHandle {
 
         let scopes = runtime.active_scopes();
         let alive_peers: Vec<_> = mesh.known_peer_ids();
-        log::info!(
-            "list_remote_nodes: querying {} scope(s) {:?}, {} known peer(s) {:?}, local_peer_id={}",
+        log::debug!(
+            "list_remote_nodes: querying {} scope(s), {} known peer(s), local_peer_id={}",
             scopes.len(),
-            scopes.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             alive_peers.len(),
-            alive_peers.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
             local_peer_id,
         );
 
         for scope in &scopes {
             let dht_name = crate::agent::remote::scope::scoped_node_manager(scope);
-            log::info!("list_remote_nodes: querying DHT name '{}'", dht_name);
+            log::debug!("list_remote_nodes: querying DHT name '{}'", dht_name);
             let mut stream = runtime.lookup_all_actors::<RemoteNodeManager>(dht_name.clone());
             let mut found_count = 0usize;
 
             while let Some(result) = stream.next().await {
                 match result {
-                Ok(node_manager_ref) => {
-                    found_count += 1;
-                    let peer_id = node_manager_ref.id().peer_id().copied();
-                    if peer_id == Some(local_peer_id) {
-                        log::debug!("list_remote_nodes: skipping local node");
-                        continue;
-                    }
+                    Ok(node_manager_ref) => {
+                        found_count += 1;
+                        let peer_id = node_manager_ref.id().peer_id().copied();
+                        if peer_id == Some(local_peer_id) {
+                            log::debug!("list_remote_nodes: skipping local node");
+                            continue;
+                        }
 
-                    if let Some(pid) = peer_id
-                        && !mesh.is_peer_alive(&pid)
-                    {
-                        let key = format!("peer:{pid}");
-                        self.remote_node_cache.by_label.write().remove(&key);
-                        log::warn!(
-                            "list_remote_nodes: skipping stale DHT record for peer {pid} \
+                        if let Some(pid) = peer_id
+                            && !mesh.is_peer_alive(&pid)
+                        {
+                            let key = format!("peer:{pid}");
+                            self.remote_node_cache.by_label.write().remove(&key);
+                            log::warn!(
+                                "list_remote_nodes: skipping stale DHT record for peer {pid} \
                              (is_peer_alive=false, dht_name='{}')",
-                            dht_name
-                        );
-                        continue;
-                    }
+                                dht_name
+                            );
+                            continue;
+                        }
 
-                    let cache_key =
-                        Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
-                    if let Some(info) = self.get_cached_remote_node(&cache_key) {
+                        let cache_key =
+                            Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
+                        if let Some(info) = self.get_cached_remote_node(&cache_key) {
+                            log::debug!(
+                                "list_remote_nodes: cache hit for peer {:?} under '{}'",
+                                peer_id,
+                                dht_name
+                            );
+                            cached_nodes.push(info);
+                            continue;
+                        }
+
                         log::debug!(
-                            "list_remote_nodes: cache hit for peer {:?} under '{}'",
+                            "list_remote_nodes: enqueuing GetNodeInfo for peer {:?} under '{}'",
                             peer_id,
                             dht_name
                         );
-                        cached_nodes.push(info);
-                        continue;
+                        let semaphore = Arc::clone(&semaphore);
+                        lookups.push(async move {
+                            let permit = semaphore.acquire_owned().await.ok();
+                            let res = tokio::time::timeout(
+                                timeout,
+                                node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
+                            )
+                            .await;
+                            drop(permit);
+                            (cache_key, peer_id, res)
+                        });
                     }
-
-                    log::debug!(
-                        "list_remote_nodes: enqueuing GetNodeInfo for peer {:?} under '{}'",
-                        peer_id,
-                        dht_name
-                    );
-                    let semaphore = Arc::clone(&semaphore);
-                    lookups.push(async move {
-                        let permit = semaphore.acquire_owned().await.ok();
-                        let res = tokio::time::timeout(
-                            timeout,
-                            node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
-                        )
-                        .await;
-                        drop(permit);
-                        (cache_key, peer_id, res)
-                    });
+                    Err(e) => {
+                        log::warn!("list_remote_nodes: lookup error for '{}': {}", dht_name, e)
+                    }
                 }
-                Err(e) => log::warn!("list_remote_nodes: lookup error for '{}': {}", dht_name, e),
-            }
             }
 
-            log::info!(
+            log::debug!(
                 "list_remote_nodes: DHT name '{}' yielded {} actor(s)",
                 dht_name,
                 found_count
@@ -1620,17 +1620,25 @@ impl LocalAgentHandle {
 
                 if let Some(bookmark) = bookmark {
                     if let Some(mesh) = self.mesh() {
-                        let provider_host_name =
-                            crate::agent::remote::scope::scoped_provider_host(
-                                &crate::agent::remote::scope::MeshScopeId::lan_default(),
-                                &bookmark.node_id,
-                            );
-                        if let Ok(Some(provider_host)) = mesh
-                            .lookup_actor::<crate::agent::remote::provider_host::ProviderHostActor>(
-                                &provider_host_name,
-                            )
-                            .await
-                        {
+                        let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+                        let mut provider_host = None;
+                        for scope in runtime.active_scopes() {
+                            let provider_host_name =
+                                crate::agent::remote::scope::scoped_provider_host(
+                                    &scope,
+                                    &bookmark.node_id,
+                                );
+                            if let Ok(Some(found)) = mesh
+                                .lookup_actor::<crate::agent::remote::provider_host::ProviderHostActor>(
+                                    &provider_host_name,
+                                )
+                                .await
+                            {
+                                provider_host = Some(found);
+                                break;
+                            }
+                        }
+                        if let Some(provider_host) = provider_host {
                             let status = provider_host
                                 .ask(
                                     &crate::agent::remote::provider_host::GetProviderStreamStatus {
@@ -2859,10 +2867,8 @@ impl SendAgent for LocalAgentHandle {
                     let mut remote_ref = None;
                     let mut lookup_err = None;
                     for scope in runtime.active_scopes() {
-                        let dht_name = crate::agent::remote::scope::scoped_session(
-                            &scope,
-                            &parsed.session_id,
-                        );
+                        let dht_name =
+                            crate::agent::remote::scope::scoped_session(&scope, &parsed.session_id);
                         match runtime
                             .lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name)
                             .await
@@ -3745,7 +3751,8 @@ mod tests {
         let peer_id = "12D3KooWCMGRXFFXJynyAG9dsgq9dukbVXRv5RofzbTXVEQaUsZv";
         let lan = crate::agent::remote::scope::MeshScopeId::lan_default();
         let global_name = crate::agent::remote::scope::scoped_node_manager(&lan);
-        let per_peer_name = crate::agent::remote::scope::scoped_node_manager_for_peer(&lan, &peer_id);
+        let per_peer_name =
+            crate::agent::remote::scope::scoped_node_manager_for_peer(&lan, &peer_id);
 
         assert_eq!(global_name, "scope::lan::default::node_manager");
         assert_eq!(
@@ -3779,8 +3786,10 @@ mod tests {
     fn find_node_manager_fast_path_dht_name_matches_registration_name() {
         let peer_id = "12D3KooWCMGRXFFXJynyAG9dsgq9dukbVXRv5RofzbTXVEQaUsZv";
         let lan = crate::agent::remote::scope::MeshScopeId::lan_default();
-        let fast_path_name = crate::agent::remote::scope::scoped_node_manager_for_peer(&lan, &peer_id);
-        let registration_name = crate::agent::remote::scope::scoped_node_manager_for_peer(&lan, &peer_id);
+        let fast_path_name =
+            crate::agent::remote::scope::scoped_node_manager_for_peer(&lan, &peer_id);
+        let registration_name =
+            crate::agent::remote::scope::scoped_node_manager_for_peer(&lan, &peer_id);
         assert_eq!(fast_path_name, registration_name);
         assert_eq!(
             fast_path_name,
