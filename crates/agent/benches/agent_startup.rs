@@ -10,6 +10,8 @@ use tokio::runtime::Runtime;
 const EMBEDDED_CONFIG: &str = include_str!("../examples/confs/single_coder.toml");
 const EMBEDDED_PROMPT: &str = include_str!("../examples/prompts/default_system.txt");
 const EMBEDDED_PROMPT_REF: &str = r#"{ file = "../prompts/default_system.txt" }"#;
+const EMBEDDED_CODE_META: &str = include_str!("../examples/prompts/code_meta.jinja2");
+const EMBEDDED_CODE_META_REF: &str = r#"{ file = "../prompts/code_meta.jinja2" }"#;
 
 #[derive(Clone)]
 struct ProviderCase {
@@ -57,7 +59,10 @@ fn provider_cases_from_env() -> Vec<ProviderCase> {
 
 fn make_bench_config(provider: &str, model: &str) -> String {
     let inline_prompt = format!("'''{}'''", EMBEDDED_PROMPT);
-    let with_prompt = EMBEDDED_CONFIG.replace(EMBEDDED_PROMPT_REF, &inline_prompt);
+    let code_meta_inline = format!("'''{}'''", EMBEDDED_CODE_META);
+    let with_prompt = EMBEDDED_CONFIG
+        .replace(EMBEDDED_PROMPT_REF, &inline_prompt)
+        .replace(EMBEDDED_CODE_META_REF, &code_meta_inline);
     let without_mcp = with_prompt
         .split("\n[[mcp]]")
         .next()
