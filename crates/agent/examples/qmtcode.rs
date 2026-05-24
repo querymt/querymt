@@ -25,11 +25,11 @@
 //! cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh=/ip4/0.0.0.0/tcp/0
 //!
 //! # Internet mesh: host a mesh and generate an invite token
-//! cargo run --example qmtcode --features "remote-internet" -- --mesh --mesh-invite
-//! cargo run --example qmtcode --features "remote-internet" -- --mesh --mesh-invite="My Dev Mesh"
+//! cargo run --example qmtcode --features "remote" -- --mesh --mesh-invite
+//! cargo run --example qmtcode --features "remote" -- --mesh --mesh-invite="My Dev Mesh"
 //!
 //! # Internet mesh: join via invite token
-//! cargo run --example qmtcode --features "remote-internet" -- --mesh-join=qmt://mesh/join/TOKEN
+//! cargo run --example qmtcode --features "remote" -- --mesh-join=qmt://mesh/join/TOKEN
 //!
 //! # Running a built binary with embedded default config
 //! ./qmtcode --mesh
@@ -117,21 +117,21 @@ struct Cli {
     /// Examples:
     ///   --mesh --mesh-invite                    → generate invite, print, start
     ///   --mesh --mesh-invite="My Agent Mesh"    → with a name
-    #[cfg(feature = "remote-internet")]
+    #[cfg(feature = "remote")]
     #[arg(long, value_name = "name", num_args = 0..=1, default_missing_value = "")]
     mesh_invite: Option<String>,
 
     /// Time-to-live for invite tokens. Default: 24h.
     ///
     /// Examples: 1h, 7d, 30m, none (no expiry)
-    #[cfg(feature = "remote-internet")]
+    #[cfg(feature = "remote")]
     #[arg(long, value_name = "duration", default_value = "24h")]
     invite_ttl: Option<String>,
 
     /// Maximum number of uses for invite tokens. Default: 1 (single-use).
     ///
     /// Set to 0 for unlimited uses.
-    #[cfg(feature = "remote-internet")]
+    #[cfg(feature = "remote")]
     #[arg(long, value_name = "n", default_value = "1")]
     invite_uses: Option<u32>,
 
@@ -143,7 +143,7 @@ struct Cli {
     /// Examples:
     ///   --mesh-join=qmt://mesh/join/eyJpbnZ...
     ///   --mesh-join=eyJpbnZ...
-    #[cfg(feature = "remote-internet")]
+    #[cfg(feature = "remote")]
     #[arg(long, value_name = "token")]
     mesh_join: Option<String>,
 }
@@ -240,15 +240,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let is_dashboard = cli.dashboard.is_some();
     #[cfg(not(feature = "dashboard"))]
     let is_dashboard = false;
-    #[cfg(feature = "remote-internet")]
+    #[cfg(feature = "remote")]
     let has_mesh_join = cli.mesh_join.is_some();
-    #[cfg(not(feature = "remote-internet"))]
+    #[cfg(not(feature = "remote"))]
     let has_mesh_join = false;
 
     // --mesh-invite implies --mesh (iroh host mode).
-    #[cfg(feature = "remote-internet")]
+    #[cfg(feature = "remote")]
     let has_mesh_invite = cli.mesh_invite.is_some();
-    #[cfg(not(feature = "remote-internet"))]
+    #[cfg(not(feature = "remote"))]
     let has_mesh_invite = false;
 
     #[cfg(feature = "remote")]
@@ -285,10 +285,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //   2. --mesh --mesh-invite (iroh host): start iroh mesh, print invite token
     //   3. --mesh-join=TOKEN (iroh join): join existing mesh via invite token
     //
-    // Modes 2 and 3 require the `remote-internet` feature.
+    // Modes 2 and 3 require the `remote` feature.
 
     // ── Mode 3: Join via invite token ─────────────────────────────────────────
-    #[cfg(feature = "remote-internet")]
+    #[cfg(feature = "remote")]
     if let Some(ref token) = cli.mesh_join {
         use querymt_agent::agent::remote::invite::SignedInviteGrant;
         use querymt_agent::agent::remote::mesh::join_mesh_via_invite;
@@ -324,10 +324,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Mode 2: Host with invite token ────────────────────────────────────────
-    #[cfg(feature = "remote-internet")]
+    #[cfg(feature = "remote")]
     let mesh_invite_handled = cli.mesh_join.is_some();
-    #[cfg(not(feature = "remote-internet"))]
-    let mesh_invite_handled = false;
 
     #[cfg(feature = "remote")]
     let effective_mesh = cli.mesh.clone().or_else(|| {
@@ -347,10 +345,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // Check if --mesh-invite was passed (iroh host mode).
-        #[cfg(feature = "remote-internet")]
         let is_iroh_host = cli.mesh_invite.is_some();
-        #[cfg(not(feature = "remote-internet"))]
-        let is_iroh_host = false;
 
         let transport = if is_iroh_host {
             MeshTransportMode::Iroh
@@ -388,7 +383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // If hosting with iroh, generate and print the signed invite token.
-                #[cfg(feature = "remote-internet")]
+                #[cfg(feature = "remote")]
                 if let Some(name) = &cli.mesh_invite {
                     let mesh_name = if name.is_empty() {
                         None

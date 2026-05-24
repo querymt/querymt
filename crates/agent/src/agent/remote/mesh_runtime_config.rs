@@ -215,12 +215,12 @@ impl MeshRuntimeConfig {
                 let mesh_id = if let Some(name) = iroh_entry.name.clone() {
                     name
                 } else if let Some(invite) = iroh_entry.invite.as_ref() {
-                    let invite_grant = crate::agent::remote::invite::SignedInviteGrant::decode(invite)
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "invalid Iroh invite for enabled scope without a name: {e}"
-                            )
-                        })?;
+                    let invite_grant = crate::agent::remote::invite::SignedInviteGrant::decode(
+                        invite,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("invalid Iroh invite for enabled scope without a name: {e}")
+                    })?;
                     crate::agent::remote::invite::mesh_id_for(
                         &invite_grant.grant.inviter_peer_id,
                         invite_grant.grant.mesh_name.as_deref(),

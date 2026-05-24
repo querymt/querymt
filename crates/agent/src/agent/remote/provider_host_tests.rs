@@ -901,15 +901,33 @@ mod provider_host_tests {
 
         let chunk = StreamRelayMessage::Chunk(StreamChunk::Text("hello".to_string()));
         assert!(
-            !should_ack_relay_message(&chunk, 0, Duration::from_millis(5), 8, Duration::from_millis(40)),
+            !should_ack_relay_message(
+                &chunk,
+                0,
+                Duration::from_millis(5),
+                8,
+                Duration::from_millis(40)
+            ),
             "fresh chunk batches inside the window should not force an ack"
         );
         assert!(
-            should_ack_relay_message(&chunk, 8, Duration::from_millis(5), 8, Duration::from_millis(40)),
+            should_ack_relay_message(
+                &chunk,
+                8,
+                Duration::from_millis(5),
+                8,
+                Duration::from_millis(40)
+            ),
             "chunk batches should ack once the batch window is reached"
         );
         assert!(
-            should_ack_relay_message(&chunk, 0, Duration::from_millis(40), 8, Duration::from_millis(40)),
+            should_ack_relay_message(
+                &chunk,
+                0,
+                Duration::from_millis(40),
+                8,
+                Duration::from_millis(40)
+            ),
             "chunk batches should ack once the time window is reached"
         );
 
@@ -917,7 +935,13 @@ mod provider_host_tests {
             finish_reason: querymt::chat::FinishReason::Stop,
         });
         assert!(
-            should_ack_relay_message(&done, 0, Duration::from_millis(0), 8, Duration::from_millis(40)),
+            should_ack_relay_message(
+                &done,
+                0,
+                Duration::from_millis(0),
+                8,
+                Duration::from_millis(40)
+            ),
             "terminal messages must always be acked"
         );
 
@@ -928,7 +952,13 @@ mod provider_host_tests {
             chunk_count: 2,
         };
         assert!(
-            should_ack_relay_message(&heartbeat, 0, Duration::from_millis(0), 8, Duration::from_millis(40)),
+            should_ack_relay_message(
+                &heartbeat,
+                0,
+                Duration::from_millis(0),
+                8,
+                Duration::from_millis(40)
+            ),
             "control messages should stay acked for health signaling"
         );
     }

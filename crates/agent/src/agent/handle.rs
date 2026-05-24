@@ -2718,7 +2718,7 @@ impl SendAgent for LocalAgentHandle {
                 }))
             }
             "querymt/mesh/join" => {
-                #[cfg(feature = "remote-internet")]
+                #[cfg(feature = "remote")]
                 {
                     #[derive(serde::Deserialize)]
                     #[serde(rename_all = "camelCase")]
@@ -2755,7 +2755,7 @@ impl SendAgent for LocalAgentHandle {
                     }));
                 }
 
-                #[cfg(not(feature = "remote-internet"))]
+                #[cfg(not(feature = "remote"))]
                 {
                     Err(Error::method_not_found())
                 }
@@ -3037,10 +3037,7 @@ impl SendAgent for LocalAgentHandle {
                                 .data(serde_json::json!({"error": format!("{e}")}))
                         })?;
 
-                    #[cfg(feature = "remote-internet")]
                     let qr_code = crate::agent::remote::qr::render_to_terminal(&invite.to_url());
-                    #[cfg(not(feature = "remote-internet"))]
-                    let qr_code: Option<String> = None;
 
                     return ext_json_response(&serde_json::json!({
                         "inviteId": invite.grant.invite_id,

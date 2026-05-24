@@ -50,7 +50,6 @@ use super::scope::{MeshScopeId, MeshTransportKind};
 /// Higher-level code uses `MeshHandle` methods (e.g. `dial_peer`) which
 /// translate intent into a `SwarmCommand` and send it over an `mpsc` channel.
 #[derive(Debug)]
-#[cfg_attr(not(feature = "remote-internet"), allow(dead_code))]
 enum SwarmCommand {
     /// Request the swarm to dial a peer by `PeerId`.
     ///
@@ -1054,30 +1053,8 @@ impl MeshHandle {
 pub async fn bootstrap_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError> {
     match config.transport {
         MeshTransportMode::Lan => bootstrap_lan_mesh(config).await,
-        MeshTransportMode::Iroh => {
-            #[cfg(feature = "remote-internet")]
-            {
-                bootstrap_iroh_mesh(config).await
-            }
-            #[cfg(not(feature = "remote-internet"))]
-            {
-                Err(MeshError::SwarmError(
-                    "iroh transport requires the 'remote-internet' cargo feature".to_string(),
-                ))
-            }
-        }
-        MeshTransportMode::Composite => {
-            #[cfg(feature = "remote-internet")]
-            {
-                bootstrap_composite_mesh(config).await
-            }
-            #[cfg(not(feature = "remote-internet"))]
-            {
-                Err(MeshError::SwarmError(
-                    "composite transport requires the 'remote-internet' cargo feature".to_string(),
-                ))
-            }
-        }
+        MeshTransportMode::Iroh => bootstrap_iroh_mesh(config).await,
+        MeshTransportMode::Composite => bootstrap_composite_mesh(config).await,
     }
 }
 
@@ -1334,7 +1311,6 @@ fn handle_connection_closed(
     }
 }
 
-#[cfg(feature = "remote-internet")]
 fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
     use libp2p::multiaddr::Protocol;
 
@@ -1344,7 +1320,6 @@ fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
     })
 }
 
-#[cfg(feature = "remote-internet")]
 fn admitted_peer_ids_for_local_mesh(
     store: &super::invite::InviteStore,
     local_peer_id: &PeerId,
@@ -1371,7 +1346,6 @@ fn admitted_peer_ids_for_local_mesh(
         .collect()
 }
 
-#[cfg(feature = "remote-internet")]
 fn reconnect_backoff_duration(attempt: u32) -> std::time::Duration {
     let secs = (1u64 << attempt.min(5)).min(30);
     std::time::Duration::from_secs(secs)
@@ -1795,7 +1769,6 @@ async fn bootstrap_lan_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError
 
 // ── Iroh mesh (QUIC + relay, NAT traversal) ────────────────────────────────────
 
-#[cfg(feature = "remote-internet")]
 async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError> {
     use futures_util::StreamExt as _;
     use kameo::remote;
@@ -2157,7 +2130,6 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
 // The mDNS behaviour is wrapped in `Toggle` so it can be enabled/disabled
 // based on config without requiring separate struct definitions.
 
-#[cfg(feature = "remote-internet")]
 async fn bootstrap_composite_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshError> {
     use futures_util::StreamExt as _;
     use kameo::remote;
@@ -2577,15 +2549,6 @@ pub async fn bootstrap_mesh_runtime(
         ));
     }
 
-    if has_iroh {
-        #[cfg(not(feature = "remote-internet"))]
-        {
-            return Err(MeshError::SwarmError(
-                "iroh transport requires the 'remote-internet' cargo feature".to_string(),
-            ));
-        }
-    }
-
     let transport_mode = match (has_lan, has_iroh) {
         (true, false) => MeshTransportMode::Lan,
         (false, true) => MeshTransportMode::Iroh,
@@ -2682,7 +2645,6 @@ pub async fn bootstrap_mesh_runtime(
 
     let mut swarm: libp2p::Swarm<UnifiedMeshBehaviour> = if has_lan && has_iroh {
         // ── Full composite: TCP + QUIC + Iroh ───────────────────────────────
-        #[cfg(feature = "remote-internet")]
         {
             let iroh_config = libp2p_iroh::TransportConfig {
                 timeout: config.request_timeout,
@@ -2735,10 +2697,6 @@ pub async fn bootstrap_mesh_runtime(
                 })
                 .build()
         }
-        #[cfg(not(feature = "remote-internet"))]
-        {
-            unreachable!("guarded above")
-        }
     } else if has_lan {
         // ── LAN only: TCP + QUIC + optional mDNS ────────────────────────────
         libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
@@ -2783,7 +2741,6 @@ pub async fn bootstrap_mesh_runtime(
             .build()
     } else {
         // ── Iroh only ───────────────────────────────────────────────────────
-        #[cfg(feature = "remote-internet")]
         {
             let iroh_config = libp2p_iroh::TransportConfig {
                 timeout: config.request_timeout,
@@ -2816,10 +2773,6 @@ pub async fn bootstrap_mesh_runtime(
                 }))
                 .with_idle_connection_timeout(std::time::Duration::from_secs(300)),
             )
-        }
-        #[cfg(not(feature = "remote-internet"))]
-        {
-            unreachable!("guarded above")
         }
     };
 
@@ -3213,7 +3166,6 @@ pub async fn bootstrap_mesh_default() -> Result<MeshHandle, MeshError> {
 /// # Arguments
 /// - `invite` — a decoded `SignedInviteGrant` (signature verified offline)
 /// - `identity_file` — optional path to the persistent ed25519 identity file
-#[cfg(feature = "remote-internet")]
 pub async fn join_mesh_via_invite(
     invite: &super::invite::SignedInviteGrant,
     identity_file: Option<std::path::PathBuf>,
@@ -3432,7 +3384,6 @@ pub async fn join_mesh_via_invite(
 ///
 /// Tries the original inviter first (per-peer DHT name), then falls back to
 /// cached peers in order.  Returns the first one that responds.
-#[cfg(feature = "remote-internet")]
 async fn find_admission_target(
     mesh: &MeshHandle,
     inviter_peer_id: &str,
@@ -3490,14 +3441,12 @@ mod tests {
         MeshEvent, MeshHandle, MeshScopeId, MeshTransportKind, MeshTransportMode, RouteTable,
         SwarmCommand, connection_route_plan,
     };
-    #[cfg(feature = "remote-internet")]
     use super::{admitted_peer_ids_for_local_mesh, peer_id_from_multiaddr};
     use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
 
-    #[cfg(feature = "remote-internet")]
     #[test]
     fn admitted_peer_ids_filters_to_specific_local_mesh() {
         let dir = tempfile::tempdir().unwrap();
@@ -3562,7 +3511,6 @@ mod tests {
         assert_eq!(local[0].to_string(), peer_a_id);
     }
 
-    #[cfg(feature = "remote-internet")]
     #[test]
     fn peer_id_from_multiaddr_extracts_p2p_component() {
         let kp = libp2p::identity::Keypair::generate_ed25519();
@@ -3573,7 +3521,6 @@ mod tests {
         assert_eq!(peer_id_from_multiaddr(&addr), Some(peer_id));
     }
 
-    #[cfg(feature = "remote-internet")]
     fn test_mesh_with_memberships(
         mesh_ids: &[&str],
     ) -> (
@@ -3635,7 +3582,6 @@ mod tests {
         (dir, mesh, peer_events_rx, swarm_cmd_rx)
     }
 
-    #[cfg(feature = "remote-internet")]
     #[test]
     fn leave_iroh_scope_removes_membership_emits_event_and_notifies_swarm() {
         let mesh_id = "inviter:mesh-a";
@@ -3659,7 +3605,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "remote-internet")]
     #[test]
     fn leave_iroh_scope_missing_scope_returns_false_and_emits_nothing() {
         let (_dir, mesh, mut events_rx, mut swarm_cmd_rx) =
@@ -3745,7 +3690,6 @@ mod tests {
         assert_eq!(best.priority, 100);
     }
 
-    #[cfg(feature = "remote-internet")]
     #[test]
     fn scope_joined_and_left_events_roundtrip_through_broadcast_channel() {
         let (_dir, mesh, mut events_rx, _swarm_cmd_rx) =

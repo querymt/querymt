@@ -226,7 +226,9 @@ pub(crate) async fn finalize_remote_session_attach(
 
     let (remote_ref, matched_scope) = match handoff {
         SessionHandoff::DirectRemote { session_ref } => (session_ref, None),
-        SessionHandoff::LookupOnly => lookup_remote_session_actor(state, node_id, session_id).await?,
+        SessionHandoff::LookupOnly => {
+            lookup_remote_session_actor(state, node_id, session_id).await?
+        }
         SessionHandoff::NoAttachPath => {
             return Err(format!(
                 "Remote session '{}' was created on node '{}' but that node cannot provide a direct or lookup attach path",
@@ -597,10 +599,7 @@ pub async fn handle_create_mesh_invite(
         match mesh.create_invite(mesh_name.clone(), ttl_secs, max_uses, false) {
             Ok(invite) => {
                 let url = invite.to_url();
-                #[cfg(feature = "remote-internet")]
                 let qr_code = crate::agent::remote::qr::render_to_terminal(&url);
-                #[cfg(not(feature = "remote-internet"))]
-                let qr_code: Option<String> = None;
                 let _ = send_message(
                     tx,
                     UiServerMessage::MeshInviteCreated {

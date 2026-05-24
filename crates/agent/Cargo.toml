@@ -30,12 +30,7 @@ dbus-secret-service = ["querymt-utils/dbus-secret-service"]
 # Enables kameo remote actor support for cross-machine session management.
 # Adds libp2p-based P2P networking, mDNS peer discovery, and Kademlia DHT
 # for distributed actor registry. SessionActorRef gains a Remote variant.
-remote = ["kameo/remote", "dep:libp2p"]
-
-# Extends `remote` with iroh-backed QUIC transport for NAT traversal and
-# relay-based connectivity across the internet.  Adds invite-token support
-# for dynamic mesh joining.
-remote-internet = ["remote", "dep:libp2p-iroh", "dep:qrcode"]
+remote = ["kameo/remote", "dep:libp2p", "dep:libp2p-iroh", "dep:qrcode"]
 
 [dependencies]
 typeshare = "1.0"
@@ -71,7 +66,7 @@ grep-regex = "0.1"
 strsim = "0.11"
 once_cell = "1.21"
 parking_lot = "0.12"
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 
 imara-diff = "0.2"
 rmcp = { version = "1.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-async-rw", "elicitation", "reqwest"] }

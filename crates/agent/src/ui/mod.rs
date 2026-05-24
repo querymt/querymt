@@ -123,10 +123,10 @@ impl ServerState {
         // Fast path: return cached result if still fresh.
         {
             let guard = self.remote_node_cache.lock().await;
-            if let Some(ref cache) = *guard {
-                if cache.is_fresh() {
-                    return cache.nodes.clone();
-                }
+            if let Some(ref cache) = *guard
+                && cache.is_fresh()
+            {
+                return cache.nodes.clone();
             }
         }
 

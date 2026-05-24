@@ -604,7 +604,7 @@ pub enum MeshTransportConfig {
     #[default]
     Lan,
     /// iroh-backed QUIC transport with relay and NAT traversal (internet-capable).
-    /// Requires the `remote-internet` feature.
+    /// Requires the `remote` feature.
     Iroh,
 }
 
@@ -709,7 +709,7 @@ pub struct MeshTomlConfig {
     /// Transport layer.  Default: `"lan"`.
     ///
     /// Set to `"iroh"` for internet-capable mesh with NAT traversal and relay.
-    /// Requires the `remote-internet` feature.
+    /// Requires the `remote` feature.
     #[serde(default)]
     pub transport: MeshTransportConfig,
 

@@ -21,7 +21,7 @@ pub mod identity;
 pub mod invite;
 pub mod node_id;
 pub mod node_manager;
-#[cfg(feature = "remote-internet")]
+#[cfg(feature = "remote")]
 pub mod qr;
 pub mod routing;
 pub mod scope;
@@ -102,7 +102,7 @@ pub use actor_ref::SessionActorRef;
 pub use cached_transport::{CachedDynMeshTransport, CachedMeshTransport};
 pub use event_forwarder::EventForwarder;
 pub use event_relay::{EventRelayActor, RelayedEvent};
-#[cfg(feature = "remote-internet")]
+#[cfg(feature = "remote")]
 pub use mesh::join_mesh_via_invite;
 #[cfg(feature = "remote")]
 pub use mesh::{

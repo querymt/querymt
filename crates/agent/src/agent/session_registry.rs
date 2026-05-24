@@ -1190,7 +1190,12 @@ mod tests {
                 mesh_id: "team-a".to_string(),
             }),
         );
-        assert_eq!(selected, MeshScopeId::Iroh { mesh_id: "team-a".to_string() });
+        assert_eq!(
+            selected,
+            MeshScopeId::Iroh {
+                mesh_id: "team-a".to_string()
+            }
+        );
     }
 
     #[test]
