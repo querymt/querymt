@@ -80,6 +80,8 @@ pub struct AgentConfig {
     pub schedule_repository: Option<Arc<dyn crate::session::repo_schedule::ScheduleRepository>>,
     /// Knowledge store for the knowledge tools.
     pub knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
+    /// Slash command registry for prompt expansion and ACP advertising.
+    pub slash_command_registry: crate::slash_commands::SlashCommandRegistry,
 }
 
 impl AgentConfig {

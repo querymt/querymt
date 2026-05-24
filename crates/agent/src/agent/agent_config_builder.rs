@@ -69,6 +69,7 @@ pub struct AgentConfigBuilder {
     mcp_servers: Vec<McpServerConfig>,
     schedule_repository: Option<Arc<dyn crate::session::repo_schedule::ScheduleRepository>>,
     knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
+    slash_command_registry: crate::slash_commands::SlashCommandRegistry,
 }
 
 impl AgentConfigBuilder {
@@ -123,6 +124,7 @@ impl AgentConfigBuilder {
             mcp_servers: Vec::new(),
             schedule_repository: None,
             knowledge_store: None,
+            slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
         }
     }
 
@@ -170,6 +172,7 @@ impl AgentConfigBuilder {
             mcp_servers: Vec::new(),
             schedule_repository: None,
             knowledge_store: None,
+            slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
         }
     }
 
@@ -208,6 +211,7 @@ impl AgentConfigBuilder {
             mcp_servers: self.mcp_servers,
             schedule_repository: self.schedule_repository,
             knowledge_store: self.knowledge_store,
+            slash_command_registry: self.slash_command_registry,
         }
     }
 
@@ -432,6 +436,15 @@ impl AgentConfigBuilder {
         store: Arc<dyn crate::knowledge::KnowledgeStore>,
     ) -> Self {
         self.knowledge_store = Some(store);
+        self
+    }
+
+    /// Set the slash command registry.
+    pub fn with_slash_command_registry(
+        mut self,
+        registry: crate::slash_commands::SlashCommandRegistry,
+    ) -> Self {
+        self.slash_command_registry = registry;
         self
     }
 
