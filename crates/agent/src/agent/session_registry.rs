@@ -606,7 +606,6 @@ impl SessionRegistry {
         self.detach_remote_session_inner(session_id, true).await
     }
 
-
     /// Fork an existing session at the latest message.
     pub async fn fork_session(
         &self,

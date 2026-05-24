@@ -658,19 +658,19 @@ impl SessionMaterializer {
         );
 
         // Publish available slash commands via ACP bridge
-        if !self.config.slash_command_registry.is_empty() {
-            if let Some(bridge_sender) = bridge {
-                let notification = crate::slash_commands::acp::build_commands_notification(
-                    &prepared.session_id,
-                    &self.config.slash_command_registry,
-                );
-                let bridge = bridge_sender.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = bridge.notify(notification).await {
-                        log::debug!("Failed to publish available commands: {}", e);
-                    }
-                });
-            }
+        if !self.config.slash_command_registry.is_empty()
+            && let Some(bridge_sender) = bridge
+        {
+            let notification = crate::slash_commands::acp::build_commands_notification(
+                &prepared.session_id,
+                &self.config.slash_command_registry,
+            );
+            let bridge = bridge_sender.clone();
+            tokio::spawn(async move {
+                if let Err(e) = bridge.notify(notification).await {
+                    log::debug!("Failed to publish available commands: {}", e);
+                }
+            });
         }
 
         Ok(())

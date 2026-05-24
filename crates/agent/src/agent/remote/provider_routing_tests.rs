@@ -332,6 +332,7 @@ mod provider_routing_integration_tests {
         use crate::agent::remote::session_stream_router::SessionStreamRouterActor;
 
         let test_id = Uuid::now_v7().to_string();
+        let _mesh = get_test_mesh().await;
         let f = ProviderHostFixture::new().await;
 
         let session_id = format!("session-h9-{}", test_id);

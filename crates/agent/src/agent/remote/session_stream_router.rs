@@ -986,7 +986,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_preserves_non_terminal_requests() {
-        let router = SessionStreamRouterActor::new(Some(10), Some(0)); // 0s TTL
+        let router = SessionStreamRouterActor::new(Some(10), Some(60)); // 60s TTL
         let request_id = "test-request-10".to_string();
         router
             .register_request(request_id.clone())
@@ -1117,6 +1117,14 @@ mod tests {
         let request_id = "req-terminal-chunk".to_string();
         let (tx, mut rx) = mpsc::channel(8);
 
+        // Register the request before attaching a consumer
+        router_ref
+            .ask(RegisterRequest {
+                request_id: request_id.clone(),
+            })
+            .await
+            .expect("register request");
+
         // Attach consumer
         router_ref
             .ask(AttachStreamConsumer {
@@ -1170,6 +1178,14 @@ mod tests {
         let router_ref = SessionStreamRouterActor::spawn(SessionStreamRouterActor::new(None, None));
         let request_id = "req-terminal-batch".to_string();
         let (tx, mut rx) = mpsc::channel(8);
+
+        // Register the request before attaching a consumer
+        router_ref
+            .ask(RegisterRequest {
+                request_id: request_id.clone(),
+            })
+            .await
+            .expect("register request");
 
         router_ref
             .ask(AttachStreamConsumer {
@@ -1280,6 +1296,14 @@ mod tests {
 
         let router_ref = SessionStreamRouterActor::spawn(SessionStreamRouterActor::new(None, None));
         let request_id = "req-buffered-terminal".to_string();
+
+        // Register the request before sending relay messages
+        router_ref
+            .ask(RegisterRequest {
+                request_id: request_id.clone(),
+            })
+            .await
+            .expect("register request");
 
         // Send messages without a consumer — they will be buffered
         router_ref
