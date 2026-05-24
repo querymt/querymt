@@ -9,7 +9,7 @@ use crate::agent::remote::SessionActorRef;
 #[cfg(feature = "remote")]
 use crate::agent::remote::runtime_handle::MeshRuntimeHandle;
 #[cfg(feature = "remote")]
-use crate::agent::remote::scope::{scoped_event_relay, scoped_session};
+use crate::agent::remote::scope::{MeshScopeId, scoped_event_relay, scoped_session};
 use crate::agent::session_actor::SessionActor;
 use crate::error::AgentError;
 use agent_client_protocol::schema::{
@@ -21,6 +21,17 @@ use kameo::actor::{ActorRef, Spawn};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+#[cfg(feature = "remote")]
+fn select_relay_scope(
+    active_scopes: &[MeshScopeId],
+    preferred_scope: Option<MeshScopeId>,
+) -> MeshScopeId {
+    preferred_scope
+        .filter(|scope| active_scopes.contains(scope))
+        .or_else(|| active_scopes.first().cloned())
+        .unwrap_or_else(MeshScopeId::lan_default)
+}
 
 pub fn all_session_modes() -> Vec<SessionMode> {
     vec![
@@ -395,6 +406,7 @@ impl SessionRegistry {
         remote_ref: kameo::actor::RemoteActorRef<SessionActor>,
         peer_label: String,
         mesh: Option<crate::agent::remote::MeshHandle>,
+        preferred_scope: Option<MeshScopeId>,
         remote_node_id: Option<String>,
     ) -> SessionActorRef {
         log::debug!(
@@ -426,21 +438,14 @@ impl SessionRegistry {
         let mesh_active = mesh.is_some();
         let relay_dht_name = if let Some(ref mesh) = mesh {
             let runtime = MeshRuntimeHandle::from(mesh.clone());
-            let mut names = Vec::new();
-            for scope in runtime.active_scopes() {
-                let name = scoped_event_relay(&scope, &session_id, mesh.peer_id());
-                runtime
-                    .register_actor(relay_ref.clone(), name.clone())
-                    .await;
-                names.push(name);
+            let active_scopes = runtime.active_scopes();
+            for scope in &active_scopes {
+                let name = scoped_event_relay(scope, &session_id, mesh.peer_id());
+                runtime.register_actor(relay_ref.clone(), name).await;
             }
-            names.into_iter().next().unwrap_or_else(|| {
-                scoped_event_relay(
-                    &crate::agent::remote::scope::MeshScopeId::lan_default(),
-                    &session_id,
-                    mesh.peer_id(),
-                )
-            })
+
+            let selected_scope = select_relay_scope(&active_scopes, preferred_scope);
+            scoped_event_relay(&selected_scope, &session_id, mesh.peer_id())
         } else {
             log::debug!(
                 "attach_remote_session: no mesh, DHT registration skipped for relay (session {})",
@@ -1169,5 +1174,39 @@ mod tests {
             .collect();
         assert!(names.contains(&"config-server"));
         assert!(names.contains(&"req-server"));
+    }
+
+    #[test]
+    fn select_relay_scope_uses_preferred_scope_when_present() {
+        let scopes = vec![
+            MeshScopeId::lan_default(),
+            MeshScopeId::Iroh {
+                mesh_id: "team-a".to_string(),
+            },
+        ];
+        let selected = select_relay_scope(
+            &scopes,
+            Some(MeshScopeId::Iroh {
+                mesh_id: "team-a".to_string(),
+            }),
+        );
+        assert_eq!(selected, MeshScopeId::Iroh { mesh_id: "team-a".to_string() });
+    }
+
+    #[test]
+    fn select_relay_scope_falls_back_to_first_scope_when_preferred_missing() {
+        let scopes = vec![
+            MeshScopeId::lan_default(),
+            MeshScopeId::Iroh {
+                mesh_id: "team-a".to_string(),
+            },
+        ];
+        let selected = select_relay_scope(
+            &scopes,
+            Some(MeshScopeId::Iroh {
+                mesh_id: "other".to_string(),
+            }),
+        );
+        assert_eq!(selected, MeshScopeId::lan_default());
     }
 }

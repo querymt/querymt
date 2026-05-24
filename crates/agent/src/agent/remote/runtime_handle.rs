@@ -560,20 +560,20 @@ mod tests {
         // node_manager
         assert_eq!(
             scoped_node_manager(&scope),
-            "scope::test-mesh::node_manager"
+            "scope::iroh::test-mesh::node_manager"
         );
 
         // node_manager for peer
         assert_eq!(
             scoped_node_manager_for_peer(&scope, &peer_id),
-            "scope::test-mesh::node_manager::peer::12D3KooWABC"
+            "scope::iroh::test-mesh::node_manager::peer::12D3KooWABC"
         );
     }
 
     #[test]
     fn mesh_scope_id_display_roundtrip() {
         let lan = MeshScopeId::lan_default();
-        assert_eq!(format!("{}", lan), "lan");
+        assert_eq!(format!("{}", lan), "lan:default");
 
         let iroh = MeshScopeId::Iroh {
             mesh_id: "team-a".to_string(),

@@ -1532,12 +1532,20 @@ impl LocalAgentHandle {
         session_id: String,
         remote_ref: kameo::actor::RemoteActorRef<crate::agent::session_actor::SessionActor>,
         peer_label: String,
+        preferred_scope: Option<crate::agent::remote::scope::MeshScopeId>,
         remote_node_id: Option<String>,
     ) -> crate::agent::remote::SessionActorRef {
         let mesh = self.mesh();
         let mut registry = self.registry.lock().await;
         registry
-            .attach_remote_session(session_id, remote_ref, peer_label, mesh, remote_node_id)
+            .attach_remote_session(
+                session_id,
+                remote_ref,
+                peer_label,
+                mesh,
+                preferred_scope,
+                remote_node_id,
+            )
             .await
     }
 
@@ -1741,6 +1749,7 @@ impl LocalAgentHandle {
 
         let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
         let mut remote_ref = None;
+        let mut matched_scope = None;
         for scope in runtime.active_scopes() {
             let dht_name =
                 crate::agent::remote::scope::scoped_session(&scope, &bookmark.session_id);
@@ -1751,8 +1760,9 @@ impl LocalAgentHandle {
                     key: dht_name.clone(),
                     reason: e.to_string(),
                 })?;
-            if lookup.is_some() {
-                remote_ref = lookup;
+            if let Some(found) = lookup {
+                remote_ref = Some(found);
+                matched_scope = Some(scope);
                 break;
             }
         }
@@ -1771,6 +1781,7 @@ impl LocalAgentHandle {
                 remote_ref,
                 bookmark.peer_label.clone(),
                 Some(mesh),
+                matched_scope,
                 Some(bookmark.node_id.clone()),
             )
             .await;
@@ -1794,6 +1805,7 @@ impl LocalAgentHandle {
 
         let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
         let mut remote_ref = None;
+        let mut matched_scope = None;
         for scope in runtime.active_scopes() {
             let dht_name =
                 crate::agent::remote::scope::scoped_session(&scope, &bookmark.session_id);
@@ -1806,8 +1818,9 @@ impl LocalAgentHandle {
                     key: dht_name.clone(),
                     reason: e.to_string(),
                 })?;
-            if lookup.is_some() {
-                remote_ref = lookup;
+            if let Some(found) = lookup {
+                remote_ref = Some(found);
+                matched_scope = Some(scope);
                 break;
             }
         }
@@ -1826,6 +1839,7 @@ impl LocalAgentHandle {
                 remote_ref,
                 bookmark.peer_label.clone(),
                 Some(mesh),
+                matched_scope,
                 Some(bookmark.node_id.clone()),
             )
             .await;
@@ -2865,6 +2879,7 @@ impl SendAgent for LocalAgentHandle {
                     // Try scoped DHT lookup first — works for already-hydrated sessions.
                     let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
                     let mut remote_ref = None;
+                    let mut matched_scope = None;
                     let mut lookup_err = None;
                     for scope in runtime.active_scopes() {
                         let dht_name =
@@ -2875,6 +2890,7 @@ impl SendAgent for LocalAgentHandle {
                         {
                             Ok(Some(found)) => {
                                 remote_ref = Some(found);
+                                matched_scope = Some(scope);
                                 break;
                             }
                             Ok(None) => {}
@@ -2914,6 +2930,7 @@ impl SendAgent for LocalAgentHandle {
                         parsed.session_id.clone(),
                         remote_ref,
                         peer_label,
+                        matched_scope,
                         Some(parsed.node_id.clone()),
                     )
                     .await;

@@ -16,6 +16,8 @@ use super::session_ops::{ListSessionsRequest, handle_list_sessions};
 #[cfg(feature = "remote")]
 use crate::agent::remote::node_manager::SessionHandoff;
 #[cfg(feature = "remote")]
+use crate::agent::remote::scope::MeshScopeId;
+#[cfg(feature = "remote")]
 use crate::agent::utils::u32_from_usize;
 #[cfg(feature = "remote")]
 use kameo::actor::RemoteActorRef;
@@ -222,11 +224,9 @@ pub(crate) async fn finalize_remote_session_attach(
         .map(|n| n.hostname)
         .unwrap_or_else(|| node_id.to_string());
 
-    let remote_ref = match handoff {
-        SessionHandoff::DirectRemote { session_ref } => session_ref,
-        SessionHandoff::LookupOnly => {
-            lookup_remote_session_actor(state, node_id, session_id).await?
-        }
+    let (remote_ref, matched_scope) = match handoff {
+        SessionHandoff::DirectRemote { session_ref } => (session_ref, None),
+        SessionHandoff::LookupOnly => lookup_remote_session_actor(state, node_id, session_id).await?,
         SessionHandoff::NoAttachPath => {
             return Err(format!(
                 "Remote session '{}' was created on node '{}' but that node cannot provide a direct or lookup attach path",
@@ -241,6 +241,7 @@ pub(crate) async fn finalize_remote_session_attach(
             session_id.to_string(),
             remote_ref,
             peer_label,
+            matched_scope,
             Some(node_id.to_string()),
         )
         .await;
@@ -372,7 +373,13 @@ async fn lookup_remote_session_actor(
     state: &ServerState,
     node_id: &str,
     session_id: &str,
-) -> Result<RemoteActorRef<crate::agent::session_actor::SessionActor>, String> {
+) -> Result<
+    (
+        RemoteActorRef<crate::agent::session_actor::SessionActor>,
+        Option<MeshScopeId>,
+    ),
+    String,
+> {
     use std::time::Duration;
 
     use crate::agent::session_actor::SessionActor;
@@ -399,7 +406,7 @@ async fn lookup_remote_session_actor(
                 .await
             {
                 Ok(Some(r)) => {
-                    found = Some(r);
+                    found = Some((r, scope));
                     break;
                 }
                 Ok(None) => {
@@ -425,7 +432,7 @@ async fn lookup_remote_session_actor(
             }
         }
 
-        if let Some(r) = found {
+        if let Some((r, scope)) = found {
             if attempt_idx > 0 {
                 log::info!(
                     "handle_attach_remote_session: DHT lookup for {} succeeded on retry {}",
@@ -433,7 +440,7 @@ async fn lookup_remote_session_actor(
                     attempt_idx + 1
                 );
             }
-            return Ok(r);
+            return Ok((r, Some(scope)));
         }
     }
 

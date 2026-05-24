@@ -212,33 +212,24 @@ impl MeshRuntimeConfig {
                 if !iroh_entry.enabled {
                     continue;
                 }
-                let mesh_id = iroh_entry
-                    .name
-                    .clone()
-                    .or_else(|| {
-                        // Derive mesh_id from invite if no explicit name
-                        iroh_entry.invite.as_ref().and_then(|inv| {
-                            // Try to extract mesh_name from invite
-                            crate::agent::remote::invite::SignedInviteGrant::decode(inv)
-                                .ok()
-                                .and_then(|g| g.grant.mesh_name.clone())
-                                .or_else(|| {
-                                    // Fallback: derive from inviter peer ID
-                                    crate::agent::remote::invite::SignedInviteGrant::decode(inv)
-                                        .ok()
-                                        .map(|g| {
-                                            crate::agent::remote::invite::mesh_id_for(
-                                                &g.grant.inviter_peer_id,
-                                                g.grant.mesh_name.as_deref(),
-                                            )
-                                        })
-                                })
-                        })
-                    })
-                    .unwrap_or_else(|| {
-                        // Last resort: generate a short ID from index
-                        format!("iroh-{}", iroh_configs.len())
-                    });
+                let mesh_id = if let Some(name) = iroh_entry.name.clone() {
+                    name
+                } else if let Some(invite) = iroh_entry.invite.as_ref() {
+                    let invite_grant = crate::agent::remote::invite::SignedInviteGrant::decode(invite)
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "invalid Iroh invite for enabled scope without a name: {e}"
+                            )
+                        })?;
+                    crate::agent::remote::invite::mesh_id_for(
+                        &invite_grant.grant.inviter_peer_id,
+                        invite_grant.grant.mesh_name.as_deref(),
+                    )
+                } else {
+                    anyhow::bail!(
+                        "enabled Iroh scope requires either 'name' or a valid 'invite' so mesh_id is stable"
+                    );
+                };
 
                 iroh_configs.push(IrohMeshConfig {
                     mesh_id,
@@ -672,6 +663,44 @@ mod tests {
         assert!(
             msg.contains("duplicate Iroh mesh_id"),
             "expected duplicate error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn new_syntax_enabled_iroh_requires_name_or_invite() {
+        let result = default_old_params()
+            .into_builder()
+            .enabled(true)
+            .iroh(vec![crate::config::IrohMeshTomlConfig {
+                enabled: true,
+                invite: None,
+                name: None,
+            }])
+            .build();
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("requires either 'name' or a valid 'invite'"),
+            "expected missing-id error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn new_syntax_enabled_iroh_invalid_invite_without_name_is_error() {
+        let result = default_old_params()
+            .into_builder()
+            .enabled(true)
+            .iroh(vec![crate::config::IrohMeshTomlConfig {
+                enabled: true,
+                invite: Some("not-an-invite".to_string()),
+                name: None,
+            }])
+            .build();
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("invalid Iroh invite"),
+            "expected invalid-invite error, got: {msg}"
         );
     }
 

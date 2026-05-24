@@ -704,6 +704,7 @@ mod event_relay_mesh_tests {
                 "test-peer".to_string(),
                 Some(mesh.clone()),
                 None,
+                None,
             )
             .await;
 

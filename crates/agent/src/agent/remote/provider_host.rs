@@ -272,6 +272,24 @@ pub(crate) fn relay_message_is_terminal(message: &StreamRelayMessage) -> bool {
     )
 }
 
+pub(crate) fn should_ack_relay_message(
+    message: &StreamRelayMessage,
+    unacked_batches: u32,
+    last_ack_at: Duration,
+    ack_window_batches: u32,
+    ack_window_interval: Duration,
+) -> bool {
+    let is_terminal = relay_message_is_terminal(message);
+    let is_chunk_batch = matches!(
+        message,
+        StreamRelayMessage::Chunk(_) | StreamRelayMessage::ChunkBatch(_)
+    );
+    is_terminal
+        || !is_chunk_batch
+        || unacked_batches >= ack_window_batches
+        || last_ack_at >= ack_window_interval
+}
+
 fn update_active_stream(
     active_streams: &Arc<Mutex<HashMap<(String, String), ActiveProviderStream>>>,
     session_id: &str,
@@ -695,6 +713,8 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
 
             const MAX_BATCH_SIZE: usize = 16;
             const BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
+            const ACK_WINDOW_BATCHES: u32 = 8;
+            const ACK_WINDOW_INTERVAL: Duration = Duration::from_millis(40);
 
             // Insert an OpeningUpstream record BEFORE heavy setup for control-plane responsiveness.
             // This allows cancel/status/lease requests to see the stream exists immediately.
@@ -825,6 +845,8 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                     let mut upstream_done = false;
                     let mut terminal_message: Option<StreamRelayMessage> = None;
                     let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
+                    let mut unacked_batches: u32 = 0;
+                    let mut last_ack_at = Instant::now();
                     heartbeat_tick.tick().await;
 
                     update_active_stream(&active_streams, &session_id, &request_id, |stream| {
@@ -1010,6 +1032,8 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                             .unwrap_or(0),
                                         "receiver reconnected (direct ref)"
                                     );
+                                    unacked_batches = 0;
+                                    last_ack_at = Instant::now();
                                 } else {
                                     let since = disconnected_since.get_or_insert_with(tokio::time::Instant::now);
                                     update_active_stream(&active_streams, &session_id, &request_id, |stream| {
@@ -1056,7 +1080,23 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                 request_id: request_id.clone(),
                                 message: front,
                             };
-                            let relay_result = stream_router_ref.tell(&relay).send_ack().await;
+                            let is_terminal = relay_message_is_terminal(&relay.message);
+                            let is_chunk_batch = matches!(
+                                &relay.message,
+                                StreamRelayMessage::Chunk(_) | StreamRelayMessage::ChunkBatch(_)
+                            );
+                            let should_ack = should_ack_relay_message(
+                                &relay.message,
+                                unacked_batches,
+                                last_ack_at.elapsed(),
+                                ACK_WINDOW_BATCHES,
+                                ACK_WINDOW_INTERVAL,
+                            );
+                            let relay_result = if should_ack {
+                                stream_router_ref.tell(&relay).send_ack().await.map_err(|e| e.to_string())
+                            } else {
+                                stream_router_ref.tell(&relay).send().map_err(|e| e.to_string())
+                            };
                             if let Err(e) = relay_result {
                                 tracing::warn!(
                                     target: "remote::provider_host::stream",
@@ -1095,6 +1135,18 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                 continue;
                             }
 
+                            if is_chunk_batch {
+                                if should_ack {
+                                    unacked_batches = 0;
+                                    last_ack_at = Instant::now();
+                                } else {
+                                    unacked_batches = unacked_batches.saturating_add(1);
+                                }
+                            } else {
+                                unacked_batches = 0;
+                                last_ack_at = Instant::now();
+                            }
+
                             buffered.pop_front();
                             let relayed_chunks = match &relay.message {
                                 StreamRelayMessage::Chunk(_) => 1,
@@ -1113,7 +1165,6 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                 });
                             }
                             let elapsed_ms = relay_start.elapsed().as_millis();
-                            let is_terminal = relay_message_is_terminal(&relay.message);
                             tracing::trace!(
                                 target: "remote::provider_host::stream",
                                 session_id = %session_id,
