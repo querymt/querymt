@@ -1726,7 +1726,25 @@ async fn execute_prompt_detached(
     .with_event_sink(config.event_sink.clone())
     .with_workspace_query_bridge(bridge.clone());
 
-    // 4. Store User Messages
+    // 4. Slash command expansion (before storing user messages)
+    let mut req = req;
+    if let Some(agent_client_protocol::schema::ContentBlock::Text(text_content)) =
+        req.prompt.first()
+        && let Some(expansion) =
+            crate::slash_commands::try_expand(&text_content.text, &config.slash_command_registry)
+    {
+        log::info!(
+            "Session {}: expanding slash command '/{}'",
+            session_id,
+            expansion.invocation.name
+        );
+        // Replace the first text block with the expanded prompt
+        req.prompt[0] = agent_client_protocol::schema::ContentBlock::Text(
+            agent_client_protocol::schema::TextContent::new(expansion.prompt_text),
+        );
+    }
+
+    // 5. Store User Messages
     // Keep separate projections for user-visible events vs LLM replay context.
     let display_content = render_prompt_for_display(&req.prompt);
 

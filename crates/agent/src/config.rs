@@ -964,6 +964,10 @@ pub struct AgentSettings {
     /// Skills system configuration.
     #[serde(default)]
     pub skills: SkillsConfig,
+
+    /// Slash commands system configuration.
+    #[serde(default)]
+    pub slash_commands: SlashCommandsConfig,
 }
 
 fn default_assume_mutating() -> bool {
@@ -1724,6 +1728,51 @@ impl Default for SkillsConfig {
 
 // ============================================================================
 // End Skills Configuration
+// ============================================================================
+
+// ============================================================================
+// Slash Commands Configuration
+// ============================================================================
+
+/// Configuration for the slash commands system
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SlashCommandsConfig {
+    /// Enable slash commands system (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Search global paths (`~/.qmt/commands`)
+    #[serde(default = "default_true")]
+    pub include_global: bool,
+
+    /// Search project paths (`<PROJECT_ROOT>/.qmt/commands`)
+    #[serde(default = "default_true")]
+    pub include_project: bool,
+
+    /// Custom search paths (added to defaults)
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+
+    /// Script execution configuration
+    #[serde(default)]
+    pub scripts: crate::slash_commands::SlashCommandScriptsConfig,
+}
+
+impl Default for SlashCommandsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            include_global: true,
+            include_project: true,
+            paths: vec![],
+            scripts: crate::slash_commands::SlashCommandScriptsConfig::default(),
+        }
+    }
+}
+
+// ============================================================================
+// End Slash Commands Configuration
 // ============================================================================
 
 // ============================================================================

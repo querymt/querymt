@@ -200,6 +200,29 @@ impl SessionRegistry {
         self.sessions.get(session_id)
     }
 
+    /// Publish available slash commands via the ACP bridge.
+    ///
+    /// Sends an `AvailableCommandsUpdate` notification to the client
+    /// so it can display slash command autocomplete/hints.
+    fn publish_available_commands(&self, session_id: &str) {
+        if self.config.slash_command_registry.is_empty() {
+            return;
+        }
+        if let Some(ref bridge) = self.bridge {
+            let notification = crate::slash_commands::acp::build_commands_notification(
+                session_id,
+                &self.config.slash_command_registry,
+            );
+            // Fire-and-forget: spawn a task so we don't block the registry lock
+            let bridge = bridge.clone();
+            tokio::spawn(async move {
+                if let Err(e) = bridge.notify(notification).await {
+                    log::debug!("Failed to publish available commands: {}", e);
+                }
+            });
+        }
+    }
+
     /// Insert a pre-spawned session actor into the registry.
     ///
     /// Accepts anything that converts into a `SessionActorRef`, including
@@ -718,6 +741,9 @@ impl SessionRegistry {
             session_ref.get_mode().await.map_err(Error::from)?
         };
 
+        // Publish available slash commands via ACP
+        self.publish_available_commands(&session_id);
+
         Ok(NewSessionResponse::new(session_id)
             .modes(mode_state(current_mode))
             .config_options(config_options(
@@ -853,6 +879,9 @@ impl SessionRegistry {
                 .clone();
             session_ref.get_mode().await.map_err(Error::from)?
         };
+
+        // Publish available slash commands via ACP
+        self.publish_available_commands(&session_id);
 
         Ok(agent_client_protocol::schema::LoadSessionResponse::new()
             .modes(mode_state(current_mode))
