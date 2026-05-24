@@ -999,6 +999,13 @@ export type UiClientMessage =
 	query?: string;
 	/** Session scope filter: all (default), root, forks, delegates, or children. */
 	session_scope?: SessionScope;
+	/**
+	 * When true, merge remote mesh sessions into the response.
+	 * Defaults to false so local session opening is never blocked on
+	 * remote discovery. The frontend sets this explicitly when the
+	 * session picker needs remote sessions.
+	 */
+	include_remote?: boolean;
 }}
 	| { type: "list_session_children", data: {
 	parent_session_id: string;
