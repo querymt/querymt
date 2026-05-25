@@ -583,6 +583,46 @@ impl SessionStore for SqliteStorage {
         })
     }
 
+    async fn set_profile_binding(&self, session_id: &str, profile_id: &str) -> SessionResult<()> {
+        let session_id = session_id.to_string();
+        let profile_id = profile_id.to_string();
+        self.run_blocking(move |conn| {
+            conn.execute(
+                "INSERT INTO profile_bindings (session_id, profile_id)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(session_id) DO UPDATE SET profile_id = excluded.profile_id",
+                params![session_id, profile_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_profile_binding(&self, session_id: &str) -> SessionResult<Option<String>> {
+        let session_id = session_id.to_string();
+        self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT profile_id FROM profile_bindings WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+        .await
+    }
+
+    async fn remove_profile_binding(&self, session_id: &str) -> SessionResult<()> {
+        let session_id = session_id.to_string();
+        self.run_blocking(move |conn| {
+            conn.execute(
+                "DELETE FROM profile_bindings WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn set_session_provider_node_id(
         &self,
         session_id: &str,

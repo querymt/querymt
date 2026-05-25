@@ -592,9 +592,12 @@ impl SessionMaterializer {
             }
         }
 
-        // Emit SessionCreated event
+        // Emit SessionCreated before later setup events so callers that await finalization
+        // can observe session creation deterministically.
         self.config
-            .emit_event(&prepared.session_id, AgentEventKind::SessionCreated);
+            .emit_event_persisted(&prepared.session_id, AgentEventKind::SessionCreated)
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
         // Emit initial provider configuration
         if let Ok(Some(llm_config)) = self

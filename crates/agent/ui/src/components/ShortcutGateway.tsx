@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Command } from 'cmdk';
-import { Bug, Clock, Keyboard, KeyRound, MessageSquare, Mic, Palette, Plus, RefreshCw, Volume2, X, Zap } from 'lucide-react';
+import { Bug, Clock, Keyboard, KeyRound, MessageSquare, Mic, Palette, Plus, RefreshCw, User, Volume2, X, Zap } from 'lucide-react';
 import { useUiStore } from '../store/uiStore';
 import { useVoiceStore } from '../store/voiceStore';
 import { useUiClientConfig } from '../context/UiClientContext';
@@ -15,6 +15,8 @@ interface ShortcutGatewayProps {
   onAuthenticateProvider: () => void;
   onUpdatePlugins: () => void;
   onCreateSchedule: () => void;
+  hasProfiles: boolean;
+  onOpenProfiles: () => void;
   isUpdatingPlugins?: boolean;
 }
 
@@ -26,6 +28,8 @@ export function ShortcutGateway({
   onAuthenticateProvider,
   onUpdatePlugins,
   onCreateSchedule,
+  hasProfiles,
+  onOpenProfiles,
   isUpdatingPlugins = false,
 }: ShortcutGatewayProps) {
   const [search, setSearch] = useState('');
@@ -189,6 +193,26 @@ export function ShortcutGateway({
                 </kbd>
               </Command.Item>
 
+              {hasProfiles && (
+                <Command.Item
+                  value="profile selector"
+                  keywords={['profile', 'profiles', 'switch', 'p']}
+                  onSelect={() => onOpenProfiles()}
+                  className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40"
+                >
+                  <div className="w-7 h-7 rounded-md border border-accent-primary/35 bg-accent-primary/10 flex items-center justify-center">
+                    <User className="w-3.5 h-3.5 text-accent-primary" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm text-ui-primary">Profiles</div>
+                    <div className="text-xs text-ui-muted">Switch active profile for new sessions</div>
+                  </div>
+                  <kbd className="px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-secondary">
+                    P
+                  </kbd>
+                </Command.Item>
+              )}
+
               <Command.Item
                 value="update provider plugins"
                 keywords={['update', 'plugin', 'plugins', 'oci', 'provider', 'u']}
@@ -265,6 +289,7 @@ export function ShortcutGateway({
                 </kbd>
               </Command.Item>
             </Command.Group>
+
 
             {hasAudio && (
               <Command.Group heading={<span className="text-[11px] font-medium text-ui-muted px-1 uppercase tracking-wider">Voice</span>} className="mt-2 mb-1">

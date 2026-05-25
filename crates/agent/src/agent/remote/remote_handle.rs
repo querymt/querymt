@@ -14,7 +14,8 @@ use crate::event_fanout::EventFanout;
 use crate::events::{AgentEventKind, EphemeralEvent, EventEnvelope, EventOrigin};
 
 use agent_client_protocol::schema::{
-    CancelNotification, Error, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    CancelNotification, Error, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, PromptRequest, PromptResponse,
 };
 use async_trait::async_trait;
 use std::any::Any;
@@ -24,6 +25,7 @@ use tokio::sync::{Mutex, broadcast};
 
 use super::mesh::MeshHandle;
 use super::node_manager::SessionHandoff;
+use crate::error::AgentError;
 
 /// A handle for interacting with a remote agent via the kameo mesh.
 ///
@@ -117,18 +119,40 @@ impl RemoteAgentHandle {
         &self,
         cwd: Option<String>,
     ) -> Result<(String, SessionActorRef), Error> {
-        use crate::agent::remote::{CreateRemoteSession, RemoteNodeManager};
-        use crate::error::AgentError;
+        use crate::agent::remote::CreateRemoteSession;
 
         let span = tracing::Span::current();
 
         let t0 = std::time::Instant::now();
+        let node_manager = self.lookup_remote_node_manager().await?;
+        span.record("dht_lookup_node_ms", t0.elapsed().as_millis() as u64);
+
+        let t1 = std::time::Instant::now();
+        let resp = node_manager
+            .ask(&CreateRemoteSession { cwd })
+            .await
+            .map_err(|e| Error::from(AgentError::RemoteActor(e.to_string())))?;
+        span.record("create_session_ms", t1.elapsed().as_millis() as u64);
+
+        let session_id = resp.session_id.clone();
+        span.record("session_id", session_id.as_str());
+
+        let session_ref = self
+            .attach_handoff_session(&session_id, resp.handoff)
+            .await?;
+
+        Ok((session_id, session_ref))
+    }
+
+    async fn lookup_remote_node_manager(
+        &self,
+    ) -> Result<kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>, Error> {
         let mut node_manager = None;
         for scope in self.mesh.active_scopes() {
             let dht_name = crate::agent::remote::scope::scoped_node_manager(&scope);
             match self
                 .mesh
-                .lookup_actor::<RemoteNodeManager>(dht_name.clone())
+                .lookup_actor::<crate::agent::remote::RemoteNodeManager>(dht_name.clone())
                 .await
             {
                 Ok(Some(found)) => {
@@ -144,7 +168,8 @@ impl RemoteAgentHandle {
                 }
             }
         }
-        let node_manager = node_manager.ok_or_else(|| {
+
+        node_manager.ok_or_else(|| {
             Error::new(
                 -32001,
                 format!(
@@ -152,20 +177,15 @@ impl RemoteAgentHandle {
                     self.peer_label
                 ),
             )
-        })?;
-        span.record("dht_lookup_node_ms", t0.elapsed().as_millis() as u64);
+        })
+    }
 
-        let t1 = std::time::Instant::now();
-        let resp = node_manager
-            .ask(&CreateRemoteSession { cwd })
-            .await
-            .map_err(|e| Error::from(AgentError::RemoteActor(e.to_string())))?;
-        span.record("create_session_ms", t1.elapsed().as_millis() as u64);
-
-        let session_id = resp.session_id.clone();
-        span.record("session_id", session_id.as_str());
-
-        let session_ref = match resp.handoff {
+    async fn attach_handoff_session(
+        &self,
+        session_id: &str,
+        handoff: SessionHandoff,
+    ) -> Result<SessionActorRef, Error> {
+        let session_ref = match handoff {
             SessionHandoff::DirectRemote { session_ref } => {
                 SessionActorRef::remote(session_ref, self.peer_label.clone())
             }
@@ -181,7 +201,7 @@ impl RemoteAgentHandle {
 
                     for scope in self.mesh.active_scopes() {
                         let dht_name =
-                            crate::agent::remote::scope::scoped_session(&scope, &session_id);
+                            crate::agent::remote::scope::scoped_session(&scope, session_id);
                         match self
                             .mesh
                             .lookup_actor_no_retry::<crate::agent::session_actor::SessionActor>(
@@ -226,13 +246,12 @@ impl RemoteAgentHandle {
             }
         };
 
-        // Store the session ref for future prompt/cancel calls.
         self.sessions
             .lock()
             .await
-            .insert(session_id.clone(), session_ref.clone());
+            .insert(session_id.to_string(), session_ref.clone());
 
-        Ok((session_id, session_ref))
+        Ok(session_ref)
     }
 }
 
@@ -281,6 +300,40 @@ impl AgentHandle for RemoteAgentHandle {
             let _ = session_ref.cancel().await;
         }
         Ok(())
+    }
+
+    async fn load_session(&self, req: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
+        let session_id = req.session_id.to_string();
+
+        if let Some(session_ref) = self.sessions.lock().await.get(&session_id).cloned() {
+            let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+            return Ok(LoadSessionResponse::new()
+                .modes(crate::agent::session_registry::mode_state(current_mode))
+                .config_options(crate::agent::session_registry::config_options(
+                    current_mode,
+                    None,
+                )));
+        }
+
+        let node_manager = self.lookup_remote_node_manager().await?;
+        let response = node_manager
+            .ask(&crate::agent::remote::ResumeRemoteSession {
+                session_id: session_id.clone(),
+            })
+            .await
+            .map_err(|e| Error::from(AgentError::RemoteActor(e.to_string())))?;
+
+        let session_ref = self
+            .attach_handoff_session(&session_id, response.handoff)
+            .await?;
+        let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+
+        Ok(LoadSessionResponse::new()
+            .modes(crate::agent::session_registry::mode_state(current_mode))
+            .config_options(crate::agent::session_registry::config_options(
+                current_mode,
+                None,
+            )))
     }
 
     async fn create_delegation_session(

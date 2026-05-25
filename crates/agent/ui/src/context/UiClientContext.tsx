@@ -4,6 +4,7 @@ import type {
   EventItem,
   RoutingMode,
   UiAgentInfo,
+  UiProfileInfo,
   SessionGroup,
   ModelEntry,
   RecentModelEntry,
@@ -59,6 +60,7 @@ export interface UiClientActionsContextValue {
   addCustomModelFromFile: (provider: string, filePath: string, displayName?: string) => void;
   deleteCustomModel: (provider: string, modelId: string) => void;
   setActiveAgent: (agentId: string) => void;
+  setActiveProfile: (profileId: string) => void;
   setRoutingMode: (mode: RoutingMode) => void;
   subscribeSession: (sessionId: string, agentId?: string) => void;
   unsubscribeSession: (sessionId: string) => void;
@@ -124,6 +126,9 @@ export interface UiClientSessionContextValue {
   connected: boolean;
   reconnecting: boolean;
   agents: UiAgentInfo[];
+  profiles: UiProfileInfo[];
+  activeProfileId: string | null;
+  sessionProfiles: Record<string, string>;
   routingMode: RoutingMode;
   activeAgentId: string;
   sessionGroups: SessionGroup[];
@@ -242,6 +247,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     addCustomModelFromFile: uiClient.addCustomModelFromFile,
     deleteCustomModel: uiClient.deleteCustomModel,
     setActiveAgent: uiClient.setActiveAgent,
+    setActiveProfile: uiClient.setActiveProfile,
     setRoutingMode: uiClient.setRoutingMode,
     subscribeSession: uiClient.subscribeSession,
     unsubscribeSession: uiClient.unsubscribeSession,
@@ -298,6 +304,9 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     connected: uiClient.connected,
     reconnecting: uiClient.reconnecting,
     agents: uiClient.agents,
+    profiles: uiClient.profiles,
+    activeProfileId: uiClient.activeProfileId,
+    sessionProfiles: uiClient.sessionProfiles,
     routingMode: uiClient.routingMode,
     activeAgentId: uiClient.activeAgentId,
     sessionGroups: uiClient.sessionGroups,
@@ -333,6 +342,9 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     uiClient.connected,
     uiClient.reconnecting,
     uiClient.agents,
+    uiClient.profiles,
+    uiClient.activeProfileId,
+    uiClient.sessionProfiles,
     uiClient.routingMode,
     uiClient.activeAgentId,
     uiClient.sessionGroups,

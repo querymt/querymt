@@ -1,21 +1,63 @@
 //! Tests for replay/live session stream cursor semantics.
 
+use crate::api::AgentInfra;
 use crate::events::{AgentEventKind, EventOrigin};
+use crate::profiles::{LocalProfileCatalog, ProfileRuntimeManager};
 use crate::session::backend::StorageBackend;
-use crate::test_utils::{TestAgent, TestServerState};
+use crate::session::sqlite_storage::SqliteStorage;
+use crate::test_utils::{TestAgent, TestServerState, empty_plugin_registry};
 use crate::ui::connection::spawn_event_forwarders;
 use crate::ui::handlers::{handle_load_session, handle_subscribe_session};
 use crate::ui::messages::StreamCursor;
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep, timeout};
 
 fn parse_message(json: &str) -> Value {
-    serde_json::from_str(json).expect("valid JSON UI message")
+    serde_json::from_str(json).expect("message should be valid json")
+}
+
+fn write_profile(dir: &Path, name: &str) {
+    std::fs::write(
+        dir.join(name),
+        r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "inline"
+"#,
+    )
+    .expect("failed to write profile");
+}
+
+async fn test_profile_manager(
+    dir: &Path,
+) -> Arc<ProfileRuntimeManager<Arc<dyn crate::profiles::ProfileCatalog>>> {
+    let (registry, _registry_dir) = empty_plugin_registry().expect("empty plugin registry");
+    let storage = Arc::new(
+        SqliteStorage::connect(":memory:".into())
+            .await
+            .expect("in-memory storage"),
+    );
+    let infra = AgentInfra {
+        plugin_registry: Arc::new(registry),
+        storage: Some(storage),
+        session_mcp_attachment_source: None,
+    };
+    let catalog: Arc<dyn crate::profiles::ProfileCatalog> = Arc::new(
+        LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(dir)
+            .build(),
+    );
+    Arc::new(ProfileRuntimeManager::with_infra_boxed(
+        catalog, "alpha", infra,
+    ))
 }
 
 #[tokio::test]
@@ -130,6 +172,7 @@ async fn forwarder_drops_event_when_seq_is_at_or_below_cursor() -> Result<()> {
         session_store: agent.storage.session_store(),
         default_cwd: None,
         event_sources: vec![fanout.clone()],
+        profiles: None,
         connections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         session_agents: Arc::new(tokio::sync::Mutex::new(HashMap::from([(
             session_id.clone(),
@@ -239,6 +282,111 @@ async fn forwarder_drops_event_when_seq_is_at_or_below_cursor() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn forwarder_picks_up_lazily_materialized_profile_runtime_events() -> Result<()> {
+    let agent = TestAgent::new().await;
+    let dir = tempfile::TempDir::new().expect("create temp profile dir");
+    write_profile(dir.path(), "alpha.toml");
+    let profiles = test_profile_manager(dir.path()).await;
+
+    let session_id = "s-profile-live".to_string();
+    let conn_id = "conn-profile-live".to_string();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be after epoch")
+        .as_secs() as i64;
+
+    let state = super::ServerState {
+        agent: agent.handle.clone(),
+        view_store: agent.storage.view_store().expect("view store"),
+        session_store: agent.storage.session_store(),
+        default_cwd: None,
+        event_sources: vec![],
+        profiles: Some(profiles.clone()),
+        connections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        session_agents: Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            session_id.clone(),
+            super::session::PRIMARY_AGENT_ID.to_string(),
+        )]))),
+        session_cwds: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
+            crate::index::WorkspaceIndexManagerConfig::default(),
+        ),
+        oauth_service: agent.handle.oauth_service.clone(),
+        #[cfg(feature = "remote")]
+        remote_node_cache: Arc::new(tokio::sync::Mutex::new(None)),
+    };
+
+    {
+        let mut connections = state.connections.lock().await;
+        connections.insert(
+            conn_id.clone(),
+            super::ConnectionState {
+                routing_mode: crate::ui::messages::RoutingMode::Single,
+                active_agent_id: super::session::PRIMARY_AGENT_ID.to_string(),
+                sessions: HashMap::new(),
+                subscribed_sessions: HashSet::from([session_id.clone()]),
+                session_cursors: HashMap::new(),
+                current_workspace_root: None,
+                file_index_forwarder: None,
+            },
+        );
+    }
+
+    let (tx, mut rx) = mpsc::channel(8);
+    spawn_event_forwarders(state.clone(), conn_id.clone(), tx);
+
+    let runtime = profiles
+        .runtime_for_profile("alpha")
+        .await
+        .expect("runtime materializes after forwarders start");
+    profiles
+        .bind_session_to_runtime(session_id.clone(), &runtime)
+        .await
+        .expect("session binds to profile runtime");
+
+    // Give the polling forwarder one interval to discover the newly materialized runtime.
+    sleep(Duration::from_millis(150)).await;
+
+    runtime.agent().handle().config.event_sink.fanout().publish(
+        crate::events::EventEnvelope::Durable(crate::events::DurableEvent {
+            event_id: "e-profile-live".into(),
+            stream_seq: 1,
+            timestamp: now,
+            session_id: session_id.clone(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::PromptReceived {
+                content: "from profile runtime".to_string(),
+                message_id: Some("profile-msg-1".to_string()),
+            },
+        }),
+    );
+
+    let forwarded = timeout(Duration::from_millis(500), rx.recv())
+        .await
+        .expect("profile runtime event should be delivered without reconnect")
+        .expect("channel should remain open");
+    let msg = parse_message(&forwarded);
+    assert_eq!(msg["type"], "event");
+    assert_eq!(msg["data"]["session_id"], session_id);
+    assert_eq!(msg["data"]["profile_id"], "alpha");
+    assert_eq!(msg["data"]["agent_id"], super::session::PRIMARY_AGENT_ID);
+    assert_eq!(msg["data"]["event"]["data"]["stream_seq"].as_i64(), Some(1));
+
+    {
+        let connections = state.connections.lock().await;
+        let conn = connections.get(&conn_id).expect("connection should exist");
+        assert_eq!(
+            conn.session_cursors.get(&session_id).map(|c| c.local_seq),
+            Some(1)
+        );
+    }
+
+    profiles.shutdown().await;
+    Ok(())
+}
+
 /// Ephemeral events (seq=0) must never be cursor-filtered.
 ///
 /// The UI forwarder uses the durable cursor to dedup replay/live overlap.
@@ -262,6 +410,7 @@ async fn forwarder_does_not_drop_ephemeral_events_despite_cursor() -> Result<()>
         session_store: agent.storage.session_store(),
         default_cwd: None,
         event_sources: vec![fanout.clone()],
+        profiles: None,
         connections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         session_agents: Arc::new(tokio::sync::Mutex::new(HashMap::from([(
             session_id.clone(),

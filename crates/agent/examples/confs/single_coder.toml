@@ -8,6 +8,12 @@
 # Switch modes at runtime with Ctrl+M (or Cmd+M on macOS).
 # The mode indicator in the UI header shows the current mode.
 
+[profile]
+id = "default"
+name = "Default"
+description = "Default single coder profile"
+tags = ["coding", "single-agent"]
+
 [agent]
 provider = "anthropic"
 model = "claude-sonnet-4-5-20250929"

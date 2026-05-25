@@ -39,6 +39,7 @@ fn test_server_state(
         session_store: storage.session_store(),
         default_cwd: None,
         event_sources: vec![],
+        profiles: None,
         connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),

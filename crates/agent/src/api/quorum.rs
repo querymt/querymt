@@ -17,7 +17,7 @@ use crate::delegation::AgentInfo;
 use crate::agent::handle::AgentHandle as AgentHandleTrait;
 use crate::middleware::MIDDLEWARE_REGISTRY;
 use crate::runner::ChatSession;
-use crate::session::backend::default_agent_db_path;
+use crate::session::backend::resolve_agent_db_path;
 use crate::session::provider::SessionProvider;
 use crate::session::store::SessionStore;
 use crate::session::{SqliteStorage, StorageBackend};
@@ -199,10 +199,7 @@ impl QuorumBuilder {
                 let storage = match infra.storage {
                     Some(s) => s,
                     None => {
-                        let path = match self.db_path {
-                            Some(path) => path,
-                            None => default_agent_db_path()?,
-                        };
+                        let path = resolve_agent_db_path(self.db_path)?;
                         Arc::new(SqliteStorage::connect(path).await?)
                     }
                 };
@@ -210,10 +207,7 @@ impl QuorumBuilder {
             }
             None => {
                 let reg = Arc::new(default_registry().await?);
-                let path = match self.db_path {
-                    Some(path) => path,
-                    None => default_agent_db_path()?,
-                };
+                let path = resolve_agent_db_path(self.db_path)?;
                 let storage = Arc::new(SqliteStorage::connect(path).await?);
                 (reg, storage)
             }
@@ -658,6 +652,22 @@ impl super::agent::Agent {
         builder.build().await
     }
 
+    /// Build a quorum with both remote registry/mesh wiring and injected infrastructure.
+    #[cfg(feature = "remote")]
+    pub async fn from_quorum_config_with_registry_and_infra(
+        config: QuorumConfig,
+        initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
+        mesh: Option<crate::agent::remote::MeshHandle>,
+        mesh_auto_fallback: bool,
+        infra: super::agent::AgentInfra,
+    ) -> Result<Self> {
+        let mut builder = Self::builder_from_quorum_config(config, initial_registry)?;
+        builder.mesh = mesh;
+        builder.mesh_auto_fallback = mesh_auto_fallback;
+        builder = builder.infra(infra);
+        builder.build().await
+    }
+
     /// Configure a `QuorumBuilder` from a `QuorumConfig`.
     ///
     /// Returns the builder before `build()` is called, allowing further
@@ -671,10 +681,6 @@ impl super::agent::Agent {
         if let Some(cwd) = config.quorum.cwd {
             builder = builder.cwd(cwd);
         }
-        if let Some(db) = config.quorum.db {
-            builder = builder.db(db);
-        }
-
         builder.delegation_enabled = config.quorum.delegation;
         builder.verification_enabled = config.quorum.verification;
         builder.delegation_summary_config = config.quorum.delegation_summary;

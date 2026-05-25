@@ -29,7 +29,6 @@
 
 [quorum]
 cwd = "."
-db = "/tmp/learning_pair.db"
 delegation = true
 verification = false
 snapshot_policy = "diff"

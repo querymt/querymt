@@ -37,6 +37,7 @@ export function AppShell() {
     setAuthMethodPref,
     clearApiTokenResult,
     setSessionModel,
+    setActiveProfile,
     addCustomModelFromHf,
     addCustomModelFromFile,
     deleteCustomModel,
@@ -62,6 +63,9 @@ export function AppShell() {
     thinkingAgentIds,
     sessionId,
     agents,
+    profiles,
+    activeProfileId,
+    sessionProfiles,
     agentModels,
     sessionLimits,
     isConversationComplete,
@@ -121,6 +125,7 @@ export function AppShell() {
   const [shortcutGatewayOpen, setShortcutGatewayOpen] = useState(false);
   const [themeSwitcherOpen, setThemeSwitcherOpen] = useState(false);
   const [providerAuthOpen, setProviderAuthOpen] = useState(false);
+  const [profilePickerOpen, setProfilePickerOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const isSessionActive = thinkingAgentIds.size > 0;
   const availableThemes = useMemo(() => getDashboardThemes(), []);
@@ -146,6 +151,9 @@ export function AppShell() {
     setThemeSwitcherOpen,
     providerAuthOpen,
     setProviderAuthOpen,
+    profilePickerOpen,
+    setProfilePickerOpen,
+    profilesAvailable: profiles.length > 0,
     handleNewSession,
     cancelSession,
     cycleAgentMode,
@@ -178,6 +186,7 @@ export function AppShell() {
       shortcutGatewayOpen ||
       themeSwitcherOpen ||
       providerAuthOpen ||
+      profilePickerOpen ||
       workspacePathDialogOpen ||
       createScheduleDialogOpen;
 
@@ -186,7 +195,7 @@ export function AppShell() {
   }, [
     sessionSwitcherOpen, modelPickerOpen, statsDrawerOpen,
     delegationDrawerOpen, selectedToolEvent, shortcutGatewayOpen,
-    themeSwitcherOpen, providerAuthOpen, workspacePathDialogOpen,
+    themeSwitcherOpen, providerAuthOpen, profilePickerOpen, workspacePathDialogOpen,
     createScheduleDialogOpen, isMobile,
   ]);
 
@@ -221,6 +230,8 @@ export function AppShell() {
     () => visibleSessionId ? agentModels[activeAgentId] : undefined,
     [agentModels, activeAgentId, visibleSessionId],
   );
+
+  const currentSessionProfileId = visibleSessionId ? sessionProfiles[visibleSessionId] : undefined;
 
   // --- Callbacks ---
 
@@ -370,6 +381,12 @@ export function AppShell() {
         updatePlugins={updatePlugins}
         setCreateScheduleDialogOpen={setCreateScheduleDialogOpen}
         isUpdatingPlugins={isUpdatingPlugins}
+        profilePickerOpen={profilePickerOpen}
+        setProfilePickerOpen={setProfilePickerOpen}
+        profiles={profiles}
+        activeProfileId={activeProfileId}
+        currentSessionProfileId={currentSessionProfileId}
+        setActiveProfile={setActiveProfile}
         themeSwitcherOpen={themeSwitcherOpen}
         availableThemes={availableThemes}
         selectedTheme={selectedTheme}

@@ -75,9 +75,6 @@ api_key = "${ANTHROPIC_API_KEY}"    # Optional: API key (env var interpolation)
 # Working directory
 cwd = "."                           # Optional: workspace directory
 
-# Database path (SQLite)
-db = "./data/agent.db"              # Optional: session history database
-
 # Tools to enable
 tools = [
     "read_tool", "edit", "write_file",
@@ -275,6 +272,18 @@ peer = "dev-gpu"           # References [[mesh.peers]] name
 capabilities = ["gpu", "fast-model"]
 ```
 
+## Sessions Database
+
+Agent and profile TOML configs do not select database paths. A process uses one shared SQLite sessions database for the root agent and all profiles.
+
+Database path precedence:
+
+1. `qmtcode --db <path>`
+2. `QMT_SESSIONS_DB` when set to a non-empty value
+3. Default `<QMT_CONFIG_DIR or QMT_HOME or ~/.qmt>/sessions.db`
+
+Programmatic builders may still call `.db(...)` as an explicit runtime override.
+
 ## Multi-Agent (Quorum) Configuration
 
 For planner-delegate workflows:
@@ -282,7 +291,6 @@ For planner-delegate workflows:
 ```toml
 [quorum]
 cwd = "."
-db = "./data/quorum.db"
 delegation = true
 verification = true
 snapshot_policy = "diff"

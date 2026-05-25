@@ -6,6 +6,7 @@ import {
   UiAgentInfo,
   UiClientMessage,
   UiServerMessage,
+  UiProfileInfo,
   SessionGroup,
   SessionSummaryWithChildren,
   UiPromptBlock,
@@ -136,6 +137,11 @@ export function useUiClient() {
   const [eventsBySession, setEventsBySession] = useState<Map<string, EventItem[]>>(new Map());
   const [mainSessionId, setMainSessionId] = useState<string | null>(null);
   const [agents, setAgents] = useState<UiAgentInfo[]>([]);
+  const [profiles, setProfiles] = useState<UiProfileInfo[]>([]);
+  const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
+  const activeProfileIdRef = useRef<string | null>(null);
+  activeProfileIdRef.current = activeProfileId;
+  const [sessionProfiles, setSessionProfiles] = useState<Record<string, string>>({});
   const [routingMode, setRoutingMode] = useState<RoutingMode>(RoutingMode.Single);
   const [activeAgentId, setActiveAgentId] = useState<string>('primary');
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -416,6 +422,8 @@ export function useUiClient() {
       case 'state': {
         const d = msg.data;
         setAgents(d.agents);
+        setProfiles(d.profiles ?? []);
+        setActiveProfileId(d.active_profile_id ?? null);
         setRoutingMode(d.routing_mode);
         setActiveAgentId(d.active_agent_id);
         setSessionId(d.active_session_id ?? null);
@@ -430,6 +438,9 @@ export function useUiClient() {
       }
       case 'session_created': {
         const d = msg.data;
+        if (d.profile_id) {
+          setSessionProfiles(prev => ({ ...prev, [d.session_id]: d.profile_id! }));
+        }
         if (d.agent_id === activeAgentId) {
           setSessionId(d.session_id);
           setMainSessionId(d.session_id);
@@ -454,6 +465,9 @@ export function useUiClient() {
       }
       case 'session_events': {
         const d = msg.data;
+        if (d.profile_id) {
+          setSessionProfiles(prev => ({ ...prev, [d.session_id]: d.profile_id! }));
+        }
         // Replay batch - set all events for this session
         // Events arrive as EventEnvelope[] (adjacently tagged); unwrap before translating.
         const translated = d.events.map((e: any) => {
@@ -497,6 +511,9 @@ export function useUiClient() {
       }
       case 'event': {
         const d = msg.data;
+        if (d.profile_id) {
+          setSessionProfiles(prev => ({ ...prev, [d.session_id]: d.profile_id! }));
+        }
         // AgentEventKind uses adjacently tagged serde: kind.data holds the payload
         // EventEnvelope is also adjacently tagged: unwrap .data to get the inner event.
         const eventEnvelope = unwrapEnvelope(d.event);
@@ -987,6 +1004,9 @@ export function useUiClient() {
       }
       case 'session_loaded': {
         const d = msg.data;
+        if (d.profile_id) {
+          setSessionProfiles(prev => ({ ...prev, [d.session_id]: d.profile_id! }));
+        }
         pendingLoadLabelsRef.current.delete(d.session_id);
         setSessionId(d.session_id);
         setMainSessionId(d.session_id);
@@ -1511,6 +1531,7 @@ export function useUiClient() {
         data: {
           cwd: cwd.length > 0 ? cwd : undefined,
           request_id: requestId,
+          profile_id: activeProfileIdRef.current ?? undefined,
         },
       });
     });
@@ -1523,6 +1544,11 @@ export function useUiClient() {
   const selectAgent = useCallback((agentId: string) => {
     setActiveAgentId(agentId);
     sendMessage({ type: 'set_active_agent', data: { agent_id: agentId } });
+  }, []);
+
+  const selectProfile = useCallback((profileId: string) => {
+    if (!profileId) return;
+    sendMessage({ type: 'set_active_profile', data: { profile_id: profileId } });
   }, []);
 
   const selectRoutingMode = useCallback((mode: RoutingMode) => {
@@ -1930,9 +1956,13 @@ export function useUiClient() {
     cancelSession,
     deleteSession,
     agents,
+    profiles,
+    activeProfileId,
+    sessionProfiles,
     routingMode,
     activeAgentId,
     setActiveAgent: selectAgent,
+    setActiveProfile: selectProfile,
     setRoutingMode: selectRoutingMode,
     sessionGroups,
     sessionNextCursor,

@@ -94,12 +94,7 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
         Config::Single(single) => single.mesh.clone(),
         Config::Multi(quorum) => quorum.mesh.clone(),
     };
-    let db_path = match &config {
-        Config::Single(single) => single.agent.db.clone(),
-        Config::Multi(_) => None,
-    };
-
-    let storage = create_storage_backend(db_path).await?;
+    let storage = create_storage_backend(None).await?;
 
     use std::sync::atomic::{AtomicU64, Ordering};
     let agent_handle_cell = Arc::new(AtomicU64::new(0));
@@ -235,10 +230,10 @@ async fn create_storage_backend(
 ) -> Result<Arc<dyn querymt_agent::session::backend::StorageBackend>, FfiErrorCode> {
     let db_path = match db_path {
         Some(path) => path,
-        None => querymt_agent::session::backend::default_agent_db_path().map_err(|e| {
+        None => querymt_agent::session::backend::resolve_agent_db_path(None).map_err(|e| {
             set_last_error(
                 FfiErrorCode::RuntimeError,
-                format!("Failed to resolve default DB path: {:#}", e),
+                format!("Failed to resolve DB path: {:#}", e),
             );
             FfiErrorCode::RuntimeError
         })?,

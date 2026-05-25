@@ -1146,8 +1146,8 @@ mod tests {
     use crate::event_fanout::EventFanout;
     use crate::events::EventEnvelope;
     use agent_client_protocol::schema::{
-        CancelNotification, Error, NewSessionRequest, NewSessionResponse, PromptRequest,
-        PromptResponse,
+        CancelNotification, Error, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+        NewSessionResponse, PromptRequest, PromptResponse,
     };
     use async_trait::async_trait;
 
@@ -1184,6 +1184,13 @@ mod tests {
 
         async fn cancel(&self, _notif: CancelNotification) -> std::result::Result<(), Error> {
             Ok(())
+        }
+
+        async fn load_session(
+            &self,
+            _req: LoadSessionRequest,
+        ) -> std::result::Result<LoadSessionResponse, Error> {
+            Ok(LoadSessionResponse::new())
         }
 
         async fn create_delegation_session(

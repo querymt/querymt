@@ -850,6 +850,16 @@ export interface UiAgentInfo {
 	capabilities: string[];
 }
 
+export interface UiProfileInfo {
+	id: string;
+	name: string;
+	description?: string;
+	tags: string[];
+	config_kind?: string;
+	source: string;
+	fingerprint?: string;
+}
+
 export interface UndoStackFrame {
 	message_id: string;
 }
@@ -930,7 +940,6 @@ export enum OAuthFlowKindTs {
 	DevicePoll = "device_poll",
 }
 
-/** Routing mode for message distribution. */
 export enum RoutingMode {
 	Single = "single",
 	Broadcast = "broadcast",
@@ -976,12 +985,17 @@ export type UiClientMessage =
 	| { type: "set_active_agent", data: {
 	agent_id: string;
 }}
+	| { type: "set_active_profile", data: {
+	profile_id: string;
+}}
+	| { type: "list_profiles", data?: undefined }
 	| { type: "set_routing_mode", data: {
 	mode: RoutingMode;
 }}
 	| { type: "new_session", data: {
 	cwd?: string;
 	request_id?: string;
+	profile_id?: string;
 }}
 	| { type: "prompt", data: {
 	prompt: UiPromptBlock[];
@@ -1281,23 +1295,28 @@ export type UiServerMessage =
 	active_session_id?: string;
 	default_cwd?: string;
 	agents: UiAgentInfo[];
+	profiles: UiProfileInfo[];
+	active_profile_id?: string;
 	sessions_by_agent: Record<string, string>;
 	agent_mode: string;
 	reasoning_effort?: string;
 }}
 	| { type: "session_created", data: {
 	agent_id: string;
+	profile_id?: string;
 	session_id: string;
 	request_id?: string;
 }}
 	| { type: "event", data: {
 	agent_id: string;
+	profile_id?: string;
 	session_id: string;
 	event: EventEnvelope;
 }}
 	| { type: "session_events", data: {
 	session_id: string;
 	agent_id: string;
+	profile_id?: string;
 	events: EventEnvelope[];
 	cursor: StreamCursor;
 }}
@@ -1318,6 +1337,7 @@ export type UiServerMessage =
 	| { type: "session_loaded", data: {
 	session_id: string;
 	agent_id: string;
+	profile_id?: string;
 	audit: AuditView;
 	undo_stack: UndoStackFrame[];
 	cursor: StreamCursor;

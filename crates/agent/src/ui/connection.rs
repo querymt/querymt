@@ -15,17 +15,21 @@
 //!
 //! All other messages use JSON text frames as before.
 
-use crate::agent::core::AgentMode;
 #[cfg(feature = "remote")]
 use crate::agent::utils::u32_from_usize;
 
 use super::messages::{RoutingMode, UiClientMessage, UiServerMessage};
-use super::session::{PRIMARY_AGENT_ID, build_agent_list};
+use super::session::{
+    PRIMARY_AGENT_ID, active_profile_id, build_agent_list, list_profiles, mode_for_session,
+    reasoning_effort_for_session, session_ref_for_profile,
+};
 use super::{ConnectionState, ServerState};
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{sink::SinkExt, stream::StreamExt as FuturesStreamExt};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
 // ── Binary frame helpers ───────────────────────────────────────────────────────
@@ -222,60 +226,21 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
     };
 
     let agents = build_agent_list(state);
+    let profiles = match list_profiles(state).await {
+        Ok(profiles) => profiles,
+        Err(message) => {
+            let _ = send_error(tx, message).await;
+            Vec::new()
+        }
+    };
+    let active_profile_id = active_profile_id(state).await;
     let default_cwd = state
         .default_cwd
         .as_ref()
         .map(|path| path.to_string_lossy().to_string());
 
-    // Try to get mode from active session actor, fall back to default_mode
-    let agent_mode = if let Some(ref session_id) = active_session_id {
-        let session_ref = {
-            let registry = state.agent.registry.lock().await;
-            registry.get(session_id).cloned()
-        };
-
-        if let Some(session_ref) = session_ref {
-            match session_ref.get_mode().await {
-                Ok(m) => m,
-                Err(_) => state
-                    .agent
-                    .default_mode
-                    .lock()
-                    .map(|guard| *guard)
-                    .unwrap_or(AgentMode::Build),
-            }
-        } else {
-            state
-                .agent
-                .default_mode
-                .lock()
-                .map(|guard| *guard)
-                .unwrap_or(AgentMode::Build)
-        }
-    } else {
-        state
-            .agent
-            .default_mode
-            .lock()
-            .map(|guard| *guard)
-            .unwrap_or(AgentMode::Build)
-    };
-
-    // Try to get reasoning effort from active session actor, fall back to default
-    let reasoning_effort = if let Some(ref session_id) = active_session_id {
-        let session_ref = {
-            let registry = state.agent.registry.lock().await;
-            registry.get(session_id).cloned()
-        };
-
-        if let Some(session_ref) = session_ref {
-            session_ref.get_reasoning_effort().await.ok().flatten()
-        } else {
-            **state.agent.default_reasoning_effort.load()
-        }
-    } else {
-        **state.agent.default_reasoning_effort.load()
-    };
+    let agent_mode = mode_for_session(state, active_session_id.as_deref()).await;
+    let reasoning_effort = reasoning_effort_for_session(state, active_session_id.as_deref()).await;
 
     let _ = send_message(
         tx,
@@ -285,6 +250,8 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
             active_session_id,
             default_cwd,
             agents,
+            profiles,
+            active_profile_id,
             sessions_by_agent,
             agent_mode: agent_mode.as_str().to_string(),
             reasoning_effort: reasoning_effort.map(|e| e.to_string()),
@@ -343,217 +310,284 @@ pub async fn send_binary(
 
 /// Spawn event forwarders for all event sources.
 pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sender<String>) {
+    let mut seen_sources = HashSet::new();
     for event_source in &state.event_sources {
-        let mut events = event_source.subscribe();
-        let tx_events = tx.clone();
-        let conn_id_events = conn_id.clone();
-        let state_events = state.clone();
+        spawn_event_source_forwarder(
+            state.clone(),
+            conn_id.clone(),
+            tx.clone(),
+            event_source.clone(),
+        );
+        seen_sources.insert(Arc::as_ptr(event_source) as usize);
+    }
+
+    if let Some(profiles) = state.profiles.clone() {
         tokio::spawn(async move {
-            while let Ok(event) = events.recv().await {
-                // Check if this connection is subscribed and if this event is newer than
-                // the replay cursor (prevents replay/live overlap duplicates).
-                // Ephemeral events (seq=0) are never cursor-filtered — they are
-                // live-only signals that were never in the replay stream.
-                let should_forward = {
-                    let mut connections = state_events.connections.lock().await;
-                    if let Some(conn) = connections.get_mut(&conn_id_events) {
-                        if !conn.subscribed_sessions.contains(event.session_id()) {
-                            false
-                        } else if event.seq() == 0 {
-                            // Ephemeral event: always forward (never in replay).
-                            true
-                        } else {
-                            let cursor = conn
-                                .session_cursors
-                                .get(event.session_id())
-                                .cloned()
-                                .unwrap_or_default();
-                            match event.origin() {
-                                crate::events::EventOrigin::Local
-                                | crate::events::EventOrigin::Unknown(_) => {
-                                    if event.seq() <= cursor.local_seq {
-                                        log::debug!(
-                                            "ui forwarder: dropping local duplicate/overlap event conn={} session={} seq={} cursor_local_seq={}",
-                                            conn_id_events,
-                                            event.session_id(),
-                                            event.seq(),
-                                            cursor.local_seq
-                                        );
-                                        false
-                                    } else {
-                                        true
-                                    }
-                                }
-                                crate::events::EventOrigin::Remote => {
-                                    if let Some(source_node) = event.source_node() {
-                                        let source_cursor = cursor
-                                            .remote_seq_by_source
-                                            .get(source_node)
-                                            .copied()
-                                            .unwrap_or(0);
-                                        if event.seq() <= source_cursor {
-                                            log::debug!(
-                                                "ui forwarder: dropping remote duplicate/overlap event conn={} session={} source={} seq={} cursor_remote_seq={}",
-                                                conn_id_events,
-                                                event.session_id(),
-                                                source_node,
-                                                event.seq(),
-                                                source_cursor
-                                            );
-                                            false
-                                        } else {
-                                            true
-                                        }
-                                    } else {
-                                        log::warn!(
-                                            "ui forwarder: dropping remote event without source conn={} session={} seq={}",
-                                            conn_id_events,
-                                            event.session_id(),
-                                            event.seq(),
-                                        );
-                                        false
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        false
-                    }
-                };
-
-                if !should_forward {
-                    continue;
-                }
-
-                // React to WorkspaceIndexReady from a remote session: push status +
-                // fetch and push the file index so the UI gets it without polling.
-                if let crate::events::AgentEventKind::WorkspaceIndexReady { .. } = event.kind() {
-                    let session_id = event.session_id().to_owned();
-
-                    // Push WorkspaceIndexStatus { ready }
-                    let _ = send_message(
-                        &tx_events,
-                        UiServerMessage::WorkspaceIndexStatus {
-                            session_id: session_id.clone(),
-                            status: "ready".to_string(),
-                            message: None,
-                        },
-                    )
-                    .await;
-
-                    // Fetch the file index from the remote actor and push it.
-                    let actor_ref = {
-                        let registry = state_events.agent.registry.lock().await;
-                        registry.get(&session_id).cloned()
-                    };
-                    if let Some(actor_ref) = actor_ref {
-                        let cwd = {
-                            let cwds = state_events.session_cwds.lock().await;
-                            cwds.get(&session_id).cloned()
-                        };
-                        match actor_ref.get_file_index().await {
-                            Ok(resp) => {
-                                use super::mentions::filter_index_for_cwd_entries;
-                                let root = std::path::PathBuf::from(&resp.workspace_root);
-                                let files =
-                                    match cwd.as_ref().and_then(|c| c.strip_prefix(&root).ok()) {
-                                        Some(relative_cwd) => {
-                                            filter_index_for_cwd_entries(&resp.files, relative_cwd)
-                                        }
-                                        None => resp.files,
-                                    };
-                                let _ = send_message(
-                                    &tx_events,
-                                    UiServerMessage::FileIndex {
-                                        files,
-                                        generated_at: resp.generated_at,
-                                    },
-                                )
-                                .await;
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "spawn_event_forwarders: WorkspaceIndexReady for {} but \
-                                     get_file_index failed: {}",
-                                    session_id,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                    // Don't forward the raw event to the UI — it's an internal
-                    // infrastructure event not meaningful to the frontend.
-                    continue;
-                }
-
-                let agent_id = {
-                    let agents = state_events.session_agents.lock().await;
-                    agents
-                        .get(event.session_id())
-                        .cloned()
-                        .unwrap_or_else(|| "unknown".to_string())
-                };
-
-                if log::log_enabled!(log::Level::Trace)
-                    && matches!(
-                        event.kind(),
-                        crate::events::AgentEventKind::AssistantThinkingDelta { .. }
-                            | crate::events::AgentEventKind::AssistantContentDelta { .. }
-                            | crate::events::AgentEventKind::AssistantMessageStored { .. }
-                            | crate::events::AgentEventKind::LlmRequestStart { .. }
-                            | crate::events::AgentEventKind::LlmRequestEnd { .. }
-                    )
-                {
-                    log::trace!(
-                        "ui forwarder: conn={} session={} agent={} seq={} kind={:?}",
-                        conn_id_events,
-                        event.session_id(),
-                        agent_id,
-                        event.seq(),
-                        event.kind()
-                    );
-                }
-
-                if send_message(
-                    &tx_events,
-                    UiServerMessage::Event {
-                        agent_id,
-                        session_id: event.session_id().to_owned(),
-                        event: event.clone(),
-                    },
-                )
-                .await
-                .is_err()
-                {
+            loop {
+                if !connection_is_open(&state, &conn_id, &tx).await {
                     break;
                 }
 
-                {
-                    let mut connections = state_events.connections.lock().await;
-                    if let Some(conn) = connections.get_mut(&conn_id_events) {
-                        let cursor = conn
-                            .session_cursors
-                            .entry(event.session_id().to_owned())
-                            .or_default();
-                        match event.origin() {
-                            crate::events::EventOrigin::Local
-                            | crate::events::EventOrigin::Unknown(_) => {
-                                cursor.local_seq = cursor.local_seq.max(event.seq());
+                let runtimes = profiles.materialized_runtimes().await;
+                for runtime in runtimes {
+                    for event_source in
+                        super::session::collect_event_sources(&runtime.agent().handle())
+                    {
+                        if seen_sources.insert(Arc::as_ptr(&event_source) as usize) {
+                            spawn_event_source_forwarder(
+                                state.clone(),
+                                conn_id.clone(),
+                                tx.clone(),
+                                event_source,
+                            );
+                        }
+                    }
+                }
+
+                sleep(Duration::from_millis(100)).await;
+            }
+        });
+    }
+}
+
+async fn connection_is_open(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<String>) -> bool {
+    !tx.is_closed() && state.connections.lock().await.contains_key(conn_id)
+}
+
+fn spawn_event_source_forwarder(
+    state: ServerState,
+    conn_id: String,
+    tx: mpsc::Sender<String>,
+    event_source: Arc<crate::event_fanout::EventFanout>,
+) {
+    let mut events = event_source.subscribe();
+    tokio::spawn(async move {
+        while let Ok(event) = events.recv().await {
+            if forward_event_to_ui(&state, &conn_id, &tx, event)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
+async fn forward_event_to_ui(
+    state: &ServerState,
+    conn_id: &str,
+    tx: &mpsc::Sender<String>,
+    event: crate::events::EventEnvelope,
+) -> Result<(), ()> {
+    // Check if this connection is subscribed and if this event is newer than
+    // the replay cursor (prevents replay/live overlap duplicates). Ephemeral
+    // events (seq=0) are live-only and are never cursor-filtered.
+    let should_forward = {
+        let mut connections = state.connections.lock().await;
+        if let Some(conn) = connections.get_mut(conn_id) {
+            if !conn.subscribed_sessions.contains(event.session_id()) {
+                false
+            } else if event.seq() == 0 {
+                true
+            } else {
+                let cursor = conn
+                    .session_cursors
+                    .get(event.session_id())
+                    .cloned()
+                    .unwrap_or_default();
+                match event.origin() {
+                    crate::events::EventOrigin::Local | crate::events::EventOrigin::Unknown(_) => {
+                        if event.seq() <= cursor.local_seq {
+                            log::debug!(
+                                "ui forwarder: dropping local duplicate/overlap event conn={} session={} seq={} cursor_local_seq={}",
+                                conn_id,
+                                event.session_id(),
+                                event.seq(),
+                                cursor.local_seq
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    crate::events::EventOrigin::Remote => {
+                        if let Some(source_node) = event.source_node() {
+                            let source_cursor = cursor
+                                .remote_seq_by_source
+                                .get(source_node)
+                                .copied()
+                                .unwrap_or(0);
+                            if event.seq() <= source_cursor {
+                                log::debug!(
+                                    "ui forwarder: dropping remote duplicate/overlap event conn={} session={} source={} seq={} cursor_remote_seq={}",
+                                    conn_id,
+                                    event.session_id(),
+                                    source_node,
+                                    event.seq(),
+                                    source_cursor
+                                );
+                                false
+                            } else {
+                                true
                             }
-                            crate::events::EventOrigin::Remote => {
-                                if let Some(source_node) = event.source_node() {
-                                    cursor
-                                        .remote_seq_by_source
-                                        .entry(source_node.to_owned())
-                                        .and_modify(|seq| *seq = (*seq).max(event.seq()))
-                                        .or_insert(event.seq());
-                                }
-                            }
+                        } else {
+                            log::warn!(
+                                "ui forwarder: dropping remote event without source conn={} session={} seq={}",
+                                conn_id,
+                                event.session_id(),
+                                event.seq(),
+                            );
+                            false
                         }
                     }
                 }
             }
-        });
+        } else {
+            false
+        }
+    };
+
+    if !should_forward {
+        return Ok(());
+    }
+
+    // React to WorkspaceIndexReady from a remote session: push status +
+    // fetch and push the file index so the UI gets it without polling.
+    if let crate::events::AgentEventKind::WorkspaceIndexReady { .. } = event.kind() {
+        let session_id = event.session_id().to_owned();
+
+        let _ = send_message(
+            tx,
+            UiServerMessage::WorkspaceIndexStatus {
+                session_id: session_id.clone(),
+                status: "ready".to_string(),
+                message: None,
+            },
+        )
+        .await;
+
+        let profile_id = profile_id_for_session(state, &session_id).await;
+        if let Some(actor_ref) =
+            session_ref_for_profile(state, profile_id.as_deref(), &session_id).await
+        {
+            let cwd = {
+                let cwds = state.session_cwds.lock().await;
+                cwds.get(&session_id).cloned()
+            };
+            match actor_ref.get_file_index().await {
+                Ok(resp) => {
+                    use super::mentions::filter_index_for_cwd_entries;
+                    let root = std::path::PathBuf::from(&resp.workspace_root);
+                    let files = match cwd.as_ref().and_then(|c| c.strip_prefix(&root).ok()) {
+                        Some(relative_cwd) => {
+                            filter_index_for_cwd_entries(&resp.files, relative_cwd)
+                        }
+                        None => resp.files,
+                    };
+                    let _ = send_message(
+                        tx,
+                        UiServerMessage::FileIndex {
+                            files,
+                            generated_at: resp.generated_at,
+                        },
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "spawn_event_forwarders: WorkspaceIndexReady for {} but get_file_index failed: {}",
+                        session_id,
+                        e
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let agent_id = {
+        let agents = state.session_agents.lock().await;
+        agents
+            .get(event.session_id())
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    let profile_id = profile_id_for_session(state, event.session_id()).await;
+
+    if log::log_enabled!(log::Level::Trace)
+        && matches!(
+            event.kind(),
+            crate::events::AgentEventKind::AssistantThinkingDelta { .. }
+                | crate::events::AgentEventKind::AssistantContentDelta { .. }
+                | crate::events::AgentEventKind::AssistantMessageStored { .. }
+                | crate::events::AgentEventKind::LlmRequestStart { .. }
+                | crate::events::AgentEventKind::LlmRequestEnd { .. }
+        )
+    {
+        log::trace!(
+            "ui forwarder: conn={} session={} agent={} seq={} kind={:?}",
+            conn_id,
+            event.session_id(),
+            agent_id,
+            event.seq(),
+            event.kind()
+        );
+    }
+
+    if send_message(
+        tx,
+        UiServerMessage::Event {
+            agent_id,
+            profile_id,
+            session_id: event.session_id().to_owned(),
+            event: event.clone(),
+        },
+    )
+    .await
+    .is_err()
+    {
+        return Err(());
+    }
+
+    update_live_cursor(state, conn_id, &event).await;
+    Ok(())
+}
+
+async fn profile_id_for_session(state: &ServerState, session_id: &str) -> Option<String> {
+    match &state.profiles {
+        Some(profiles) => profiles
+            .session_binding(session_id)
+            .await
+            .map(|binding| binding.profile_id),
+        None => None,
+    }
+}
+
+async fn update_live_cursor(
+    state: &ServerState,
+    conn_id: &str,
+    event: &crate::events::EventEnvelope,
+) {
+    let mut connections = state.connections.lock().await;
+    if let Some(conn) = connections.get_mut(conn_id) {
+        let cursor = conn
+            .session_cursors
+            .entry(event.session_id().to_owned())
+            .or_default();
+        match event.origin() {
+            crate::events::EventOrigin::Local | crate::events::EventOrigin::Unknown(_) => {
+                cursor.local_seq = cursor.local_seq.max(event.seq());
+            }
+            crate::events::EventOrigin::Remote => {
+                if let Some(source_node) = event.source_node() {
+                    cursor
+                        .remote_seq_by_source
+                        .entry(source_node.to_owned())
+                        .and_modify(|seq| *seq = (*seq).max(event.seq()))
+                        .or_insert(event.seq());
+                }
+            }
+        }
     }
 }
 

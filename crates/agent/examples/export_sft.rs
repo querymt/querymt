@@ -19,7 +19,7 @@
 //! cargo run --example export_sft -- --stats
 //!
 //! # Custom DB path, with path scrubbing
-//! cargo run --example export_sft -- --db /path/to/agent.db --scrub-paths
+//! cargo run --example export_sft -- --db /path/to/sessions.db --scrub-paths
 //!
 //! # Filter: at least 5 turns, exclude sessions with errors
 //! cargo run --example export_sft -- --min-turns 5 --exclude-errored
@@ -165,7 +165,7 @@ USAGE:
     export_sft [OPTIONS]
 
 OPTIONS:
-    --db <path>              Path to agent.db (default: ~/.qmt/agent.db)
+    --db <path>              Path to sessions.db (default: ~/.qmt/sessions.db)
     --output, -o <path>      Output file (default: stdout)
     --format, -f <fmt>       Output format: openai (default), sharegpt
     --stats                  Show export stats without writing data

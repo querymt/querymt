@@ -64,8 +64,9 @@ pub use session_ops::{ListSessionsRequest, handle_list_session_children, handle_
 
 use super::ServerState;
 use super::connection::{send_error, send_state};
+use super::error::format_prefixed_error_chain;
 use super::messages::{UiClientMessage, UiPromptBlock};
-use super::session::{ensure_sessions_for_mode, prompt_for_mode, resolve_cwd};
+use super::session::{ensure_sessions_for_mode_with_profile, prompt_for_mode, resolve_cwd};
 use models::{handle_get_recent_models, handle_set_session_model};
 use std::time::Instant;
 
@@ -109,6 +110,24 @@ pub async fn handle_ui_message(
             drop(connections);
             send_state(state, conn_id, tx).await;
         }
+        UiClientMessage::SetActiveProfile { profile_id } => {
+            let Some(profiles) = &state.profiles else {
+                let _ = send_error(tx, format!("Unknown profile: {profile_id}")).await;
+                return;
+            };
+            if let Err(err) = profiles.set_active_profile(profile_id).await {
+                let _ = send_error(
+                    tx,
+                    format_prefixed_error_chain("Failed to set active profile", &err),
+                )
+                .await;
+                return;
+            }
+            send_state(state, conn_id, tx).await;
+        }
+        UiClientMessage::ListProfiles => {
+            send_state(state, conn_id, tx).await;
+        }
         UiClientMessage::SetRoutingMode { mode } => {
             let mut connections = state.connections.lock().await;
             if let Some(conn) = connections.get_mut(conn_id) {
@@ -117,10 +136,15 @@ pub async fn handle_ui_message(
             drop(connections);
             send_state(state, conn_id, tx).await;
         }
-        UiClientMessage::NewSession { cwd, request_id } => {
+        UiClientMessage::NewSession {
+            cwd,
+            request_id,
+            profile_id,
+        } => {
             let cwd = resolve_cwd(cwd).or_else(|| state.default_cwd.clone());
 
-            // Clear existing sessions for this connection to start fresh
+            // Clear only this connection's session references; persisted sessions
+            // and profile bindings remain loadable after NewSession.
             {
                 let mut connections = state.connections.lock().await;
                 if let Some(conn) = connections.get_mut(conn_id) {
@@ -138,9 +162,15 @@ pub async fn handle_ui_message(
                 }
             }
 
-            if let Err(err) =
-                ensure_sessions_for_mode(state, conn_id, cwd.as_ref(), tx, request_id.as_deref())
-                    .await
+            if let Err(err) = ensure_sessions_for_mode_with_profile(
+                state,
+                conn_id,
+                cwd.as_ref(),
+                tx,
+                request_id.as_deref(),
+                profile_id.as_deref(),
+            )
+            .await
             {
                 let _ = send_error(tx, err).await;
             }

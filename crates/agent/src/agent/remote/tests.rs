@@ -849,11 +849,18 @@ mod node_manager_tests {
             .await
             .expect("create");
 
-        // Should receive SessionCreated event
-        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
-            .await
-            .expect("should receive event within timeout")
-            .expect("recv");
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                let event = rx.recv().await.expect("recv");
+                if event.session_id() == resp.session_id
+                    && matches!(event.kind(), AgentEventKind::SessionCreated)
+                {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("should receive SessionCreated event within timeout");
 
         assert_eq!(event.session_id(), resp.session_id);
         assert!(matches!(event.kind(), AgentEventKind::SessionCreated));

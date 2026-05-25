@@ -35,6 +35,7 @@ pub mod model_inventory;
 pub mod model_registry;
 #[cfg(feature = "plugin-loaders")]
 pub mod plugin_update;
+pub mod profiles;
 pub mod quorum;
 pub mod scheduler;
 pub mod send_agent;
