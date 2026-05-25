@@ -318,6 +318,10 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
     if let Some(profiles) = state.profiles.clone() {
         tokio::spawn(async move {
             loop {
+                if !connection_is_open(&state, &conn_id, &tx).await {
+                    break;
+                }
+
                 let runtimes = profiles.materialized_runtimes().await;
                 for runtime in runtimes {
                     for event_source in
@@ -338,6 +342,10 @@ pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sen
             }
         });
     }
+}
+
+async fn connection_is_open(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<String>) -> bool {
+    !tx.is_closed() && state.connections.lock().await.contains_key(conn_id)
 }
 
 fn spawn_event_source_forwarder(
