@@ -55,6 +55,7 @@ impl AgentServer {
     }
 
     pub async fn run(self, addr: &str, mode: ServerMode) -> anyhow::Result<()> {
+        let profiles = self.profiles.clone();
         let app = self.build_app(mode)?;
         let agent = self.agent.clone();
 
@@ -71,6 +72,10 @@ impl AgentServer {
             })
             .await?;
 
+        // Profiles are lazily materialized side runtimes; stop their background tasks too.
+        if let Some(profiles) = profiles {
+            profiles.shutdown().await;
+        }
         // Run graceful agent shutdown (releases scheduler lease, stops background tasks)
         agent.shutdown().await;
 
