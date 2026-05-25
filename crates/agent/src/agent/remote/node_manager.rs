@@ -373,24 +373,25 @@ mod remote_impl {
                 actor_id_raw,
             );
 
+            if self.mesh.is_none() {
+                log::warn!(
+                    "RemoteNodeManager: direct remote export unavailable for existing session {} and no mesh is active; returning no-attach-path handoff",
+                    session_id
+                );
+                return SessionHandoff::no_attach_path();
+            }
+
             match std::panic::AssertUnwindSafe(async { actor_ref.into_remote_ref().await })
                 .catch_unwind()
                 .await
             {
                 Ok(remote_ref) => SessionHandoff::direct(remote_ref),
-                Err(_) if self.mesh.is_some() => {
+                Err(_) => {
                     log::warn!(
                         "RemoteNodeManager: direct remote export unavailable for existing session {}; returning lookup-only handoff",
                         session_id
                     );
                     SessionHandoff::lookup_only()
-                }
-                Err(_) => {
-                    log::warn!(
-                        "RemoteNodeManager: direct remote export unavailable for existing session {} and no mesh is active; returning no-attach-path handoff",
-                        session_id
-                    );
-                    SessionHandoff::no_attach_path()
                 }
             }
         }
