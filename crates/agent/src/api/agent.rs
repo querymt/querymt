@@ -13,6 +13,7 @@ use crate::agent::core::{SnapshotPolicy, ToolPolicy};
 use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{
     ExecutionPolicy, McpServerConfig, MiddlewareEntry, SingleAgentConfig, SkillsConfig,
+    SlashCommandsConfig,
 };
 use crate::middleware::{MIDDLEWARE_REGISTRY, MiddlewareDriver};
 use crate::runner::{ChatRunner, ChatSession};
@@ -112,6 +113,8 @@ pub struct AgentBuilder {
     max_prompt_bytes_override: Option<usize>,
     /// Override: execution timeout in seconds (forwarded to AgentConfigBuilder).
     execution_timeout_secs_override: Option<u64>,
+    /// Slash commands configuration (frontloaded from SingleAgentConfig).
+    slash_commands_config: Option<SlashCommandsConfig>,
 }
 
 impl Default for AgentBuilder {
@@ -141,6 +144,7 @@ impl AgentBuilder {
             max_steps_override: None,
             max_prompt_bytes_override: None,
             execution_timeout_secs_override: None,
+            slash_commands_config: None,
         }
     }
 
@@ -227,6 +231,12 @@ impl AgentBuilder {
     /// Set the execution timeout in seconds.
     pub fn execution_timeout_secs(mut self, secs: u64) -> Self {
         self.execution_timeout_secs_override = Some(secs);
+        self
+    }
+
+    /// Configure slash commands.
+    pub fn slash_commands(mut self, config: SlashCommandsConfig) -> Self {
+        self.slash_commands_config = Some(config);
         self
     }
 
@@ -362,6 +372,65 @@ impl AgentBuilder {
         }
         if let Some(ks) = backend.knowledge_store() {
             builder = builder.with_knowledge_store(ks);
+        }
+        if let Some(wps) = backend.work_packet_store() {
+            builder = builder.with_work_packet_store(wps);
+        }
+
+        // Build slash command registry from config (includes built-in commands).
+        if let Some(ref sc_config) = self.slash_commands_config {
+            if sc_config.enabled {
+                use crate::slash_commands::{SlashCommandRegistry, SlashCommandSource};
+
+                let mut sources: Vec<SlashCommandSource> = Vec::new();
+                if sc_config.include_global {
+                    if let Some(home) = dirs::home_dir() {
+                        sources.push(SlashCommandSource::Global(home.join(".qmt/commands")));
+                    }
+                    if let Ok(cfg_dir) = querymt_utils::providers::config_dir() {
+                        sources.push(SlashCommandSource::Global(cfg_dir.join("commands")));
+                    }
+                }
+                if sc_config.include_project
+                    && let Some(ref cwd) = cwd
+                {
+                    sources.push(SlashCommandSource::Project(cwd.join(".qmt/commands")));
+                }
+                for p in &sc_config.paths {
+                    sources.push(SlashCommandSource::Configured(p.clone()));
+                }
+
+                let (registry, diags) =
+                    SlashCommandRegistry::from_sources(&sources, &sc_config.scripts);
+
+                if !diags.is_empty() {
+                    for d in &diags {
+                        log::warn!(
+                            "Slash command diagnostic: {} — {}",
+                            d.path.display(),
+                            d.message
+                        );
+                    }
+                }
+
+                log::info!(
+                    "Slash commands: {} registered ({} built-in + {} from filesystem + {} runtime)",
+                    registry.len(),
+                    registry
+                        .all()
+                        .filter(|c| matches!(c.source, SlashCommandSource::Builtin))
+                        .count(),
+                    registry
+                        .all()
+                        .filter(|c| !matches!(c.source, SlashCommandSource::Builtin))
+                        .count(),
+                    registry.all_runtime().count(),
+                );
+
+                builder = builder.with_slash_command_registry(registry);
+            } else {
+                log::debug!("Slash commands disabled in configuration");
+            }
         }
 
         if let Some(assume_mutating) = self.assume_mutating {
@@ -918,6 +987,7 @@ impl Agent {
         // Thread through config fields that were previously silently dropped
         builder.execution = Some(config.agent.execution);
         builder.skills_config = Some(config.agent.skills);
+        builder.slash_commands_config = Some(config.agent.slash_commands);
 
         // Wire MCP servers from TOML `[[mcp]]` config.
         if !config.mcp.is_empty() {

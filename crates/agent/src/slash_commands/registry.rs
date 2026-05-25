@@ -1,4 +1,5 @@
 use crate::slash_commands::discovery;
+use crate::slash_commands::runtime::{RegisteredRuntimeCommand, RuntimeSlashCommandPlugin};
 use crate::slash_commands::types::{
     SlashCommand, SlashCommandDiagnostic, SlashCommandScriptsConfig, SlashCommandSource,
 };
@@ -7,30 +8,51 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Registry holding discovered slash commands.
-#[derive(Debug, Clone, Default)]
+///
+/// Stores two kinds of command backends:
+/// - **Prompt commands** — markdown templates expanded into LLM prompts.
+/// - **Runtime commands** — deterministic plugin-backed commands.
+///
+/// Runtime commands take precedence over prompt commands of the same name.
 pub struct SlashCommandRegistry {
-    /// Commands indexed by name.
-    by_name: HashMap<String, Arc<SlashCommand>>,
-    /// Whether script execution is enabled (controls visibility of script-only commands).
+    prompt_commands: HashMap<String, Arc<SlashCommand>>,
+    runtime_commands: HashMap<String, RegisteredRuntimeCommand>,
     scripts_enabled: bool,
+}
+
+impl Clone for SlashCommandRegistry {
+    fn clone(&self) -> Self {
+        Self {
+            prompt_commands: self.prompt_commands.clone(),
+            runtime_commands: self.runtime_commands.clone(),
+            scripts_enabled: self.scripts_enabled,
+        }
+    }
+}
+
+impl Default for SlashCommandRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SlashCommandRegistry {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            prompt_commands: HashMap::new(),
+            runtime_commands: HashMap::new(),
+            scripts_enabled: false,
+        }
     }
 
-    /// Build a registry by discovering commands from the given sources.
-    ///
-    /// Script-only commands are hidden when `scripts_enabled` is false.
-    /// Diagnostics for invalid files are returned alongside the registry.
     pub fn from_sources(
         sources: &[SlashCommandSource],
         scripts_config: &SlashCommandScriptsConfig,
     ) -> (Self, Vec<SlashCommandDiagnostic>) {
         let (commands, diagnostics) = discovery::discover_all(sources);
         let mut registry = Self {
-            by_name: HashMap::new(),
+            prompt_commands: HashMap::new(),
+            runtime_commands: HashMap::new(),
             scripts_enabled: scripts_config.enabled,
         };
 
@@ -41,23 +63,34 @@ impl SlashCommandRegistry {
         (registry, diagnostics)
     }
 
-    /// Build an empty registry (no discovery).
     pub fn empty() -> Self {
-        Self::default()
+        Self::new()
     }
 
-    /// Register a single command. Later registrations of the same name overwrite.
     pub fn register(&mut self, command: SlashCommand) {
-        self.by_name.insert(command.name.clone(), Arc::new(command));
+        self.prompt_commands
+            .insert(command.name.clone(), Arc::new(command));
     }
 
-    /// Look up a command by name.
-    ///
-    /// Returns `None` if the command doesn't exist or is a script-only command
-    /// while scripts are disabled.
+    /// Register a runtime plugin and all commands it advertises.
+    pub fn register_plugin(&mut self, plugin: Arc<dyn RuntimeSlashCommandPlugin>) {
+        for descriptor in plugin.descriptors() {
+            self.runtime_commands.insert(
+                descriptor.name.to_string(),
+                RegisteredRuntimeCommand {
+                    descriptor,
+                    plugin: plugin.clone(),
+                },
+            );
+        }
+    }
+
+    pub fn get_runtime(&self, name: &str) -> Option<&RegisteredRuntimeCommand> {
+        self.runtime_commands.get(name)
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<SlashCommand>> {
-        self.by_name.get(name).and_then(|cmd| {
-            // Hide script-required commands when scripts are disabled
+        self.prompt_commands.get(name).and_then(|cmd| {
             if cmd.requires_script && !self.scripts_enabled {
                 None
             } else {
@@ -66,39 +99,42 @@ impl SlashCommandRegistry {
         })
     }
 
-    /// List all visible command names (sorted).
+    pub fn is_runtime(&self, name: &str) -> bool {
+        self.runtime_commands.contains_key(name)
+    }
+
     pub fn names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self
-            .by_name
+            .prompt_commands
             .iter()
             .filter(|(_, cmd)| !cmd.requires_script || self.scripts_enabled)
             .map(|(name, _)| name.as_str())
+            .chain(self.runtime_commands.keys().map(|name| name.as_str()))
             .collect();
         names.sort();
+        names.dedup();
         names
     }
 
-    /// Iterate over all visible commands.
     pub fn all(&self) -> impl Iterator<Item = Arc<SlashCommand>> + '_ {
-        self.by_name
+        self.prompt_commands
             .iter()
             .filter(|(_, cmd)| !cmd.requires_script || self.scripts_enabled)
             .map(|(_, cmd)| cmd.clone())
     }
 
-    /// Number of visible commands.
+    pub fn all_runtime(&self) -> impl Iterator<Item = &RegisteredRuntimeCommand> + '_ {
+        self.runtime_commands.values()
+    }
+
     pub fn len(&self) -> usize {
         self.names().len()
     }
 
-    /// Whether the registry has no visible commands.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Discover and reload commands from the given project root and config paths.
-    ///
-    /// This replaces the entire registry contents.
     pub fn reload(
         &mut self,
         project_root: Option<&Path>,
@@ -110,7 +146,6 @@ impl SlashCommandRegistry {
         if let Some(root) = project_root {
             sources.extend(discovery::default_search_paths(root));
         } else {
-            // Global-only when no project root
             if let Some(home) = dirs::home_dir() {
                 sources.push(SlashCommandSource::Global(home.join(".qmt/commands")));
             }
@@ -125,7 +160,7 @@ impl SlashCommandRegistry {
 
         let (commands, diagnostics) = discovery::discover_all(&sources);
 
-        self.by_name.clear();
+        self.prompt_commands.clear();
         self.scripts_enabled = scripts_config.enabled;
         for cmd in commands {
             self.register(cmd);
@@ -139,7 +174,6 @@ impl SlashCommandRegistry {
 mod tests {
     use super::*;
     use crate::slash_commands::types::{ScriptMode, ScriptRuntime, SlashCommandScript};
-    use std::collections::HashMap;
     use std::fs;
     use tempfile::TempDir;
 
@@ -191,7 +225,6 @@ mod tests {
         reg.register(make_command("normal", "Normal command", false));
         reg.register(make_command("scripted", "Script command", true));
 
-        // Scripts disabled (default)
         assert!(reg.get("normal").is_some());
         assert!(reg.get("scripted").is_none());
         assert_eq!(reg.names(), vec!["normal"]);
@@ -200,7 +233,8 @@ mod tests {
     #[test]
     fn test_script_required_command_visible_when_enabled() {
         let mut reg = SlashCommandRegistry {
-            by_name: HashMap::new(),
+            prompt_commands: HashMap::new(),
+            runtime_commands: HashMap::new(),
             scripts_enabled: true,
         };
         reg.register(make_command("normal", "Normal command", false));
@@ -245,8 +279,10 @@ mod tests {
         assert!(reg.get("old").is_some());
 
         let dir = TempDir::new().unwrap();
+        let commands_dir = dir.path().join(".qmt/commands");
+        fs::create_dir_all(&commands_dir).unwrap();
         fs::write(
-            dir.path().join("new.md"),
+            commands_dir.join("new.md"),
             "---\ndescription: New command\n---\nBody\n",
         )
         .unwrap();
@@ -255,11 +291,7 @@ mod tests {
         let diags = reg.reload(Some(dir.path()), &[], &scripts_config);
         assert!(diags.is_empty());
 
-        // Old command is gone
         assert!(reg.get("old").is_none());
-        // New command from project discovery (under .qmt/commands)
-        // But .qmt/commands doesn't exist in the temp dir, so let's check reload
-        // actually cleared old and didn't add anything (no .qmt/commands dir)
-        assert!(reg.is_empty());
+        assert!(reg.get("new").is_some());
     }
 }

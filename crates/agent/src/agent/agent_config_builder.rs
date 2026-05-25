@@ -71,6 +71,7 @@ pub struct AgentConfigBuilder {
     session_mcp_attachment_source: Arc<dyn SessionMcpAttachmentSource>,
     schedule_repository: Option<Arc<dyn crate::session::repo_schedule::ScheduleRepository>>,
     knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
+    work_packet_store: Option<Arc<dyn crate::work_packet::WorkPacketStore>>,
     slash_command_registry: crate::slash_commands::SlashCommandRegistry,
 }
 
@@ -127,6 +128,7 @@ impl AgentConfigBuilder {
             session_mcp_attachment_source: Arc::new(NoopSessionMcpAttachmentSource),
             schedule_repository: None,
             knowledge_store: None,
+            work_packet_store: None,
             slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
         }
     }
@@ -176,16 +178,26 @@ impl AgentConfigBuilder {
             session_mcp_attachment_source: Arc::new(NoopSessionMcpAttachmentSource),
             schedule_repository: None,
             knowledge_store: None,
+            work_packet_store: None,
             slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
         }
     }
 
     /// Build the final [`AgentConfig`].
-    pub fn build(self) -> AgentConfig {
+    pub fn build(mut self) -> AgentConfig {
         let event_sink = Arc::new(EventSink::new(
             self.event_journal.clone(),
             self.event_fanout.clone(),
         ));
+
+        // Register runtime slash command plugin for work packets.
+        if let Some(ref wps) = self.work_packet_store {
+            let plugin = std::sync::Arc::new(
+                crate::work_packet::slash_commands::WorkPacketSlashPlugin::new(wps.clone()),
+            );
+            self.slash_command_registry.register_plugin(plugin);
+        }
+
         AgentConfig {
             provider: self.provider,
             event_sink,
@@ -216,6 +228,7 @@ impl AgentConfigBuilder {
             session_mcp_attachment_source: self.session_mcp_attachment_source,
             schedule_repository: self.schedule_repository,
             knowledge_store: self.knowledge_store,
+            work_packet_store: self.work_packet_store,
             slash_command_registry: self.slash_command_registry,
         }
     }
@@ -455,6 +468,15 @@ impl AgentConfigBuilder {
         store: Arc<dyn crate::knowledge::KnowledgeStore>,
     ) -> Self {
         self.knowledge_store = Some(store);
+        self
+    }
+
+    /// Set the work packet store (from storage backend).
+    pub fn with_work_packet_store(
+        mut self,
+        store: Arc<dyn crate::work_packet::WorkPacketStore>,
+    ) -> Self {
+        self.work_packet_store = Some(store);
         self
     }
 

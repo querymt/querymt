@@ -12,6 +12,7 @@ use crate::elicitation::{ElicitationAction, ElicitationResponse};
 use crate::event_sink::EventSink;
 use crate::knowledge::{KnowledgeStore, ScopePolicy};
 use crate::tools::context::{ToolContext, ToolError};
+use crate::work_packet::WorkPacketStore;
 
 /// A request to elicit information from the user, sent from tool context to the agent
 pub struct ElicitationRequest {
@@ -31,6 +32,7 @@ pub struct AgentToolContext {
     cancellation_token: CancellationToken,
     workspace_query_bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
     knowledge_store: Option<Arc<dyn KnowledgeStore>>,
+    work_packet_store: Option<Arc<dyn WorkPacketStore>>,
     scope_policy: Arc<dyn ScopePolicy>,
     event_sink: Option<Arc<EventSink>>,
 }
@@ -50,6 +52,7 @@ impl AgentToolContext {
             cancellation_token: CancellationToken::new(),
             workspace_query_bridge: None,
             knowledge_store: None,
+            work_packet_store: None,
             scope_policy: Arc::new(crate::knowledge::PermissiveScopePolicy),
             event_sink: None,
         }
@@ -76,6 +79,11 @@ impl AgentToolContext {
     /// Attach a knowledge store to this context.
     pub fn with_knowledge_store(&mut self, knowledge_store: Arc<dyn KnowledgeStore>) {
         self.knowledge_store = Some(knowledge_store);
+    }
+
+    /// Attach a work packet store to this context.
+    pub fn with_work_packet_store(&mut self, store: Arc<dyn WorkPacketStore>) {
+        self.work_packet_store = Some(store);
     }
 
     /// Set the scope policy for knowledge tools.
@@ -114,6 +122,10 @@ impl ToolContext for AgentToolContext {
 
     fn knowledge_store(&self) -> Option<Arc<dyn KnowledgeStore>> {
         self.knowledge_store.clone()
+    }
+
+    fn work_packet_store(&self) -> Option<Arc<dyn WorkPacketStore>> {
+        self.work_packet_store.clone()
     }
 
     fn scope_policy(&self) -> Arc<dyn ScopePolicy> {

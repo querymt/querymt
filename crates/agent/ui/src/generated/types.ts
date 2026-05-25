@@ -489,6 +489,8 @@ export interface Delegation {
 	verification_spec?: any;
 	/** AI-generated summary of parent planning conversation for coder context */
 	planning_summary?: string;
+	/** Optional work packet used as delegation input */
+	input_packet_id?: string;
 	status: DelegationStatus;
 	/** Number of retry attempts for this objective */
 	retry_count: number;

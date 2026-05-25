@@ -321,6 +321,7 @@ mod tests {
             expected_output: None,
             verification_spec: None,
             planning_summary: None,
+            input_packet_id: None,
             status: DelegationStatus::Running,
             retry_count: 0,
             created_at: OffsetDateTime::now_utc(),
@@ -359,6 +360,7 @@ mod tests {
             expected_output: None,
             verification_spec: None,
             planning_summary: None,
+            input_packet_id: None,
             status: DelegationStatus::Failed,
             retry_count: 5, // exceeds default max of 3
             created_at: OffsetDateTime::now_utc(),
@@ -397,6 +399,7 @@ mod tests {
             expected_output: None,
             verification_spec: None,
             planning_summary: None,
+            input_packet_id: None,
             status: DelegationStatus::Complete, // completed is fine
             retry_count: 0,
             created_at: OffsetDateTime::now_utc(),

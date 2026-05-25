@@ -105,12 +105,13 @@ impl DelegationRepository for SqliteDelegationRepository {
         let constraints = delegation.constraints.clone();
         let expected_output = delegation.expected_output.clone();
         let planning_summary = delegation.planning_summary.clone();
+        let input_packet_id = delegation.input_packet_id.clone();
         let status_str = delegation.status.to_string();
         let retry_count = delegation.retry_count;
 
         let internal_id = self.run_blocking(move |conn| {
             conn.execute(
-                "INSERT INTO delegations (public_id, session_id, task_id, target_agent_id, objective, objective_hash, context, constraints, expected_output, planning_summary, status, retry_count, created_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO delegations (public_id, session_id, task_id, target_agent_id, objective, objective_hash, context, constraints, expected_output, planning_summary, input_packet_id, status, retry_count, created_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     public_id,
                     session_id,
@@ -122,6 +123,7 @@ impl DelegationRepository for SqliteDelegationRepository {
                     constraints,
                     expected_output,
                     planning_summary,
+                    input_packet_id,
                     status_str,
                     retry_count,
                     created_at,
@@ -140,7 +142,7 @@ impl DelegationRepository for SqliteDelegationRepository {
         let delegation_id = delegation_id.to_string();
         self.run_blocking(move |conn| {
             conn.query_row(
-                "SELECT id, public_id, session_id, task_id, target_agent_id, objective, objective_hash, context, constraints, expected_output, planning_summary, status, retry_count, created_at, completed_at FROM delegations WHERE public_id = ?",
+                "SELECT id, public_id, session_id, task_id, target_agent_id, objective, objective_hash, context, constraints, expected_output, planning_summary, input_packet_id, status, retry_count, created_at, completed_at FROM delegations WHERE public_id = ?",
                 params![delegation_id],
                 map_row_to_delegation,
             )
@@ -153,7 +155,7 @@ impl DelegationRepository for SqliteDelegationRepository {
         let internal_session_id = self.resolve_session_internal_id(session_id).await?;
         self.run_blocking(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, public_id, session_id, task_id, target_agent_id, objective, objective_hash, context, constraints, expected_output, planning_summary, status, retry_count, created_at, completed_at FROM delegations WHERE session_id = ? ORDER BY created_at ASC",
+                "SELECT id, public_id, session_id, task_id, target_agent_id, objective, objective_hash, context, constraints, expected_output, planning_summary, input_packet_id, status, retry_count, created_at, completed_at FROM delegations WHERE session_id = ? ORDER BY created_at ASC",
             )?;
             let delegations_iter = stmt.query_map(params![internal_session_id], map_row_to_delegation)?;
             delegations_iter.collect::<Result<Vec<_>, _>>()
@@ -195,7 +197,7 @@ impl DelegationRepository for SqliteDelegationRepository {
 
         self.run_blocking(move |conn| {
             let affected = conn.execute(
-                "UPDATE delegations SET target_agent_id = ?, objective = ?, objective_hash = ?, context = ?, constraints = ?, expected_output = ?, planning_summary = ?, status = ?, retry_count = ?, completed_at = ? WHERE public_id = ?",
+                "UPDATE delegations SET target_agent_id = ?, objective = ?, objective_hash = ?, context = ?, constraints = ?, expected_output = ?, planning_summary = ?, input_packet_id = ?, status = ?, retry_count = ?, completed_at = ? WHERE public_id = ?",
                 params![
                     delegation.target_agent_id,
                     delegation.objective,
@@ -204,6 +206,7 @@ impl DelegationRepository for SqliteDelegationRepository {
                     delegation.constraints,
                     delegation.expected_output,
                     delegation.planning_summary,
+                    delegation.input_packet_id,
                     status_str,
                     delegation.retry_count,
                     completed_at,
@@ -234,10 +237,10 @@ fn parse_rfc3339(value: &str) -> Result<OffsetDateTime, rusqlite::Error> {
 }
 
 fn map_row_to_delegation(row: &rusqlite::Row) -> Result<Delegation, rusqlite::Error> {
-    let status_str: String = row.get(11)?; // Shifted from 10 to 11
-    let created_at = parse_rfc3339(&row.get::<_, String>(13)?)?; // Shifted from 12 to 13
+    let status_str: String = row.get(12)?; // Shifted from 11 to 12
+    let created_at = parse_rfc3339(&row.get::<_, String>(14)?)?; // Shifted from 13 to 14
     let completed_at = row
-        .get::<_, Option<String>>(14)? // Shifted from 13 to 14
+        .get::<_, Option<String>>(15)? // Shifted from 14 to 15
         .and_then(|s| OffsetDateTime::parse(&s, &Rfc3339).ok());
 
     // NOTE: Parse hash from TEXT (hex) - could switch to BLOB for efficiency
@@ -258,9 +261,10 @@ fn map_row_to_delegation(row: &rusqlite::Row) -> Result<Delegation, rusqlite::Er
         expected_output: row.get(9)?,
         verification_spec: None,
         planning_summary: row.get(10)?, // New field at position 10
+        input_packet_id: row.get(11)?,  // Optional packet link at position 11
         status: DelegationStatus::from_str(&status_str)
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
-        retry_count: row.get::<_, i64>(12)? as u32, // Shifted from 11 to 12
+        retry_count: row.get::<_, i64>(13)? as u32, // Shifted from 12 to 13
         created_at,
         completed_at,
     })

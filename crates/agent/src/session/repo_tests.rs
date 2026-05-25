@@ -770,6 +770,7 @@ mod tests {
                 expected_output: None,
                 verification_spec: None,
                 planning_summary: None,
+                input_packet_id: None,
                 status: DelegationStatus::Requested,
                 retry_count: 0,
                 created_at: now(),

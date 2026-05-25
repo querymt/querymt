@@ -106,6 +106,8 @@ pub struct DelegationOrchestrator {
     delegation_summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
     /// Optional routing snapshot for per-agent routing decisions.
     routing_snapshot: Option<crate::agent::remote::RoutingSnapshotHandle>,
+    /// Optional work packet store for loading input packets and saving result packets.
+    work_packet_store: Option<Arc<dyn crate::work_packet::WorkPacketStore>>,
 }
 
 impl DelegationOrchestrator {
@@ -128,6 +130,7 @@ impl DelegationOrchestrator {
             active_delegations: Arc::new(Mutex::new(HashMap::new())),
             delegation_summarizer: None,
             routing_snapshot: None,
+            work_packet_store: None,
         }
     }
 
@@ -184,6 +187,15 @@ impl DelegationOrchestrator {
         self
     }
 
+    /// Set the work packet store for loading input packets and saving result packets.
+    pub fn with_work_packet_store(
+        mut self,
+        store: Option<Arc<dyn crate::work_packet::WorkPacketStore>>,
+    ) -> Self {
+        self.work_packet_store = store;
+        self
+    }
+
     /// Start listening for events on the given `EventFanout`.
     ///
     /// Spawns a background task that subscribes to the fanout and dispatches
@@ -228,6 +240,7 @@ impl DelegationOrchestrator {
                 let max_parallel = self.max_parallel.clone();
                 let delegation_summarizer = self.delegation_summarizer.clone();
                 let routing_snapshot = self.routing_snapshot.clone();
+                let work_packet_store = self.work_packet_store.clone();
                 let parent_session_id = session_id.to_string();
                 let parent_session_id_for_insert = parent_session_id.clone();
                 let delegation = delegation.clone();
@@ -271,6 +284,7 @@ impl DelegationOrchestrator {
                         active_delegations: active_delegations_for_spawn,
                         delegation_summarizer,
                         routing_snapshot,
+                        work_packet_store,
                     };
                     match target_handle {
                         Some(target) => {
@@ -382,6 +396,7 @@ struct DelegationContext {
     active_delegations: ActiveDelegations,
     delegation_summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
     routing_snapshot: Option<crate::agent::remote::RoutingSnapshotHandle>,
+    work_packet_store: Option<Arc<dyn crate::work_packet::WorkPacketStore>>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -600,6 +615,48 @@ async fn execute_delegation(
         }
     }
 
+    // 2b. Inject input packet body as planning context (if delegation references one)
+    if let Some(ref packet_store) = ctx.work_packet_store
+        && let Some(ref input_packet_id) = delegation.input_packet_id
+    {
+        match packet_store.load(input_packet_id).await {
+            Ok(packet) => {
+                let packet_context = format!(
+                    "\n\n<work-packet>\n# {}\n\n{}\n\n{}\n</work-packet>",
+                    packet.title, packet.summary, packet.body_markdown
+                );
+                let packet_bytes = packet_context.len();
+                async {
+                    if let Err(e) = session_ref.set_planning_context(packet_context).await {
+                        warn!(
+                            "Failed to inject input packet '{}' into delegate session: {}",
+                            input_packet_id, e
+                        );
+                    } else {
+                        log::info!(
+                            "Injected input packet '{}' ({} bytes) into delegate session {}",
+                            input_packet_id,
+                            packet_bytes,
+                            child_session_id
+                        );
+                    }
+                }
+                .instrument(tracing::info_span!(
+                    "delegation.inject_input_packet",
+                    input_packet_id = %input_packet_id,
+                    packet_bytes = packet_bytes,
+                ))
+                .await;
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to load input packet '{}' for delegation: {}",
+                    input_packet_id, e
+                );
+            }
+        }
+    }
+
     // 3. Send prompt directly via kameo
     let prompt_text = build_delegation_prompt(&delegation);
     let prompt_req = PromptRequest::new(
@@ -760,6 +817,46 @@ async fn execute_delegation(
                     result: Some(summary.clone()),
                 },
             );
+
+            // 5b. Save result as a work packet (if store is available)
+            if let Some(ref packet_store) = ctx.work_packet_store {
+                let title = format!(
+                    "Delegation result: {}",
+                    &delegation.objective.chars().take(80).collect::<String>()
+                );
+                let summary_text: String = summary.chars().take(300).collect();
+                let input = crate::work_packet::CreateWorkPacket {
+                    scope: parent_session_id.clone(),
+                    kind: crate::work_packet::WorkPacketKind::Result,
+                    title,
+                    summary: summary_text,
+                    body_markdown: summary.clone(),
+                    metadata_json: Some(serde_json::json!({
+                        "delegation_id": delegation.public_id,
+                        "target_agent_id": delegation.target_agent_id,
+                        "objective": delegation.objective,
+                    })),
+                    origin_session_id: Some(parent_session_id.clone()),
+                    parent_packet_id: delegation.input_packet_id.clone(),
+                    source_delegation_id: Some(delegation.public_id.clone()),
+                    target_delegation_id: None,
+                };
+                match packet_store.create(input).await {
+                    Ok(packet) => {
+                        log::info!(
+                            "Saved delegation result packet '{}' for delegation '{}'",
+                            packet.public_id,
+                            delegation.public_id
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to save delegation result packet for '{}': {}",
+                            delegation.public_id, e
+                        );
+                    }
+                }
+            }
 
             if ctx.config.inject_results {
                 inject_results(

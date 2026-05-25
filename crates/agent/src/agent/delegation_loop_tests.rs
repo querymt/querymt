@@ -715,6 +715,7 @@ async fn test_delegation_guard_blocks_duplicate() {
         created_at: OffsetDateTime::now_utc(),
         completed_at: None,
         planning_summary: None,
+        input_packet_id: None,
     };
 
     store
@@ -792,6 +793,7 @@ async fn test_delegation_guard_blocks_max_retries() {
         created_at: OffsetDateTime::now_utc(),
         completed_at: Some(OffsetDateTime::now_utc() - time::Duration::seconds(10)),
         planning_summary: None,
+        input_packet_id: None,
     };
 
     store

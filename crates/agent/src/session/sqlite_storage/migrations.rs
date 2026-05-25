@@ -51,6 +51,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
     Migration {
         version: "0010_profile_bindings",
         apply: migration_0010_profile_bindings,
+    }.
+    Migration {
+        version: "0011_delegation_input_packet_id",
+        apply: migration_0011_delegation_input_packet_id,
     },
 ];
 
@@ -431,4 +435,14 @@ fn migration_0010_profile_bindings(conn: &mut Connection) -> Result<(), rusqlite
         "#,
     )?;
     Ok(())
+
+fn migration_0011_delegation_input_packet_id(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    // Idempotent: fresh DB already has the column from init_schema.
+    // Ignore "duplicate column name" errors for existing DBs that ran this migration.
+    let result = conn.execute_batch("ALTER TABLE delegations ADD COLUMN input_packet_id TEXT;");
+    match result {
+        Ok(()) => Ok(()),
+        Err(ref e) if e.to_string().contains("duplicate column name") => Ok(()),
+        Err(e) => Err(e),
+    }
 }

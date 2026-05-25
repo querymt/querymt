@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::knowledge::{KnowledgeStore, ScopePolicy};
+use crate::work_packet::WorkPacketStore;
 
 /// Capability requirements that tools may need
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -45,6 +46,11 @@ pub trait ToolContext: Send + Sync {
 
     /// Optional knowledge store access for knowledge tools.
     fn knowledge_store(&self) -> Option<Arc<dyn KnowledgeStore>> {
+        None
+    }
+
+    /// Optional work packet store access for packet tools.
+    fn work_packet_store(&self) -> Option<Arc<dyn WorkPacketStore>> {
         None
     }
 

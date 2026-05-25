@@ -1,4 +1,4 @@
-use crate::slash_commands::parser::parse_command_file;
+use crate::slash_commands::parser::{parse_command_content, parse_command_file};
 use crate::slash_commands::types::{SlashCommand, SlashCommandDiagnostic, SlashCommandSource};
 use std::path::Path;
 
@@ -25,14 +25,53 @@ pub fn default_search_paths(project_root: &Path) -> Vec<SlashCommandSource> {
     paths
 }
 
+/// Built-in slash commands embedded in the querymt-agent binary.
+///
+/// Each entry is `(name, file_path, content)` where content is included via
+/// `include_str!` at compile time.
+const BUILTIN_COMMANDS: &[(&str, &str, &str)] = &[];
+
+/// Discover built-in slash commands embedded in the binary.
+///
+/// These commands have the lowest priority and can be overridden by
+/// global, project, or configured commands with the same name.
+pub fn discover_builtin() -> (Vec<SlashCommand>, Vec<SlashCommandDiagnostic>) {
+    let mut commands = Vec::new();
+    let mut diagnostics = Vec::new();
+
+    for (name, rel_path, content) in BUILTIN_COMMANDS {
+        let pseudo_path = std::path::PathBuf::from(format!("<builtin>/{}", rel_path));
+        match parse_command_content(name, content, pseudo_path, SlashCommandSource::Builtin) {
+            Ok(cmd) => {
+                log::debug!("Loaded built-in slash command '/{}'", cmd.name);
+                commands.push(cmd);
+            }
+            Err(diag) => {
+                log::warn!(
+                    "Skipping invalid built-in command '{}': {}",
+                    name,
+                    diag.message
+                );
+                diagnostics.push(diag);
+            }
+        }
+    }
+
+    (commands, diagnostics)
+}
+
 /// Discover commands from a single source directory.
 ///
 /// Scans for `*.md` files in the directory (non-recursive).
 /// Invalid files produce diagnostics instead of failing the entire scan.
+///
+/// Note: `SlashCommandSource::Builtin` is not handled here; use
+/// [`discover_builtin`] instead.
 pub fn discover_from_source(
     source: &SlashCommandSource,
 ) -> (Vec<SlashCommand>, Vec<SlashCommandDiagnostic>) {
     let base_path = match source {
+        SlashCommandSource::Builtin => return (Vec::new(), Vec::new()),
         SlashCommandSource::Global(p)
         | SlashCommandSource::Project(p)
         | SlashCommandSource::Configured(p) => p,
@@ -95,8 +134,9 @@ pub fn discover_from_source(
 
 /// Discover commands from multiple sources with deduplication.
 ///
+/// Built-in commands are always included first (lowest priority).
 /// Higher-priority sources override lower-priority ones for the same name.
-/// Priority order: Global < Project < Configured.
+/// Priority order: Builtin < Global < Project < Configured.
 pub fn discover_all(
     sources: &[SlashCommandSource],
 ) -> (Vec<SlashCommand>, Vec<SlashCommandDiagnostic>) {
@@ -104,6 +144,15 @@ pub fn discover_all(
     let mut all_diagnostics = Vec::new();
     let mut seen: std::collections::HashMap<String, (u8, std::path::PathBuf)> =
         std::collections::HashMap::new();
+
+    // Always include built-in commands first
+    let (builtin_cmds, builtin_diags) = discover_builtin();
+    all_diagnostics.extend(builtin_diags);
+    for cmd in builtin_cmds {
+        let name = cmd.name.clone();
+        seen.insert(name.clone(), (cmd.source.priority(), cmd.path.clone()));
+        all_commands.push(cmd);
+    }
 
     for source in sources {
         let (commands, diagnostics) = discover_from_source(source);
@@ -260,8 +309,9 @@ description: {}
         ];
 
         let (cmds, _) = discover_all(&sources);
-        assert_eq!(cmds.len(), 1);
-        assert_eq!(cmds[0].description, "Project review");
+        // Built-in commands are always included; only check the 'review' command
+        let review = cmds.iter().find(|c| c.name == "review").unwrap();
+        assert_eq!(review.description, "Project review");
     }
 
     #[test]
@@ -278,8 +328,9 @@ description: {}
         ];
 
         let (cmds, _) = discover_all(&sources);
-        assert_eq!(cmds.len(), 1);
-        assert_eq!(cmds[0].description, "Configured review");
+        // Built-in commands are always included; only check the 'review' command
+        let review = cmds.iter().find(|c| c.name == "review").unwrap();
+        assert_eq!(review.description, "Configured review");
     }
 
     #[test]

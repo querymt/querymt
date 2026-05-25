@@ -269,6 +269,7 @@ impl RuntimeContext {
         context: Option<String>,
         constraints: Option<String>,
         expected_output: Option<String>,
+        input_packet_id: Option<String>,
     ) -> SessionResult<Delegation> {
         let session_internal_id = self.resolve_session_internal_id().await?;
 
@@ -303,6 +304,7 @@ impl RuntimeContext {
             status: DelegationStatus::Requested,
             verification_spec: None,
             planning_summary: None,
+            input_packet_id,
             retry_count,
             created_at: OffsetDateTime::now_utc(),
             completed_at: None,

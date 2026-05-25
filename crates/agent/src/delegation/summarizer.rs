@@ -4,20 +4,26 @@
 //! a parent planning conversation before delegating to a coder agent. The brief
 //! provides the coder with context about decisions made, files to modify, patterns
 //! to follow, and implementation steps.
+//!
+//! The heavy lifting (history formatting, token estimation, compaction detection,
+//! LLM call logic) is delegated to the shared `BriefGenerator` infrastructure in
+//! `crate::work_packet::brief_generator`. This module keeps the `DelegationSummarizer`
+//! public API intact for backward compatibility while sharing the underlying logic.
 
-use crate::agent::utils::{render_prompt_for_display, render_prompt_for_llm};
 use crate::config::DelegationSummaryConfig;
-use crate::model::{AgentMessage, MessagePart};
+use crate::model::AgentMessage;
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::provider::{ProviderRequest, SessionProvider};
-use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
+use crate::session::pruning::SimpleTokenEstimator;
+use crate::work_packet::brief_generator::BriefMode;
 use querymt::LLMProvider;
-use querymt::chat::{ChatMessage, ChatRole};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
 
-/// System prompt for the summarizer LLM
+/// System prompt for the summarizer LLM.
+///
+/// Kept as a constant for backward compatibility with tests that assert on it.
 const SUMMARIZER_SYSTEM_PROMPT: &str = r#"You are a technical brief writer for a software development team. Your job is to 
 read a planning conversation between a user and a planning agent, then produce a 
 concise, structured Implementation Brief for a coding agent who will do the actual 
@@ -31,12 +37,16 @@ Rules:
 - Include patterns: reference existing code the coder should follow
 - Skip meta-discussion: omit back-and-forth about planning process itself"#;
 
-/// Summarizes a parent planning session for delegation handoff
+/// Summarizes a parent planning session for delegation handoff.
+///
+/// Internally delegates to the shared `BriefGenerator` infrastructure, using
+/// `BriefMode::ImplementationBrief` mode. This keeps the public API stable
+/// while sharing formatting, token estimation, and LLM call logic.
 pub struct DelegationSummarizer {
     provider: Arc<dyn LLMProvider>,
     timeout: Duration,
     min_history_tokens: usize,
-    estimator: Arc<dyn TokenEstimator>,
+    estimator: Arc<dyn crate::session::pruning::TokenEstimator>,
 }
 
 impl DelegationSummarizer {
@@ -70,7 +80,9 @@ impl DelegationSummarizer {
         })
     }
 
-    /// Generate a structured Implementation Brief from parent session history
+    /// Generate a structured Implementation Brief from parent session history.
+    ///
+    /// Uses the shared brief generation logic with `BriefMode::ImplementationBrief`.
     #[instrument(
         name = "delegation.summarizer.summarize",
         skip(self, parent_history),
@@ -90,9 +102,11 @@ impl DelegationSummarizer {
     ) -> SessionResult<String> {
         let span = tracing::Span::current();
 
+        use crate::work_packet::brief_generator::{compaction_as_summary, estimate_history_tokens};
+
         // If the last message in history is a compaction (no messages after it),
         // its summary is already adequate — skip the LLM call.
-        if let Some(summary) = Self::compaction_as_summary(parent_history) {
+        if let Some(summary) = compaction_as_summary(parent_history) {
             span.record("strategy", "compaction");
             span.record("output_bytes", summary.len() as u64);
             log::info!("Using existing compaction summary for delegation (skipping LLM call)");
@@ -101,7 +115,7 @@ impl DelegationSummarizer {
 
         // Check token threshold — below threshold, inject raw formatted history
         // directly into the delegate context (no LLM summarization needed)
-        let estimated_tokens = self.estimate_history_tokens(parent_history);
+        let estimated_tokens = estimate_history_tokens(&*self.estimator, parent_history);
         span.record("estimated_tokens", estimated_tokens as u64);
         if estimated_tokens < self.min_history_tokens {
             span.record("strategy", "raw");
@@ -110,7 +124,8 @@ impl DelegationSummarizer {
                 estimated_tokens,
                 self.min_history_tokens
             );
-            let result = self.format_conversation(parent_history, delegation_objective);
+            // Use "Delegation objective" prefix for backward compatibility
+            let result = Self::format_conversation_delegated(parent_history, delegation_objective);
             span.record("output_bytes", result.len() as u64);
             return Ok(result);
         }
@@ -118,11 +133,11 @@ impl DelegationSummarizer {
         span.record("strategy", "llm");
 
         // 1. Prepare LLM prompt from parent history
-        let input = self.prepare_llm_input(parent_history, delegation_objective);
+        let input = Self::prepare_llm_input_delegated(parent_history, delegation_objective);
 
         // 2. Call LLM with timeout
-        let messages = vec![ChatMessage {
-            role: ChatRole::User,
+        let messages = vec![querymt::chat::ChatMessage {
+            role: querymt::chat::ChatRole::User,
             content: vec![querymt::chat::Content::text(input)],
             cache: None,
         }];
@@ -153,202 +168,33 @@ impl DelegationSummarizer {
         Ok(summary)
     }
 
-    /// Estimate token count for a list of messages using the configured estimator
-    fn estimate_history_tokens(&self, history: &[AgentMessage]) -> usize {
-        history
-            .iter()
-            .map(|m| {
-                m.parts
-                    .iter()
-                    .map(|p| match p {
-                        MessagePart::Text { content } => self.estimator.estimate(content),
-                        MessagePart::Prompt { blocks } => self
-                            .estimator
-                            .estimate(&render_prompt_for_llm(blocks, None)),
-                        MessagePart::ToolResult { content, .. } => {
-                            let text: String = content
-                                .iter()
-                                .filter_map(|b| b.as_text())
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            self.estimator.estimate(&text)
-                        }
-                        MessagePart::Reasoning { content, .. } => self.estimator.estimate(content),
-                        MessagePart::Compaction { summary, .. } => self.estimator.estimate(summary),
-                        _ => 0,
-                    })
-                    .sum::<usize>()
-            })
-            .sum()
+    /// Format the conversation using the shared utility with "Delegation objective" prefix
+    /// for backward compatibility with existing tests.
+    fn format_conversation_delegated(history: &[AgentMessage], objective: &str) -> String {
+        use crate::work_packet::brief_generator::format_conversation;
+        let result = format_conversation(history, objective);
+        // The shared utility uses "Objective:" prefix; delegation uses
+        // "Delegation objective:" for backward compatibility.
+        result.replace("Objective: ", "Delegation objective: ")
     }
 
-    /// If the last message in history is a compaction (no messages after it),
-    /// return its summary directly — it's already adequate context.
-    fn compaction_as_summary(history: &[AgentMessage]) -> Option<String> {
-        // Find the index of the last message that contains a Compaction part
-        let last_compaction_idx = history.iter().rposition(|m| {
-            m.parts
-                .iter()
-                .any(|p| matches!(p, MessagePart::Compaction { .. }))
-        })?;
-
-        // If there are messages after the compaction, we can't skip
-        if last_compaction_idx < history.len() - 1 {
-            return None;
-        }
-
-        // Extract the compaction summary text
-        history[last_compaction_idx].parts.iter().find_map(|p| {
-            if let MessagePart::Compaction { summary, .. } = p {
-                Some(summary.clone())
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Format the planning conversation as a readable transcript.
-    ///
-    /// This produces a clean context dump suitable for direct injection into
-    /// a delegate agent's context. It does NOT include LLM meta-instructions.
-    /// History is expected to be pre-filtered via `get_effective_history`.
-    fn format_conversation(&self, history: &[AgentMessage], objective: &str) -> String {
-        let mut conversation = String::new();
-
-        for msg in history {
-            match msg.role {
-                ChatRole::User => {
-                    // Include full user messages — they contain decisions and requirements
-                    conversation
-                        .push_str(&format!("\n[User]: {}\n", Self::extract_text_content(msg)));
-                }
-                ChatRole::Assistant => {
-                    for part in &msg.parts {
-                        match part {
-                            MessagePart::Text { content } => {
-                                conversation.push_str(&format!("\n[Planner]: {}\n", content));
-                            }
-                            MessagePart::Prompt { blocks } => {
-                                let display_content = render_prompt_for_display(blocks);
-                                if !display_content.trim().is_empty() {
-                                    conversation
-                                        .push_str(&format!("\n[Planner]: {}\n", display_content));
-                                }
-                            }
-                            MessagePart::ToolUse(tu) => {
-                                // Just the tool name + key args, not full output
-                                let args_summary = if let Ok(args_value) =
-                                    serde_json::from_str::<serde_json::Value>(
-                                        &tu.function.arguments,
-                                    ) {
-                                    Self::summarize_tool_args(&args_value)
-                                } else {
-                                    tu.function.arguments.clone()
-                                };
-                                conversation.push_str(&format!(
-                                    "\n[Tool Call]: {} ({})\n",
-                                    tu.function.name, args_summary
-                                ));
-                            }
-                            MessagePart::Compaction {
-                                summary,
-                                original_token_count: _,
-                            } => {
-                                // Include compaction summaries — they're already condensed
-                                conversation.push_str(&format!(
-                                    "\n[Previous Context Summary]: {}\n",
-                                    summary
-                                ));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-
-        format!("Delegation objective: {objective}\n\nPlanning conversation:\n{conversation}")
-    }
-
-    /// Prepare the full prompt for the summarizer LLM.
-    ///
-    /// Wraps the formatted conversation with instructions for the summarizer
-    /// to produce a structured Implementation Brief.
-    fn prepare_llm_input(&self, history: &[AgentMessage], objective: &str) -> String {
-        let conversation = self.format_conversation(history, objective);
-        format!(
-            r#"You are a technical brief writer. A planning agent had the following \
-conversation while researching a task. The task will now be delegated \
-to a coding agent for implementation.
-
-{conversation}
-
-Write a structured Implementation Brief for the coding agent. Include:
-1. **Objective** — one clear sentence
-2. **Key Decisions** — what was decided during planning
-3. **Files to Modify** — specific file paths and what to change in each
-4. **Patterns to Follow** — code patterns, conventions, or reference implementations found
-5. **Constraints** — technical constraints, user preferences, things to avoid
-6. **Implementation Steps** — ordered list of concrete steps
-
-Be specific. Include file paths, function names, and code patterns \
-the planner discovered. The coding agent has no access to this \
-planning conversation."#
-        )
-    }
-
-    /// Extract text content from all message parts
-    fn extract_text_content(msg: &AgentMessage) -> String {
-        let mut rendered_parts = Vec::new();
-        for part in &msg.parts {
-            match part {
-                MessagePart::Text { content } => rendered_parts.push(content.clone()),
-                MessagePart::Prompt { blocks } => {
-                    rendered_parts.push(render_prompt_for_display(blocks));
-                }
-                _ => {}
-            }
-        }
-        rendered_parts.join("\n")
-    }
-
-    /// Summarize tool arguments to just the key info
-    fn summarize_tool_args(input: &serde_json::Value) -> String {
-        // Extract common useful fields
-        if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
-            return path.to_string();
-        }
-        if let Some(pattern) = input.get("pattern").and_then(|v| v.as_str()) {
-            return pattern.to_string();
-        }
-        if let Some(file_path) = input.get("filePath").and_then(|v| v.as_str()) {
-            return file_path.to_string();
-        }
-        if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
-            return if command.len() > 100 {
-                let end = command.floor_char_boundary(100);
-                format!("{}...", &command[..end])
-            } else {
-                command.to_string()
-            };
-        }
-
-        // Fallback: truncated JSON
-        let s = serde_json::to_string(input).unwrap_or_default();
-        if s.len() > 200 {
-            let end = s.floor_char_boundary(200);
-            format!("{}...", &s[..end])
-        } else {
-            s
-        }
+    /// Prepare LLM input using the shared utility with "Delegation objective" prefix
+    /// for backward compatibility.
+    fn prepare_llm_input_delegated(history: &[AgentMessage], objective: &str) -> String {
+        use crate::work_packet::brief_generator::prepare_llm_input;
+        let result = prepare_llm_input(history, objective, BriefMode::ImplementationBrief);
+        // The shared utility uses "Objective:" prefix; delegation uses
+        // "Delegation objective:" for backward compatibility.
+        result.replace("Objective: ", "Delegation objective: ")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::work_packet::brief_generator::summarize_tool_args;
 
-    // ── summarize_tool_args ────────────────────────────────────────────────
+    // ── summarize_tool_args (re-exported from brief_generator) ────────────
 
     #[test]
     fn summarize_tool_args_extracts_path() {
@@ -356,7 +202,7 @@ mod tests {
             "path": "src/main.rs",
             "other": "ignored"
         });
-        let summary = DelegationSummarizer::summarize_tool_args(&args);
+        let summary = summarize_tool_args(&args);
         assert_eq!(summary, "src/main.rs");
     }
 
@@ -366,7 +212,7 @@ mod tests {
             "pattern": "*.rs",
             "other": "ignored"
         });
-        let summary = DelegationSummarizer::summarize_tool_args(&args);
+        let summary = summarize_tool_args(&args);
         assert_eq!(summary, "*.rs");
     }
 
@@ -376,7 +222,7 @@ mod tests {
             "filePath": "test.txt",
             "other": "ignored"
         });
-        let summary = DelegationSummarizer::summarize_tool_args(&args);
+        let summary = summarize_tool_args(&args);
         assert_eq!(summary, "test.txt");
     }
 
@@ -386,7 +232,7 @@ mod tests {
             "command": "cargo build",
             "other": "ignored"
         });
-        let summary = DelegationSummarizer::summarize_tool_args(&args);
+        let summary = summarize_tool_args(&args);
         assert_eq!(summary, "cargo build");
     }
 
@@ -396,28 +242,21 @@ mod tests {
         let args = serde_json::json!({
             "command": long_cmd
         });
-        let summary = DelegationSummarizer::summarize_tool_args(&args);
-        // floor_char_boundary may round down, so length is <= 100 + "...".len()
+        let summary = summarize_tool_args(&args);
         assert!(summary.len() <= 103);
         assert!(summary.ends_with("..."));
-        // The retained prefix must itself be valid UTF-8 (no panic on indexing)
         assert!(std::str::from_utf8(summary.trim_end_matches("...").as_bytes()).is_ok());
     }
 
     #[test]
     fn summarize_tool_args_truncates_multibyte_json() {
-        // em dash (—) is 3 bytes: 0xE2 0x80 0x94.
-        // Previously `&s[..200]` would panic when the boundary landed inside it.
-        // Build a JSON string that is > 200 bytes and contains an em dash near byte 200.
-        let filler = "x".repeat(195); // 195 ASCII bytes in JSON value
+        let filler = "x".repeat(195);
         let args = serde_json::json!({
             "todos": [{"id": "1", "content": format!("{}—suffix", filler)}]
         });
-        // This must not panic.
-        let summary = DelegationSummarizer::summarize_tool_args(&args);
+        let summary = summarize_tool_args(&args);
         assert!(summary.ends_with("..."));
         assert!(summary.len() <= 203);
-        // Result must be valid UTF-8.
         assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
     }
 
@@ -427,8 +266,7 @@ mod tests {
             "unknown_field": "value",
             "another": 123
         });
-        let summary = DelegationSummarizer::summarize_tool_args(&args);
-        // Should be JSON representation
+        let summary = summarize_tool_args(&args);
         assert!(summary.contains("unknown_field"));
         assert!(summary.contains("value"));
     }
@@ -440,11 +278,9 @@ mod tests {
             obj.insert(format!("field_{}", i), serde_json::json!("long_value"));
         }
         let args = serde_json::Value::Object(obj);
-        let summary = DelegationSummarizer::summarize_tool_args(&args);
-        // floor_char_boundary may round down, so length is <= 200 + "...".len()
+        let summary = summarize_tool_args(&args);
         assert!(summary.len() <= 203);
         assert!(summary.ends_with("..."));
-        // The retained prefix must itself be valid UTF-8 (no panic on indexing)
         assert!(std::str::from_utf8(summary.trim_end_matches("...").as_bytes()).is_ok());
     }
 
@@ -454,8 +290,8 @@ mod tests {
         AgentMessage {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: "s1".to_string(),
-            role: ChatRole::User,
-            parts: vec![MessagePart::Text {
+            role: querymt::chat::ChatRole::User,
+            parts: vec![crate::model::MessagePart::Text {
                 content: text.to_string(),
             }],
             created_at: 0,
@@ -469,8 +305,8 @@ mod tests {
         AgentMessage {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: "s1".to_string(),
-            role: ChatRole::Assistant,
-            parts: vec![MessagePart::Text {
+            role: querymt::chat::ChatRole::Assistant,
+            parts: vec![crate::model::MessagePart::Text {
                 content: text.to_string(),
             }],
             created_at: 0,
@@ -480,34 +316,18 @@ mod tests {
         }
     }
 
-    /// Helper: build a DelegationSummarizer with dummy provider (only used for
-    /// testing format_conversation / prepare_llm_input which don't call the LLM).
-    fn test_summarizer() -> DelegationSummarizer {
-        use crate::session::pruning::SimpleTokenEstimator;
-        // We need a provider to satisfy the struct, but format_conversation
-        // and prepare_llm_input don't use it.
-        let provider: Arc<dyn querymt::LLMProvider> =
-            Arc::new(crate::test_utils::mocks::MockLlmProvider::new());
-        DelegationSummarizer {
-            provider,
-            timeout: Duration::from_secs(30),
-            min_history_tokens: 500,
-            estimator: Arc::new(SimpleTokenEstimator),
-        }
-    }
-
     #[test]
     fn format_conversation_does_not_contain_llm_instructions() {
         let history = vec![
             make_user_msg("Add a login page"),
             make_assistant_msg("I'll create a login component in src/Login.tsx"),
         ];
-        let summarizer = test_summarizer();
-        let output = summarizer.format_conversation(&history, "Implement login page");
+        let output =
+            DelegationSummarizer::format_conversation_delegated(&history, "Implement login page");
 
         assert!(output.contains("Delegation objective: Implement login page"));
         assert!(output.contains("[User]: Add a login page"));
-        assert!(output.contains("[Planner]: I'll create a login component"));
+        assert!(output.contains("[Agent]: I'll create a login component"));
         // Must NOT contain summarizer LLM instructions
         assert!(
             !output.contains("Write a structured Implementation Brief"),
@@ -525,8 +345,8 @@ mod tests {
             make_user_msg("Add a login page"),
             make_assistant_msg("I'll create a login component"),
         ];
-        let summarizer = test_summarizer();
-        let output = summarizer.prepare_llm_input(&history, "Implement login page");
+        let output =
+            DelegationSummarizer::prepare_llm_input_delegated(&history, "Implement login page");
 
         // Should contain the conversation content
         assert!(output.contains("[User]: Add a login page"));

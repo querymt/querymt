@@ -637,6 +637,10 @@ pub(super) async fn record_tool_side_effects(
             .get("expected_output")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let input_packet_id = args
+            .get("input_packet_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         if let Ok(delegation) = exec_ctx
             .state
@@ -646,6 +650,7 @@ pub(super) async fn record_tool_side_effects(
                 context_val.clone(),
                 constraints,
                 expected_output,
+                input_packet_id,
             )
             .await
         {
