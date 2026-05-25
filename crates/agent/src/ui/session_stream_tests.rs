@@ -47,6 +47,7 @@ async fn test_profile_manager(
     let infra = AgentInfra {
         plugin_registry: Arc::new(registry),
         storage: Some(storage),
+        session_mcp_attachment_source: None,
     };
     let catalog: Arc<dyn crate::profiles::ProfileCatalog> = Arc::new(
         LocalProfileCatalog::builder()

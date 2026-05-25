@@ -137,7 +137,9 @@ impl RemoteAgentHandle {
         let session_id = resp.session_id.clone();
         span.record("session_id", session_id.as_str());
 
-        let session_ref = self.attach_handoff_session(&session_id, resp.handoff).await?;
+        let session_ref = self
+            .attach_handoff_session(&session_id, resp.handoff)
+            .await?;
 
         Ok((session_id, session_ref))
     }

@@ -78,6 +78,7 @@ impl AgentInfra {
         Ok(Self {
             plugin_registry: registry,
             storage: Some(storage),
+            session_mcp_attachment_source: None,
         })
     }
 }
