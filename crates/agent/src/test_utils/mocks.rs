@@ -47,6 +47,19 @@ mock! {
         async fn get_llm_config(&self, id: i64) -> SessionResult<Option<LLMConfig>>;
         async fn get_session_llm_config(&self, session_id: &str) -> SessionResult<Option<LLMConfig>>;
         async fn set_session_llm_config(&self, session_id: &str, config_id: i64) -> SessionResult<()>;
+        async fn set_profile_binding<'a, 'b, 'c>(
+            &'a self,
+            session_id: &'b str,
+            profile_id: &'c str,
+        ) -> SessionResult<()>;
+        async fn get_profile_binding<'a, 'b>(
+            &'a self,
+            session_id: &'b str,
+        ) -> SessionResult<Option<String>>;
+        async fn remove_profile_binding<'a, 'b>(
+            &'a self,
+            session_id: &'b str,
+        ) -> SessionResult<()>;
         async fn set_session_provider_node_id<'a, 'b, 'c>(
             &'a self,
             session_id: &'b str,

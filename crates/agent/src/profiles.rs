@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -79,11 +79,10 @@ pub struct ProfileDocument {
 /// This matters because resume/routing code must know which profile runtime owns a
 /// session; otherwise a session could be resumed under the wrong profile after the
 /// user switches profiles. Bindings are cached in memory and backed by a
-/// best-effort cache file that maps session id to profile id only.
+/// best-effort `profile_bindings` side table that maps session id to profile id.
 ///
-/// The session database intentionally does not store profile provenance. The cache
-/// is advisory: unavailable, empty, or invalid cached profile ids are ignored so
-/// callers can fall back to the active profile behavior.
+/// The binding is advisory: missing or unavailable persisted profile ids are
+/// ignored so callers can fall back to the active profile behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionProfileBinding {
     pub profile_id: String,
@@ -439,92 +438,17 @@ pub fn ensure_unique_profile_ids(profiles: &[ProfileMetadata]) -> Result<()> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct SessionProfileBindingCache {
-    dir: PathBuf,
-}
-
-impl SessionProfileBindingCache {
-    fn default() -> Option<Self> {
-        dirs::cache_dir().map(Self::from_cache_root)
-    }
-
-    fn from_cache_root(root: impl Into<PathBuf>) -> Self {
-        let mut dir = root.into();
-        dir.push("querymt");
-        dir.push("session-profiles");
-        Self { dir }
-    }
-
-    fn path_for(&self, session_id: &str) -> Option<PathBuf> {
-        if session_id.is_empty()
-            || session_id.contains('/')
-            || session_id.contains('\\')
-            || session_id.contains("..")
-            || Path::new(session_id)
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
-        {
-            warn!(session_id, "skipping invalid session profile cache key");
-            return None;
-        }
-        Some(self.dir.join(session_id))
-    }
-
-    async fn write(&self, session_id: &str, profile_id: &str) -> Result<()> {
-        let Some(path) = self.path_for(session_id) else {
-            return Ok(());
-        };
-        tokio::fs::create_dir_all(&self.dir)
-            .await
-            .with_context(|| format!("create session profile cache dir {}", self.dir.display()))?;
-        tokio::fs::write(&path, profile_id.as_bytes())
-            .await
-            .with_context(|| format!("write session profile cache {}", path.display()))
-    }
-
-    async fn read(&self, session_id: &str) -> Option<String> {
-        let path = self.path_for(session_id)?;
-        match tokio::fs::read_to_string(&path).await {
-            Ok(content) => {
-                let profile_id = content.trim();
-                if profile_id.is_empty() {
-                    warn!(session_id, path = %path.display(), "ignoring empty session profile cache entry");
-                    None
-                } else {
-                    Some(profile_id.to_string())
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => {
-                warn!(session_id, path = %path.display(), error = %err, "failed to read session profile cache entry");
-                None
-            }
-        }
-    }
-
-    async fn remove(&self, session_id: &str) {
-        let Some(path) = self.path_for(session_id) else {
-            return;
-        };
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                warn!(session_id, path = %path.display(), error = %err, "failed to remove session profile cache entry");
-            }
-        }
-    }
-}
-
 /// Lazily builds and caches profile runtimes keyed by profile id.
+///
+/// Session/profile bindings are advisory: they are kept in memory and, when
+/// shared storage is available, persisted to the sessions DB `profile_bindings`
+/// side table. Missing or unavailable persisted profiles fall back to active.
 pub struct ProfileRuntimeManager<C = Arc<dyn ProfileCatalog>> {
     catalog: C,
     shared_infra: AgentInfra,
     active_profile_id: Mutex<String>,
     runtimes: Mutex<HashMap<String, Arc<ProfileRuntime>>>,
     session_bindings: Mutex<HashMap<String, SessionProfileBinding>>,
-    binding_cache: Option<SessionProfileBindingCache>,
 }
 
 impl<C> ProfileRuntimeManager<C>
@@ -553,14 +477,7 @@ where
             active_profile_id: Mutex::new(active_profile_id.into()),
             runtimes: Mutex::new(HashMap::new()),
             session_bindings: Mutex::new(HashMap::new()),
-            binding_cache: SessionProfileBindingCache::default(),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_session_binding_cache_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.binding_cache = Some(SessionProfileBindingCache::from_cache_root(root));
-        self
     }
 
     pub async fn list_profiles(&self) -> Result<Vec<ProfileMetadata>> {
@@ -624,10 +541,16 @@ where
             .lock()
             .await
             .insert(session_id.clone(), binding.clone());
-        if let Some(cache) = &self.binding_cache
-            && let Err(err) = cache.write(&session_id, &binding.profile_id).await
+        let Some(storage) = &self.shared_infra.storage else {
+            warn!(session_id, profile_id = %binding.profile_id, "session profile binding is memory-only because shared storage is unavailable");
+            return;
+        };
+        if let Err(err) = storage
+            .session_store()
+            .set_profile_binding(&session_id, &binding.profile_id)
+            .await
         {
-            warn!(session_id, profile_id = %binding.profile_id, error = %err, "failed to write session profile cache entry");
+            warn!(session_id, profile_id = %binding.profile_id, error = %err, "failed to persist session profile binding");
         }
     }
 
@@ -636,11 +559,25 @@ where
             return Some(binding);
         }
 
-        let profile_id = self.binding_cache.as_ref()?.read(session_id).await?;
+        let Some(storage) = &self.shared_infra.storage else {
+            return None;
+        };
+        let profile_id = match storage
+            .session_store()
+            .get_profile_binding(session_id)
+            .await
+        {
+            Ok(Some(profile_id)) => profile_id,
+            Ok(None) => return None,
+            Err(err) => {
+                warn!(session_id, error = %err, "failed to read session profile binding");
+                return None;
+            }
+        };
         let runtime = match self.runtime_for_profile(&profile_id).await {
             Ok(runtime) => runtime,
             Err(err) => {
-                warn!(session_id, profile_id, error = %err, "ignoring unavailable cached session profile");
+                warn!(session_id, profile_id, error = %err, "ignoring unavailable persisted session profile binding");
                 return None;
             }
         };
@@ -658,8 +595,13 @@ where
 
     pub async fn forget_session_binding(&self, session_id: &str) -> Option<SessionProfileBinding> {
         let removed = self.session_bindings.lock().await.remove(session_id);
-        if let Some(cache) = &self.binding_cache {
-            cache.remove(session_id).await;
+        if let Some(storage) = &self.shared_infra.storage
+            && let Err(err) = storage
+                .session_store()
+                .remove_profile_binding(session_id)
+                .await
+        {
+            warn!(session_id, error = %err, "failed to remove session profile binding");
         }
         removed
     }
@@ -700,7 +642,6 @@ impl ProfileRuntimeManager<Arc<dyn ProfileCatalog>> {
             active_profile_id: Mutex::new(active_profile_id.into()),
             runtimes: Mutex::new(HashMap::new()),
             session_bindings: Mutex::new(HashMap::new()),
-            binding_cache: SessionProfileBindingCache::default(),
         }
     }
 }
@@ -1334,7 +1275,7 @@ system = "inline"
     }
 
     #[tokio::test]
-    async fn session_bindings_read_through_cache_across_managers() {
+    async fn session_bindings_read_through_db_across_managers() {
         let dir = temp_profile_dir();
         write_profile(
             dir.path(),
@@ -1356,16 +1297,13 @@ model = "test-model"
 system = "inline"
 "#,
         );
-        let cache_dir = tempfile::TempDir::new().expect("temp cache dir");
         let (infra, _registry_dir) = test_infra().await;
         let catalog = LocalProfileCatalog::builder()
             .include_embedded_default(false)
             .local_dir(dir.path())
             .build();
-        let manager_a = ProfileRuntimeManager::with_infra(catalog.clone(), "alpha", infra.clone())
-            .with_session_binding_cache_root(cache_dir.path());
-        let manager_b = ProfileRuntimeManager::with_infra(catalog, "beta", infra)
-            .with_session_binding_cache_root(cache_dir.path());
+        let manager_a = ProfileRuntimeManager::with_infra(catalog.clone(), "alpha", infra.clone());
+        let manager_b = ProfileRuntimeManager::with_infra(catalog, "beta", infra.clone());
 
         let binding = manager_a
             .bind_session_to_profile("session-1", "alpha")
@@ -1382,13 +1320,24 @@ system = "inline"
             manager_b.session_binding("session-1").await.as_ref(),
             Some(&binding)
         );
+        assert_eq!(
+            infra
+                .storage
+                .as_ref()
+                .expect("shared storage")
+                .session_store()
+                .get_profile_binding("session-1")
+                .await
+                .expect("binding row"),
+            Some("alpha".to_string())
+        );
 
         manager_a.shutdown().await;
         manager_b.shutdown().await;
     }
 
     #[tokio::test]
-    async fn missing_or_invalid_session_binding_cache_returns_none() {
+    async fn missing_or_unavailable_db_session_binding_returns_none() {
         let dir = temp_profile_dir();
         write_profile(
             dir.path(),
@@ -1400,29 +1349,29 @@ model = "test-model"
 system = "inline"
 "#,
         );
-        let cache_dir = tempfile::TempDir::new().expect("temp cache dir");
-        let session_profiles_dir = cache_dir.path().join("querymt").join("session-profiles");
-        std::fs::create_dir_all(&session_profiles_dir).expect("cache dir");
-        std::fs::write(session_profiles_dir.join("empty-session"), "\n").expect("empty cache file");
-        std::fs::write(session_profiles_dir.join("unknown-session"), "alpha\n")
-            .expect("unknown cache file");
         let (infra, _registry_dir) = test_infra().await;
+        infra
+            .storage
+            .as_ref()
+            .expect("shared storage")
+            .session_store()
+            .set_profile_binding("unknown-session", "alpha")
+            .await
+            .expect("binding row");
         let catalog = LocalProfileCatalog::builder()
             .include_embedded_default(false)
             .local_dir(dir.path())
             .build();
-        let manager = ProfileRuntimeManager::with_infra(catalog, "beta", infra)
-            .with_session_binding_cache_root(cache_dir.path());
+        let manager = ProfileRuntimeManager::with_infra(catalog, "beta", infra);
 
         assert!(manager.session_binding("missing-session").await.is_none());
-        assert!(manager.session_binding("empty-session").await.is_none());
         assert!(manager.session_binding("unknown-session").await.is_none());
 
         manager.shutdown().await;
     }
 
     #[tokio::test]
-    async fn forget_session_binding_removes_cache_entry() {
+    async fn forget_session_binding_removes_db_entry() {
         let dir = temp_profile_dir();
         write_profile(
             dir.path(),
@@ -1434,31 +1383,29 @@ model = "test-model"
 system = "inline"
 "#,
         );
-        let cache_dir = tempfile::TempDir::new().expect("temp cache dir");
         let (infra, _registry_dir) = test_infra().await;
+        let store = infra
+            .storage
+            .as_ref()
+            .expect("shared storage")
+            .session_store();
         let catalog = LocalProfileCatalog::builder()
             .include_embedded_default(false)
             .local_dir(dir.path())
             .build();
-        let manager_a = ProfileRuntimeManager::with_infra(catalog.clone(), "alpha", infra.clone())
-            .with_session_binding_cache_root(cache_dir.path());
-        let manager_b = ProfileRuntimeManager::with_infra(catalog, "alpha", infra)
-            .with_session_binding_cache_root(cache_dir.path());
+        let manager_a = ProfileRuntimeManager::with_infra(catalog.clone(), "alpha", infra.clone());
+        let manager_b = ProfileRuntimeManager::with_infra(catalog, "alpha", infra);
 
         let binding = manager_a
             .bind_session_to_profile("session-1", "alpha")
             .await
             .expect("session binds in manager A");
         assert_eq!(
-            std::fs::read_to_string(
-                cache_dir
-                    .path()
-                    .join("querymt")
-                    .join("session-profiles")
-                    .join("session-1")
-            )
-            .expect("cache entry"),
-            "alpha"
+            store
+                .get_profile_binding("session-1")
+                .await
+                .expect("binding row"),
+            Some("alpha".to_string())
         );
         assert_eq!(
             manager_a.forget_session_binding("session-1").await,
@@ -1466,13 +1413,12 @@ system = "inline"
         );
 
         assert!(manager_b.session_binding("session-1").await.is_none());
-        assert!(
-            !cache_dir
-                .path()
-                .join("querymt")
-                .join("session-profiles")
-                .join("session-1")
-                .exists()
+        assert_eq!(
+            store
+                .get_profile_binding("session-1")
+                .await
+                .expect("binding removed"),
+            None
         );
 
         manager_a.shutdown().await;

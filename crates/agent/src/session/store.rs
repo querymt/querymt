@@ -257,6 +257,15 @@ pub trait SessionStore: Send + Sync {
     /// Set the LLM configuration id for a session
     async fn set_session_llm_config(&self, session_id: &str, config_id: i64) -> SessionResult<()>;
 
+    /// Persist the advisory profile binding for a session.
+    async fn set_profile_binding(&self, session_id: &str, profile_id: &str) -> SessionResult<()>;
+
+    /// Retrieve the advisory profile binding for a session.
+    async fn get_profile_binding(&self, session_id: &str) -> SessionResult<Option<String>>;
+
+    /// Remove the advisory profile binding for a session.
+    async fn remove_profile_binding(&self, session_id: &str) -> SessionResult<()>;
+
     /// Set the provider node for a session (None = local, Some = remote mesh node).
     async fn set_session_provider_node_id(
         &self,

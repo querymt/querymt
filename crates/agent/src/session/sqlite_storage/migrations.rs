@@ -48,6 +48,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0009_sessions_browse_and_search_indexes",
         apply: migration_0009_sessions_browse_and_search_indexes,
     },
+    Migration {
+        version: "0010_profile_bindings",
+        apply: migration_0010_profile_bindings,
+    },
 ];
 
 pub(super) fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -414,5 +418,17 @@ fn migration_0009_sessions_browse_and_search_indexes(
         "#,
     )?;
 
+    Ok(())
+}
+
+fn migration_0010_profile_bindings(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        r#"
+            CREATE TABLE IF NOT EXISTS profile_bindings (
+                session_id TEXT PRIMARY KEY,
+                profile_id TEXT NOT NULL
+            );
+        "#,
+    )?;
     Ok(())
 }
