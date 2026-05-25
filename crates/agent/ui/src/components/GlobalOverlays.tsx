@@ -7,12 +7,13 @@ import { SessionSwitcher } from './SessionSwitcher';
 import { ShortcutGateway } from './ShortcutGateway';
 import { ThemeSwitcher } from './ThemeSwitcher';
 import { ProviderAuthSwitcher } from './ProviderAuthSwitcher';
+import { ProfilePicker } from './ProfilePicker';
 import { WorkspacePathDialog } from './WorkspacePathDialog';
 import { CreateScheduleDialog } from './CreateScheduleDialog';
 import { StatsDrawer } from './StatsDrawer';
 import { PluginUpdateIndicator } from './PluginUpdateIndicator';
 import type { DashboardTheme } from '../utils/dashboardThemes';
-import type { UiAgentInfo, SessionGroup, SessionLimits, AuthMethod } from '../types';
+import type { UiAgentInfo, SessionGroup, SessionLimits, AuthMethod, UiProfileInfo } from '../types';
 
 interface GlobalOverlaysProps {
   // Session switcher
@@ -38,6 +39,12 @@ interface GlobalOverlaysProps {
   updatePlugins: () => void;
   setCreateScheduleDialogOpen: (open: boolean) => void;
   isUpdatingPlugins: boolean;
+  profilePickerOpen: boolean;
+  setProfilePickerOpen: (open: boolean) => void;
+  profiles: UiProfileInfo[];
+  activeProfileId: string | null;
+  currentSessionProfileId?: string;
+  setActiveProfile: (profileId: string) => void;
 
   // Theme switcher
   themeSwitcherOpen: boolean;
@@ -128,7 +135,22 @@ export function GlobalOverlays(props: GlobalOverlaysProps) {
           props.setShortcutGatewayOpen(false);
           props.setCreateScheduleDialogOpen(true);
         }}
+        hasProfiles={props.profiles.length > 0}
+        onOpenProfiles={() => {
+          props.setShortcutGatewayOpen(false);
+          props.setProfilePickerOpen(true);
+        }}
         isUpdatingPlugins={props.isUpdatingPlugins}
+      />
+
+      <ProfilePicker
+        open={props.profilePickerOpen}
+        onOpenChange={props.setProfilePickerOpen}
+        profiles={props.profiles}
+        activeProfileId={props.activeProfileId}
+        currentSessionProfileId={props.currentSessionProfileId}
+        connected={props.connected}
+        onSelectProfile={props.setActiveProfile}
       />
 
       <ThemeSwitcher

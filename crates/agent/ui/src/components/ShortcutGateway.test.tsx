@@ -19,6 +19,9 @@ describe('ShortcutGateway', () => {
     onSelectTheme: vi.fn(),
     onAuthenticateProvider: vi.fn(),
     onUpdatePlugins: vi.fn(),
+    onCreateSchedule: vi.fn(),
+    hasProfiles: false,
+    onOpenProfiles: vi.fn(),
     isUpdatingPlugins: false,
   };
 
@@ -133,5 +136,32 @@ describe('ShortcutGateway', () => {
     expect(updateItem).toBeTruthy();
     // Badge should show "Updating..." instead of "U"
     expect(updateItem).toHaveTextContent('Updating...');
+  });
+
+  it('hides profiles command when profiles are unavailable', () => {
+    render(<ShortcutGateway {...defaultProps} hasProfiles={false} />);
+
+    expect(screen.queryByText('Profiles')).not.toBeInTheDocument();
+  });
+
+  it('renders a single profiles command when profiles are available', () => {
+    render(<ShortcutGateway {...defaultProps} hasProfiles={true} />);
+
+    expect(screen.getByText('Profiles')).toBeInTheDocument();
+    expect(screen.getByText('Switch active profile for new sessions')).toBeInTheDocument();
+    expect(screen.queryByText('Default')).not.toBeInTheDocument();
+    expect(screen.queryByText('Research')).not.toBeInTheDocument();
+  });
+
+  it('opens the profile picker from the profiles command', async () => {
+    const user = userEvent.setup();
+    const onOpenProfiles = vi.fn();
+    render(<ShortcutGateway {...defaultProps} hasProfiles={true} onOpenProfiles={onOpenProfiles} />);
+
+    const profilesItem = screen.getByText('Profiles').closest('[cmdk-item]');
+    expect(profilesItem).toBeTruthy();
+    await user.click(profilesItem!);
+
+    expect(onOpenProfiles).toHaveBeenCalledTimes(1);
   });
 });

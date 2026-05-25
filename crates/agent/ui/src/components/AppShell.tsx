@@ -125,6 +125,7 @@ export function AppShell() {
   const [shortcutGatewayOpen, setShortcutGatewayOpen] = useState(false);
   const [themeSwitcherOpen, setThemeSwitcherOpen] = useState(false);
   const [providerAuthOpen, setProviderAuthOpen] = useState(false);
+  const [profilePickerOpen, setProfilePickerOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const isSessionActive = thinkingAgentIds.size > 0;
   const availableThemes = useMemo(() => getDashboardThemes(), []);
@@ -150,6 +151,9 @@ export function AppShell() {
     setThemeSwitcherOpen,
     providerAuthOpen,
     setProviderAuthOpen,
+    profilePickerOpen,
+    setProfilePickerOpen,
+    profilesAvailable: profiles.length > 0,
     handleNewSession,
     cancelSession,
     cycleAgentMode,
@@ -182,6 +186,7 @@ export function AppShell() {
       shortcutGatewayOpen ||
       themeSwitcherOpen ||
       providerAuthOpen ||
+      profilePickerOpen ||
       workspacePathDialogOpen ||
       createScheduleDialogOpen;
 
@@ -190,7 +195,7 @@ export function AppShell() {
   }, [
     sessionSwitcherOpen, modelPickerOpen, statsDrawerOpen,
     delegationDrawerOpen, selectedToolEvent, shortcutGatewayOpen,
-    themeSwitcherOpen, providerAuthOpen, workspacePathDialogOpen,
+    themeSwitcherOpen, providerAuthOpen, profilePickerOpen, workspacePathDialogOpen,
     createScheduleDialogOpen, isMobile,
   ]);
 
@@ -277,10 +282,6 @@ export function AppShell() {
         reconnecting={reconnecting}
         isSessionActive={isSessionActive}
         isConversationComplete={isConversationComplete}
-        profiles={profiles}
-        activeProfileId={activeProfileId}
-        currentSessionProfileId={currentSessionProfileId}
-        onSelectProfile={setActiveProfile}
         agentMode={agentMode}
         cycleAgentMode={cycleAgentMode}
         setSessionSwitcherOpen={setSessionSwitcherOpen}
@@ -380,6 +381,12 @@ export function AppShell() {
         updatePlugins={updatePlugins}
         setCreateScheduleDialogOpen={setCreateScheduleDialogOpen}
         isUpdatingPlugins={isUpdatingPlugins}
+        profilePickerOpen={profilePickerOpen}
+        setProfilePickerOpen={setProfilePickerOpen}
+        profiles={profiles}
+        activeProfileId={activeProfileId}
+        currentSessionProfileId={currentSessionProfileId}
+        setActiveProfile={setActiveProfile}
         themeSwitcherOpen={themeSwitcherOpen}
         availableThemes={availableThemes}
         selectedTheme={selectedTheme}

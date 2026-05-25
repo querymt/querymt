@@ -5,7 +5,7 @@ import { toggleDebugLog } from '../utils/debugLog';
 /**
  * Centralizes all global keyboard shortcuts previously inline in AppShell.
  *
- * - Ctrl/Cmd+X gateway (chords: T, N, A, U, S, D)
+ * - Ctrl/Cmd+X gateway (chords: T, P, N, A, U, S, D)
  * - Ctrl/Cmd+E cycle agent mode
  * - Ctrl/Cmd+; cycle reasoning effort
  * - Ctrl/Cmd+Shift+M toggle model picker
@@ -22,6 +22,9 @@ export function useGlobalKeyboardShortcuts({
   setThemeSwitcherOpen,
   providerAuthOpen,
   setProviderAuthOpen,
+  profilePickerOpen,
+  setProfilePickerOpen,
+  profilesAvailable,
   handleNewSession,
   cancelSession,
   cycleAgentMode,
@@ -39,6 +42,9 @@ export function useGlobalKeyboardShortcuts({
   setThemeSwitcherOpen: (open: boolean) => void;
   providerAuthOpen: boolean;
   setProviderAuthOpen: (open: boolean) => void;
+  profilePickerOpen: boolean;
+  setProfilePickerOpen: (open: boolean) => void;
+  profilesAvailable: boolean;
   handleNewSession: () => void;
   cancelSession: () => void;
   cycleAgentMode: () => void;
@@ -74,6 +80,13 @@ export function useGlobalKeyboardShortcuts({
         e.preventDefault();
         setShortcutGatewayOpen(false);
         setThemeSwitcherOpen(true);
+        return;
+      }
+
+      if (shortcutGatewayOpen && !e.altKey && !e.shiftKey && normalizedKey === 'p' && profilesAvailable) {
+        e.preventDefault();
+        setShortcutGatewayOpen(false);
+        setProfilePickerOpen(true);
         return;
       }
 
@@ -170,6 +183,8 @@ export function useGlobalKeyboardShortcuts({
     setShortcutGatewayOpen,
     setThemeSwitcherOpen,
     setProviderAuthOpen,
+    setProfilePickerOpen,
+    profilesAvailable,
     requestAuthProviders,
     updatePlugins,
     setCreateScheduleDialogOpen,
@@ -220,6 +235,12 @@ export function useGlobalKeyboardShortcuts({
           setThemeSwitcherOpen(false);
           return;
         }
+        if (profilePickerOpen) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          setProfilePickerOpen(false);
+          return;
+        }
         if (providerAuthOpen) {
           e.preventDefault();
           e.stopImmediatePropagation();
@@ -255,6 +276,7 @@ export function useGlobalKeyboardShortcuts({
     cancelSession,
     shortcutGatewayOpen,
     themeSwitcherOpen,
+    profilePickerOpen,
     providerAuthOpen,
     workspacePathDialogOpen,
     cancelWorkspacePathDialog,
@@ -263,6 +285,7 @@ export function useGlobalKeyboardShortcuts({
     setModelPickerOpen,
     setShortcutGatewayOpen,
     setProviderAuthOpen,
+    setProfilePickerOpen,
     setStatsDrawerOpen,
     setCreateScheduleDialogOpen,
     setThemeSwitcherOpen,
