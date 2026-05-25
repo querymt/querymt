@@ -1,17 +1,19 @@
 //! Focused tests for session list UI handlers and dispatch.
 
 use crate::api::AgentInfra;
+use crate::model::{AgentMessage, MessagePart};
 use crate::profiles::{LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager};
 use crate::session::backend::StorageBackend;
 use crate::session::domain::ForkOrigin;
 use crate::session::projection::SessionScope;
 use crate::test_utils::empty_plugin_registry;
 use crate::ui::handlers::{
-    ListSessionsRequest, handle_list_session_children, handle_list_sessions, handle_load_session,
-    handle_ui_message,
+    ListSessionsRequest, handle_fork_session, handle_list_session_children, handle_list_sessions,
+    handle_load_session, handle_ui_message,
 };
 use crate::ui::messages::UiClientMessage;
 use anyhow::Result;
+use querymt::chat::ChatRole;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -583,6 +585,81 @@ async fn handle_load_session_falls_back_active_when_db_profile_unavailable() -> 
     let loaded = next_message_of_type(&mut rx, "session_loaded").await;
     assert_eq!(loaded["data"]["session_id"], session_id);
     assert_eq!(loaded["data"]["profile_id"], "beta");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn handle_fork_session_preserves_bound_profile_after_active_profile_changes() -> Result<()> {
+    let mut f = crate::test_utils::TestServerState::new().await;
+    let dir = TempDir::new()?;
+    write_profile(dir.path(), "alpha.toml");
+    write_profile(dir.path(), "beta.toml");
+    let profiles = attach_profiles(&mut f, "alpha", dir.path()).await;
+    let session_id = f.agent.create_session().await;
+    let message_id = uuid::Uuid::new_v4().to_string();
+    f.agent
+        .storage
+        .session_store()
+        .add_message(
+            &session_id,
+            AgentMessage {
+                id: message_id.clone(),
+                session_id: session_id.clone(),
+                role: ChatRole::User,
+                parts: vec![MessagePart::Text {
+                    content: "Fork from alpha".to_string(),
+                }],
+                created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+                parent_message_id: None,
+                source_provider: None,
+                source_model: None,
+            },
+        )
+        .await?;
+    profiles
+        .bind_session_to_profile(session_id.clone(), "alpha")
+        .await
+        .expect("source session should bind to alpha");
+    profiles
+        .set_active_profile("beta")
+        .await
+        .expect("active profile should switch for future sessions");
+    let (tx, mut rx) = f.add_connection("conn-fork-profile").await;
+
+    {
+        let mut connections = f.state.connections.lock().await;
+        let conn = connections
+            .get_mut("conn-fork-profile")
+            .expect("connection should exist");
+        conn.sessions
+            .insert("primary".to_string(), session_id.clone());
+    }
+
+    handle_fork_session(&f.state, "conn-fork-profile", &message_id, &tx).await;
+
+    let fork_result = next_message_of_type(&mut rx, "fork_result").await;
+    assert_eq!(fork_result["data"]["success"], true);
+    assert_eq!(fork_result["data"]["source_session_id"], session_id);
+    let forked_session_id = fork_result["data"]["forked_session_id"]
+        .as_str()
+        .expect("forked session id should be present")
+        .to_string();
+
+    let binding = profiles
+        .session_binding(&forked_session_id)
+        .await
+        .expect("forked session should inherit source profile binding");
+    assert_eq!(binding.profile_id, "alpha");
+
+    handle_load_session(&f.state, "conn-fork-profile", &forked_session_id, &tx).await;
+
+    let loaded = next_message_of_type(&mut rx, "session_loaded").await;
+    assert_eq!(loaded["data"]["session_id"], forked_session_id);
+    assert_eq!(loaded["data"]["profile_id"], "alpha");
+
+    let state_msg = next_message_of_type(&mut rx, "state").await;
+    assert_eq!(state_msg["data"]["active_profile_id"], "beta");
 
     Ok(())
 }

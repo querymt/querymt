@@ -1195,6 +1195,27 @@ pub async fn handle_fork_session(
             Ok(resp) => {
                 let forked_session_id = resp.session_id.clone();
                 let cwd = resp.cwd.as_ref().map(PathBuf::from);
+                if let (Some(profiles), Some(profile_id)) =
+                    (&state.profiles, source_profile_id.as_deref())
+                    && let Err(err) = profiles
+                        .bind_session_to_profile(forked_session_id.clone(), profile_id)
+                        .await
+                {
+                    let _ = send_message(
+                        tx,
+                        UiServerMessage::ForkResult {
+                            success: false,
+                            source_session_id: Some(source_session_id),
+                            forked_session_id: Some(forked_session_id),
+                            message: Some(format!(
+                                "Fork created but failed to bind profile: {err}"
+                            )),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+
                 if let Err(err) = finalize_remote_session_attach(
                     state,
                     conn_id,
