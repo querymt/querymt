@@ -501,13 +501,20 @@ where
     }
 
     pub async fn runtime_for_profile(&self, profile_id: &str) -> Result<Arc<ProfileRuntime>> {
-        let mut runtimes = self.runtimes.lock().await;
-        if let Some(runtime) = runtimes.get(profile_id) {
-            return Ok(runtime.clone());
+        if let Some(runtime) = self.runtimes.lock().await.get(profile_id).cloned() {
+            return Ok(runtime);
         }
 
+        // Do profile I/O/runtime startup outside the cache lock so slow profile startup does not
+        // block unrelated cached runtime reads or event-forwarder polling. Re-check before insert
+        // in case another task won the race.
         let document = self.catalog.load_profile(profile_id).await?;
         let runtime = Arc::new(build_profile_runtime(document, self.shared_infra.clone()).await?);
+
+        let mut runtimes = self.runtimes.lock().await;
+        if let Some(existing) = runtimes.get(profile_id) {
+            return Ok(existing.clone());
+        }
         runtimes.insert(profile_id.to_string(), runtime.clone());
         Ok(runtime)
     }
