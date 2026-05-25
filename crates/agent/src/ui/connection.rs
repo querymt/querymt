@@ -226,7 +226,13 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
     };
 
     let agents = build_agent_list(state);
-    let profiles = list_profiles(state).await;
+    let profiles = match list_profiles(state).await {
+        Ok(profiles) => profiles,
+        Err(message) => {
+            let _ = send_error(tx, message).await;
+            Vec::new()
+        }
+    };
     let active_profile_id = active_profile_id(state).await;
     let default_cwd = state
         .default_cwd

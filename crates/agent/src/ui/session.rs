@@ -494,17 +494,15 @@ pub async fn reasoning_effort_for_session(
     default_reasoning_effort_for_session(state, session_id).await
 }
 
-pub async fn list_profiles(state: &ServerState) -> Vec<UiProfileInfo> {
+pub async fn list_profiles(state: &ServerState) -> Result<Vec<UiProfileInfo>, String> {
     if let Some(profiles) = &state.profiles {
         profiles
             .list_profiles()
             .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(Into::into)
-            .collect()
+            .map(|profiles| profiles.into_iter().map(Into::into).collect())
+            .map_err(|err| format_prefixed_error_chain("Failed to list profiles", &err))
     } else {
-        Vec::new()
+        Ok(Vec::new())
     }
 }
 

@@ -395,6 +395,47 @@ async fn handle_ui_message_dispatches_list_session_children() -> Result<()> {
 }
 
 #[tokio::test]
+async fn send_state_surfaces_profile_list_errors_and_continues() -> Result<()> {
+    let mut f = crate::test_utils::TestServerState::new().await;
+    let dir = TempDir::new()?;
+    let duplicate = r#"
+[profile]
+id = "shared"
+
+[agent]
+provider = "test"
+model = "test-model"
+system = "inline"
+"#;
+    write_profile_with_content(dir.path(), "alpha.toml", duplicate);
+    write_profile_with_content(dir.path(), "beta.toml", duplicate);
+    attach_profiles(&mut f, "shared", dir.path()).await;
+    let (tx, mut rx) = f.add_connection("conn-profile-list-error").await;
+
+    crate::ui::connection::send_state(&f.state, "conn-profile-list-error", &tx).await;
+
+    let error_msg = next_json(&mut rx).await;
+    assert_eq!(error_msg["type"], "error");
+    let message = error_msg["data"]["message"]
+        .as_str()
+        .expect("error message should be a string");
+    assert!(
+        message.contains("Failed to list profiles"),
+        "message was: {message}"
+    );
+    assert!(
+        message.contains("Duplicate profile id"),
+        "message was: {message}"
+    );
+
+    let state_msg = next_json(&mut rx).await;
+    assert_eq!(state_msg["type"], "state");
+    assert_eq!(state_msg["data"]["profiles"], serde_json::json!([]));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn handle_ui_message_set_active_profile_updates_state() -> Result<()> {
     let mut f = crate::test_utils::TestServerState::new().await;
     let dir = TempDir::new()?;
