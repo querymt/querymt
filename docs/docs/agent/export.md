@@ -1,6 +1,6 @@
 # Session Data Export
 
-QueryMT Agent records every session interaction in its database (`~/.qmt/agent.db`). The export system lets you extract this data in standardized formats for analysis, compliance, and — most notably — **fine-tuning LLMs** on your own agent trajectories.
+QueryMT Agent records every session interaction in its database (`~/.qmt/sessions.db`). The export system lets you extract this data in standardized formats for analysis, compliance, and — most notably — **fine-tuning LLMs** on your own agent trajectories.
 
 ## Export Formats
 
@@ -25,7 +25,7 @@ Both exporters share a common **turn materialization** layer that walks the even
 
 ```mermaid
 graph LR
-    DB[(agent.db<br/>event_journal)] --> MT[materialize_turns]
+    DB[(sessions.db<br/>event_journal)] --> MT[materialize_turns]
     MT --> ATIF[ATIF Exporter]
     MT --> SFT[SFT Exporter]
     SFT --> OAI[OpenAI JSONL]
@@ -66,7 +66,7 @@ cargo run --example export_sft -- -f sharegpt --models claude-opus-4-6 -o traini
 export_sft [OPTIONS]
 
 OPTIONS:
-    --db <path>                Path to agent.db (default: ~/.qmt/agent.db)
+    --db <path>                Path to sessions.db (default: ~/.qmt/sessions.db)
     --output, -o <path>        Output file (default: stdout)
     --format, -f <fmt>         Output format: openai (default), sharegpt
     --stats                    Show export stats without writing data

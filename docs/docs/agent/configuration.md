@@ -280,7 +280,7 @@ Database path precedence:
 
 1. `qmtcode --db <path>`
 2. `QMT_SESSIONS_DB` when set to a non-empty value
-3. Default `<QMT_CONFIG_DIR or QMT_HOME or ~/.qmt>/agent.db`
+3. Default `<QMT_CONFIG_DIR or QMT_HOME or ~/.qmt>/sessions.db`
 
 Programmatic builders may still call `.db(...)` as an explicit runtime override.
 

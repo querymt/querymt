@@ -19,7 +19,7 @@ pub const QMT_SESSIONS_DB_ENV: &str = "QMT_SESSIONS_DB";
 /// Resolve the default on-disk SQLite path for agent state.
 ///
 /// Uses the shared QueryMT config directory (`$HOME/.qmt`) and ensures the
-/// directory exists before returning `<config_dir>/agent.db`.
+/// directory exists before returning `<config_dir>/sessions.db`.
 pub fn default_agent_db_path() -> SessionResult<PathBuf> {
     let cfg_dir = querymt_utils::providers::config_dir()
         .map_err(|e| SessionError::Other(format!("Failed to resolve QueryMT config dir: {e}")))?;
@@ -31,7 +31,7 @@ pub fn default_agent_db_path() -> SessionResult<PathBuf> {
         ))
     })?;
 
-    Ok(cfg_dir.join("agent.db"))
+    Ok(cfg_dir.join("sessions.db"))
 }
 
 /// Resolve the shared sessions database path.
@@ -162,26 +162,26 @@ mod tests {
     fn default_agent_db_path_points_to_qmt_dir() {
         let path = default_agent_db_path().expect("default agent db path");
         let cfg_dir = querymt_utils::providers::config_dir().expect("config dir");
-        assert_eq!(path, cfg_dir.join("agent.db"));
+        assert_eq!(path, cfg_dir.join("sessions.db"));
     }
 
     #[test]
     fn resolve_agent_db_path_prefers_override() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let _env = EnvVarGuard::set(QMT_SESSIONS_DB_ENV, "/tmp/env-agent.db");
+        let _env = EnvVarGuard::set(QMT_SESSIONS_DB_ENV, "/tmp/env-sessions.db");
         assert_eq!(
-            resolve_agent_db_path(Some(PathBuf::from("/tmp/cli-agent.db"))).unwrap(),
-            PathBuf::from("/tmp/cli-agent.db")
+            resolve_agent_db_path(Some(PathBuf::from("/tmp/cli-sessions.db"))).unwrap(),
+            PathBuf::from("/tmp/cli-sessions.db")
         );
     }
 
     #[test]
     fn resolve_agent_db_path_uses_non_empty_env() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let _env = EnvVarGuard::set(QMT_SESSIONS_DB_ENV, "/tmp/env-agent.db");
+        let _env = EnvVarGuard::set(QMT_SESSIONS_DB_ENV, "/tmp/env-sessions.db");
         assert_eq!(
             resolve_agent_db_path(None).unwrap(),
-            PathBuf::from("/tmp/env-agent.db")
+            PathBuf::from("/tmp/env-sessions.db")
         );
     }
 
@@ -191,6 +191,6 @@ mod tests {
         let _env = EnvVarGuard::set(QMT_SESSIONS_DB_ENV, "   ");
         let path = resolve_agent_db_path(None).expect("default agent db path");
         let cfg_dir = querymt_utils::providers::config_dir().expect("config dir");
-        assert_eq!(path, cfg_dir.join("agent.db"));
+        assert_eq!(path, cfg_dir.join("sessions.db"));
     }
 }

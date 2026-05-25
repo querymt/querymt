@@ -98,7 +98,7 @@ struct Cli {
 
     /// Path to the shared sessions SQLite database.
     ///
-    /// Overrides QMT_SESSIONS_DB and the default ~/.qmt/agent.db runtime path.
+    /// Overrides QMT_SESSIONS_DB and the default ~/.qmt/sessions.db runtime path.
     #[arg(long, value_name = "path")]
     db: Option<PathBuf>,
 
