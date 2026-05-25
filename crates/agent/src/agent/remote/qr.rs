@@ -10,7 +10,6 @@
 ///
 /// Returns a multi-line string suitable for printing to stderr.
 /// Returns `None` if the data is too long for a QR code.
-#[cfg(feature = "remote-internet")]
 pub fn render_to_terminal(data: &str) -> Option<String> {
     use qrcode::QrCode;
 

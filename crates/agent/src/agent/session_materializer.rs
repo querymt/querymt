@@ -21,9 +21,16 @@ use crate::acp::cwd::acp_cwd_to_optional;
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::SessionRuntime;
 use crate::agent::remote::SessionActorRef;
+#[cfg(feature = "remote")]
+use crate::agent::remote::runtime_handle::MeshRuntimeHandle;
+#[cfg(feature = "remote")]
+use crate::agent::remote::scope::scoped_session;
 use crate::agent::session_actor::SessionActor;
+use crate::agent::session_mcp::{
+    ConnectedMcpPeer, SessionMaterializationKind, SessionMcpAttachmentContext,
+};
 use crate::agent::session_registry::{
-    PreconnectedMcpPeer, SessionMaterialization, SessionMaterializationOptions, SessionRegistry,
+    SessionMaterialization, SessionMaterializationOptions, SessionRegistry,
 };
 use crate::events::AgentEventKind;
 use agent_client_protocol::schema::{
@@ -113,6 +120,17 @@ pub struct SessionMaterializer {
     mesh: parking_lot::RwLock<Option<crate::agent::remote::MeshHandle>>,
 }
 
+/// Resolved MCP server configs and connected peers after consulting
+/// the runtime attachment source and merging with request servers.
+struct ResolvedSessionMcpInputs {
+    /// The full list of MCP server configs (config + request + attached
+    /// `ServerConfig` attachments).
+    server_configs: Vec<McpServer>,
+    /// Connected MCP peers that should be merged into runtime tool state
+    /// after the actor has been spawned.
+    connected_peers: Vec<ConnectedMcpPeer>,
+}
+
 impl SessionMaterializer {
     pub fn new(config: Arc<AgentConfig>) -> Self {
         Self {
@@ -156,6 +174,78 @@ impl SessionMaterializer {
         }
     }
 
+    // ── Internal: Resolve MCP inputs ───────────────────────────────────────
+
+    async fn resolve_mcp_inputs(
+        &self,
+        session_id: &str,
+        cwd: &Option<PathBuf>,
+        kind: SessionMaterializationKind,
+        request_mcp_servers: &[McpServer],
+    ) -> Result<ResolvedSessionMcpInputs, Error> {
+        // Resolve attachments from the runtime attachment source.
+        let ctx = SessionMcpAttachmentContext {
+            session_id: session_id.to_string(),
+            cwd: cwd.clone(),
+            kind,
+        };
+        let attachments = self
+            .config
+            .session_mcp_attachment_source
+            .attachments(&ctx)
+            .await?;
+
+        let (attached_servers, connected_peers) =
+            crate::agent::session_mcp::split_attachments(attachments);
+
+        // Build the full server config list: config + request + attached servers.
+        let mut server_configs = self
+            .config
+            .mcp_servers
+            .iter()
+            .map(|s| s.to_acp())
+            .collect::<Vec<_>>();
+
+        for req_server in request_mcp_servers {
+            let req_name = match req_server {
+                McpServer::Stdio(s) => s.name.as_str(),
+                McpServer::Http(s) => s.name.as_str(),
+                _ => continue,
+            };
+            if let Some(pos) = server_configs.iter().position(|s| match s {
+                McpServer::Stdio(cs) => cs.name == req_name,
+                McpServer::Http(cs) => cs.name == req_name,
+                _ => false,
+            }) {
+                server_configs[pos] = req_server.clone();
+            } else {
+                server_configs.push(req_server.clone());
+            }
+        }
+
+        for attached in attached_servers {
+            let name = match &attached {
+                McpServer::Stdio(s) => s.name.as_str(),
+                McpServer::Http(s) => s.name.as_str(),
+                _ => continue,
+            };
+            if !server_configs.iter().any(|s| match s {
+                McpServer::Stdio(cs) => cs.name == name,
+                McpServer::Http(cs) => cs.name == name,
+                _ => false,
+            }) {
+                server_configs.push(attached);
+            }
+        }
+
+        Ok(ResolvedSessionMcpInputs {
+            server_configs,
+            connected_peers,
+        })
+    }
+
+    // ── Public materialization ─────────────────────────────────────────────
+
     /// Prepare a new session: create in DB, initialize MCP, spawn actor.
     ///
     /// This does NOT hold the registry lock. After this returns, call
@@ -163,7 +253,6 @@ impl SessionMaterializer {
     pub async fn prepare_new_session(
         &self,
         req: NewSessionRequest,
-        preconnected_peers: Vec<PreconnectedMcpPeer>,
     ) -> Result<PreparedSession, Error> {
         let cwd = acp_cwd_to_optional(&req.cwd)?;
 
@@ -186,12 +275,22 @@ impl SessionMaterializer {
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
         let session_id = session_context.session().public_id.clone();
 
+        // Resolve MCP inputs (config + request + runtime attachments)
+        let resolved = self
+            .resolve_mcp_inputs(
+                &session_id,
+                &cwd,
+                SessionMaterializationKind::New,
+                &req.mcp_servers,
+            )
+            .await?;
+
         // Materialize session actor (heavy: MCP startup, actor spawn)
         let materialization = self
             .materialize_session_actor(
                 session_id.clone(),
                 cwd.clone(),
-                &req.mcp_servers,
+                &resolved.server_configs,
                 parent_session_id.is_some(),
                 &SessionMaterializationOptions {
                     attach_mesh_handle: true,
@@ -200,10 +299,10 @@ impl SessionMaterializer {
             )
             .await?;
 
-        // Merge preconnected MCP peers (if provided)
-        crate::agent::protocol::merge_preconnected_mcp_peers(
+        // Merge connected MCP peers (from runtime attachments)
+        crate::agent::protocol::merge_connected_mcp_peers(
             materialization.runtime.mcp_tool_state.clone(),
-            &preconnected_peers,
+            &resolved.connected_peers,
         )
         .await?;
 
@@ -211,7 +310,7 @@ impl SessionMaterializer {
             session_id,
             actor_ref: materialization.actor_ref,
             runtime: materialization.runtime,
-            mcp_servers: req.mcp_servers,
+            mcp_servers: resolved.server_configs,
             cwd,
             register_in_dht: true,
             _single_flight_guard: None,
@@ -229,7 +328,6 @@ impl SessionMaterializer {
     pub async fn prepare_load_session(
         &self,
         req: LoadSessionRequest,
-        preconnected_peers: Vec<PreconnectedMcpPeer>,
         registry: Option<&Mutex<SessionRegistry>>,
     ) -> Result<PreparedSessionResult, Error> {
         let session_id = req.session_id.to_string();
@@ -260,12 +358,22 @@ impl SessionMaterializer {
 
         let cwd = acp_cwd_to_optional(&req.cwd)?;
 
+        // Resolve MCP inputs (config + request + runtime attachments)
+        let resolved = self
+            .resolve_mcp_inputs(
+                &session_id,
+                &cwd,
+                SessionMaterializationKind::Load,
+                &req.mcp_servers,
+            )
+            .await?;
+
         // Materialize session actor (heavy: MCP startup, actor spawn)
         let materialization = self
             .materialize_session_actor(
                 session_id.clone(),
                 cwd.clone(),
-                &req.mcp_servers,
+                &resolved.server_configs,
                 false,
                 &SessionMaterializationOptions {
                     attach_mesh_handle: true,
@@ -274,10 +382,10 @@ impl SessionMaterializer {
             )
             .await?;
 
-        // Merge preconnected MCP peers (if provided)
-        crate::agent::protocol::merge_preconnected_mcp_peers(
+        // Merge connected MCP peers (from runtime attachments)
+        crate::agent::protocol::merge_connected_mcp_peers(
             materialization.runtime.mcp_tool_state.clone(),
-            &preconnected_peers,
+            &resolved.connected_peers,
         )
         .await?;
 
@@ -285,7 +393,7 @@ impl SessionMaterializer {
             session_id,
             actor_ref: materialization.actor_ref,
             runtime: materialization.runtime,
-            mcp_servers: req.mcp_servers,
+            mcp_servers: resolved.server_configs,
             cwd,
             register_in_dht: true,
             _single_flight_guard: Some(single_flight_guard),
@@ -345,12 +453,22 @@ impl SessionMaterializer {
             Some(req.cwd.clone())
         };
 
+        // Resolve MCP inputs (config + request + runtime attachments)
+        let resolved = self
+            .resolve_mcp_inputs(
+                &session_id,
+                &cwd,
+                SessionMaterializationKind::Resume,
+                &req.mcp_servers,
+            )
+            .await?;
+
         // Materialize session actor (heavy: MCP startup, actor spawn)
         let materialization = self
             .materialize_session_actor(
                 session_id.clone(),
                 cwd.clone(),
-                &req.mcp_servers,
+                &resolved.server_configs,
                 false,
                 &SessionMaterializationOptions {
                     attach_mesh_handle: true,
@@ -359,11 +477,18 @@ impl SessionMaterializer {
             )
             .await?;
 
+        // Merge connected MCP peers (from runtime attachments)
+        crate::agent::protocol::merge_connected_mcp_peers(
+            materialization.runtime.mcp_tool_state.clone(),
+            &resolved.connected_peers,
+        )
+        .await?;
+
         let prepared = PreparedSession {
             session_id,
             actor_ref: materialization.actor_ref,
             runtime: materialization.runtime,
-            mcp_servers: req.mcp_servers,
+            mcp_servers: resolved.server_configs,
             cwd: cwd.clone(),
             register_in_dht: true,
             _single_flight_guard: Some(single_flight_guard),
@@ -439,10 +564,10 @@ impl SessionMaterializer {
         // Set bridge on the session actor if available.
         // This is done here instead of in register_prepared_session to avoid
         // holding the registry lock during the async actor call.
-        if let Some(bridge_sender) = bridge {
+        if let Some(ref bridge_sender) = bridge {
             let session_ref =
                 crate::agent::remote::SessionActorRef::from(prepared.actor_ref.clone());
-            if let Err(e) = session_ref.set_bridge(bridge_sender).await {
+            if let Err(e) = session_ref.set_bridge(bridge_sender.clone()).await {
                 log::warn!(
                     "Session {}: failed to set bridge on session actor: {}",
                     prepared.session_id,
@@ -456,12 +581,15 @@ impl SessionMaterializer {
         if prepared.register_in_dht
             && let Some(mesh) = self.mesh()
         {
-            let dht_name = crate::agent::remote::dht_name::session(&prepared.session_id);
-            let mesh = mesh.clone();
-            let actor_ref = prepared.actor_ref.clone();
-            tokio::spawn(async move {
-                mesh.register_actor(actor_ref, dht_name).await;
-            });
+            let runtime = MeshRuntimeHandle::from(mesh.clone());
+            for scope in runtime.active_scopes() {
+                let dht_name = scoped_session(&scope, &prepared.session_id);
+                let runtime = runtime.clone();
+                let actor_ref = prepared.actor_ref.clone();
+                tokio::spawn(async move {
+                    runtime.register_actor(actor_ref, dht_name).await;
+                });
+            }
         }
 
         // Emit SessionCreated event
@@ -529,6 +657,22 @@ impl SessionMaterializer {
             },
         );
 
+        // Publish available slash commands via ACP bridge
+        if !self.config.slash_command_registry.is_empty()
+            && let Some(bridge_sender) = bridge
+        {
+            let notification = crate::slash_commands::acp::build_commands_notification(
+                &prepared.session_id,
+                &self.config.slash_command_registry,
+            );
+            let bridge = bridge_sender.clone();
+            tokio::spawn(async move {
+                if let Err(e) = bridge.notify(notification).await {
+                    log::debug!("Failed to publish available commands: {}", e);
+                }
+            });
+        }
+
         Ok(())
     }
 
@@ -541,12 +685,11 @@ impl SessionMaterializer {
         cwd: Option<PathBuf>,
         mcp_servers: &[McpServer],
         initialize_fork: bool,
-        options: &SessionMaterializationOptions,
+        _options: &SessionMaterializationOptions,
     ) -> Result<SessionMaterialization, Error> {
-        let merged_mcp = self.merged_mcp_servers(mcp_servers);
         let tool_state = crate::agent::core::McpToolState::empty();
         let mcp_services = crate::agent::protocol::build_mcp_state(
-            &merged_mcp,
+            mcp_servers,
             self.config.pending_elicitations(),
             self.config.event_sink.clone(),
             session_id.clone(),
@@ -567,7 +710,7 @@ impl SessionMaterializer {
         let runtime = SessionRuntime::new(cwd.clone(), mcp_services, tool_state);
         #[cfg(feature = "remote")]
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone())
-            .with_mesh(if options.attach_mesh_handle {
+            .with_mesh(if _options.attach_mesh_handle {
                 // Use the mesh handle from the materializer's shared state
                 self.mesh()
             } else {
@@ -581,33 +724,5 @@ impl SessionMaterializer {
         // We defer this to avoid needing the registry lock
 
         Ok(SessionMaterialization { actor_ref, runtime })
-    }
-
-    /// Internal: Merge MCP servers from config with client-supplied servers.
-    fn merged_mcp_servers(&self, req_servers: &[McpServer]) -> Vec<McpServer> {
-        // Start with config servers converted to ACP format.
-        let mut merged: Vec<McpServer> =
-            self.config.mcp_servers.iter().map(|s| s.to_acp()).collect();
-
-        // For each client-supplied server, replace any config server with the same
-        // name or append it if not present.
-        for req_server in req_servers {
-            let req_name = match req_server {
-                McpServer::Stdio(s) => s.name.as_str(),
-                McpServer::Http(s) => s.name.as_str(),
-                _ => continue,
-            };
-            if let Some(pos) = merged.iter().position(|s| match s {
-                McpServer::Stdio(cs) => cs.name == req_name,
-                McpServer::Http(cs) => cs.name == req_name,
-                _ => false,
-            }) {
-                merged[pos] = req_server.clone();
-            } else {
-                merged.push(req_server.clone());
-            }
-        }
-
-        merged
     }
 }

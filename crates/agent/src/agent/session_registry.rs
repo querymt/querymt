@@ -3,31 +3,35 @@
 //! Lives on the server layer. Not an actor — just a plain data structure
 //! protected by a mutex (acceptable: only accessed for routing, not during execution).
 
-use crate::acp::cwd::acp_cwd_to_optional;
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, SessionRuntime};
 use crate::agent::remote::SessionActorRef;
+#[cfg(feature = "remote")]
+use crate::agent::remote::runtime_handle::MeshRuntimeHandle;
+#[cfg(feature = "remote")]
+use crate::agent::remote::scope::{MeshScopeId, scoped_event_relay, scoped_session};
 use crate::agent::session_actor::SessionActor;
 use crate::error::AgentError;
-use crate::events::AgentEventKind;
 use agent_client_protocol::schema::{
-    Error, ListSessionsRequest, ListSessionsResponse, McpServer, NewSessionRequest,
-    NewSessionResponse, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOption, SessionInfo, SessionMode, SessionModeState,
+    Error, ListSessionsRequest, ListSessionsResponse, McpServer, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionInfo, SessionMode,
+    SessionModeState,
 };
 use kameo::actor::{ActorRef, Spawn};
-use rmcp::RoleClient;
-use rmcp::service::Peer;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// A pre-connected MCP peer that should be merged into session tool state.
-///
-/// The string is the MCP server name used for adapter metadata and diagnostics.
-/// The peer is already initialized (has completed MCP handshake) and can be
-/// reused across multiple sessions without re-initializing.
-pub type PreconnectedMcpPeer = (String, Peer<RoleClient>);
+#[cfg(feature = "remote")]
+fn select_relay_scope(
+    active_scopes: &[MeshScopeId],
+    preferred_scope: Option<MeshScopeId>,
+) -> MeshScopeId {
+    preferred_scope
+        .filter(|scope| active_scopes.contains(scope))
+        .or_else(|| active_scopes.first().cloned())
+        .unwrap_or_else(MeshScopeId::lan_default)
+}
 
 pub fn all_session_modes() -> Vec<SessionMode> {
     vec![
@@ -150,15 +154,19 @@ impl SessionRegistry {
     /// and attach to them.
     #[cfg(feature = "remote")]
     pub fn set_mesh(&mut self, mesh: Option<crate::agent::remote::MeshHandle>) {
-        // Register all existing local sessions in DHT so remote peers can attach.
+        // Register all existing local sessions in each active scope so remote peers can attach.
         if let Some(ref mesh) = mesh {
+            let runtime = MeshRuntimeHandle::from(mesh.clone());
+            let scopes = runtime.active_scopes();
             for (session_id, actor_ref) in &self.local_actor_refs {
-                let dht_name = crate::agent::remote::dht_name::session(session_id);
-                let mesh = mesh.clone();
-                let actor_ref = actor_ref.clone();
-                tokio::spawn(async move {
-                    mesh.register_actor(actor_ref, dht_name).await;
-                });
+                for scope in &scopes {
+                    let dht_name = scoped_session(scope, session_id);
+                    let runtime = runtime.clone();
+                    let actor_ref = actor_ref.clone();
+                    tokio::spawn(async move {
+                        runtime.register_actor(actor_ref, dht_name).await;
+                    });
+                }
             }
         }
         self.mesh = mesh;
@@ -198,29 +206,6 @@ impl SessionRegistry {
     /// Get a reference to the session actor for routing.
     pub fn get(&self, session_id: &str) -> Option<&SessionActorRef> {
         self.sessions.get(session_id)
-    }
-
-    /// Publish available slash commands via the ACP bridge.
-    ///
-    /// Sends an `AvailableCommandsUpdate` notification to the client
-    /// so it can display slash command autocomplete/hints.
-    fn publish_available_commands(&self, session_id: &str) {
-        if self.config.slash_command_registry.is_empty() {
-            return;
-        }
-        if let Some(ref bridge) = self.bridge {
-            let notification = crate::slash_commands::acp::build_commands_notification(
-                session_id,
-                &self.config.slash_command_registry,
-            );
-            // Fire-and-forget: spawn a task so we don't block the registry lock
-            let bridge = bridge.clone();
-            tokio::spawn(async move {
-                if let Err(e) = bridge.notify(notification).await {
-                    log::debug!("Failed to publish available commands: {}", e);
-                }
-            });
-        }
     }
 
     /// Insert a pre-spawned session actor into the registry.
@@ -335,12 +320,15 @@ impl SessionRegistry {
         if options.register_in_dht
             && let Some(ref mesh) = self.mesh
         {
-            let dht_name = crate::agent::remote::dht_name::session(&session_id);
-            let mesh = mesh.clone();
-            let actor_ref = actor_ref.clone();
-            tokio::spawn(async move {
-                mesh.register_actor(actor_ref, dht_name).await;
-            });
+            let runtime = MeshRuntimeHandle::from(mesh.clone());
+            for scope in runtime.active_scopes() {
+                let dht_name = scoped_session(&scope, &session_id);
+                let runtime = runtime.clone();
+                let actor_ref = actor_ref.clone();
+                tokio::spawn(async move {
+                    runtime.register_actor(actor_ref, dht_name).await;
+                });
+            }
         }
 
         Ok(SessionMaterialization { actor_ref, runtime })
@@ -353,8 +341,11 @@ impl SessionRegistry {
     pub fn remove(&mut self, session_id: &str) -> Option<SessionActorRef> {
         #[cfg(feature = "remote")]
         if let Some(ref mesh) = self.mesh {
-            let session_dht_name = crate::agent::remote::dht_name::session(session_id);
-            mesh.deregister_actor(&session_dht_name);
+            let runtime = MeshRuntimeHandle::from(mesh.clone());
+            for scope in runtime.active_scopes() {
+                let session_dht_name = scoped_session(&scope, session_id);
+                runtime.deregister_actor(&session_dht_name);
+            }
         }
         self.local_actor_refs.remove(session_id);
         self.sessions.remove(session_id)
@@ -415,6 +406,7 @@ impl SessionRegistry {
         remote_ref: kameo::actor::RemoteActorRef<SessionActor>,
         peer_label: String,
         mesh: Option<crate::agent::remote::MeshHandle>,
+        preferred_scope: Option<MeshScopeId>,
         remote_node_id: Option<String>,
     ) -> SessionActorRef {
         log::debug!(
@@ -445,9 +437,15 @@ impl SessionRegistry {
         //    session without overwriting each other's relay (Bug 3 fix).
         let mesh_active = mesh.is_some();
         let relay_dht_name = if let Some(ref mesh) = mesh {
-            let name = crate::agent::remote::dht_name::event_relay(&session_id, mesh.peer_id());
-            mesh.register_actor(relay_ref.clone(), name.clone()).await;
-            name
+            let runtime = MeshRuntimeHandle::from(mesh.clone());
+            let active_scopes = runtime.active_scopes();
+            for scope in &active_scopes {
+                let name = scoped_event_relay(scope, &session_id, mesh.peer_id());
+                runtime.register_actor(relay_ref.clone(), name).await;
+            }
+
+            let selected_scope = select_relay_scope(&active_scopes, preferred_scope);
+            scoped_event_relay(&selected_scope, &session_id, mesh.peer_id())
         } else {
             log::debug!(
                 "attach_remote_session: no mesh, DHT registration skipped for relay (session {})",
@@ -559,11 +557,13 @@ impl SessionRegistry {
         // Deregister the session and relay actors from the re-registration map
         // so dead closures don't accumulate (Phase 4 of Bug 1 fix).
         if let Some(ref mesh) = self.mesh {
-            let session_dht_name = crate::agent::remote::dht_name::session(session_id);
-            mesh.deregister_actor(&session_dht_name);
+            let runtime = MeshRuntimeHandle::from(mesh.clone());
+            for scope in runtime.active_scopes() {
+                let session_dht_name = scoped_session(&scope, session_id);
+                runtime.deregister_actor(&session_dht_name);
 
-            if let Some((_, relay_name)) = self.relay_actor_ids.get(session_id) {
-                mesh.deregister_actor(relay_name);
+                let relay_name = scoped_event_relay(&scope, session_id, mesh.peer_id());
+                runtime.deregister_actor(&relay_name);
             }
         }
 
@@ -604,291 +604,6 @@ impl SessionRegistry {
         session_id: &str,
     ) -> Option<SessionActorRef> {
         self.detach_remote_session_inner(session_id, true).await
-    }
-
-    /// Create a new session: build runtime, spawn SessionActor, return session_id.
-    pub async fn new_session(
-        &mut self,
-        req: NewSessionRequest,
-    ) -> Result<NewSessionResponse, Error> {
-        self.new_session_with_preconnected(req, Vec::new()).await
-    }
-
-    /// Create a new session and merge tools from already-connected MCP peers.
-    ///
-    /// Used by mobile FFI clients that manage MCP transport lifetimes externally
-    /// (for example iOS/Android pipe transports) and want those tools available in
-    /// each newly created session. The peers are already initialized and can be
-    /// reused across sessions without re-initializing.
-    pub async fn new_session_with_preconnected(
-        &mut self,
-        req: NewSessionRequest,
-        preconnected_peers: Vec<PreconnectedMcpPeer>,
-    ) -> Result<NewSessionResponse, Error> {
-        let cwd = acp_cwd_to_optional(&req.cwd)?;
-
-        let parent_session_id = req
-            .meta
-            .as_ref()
-            .and_then(|m| m.get("parent_session_id"))
-            .and_then(|v| v.as_str());
-
-        let session_context = self
-            .config
-            .provider
-            .create_session(
-                cwd.clone(),
-                parent_session_id,
-                &self.config.execution_config_snapshot(),
-            )
-            .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?;
-        let session_id = session_context.session().public_id.clone();
-
-        let materialization = self
-            .materialize_session_actor(
-                session_id.clone(),
-                cwd.clone(),
-                &req.mcp_servers,
-                parent_session_id.is_some(),
-                &mut SessionMaterializationOptions {
-                    attach_mesh_handle: true,
-                    register_in_dht: true,
-                },
-            )
-            .await?;
-        let runtime = materialization.runtime;
-
-        // Merge tools from already-connected MCP peers (e.g. mobile pipe transports).
-        crate::agent::protocol::merge_preconnected_mcp_peers(
-            runtime.mcp_tool_state.clone(),
-            &preconnected_peers,
-        )
-        .await?;
-
-        self.config
-            .emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);
-
-        // Emit initial provider configuration
-        if let Ok(Some(llm_config)) = self
-            .config
-            .provider
-            .history_store()
-            .get_session_llm_config(&session_id)
-            .await
-        {
-            let context_limit =
-                crate::model_info::get_model_info(&llm_config.provider, &llm_config.model)
-                    .and_then(|m| m.context_limit());
-            self.config.emit_event(
-                &session_id,
-                crate::events::AgentEventKind::ProviderChanged {
-                    provider: llm_config.provider.clone(),
-                    model: llm_config.model.clone(),
-                    config_id: llm_config.id,
-                    context_limit,
-                    provider_node_id: None,
-                },
-            );
-        }
-
-        // Background: initialize workspace index (only if the path exists on this machine)
-        if let Some(ref cwd_path) = cwd {
-            if cwd_path.exists() {
-                let manager_actor = self.config.workspace_manager_actor.clone();
-                let runtime_clone = runtime.clone();
-                let cwd_owned = cwd_path.clone();
-                tokio::spawn(async move {
-                    let root = crate::index::resolve_workspace_root(&cwd_owned);
-                    match manager_actor.ask(crate::index::GetOrCreate { root }).await {
-                        Ok(handle) => {
-                            let _ = runtime_clone.workspace_handle.set(handle);
-                        }
-                        Err(e) => log::warn!("Failed to initialize workspace index: {}", e),
-                    }
-                });
-            } else {
-                log::debug!(
-                    "SessionRegistry: cwd {:?} does not exist, skipping workspace index",
-                    cwd_path
-                );
-            }
-        }
-
-        // Emit SessionConfigured
-        let mcp_configs: Vec<crate::config::McpServerConfig> = req
-            .mcp_servers
-            .iter()
-            .map(crate::config::McpServerConfig::from_acp)
-            .collect();
-        self.config.emit_event(
-            &session_id,
-            crate::events::AgentEventKind::SessionConfigured {
-                cwd,
-                mcp_servers: mcp_configs,
-                limits: self.config.get_session_limits(),
-            },
-        );
-
-        let current_mode = {
-            let session_ref = self
-                .sessions
-                .get(&session_id)
-                .ok_or_else(|| {
-                    Error::internal_error().data("session actor missing after creation")
-                })?
-                .clone();
-            session_ref.get_mode().await.map_err(Error::from)?
-        };
-
-        // Publish available slash commands via ACP
-        self.publish_available_commands(&session_id);
-
-        Ok(NewSessionResponse::new(session_id)
-            .modes(mode_state(current_mode))
-            .config_options(config_options(
-                current_mode,
-                **self.config.default_reasoning_effort.load(),
-            )))
-    }
-
-    /// Load an existing session: validate it exists, build runtime, spawn SessionActor.
-    pub async fn load_session(
-        &mut self,
-        req: agent_client_protocol::schema::LoadSessionRequest,
-    ) -> Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
-        self.load_session_with_preconnected(req, Vec::new()).await
-    }
-
-    /// Load an existing session and merge tools from already-connected MCP peers.
-    pub async fn load_session_with_preconnected(
-        &mut self,
-        req: agent_client_protocol::schema::LoadSessionRequest,
-        preconnected_peers: Vec<PreconnectedMcpPeer>,
-    ) -> Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
-        let session_id = req.session_id.to_string();
-
-        let attached_remote = self
-            .sessions
-            .get(&session_id)
-            .is_some_and(|session_ref| session_ref.is_remote());
-
-        if attached_remote {
-            let current_mode = {
-                let session_ref = self
-                    .sessions
-                    .get(&session_id)
-                    .ok_or_else(|| {
-                        Error::internal_error().data("remote session missing after attach")
-                    })?
-                    .clone();
-                session_ref.get_mode().await.map_err(Error::from)?
-            };
-
-            return Ok(agent_client_protocol::schema::LoadSessionResponse::new()
-                .modes(mode_state(current_mode))
-                .config_options(config_options(
-                    current_mode,
-                    **self.config.default_reasoning_effort.load(),
-                )));
-        }
-
-        // If a local actor already exists for this session, reuse it instead
-        // of spawning a duplicate.
-        if let Some(existing_ref) = self.local_actor_ref(&session_id).cloned() {
-            let current_mode = existing_ref
-                .ask(crate::agent::messages::GetMode)
-                .await
-                .map_err(|e| Error::internal_error().data(e.to_string()))?;
-
-            return Ok(agent_client_protocol::schema::LoadSessionResponse::new()
-                .modes(mode_state(current_mode))
-                .config_options(config_options(
-                    current_mode,
-                    **self.config.default_reasoning_effort.load(),
-                )));
-        }
-
-        let _session = self
-            .config
-            .provider
-            .history_store()
-            .get_session(&session_id)
-            .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?
-            .ok_or_else(|| {
-                Error::invalid_params().data(serde_json::json!({
-                    "message": "session not found",
-                    "session_id": session_id,
-                }))
-            })?;
-
-        let cwd = acp_cwd_to_optional(&req.cwd)?;
-
-        let materialization = self
-            .materialize_session_actor(
-                session_id.clone(),
-                cwd,
-                &req.mcp_servers,
-                false,
-                &mut SessionMaterializationOptions {
-                    attach_mesh_handle: true,
-                    register_in_dht: true,
-                },
-            )
-            .await?;
-
-        // Merge tools from already-connected MCP peers (e.g. mobile pipe transports).
-        crate::agent::protocol::merge_preconnected_mcp_peers(
-            materialization.runtime.mcp_tool_state.clone(),
-            &preconnected_peers,
-        )
-        .await?;
-
-        self.config
-            .emit_event(&session_id, AgentEventKind::SessionCreated);
-
-        // Emit initial provider configuration so UI can display context limits
-        if let Ok(Some(llm_config)) = self
-            .config
-            .provider
-            .history_store()
-            .get_session_llm_config(&session_id)
-            .await
-        {
-            let context_limit =
-                crate::model_info::get_model_info(&llm_config.provider, &llm_config.model)
-                    .and_then(|m| m.context_limit());
-            self.config.emit_event(
-                &session_id,
-                crate::events::AgentEventKind::ProviderChanged {
-                    provider: llm_config.provider.clone(),
-                    model: llm_config.model.clone(),
-                    config_id: llm_config.id,
-                    context_limit,
-                    provider_node_id: None,
-                },
-            );
-        }
-
-        let current_mode = {
-            let session_ref = self
-                .sessions
-                .get(&session_id)
-                .ok_or_else(|| Error::internal_error().data("session actor missing after load"))?
-                .clone();
-            session_ref.get_mode().await.map_err(Error::from)?
-        };
-
-        // Publish available slash commands via ACP
-        self.publish_available_commands(&session_id);
-
-        Ok(agent_client_protocol::schema::LoadSessionResponse::new()
-            .modes(mode_state(current_mode))
-            .config_options(config_options(
-                current_mode,
-                **self.config.default_reasoning_effort.load(),
-            )))
     }
 
     /// Fork an existing session at the latest message.
@@ -1458,5 +1173,44 @@ mod tests {
             .collect();
         assert!(names.contains(&"config-server"));
         assert!(names.contains(&"req-server"));
+    }
+
+    #[test]
+    fn select_relay_scope_uses_preferred_scope_when_present() {
+        let scopes = vec![
+            MeshScopeId::lan_default(),
+            MeshScopeId::Iroh {
+                mesh_id: "team-a".to_string(),
+            },
+        ];
+        let selected = select_relay_scope(
+            &scopes,
+            Some(MeshScopeId::Iroh {
+                mesh_id: "team-a".to_string(),
+            }),
+        );
+        assert_eq!(
+            selected,
+            MeshScopeId::Iroh {
+                mesh_id: "team-a".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn select_relay_scope_falls_back_to_first_scope_when_preferred_missing() {
+        let scopes = vec![
+            MeshScopeId::lan_default(),
+            MeshScopeId::Iroh {
+                mesh_id: "team-a".to_string(),
+            },
+        ];
+        let selected = select_relay_scope(
+            &scopes,
+            Some(MeshScopeId::Iroh {
+                mesh_id: "other".to_string(),
+            }),
+        );
+        assert_eq!(selected, MeshScopeId::lan_default());
     }
 }

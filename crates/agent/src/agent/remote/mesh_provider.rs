@@ -14,17 +14,21 @@
 //!
 //! ## Streaming flow
 //!
-//! `chat_stream_with_tools` → spawn `StreamReceiverActor` + register in DHT
+//! `chat_stream_with_tools` → get/create `SessionStreamRouterActor`
+//!                          → attach local consumer to router
 //!                          → `tell(ProviderStreamRequest)` to `ProviderHostActor`
-//!                          → `StreamChunkRelay` messages arrive at `StreamReceiverActor`
-//!                          → forwarded via `mpsc` channel → `Stream<StreamChunk>`
+//!                          → `StreamRelayMessage` messages arrive at router
+//!                          → forwarded to local consumer via `mpsc` channel → `Stream<StreamChunk>`
 
 use crate::agent::remote::NodeId;
 use crate::agent::remote::mesh::MeshHandle;
 use crate::agent::remote::provider_host::{
     CancelProviderStreamRequest, GetProviderStreamStatus, ProviderChatRequest, ProviderHostActor,
-    ProviderStreamRequest, ProviderStreamStatus, RenewProviderStreamLease, StreamReceiverActor,
-    StreamRelayMessage,
+    ProviderStreamRequest, ProviderStreamStatus, RenewProviderStreamLease, StreamRelayMessage,
+};
+use crate::agent::remote::scope::{MeshScopeId, scoped_node_manager, scoped_provider_host};
+use crate::agent::remote::session_stream_router::{
+    AttachStreamConsumer, RegisterRequest, SessionStreamRouterActor,
 };
 use futures_util::StreamExt;
 use kameo::actor::Spawn;
@@ -39,7 +43,6 @@ use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::Instant;
 use tokio::sync::{RwLock, mpsc};
-use tracing::Instrument;
 use uuid::Uuid;
 
 // ── MeshChatProvider ──────────────────────────────────────────────────────────
@@ -57,6 +60,15 @@ static PROVIDER_HOST_CACHE: OnceLock<
     RwLock<HashMap<String, kameo::actor::RemoteActorRef<ProviderHostActor>>>,
 > = OnceLock::new();
 
+/// Cache of `SessionStreamRouterActor` refs per session.
+///
+/// The router is a stable per-session actor that routes stream chunks to local
+/// consumers. This is especially important for iroh/mobile resilience where
+/// direct per-request receiver refs may not survive transient disconnects.
+static STREAM_ROUTER_CACHE: OnceLock<
+    RwLock<HashMap<String, kameo::actor::ActorRef<SessionStreamRouterActor>>>,
+> = OnceLock::new();
+
 #[derive(Clone)]
 pub struct MeshChatProvider {
     /// Provider name, e.g. `"anthropic"`.
@@ -65,7 +77,7 @@ pub struct MeshChatProvider {
     model: String,
     /// Mesh handle used for DHT lookups and actor registration.
     mesh: MeshHandle,
-    /// DHT name of the target `ProviderHostActor`, e.g. `"provider_host::peer::<peer_id>"`.
+    /// DHT name of the target `ProviderHostActor` within the selected scope.
     target_dht_name: String,
     /// Per-session LLM parameters (system prompt, temperature, etc.) to forward
     /// to the remote `ProviderHostActor`.
@@ -79,7 +91,8 @@ pub struct MeshChatProvider {
 impl MeshChatProvider {
     fn target_peer_id(&self) -> Option<PeerId> {
         self.target_dht_name
-            .strip_prefix("provider_host::peer::")
+            .rsplit("::peer::")
+            .next()
             .and_then(|s| s.parse::<PeerId>().ok())
     }
 
@@ -95,11 +108,48 @@ impl MeshChatProvider {
         PROVIDER_HOST_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
     }
 
+    fn stream_router_cache()
+    -> &'static RwLock<HashMap<String, kameo::actor::ActorRef<SessionStreamRouterActor>>> {
+        STREAM_ROUTER_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+    }
+
     async fn invalidate_cached_provider_host(&self) {
         Self::provider_host_cache()
             .write()
             .await
             .remove(&self.target_dht_name);
+    }
+
+    /// Get or create a `SessionStreamRouterActor` for the given session.
+    ///
+    /// The router is cached and reused across multiple streaming requests in the
+    /// same session. This provides a stable delivery target for iroh/mobile
+    /// scenarios where the app may temporarily lose connectivity.
+    async fn get_or_create_stream_router(
+        &self,
+        session_id: &str,
+    ) -> kameo::actor::ActorRef<SessionStreamRouterActor> {
+        // Check cache first
+        if let Some(cached) = Self::stream_router_cache()
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+        {
+            return cached;
+        }
+
+        // Create new router
+        let router = SessionStreamRouterActor::new(None, None);
+        let router_ref = SessionStreamRouterActor::spawn(router);
+
+        // Cache it
+        Self::stream_router_cache()
+            .write()
+            .await
+            .insert(session_id.to_string(), router_ref.clone());
+
+        router_ref
     }
 
     /// Create a new `MeshChatProvider`.
@@ -111,11 +161,17 @@ impl MeshChatProvider {
     /// * `provider_name`  — provider plugin name (e.g. `"anthropic"`).
     /// * `model`          — model name (e.g. `"claude-sonnet-4-20250514"`).
     pub fn new(mesh: &MeshHandle, target_node_id: &str, provider_name: &str, model: &str) -> Self {
+        let peer_id = target_node_id.parse::<PeerId>().ok();
+        let target_scope = peer_id
+            .as_ref()
+            .and_then(|pid| mesh.best_route_for_peer(pid).map(|route| route.scope))
+            .unwrap_or(MeshScopeId::lan_default());
+
         Self {
             provider_name: provider_name.to_string(),
             model: model.to_string(),
             mesh: mesh.clone(),
-            target_dht_name: super::dht_name::provider_host(&target_node_id),
+            target_dht_name: scoped_provider_host(&target_scope, &target_node_id),
             params: None,
             heartbeat_interval_secs: 10,
             lease_ttl_secs: 60,
@@ -343,7 +399,7 @@ impl ChatProvider for MeshChatProvider {
             has_tools = tools.is_some(),
             request_id = tracing::field::Empty,
             provider_lookup_ms = tracing::field::Empty,
-            register_receiver_ms = tracing::field::Empty,
+            router_setup_ms = tracing::field::Empty,
             send_request_ms = tracing::field::Empty,
             first_chunk_ms = tracing::field::Empty,
         )
@@ -364,52 +420,70 @@ impl ChatProvider for MeshChatProvider {
             lookup_started.elapsed().as_millis() as u64,
         );
 
-        // ── 1. Create the mpsc channel ────────────────────────────────────────
-        let (tx, rx) = mpsc::channel::<StreamRelayMessage>(64);
-
-        // ── 2. Spawn the ephemeral StreamReceiverActor on the local node ──────
+        // ── 1. Get or create the session stream router ──────────────────────
         let request_id = Uuid::now_v7().to_string();
         let session_id = self
             .remote_session_id()
             .unwrap_or("unknown-session")
             .to_string();
-        let stream_rx_name = super::dht_name::stream_receiver(&session_id, &request_id);
         setup_span.record("request_id", &request_id);
 
-        {
-            let register_started = Instant::now();
-            let reg_span = tracing::info_span!(
-                "remote.mesh_provider.dht_register_receiver",
-                session_id = %session_id,
-                request_id = %request_id,
-                stream_rx_name = %stream_rx_name,
-                local_peer_id = %self.mesh.peer_id(),
-                target_peer_id = tracing::field::display(self.target_peer_id().as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
-            );
-            let receiver_actor =
-                StreamReceiverActor::new(tx, stream_rx_name.clone(), Some(self.mesh.clone()));
-            let receiver_ref = StreamReceiverActor::spawn(receiver_actor);
+        let router_setup_started = Instant::now();
+        let setup_span_inner = tracing::info_span!(
+            "remote.mesh_provider.router_setup",
+            session_id = %session_id,
+            request_id = %request_id,
+            local_peer_id = %self.mesh.peer_id(),
+            target_peer_id = tracing::field::display(self.target_peer_id().as_ref().map_or("unknown-peer".to_string(), ToString::to_string)),
+            router_mode = "session_router",
+        );
 
-            // Register in REMOTE_REGISTRY + DHT so the remote ProviderHostActor can
-            // send StreamChunkRelay messages back to us.
-            self.mesh
-                .register_actor(receiver_ref, stream_rx_name.clone())
-                .instrument(reg_span)
-                .await;
-            setup_span.record(
-                "register_receiver_ms",
-                register_started.elapsed().as_millis() as u64,
-            );
-        }
+        // Get or create the stable per-session router
+        let router_ref = self.get_or_create_stream_router(&session_id).await;
+
+        // Pre-register the request ID so the router does not auto-create
+        // entries for unsolicited relay messages. Await completion to avoid a
+        // race where attach arrives before registration is visible.
+        router_ref
+            .ask(RegisterRequest {
+                request_id: request_id.clone(),
+            })
+            .await
+            .map_err(|e| {
+                LLMError::ProviderError(format!("failed to register stream request: {}", e))
+            })?;
+
+        // Convert to remote ref so the provider host can send to it
+        let remote_router_ref = router_ref.clone().into_remote_ref().await;
+
+        // Create local consumer channel and attach to router
+        let (tx, rx) = mpsc::channel::<StreamRelayMessage>(64);
+        router_ref
+            .ask(AttachStreamConsumer {
+                request_id: request_id.clone(),
+                consumer_tx: tx,
+            })
+            .await
+            .map_err(|e| {
+                LLMError::ProviderError(format!("failed to attach stream consumer: {}", e))
+            })?;
+
+        setup_span_inner.record(
+            "router_setup_ms",
+            router_setup_started.elapsed().as_millis() as u64,
+        );
+        setup_span.record(
+            "router_setup_ms",
+            router_setup_started.elapsed().as_millis() as u64,
+        );
 
         log::debug!(
-            "MeshChatProvider: registered StreamReceiverActor as '{}' for {}/{}",
-            stream_rx_name,
+            "MeshChatProvider: using SessionStreamRouterActor for {}/{}",
             self.provider_name,
             self.model
         );
 
-        // ── 3. Tell the ProviderHostActor to start streaming ──────────────────
+        // ── 2. Tell the ProviderHostActor to start streaming ──────────────────
         let stream_request = ProviderStreamRequest {
             provider: self.provider_name.clone(),
             model: self.model.clone(),
@@ -417,7 +491,7 @@ impl ChatProvider for MeshChatProvider {
             tools: tools.map(|t| t.to_vec()),
             session_id: session_id.clone(),
             request_id: request_id.clone(),
-            stream_receiver_name: stream_rx_name.clone(),
+            stream_router_ref: remote_router_ref,
             reconnect_grace_secs: self.mesh.stream_reconnect_grace().as_secs(),
             heartbeat_interval_secs: self.heartbeat_interval_secs,
             lease_ttl_secs: self.lease_ttl_secs,
@@ -448,15 +522,10 @@ impl ChatProvider for MeshChatProvider {
         );
 
         // ── 4. Wrap mpsc::Receiver as Stream<Item = Result<StreamChunk, LLMError>> ──
-        //
-        // Transport disconnects are handled explicitly via relay control messages.
-        // We still keep a large reconnect grace window as a last-resort failure
-        // boundary when the remote node disappears and does not come back.
         let raw_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
 
         let session_id_for_stream = session_id.clone();
         let request_id_for_stream = request_id.clone();
-        let stream_rx_name_for_log = stream_rx_name.clone();
         let provider_for_stream = self.provider_name.clone();
         let model_for_stream = self.model.clone();
         let target_for_stream = self.target_dht_name.clone();
@@ -479,7 +548,7 @@ impl ChatProvider for MeshChatProvider {
             ),
             move |(
                 mut raw_stream,
-                disconnected_since,
+                mut disconnected_since,
                 mut chunk_index,
                 mut pending_chunks,
                 mut first_chunk_recorded,
@@ -490,28 +559,20 @@ impl ChatProvider for MeshChatProvider {
                 let request_id_for_stream = request_id_for_stream.clone();
                 let target_peer_id = target_peer_id;
                 let local_peer_id = local_peer_id.clone();
-                let stream_rx_name_for_log = stream_rx_name_for_log.clone();
                 let provider_for_stream = provider_for_stream.clone();
                 let model_for_stream = model_for_stream.clone();
                 let target_for_stream = target_for_stream.clone();
                 let setup_span = setup_span.clone();
                 let provider_handle = provider_handle.clone();
                 async move {
-                    if tokio::time::Instant::now() >= renew_due {
-                        let _ = provider_handle
-                            .renew_remote_stream_lease(
-                                &session_id_for_stream,
-                                &request_id_for_stream,
-                            )
-                            .await;
-                        renew_due = tokio::time::Instant::now() + lease_renew_every;
-                    }
-
+                    // ── Pending chunks are always yielded immediately ────────
                     if let Some(chunk) = pending_chunks.pop_front() {
                         chunk_index += 1;
-                        let elapsed_ms = stream_start.elapsed().as_millis();
                         if !first_chunk_recorded {
-                            setup_span.record("first_chunk_ms", elapsed_ms as u64);
+                            setup_span.record(
+                                "first_chunk_ms",
+                                stream_start.elapsed().as_millis() as u64,
+                            );
                             first_chunk_recorded = true;
                         }
                         return Some((
@@ -528,6 +589,27 @@ impl ChatProvider for MeshChatProvider {
                     }
 
                     loop {
+                        // ── Renew lease while waiting for the next chunk ────
+                        // Lease renewal runs concurrently with stream polling so
+                        // that a long-waiting `raw_stream.next()` (e.g. slow
+                        // provider setup or first-token latency) cannot starve
+                        // renewal.  The provider host independently expires
+                        // unused leases on heartbeat ticks.
+                        let now = tokio::time::Instant::now();
+                        let sleep = if now >= renew_due {
+                            // Overdue — renew now without waiting.
+                            let _ = provider_handle
+                                .renew_remote_stream_lease(
+                                    &session_id_for_stream,
+                                    &request_id_for_stream,
+                                )
+                                .await;
+                            renew_due = tokio::time::Instant::now() + lease_renew_every;
+                            tokio::time::sleep(std::time::Duration::ZERO)
+                        } else {
+                            tokio::time::sleep_until(renew_due)
+                        };
+
                         let next = if let Some(since) = disconnected_since {
                             let elapsed = since.elapsed();
                             let remaining = reconnect_grace.saturating_sub(elapsed);
@@ -550,9 +632,21 @@ impl ChatProvider for MeshChatProvider {
                                     ),
                                 ));
                             }
-                            match tokio::time::timeout(remaining, raw_stream.next()).await {
-                                Ok(item) => item,
-                                Err(_) => {
+                            tokio::select! {
+                                item = raw_stream.next() => item,
+                                _ = sleep => {
+                                    // Renew lease while waiting for reconnect.
+                                    let _ = provider_handle
+                                        .renew_remote_stream_lease(
+                                            &session_id_for_stream,
+                                            &request_id_for_stream,
+                                        )
+                                        .await;
+                                    renew_due = tokio::time::Instant::now()
+                                        + lease_renew_every;
+                                    continue;
+                                }
+                                _ = tokio::time::sleep(remaining) => {
                                     return Some((
                                         Err(LLMError::Transport {
                                             kind: TransportErrorKind::Timeout,
@@ -573,7 +667,21 @@ impl ChatProvider for MeshChatProvider {
                                 }
                             }
                         } else {
-                            raw_stream.next().await
+                            tokio::select! {
+                                item = raw_stream.next() => item,
+                                _ = sleep => {
+                                    // Renew lease while waiting for next chunk.
+                                    let _ = provider_handle
+                                        .renew_remote_stream_lease(
+                                            &session_id_for_stream,
+                                            &request_id_for_stream,
+                                        )
+                                        .await;
+                                    renew_due = tokio::time::Instant::now()
+                                        + lease_renew_every;
+                                    continue;
+                                }
+                            }
                         };
 
                         match next {
@@ -593,7 +701,6 @@ impl ChatProvider for MeshChatProvider {
                                         provider = %provider_for_stream,
                                         model = %model_for_stream,
                                         target_node = %target_for_stream,
-                                        stream_rx = %stream_rx_name_for_log,
                                         chunk_index = chunk_index + 1,
                                         elapsed_ms,
                                         finish_reason = ?finish_reason,
@@ -609,7 +716,6 @@ impl ChatProvider for MeshChatProvider {
                                         provider = %provider_for_stream,
                                         model = %model_for_stream,
                                         target_node = %target_for_stream,
-                                        stream_rx = %stream_rx_name_for_log,
                                         chunk_index = chunk_index + 1,
                                         elapsed_ms,
                                         "stream chunk received"
@@ -620,7 +726,7 @@ impl ChatProvider for MeshChatProvider {
                                     Ok(chunk),
                                     (
                                         raw_stream,
-                                        None,
+                                        disconnected_since,
                                         chunk_index,
                                         pending_chunks,
                                         first_chunk_recorded,
@@ -630,11 +736,11 @@ impl ChatProvider for MeshChatProvider {
                             }
                             Some(StreamRelayMessage::ChunkBatch(chunks)) => {
                                 let elapsed_ms = stream_start.elapsed().as_millis();
+                                let batch_len = chunks.len();
                                 if !first_chunk_recorded && !chunks.is_empty() {
                                     setup_span.record("first_chunk_ms", elapsed_ms as u64);
                                     first_chunk_recorded = true;
                                 }
-                                let batch_len = chunks.len();
                                 pending_chunks.extend(chunks);
                                 tracing::trace!(
                                     target: "remote::mesh_provider::stream",
@@ -645,18 +751,26 @@ impl ChatProvider for MeshChatProvider {
                                     provider = %provider_for_stream,
                                     model = %model_for_stream,
                                     target_node = %target_for_stream,
-                                    stream_rx = %stream_rx_name_for_log,
                                     batch_len,
                                     elapsed_ms,
                                     "stream batch received"
                                 );
-                                let chunk = pending_chunks.pop_front()?;
+                                let Some(chunk) = pending_chunks.pop_front() else {
+                                    tracing::warn!(
+                                        target: "remote::mesh_provider::stream",
+                                        session_id = %session_id_for_stream,
+                                        request_id = %request_id_for_stream,
+                                        batch_len,
+                                        "empty chunk batch after extend; continuing"
+                                    );
+                                    continue;
+                                };
                                 chunk_index += 1;
                                 break Some((
                                     Ok(chunk),
                                     (
                                         raw_stream,
-                                        None,
+                                        disconnected_since,
                                         chunk_index,
                                         pending_chunks,
                                         first_chunk_recorded,
@@ -679,7 +793,6 @@ impl ChatProvider for MeshChatProvider {
                                     provider = %provider_for_stream,
                                     model = %model_for_stream,
                                     target_node = %target_for_stream,
-                                    stream_rx = %stream_rx_name_for_log,
                                     phase = ?phase,
                                     elapsed_ms,
                                     idle_ms,
@@ -711,21 +824,13 @@ impl ChatProvider for MeshChatProvider {
                                     provider = %provider_for_stream,
                                     model = %model_for_stream,
                                     target_node = %target_for_stream,
-                                    stream_rx = %stream_rx_name_for_log,
                                     reason,
-                                    "stream transport disconnected"
+                                    "stream transport disconnected (internal state, continuing)"
                                 );
-                                break Some((
-                                    Err(LLMError::RemoteStreamDisconnected { message: reason }),
-                                    (
-                                        raw_stream,
-                                        None,
-                                        chunk_index,
-                                        pending_chunks,
-                                        first_chunk_recorded,
-                                        renew_due,
-                                    ),
-                                ));
+                                // Track disconnect time internally; do NOT expose
+                                // as a stream error.
+                                disconnected_since.get_or_insert_with(tokio::time::Instant::now);
+                                continue;
                             }
                             Some(StreamRelayMessage::TransportReconnected { buffered_chunks }) => {
                                 tracing::info!(
@@ -737,23 +842,12 @@ impl ChatProvider for MeshChatProvider {
                                     provider = %provider_for_stream,
                                     model = %model_for_stream,
                                     target_node = %target_for_stream,
-                                    stream_rx = %stream_rx_name_for_log,
                                     buffered_chunks,
-                                    "stream transport reconnected"
+                                    "stream transport reconnected (internal state update)"
                                 );
-                                break Some((
-                                    Err(LLMError::RemoteStreamReconnected {
-                                        message: format!("buffered_chunks={}", buffered_chunks),
-                                    }),
-                                    (
-                                        raw_stream,
-                                        None,
-                                        chunk_index,
-                                        pending_chunks,
-                                        first_chunk_recorded,
-                                        renew_due,
-                                    ),
-                                ));
+                                // Reset disconnect tracking.
+                                disconnected_since = None;
+                                continue;
                             }
                             Some(StreamRelayMessage::TransportFailed { error }) => {
                                 break Some((
@@ -963,58 +1057,80 @@ pub(crate) async fn find_provider_on_mesh(
     use crate::agent::remote::node_manager::{GetNodeInfo, RemoteNodeManager};
     use crate::agent::remote::{ListAvailableModels, NodeInfo};
 
-    let mut stream = mesh.lookup_all_actors::<RemoteNodeManager>(super::dht_name::NODE_MANAGER);
     let mut peers_checked: u32 = 0;
+    let mut candidates: Vec<(PeerId, NodeId)> = Vec::new();
 
-    while let Some(node_ref_result) = stream.next().await {
-        let node_ref = match node_ref_result {
-            Ok(r) => r,
-            Err(e) => {
-                log::debug!("find_provider_on_mesh: DHT stream error: {}", e);
+    for scope in mesh.active_scopes() {
+        let node_manager_name = scoped_node_manager(&scope);
+        let mut stream = mesh.lookup_all_actors::<RemoteNodeManager>(node_manager_name);
+
+        while let Some(node_ref_result) = stream.next().await {
+            let node_ref = match node_ref_result {
+                Ok(r) => r,
+                Err(e) => {
+                    log::debug!("find_provider_on_mesh: DHT stream error: {}", e);
+                    continue;
+                }
+            };
+
+            peers_checked += 1;
+            tracing::Span::current().record("peers_checked", peers_checked);
+
+            let Some(peer_id) = node_ref.id().peer_id().copied() else {
+                continue;
+            };
+
+            // Ask for available models first (cheaper filter).
+            let models = match node_ref
+                .ask::<ListAvailableModels>(&ListAvailableModels)
+                .await
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    log::debug!("find_provider_on_mesh: ListAvailableModels failed: {}", e);
+                    continue;
+                }
+            };
+
+            if !models.iter().any(|m| m.provider == provider_name) {
                 continue;
             }
-        };
 
-        peers_checked += 1;
-        tracing::Span::current().record("peers_checked", peers_checked);
+            // This peer has the provider — ask for its stable node identity.
+            let node_info: NodeInfo = match node_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
+                Ok(info) => info,
+                Err(e) => {
+                    log::debug!(
+                        "find_provider_on_mesh: GetNodeInfo failed for peer with provider '{}': {}",
+                        provider_name,
+                        e
+                    );
+                    continue;
+                }
+            };
 
-        // Ask for available models first (cheaper filter).
-        let models = match node_ref
-            .ask::<ListAvailableModels>(&ListAvailableModels)
-            .await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                log::debug!("find_provider_on_mesh: ListAvailableModels failed: {}", e);
-                continue;
-            }
-        };
-
-        if !models.iter().any(|m| m.provider == provider_name) {
-            continue;
+            candidates.push((peer_id, node_info.node_id));
         }
+    }
 
-        // This peer has the provider — ask for its stable node identity.
-        let node_info: NodeInfo = match node_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
-            Ok(info) => info,
-            Err(e) => {
-                log::debug!(
-                    "find_provider_on_mesh: GetNodeInfo failed for peer with provider '{}': {}",
-                    provider_name,
-                    e
-                );
-                continue;
-            }
-        };
+    candidates.sort_by_key(|(peer_id, node_id)| {
+        let priority = mesh
+            .best_route_for_peer(peer_id)
+            .map(|route| route.priority)
+            .unwrap_or(0);
+        (std::cmp::Reverse(priority), node_id.to_string())
+    });
+    candidates.dedup_by(|a, b| a.0 == b.0);
 
+    if let Some((peer_id, node_id)) = candidates.first() {
         log::info!(
-            "find_provider_on_mesh: provider '{}' found on mesh peer '{}' ({}) (mesh fallback)",
+            "find_provider_on_mesh: provider '{}' selected mesh peer '{}' ({}) (mesh fallback)",
             provider_name,
-            node_info.hostname,
-            node_info.node_id
+            peer_id,
+            node_id
         );
         tracing::Span::current().record("found", true);
-        return Some(node_info.node_id);
+        return Some(node_id.clone());
     }
 
     tracing::Span::current().record("found", false);

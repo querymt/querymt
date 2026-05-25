@@ -43,7 +43,8 @@ mod event_relay_mesh_tests {
         let relay = EventRelayActor::new(event_sink.clone(), label.to_string());
         let relay_ref = EventRelayActor::spawn(relay);
 
-        let dht_name = crate::agent::remote::dht_name::event_relay(
+        let dht_name = crate::agent::remote::scope::scoped_event_relay(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
             &format!("{}-{}", label, test_id),
             mesh.peer_id(),
         );
@@ -674,15 +675,22 @@ mod event_relay_mesh_tests {
         let session_ref_local = SessionActor::spawn(actor);
 
         // Register session in DHT so attach can find it
-        let session_dht = crate::agent::remote::dht_name::session(&session_id);
+        let session_dht = crate::agent::remote::scope::scoped_session(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &session_id,
+        );
         mesh.register_actor(session_ref_local.clone(), session_dht)
             .await;
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Resolve as RemoteActorRef (simulates the attach path)
+        let session_dht_lookup = crate::agent::remote::scope::scoped_session(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &session_id,
+        );
         let remote_session = mesh
-            .lookup_actor::<SessionActor>(crate::agent::remote::dht_name::session(&session_id))
+            .lookup_actor::<SessionActor>(&session_dht_lookup)
             .await
             .expect("DHT lookup")
             .expect("session not in DHT");
@@ -695,6 +703,7 @@ mod event_relay_mesh_tests {
                 remote_session,
                 "test-peer".to_string(),
                 Some(mesh.clone()),
+                None,
                 None,
             )
             .await;

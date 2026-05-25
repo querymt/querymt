@@ -148,37 +148,27 @@ mod mesh_provider_tests {
 
     // ── B.6 — Bug #2 (FIXED) ─────────────────────────────────────────────────
 
-    /// **Bug #2 — FIXED.** The root cause was `qmtcode.rs` registering
-    /// `ProviderHostActor` under `"provider_host::{hostname}"` instead of
-    /// `dht_name::provider_host(peer_id)` (`"provider_host::peer::{peer_id}"`).
-    ///
-    /// The fix was two-fold:
-    /// 1. Introduced `agent::remote::dht_name` module to centralise all DHT
-    ///    naming conventions, eliminating ad-hoc `format!` strings.
-    /// 2. Changed `qmtcode.rs` (and all other call sites) to use
-    ///    `dht_name::provider_host(mesh.peer_id())`.
-    ///
-    /// `find_provider_on_mesh` itself was correct — it returns `node_info.node_id`
-    /// (a PeerId), not a hostname. The bug was only on the registration side.
-    ///
-    /// This test verifies the `dht_name` API produces the correct format.
+    /// Verifies that `scoped_provider_host` produces the correct scoped DHT
+    /// name format.  `MeshChatProvider::new` uses this to construct the DHT
+    /// lookup key, so the registration side must produce the same string.
     #[tokio::test]
-    async fn test_dht_name_provider_host_uses_peer_id_not_hostname() {
-        use crate::agent::remote::dht_name;
+    async fn test_scoped_provider_host_uses_peer_id_not_hostname() {
+        use crate::agent::remote::scope::{MeshScopeId, scoped_provider_host};
 
         let peer_id = "12D3KooWPv7fUDC2WqR5c6v71fMsoxhoYYqcPEciyCfuqRz6f6qH";
-        let dht_name = dht_name::provider_host(&peer_id);
+        let dht_name = scoped_provider_host(&MeshScopeId::lan_default(), peer_id);
 
-        // Must use the "provider_host::peer::" prefix with peer_id.
+        // Must use the scoped "scope::lan::default::provider_host::peer::" prefix.
         assert_eq!(
-            dht_name, "provider_host::peer::12D3KooWPv7fUDC2WqR5c6v71fMsoxhoYYqcPEciyCfuqRz6f6qH",
-            "dht_name::provider_host must produce 'provider_host::peer::{{peer_id}}'"
+            dht_name,
+            "scope::lan::default::provider_host::peer::12D3KooWPv7fUDC2WqR5c6v71fMsoxhoYYqcPEciyCfuqRz6f6qH",
+            "scoped_provider_host must produce 'scope::lan::default::provider_host::peer::{{peer_id}}'"
         );
 
         // Must NOT contain just a hostname.
         assert!(
-            dht_name.starts_with("provider_host::peer::"),
-            "dht_name must start with 'provider_host::peer::'"
+            dht_name.contains("provider_host::peer::"),
+            "dht_name must contain 'provider_host::peer::'"
         );
     }
 
@@ -211,7 +201,10 @@ mod mesh_provider_tests {
         // Register a ProviderHostActor under a unique peer-id keyed DHT name.
         let f = ProviderHostFixture::new().await;
         let node_id = format!("test-node-b8-{}", test_id);
-        let dht_name = crate::agent::remote::dht_name::provider_host(&node_id);
+        let dht_name = crate::agent::remote::scope::scoped_provider_host(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &node_id,
+        );
         mesh.register_actor(f.actor_ref, dht_name.clone()).await;
 
         let provider = MeshChatProvider::new(mesh, &node_id, "nonexistent", "no-model");

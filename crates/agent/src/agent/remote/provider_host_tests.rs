@@ -167,8 +167,9 @@ mod provider_host_tests {
     }
     use crate::agent::remote::provider_host::{
         CancelProviderStreamRequest, GetProviderStreamStatus, ProviderChatRequest,
-        ProviderChatResponse, ProviderStreamPhase, RenewProviderStreamLease, StreamChunkRelay,
-        StreamReceiverActor, StreamRelayMessage,
+        ProviderChatResponse, ProviderStreamPhase, ProviderStreamStatus, RenewProviderStreamLease,
+        StreamChunkRelay, StreamReceiverActor, StreamRelayMessage, keep_stream_message_buffered,
+        relay_message_is_terminal,
     };
     use crate::agent::remote::test_helpers::fixtures::ProviderHostFixture;
     use kameo::actor::Spawn;
@@ -427,7 +428,7 @@ mod provider_host_tests {
     #[tokio::test]
     async fn test_stream_receiver_actor_kill_on_done_chunk() {
         let (tx, mut rx) = mpsc::channel(8);
-        let actor = StreamReceiverActor::new(tx, "test-done".to_string(), None);
+        let actor = StreamReceiverActor::new(tx);
         let actor_ref = StreamReceiverActor::spawn(actor);
 
         let done_relay = StreamChunkRelay {
@@ -469,7 +470,7 @@ mod provider_host_tests {
     #[tokio::test]
     async fn test_stream_receiver_actor_kill_on_done_batch() {
         let (tx, mut rx) = mpsc::channel(8);
-        let actor = StreamReceiverActor::new(tx, "test-done-batch".to_string(), None);
+        let actor = StreamReceiverActor::new(tx);
         let actor_ref = StreamReceiverActor::spawn(actor);
 
         let done_relay = StreamChunkRelay {
@@ -510,7 +511,7 @@ mod provider_host_tests {
     #[tokio::test]
     async fn test_stream_receiver_actor_kill_on_error_chunk() {
         let (tx, mut rx) = mpsc::channel(8);
-        let actor = StreamReceiverActor::new(tx, "test-err".to_string(), None);
+        let actor = StreamReceiverActor::new(tx);
         let actor_ref = StreamReceiverActor::spawn(actor);
 
         let error_relay = StreamChunkRelay {
@@ -547,7 +548,7 @@ mod provider_host_tests {
     #[tokio::test]
     async fn test_stream_receiver_actor_keeps_running_on_heartbeat() {
         let (tx, mut rx) = mpsc::channel(8);
-        let actor = StreamReceiverActor::new(tx, "test-heartbeat".to_string(), None);
+        let actor = StreamReceiverActor::new(tx);
         let actor_ref = StreamReceiverActor::spawn(actor);
 
         actor_ref
@@ -697,8 +698,6 @@ mod provider_host_tests {
 
     #[test]
     fn test_provider_chat_request_params_roundtrip() {
-        use crate::agent::remote::provider_host::ProviderStreamRequest;
-
         let req = ProviderChatRequest {
             provider: "llama_cpp".to_string(),
             model: "test-model".to_string(),
@@ -727,25 +726,9 @@ mod provider_host_tests {
             Some(0.3)
         );
 
-        // Same for ProviderStreamRequest
-        let stream_req = ProviderStreamRequest {
-            provider: "llama_cpp".to_string(),
-            model: "test-model".to_string(),
-            messages: vec![],
-            tools: None,
-            session_id: "session-test".to_string(),
-            request_id: "request-test".to_string(),
-            stream_receiver_name: "stream_rx::session-test::request-test".to_string(),
-            reconnect_grace_secs: 120,
-            heartbeat_interval_secs: 7,
-            lease_ttl_secs: 33,
-            params: Some(serde_json::json!({"system": ["prompt"]})),
-        };
-        let json = serde_json::to_string(&stream_req).expect("serialize");
-        let back: ProviderStreamRequest = serde_json::from_str(&json).expect("deserialize");
-        assert!(back.params.is_some());
-        assert_eq!(back.heartbeat_interval_secs, 7);
-        assert_eq!(back.lease_ttl_secs, 33);
+        // RemoteActorRef doesn't roundtrip through JSON serialization
+        // Skip the stream request test since RemoteActorRef cannot be easily constructed in tests
+        // The actual direct handoff is tested in integration tests
     }
 
     #[test]
@@ -911,6 +894,75 @@ mod provider_host_tests {
         assert_eq!(merged, host);
     }
 
+    #[test]
+    fn test_should_ack_relay_message_uses_window_for_chunk_batches() {
+        use crate::agent::remote::provider_host::should_ack_relay_message;
+        use std::time::Duration;
+
+        let chunk = StreamRelayMessage::Chunk(StreamChunk::Text("hello".to_string()));
+        assert!(
+            !should_ack_relay_message(
+                &chunk,
+                0,
+                Duration::from_millis(5),
+                8,
+                Duration::from_millis(40)
+            ),
+            "fresh chunk batches inside the window should not force an ack"
+        );
+        assert!(
+            should_ack_relay_message(
+                &chunk,
+                8,
+                Duration::from_millis(5),
+                8,
+                Duration::from_millis(40)
+            ),
+            "chunk batches should ack once the batch window is reached"
+        );
+        assert!(
+            should_ack_relay_message(
+                &chunk,
+                0,
+                Duration::from_millis(40),
+                8,
+                Duration::from_millis(40)
+            ),
+            "chunk batches should ack once the time window is reached"
+        );
+
+        let done = StreamRelayMessage::Chunk(StreamChunk::Done {
+            finish_reason: querymt::chat::FinishReason::Stop,
+        });
+        assert!(
+            should_ack_relay_message(
+                &done,
+                0,
+                Duration::from_millis(0),
+                8,
+                Duration::from_millis(40)
+            ),
+            "terminal messages must always be acked"
+        );
+
+        let heartbeat = StreamRelayMessage::Heartbeat {
+            phase: ProviderStreamPhase::Streaming,
+            elapsed_ms: 100,
+            idle_ms: 10,
+            chunk_count: 2,
+        };
+        assert!(
+            should_ack_relay_message(
+                &heartbeat,
+                0,
+                Duration::from_millis(0),
+                8,
+                Duration::from_millis(40)
+            ),
+            "control messages should stay acked for health signaling"
+        );
+    }
+
     // ── A.3 supplemental — verify ToolCall round-trip ────────────────────────
 
     #[test]
@@ -933,5 +985,213 @@ mod provider_host_tests {
         let returned = resp.tool_calls().expect("should be Some");
         assert_eq!(returned.len(), 1);
         assert_eq!(returned[0].function.name, "my_tool");
+    }
+
+    // ── Phase 2: Direct-ref reconnect — phase variants ─────────────────────
+
+    #[test]
+    fn test_stream_phase_grace_expired_serde_roundtrip() {
+        let phase = ProviderStreamPhase::GraceExpired;
+        let json = serde_json::to_string(&phase).expect("serialize");
+        assert_eq!(json, "\"grace_expired\"");
+        let back: ProviderStreamPhase = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, ProviderStreamPhase::GraceExpired);
+    }
+
+    #[test]
+    fn test_stream_phase_lease_expired_serde_roundtrip() {
+        let phase = ProviderStreamPhase::LeaseExpired;
+        let json = serde_json::to_string(&phase).expect("serialize");
+        assert_eq!(json, "\"lease_expired\"");
+        let back: ProviderStreamPhase = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, ProviderStreamPhase::LeaseExpired);
+    }
+
+    #[test]
+    fn test_stream_phase_all_distinct_variants_deserialize() {
+        // Verify all phase variants produce distinct serialized values.
+        let variants = vec![
+            (ProviderStreamPhase::OpeningUpstream, "opening_upstream"),
+            (
+                ProviderStreamPhase::WaitingFirstChunk,
+                "waiting_first_chunk",
+            ),
+            (ProviderStreamPhase::Streaming, "streaming"),
+            (
+                ProviderStreamPhase::ReceiverDisconnected,
+                "receiver_disconnected",
+            ),
+            (ProviderStreamPhase::GraceExpired, "grace_expired"),
+            (ProviderStreamPhase::LeaseExpired, "lease_expired"),
+            (ProviderStreamPhase::Cancelling, "cancelling"),
+            (ProviderStreamPhase::Completed, "completed"),
+            (ProviderStreamPhase::Failed, "failed"),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (variant, expected_name) in &variants {
+            let json = serde_json::to_string(variant).expect("serialize");
+            assert_eq!(json, format!("\"{}\"", expected_name));
+            assert!(
+                seen.insert(*expected_name),
+                "duplicate phase name: {}",
+                expected_name
+            );
+            let back: ProviderStreamPhase = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, *variant);
+        }
+    }
+
+    // ── Phase 2: Stream status with reconnect phases ────────────────────────
+
+    #[test]
+    fn test_provider_stream_status_with_grace_expired_phase() {
+        let status = ProviderStreamStatus {
+            session_id: "s-1".to_string(),
+            request_id: "r-1".to_string(),
+            provider: "test".to_string(),
+            model: "m".to_string(),
+            phase: ProviderStreamPhase::GraceExpired,
+            elapsed_ms: 5000,
+            idle_ms: 3000,
+            chunk_count: 10,
+            receiver_connected: false,
+            lease_expires_in_ms: 0,
+            last_error: Some("reconnect grace expired".to_string()),
+        };
+        let json = serde_json::to_string(&status).expect("serialize status");
+        assert!(json.contains("\"phase\":\"grace_expired\""));
+        assert!(json.contains("\"receiver_connected\":false"));
+        let back: ProviderStreamStatus = serde_json::from_str(&json).expect("deserialize status");
+        assert_eq!(back.phase, ProviderStreamPhase::GraceExpired);
+        assert_eq!(back.last_error.as_deref(), Some("reconnect grace expired"));
+    }
+
+    #[test]
+    fn test_provider_stream_status_with_lease_expired_phase() {
+        let status = ProviderStreamStatus {
+            session_id: "s-2".to_string(),
+            request_id: "r-2".to_string(),
+            provider: "test".to_string(),
+            model: "m".to_string(),
+            phase: ProviderStreamPhase::LeaseExpired,
+            elapsed_ms: 120000,
+            idle_ms: 60000,
+            chunk_count: 50,
+            receiver_connected: true,
+            lease_expires_in_ms: 0,
+            last_error: Some("stream lease expired".to_string()),
+        };
+        let json = serde_json::to_string(&status).expect("serialize status");
+        assert!(json.contains("\"phase\":\"lease_expired\""));
+        let back: ProviderStreamStatus = serde_json::from_str(&json).expect("deserialize status");
+        assert_eq!(back.phase, ProviderStreamPhase::LeaseExpired);
+    }
+
+    // ── Phase 2: relay helpers for reconnect messages ───────────────────────
+
+    #[test]
+    fn test_keep_stream_message_buffered_excludes_reconnect_signals() {
+        // Heartbeats and transport control signals are not buffered for replay.
+        assert!(!keep_stream_message_buffered(
+            &StreamRelayMessage::Heartbeat {
+                phase: ProviderStreamPhase::Streaming,
+                elapsed_ms: 100,
+                idle_ms: 50,
+                chunk_count: 5,
+            }
+        ));
+        assert!(!keep_stream_message_buffered(
+            &StreamRelayMessage::TransportDisconnected {
+                reason: "test".to_string(),
+            }
+        ));
+        assert!(!keep_stream_message_buffered(
+            &StreamRelayMessage::TransportReconnected { buffered_chunks: 3 }
+        ));
+        // Chunks and errors should be buffered.
+        assert!(keep_stream_message_buffered(&StreamRelayMessage::Chunk(
+            StreamChunk::Text("hi".to_string())
+        )));
+        assert!(keep_stream_message_buffered(
+            &StreamRelayMessage::ProviderError {
+                error: querymt::error::LLMError::ProviderError("fail".to_string()).to_payload(),
+            }
+        ));
+        assert!(keep_stream_message_buffered(
+            &StreamRelayMessage::TransportFailed {
+                error: querymt::error::LLMError::Transport {
+                    kind: querymt::error::TransportErrorKind::Timeout,
+                    message: "grace expired".to_string(),
+                }
+                .to_payload(),
+            }
+        ));
+    }
+
+    #[test]
+    fn test_relay_message_is_terminal_includes_transport_failed() {
+        // TransportFailed from grace expiry is terminal.
+        let msg = StreamRelayMessage::TransportFailed {
+            error: querymt::error::LLMError::Transport {
+                kind: querymt::error::TransportErrorKind::Timeout,
+                message: "reconnect grace expired".to_string(),
+            }
+            .to_payload(),
+        };
+        assert!(relay_message_is_terminal(&msg));
+    }
+
+    // ── Phase 2: StreamReceiverActor on terminal does not need DHT unregistration ──
+
+    #[tokio::test]
+    async fn test_stream_receiver_actor_kills_on_transport_failed_without_dht() {
+        // Verify the actor stops on TransportFailed without any DHT unregistration.
+        let (tx, mut rx) = mpsc::channel(16);
+        let actor = StreamReceiverActor::new(tx);
+        let actor_ref = StreamReceiverActor::spawn(actor);
+
+        // Send a TransportFailed message — this is terminal.
+        let result = actor_ref
+            .tell(StreamChunkRelay {
+                message: StreamRelayMessage::TransportFailed {
+                    error: querymt::error::LLMError::Transport {
+                        kind: querymt::error::TransportErrorKind::Timeout,
+                        message: "reconnect grace expired".to_string(),
+                    }
+                    .to_payload(),
+                },
+            })
+            .send()
+            .await;
+        // The tell should succeed — the message is forwarded and the actor stops.
+        assert!(result.is_ok(), "tell should succeed: {:?}", result);
+
+        // The channel should receive the TransportFailed message.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("should receive message before timeout");
+        assert!(
+            matches!(msg, Some(StreamRelayMessage::TransportFailed { .. })),
+            "expected TransportFailed, got {:?}",
+            msg
+        );
+
+        // The actor should have been killed (no further messages accepted).
+        let tell_result = actor_ref
+            .tell(StreamChunkRelay {
+                message: StreamRelayMessage::Heartbeat {
+                    phase: ProviderStreamPhase::Streaming,
+                    elapsed_ms: 0,
+                    idle_ms: 0,
+                    chunk_count: 0,
+                },
+            })
+            .send()
+            .await;
+        // The actor is dead, so subsequent tells should fail.
+        assert!(
+            tell_result.is_err(),
+            "actor should be killed after terminal message"
+        );
     }
 }

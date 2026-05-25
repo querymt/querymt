@@ -14,7 +14,6 @@ use super::super::session::PRIMARY_AGENT_ID;
 use crate::agent::core::AgentMode;
 use crate::events::EventEnvelope;
 use crate::index::resolve_workspace_root;
-use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
 use crate::session::load_session_snapshot;
 use crate::session::projection::SessionScope;
@@ -85,12 +84,16 @@ pub struct ListSessionsRequest {
     pub cwd: Option<String>,
     pub query: Option<String>,
     pub session_scope: Option<SessionScope>,
+    /// When true, merge remote mesh sessions into the response.
+    /// Defaults to false so local session open is never blocked on remote discovery.
+    pub include_remote: bool,
 }
 
 impl ListSessionsRequest {
     pub fn root_browse() -> Self {
         Self {
             session_scope: Some(SessionScope::Root),
+            include_remote: false,
             ..Self::default()
         }
     }
@@ -125,13 +128,15 @@ pub async fn handle_list_sessions(
         cwd,
         query,
         session_scope,
+        include_remote: _,
     } = request;
     let page_limit = limit.unwrap_or(20).clamp(1, 200) as usize;
     let mode = mode.unwrap_or_else(|| "browse".to_string());
     let session_scope = session_scope.unwrap_or_default();
     let is_browse_first_page = mode == "browse" && cursor.is_none();
-    let should_merge_remote =
-        is_browse_first_page && matches!(session_scope, SessionScope::Root | SessionScope::All);
+    let should_merge_remote = request.include_remote
+        && is_browse_first_page
+        && matches!(session_scope, SessionScope::Root | SessionScope::All);
 
     let to_ui_group = |g: crate::session::projection::SessionGroup| SessionGroup {
         cwd: g.cwd,
@@ -231,8 +236,7 @@ pub async fn handle_list_sessions(
             let node_id_by_label: std::collections::HashMap<String, String> =
                 if state.agent.mesh().is_some() {
                     state
-                        .agent
-                        .list_remote_nodes()
+                        .get_remote_nodes_cached()
                         .await
                         .into_iter()
                         .map(|n| (n.hostname, n.node_id.to_string()))

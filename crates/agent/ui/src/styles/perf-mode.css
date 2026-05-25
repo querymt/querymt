@@ -1,0 +1,158 @@
+/* ========================================================================
+ * Performance Mode (class on <html>)
+ *
+ * When .perf-mode is added to document.documentElement, all GPU-expensive
+ * CSS effects are disabled or simplified:
+ *   - Infinite animations → none
+ *   - Transitions → none
+ *   - Filter effects (backdrop-filter, filter, drop-shadow) → none
+ *   - Text-shadow → none
+ *   - Box-shadow → none (except essential structural borders)
+ *   - Glitch effects → disabled
+ * ======================================================================== */
+
+/* 1. Kill all animations and transitions globally */
+.perf-mode,
+.perf-mode *,
+.perf-mode *::before,
+.perf-mode *::after {
+  animation-duration: 0s !important;
+  animation-delay: 0s !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0s !important;
+  transition-delay: 0s !important;
+}
+
+/* 2. Kill filters (backdrop-filter, filter, drop-shadow, text-shadow) */
+.perf-mode,
+.perf-mode *,
+.perf-mode *::before,
+.perf-mode *::after {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  filter: none !important;
+  text-shadow: none !important;
+}
+
+/* 3. Kill box-shadow — keep only thin border-based separators */
+.perf-mode,
+.perf-mode * {
+  box-shadow: none !important;
+}
+
+/* 4. Override backdrop-blur containers to opaque backgrounds */
+.perf-mode .modal-backdrop {
+  background: rgb(var(--surface-canvas-rgb)) !important;
+}
+
+.perf-mode .pinned-user-bar {
+  background: rgb(var(--surface-elevated-rgb)) !important;
+}
+
+/* 5. Disable the background gradient radials on <body> */
+.perf-mode body {
+  background-image: none !important;
+}
+
+/* 6. Disable grid background pattern */
+.perf-mode [style*="background-image"],
+.perf-mode .bg-grid-pattern {
+  background-image: none !important;
+}
+
+/* 7. Glitch effects — hide pseudo-elements and reset transforms */
+.perf-mode .glitch,
+.perf-mode .glitch *,
+.perf-mode .glitch *::before,
+.perf-mode .glitch *::after {
+  animation: none !important;
+  transform: none !important;
+  clip-path: none !important;
+  -webkit-clip-path: none !important;
+  color: rgb(var(--glitch-fg-rgb)) !important;
+  text-shadow: none !important;
+}
+
+.perf-mode .glitch [data-char]::before,
+.perf-mode .glitch [data-char]::after {
+  display: none !important;
+}
+
+/* 8. SVG delegation connector animation */
+.perf-mode .delegation-connector-active {
+  stroke-dashoffset: 0 !important;
+  animation: none !important;
+}
+
+/* 9. Timeline dot pulse */
+.perf-mode .timeline-dot.active {
+  animation: none !important;
+  filter: none !important;
+}
+
+.perf-mode .timeline-dot:hover {
+  filter: none !important;
+  transform: scale(1.2) !important;
+}
+
+/* 10. Session card border-trace */
+.perf-mode .session-card::before {
+  animation: none !important;
+  opacity: 0 !important;
+}
+
+.perf-mode .session-card:hover::before {
+  opacity: 0.5 !important;
+  animation: none !important;
+}
+
+/* 11. Glow utility classes — flatten to no-ops */
+.perf-mode .glow-text-primary {
+  text-shadow: none !important;
+}
+
+.perf-mode .glow-border-primary,
+.perf-mode .shadow-glow-primary,
+.perf-mode .shadow-glow-secondary,
+.perf-mode .shadow-glow-tertiary,
+.perf-mode .shadow-glow-success {
+  box-shadow: none !important;
+}
+
+.perf-mode .shadow-mode {
+  box-shadow: none !important;
+}
+
+/* 12. Accent-pulse border animation */
+.perf-mode .animate-accent-pulse {
+  animation: none !important;
+}
+
+/* 13. Pulsing dots become static colored dots */
+.perf-mode .animate-pulse {
+  animation: none !important;
+  opacity: 1 !important;
+}
+
+/* 14. Fade-in animations — skip them */
+.perf-mode .animate-fade-in,
+.perf-mode .animate-fade-in-up,
+.perf-mode .animate-scale-in,
+.perf-mode .animate-slide-in-right,
+.perf-mode .animate-slide-in-left,
+.perf-mode .animate-slide-down,
+.perf-mode .animate-slide-up {
+  animation: none !important;
+  opacity: 1 !important;
+  transform: none !important;
+}
+
+/* 15. Spinning loaders — stop spinning */
+.perf-mode .animate-spin {
+  animation: none !important;
+}
+
+/* 16. Connector pulse */
+.perf-mode .delegation-connector.active {
+  animation: none !important;
+}

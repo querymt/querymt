@@ -117,6 +117,7 @@ async fn handle_list_sessions_browse_root_scope_reports_user_fork_counts() -> Re
             cwd: None,
             query: None,
             session_scope: Some(SessionScope::Root),
+            include_remote: false,
         },
     )
     .await;
@@ -153,6 +154,7 @@ async fn handle_list_sessions_group_and_search_respect_session_scope() -> Result
             cwd: Some("/workspace-a".to_string()),
             query: None,
             session_scope: Some(SessionScope::Forks),
+            include_remote: false,
         },
     )
     .await;
@@ -172,6 +174,7 @@ async fn handle_list_sessions_group_and_search_respect_session_scope() -> Result
             cwd: None,
             query: Some("delegate".to_string()),
             session_scope: Some(SessionScope::Delegates),
+            include_remote: false,
         },
     )
     .await;
@@ -265,6 +268,7 @@ async fn handle_ui_message_dispatches_list_sessions() -> Result<()> {
             cwd: None,
             query: Some("root-alpha".to_string()),
             session_scope: Some(SessionScope::Root),
+            include_remote: None,
         },
     )
     .await;

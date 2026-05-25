@@ -16,6 +16,8 @@ use super::session_ops::{ListSessionsRequest, handle_list_sessions};
 #[cfg(feature = "remote")]
 use crate::agent::remote::node_manager::SessionHandoff;
 #[cfg(feature = "remote")]
+use crate::agent::remote::scope::MeshScopeId;
+#[cfg(feature = "remote")]
 use crate::agent::utils::u32_from_usize;
 #[cfg(feature = "remote")]
 use kameo::actor::RemoteActorRef;
@@ -27,7 +29,7 @@ use tokio::sync::mpsc;
 pub async fn handle_list_remote_nodes(state: &ServerState, tx: &mpsc::Sender<String>) {
     #[cfg(feature = "remote")]
     {
-        let nodes = state.agent.list_remote_nodes().await;
+        let nodes = state.get_remote_nodes_cached().await;
         let _ = send_message(
             tx,
             UiServerMessage::RemoteNodes {
@@ -215,16 +217,15 @@ pub(crate) async fn finalize_remote_session_attach(
     tx: &mpsc::Sender<String>,
 ) -> Result<(), String> {
     let peer_label = state
-        .agent
-        .list_remote_nodes()
+        .get_remote_nodes_cached()
         .await
         .into_iter()
         .find(|n| n.node_id.to_string() == node_id)
         .map(|n| n.hostname)
         .unwrap_or_else(|| node_id.to_string());
 
-    let remote_ref = match handoff {
-        SessionHandoff::DirectRemote { session_ref } => session_ref,
+    let (remote_ref, matched_scope) = match handoff {
+        SessionHandoff::DirectRemote { session_ref } => (session_ref, None),
         SessionHandoff::LookupOnly => {
             lookup_remote_session_actor(state, node_id, session_id).await?
         }
@@ -242,6 +243,7 @@ pub(crate) async fn finalize_remote_session_attach(
             session_id.to_string(),
             remote_ref,
             peer_label,
+            matched_scope,
             Some(node_id.to_string()),
         )
         .await;
@@ -373,7 +375,13 @@ async fn lookup_remote_session_actor(
     state: &ServerState,
     node_id: &str,
     session_id: &str,
-) -> Result<RemoteActorRef<crate::agent::session_actor::SessionActor>, String> {
+) -> Result<
+    (
+        RemoteActorRef<crate::agent::session_actor::SessionActor>,
+        Option<MeshScopeId>,
+    ),
+    String,
+> {
     use std::time::Duration;
 
     use crate::agent::session_actor::SessionActor;
@@ -383,7 +391,7 @@ async fn lookup_remote_session_actor(
         .mesh()
         .ok_or_else(|| "mesh not bootstrapped — start with --mesh".to_string())?;
 
-    let dht_name = crate::agent::remote::dht_name::session(session_id);
+    let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
     let lookup_backoff_ms: [u64; 4] = [0, 120, 300, 700];
     let mut last_lookup_error = None;
 
@@ -392,51 +400,59 @@ async fn lookup_remote_session_actor(
             tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
         }
 
-        match mesh
-            .lookup_actor_no_retry::<SessionActor>(dht_name.clone())
-            .await
-        {
-            Ok(Some(r)) => {
-                if attempt_idx > 0 {
-                    log::info!(
-                        "handle_attach_remote_session: DHT lookup for {} succeeded on retry {}",
+        let mut found = None;
+        for scope in runtime.active_scopes() {
+            let dht_name = crate::agent::remote::scope::scoped_session(&scope, session_id);
+            match runtime
+                .lookup_actor_no_retry::<SessionActor>(dht_name.clone())
+                .await
+            {
+                Ok(Some(r)) => {
+                    found = Some((r, scope));
+                    break;
+                }
+                Ok(None) => {
+                    log::debug!(
+                        "handle_attach_remote_session: DHT lookup miss for {} under '{}' (attempt {}/{})",
                         session_id,
-                        attempt_idx + 1
+                        dht_name,
+                        attempt_idx + 1,
+                        lookup_backoff_ms.len()
                     );
                 }
-                return Ok(r);
+                Err(e) => {
+                    last_lookup_error = Some(e.to_string());
+                    log::warn!(
+                        "handle_attach_remote_session: DHT lookup error for {} under '{}' (attempt {}/{}): {}",
+                        session_id,
+                        dht_name,
+                        attempt_idx + 1,
+                        lookup_backoff_ms.len(),
+                        e
+                    );
+                }
             }
-            Ok(None) => {
-                log::debug!(
-                    "handle_attach_remote_session: DHT lookup miss for {} under '{}' (attempt {}/{})",
+        }
+
+        if let Some((r, scope)) = found {
+            if attempt_idx > 0 {
+                log::info!(
+                    "handle_attach_remote_session: DHT lookup for {} succeeded on retry {}",
                     session_id,
-                    dht_name,
-                    attempt_idx + 1,
-                    lookup_backoff_ms.len()
+                    attempt_idx + 1
                 );
             }
-            Err(e) => {
-                last_lookup_error = Some(e.to_string());
-                log::warn!(
-                    "handle_attach_remote_session: DHT lookup error for {} under '{}' (attempt {}/{}): {}",
-                    session_id,
-                    dht_name,
-                    attempt_idx + 1,
-                    lookup_backoff_ms.len(),
-                    e
-                );
-            }
+            return Ok((r, Some(scope)));
         }
     }
 
     let detail = last_lookup_error
         .map(|e| format!("last error: {e}"))
-        .unwrap_or_else(|| "session was not visible in DHT yet".to_string());
+        .unwrap_or_else(|| "session was not visible in scoped DHT yet".to_string());
     Err(format!(
-        "Session '{}' not attachable from node '{}': looked up '{}' {} times, {}",
+        "Session '{}' not attachable from node '{}': looked up scoped session names {} times, {}",
         session_id,
         node_id,
-        dht_name,
         lookup_backoff_ms.len(),
         detail
     ))
@@ -566,7 +582,7 @@ pub async fn handle_create_mesh_invite(
             return;
         };
 
-        if !mesh.is_iroh_transport() {
+        if !mesh.is_iroh_transport_internal() {
             let _ = send_error(
                 tx,
                 "Mesh invites require iroh transport. Restart host with --mesh --mesh-invite (or set transport=iroh).".to_string(),
@@ -583,10 +599,7 @@ pub async fn handle_create_mesh_invite(
         match mesh.create_invite(mesh_name.clone(), ttl_secs, max_uses, false) {
             Ok(invite) => {
                 let url = invite.to_url();
-                #[cfg(feature = "remote-internet")]
                 let qr_code = crate::agent::remote::qr::render_to_terminal(&url);
-                #[cfg(not(feature = "remote-internet"))]
-                let qr_code: Option<String> = None;
                 let _ = send_message(
                     tx,
                     UiServerMessage::MeshInviteCreated {

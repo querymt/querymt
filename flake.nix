@@ -99,7 +99,7 @@
               "--example"
               "qmtcode"
               "--features"
-              "dashboard,oauth,dbus-secret-service,remote-internet"
+              "dashboard,oauth,dbus-secret-service,remote"
             ];
             nativeBuildInputs = [
               pkgs.pkg-config

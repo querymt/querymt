@@ -30,7 +30,7 @@ use super::mesh::{MeshHandle, PeerEvent};
 
 use super::event_relay::EventRelayActor;
 use super::node_manager::RemoteNodeManager;
-use super::provider_host::{ProviderHostActor, StreamReceiverActor};
+use super::provider_host::ProviderHostActor;
 use crate::agent::session_actor::SessionActor;
 
 // ── MeshTransport trait ───────────────────────────────────────────────────────
@@ -228,15 +228,6 @@ impl DynMeshTransport {
         name: &str,
     ) -> Result<Option<RemoteActorRef<EventRelayActor>>, kameo::error::RegistryError> {
         self.inner.lookup_actor::<EventRelayActor>(name).await
-    }
-
-    /// Register a [`StreamReceiverActor`] in the DHT.
-    pub async fn register_stream_receiver(
-        &self,
-        actor_ref: kameo::actor::ActorRef<StreamReceiverActor>,
-        name: impl Into<String>,
-    ) {
-        self.inner.register_actor(actor_ref, name).await
     }
 
     /// Stream all [`RemoteNodeManager`] actors registered under `name`.

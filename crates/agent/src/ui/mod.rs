@@ -49,6 +49,7 @@ use session::collect_event_sources;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
@@ -66,6 +67,34 @@ pub struct UiServer {
     oauth_service: OAuthService,
 }
 
+/// Cached result of a remote-node DHT discovery query.
+///
+/// Stored in `ServerState` so concurrent callers (list_remote_nodes,
+/// peer event watcher, remote session merge) can reuse a recent result
+/// instead of each hitting the DHT independently.
+pub(crate) struct RemoteNodeCache {
+    /// Snapshot of `list_remote_nodes()` results.
+    nodes: Vec<crate::agent::remote::NodeInfo>,
+    /// `Instant::now()` when `nodes` was populated.
+    refreshed_at: Instant,
+}
+
+impl RemoteNodeCache {
+    /// Maximum age before a cached result is considered stale.
+    const TTL_SECS: u64 = 5;
+
+    fn new(nodes: Vec<crate::agent::remote::NodeInfo>) -> Self {
+        Self {
+            nodes,
+            refreshed_at: Instant::now(),
+        }
+    }
+
+    fn is_fresh(&self) -> bool {
+        self.refreshed_at.elapsed().as_secs() < Self::TTL_SECS
+    }
+}
+
 /// Shared server state for request handlers.
 #[derive(Clone)]
 pub(crate) struct ServerState {
@@ -79,6 +108,41 @@ pub(crate) struct ServerState {
     pub session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
     pub workspace_manager: ActorRef<WorkspaceIndexManagerActor>,
     pub oauth_service: OAuthService,
+    /// Cache for remote node DHT discovery results with a short TTL.
+    #[cfg(feature = "remote")]
+    pub remote_node_cache: Arc<Mutex<Option<RemoteNodeCache>>>,
+}
+
+impl ServerState {
+    /// Return cached remote nodes if fresh, otherwise query the DHT and cache.
+    ///
+    /// The cache has a 5-second TTL.  Peer events invalidate it immediately
+    /// via [`Self::invalidate_remote_node_cache`].
+    #[cfg(feature = "remote")]
+    pub async fn get_remote_nodes_cached(&self) -> Vec<crate::agent::remote::NodeInfo> {
+        // Fast path: return cached result if still fresh.
+        {
+            let guard = self.remote_node_cache.lock().await;
+            if let Some(ref cache) = *guard
+                && cache.is_fresh()
+            {
+                return cache.nodes.clone();
+            }
+        }
+
+        // Slow path: query DHT and update cache.
+        let nodes = self.agent.list_remote_nodes().await;
+        let mut guard = self.remote_node_cache.lock().await;
+        *guard = Some(RemoteNodeCache::new(nodes.clone()));
+        nodes
+    }
+
+    /// Invalidate the remote-node cache (called on peer topology changes).
+    #[cfg(feature = "remote")]
+    pub async fn invalidate_remote_node_cache(&self) {
+        let mut guard = self.remote_node_cache.lock().await;
+        *guard = None;
+    }
 }
 
 /// State for a single WebSocket connection.
@@ -130,6 +194,8 @@ impl UiServer {
             session_cwds: self.session_cwds,
             workspace_manager: self.workspace_manager,
             oauth_service: self.oauth_service,
+            #[cfg(feature = "remote")]
+            remote_node_cache: Arc::new(Mutex::new(None)),
         };
 
         Router::new()

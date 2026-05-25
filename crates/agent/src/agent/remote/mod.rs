@@ -21,15 +21,22 @@ pub mod identity;
 pub mod invite;
 pub mod node_id;
 pub mod node_manager;
-#[cfg(feature = "remote-internet")]
+#[cfg(feature = "remote")]
 pub mod qr;
 pub mod routing;
+pub mod scope;
 
 #[cfg(feature = "remote")]
 pub mod mesh;
 
 #[cfg(feature = "remote")]
 pub mod mesh_provider;
+
+#[cfg(feature = "remote")]
+pub mod mesh_runtime_config;
+
+#[cfg(feature = "remote")]
+pub mod runtime_handle;
 
 #[cfg(feature = "remote")]
 pub mod transport;
@@ -42,6 +49,9 @@ pub mod cached_transport;
 
 #[cfg(feature = "remote")]
 pub mod provider_host;
+
+#[cfg(feature = "remote")]
+pub mod session_stream_router;
 
 #[cfg(feature = "remote")]
 pub mod remote_handle;
@@ -92,12 +102,12 @@ pub use actor_ref::SessionActorRef;
 pub use cached_transport::{CachedDynMeshTransport, CachedMeshTransport};
 pub use event_forwarder::EventForwarder;
 pub use event_relay::{EventRelayActor, RelayedEvent};
-#[cfg(feature = "remote-internet")]
+#[cfg(feature = "remote")]
 pub use mesh::join_mesh_via_invite;
 #[cfg(feature = "remote")]
 pub use mesh::{
     DirectoryMode, MeshConfig, MeshDiscovery, MeshError, MeshHandle, MeshTransportMode, PeerEvent,
-    bootstrap_mesh, bootstrap_mesh_default,
+    bootstrap_mesh, bootstrap_mesh_default, bootstrap_mesh_runtime,
 };
 #[cfg(feature = "remote")]
 pub use mesh_provider::MeshChatProvider;
@@ -129,6 +139,14 @@ pub use routing::{
     ClearRoute, ListRoutes, ResolvePeer, RouteConfirmation, RouteTarget, RoutingActor,
     RoutingPolicy, RoutingSnapshot, RoutingSnapshotHandle, SetProviderTarget, SetSessionTarget,
     UnresolvePeer, new_routing_snapshot_handle,
+};
+#[cfg(feature = "remote")]
+pub use runtime_handle::{MeshRuntimeHandle, MeshScopeHandle};
+pub use scope::{MeshScopeId, MeshTransportKind};
+#[cfg(feature = "remote")]
+pub use session_stream_router::{
+    AttachStreamConsumer, DetachStreamConsumer, GetRouterStatus, RequestPhase, RoutedRequestStatus,
+    RoutedStreamRelayMessage, SessionStreamRouterActor,
 };
 #[cfg(feature = "remote")]
 pub use transport::{DynMeshTransport, MeshTransport};

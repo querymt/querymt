@@ -5,7 +5,6 @@
 //! RPC message handling.
 
 use crate::agent::LocalAgentHandle as AgentHandle;
-use crate::agent::session_registry::PreconnectedMcpPeer;
 use crate::event_fanout::EventFanout;
 use crate::events::{AgentEventKind, EventEnvelope};
 use crate::send_agent::SendAgent;
@@ -64,8 +63,6 @@ pub struct RpcDispatchContext {
 
 #[async_trait::async_trait]
 pub trait AcpSessionHooks: Send + Sync {
-    async fn preconnected_mcp_peers(&self) -> Result<Vec<PreconnectedMcpPeer>, Error>;
-
     async fn on_session_loaded(
         &self,
         _agent: &AgentHandle,
@@ -458,14 +455,9 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
 
             m if m == AGENT_METHOD_NAMES.session_new => match serde_json::from_value(req.params) {
                 Ok(params) => {
-                    let preconnected = if let Some(hooks) = &context.session_hooks {
-                        hooks.preconnected_mcp_peers().await?
-                    } else {
-                        Vec::new()
-                    };
-                    let response = agent
-                        .new_session_with_preconnected(params, preconnected)
-                        .await;
+                    // MCP attachments are now resolved internally by the
+                    // materializer via the runtime attachment source.
+                    let response = agent.new_session(params).await;
                     match response {
                         Ok(r) => {
                             let session_id = r.session_id.to_string();
@@ -522,14 +514,9 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                 ) {
                     Ok(params) => {
                         let session_id = params.session_id.to_string();
-                        let preconnected = if let Some(hooks) = &context.session_hooks {
-                            hooks.preconnected_mcp_peers().await?
-                        } else {
-                            Vec::new()
-                        };
-                        let response = agent
-                            .load_session_with_preconnected(params, preconnected)
-                            .await;
+                        // MCP attachments are now resolved internally by the
+                        // materializer via the runtime attachment source.
+                        let response = agent.load_session(params).await;
                         match response {
                             Ok(r) => {
                                 let mut value = serde_json::to_value(r).unwrap();
@@ -729,9 +716,16 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                     .map(|r| serde_json::from_str(r.0.get()).unwrap_or(serde_json::Value::Null));
                 match response {
                     Ok(mut value) => {
-                        if m == "querymt/remote/attachSession"
-                            && let Some(session_id) = session_id_for_owner
-                        {
+                        // For remote/createSession the sessionId is not in
+                        // request params but in the response body.
+                        let session_id = if m == "querymt/remote/createSession" {
+                            value.get("sessionId").and_then(|v| v.as_str()).map(|s| s.to_string())
+                        } else if m == "querymt/remote/attachSession" {
+                            session_id_for_owner
+                        } else {
+                            None
+                        };
+                        if let Some(session_id) = session_id {
                             let mut owners = session_owners.lock().await;
                             owners.insert(session_id.clone(), conn_id.to_string());
                             drop(owners);
@@ -876,13 +870,11 @@ fn acp_method_span(method: &str) -> tracing::Span {
 mod tests {
     use super::*;
     use crate::agent::core::AgentMode;
-    use crate::agent::session_registry::PreconnectedMcpPeer;
     use crate::elicitation::ElicitationAction;
     use crate::events::{AgentEventKind, DurableEvent, EventEnvelope, EventOrigin};
     use crate::test_utils::DelegateTestFixture;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::Mutex;
     use tokio::sync::oneshot;
 
@@ -1165,26 +1157,11 @@ mod tests {
         assert_eq!(select.current_value.0.as_ref(), "auto");
     }
 
-    struct HookProbe {
-        called: AtomicBool,
-    }
-
-    #[async_trait::async_trait]
-    impl AcpSessionHooks for HookProbe {
-        async fn preconnected_mcp_peers(&self) -> Result<Vec<PreconnectedMcpPeer>, Error> {
-            self.called.store(true, Ordering::SeqCst);
-            Ok(Vec::new())
-        }
-    }
-
     #[tokio::test]
-    async fn session_new_rpc_uses_dispatch_hooks_for_preconnected_peers() {
+    async fn session_new_rpc_dispatches_to_agent_new_session() {
         let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
-        let hook = Arc::new(HookProbe {
-            called: AtomicBool::new(false),
-        });
 
         struct Dummy;
 
@@ -1206,15 +1183,8 @@ mod tests {
                 &self,
                 _: agent_client_protocol::schema::NewSessionRequest,
             ) -> Result<agent_client_protocol::schema::NewSessionResponse, Error> {
-                unreachable!("dispatcher should prefer new_session_with_preconnected")
-            }
-            async fn new_session_with_preconnected(
-                &self,
-                _: agent_client_protocol::schema::NewSessionRequest,
-                _: Vec<PreconnectedMcpPeer>,
-            ) -> Result<agent_client_protocol::schema::NewSessionResponse, Error> {
                 Ok(agent_client_protocol::schema::NewSessionResponse::new(
-                    "s-hooked",
+                    "s-plain",
                 ))
             }
             async fn prompt(
@@ -1301,16 +1271,15 @@ mod tests {
                 id: serde_json::json!(1),
             },
             RpcDispatchContext {
-                session_hooks: Some(hook.clone()),
+                session_hooks: None,
             },
         )
         .await;
 
-        assert!(hook.called.load(Ordering::SeqCst));
         assert!(output.response.error.is_none());
         assert_eq!(
             output.response.result,
-            Some(serde_json::json!({"sessionId": "s-hooked"}))
+            Some(serde_json::json!({"sessionId": "s-plain"}))
         );
     }
 
@@ -1438,6 +1407,134 @@ mod tests {
         assert!(output.response.error.is_none());
         assert_eq!(
             session_owners.lock().await.get("s-remote").cloned(),
+            Some("conn-9".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_create_session_records_session_owner() {
+        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+
+        struct Dummy;
+
+        #[async_trait::async_trait]
+        impl SendAgent for Dummy {
+            async fn initialize(
+                &self,
+                _: agent_client_protocol::schema::InitializeRequest,
+            ) -> Result<agent_client_protocol::schema::InitializeResponse, Error> {
+                unreachable!()
+            }
+            async fn authenticate(
+                &self,
+                _: agent_client_protocol::schema::AuthenticateRequest,
+            ) -> Result<agent_client_protocol::schema::AuthenticateResponse, Error> {
+                unreachable!()
+            }
+            async fn new_session(
+                &self,
+                _: agent_client_protocol::schema::NewSessionRequest,
+            ) -> Result<agent_client_protocol::schema::NewSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn prompt(
+                &self,
+                _: agent_client_protocol::schema::PromptRequest,
+            ) -> Result<agent_client_protocol::schema::PromptResponse, Error> {
+                unreachable!()
+            }
+            async fn cancel(
+                &self,
+                _: agent_client_protocol::schema::CancelNotification,
+            ) -> Result<(), Error> {
+                unreachable!()
+            }
+            async fn load_session(
+                &self,
+                _: agent_client_protocol::schema::LoadSessionRequest,
+            ) -> Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn list_sessions(
+                &self,
+                _: agent_client_protocol::schema::ListSessionsRequest,
+            ) -> Result<agent_client_protocol::schema::ListSessionsResponse, Error> {
+                unreachable!()
+            }
+            async fn fork_session(
+                &self,
+                _: agent_client_protocol::schema::ForkSessionRequest,
+            ) -> Result<agent_client_protocol::schema::ForkSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn resume_session(
+                &self,
+                _: agent_client_protocol::schema::ResumeSessionRequest,
+            ) -> Result<agent_client_protocol::schema::ResumeSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn close_session(
+                &self,
+                _: agent_client_protocol::schema::CloseSessionRequest,
+            ) -> Result<agent_client_protocol::schema::CloseSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn delete_session(
+                &self,
+                _: agent_client_protocol::schema::DeleteSessionRequest,
+            ) -> Result<agent_client_protocol::schema::DeleteSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn set_session_model(
+                &self,
+                _: agent_client_protocol::schema::SetSessionModelRequest,
+            ) -> Result<agent_client_protocol::schema::SetSessionModelResponse, Error> {
+                unreachable!()
+            }
+            async fn ext_method(
+                &self,
+                _: agent_client_protocol::schema::ExtRequest,
+            ) -> Result<agent_client_protocol::schema::ExtResponse, Error> {
+                let raw = serde_json::value::RawValue::from_string(
+                    serde_json::json!({"sessionId": "s-cr","attached":false}).to_string(),
+                )
+                .unwrap();
+                Ok(agent_client_protocol::schema::ExtResponse::new(Arc::from(
+                    raw,
+                )))
+            }
+            async fn ext_notification(
+                &self,
+                _: agent_client_protocol::schema::ExtNotification,
+            ) -> Result<(), Error> {
+                unreachable!()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let output = handle_rpc_message_with_context(
+            &Dummy,
+            &session_owners,
+            &pending_permissions,
+            &pending_elicitations,
+            "conn-9",
+            RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "querymt/remote/createSession".to_string(),
+                params: serde_json::json!({"nodeId": "n-1"}),
+                id: serde_json::json!(1),
+            },
+            RpcDispatchContext::default(),
+        )
+        .await;
+
+        assert!(output.response.error.is_none());
+        assert_eq!(
+            session_owners.lock().await.get("s-cr").cloned(),
             Some("conn-9".to_string())
         );
     }
@@ -1921,6 +2018,62 @@ mod tests {
             assert_eq!(
                 attrs["rpc.method"].as_str(),
                 AGENT_METHOD_NAMES.session_prompt
+            );
+        }
+    }
+
+    mod prompt_response_json {
+        use agent_client_protocol::schema::{PromptResponse, StopReason};
+
+        #[test]
+        fn end_turn_serializes_to_acp_json() {
+            let response = PromptResponse::new(StopReason::EndTurn);
+            let json = serde_json::to_value(&response).unwrap();
+            assert_eq!(
+                json.get("stopReason").and_then(|v| v.as_str()),
+                Some("end_turn"),
+                "expected camelCase stopReason in ACP PromptResponse"
+            );
+        }
+
+        #[test]
+        fn cancelled_serializes_to_acp_json() {
+            let response = PromptResponse::new(StopReason::Cancelled);
+            let json = serde_json::to_value(&response).unwrap();
+            assert_eq!(
+                json.get("stopReason").and_then(|v| v.as_str()),
+                Some("cancelled"),
+                "expected camelCase stopReason for cancelled"
+            );
+        }
+
+        #[test]
+        fn max_tokens_serializes_to_acp_json() {
+            let response = PromptResponse::new(StopReason::MaxTokens);
+            let json = serde_json::to_value(&response).unwrap();
+            assert_eq!(
+                json.get("stopReason").and_then(|v| v.as_str()),
+                Some("max_tokens")
+            );
+        }
+
+        #[test]
+        fn max_turn_requests_serializes_to_acp_json() {
+            let response = PromptResponse::new(StopReason::MaxTurnRequests);
+            let json = serde_json::to_value(&response).unwrap();
+            assert_eq!(
+                json.get("stopReason").and_then(|v| v.as_str()),
+                Some("max_turn_requests")
+            );
+        }
+
+        #[test]
+        fn refusal_serializes_to_acp_json() {
+            let response = PromptResponse::new(StopReason::Refusal);
+            let json = serde_json::to_value(&response).unwrap();
+            assert_eq!(
+                json.get("stopReason").and_then(|v| v.as_str()),
+                Some("refusal")
             );
         }
     }

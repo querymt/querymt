@@ -324,7 +324,10 @@ mod remote_session_lifecycle_integration_tests {
         // Give DHT a moment to propagate the session registration.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let dht_name = crate::agent::remote::dht_name::session(&resp.session_id);
+        let dht_name = crate::agent::remote::scope::scoped_session(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &resp.session_id,
+        );
         let session_actor_ref = within_timeout(
             "lookup session in DHT",
             mesh.lookup_actor::<SessionActor>(&dht_name),
@@ -652,7 +655,10 @@ mod remote_session_lifecycle_integration_tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Attach by resolving via DHT.
-        let dht_name = crate::agent::remote::dht_name::session(&resp.session_id);
+        let dht_name = crate::agent::remote::scope::scoped_session(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &resp.session_id,
+        );
         let remote_ref = within_timeout(
             "lookup session actor",
             mesh.lookup_actor::<SessionActor>(&dht_name),
@@ -705,7 +711,10 @@ mod remote_session_lifecycle_integration_tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let dht_name = crate::agent::remote::dht_name::session(&resp.session_id);
+        let dht_name = crate::agent::remote::scope::scoped_session(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &resp.session_id,
+        );
         let remote_ref = within_timeout(
             "lookup session actor",
             mesh.lookup_actor::<SessionActor>(&dht_name),
@@ -786,8 +795,11 @@ mod remote_session_lifecycle_integration_tests {
         let relay = EventRelayActor::new(alpha_sink.clone(), "alpha-relay-g8".to_string());
         let relay_ref = EventRelayActor::spawn(relay);
 
-        let relay_dht_name =
-            crate::agent::remote::dht_name::event_relay(&resp.session_id, mesh.peer_id());
+        let relay_dht_name = crate::agent::remote::scope::scoped_event_relay(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &resp.session_id,
+            mesh.peer_id(),
+        );
         mesh.register_actor(relay_ref.clone(), relay_dht_name.clone())
             .await;
         let _ = relay_ref;
@@ -796,7 +808,10 @@ mod remote_session_lifecycle_integration_tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Look up and subscribe.
-        let dht_name = crate::agent::remote::dht_name::session(&resp.session_id);
+        let dht_name = crate::agent::remote::scope::scoped_session(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &resp.session_id,
+        );
         let remote_ref = mesh
             .lookup_actor::<SessionActor>(&dht_name)
             .await
@@ -858,7 +873,10 @@ mod remote_session_lifecycle_integration_tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let dht_name = crate::agent::remote::dht_name::session(&resp.session_id);
+        let dht_name = crate::agent::remote::scope::scoped_session(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &resp.session_id,
+        );
         let remote_ref = mesh
             .lookup_actor::<SessionActor>(&dht_name)
             .await

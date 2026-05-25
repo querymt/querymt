@@ -395,71 +395,81 @@ async fn enumerate_remote_models(mesh: &crate::agent::remote::MeshHandle) -> Vec
     use futures_util::StreamExt;
 
     let local_peer_id = *mesh.peer_id();
-    let mut stream =
-        mesh.lookup_all_actors::<RemoteNodeManager>(crate::agent::remote::dht_name::NODE_MANAGER);
     let mut all_remote = Vec::new();
+    let mut seen_peers = std::collections::HashSet::new();
 
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(node_manager_ref) => {
-                // Skip local node — its models are already fetched via enumerate_local_models.
-                if node_manager_ref.id().peer_id() == Some(&local_peer_id) {
-                    continue;
-                }
+    for scope in mesh.active_scopes() {
+        let mut stream = mesh.lookup_all_actors::<RemoteNodeManager>(
+            crate::agent::remote::scope::scoped_node_manager(&scope),
+        );
 
-                // Get the node's identity/label for tagging.
-                let node_info = match node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
-                    Ok(info) => info,
-                    Err(e) => {
-                        log::warn!("enumerate_remote_models: GetNodeInfo failed: {}", e);
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(node_manager_ref) => {
+                    // Skip local node — its models are already fetched via enumerate_local_models.
+                    if node_manager_ref.id().peer_id() == Some(&local_peer_id) {
                         continue;
                     }
-                };
-                if NodeId::parse(&node_info.node_id.to_string()).is_err() {
-                    log::warn!(
-                        "enumerate_remote_models: ignoring node with invalid id '{}'",
-                        node_info.node_id
-                    );
-                    continue;
-                }
+                    if let Some(pid) = node_manager_ref.id().peer_id().copied()
+                        && !seen_peers.insert(pid)
+                    {
+                        continue;
+                    }
 
-                // Query available models
-                match node_manager_ref
-                    .ask::<ListAvailableModels>(&ListAvailableModels)
-                    .await
-                {
-                    Ok(models) => {
-                        log::debug!(
-                            "enumerate_remote_models: got {} models from node '{}' ({})",
-                            models.len(),
-                            node_info.hostname,
+                    // Get the node's identity/label for tagging.
+                    let node_info = match node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
+                        Ok(info) => info,
+                        Err(e) => {
+                            log::warn!("enumerate_remote_models: GetNodeInfo failed: {}", e);
+                            continue;
+                        }
+                    };
+                    if NodeId::parse(&node_info.node_id.to_string()).is_err() {
+                        log::warn!(
+                            "enumerate_remote_models: ignoring node with invalid id '{}'",
                             node_info.node_id
                         );
-                        for m in models {
-                            all_remote.push(ModelEntry {
-                                id: format!("{}/{}", m.provider, m.model),
-                                label: m.model.clone(),
-                                source: "catalog".to_string(),
-                                provider: m.provider,
-                                model: m.model,
-                                node_id: Some(node_info.node_id.to_string()),
-                                node_label: Some(node_info.hostname.clone()),
-                                family: None,
-                                quant: None,
-                            });
+                        continue;
+                    }
+
+                    // Query available models
+                    match node_manager_ref
+                        .ask::<ListAvailableModels>(&ListAvailableModels)
+                        .await
+                    {
+                        Ok(models) => {
+                            log::debug!(
+                                "enumerate_remote_models: got {} models from node '{}' ({})",
+                                models.len(),
+                                node_info.hostname,
+                                node_info.node_id
+                            );
+                            for m in models {
+                                all_remote.push(ModelEntry {
+                                    id: format!("{}/{}", m.provider, m.model),
+                                    label: m.model.clone(),
+                                    source: "catalog".to_string(),
+                                    provider: m.provider,
+                                    model: m.model,
+                                    node_id: Some(node_info.node_id.to_string()),
+                                    node_label: Some(node_info.hostname.clone()),
+                                    family: None,
+                                    quant: None,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "enumerate_remote_models: ListAvailableModels failed for '{}' ({}): {}",
+                                node_info.hostname,
+                                node_info.node_id,
+                                e
+                            );
                         }
                     }
-                    Err(e) => {
-                        log::warn!(
-                            "enumerate_remote_models: ListAvailableModels failed for '{}' ({}): {}",
-                            node_info.hostname,
-                            node_info.node_id,
-                            e
-                        );
-                    }
                 }
+                Err(e) => log::warn!("enumerate_remote_models: lookup error: {}", e),
             }
-            Err(e) => log::warn!("enumerate_remote_models: lookup error: {}", e),
         }
     }
 

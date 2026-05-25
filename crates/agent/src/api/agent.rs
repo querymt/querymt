@@ -10,6 +10,7 @@ use crate::acp::websocket::serve_websocket;
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::{SnapshotPolicy, ToolPolicy};
+use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{
     ExecutionPolicy, McpServerConfig, MiddlewareEntry, SingleAgentConfig, SkillsConfig,
 };
@@ -59,6 +60,8 @@ pub struct AgentInfra {
     /// Pre-opened storage backend.
     /// `None` = create SQLite from the db path specified in config/builder.
     pub storage: Option<Arc<dyn StorageBackend>>,
+    /// Optional runtime MCP attachment source (e.g., for mobile in-process MCP peers).
+    pub session_mcp_attachment_source: Option<Arc<dyn SessionMcpAttachmentSource>>,
 }
 
 /// Type alias for middleware factory closures
@@ -78,6 +81,8 @@ pub struct AgentBuilder {
     skills_config: Option<SkillsConfig>,
     /// MCP servers from TOML `[[mcp]]` config, attached to every new session.
     mcp_servers: Vec<McpServerConfig>,
+    /// Runtime MCP attachment source (e.g., mobile in-process MCP peers).
+    session_mcp_attachment_source: Option<Arc<dyn SessionMcpAttachmentSource>>,
     /// Optional pre-built agent registry (Phase 7: injected by `from_single_config_with_registry`).
     pub(super) agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
     /// Optional pre-built infrastructure (plugin registry + storage).
@@ -111,6 +116,7 @@ impl AgentBuilder {
             execution: None,
             skills_config: None,
             mcp_servers: Vec::new(),
+            session_mcp_attachment_source: None,
             agent_registry: None,
             infra: None,
             max_steps_override: None,
@@ -226,6 +232,15 @@ impl AgentBuilder {
     /// Set specific tools to be considered mutating.
     pub fn mutating_tools(mut self, tools: Vec<String>) -> Self {
         self.mutating_tools = Some(tools);
+        self
+    }
+
+    /// Set the runtime MCP attachment source (e.g., for mobile in-process MCP peers).
+    pub fn with_session_mcp_attachment_source(
+        mut self,
+        source: Arc<dyn SessionMcpAttachmentSource>,
+    ) -> Self {
+        self.session_mcp_attachment_source = Some(source);
         self
     }
 
@@ -443,6 +458,10 @@ impl AgentBuilder {
 
         if !self.mcp_servers.is_empty() {
             builder = builder.with_mcp_servers(self.mcp_servers.clone());
+        }
+
+        if let Some(source) = self.session_mcp_attachment_source {
+            builder = builder.with_session_mcp_attachment_source(source);
         }
 
         if let Some(ref exec) = self.execution {
@@ -790,6 +809,10 @@ impl Agent {
         config: SingleAgentConfig,
         infra: Option<AgentInfra>,
     ) -> Result<Self> {
+        let attachment_source = infra
+            .as_ref()
+            .and_then(|i| i.session_mcp_attachment_source.clone());
+
         #[cfg(feature = "remote")]
         {
             use crate::agent::remote::{
@@ -812,6 +835,9 @@ impl Agent {
                 if let Some(infra) = infra {
                     builder = builder.infra(infra);
                 }
+                if let Some(source) = attachment_source {
+                    builder = builder.with_session_mcp_attachment_source(source);
+                }
                 let agent = builder.build().await?;
                 agent.inner.set_mesh_fallback(auto_fallback);
                 agent.inner.set_mesh(result.mesh.clone());
@@ -823,6 +849,9 @@ impl Agent {
         let mut builder = Self::builder_from_config(config, None)?;
         if let Some(infra) = infra {
             builder = builder.infra(infra);
+        }
+        if let Some(source) = attachment_source {
+            builder = builder.with_session_mcp_attachment_source(source);
         }
         builder.build().await
     }

@@ -6,11 +6,10 @@ license.workspace = true
 description = "Mobile FFI crate exposing a stable C ABI for iOS and Android QueryMT bindings"
 
 [features]
-default = ["remote", "remote-internet", "provider-anthropic", "provider-openai", "provider-google", "provider-deepseek"]
+default = ["remote", "provider-anthropic", "provider-openai", "provider-google", "provider-deepseek"]
 
 # Remote agent / mesh support
 remote = ["querymt-agent/plugin-host-only", "querymt-agent/remote"]
-remote-internet = ["remote", "querymt-agent/remote-internet"]
 
 # Static provider registration for mobile
 provider-anthropic = ["dep:qmt-anthropic"]

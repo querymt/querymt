@@ -6,7 +6,7 @@
 use crate::ffi_helpers::set_last_error;
 use crate::state;
 use crate::types::FfiErrorCode;
-use querymt_agent::agent::session_registry::PreconnectedMcpPeer;
+use querymt_agent::agent::session_mcp::ConnectedMcpPeer;
 use rmcp::RoleClient;
 use rmcp::service::{Peer, RunningService, serve_client};
 use std::collections::HashMap;
@@ -277,15 +277,15 @@ async fn connect_one_pipe_server(
 /// Collect all preconnected MCP pipe peers for a given agent.
 ///
 /// Lazily connects any pipe servers that have not yet been connected.
-/// Returns `Vec<PreconnectedMcpPeer>` where each peer is already initialized
+/// Returns `Vec<ConnectedMcpPeer>` where each peer is already initialized
 /// and can be reused across sessions without re-initializing.
 ///
 /// This is `async` because it may need to perform MCP handshake over the pipe.
 /// It must be called from within a tokio runtime context (e.g. inside
 /// `runtime.block_on(async { ... })`).
-pub async fn collect_preconnected_mcp_servers(
+pub async fn collect_connected_mcp_peers(
     agent_handle: u64,
-) -> Result<Vec<PreconnectedMcpPeer>, FfiErrorCode> {
+) -> Result<Vec<ConnectedMcpPeer>, FfiErrorCode> {
     // Extract agent dependencies before acquiring MCP_REGISTRATIONS lock,
     // to avoid holding two locks simultaneously.
     let (pending_elicitations, event_sink) = state::with_agent_read(agent_handle, |r| {
@@ -299,7 +299,7 @@ pub async fn collect_preconnected_mcp_servers(
     // Phase 1: collect already-connected peers and extract FDs for
     // unconnected servers — all under a single short-lived lock.
     let mut pending_connects: Vec<PendingPipeConnect> = Vec::new();
-    let mut preconnected: Vec<PreconnectedMcpPeer> = Vec::new();
+    let mut connected: Vec<ConnectedMcpPeer> = Vec::new();
 
     {
         let mut regs = MCP_REGISTRATIONS.lock();
@@ -309,9 +309,12 @@ pub async fn collect_preconnected_mcp_servers(
 
         for (name, server) in agent_regs.iter_mut() {
             let InprocMcpServer::Pipe(pipe_server) = server;
-            if let Some(connected) = &pipe_server.connected {
+            if let Some(connected_pipe) = &pipe_server.connected {
                 // Already connected — just clone the peer.
-                preconnected.push((name.clone(), connected.peer.clone()));
+                connected.push(ConnectedMcpPeer {
+                    server_name: name.clone(),
+                    peer: connected_pipe.peer.clone(),
+                });
             } else if pipe_server.rust_read_fd >= 0 && pipe_server.rust_write_fd >= 0 {
                 // Not yet connected and FDs are valid — take ownership.
                 pending_connects.push(PendingPipeConnect {
@@ -334,16 +337,19 @@ pub async fn collect_preconnected_mcp_servers(
         )
         .await
         {
-            Ok((name, connected)) => {
-                let peer = connected.peer.clone();
-                preconnected.push((name.clone(), peer));
+            Ok((name, connected_pipe)) => {
+                let peer = connected_pipe.peer.clone();
+                connected.push(ConnectedMcpPeer {
+                    server_name: name.clone(),
+                    peer,
+                });
 
                 // Phase 3: re-lock and store the connected peer.
                 let mut regs = MCP_REGISTRATIONS.lock();
                 if let Some(agent_regs) = regs.get_mut(&agent_handle)
                     && let Some(InprocMcpServer::Pipe(pipe_server)) = agent_regs.get_mut(&name)
                 {
-                    pipe_server.connected = Some(connected);
+                    pipe_server.connected = Some(connected_pipe);
                 }
             }
             Err(e) => {
@@ -357,7 +363,7 @@ pub async fn collect_preconnected_mcp_servers(
         }
     }
 
-    Ok(preconnected)
+    Ok(connected)
 }
 
 /// Unregister all MCP servers for a given agent handle. Called during shutdown.

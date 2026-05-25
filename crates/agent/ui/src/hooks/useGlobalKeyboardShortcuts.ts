@@ -146,6 +146,13 @@ export function useGlobalKeyboardShortcuts({
         e.preventDefault();
         setSessionSwitcherOpen(!sessionSwitcherOpen);
       }
+
+      // Ctrl+Shift+P / Cmd+Shift+P — Toggle performance mode
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && normalizedKey === 'p') {
+        e.preventDefault();
+        useUiStore.getState().togglePerfMode();
+        return;
+      }
     };
 
     window.addEventListener('keydown', handleKeyDown);

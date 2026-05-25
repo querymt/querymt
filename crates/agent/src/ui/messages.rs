@@ -201,6 +201,12 @@ pub enum UiClientMessage {
         /// Session scope filter: all (default), root, forks, delegates, or children.
         #[serde(default)]
         session_scope: Option<SessionScope>,
+        /// When true, merge remote mesh sessions into the response.
+        /// Defaults to false so local session opening is never blocked on
+        /// remote discovery. The frontend sets this explicitly when the
+        /// session picker needs remote sessions.
+        #[serde(default)]
+        include_remote: Option<bool>,
     },
     ListSessionChildren {
         parent_session_id: String,

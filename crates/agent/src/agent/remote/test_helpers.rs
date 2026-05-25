@@ -349,7 +349,7 @@ pub(crate) mod fixtures {
     /// ```rust,ignore
     /// let f = MeshNodeManagerFixture::new("alpha", &test_id).await;
     /// // f.actor_ref  — ActorRef<RemoteNodeManager>
-    /// // f.dht_name   — "node_manager::alpha-{test_id}"
+    /// // f.dht_name   — "scope::lan::default::node_manager::alpha-{test_id}"
     /// // f.mesh       — &'static MeshHandle
     /// ```
     pub struct MeshNodeManagerFixture {
@@ -368,7 +368,7 @@ pub(crate) mod fixtures {
             let nm = RemoteNodeManager::new(f.config.clone(), registry, Some(mesh.clone()));
             let actor_ref = RemoteNodeManager::spawn(nm);
 
-            let dht_name = format!("node_manager::{}-{}", label, test_id);
+            let dht_name = format!("scope::lan::default::node_manager::{}-{}", label, test_id);
             mesh.register_actor(actor_ref.clone(), dht_name.clone())
                 .await;
 
@@ -468,8 +468,10 @@ pub(crate) mod fixtures {
             let actor = ProviderHostActor::new(alpha_f.config.clone());
             let actor_ref = ProviderHostActor::spawn(actor);
 
-            let provider_host_dht =
-                crate::agent::remote::dht_name::provider_host(&format!("alpha-{}", test_id));
+            let provider_host_dht = crate::agent::remote::scope::scoped_provider_host(
+                &crate::agent::remote::scope::MeshScopeId::lan_default(),
+                &format!("alpha-{}", test_id),
+            );
             mesh.register_actor(actor_ref.clone(), provider_host_dht.clone())
                 .await;
 

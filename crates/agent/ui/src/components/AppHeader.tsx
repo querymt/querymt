@@ -8,7 +8,6 @@
 
 import { Link } from 'react-router-dom';
 import { Menu, X } from 'lucide-react';
-import { GlitchText } from './GlitchText';
 import { ModelPickerPopover } from './ModelPickerPopover';
 import { HeaderStatsBar } from './HeaderStatsBar';
 import { RemoteNodeIndicator } from './RemoteNodeIndicator';
@@ -105,7 +104,7 @@ export function AppHeader(props: AppHeaderProps) {
           }`}
         >
           <span className="hidden md:inline glow-text-primary">
-            <GlitchText text="QueryMT" variant="3" hoverOnly />
+            <span data-static-querymt>QueryMT</span>
           </span>
           <span className="md:hidden text-base font-semibold text-accent-primary">QMT</span>
         </Link>

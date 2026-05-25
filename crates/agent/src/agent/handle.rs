@@ -365,13 +365,15 @@ impl LocalAgentHandle {
     /// each newly created session.
     ///
     /// Uses the 3-phase materialization pattern:
+    /// Create a new session.
+    ///
+    /// Uses the 3-phase materialization pattern:
     /// 1. Prepare (NO lock): DB creation, MCP init, actor spawn
     /// 2. Register (lock held): Insert into in-memory maps (microseconds)
     /// 3. Finalize (NO lock): DHT registration, event emission
-    pub async fn new_session_with_preconnected(
+    pub async fn new_session(
         &self,
         req: NewSessionRequest,
-        preconnected_peers: Vec<crate::agent::session_registry::PreconnectedMcpPeer>,
     ) -> std::result::Result<NewSessionResponse, Error> {
         // Auth check stays on LocalAgentHandle (connection-level concern)
         if let Ok(state) = self.client_state.lock()
@@ -385,10 +387,7 @@ impl LocalAgentHandle {
         }
 
         // Phase 1: Prepare session (heavy work, NO registry lock held)
-        let prepared = self
-            .session_materializer
-            .prepare_new_session(req, preconnected_peers)
-            .await?;
+        let prepared = self.session_materializer.prepare_new_session(req).await?;
 
         let session_id = prepared.session_id.clone();
 
@@ -416,21 +415,17 @@ impl LocalAgentHandle {
             )))
     }
 
-    /// Load an existing session with already-connected MCP peers.
-    ///
-    /// This is used by mobile FFI clients that manage MCP transport lifetimes
-    /// externally (e.g. pipe transports) and want those tools available in
-    /// loaded sessions.
+    /// Load an existing session. MCP attachments are resolved internally by
+    /// the [`SessionMaterializer`] via the runtime attachment source.
     ///
     /// Uses the 3-phase materialization pattern with single-flight protection:
     /// 1. Check registry (lock held briefly): Return existing if already materialized
     /// 2. Prepare (NO lock): DB validation, MCP init, actor spawn
     /// 3. Register (lock held): Insert into in-memory maps (microseconds)
     /// 4. Finalize (NO lock): DHT registration, event emission
-    pub async fn load_session_with_preconnected(
+    pub async fn load_session(
         &self,
         req: agent_client_protocol::schema::LoadSessionRequest,
-        preconnected_peers: Vec<crate::agent::session_registry::PreconnectedMcpPeer>,
     ) -> std::result::Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
         let session_id = req.session_id.to_string();
 
@@ -459,7 +454,7 @@ impl LocalAgentHandle {
         // Pass registry so it can re-check after acquiring the lock.
         let (prepared, session_ref) = match self
             .session_materializer
-            .prepare_load_session(req, preconnected_peers, Some(&self.registry))
+            .prepare_load_session(req, Some(&self.registry))
             .await?
         {
             PreparedSessionResult::Prepared(prepared) => {
@@ -1157,6 +1152,7 @@ impl LocalAgentHandle {
                         let key = format!("peer:{peer_id}");
                         cache.by_label.write().remove(&key);
                     }
+                    Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         cache
@@ -1186,50 +1182,92 @@ impl LocalAgentHandle {
         let concurrency = Self::remote_node_lookup_parallelism();
         let semaphore = Arc::new(Semaphore::new(concurrency));
 
-        let mut stream = mesh
-            .lookup_all_actors::<RemoteNodeManager>(crate::agent::remote::dht_name::NODE_MANAGER);
+        let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
         let mut lookups = FuturesUnordered::new();
         let mut cached_nodes = Vec::new();
 
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(node_manager_ref) => {
-                    let peer_id = node_manager_ref.id().peer_id().copied();
-                    if peer_id == Some(local_peer_id) {
-                        log::debug!("list_remote_nodes: skipping local node");
-                        continue;
-                    }
+        let scopes = runtime.active_scopes();
+        let alive_peers: Vec<_> = mesh.known_peer_ids();
+        log::debug!(
+            "list_remote_nodes: querying {} scope(s), {} known peer(s), local_peer_id={}",
+            scopes.len(),
+            alive_peers.len(),
+            local_peer_id,
+        );
 
-                    if let Some(pid) = peer_id
-                        && !mesh.is_peer_alive(&pid)
-                    {
-                        let key = format!("peer:{pid}");
-                        self.remote_node_cache.by_label.write().remove(&key);
-                        log::debug!("list_remote_nodes: skipping stale DHT record for peer {pid}");
-                        continue;
-                    }
+        for scope in &scopes {
+            let dht_name = crate::agent::remote::scope::scoped_node_manager(scope);
+            log::debug!("list_remote_nodes: querying DHT name '{}'", dht_name);
+            let mut stream = runtime.lookup_all_actors::<RemoteNodeManager>(dht_name.clone());
+            let mut found_count = 0usize;
 
-                    let cache_key =
-                        Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
-                    if let Some(info) = self.get_cached_remote_node(&cache_key) {
-                        cached_nodes.push(info);
-                        continue;
-                    }
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(node_manager_ref) => {
+                        found_count += 1;
+                        let peer_id = node_manager_ref.id().peer_id().copied();
+                        if peer_id == Some(local_peer_id) {
+                            log::debug!("list_remote_nodes: skipping local node");
+                            continue;
+                        }
 
-                    let semaphore = Arc::clone(&semaphore);
-                    lookups.push(async move {
-                        let permit = semaphore.acquire_owned().await.ok();
-                        let res = tokio::time::timeout(
-                            timeout,
-                            node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
-                        )
-                        .await;
-                        drop(permit);
-                        (cache_key, peer_id, res)
-                    });
+                        if let Some(pid) = peer_id
+                            && !mesh.is_peer_alive(&pid)
+                        {
+                            let key = format!("peer:{pid}");
+                            self.remote_node_cache.by_label.write().remove(&key);
+                            log::warn!(
+                                "list_remote_nodes: skipping stale DHT record for peer {pid} \
+                             (is_peer_alive=false, dht_name='{}')",
+                                dht_name
+                            );
+                            continue;
+                        }
+
+                        let cache_key =
+                            Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
+                        if let Some(info) = self.get_cached_remote_node(&cache_key) {
+                            log::debug!(
+                                "list_remote_nodes: cache hit for peer {:?} under '{}'",
+                                peer_id,
+                                dht_name
+                            );
+                            cached_nodes.push(info);
+                            continue;
+                        }
+
+                        log::debug!(
+                            "list_remote_nodes: enqueuing GetNodeInfo for peer {:?} under '{}'",
+                            peer_id,
+                            dht_name
+                        );
+                        let semaphore = Arc::clone(&semaphore);
+                        lookups.push(async move {
+                            let permit = semaphore.acquire_owned().await.ok();
+                            let res = tokio::time::timeout(
+                                timeout,
+                                node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
+                            )
+                            .await;
+                            drop(permit);
+                            (cache_key, peer_id, res)
+                        });
+                    }
+                    Err(e) => {
+                        log::warn!("list_remote_nodes: lookup error for '{}': {}", dht_name, e)
+                    }
                 }
-                Err(e) => log::warn!("list_remote_nodes: lookup error: {}", e),
             }
+
+            log::debug!(
+                "list_remote_nodes: DHT name '{}' yielded {} actor(s)",
+                dht_name,
+                found_count
+            );
+        }
+
+        if scopes.is_empty() {
+            log::warn!("list_remote_nodes: active_scopes() returned empty — no DHT queries issued");
         }
 
         let mut fetched_nodes = Vec::new();
@@ -1259,9 +1297,9 @@ impl LocalAgentHandle {
     ///
     /// ## Fast path
     ///
-    /// Tries a direct DHT lookup under `node_manager::peer::{node_id}` first.
-    /// This succeeds whenever the remote node registered under the per-peer name
-    /// (see [`dht_name::node_manager_for_peer`]) and is **not** gated on
+    /// Tries a direct DHT lookup under the scoped per-peer node-manager name first.
+    /// This succeeds whenever the remote node registered under the same scope
+    /// (see [`crate::agent::remote::scope::scoped_node_manager_for_peer`]) and is **not** gated on
     /// `is_peer_alive`, so it works even when mDNS has transiently expired the
     /// peer (TTL = 30 s) while the TCP connection is still alive.
     ///
@@ -1300,30 +1338,34 @@ impl LocalAgentHandle {
         // name (for this O(1) lookup). The per-peer lookup bypasses the
         // is_peer_alive gate that guards the fallback scan, so it works even
         // when mDNS has temporarily expired the peer's heartbeat.
-        let direct_dht_name = crate::agent::remote::dht_name::node_manager_for_peer(&node_id);
-        match mesh
-            .lookup_actor::<RemoteNodeManager>(direct_dht_name.clone())
-            .await
-        {
-            Ok(Some(node_manager_ref)) => {
-                log::debug!(
-                    "find_node_manager: fast-path DHT hit for '{}'",
-                    direct_dht_name
-                );
-                return Ok(node_manager_ref);
-            }
-            Ok(None) => {
-                log::debug!(
-                    "find_node_manager: no direct DHT entry for '{}', falling back to scan",
-                    direct_dht_name
-                );
-            }
-            Err(e) => {
-                log::debug!(
-                    "find_node_manager: direct DHT lookup error for '{}': {}, falling back to scan",
-                    direct_dht_name,
-                    e
-                );
+        let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+        for scope in runtime.active_scopes() {
+            let direct_dht_name =
+                crate::agent::remote::scope::scoped_node_manager_for_peer(&scope, &node_id);
+            match runtime
+                .lookup_actor::<RemoteNodeManager>(direct_dht_name.clone())
+                .await
+            {
+                Ok(Some(node_manager_ref)) => {
+                    log::debug!(
+                        "find_node_manager: fast-path DHT hit for '{}'",
+                        direct_dht_name
+                    );
+                    return Ok(node_manager_ref);
+                }
+                Ok(None) => {
+                    log::debug!(
+                        "find_node_manager: no direct DHT entry for '{}', trying next scope",
+                        direct_dht_name
+                    );
+                }
+                Err(e) => {
+                    log::debug!(
+                        "find_node_manager: direct DHT lookup error for '{}': {}, trying next scope",
+                        direct_dht_name,
+                        e
+                    );
+                }
             }
         }
 
@@ -1337,43 +1379,46 @@ impl LocalAgentHandle {
         let timeout = Self::remote_node_info_timeout();
         let concurrency = Self::remote_node_lookup_parallelism();
         let semaphore = Arc::new(Semaphore::new(concurrency));
-        let mut stream = mesh
-            .lookup_all_actors::<RemoteNodeManager>(crate::agent::remote::dht_name::NODE_MANAGER);
         let mut lookups = FuturesUnordered::new();
 
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(node_manager_ref) => {
-                    let peer_id = node_manager_ref.id().peer_id().copied();
-                    if peer_id == Some(local_peer_id) {
-                        continue;
-                    }
-                    // No is_peer_alive check here — we contact the peer
-                    // directly and let the GetNodeInfo timeout decide.
-
-                    let cache_key =
-                        Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
-                    if let Some(info) = self.get_cached_remote_node(&cache_key) {
-                        if info.node_id.to_string() == node_id {
-                            return Ok(node_manager_ref);
+        for scope in runtime.active_scopes() {
+            let mut stream = runtime.lookup_all_actors::<RemoteNodeManager>(
+                crate::agent::remote::scope::scoped_node_manager(&scope),
+            );
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(node_manager_ref) => {
+                        let peer_id = node_manager_ref.id().peer_id().copied();
+                        if peer_id == Some(local_peer_id) {
+                            continue;
                         }
-                        continue;
-                    }
+                        // No is_peer_alive check here — we contact the peer
+                        // directly and let the GetNodeInfo timeout decide.
 
-                    let semaphore = Arc::clone(&semaphore);
-                    lookups.push(async move {
-                        let permit = semaphore.acquire_owned().await.ok();
-                        let res = tokio::time::timeout(
-                            timeout,
-                            node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
-                        )
-                        .await;
-                        drop(permit);
-                        (node_manager_ref, cache_key, peer_id, res)
-                    });
-                }
-                Err(e) => {
-                    log::warn!("find_node_manager: lookup error: {}", e);
+                        let cache_key =
+                            Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
+                        if let Some(info) = self.get_cached_remote_node(&cache_key) {
+                            if info.node_id.to_string() == node_id {
+                                return Ok(node_manager_ref);
+                            }
+                            continue;
+                        }
+
+                        let semaphore = Arc::clone(&semaphore);
+                        lookups.push(async move {
+                            let permit = semaphore.acquire_owned().await.ok();
+                            let res = tokio::time::timeout(
+                                timeout,
+                                node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
+                            )
+                            .await;
+                            drop(permit);
+                            (node_manager_ref, cache_key, peer_id, res)
+                        });
+                    }
+                    Err(e) => {
+                        log::warn!("find_node_manager: lookup error: {}", e);
+                    }
                 }
             }
         }
@@ -1487,12 +1532,20 @@ impl LocalAgentHandle {
         session_id: String,
         remote_ref: kameo::actor::RemoteActorRef<crate::agent::session_actor::SessionActor>,
         peer_label: String,
+        preferred_scope: Option<crate::agent::remote::scope::MeshScopeId>,
         remote_node_id: Option<String>,
     ) -> crate::agent::remote::SessionActorRef {
         let mesh = self.mesh();
         let mut registry = self.registry.lock().await;
         registry
-            .attach_remote_session(session_id, remote_ref, peer_label, mesh, remote_node_id)
+            .attach_remote_session(
+                session_id,
+                remote_ref,
+                peer_label,
+                mesh,
+                preferred_scope,
+                remote_node_id,
+            )
             .await
     }
 
@@ -1575,14 +1628,25 @@ impl LocalAgentHandle {
 
                 if let Some(bookmark) = bookmark {
                     if let Some(mesh) = self.mesh() {
-                        let provider_host_name =
-                            crate::agent::remote::dht_name::provider_host(&bookmark.node_id);
-                        if let Ok(Some(provider_host)) = mesh
-                            .lookup_actor::<crate::agent::remote::provider_host::ProviderHostActor>(
-                                &provider_host_name,
-                            )
-                            .await
-                        {
+                        let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+                        let mut provider_host = None;
+                        for scope in runtime.active_scopes() {
+                            let provider_host_name =
+                                crate::agent::remote::scope::scoped_provider_host(
+                                    &scope,
+                                    &bookmark.node_id,
+                                );
+                            if let Ok(Some(found)) = mesh
+                                .lookup_actor::<crate::agent::remote::provider_host::ProviderHostActor>(
+                                    &provider_host_name,
+                                )
+                                .await
+                            {
+                                provider_host = Some(found);
+                                break;
+                            }
+                        }
+                        if let Some(provider_host) = provider_host {
                             let status = provider_host
                                 .ask(
                                     &crate::agent::remote::provider_host::GetProviderStreamStatus {
@@ -1683,15 +1747,27 @@ impl LocalAgentHandle {
             .mesh()
             .ok_or(crate::error::AgentError::MeshNotBootstrapped)?;
 
-        let dht_name = crate::agent::remote::dht_name::session(&bookmark.session_id);
-        let remote_ref = mesh
-            .lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name.clone())
-            .await
-            .map_err(|e| crate::error::AgentError::SwarmLookupFailed {
-                key: dht_name.clone(),
-                reason: e.to_string(),
-            })?
-            .ok_or_else(|| crate::error::AgentError::RemoteSessionNotFound {
+        let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+        let mut remote_ref = None;
+        let mut matched_scope = None;
+        for scope in runtime.active_scopes() {
+            let dht_name =
+                crate::agent::remote::scope::scoped_session(&scope, &bookmark.session_id);
+            let lookup = runtime
+                .lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name.clone())
+                .await
+                .map_err(|e| crate::error::AgentError::SwarmLookupFailed {
+                    key: dht_name.clone(),
+                    reason: e.to_string(),
+                })?;
+            if let Some(found) = lookup {
+                remote_ref = Some(found);
+                matched_scope = Some(scope);
+                break;
+            }
+        }
+        let remote_ref =
+            remote_ref.ok_or_else(|| crate::error::AgentError::RemoteSessionNotFound {
                 details: format!(
                     "bookmarked session {} not found in DHT",
                     bookmark.session_id
@@ -1705,6 +1781,7 @@ impl LocalAgentHandle {
                 remote_ref,
                 bookmark.peer_label.clone(),
                 Some(mesh),
+                matched_scope,
                 Some(bookmark.node_id.clone()),
             )
             .await;
@@ -1726,15 +1803,29 @@ impl LocalAgentHandle {
             .mesh()
             .ok_or(crate::error::AgentError::MeshNotBootstrapped)?;
 
-        let dht_name = crate::agent::remote::dht_name::session(&bookmark.session_id);
-        let remote_ref = mesh
-            .lookup_actor_no_retry::<crate::agent::session_actor::SessionActor>(dht_name.clone())
-            .await
-            .map_err(|e| crate::error::AgentError::SwarmLookupFailed {
-                key: dht_name.clone(),
-                reason: e.to_string(),
-            })?
-            .ok_or_else(|| crate::error::AgentError::RemoteSessionNotFound {
+        let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+        let mut remote_ref = None;
+        let mut matched_scope = None;
+        for scope in runtime.active_scopes() {
+            let dht_name =
+                crate::agent::remote::scope::scoped_session(&scope, &bookmark.session_id);
+            let lookup = runtime
+                .lookup_actor_no_retry::<crate::agent::session_actor::SessionActor>(
+                    dht_name.clone(),
+                )
+                .await
+                .map_err(|e| crate::error::AgentError::SwarmLookupFailed {
+                    key: dht_name.clone(),
+                    reason: e.to_string(),
+                })?;
+            if let Some(found) = lookup {
+                remote_ref = Some(found);
+                matched_scope = Some(scope);
+                break;
+            }
+        }
+        let remote_ref =
+            remote_ref.ok_or_else(|| crate::error::AgentError::RemoteSessionNotFound {
                 details: format!(
                     "bookmarked session {} not found in DHT",
                     bookmark.session_id
@@ -1748,6 +1839,7 @@ impl LocalAgentHandle {
                 remote_ref,
                 bookmark.peer_label.clone(),
                 Some(mesh),
+                matched_scope,
                 Some(bookmark.node_id.clone()),
             )
             .await;
@@ -1779,23 +1871,30 @@ impl LocalAgentHandle {
                 let mesh = self.mesh().ok_or_else(|| {
                     agent_client_protocol::Error::from(AgentError::MeshNotBootstrapped)
                 })?;
-                let dht_name = crate::agent::remote::dht_name::session(session_id);
-                mesh.lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name)
-                    .await
-                    .map_err(|e| {
-                        agent_client_protocol::Error::from(AgentError::SwarmLookupFailed {
-                            key: session_id.to_string(),
-                            reason: e.to_string(),
-                        })
-                    })?
-                    .ok_or_else(|| {
-                        agent_client_protocol::Error::from(AgentError::RemoteSessionNotFound {
-                            details: format!(
-                                "session {} registered but not found in DHT after lookup",
-                                session_id
-                            ),
-                        })
-                    })
+                let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+                for scope in runtime.active_scopes() {
+                    let dht_name = crate::agent::remote::scope::scoped_session(&scope, session_id);
+                    if let Some(found) = runtime
+                        .lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name)
+                        .await
+                        .map_err(|e| {
+                            agent_client_protocol::Error::from(AgentError::SwarmLookupFailed {
+                                key: session_id.to_string(),
+                                reason: e.to_string(),
+                            })
+                        })?
+                    {
+                        return Ok(found);
+                    }
+                }
+                Err(agent_client_protocol::Error::from(
+                    AgentError::RemoteSessionNotFound {
+                        details: format!(
+                            "session {} registered but not found in DHT after lookup",
+                            session_id
+                        ),
+                    },
+                ))
             }
             crate::agent::remote::node_manager::SessionHandoff::NoAttachPath => Err(
                 agent_client_protocol::Error::from(AgentError::RemoteSessionNotFound {
@@ -1891,7 +1990,7 @@ impl AgentHandle for LocalAgentHandle {
         let req = NewSessionRequest::new(cwd_path).meta(meta);
 
         // Use the 3-phase materialization pattern (no registry lock held during DB/actor work)
-        let resp = LocalAgentHandle::new_session_with_preconnected(self, req, Vec::new()).await?;
+        let resp = self.new_session(req).await?;
         let session_id = resp.session_id.to_string();
         let session_ref = self.registry.lock().await;
         let session_ref = session_ref.get(&session_id).cloned().ok_or_else(|| {
@@ -2004,15 +2103,7 @@ impl SendAgent for LocalAgentHandle {
     }
 
     async fn new_session(&self, req: NewSessionRequest) -> Result<NewSessionResponse, Error> {
-        self.new_session_with_preconnected(req, Vec::new()).await
-    }
-
-    async fn new_session_with_preconnected(
-        &self,
-        req: NewSessionRequest,
-        preconnected: Vec<crate::agent::session_registry::PreconnectedMcpPeer>,
-    ) -> Result<NewSessionResponse, Error> {
-        LocalAgentHandle::new_session_with_preconnected(self, req, preconnected).await
+        self.new_session(req).await
     }
 
     async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, Error> {
@@ -2036,15 +2127,7 @@ impl SendAgent for LocalAgentHandle {
     }
 
     async fn load_session(&self, req: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
-        self.load_session_with_preconnected(req, Vec::new()).await
-    }
-
-    async fn load_session_with_preconnected(
-        &self,
-        req: LoadSessionRequest,
-        preconnected: Vec<crate::agent::session_registry::PreconnectedMcpPeer>,
-    ) -> Result<LoadSessionResponse, Error> {
-        LocalAgentHandle::load_session_with_preconnected(self, req, preconnected).await
+        self.load_session(req).await
     }
 
     async fn list_sessions(&self, req: ListSessionsRequest) -> Result<ListSessionsResponse, Error> {
@@ -2616,7 +2699,7 @@ impl SendAgent for LocalAgentHandle {
                         let result = serde_json::json!({
                             "enabled": true,
                             "peer_id": mesh.peer_id().to_string(),
-                            "transport": if mesh.is_iroh_transport() { "iroh" } else { "lan" },
+                            "transport": if mesh.is_iroh_transport_internal() { "iroh" } else { "lan" },
                             "known_peer_count": mesh.known_peer_ids().len(),
                             "has_invite_store": mesh.invite_store().is_some(),
                             "has_membership_store": mesh.membership_store().is_some(),
@@ -2635,7 +2718,7 @@ impl SendAgent for LocalAgentHandle {
                 }))
             }
             "querymt/mesh/join" => {
-                #[cfg(feature = "remote-internet")]
+                #[cfg(feature = "remote")]
                 {
                     #[derive(serde::Deserialize)]
                     #[serde(rename_all = "camelCase")]
@@ -2672,7 +2755,7 @@ impl SendAgent for LocalAgentHandle {
                     }));
                 }
 
-                #[cfg(not(feature = "remote-internet"))]
+                #[cfg(not(feature = "remote"))]
                 {
                     Err(Error::method_not_found())
                 }
@@ -2757,28 +2840,14 @@ impl SendAgent for LocalAgentHandle {
                         .create_remote_session(&nm_ref, parsed.cwd.clone())
                         .await?;
 
-                    let remote_ref = self.resolve_handoff(&resp.session_id, resp.handoff).await?;
-
-                    let peer_label = self
-                        .list_remote_nodes()
-                        .await
-                        .into_iter()
-                        .find(|n| n.node_id.to_string() == parsed.node_id)
-                        .map(|n| n.hostname)
-                        .unwrap_or_else(|| parsed.node_id.clone());
-
-                    self.attach_remote_session(
-                        resp.session_id.clone(),
-                        remote_ref,
-                        peer_label,
-                        Some(parsed.node_id.clone()),
-                    )
-                    .await;
-
+                    // Session is created on the remote node but NOT attached
+                    // to the local registry here. The caller must call
+                    // querymt/remote/attachSession to subscribe to session
+                    // events and hydrate the local view.
                     return ext_json_response(&serde_json::json!({
                         "sessionId": resp.session_id,
                         "nodeId": parsed.node_id,
-                        "attached": true,
+                        "attached": false,
                         "configOptions": [],
                     }));
                 }
@@ -2807,14 +2876,36 @@ impl SendAgent for LocalAgentHandle {
                         .mesh()
                         .ok_or_else(|| Error::invalid_request().data("mesh not bootstrapped"))?;
 
-                    // Try DHT lookup first — works for already-hydrated sessions.
-                    let dht_name = crate::agent::remote::dht_name::session(&parsed.session_id);
-                    let remote_ref = match mesh
-                        .lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name)
-                        .await
-                    {
-                        Ok(Some(r)) => r,
-                        _ => {
+                    // Try scoped DHT lookup first — works for already-hydrated sessions.
+                    let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+                    let mut remote_ref = None;
+                    let mut matched_scope = None;
+                    let mut lookup_err = None;
+                    for scope in runtime.active_scopes() {
+                        let dht_name =
+                            crate::agent::remote::scope::scoped_session(&scope, &parsed.session_id);
+                        match runtime
+                            .lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name)
+                            .await
+                        {
+                            Ok(Some(found)) => {
+                                remote_ref = Some(found);
+                                matched_scope = Some(scope);
+                                break;
+                            }
+                            Ok(None) => {}
+                            Err(e) => lookup_err = Some(e),
+                        }
+                    }
+                    let remote_ref = match remote_ref {
+                        Some(r) => r,
+                        None => {
+                            if let Some(err) = lookup_err {
+                                log::debug!(
+                                    "remote attach scoped lookup error before resume fallback: {}",
+                                    err
+                                );
+                            }
                             // Session not in DHT — ask the remote node to
                             // resume (materialize) it from persistence, then
                             // resolve the handoff into a remote actor ref.
@@ -2839,6 +2930,7 @@ impl SendAgent for LocalAgentHandle {
                         parsed.session_id.clone(),
                         remote_ref,
                         peer_label,
+                        matched_scope,
                         Some(parsed.node_id.clone()),
                     )
                     .await;
@@ -2926,7 +3018,7 @@ impl SendAgent for LocalAgentHandle {
                         ));
                     };
 
-                    if !mesh.is_iroh_transport() {
+                    if !mesh.is_iroh_transport_internal() {
                         return ext_json_response(&serde_json::json!({
                             "error": "mesh invites require iroh transport; restart host with --mesh --mesh-invite (or set transport=iroh)"
                         }));
@@ -2945,10 +3037,7 @@ impl SendAgent for LocalAgentHandle {
                                 .data(serde_json::json!({"error": format!("{e}")}))
                         })?;
 
-                    #[cfg(feature = "remote-internet")]
                     let qr_code = crate::agent::remote::qr::render_to_terminal(&invite.to_url());
-                    #[cfg(not(feature = "remote-internet"))]
-                    let qr_code: Option<String> = None;
 
                     return ext_json_response(&serde_json::json!({
                         "inviteId": invite.grant.invite_id,
@@ -3667,37 +3756,24 @@ mod tests {
 
     // ── Registration contract tests ───────────────────────────────────────────
     //
-    // These tests verify that the per-peer DHT names produced by the
-    // registration sites match what find_node_manager uses for fast-path
-    // lookup, and that the global NODE_MANAGER name is still used so
-    // list_remote_nodes continues to work via lookup_all_actors.
+    // These tests verify that remote node/session discovery uses scoped names
+    // (including LAN default scope) consistently between registration and lookup.
 
     #[cfg(feature = "remote")]
     #[test]
-    fn registration_uses_both_global_and_per_peer_dht_names() {
-        // The registration sites must register under BOTH names:
-        //   1. NODE_MANAGER  — for lookup_all_actors (list_remote_nodes)
-        //   2. node_manager_for_peer(peer_id) — for find_node_manager fast path
-        //
-        // This test verifies the two names are distinct and non-empty.
+    fn registration_uses_scoped_lan_global_and_per_peer_dht_names() {
         let peer_id = "12D3KooWCMGRXFFXJynyAG9dsgq9dukbVXRv5RofzbTXVEQaUsZv";
-        let global_name = crate::agent::remote::dht_name::NODE_MANAGER;
-        let per_peer_name = crate::agent::remote::dht_name::node_manager_for_peer(&peer_id);
+        let lan = crate::agent::remote::scope::MeshScopeId::lan_default();
+        let global_name = crate::agent::remote::scope::scoped_node_manager(&lan);
+        let per_peer_name =
+            crate::agent::remote::scope::scoped_node_manager_for_peer(&lan, &peer_id);
 
-        assert!(!global_name.is_empty());
-        assert!(!per_peer_name.is_empty());
-        assert_ne!(
-            global_name, per_peer_name,
-            "per-peer name must differ from global name so lookup_all_actors \
-             and direct lookup remain independent"
-        );
-        // The per-peer name must embed the peer_id so it is unique per node.
-        assert!(
-            per_peer_name.contains(peer_id),
-            "per-peer name '{}' must contain peer_id '{}'",
+        assert_eq!(global_name, "scope::lan::default::node_manager");
+        assert_eq!(
             per_peer_name,
-            peer_id
+            format!("scope::lan::default::node_manager::peer::{}", peer_id)
         );
+        assert_ne!(global_name, per_peer_name);
     }
 
     // ── find_node_manager behavioral contract tests ───────────────────────────
@@ -3722,20 +3798,17 @@ mod tests {
     #[cfg(feature = "remote")]
     #[test]
     fn find_node_manager_fast_path_dht_name_matches_registration_name() {
-        // The DHT name used in find_node_manager's fast path must be exactly
-        // the same string that qmtcode/remote_setup registers the actor
-        // under. Any mismatch here would cause the fast path to always miss.
         let peer_id = "12D3KooWCMGRXFFXJynyAG9dsgq9dukbVXRv5RofzbTXVEQaUsZv";
-        let fast_path_name = crate::agent::remote::dht_name::node_manager_for_peer(&peer_id);
-        let registration_name = crate::agent::remote::dht_name::node_manager_for_peer(&peer_id);
-        assert_eq!(
-            fast_path_name, registration_name,
-            "fast-path lookup name must equal registration name"
-        );
+        let lan = crate::agent::remote::scope::MeshScopeId::lan_default();
+        let fast_path_name =
+            crate::agent::remote::scope::scoped_node_manager_for_peer(&lan, &peer_id);
+        let registration_name =
+            crate::agent::remote::scope::scoped_node_manager_for_peer(&lan, &peer_id);
+        assert_eq!(fast_path_name, registration_name);
         assert_eq!(
             fast_path_name,
-            format!("node_manager::peer::{}", peer_id),
-            "name must follow node_manager::peer::{{peer_id}} convention"
+            format!("scope::lan::default::node_manager::peer::{}", peer_id),
+            "name must follow scoped lan per-peer convention"
         );
     }
 

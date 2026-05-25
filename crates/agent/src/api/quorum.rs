@@ -530,16 +530,23 @@ impl QuorumBuilder {
                         match rx.recv().await {
                             Ok(PeerEvent::Discovered(peer_id)) => {
                                 // Try to resolve any unresolved peer names.
-                                let per_peer_name =
-                                    crate::agent::remote::dht_name::node_manager_for_peer(
-                                        &peer_id.to_string(),
-                                    );
-                                let node_manager = match mesh_for_events
-                                    .lookup_actor::<RemoteNodeManager>(&per_peer_name)
-                                    .await
-                                {
-                                    Ok(Some(nm)) => nm,
-                                    _ => continue,
+                                let mut node_manager = None;
+                                for scope in mesh_for_events.active_scopes() {
+                                    let per_peer_name =
+                                        crate::agent::remote::scope::scoped_node_manager_for_peer(
+                                            &scope,
+                                            &peer_id.to_string(),
+                                        );
+                                    if let Ok(Some(nm)) = mesh_for_events
+                                        .lookup_actor::<RemoteNodeManager>(&per_peer_name)
+                                        .await
+                                    {
+                                        node_manager = Some(nm);
+                                        break;
+                                    }
+                                }
+                                let Some(node_manager) = node_manager else {
+                                    continue;
                                 };
                                 let node_info = match node_manager
                                     .ask::<GetNodeInfo>(&GetNodeInfo)
@@ -587,6 +594,7 @@ impl QuorumBuilder {
                                     );
                                 }
                             }
+                            Ok(_) => {}
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 log::warn!(

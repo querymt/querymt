@@ -87,7 +87,7 @@ mod tests {
         // First, create a session to load
         let create_req = NewSessionRequest::new(PathBuf::from("/tmp/test-session"));
         let prepared = materializer
-            .prepare_new_session(create_req, vec![])
+            .prepare_new_session(create_req)
             .await
             .expect("create session");
         let session_id = prepared.session_id.clone();
@@ -111,7 +111,7 @@ mod tests {
 
             // Spawn concurrent calls with the registry
             handles.push(tokio::spawn(async move {
-                match mat.prepare_load_session(load_req, vec![], Some(&reg)).await {
+                match mat.prepare_load_session(load_req, Some(&reg)).await {
                     Ok(PreparedSessionResult::Prepared(prepared)) => {
                         let actor_id = prepared.actor_ref.id();
                         {
@@ -193,7 +193,7 @@ mod tests {
         // Create a session in the DB but DON'T register it in the registry yet
         let create_req = NewSessionRequest::new(PathBuf::from("/tmp/test-session"));
         let prepared = materializer
-            .prepare_new_session(create_req, vec![])
+            .prepare_new_session(create_req)
             .await
             .expect("create session");
         let session_id = prepared.session_id.clone();
@@ -211,7 +211,7 @@ mod tests {
 
             // Spawn concurrent calls with the registry
             handles.push(tokio::spawn(async move {
-                match mat.prepare_load_session(load_req, vec![], Some(&reg)).await {
+                match mat.prepare_load_session(load_req, Some(&reg)).await {
                     Ok(PreparedSessionResult::Prepared(prepared)) => {
                         let actor_id = prepared.actor_ref.id();
                         {
@@ -301,7 +301,7 @@ mod tests {
         for i in 0..5 {
             let create_req = NewSessionRequest::new(PathBuf::from(format!("/tmp/test-{}", i)));
             let prepared = materializer
-                .prepare_new_session(create_req, vec![])
+                .prepare_new_session(create_req)
                 .await
                 .expect("create session");
             session_ids.push(prepared.session_id.clone());
@@ -321,7 +321,7 @@ mod tests {
 
             // Different sessions should proceed independently
             handles.push(tokio::spawn(async move {
-                let result = match mat.prepare_load_session(load_req, vec![], Some(&reg)).await {
+                let result = match mat.prepare_load_session(load_req, Some(&reg)).await {
                     Ok(PreparedSessionResult::Prepared(prepared)) => {
                         let actor_id = prepared.actor_ref.id();
                         {
@@ -397,10 +397,7 @@ mod tests {
         let (materializer, _registry, config, _temp_dir) = create_test_setup().await;
 
         let prepared = materializer
-            .prepare_new_session(
-                NewSessionRequest::new(PathBuf::from("/tmp/test-session")),
-                vec![],
-            )
+            .prepare_new_session(NewSessionRequest::new(PathBuf::from("/tmp/test-session")))
             .await
             .expect("create session");
         let session_id = prepared.session_id.clone();

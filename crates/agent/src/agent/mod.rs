@@ -25,6 +25,7 @@ pub mod protocol;
 pub mod remote;
 pub mod session_actor;
 pub mod session_materializer;
+pub mod session_mcp;
 pub mod session_registry;
 pub mod snapshots;
 pub mod tools;

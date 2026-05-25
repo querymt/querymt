@@ -9,6 +9,7 @@ use crate::agent::core::{
     AgentMode, ClientState, DelegationContextConfig, DelegationContextTiming, SnapshotPolicy,
     ToolConfig, ToolPolicy,
 };
+use crate::agent::session_mcp::{NoopSessionMcpAttachmentSource, SessionMcpAttachmentSource};
 use crate::config::{
     CompactionConfig, DelegationWaitPolicy, McpServerConfig, PruningConfig, RateLimitConfig,
     RuntimeExecutionPolicy, ToolOutputConfig,
@@ -67,6 +68,7 @@ pub struct AgentConfigBuilder {
     snapshot_gc_config: crate::snapshot::GcConfig,
     pending_elicitations: crate::elicitation::PendingElicitationMap,
     mcp_servers: Vec<McpServerConfig>,
+    session_mcp_attachment_source: Arc<dyn SessionMcpAttachmentSource>,
     schedule_repository: Option<Arc<dyn crate::session::repo_schedule::ScheduleRepository>>,
     knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
     slash_command_registry: crate::slash_commands::SlashCommandRegistry,
@@ -122,6 +124,7 @@ impl AgentConfigBuilder {
             snapshot_gc_config: crate::snapshot::GcConfig::default(),
             pending_elicitations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             mcp_servers: Vec::new(),
+            session_mcp_attachment_source: Arc::new(NoopSessionMcpAttachmentSource),
             schedule_repository: None,
             knowledge_store: None,
             slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
@@ -170,6 +173,7 @@ impl AgentConfigBuilder {
             snapshot_gc_config: crate::snapshot::GcConfig::default(),
             pending_elicitations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             mcp_servers: Vec::new(),
+            session_mcp_attachment_source: Arc::new(NoopSessionMcpAttachmentSource),
             schedule_repository: None,
             knowledge_store: None,
             slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
@@ -209,6 +213,7 @@ impl AgentConfigBuilder {
             delegation_context_config: self.delegation_context_config,
             pending_elicitations: self.pending_elicitations,
             mcp_servers: self.mcp_servers,
+            session_mcp_attachment_source: self.session_mcp_attachment_source,
             schedule_repository: self.schedule_repository,
             knowledge_store: self.knowledge_store,
             slash_command_registry: self.slash_command_registry,
@@ -416,6 +421,20 @@ impl AgentConfigBuilder {
     /// Sets the MCP servers to attach to every new session (from TOML `[[mcp]]` config).
     pub fn with_mcp_servers(mut self, servers: Vec<McpServerConfig>) -> Self {
         self.mcp_servers = servers;
+        self
+    }
+
+    // ── Session MCP attachment source ──────────────────────────────────────
+
+    /// Sets the source of runtime MCP attachments (e.g., mobile in-process MCP
+    /// peers) that should be added to every session materialized on this node.
+    ///
+    /// Defaults to [`NoopSessionMcpAttachmentSource`] if not called.
+    pub fn with_session_mcp_attachment_source(
+        mut self,
+        source: Arc<dyn SessionMcpAttachmentSource>,
+    ) -> Self {
+        self.session_mcp_attachment_source = source;
         self
     }
 

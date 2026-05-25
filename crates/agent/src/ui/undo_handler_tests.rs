@@ -46,6 +46,8 @@ fn test_server_state(
             crate::index::WorkspaceIndexManagerConfig::default(),
         ),
         oauth_service: handle.oauth_service.clone(),
+        #[cfg(feature = "remote")]
+        remote_node_cache: Arc::new(tokio::sync::Mutex::new(None)),
     }
 }
 

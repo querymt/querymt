@@ -7,6 +7,7 @@
 use crate::agent::core::{
     AgentMode, DelegationContextConfig, SnapshotPolicy, ToolConfig, ToolPolicy,
 };
+use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{DelegationWaitPolicy, McpServerConfig, RuntimeExecutionPolicy};
 use crate::delegation::AgentRegistry;
 use crate::event_sink::EventSink;
@@ -74,6 +75,12 @@ pub struct AgentConfig {
     pub snapshot_gc_config: crate::snapshot::GcConfig,
     pub delegation_context_config: DelegationContextConfig,
     pub pending_elicitations: crate::elicitation::PendingElicitationMap,
+
+    // ── Session MCP attachments ───────────────────────────────────
+    /// Source of MCP capabilities that should be attached to every session
+    /// materialized on this agent node (e.g., mobile in-process MCP peers).
+    /// Defaults to a no-op if not configured.
+    pub session_mcp_attachment_source: Arc<dyn SessionMcpAttachmentSource>,
 
     // ── Scheduling & Knowledge (optional) ─────────────────────────
     /// Schedule repository for the scheduler actor.
