@@ -446,6 +446,9 @@ pub fn ensure_unique_profile_ids(profiles: &[ProfileMetadata]) -> Result<()> {
 pub struct ProfileRuntimeManager<C = Arc<dyn ProfileCatalog>> {
     catalog: C,
     shared_infra: AgentInfra,
+    // NOTE: This is a server-wide default profile shared by all UI connections.
+    // Per-connection profile selection would need to live in ConnectionState and be threaded into
+    // profile resolution for new sessions; existing session bindings should remain authoritative.
     active_profile_id: Mutex<String>,
     runtimes: Mutex<HashMap<String, Arc<ProfileRuntime>>>,
     session_bindings: Mutex<HashMap<String, SessionProfileBinding>>,
