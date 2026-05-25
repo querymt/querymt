@@ -201,7 +201,7 @@ impl RemoteAgentHandle {
 
                     for scope in self.mesh.active_scopes() {
                         let dht_name =
-                            crate::agent::remote::scope::scoped_session(&scope, &session_id);
+                            crate::agent::remote::scope::scoped_session(&scope, session_id);
                         match self
                             .mesh
                             .lookup_actor_no_retry::<crate::agent::session_actor::SessionActor>(

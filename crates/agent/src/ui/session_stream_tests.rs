@@ -313,6 +313,8 @@ async fn forwarder_picks_up_lazily_materialized_profile_runtime_events() -> Resu
             crate::index::WorkspaceIndexManagerConfig::default(),
         ),
         oauth_service: agent.handle.oauth_service.clone(),
+        #[cfg(feature = "remote")]
+        remote_node_cache: Arc::new(tokio::sync::Mutex::new(None)),
     };
 
     {

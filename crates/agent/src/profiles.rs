@@ -178,6 +178,7 @@ pub struct ProfileCatalogBuilder {
 struct EmbeddedTomlProfile {
     name: String,
     description: Option<String>,
+    tags: Vec<String>,
     toml: String,
     config_kind: Option<ProfileConfigKind>,
 }
@@ -234,11 +235,40 @@ impl ProfileCatalogBuilder {
             EmbeddedTomlProfile {
                 name: name.into(),
                 description,
+                tags: Vec::new(),
                 toml,
                 config_kind,
             },
         );
         self
+    }
+
+    pub fn embedded_profile_toml(mut self, toml: impl Into<String>) -> Result<Self> {
+        let toml = toml.into();
+        let metadata = parse_profile_file_metadata(&toml)?.ok_or_else(|| {
+            anyhow!("Embedded TOML profile is missing required [profile] metadata")
+        })?;
+        let id = metadata
+            .id
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| anyhow!("Embedded TOML profile [profile] metadata requires id"))?;
+        let name = metadata
+            .name
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| anyhow!("Embedded TOML profile [profile] metadata requires name"))?;
+        let config_kind = infer_config_kind_from_toml(&toml)?;
+
+        self.embedded_toml_profiles.insert(
+            id,
+            EmbeddedTomlProfile {
+                name,
+                description: metadata.description,
+                tags: metadata.tags,
+                toml,
+                config_kind,
+            },
+        );
+        Ok(self)
     }
 
     pub fn build(self) -> LocalProfileCatalog {
@@ -339,7 +369,7 @@ impl ProfileCatalog for LocalProfileCatalog {
                 id: key.clone(),
                 name: profile.name.clone(),
                 description: profile.description.clone(),
-                tags: Vec::new(),
+                tags: profile.tags.clone(),
                 source: ProfileSource::EmbeddedToml { key: key.clone() },
                 config_kind: profile.config_kind,
                 fingerprint: None,
@@ -799,6 +829,7 @@ mod tests {
             AgentInfra {
                 plugin_registry: Arc::new(registry),
                 storage: Some(storage),
+                session_mcp_attachment_source: None,
             },
             temp_dir,
         )
@@ -873,6 +904,96 @@ system = ["inline"]
 
         let document = catalog.load_profile("default").await.unwrap();
         assert!(matches!(document.config, Config::Single(_)));
+    }
+
+    #[tokio::test]
+    async fn embedded_profile_toml_uses_profile_metadata() {
+        let inline = r#"
+[profile]
+id = "metadata-profile"
+name = "Metadata Profile"
+description = "Loaded from TOML metadata"
+tags = ["coding", "embedded"]
+
+[agent]
+provider = "test"
+model = "mock"
+tools = []
+system = ["inline"]
+"#;
+        let catalog = LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .embedded_profile_toml(inline)
+            .expect("embedded profile metadata should parse")
+            .build();
+
+        let profiles = catalog.list_profiles().await.unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, "metadata-profile");
+        assert_eq!(profiles[0].name, "Metadata Profile");
+        assert_eq!(
+            profiles[0].description.as_deref(),
+            Some("Loaded from TOML metadata")
+        );
+        assert_eq!(profiles[0].tags, vec!["coding", "embedded"]);
+        assert_eq!(profiles[0].config_kind, Some(ProfileConfigKind::Single));
+
+        let document = catalog.load_profile("metadata-profile").await.unwrap();
+        assert!(matches!(document.config, Config::Single(_)));
+    }
+
+    #[test]
+    fn embedded_profile_toml_requires_profile_metadata() {
+        let missing_profile = LocalProfileCatalog::builder().embedded_profile_toml(
+            r#"
+[agent]
+provider = "test"
+model = "mock"
+system = "inline"
+"#,
+        );
+        assert!(
+            missing_profile
+                .expect_err("missing [profile] should fail")
+                .to_string()
+                .contains("missing required [profile] metadata")
+        );
+
+        let missing_id = LocalProfileCatalog::builder().embedded_profile_toml(
+            r#"
+[profile]
+name = "Missing ID"
+
+[agent]
+provider = "test"
+model = "mock"
+system = "inline"
+"#,
+        );
+        assert!(
+            missing_id
+                .expect_err("missing id should fail")
+                .to_string()
+                .contains("requires id")
+        );
+
+        let missing_name = LocalProfileCatalog::builder().embedded_profile_toml(
+            r#"
+[profile]
+id = "missing-name"
+
+[agent]
+provider = "test"
+model = "mock"
+system = "inline"
+"#,
+        );
+        assert!(
+            missing_name
+                .expect_err("missing name should fail")
+                .to_string()
+                .contains("requires name")
+        );
     }
 
     #[tokio::test]

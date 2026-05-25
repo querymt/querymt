@@ -3,19 +3,25 @@
 # This configuration defines a quorum with a planner agent that coordinates
 # a specialized coder agent for implementation tasks.
 
+[profile]
+id = "coder-delegate"
+name = "Coder Delegate"
+description = "Multi-agent coder profile with planner, coder, and explorer delegates"
+tags = ["coding", "delegation", "multi-agent"]
+
 [quorum]
-cwd = "/Users/wiking/qmt/querymt"
+cwd = "."
 delegation = true
-verification = false
+verification = true
 snapshot_policy = "diff"
 delegation_wait_policy = "all"
 delegation_wait_timeout_secs = 2400
 delegation_cancel_grace_secs = 5
-max_parallel_delegations = 1
+max_parallel_delegations = 5
 
 [planner]
-provider = "anthropic"
-model = "claude-opus-4-6"
+provider = "codex"
+model = "gpt-5.5"
 tools = ["delegate", "create_task", "todowrite", "todoread", "question", "search_text", "glob", "ls", "index", "read_tool", "shell", "browse"]
 system = [
   { file = "../prompts/default_system.txt" },
@@ -27,7 +33,8 @@ system = [
 [[planner.middleware]]
 type = "context"
 warn_at_percent = 80
-fallback_max_tokens = 32000
+compact_at_percent = 90
+fallback_max_tokens = 128000
 
 [[planner.middleware]]
 type = "agent_mode"
@@ -44,6 +51,10 @@ However, your PRIMARY job is to **delegate implementation work to specialized ag
 **Read-only constraint applies to YOU, not your delegates.** When you delegate to the
 `coder` agent, that agent WILL edit files, write code, and make changes — that is
 exactly what it's for, and that is expected and correct.
+
+**Remember: Delegates are ephemeral**. When you are delegating something to agent, note
+that agents are brand new, and don't contain any information about previous runs, you
+must supply all required context to agent to execute task.
 
 ## What You MUST Do
 
@@ -81,28 +92,16 @@ Don't make large assumptions about user intent.
 # [[planner.middleware]]
 # type = "dedup_check"
 # threshold = 0.8
- 
+
 [quorum.delegation_summary]
-provider = "anthropic"
-model = "claude-haiku-4-5-20251001"
-
-[mesh]
-enabled = true
-listen = "/ip4/0.0.0.0/tcp/0"
-discovery = "mdns"                    # or "none" with explicit peers
-
-# Specify a direct connection to your gpu instance
-# 
-# [[mesh.peers]]
-# name = "gpu-peer"
-# addr = "/ip4/10.0.0.1/tcp/9000"
+provider = "codex"
+model = "gpt-5.4"
 
 [[delegates]]
 id = "coder"
-provider = "llama_cpp"
-model = "unsloth/Qwen3.5-35B-A3B-GGUF:UD-Q4_K_XL"
+provider = "codex"
+model = "gpt-5.4"
 description = "Specialized in implementation and code writing"
-peer = "nas"
 capabilities = ["rust", "python"]
 tools = ["question", "edit", "todowrite", "todoread", "glob", "search_text", "ls", "index", "shell", "read_tool", "write_file"]
 assume_mutating = false
@@ -111,29 +110,18 @@ system = [
   { file = "../prompts/default_system.txt" }
 ]
 
-[delegates.parameters]
-n_ctx = 110000
-max_tokens = 4096
-flash_attention = "enabled"
-kv_cache_type_k = "q8_0"
-kv_cache_type_v = "q8_0"
-top_p = 0.95
-top_k = 20
-temperature = 0.6
-min_p = 0.0
-text_only = true
-
 # Middleware for coder delegate
 # Apply same limits as planner
 [[delegates.middleware]]
 type = "limits"
-max_steps = 100
-max_turns = 30
+max_steps = 200
+max_turns = 50
 
 [[delegates.middleware]]
 type = "context"
 warn_at_percent = 80
-fallback_max_tokens = 110000
+compact_at_percent = 90
+fallback_max_tokens = 128000
 
 # Detect when code is similar to existing code
 [[delegates.middleware]]
@@ -143,12 +131,11 @@ min_lines = 10
 
 [[delegates]]
 id = "explorer"
-provider = "llama_cpp"
-model = "unsloth/Qwen3.5-35B-A3B-GGUF:UD-Q4_K_XL"
+provider = "codex"
+model = "gpt-5.4"
 description = "Specialized in reviewing and understanding and summarizing code."
-peer = "nas"
 capabilities = ["rust", "python"]
-tools = ["question", "todowrite", "todoread", "glob", "search_text", "ls", "index", "shell", "read_tool"]
+tools = ["question", "todowrite", "todoread", "glob", "search_text", "ls", "index", "shell", "read_tool", "browse"]
 assume_mutating = false
 mutating_tools = []
 system = ["""You are a file search specialist. You excel at thoroughly navigating and exploring codebases.
@@ -171,19 +158,13 @@ Guidelines:
 Complete the user's search request efficiently and report your findings clearly."""
 ]
 
-[delegates.parameters]
-n_ctx = 120000
-max_tokens = 4096
-flash_attention = "enabled"
-kv_cache_type_k = "q8_0"
-kv_cache_type_v = "q8_0"
-top_p = 0.95
-top_k = 20
-temperature = 0.9
-min_p = 0.0
-text_only = true
-
 [[delegates.middleware]]
 type = "context"
 warn_at_percent = 80
+compact_at_percent = 90
 fallback_max_tokens = 120000
+
+[[delegates.middleware]]
+type = "limits"
+max_steps = 200
+max_turns = 50
