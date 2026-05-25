@@ -1,5 +1,6 @@
 //! Focused tests for session list UI handlers and dispatch.
 
+use crate::agent::{SessionActor, core::SessionRuntime};
 use crate::api::AgentInfra;
 use crate::model::{AgentMessage, MessagePart};
 use crate::profiles::{LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager};
@@ -8,13 +9,15 @@ use crate::session::domain::ForkOrigin;
 use crate::session::projection::SessionScope;
 use crate::test_utils::empty_plugin_registry;
 use crate::ui::handlers::{
-    ListSessionsRequest, handle_fork_session, handle_list_session_children, handle_list_sessions,
-    handle_load_session, handle_ui_message,
+    ListSessionsRequest, handle_delete_session, handle_fork_session, handle_list_session_children,
+    handle_list_sessions, handle_load_session, handle_ui_message,
 };
 use crate::ui::messages::UiClientMessage;
 use anyhow::Result;
+use kameo::actor::Spawn;
 use querymt::chat::ChatRole;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -161,6 +164,24 @@ async fn next_message_of_type(
             return msg;
         }
     }
+}
+
+async fn insert_test_actor(agent: &Arc<crate::agent::LocalAgentHandle>, session_id: &str) {
+    let actor = SessionActor::new(
+        agent.config.clone(),
+        session_id.to_string(),
+        SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        ),
+    );
+    let actor_ref = SessionActor::spawn(actor);
+    agent
+        .registry
+        .lock()
+        .await
+        .insert(session_id.to_string(), actor_ref);
 }
 
 #[tokio::test]
@@ -562,6 +583,58 @@ async fn handle_load_session_uses_db_profile_binding_after_manager_rebuild() -> 
     let loaded = next_message_of_type(&mut rx, "session_loaded").await;
     assert_eq!(loaded["data"]["session_id"], session_id);
     assert_eq!(loaded["data"]["profile_id"], "alpha");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn handle_delete_session_clears_bound_profile_registry_after_active_profile_changes()
+-> Result<()> {
+    let mut f = crate::test_utils::TestServerState::new().await;
+    let dir = TempDir::new()?;
+    write_profile(dir.path(), "alpha.toml");
+    write_profile(dir.path(), "beta.toml");
+    let profiles = attach_profiles(&mut f, "alpha", dir.path()).await;
+    let session_id = f.agent.create_session().await;
+    profiles
+        .bind_session_to_profile(session_id.clone(), "alpha")
+        .await
+        .expect("session should bind to alpha");
+    let alpha_agent = profiles
+        .runtime_for_profile("alpha")
+        .await
+        .expect("alpha runtime should load")
+        .agent()
+        .handle();
+    insert_test_actor(&alpha_agent, &session_id).await;
+    profiles
+        .set_active_profile("beta")
+        .await
+        .expect("active profile should switch for future sessions");
+    let (tx, mut rx) = f.add_connection("conn-delete-profile").await;
+
+    handle_delete_session(&f.state, "conn-delete-profile", &session_id, &tx).await;
+
+    let root_registry = f.state.agent.registry.lock().await;
+    assert!(root_registry.get(&session_id).is_none());
+    drop(root_registry);
+    let alpha_registry = alpha_agent.registry.lock().await;
+    assert!(alpha_registry.get(&session_id).is_none());
+    drop(alpha_registry);
+    assert!(profiles.session_binding(&session_id).await.is_none());
+    assert!(
+        f.agent
+            .storage
+            .session_store()
+            .get_profile_binding(&session_id)
+            .await?
+            .is_none()
+    );
+
+    let state_msg = next_message_of_type(&mut rx, "state").await;
+    assert_eq!(state_msg["data"]["active_profile_id"], "beta");
+    let list_msg = next_message_of_type(&mut rx, "session_list").await;
+    assert!(!session_ids(&list_msg).contains(&session_id));
 
     Ok(())
 }

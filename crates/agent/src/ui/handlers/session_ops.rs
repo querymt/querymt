@@ -15,6 +15,7 @@ use super::super::session::{
     reasoning_effort_for_session, resolve_profile_id, resolve_profile_id_for_session,
     session_ref_for_session,
 };
+use crate::agent::LocalAgentHandle;
 use crate::agent::core::AgentMode;
 use crate::events::EventEnvelope;
 use crate::index::resolve_workspace_root;
@@ -697,6 +698,20 @@ pub async fn handle_load_session(
     }
 }
 
+async fn remove_session_actor_from_agent(agent: &Arc<LocalAgentHandle>, session_id: &str) {
+    let mut registry = agent.registry.lock().await;
+    // For remote sessions, send UnsubscribeEvents before removing so the remote
+    // EventForwarder task is properly cleaned up.
+    #[cfg(feature = "remote")]
+    {
+        registry.detach_remote_session(session_id).await;
+    }
+    #[cfg(not(feature = "remote"))]
+    {
+        registry.remove(session_id);
+    }
+}
+
 /// Handle session deletion request.
 pub async fn handle_delete_session(
     state: &ServerState,
@@ -704,23 +719,23 @@ pub async fn handle_delete_session(
     session_id: &str,
     tx: &mpsc::Sender<String>,
 ) {
+    let bound_agent = local_agent_for_session(state, Some(session_id), None)
+        .await
+        .ok();
+
     if let Err(err) = state.session_store.delete_session(session_id).await {
         let _ = send_error(tx, format!("Failed to delete session: {}", err)).await;
         return;
     }
 
-    {
-        let mut registry = state.agent.registry.lock().await;
-        // For remote sessions, send UnsubscribeEvents before removing so the
-        // remote EventForwarder task is properly cleaned up.
-        #[cfg(feature = "remote")]
-        {
-            registry.detach_remote_session(session_id).await;
-        }
-        #[cfg(not(feature = "remote"))]
-        {
-            registry.remove(session_id);
-        }
+    if let Some(agent) = bound_agent.as_ref() {
+        remove_session_actor_from_agent(agent, session_id).await;
+    }
+    let removed_from_root = bound_agent
+        .as_ref()
+        .is_some_and(|agent| Arc::ptr_eq(agent, &state.agent));
+    if !removed_from_root {
+        remove_session_actor_from_agent(&state.agent, session_id).await;
     }
 
     {

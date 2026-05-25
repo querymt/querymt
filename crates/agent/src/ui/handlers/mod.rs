@@ -143,7 +143,8 @@ pub async fn handle_ui_message(
         } => {
             let cwd = resolve_cwd(cwd).or_else(|| state.default_cwd.clone());
 
-            // Clear existing sessions for this connection to start fresh
+            // Clear only this connection's session references; persisted sessions
+            // and profile bindings remain loadable after NewSession.
             {
                 let mut connections = state.connections.lock().await;
                 if let Some(conn) = connections.get_mut(conn_id) {
