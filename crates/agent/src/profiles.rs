@@ -712,25 +712,13 @@ async fn build_profile_runtime(
     let metadata = document.metadata;
     let agent = match document.config {
         Config::Single(config) => {
-            let infra = if config.agent.db.is_some() {
-                AgentInfra {
-                    plugin_registry: shared_infra.plugin_registry,
-                    storage: None,
-                }
-            } else {
-                shared_infra
-            };
-            Agent::from_single_config_with_infra(config, infra).await?
+            Agent::from_single_config_with_infra(config, shared_infra).await?
         }
         Config::Multi(config) => {
-            let infra = if config.quorum.db.is_some() {
-                AgentInfra {
-                    plugin_registry: shared_infra.plugin_registry,
-                    storage: None,
-                }
-            } else {
-                shared_infra
-            };
+            #[cfg(feature = "remote")]
+            let infra = shared_infra.clone();
+            #[cfg(not(feature = "remote"))]
+            let infra = shared_infra;
 
             #[cfg(feature = "remote")]
             if config.mesh.enabled {
@@ -1524,37 +1512,36 @@ system = "inline"
     }
 
     #[tokio::test]
-    async fn explicit_single_db_uses_profile_storage_instead_of_shared_storage() {
+    async fn profile_config_rejects_db_field() {
         let dir = temp_profile_dir();
-        let db_path = dir.path().join("profile.db");
         write_profile(
             dir.path(),
             "single-db.toml",
-            &format!(
-                r#"
+            r#"
 [agent]
-db = "{}"
+db = "./profile.db"
 provider = "test"
 model = "test-model"
 system = "inline"
 "#,
-                db_path.display()
-            ),
         );
         let (infra, _registry_dir) = test_infra().await;
-        let shared = infra.storage.as_ref().expect("shared storage").clone();
         let catalog = LocalProfileCatalog::builder()
             .include_embedded_default(false)
             .local_dir(dir.path())
             .build();
         let manager = ProfileRuntimeManager::with_infra(catalog, "single-db", infra);
 
-        let runtime = manager
-            .active_runtime()
-            .await
-            .expect("single runtime with db override builds");
-        assert!(!Arc::ptr_eq(&shared, &runtime.agent().storage_backend()));
-        assert!(db_path.exists());
+        match manager.active_runtime().await {
+            Ok(_) => panic!("profile db config field should be rejected"),
+            Err(err) => {
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains("Failed to deserialize single agent config"),
+                    "unexpected error: {message}"
+                );
+            }
+        }
 
         manager.shutdown().await;
     }

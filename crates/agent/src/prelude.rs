@@ -36,6 +36,7 @@ pub use crate::config::{
 };
 pub use crate::runner::{
     AgentRunner, ChatRunner, ChatRunnerExt, ChatSession, ChatSessionExt, from_config,
+    from_config_value_with_infra, from_config_with_infra,
 };
 
 // Core agent types

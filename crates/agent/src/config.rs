@@ -970,10 +970,6 @@ pub struct AgentSettings {
     /// against this directory. Defaults to the process working directory.
     pub cwd: Option<PathBuf>,
 
-    /// Path to the SQLite database for session history.
-    /// Defaults to a platform-specific data directory when absent.
-    pub db: Option<PathBuf>,
-
     /// LLM provider name. Providers are loaded from `~/.qmt/providers.toml`.
     /// Common values: `"anthropic"`, `"openai"`, `"ollama"`, `"llama_cpp"`.
     pub provider: String,
@@ -1126,9 +1122,6 @@ fn default_max_parallel_delegations() -> usize {
 pub struct QuorumSettings {
     /// Working directory for the quorum. Relative paths are resolved against this.
     pub cwd: Option<PathBuf>,
-
-    /// Path to the SQLite session database.
-    pub db: Option<PathBuf>,
 
     /// Enable task delegation from the planner to delegate agents. Default: `true`.
     #[serde(default = "default_true")]
@@ -2121,6 +2114,45 @@ system = [{ file = "prompts/agent.md" }]
         let msg = err.to_string();
         assert!(msg.contains("inline TOML config"));
         assert!(msg.contains("agent.system"));
+    }
+
+    #[tokio::test]
+    async fn test_load_config_rejects_agent_db_field() {
+        let inline = r#"
+[agent]
+db = "./old-agent.db"
+provider = "test"
+model = "test-model"
+"#;
+
+        let err = load_config(ConfigSource::Toml(inline.to_string()))
+            .await
+            .expect_err("agent db config field should be rejected");
+        assert!(
+            err.to_string()
+                .contains("Failed to deserialize single agent config")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_config_rejects_quorum_db_field() {
+        let inline = r#"
+[quorum]
+db = "./old-quorum.db"
+
+[planner]
+provider = "test"
+model = "test-model"
+system = "plan"
+"#;
+
+        let err = load_config(ConfigSource::Toml(inline.to_string()))
+            .await
+            .expect_err("quorum db config field should be rejected");
+        assert!(
+            err.to_string()
+                .contains("Failed to deserialize quorum config")
+        );
     }
 
     #[tokio::test]

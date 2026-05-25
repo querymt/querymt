@@ -4,7 +4,6 @@
 
 [agent]
 cwd = "."
-db = "./agent.db"
 
 # Provider configuration - supports env var interpolation
 provider = "openai"

@@ -5,7 +5,6 @@
 
 [quorum]
 cwd = "."
-db = "./quorum.db"
 delegation = true
 verification = true
 

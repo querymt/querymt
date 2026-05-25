@@ -36,6 +36,7 @@
 //! ```
 
 use clap::ArgAction;
+#[cfg(any(feature = "api", feature = "dashboard"))]
 use clap::ArgGroup;
 use clap::Parser;
 use querymt_agent::prelude::*;
@@ -43,7 +44,7 @@ use querymt_agent::profiles::{
     DEFAULT_EMBEDDED_PROFILE_KEY, LocalProfileCatalog, ProfileCatalog, ProfileConfigKind,
     ProfileMetadata, ProfileRuntimeManager, ProfileSource, ensure_unique_profile_ids,
 };
-#[cfg(feature = "api")]
+#[cfg(any(feature = "api", feature = "dashboard"))]
 use querymt_agent::server::ServerMode;
 use rust_embed::RustEmbed;
 use std::path::{Component, Path, PathBuf};
@@ -93,6 +94,12 @@ struct Cli {
     /// List local profiles and exit.
     #[arg(long)]
     list_profiles: bool,
+
+    /// Path to the shared sessions SQLite database.
+    ///
+    /// Overrides QMT_SESSIONS_DB and the default ~/.qmt/agent.db runtime path.
+    #[arg(long, value_name = "path")]
+    db: Option<PathBuf>,
 
     /// Run as ACP stdio server (for subprocess spawning)
     #[arg(long)]
@@ -463,28 +470,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // OTLP export (traces + logs over gRPC) is active in all modes.
     querymt_utils::telemetry::setup_telemetry("qmtcode", env!("QMT_BUILD_VERSION"), is_acp);
 
+    let shared_infra = AgentInfra::shared_with_db_path(cli.db.clone()).await?;
+
+    #[allow(unused_variables, unused_assignments)]
     let mut profile_manager: Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>> = None;
     let runner = if let Some(config_path) = &cli.config_file {
         eprintln!("Loading agent from: {}", config_path.display());
-        from_config(config_path).await?
+        from_config_with_infra(config_path, shared_infra.clone()).await?
     } else {
         let selected_profile = selected_profile_id(&cli).to_string();
         eprintln!("Loading agent from profile: {selected_profile}");
         let document = profile_catalog.load_profile(&selected_profile).await?;
-        let runner = match &document.metadata.source {
-            ProfileSource::EmbeddedToml { .. } => {
-                from_config(ConfigSource::Toml(embedded_single_coder_config()?)).await?
-            }
-            ProfileSource::Embedded { .. } => {
-                from_config(ConfigSource::Toml(embedded_single_coder_config()?)).await?
-            }
-            ProfileSource::LocalPath { path } => from_config(path).await?,
-        };
+        let runner = from_config_value_with_infra(document.config, shared_infra.clone()).await?;
         let catalog: Arc<dyn ProfileCatalog> = Arc::new(profile_catalog);
-        profile_manager = Some(Arc::new(
-            ProfileRuntimeManager::with_default_infra_boxed(catalog, selected_profile.clone())
-                .await?,
-        ));
+        #[allow(unused_assignments)]
+        {
+            profile_manager = Some(Arc::new(ProfileRuntimeManager::with_infra_boxed(
+                catalog,
+                selected_profile.clone(),
+                shared_infra.clone(),
+            )));
+        }
         runner
     };
 
@@ -904,5 +910,12 @@ system = "inline"
         assert!(help.contains("--profile"));
         assert!(help.contains("--list-profiles"));
         assert!(!help.contains("--profiles-url"));
+    }
+
+    #[test]
+    fn db_flag_is_exposed() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--db <path>"));
+        assert!(help.contains("QMT_SESSIONS_DB"));
     }
 }

@@ -19,7 +19,7 @@ use crate::runner::{ChatRunner, ChatSession};
 use crate::send_agent::SendAgent;
 #[cfg(feature = "api")]
 use crate::server::AgentServer;
-use crate::session::backend::{StorageBackend, default_agent_db_path};
+use crate::session::backend::{StorageBackend, resolve_agent_db_path};
 use crate::session::sqlite_storage::SqliteStorage;
 use agent_client_protocol::schema::{ContentBlock, NewSessionRequest, PromptRequest, TextContent};
 use anyhow::{Result, anyhow};
@@ -59,7 +59,7 @@ pub struct AgentInfra {
     /// Required for iOS/embedded where default loaders are unavailable.
     pub plugin_registry: Arc<querymt::plugin::host::PluginRegistry>,
     /// Pre-opened storage backend.
-    /// `None` = create SQLite from the db path specified in config/builder.
+    /// `None` = create SQLite from the builder/env/default db path.
     pub storage: Option<Arc<dyn StorageBackend>>,
     /// Optional runtime MCP attachment source (e.g., for mobile in-process MCP peers).
     pub session_mcp_attachment_source: Option<Arc<dyn SessionMcpAttachmentSource>>,
@@ -68,8 +68,13 @@ pub struct AgentInfra {
 impl AgentInfra {
     /// Build the default shared infrastructure used by profile runtimes.
     pub async fn default_shared() -> Result<Self> {
+        Self::shared_with_db_path(None).await
+    }
+
+    /// Build shared infrastructure with an optional explicit sessions DB path.
+    pub async fn shared_with_db_path(db_path: Option<PathBuf>) -> Result<Self> {
         let registry = Arc::new(default_registry().await?);
-        let storage = Arc::new(SqliteStorage::connect(default_agent_db_path()?).await?);
+        let storage = Arc::new(SqliteStorage::connect(resolve_agent_db_path(db_path)?).await?);
         Ok(Self {
             plugin_registry: registry,
             storage: Some(storage),
@@ -321,10 +326,7 @@ impl AgentBuilder {
                 let storage = match infra.storage {
                     Some(s) => s,
                     None => {
-                        let db_path = match self.db_path {
-                            Some(path) => path,
-                            None => default_agent_db_path()?,
-                        };
+                        let db_path = resolve_agent_db_path(self.db_path)?;
                         Arc::new(SqliteStorage::connect(db_path).await?)
                     }
                 };
@@ -332,10 +334,7 @@ impl AgentBuilder {
             }
             None => {
                 let registry = Arc::new(default_registry().await?);
-                let db_path = match self.db_path {
-                    Some(path) => path,
-                    None => default_agent_db_path()?,
-                };
+                let db_path = resolve_agent_db_path(self.db_path)?;
                 let storage = Arc::new(SqliteStorage::connect(db_path).await?);
                 (registry, storage)
             }
@@ -901,9 +900,6 @@ impl Agent {
         }
         if let Some(cwd) = config.agent.cwd {
             builder.cwd = Some(cwd);
-        }
-        if let Some(db) = config.agent.db {
-            builder.db_path = Some(db);
         }
         builder.assume_mutating = Some(config.agent.assume_mutating);
         builder.mutating_tools = Some(config.agent.mutating_tools);

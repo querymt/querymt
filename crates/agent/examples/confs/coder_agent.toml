@@ -5,7 +5,6 @@
 
 [quorum]
 cwd = "."
-db = "/tmp/test.db"
 delegation = true
 verification = false
 snapshot_policy = "diff"

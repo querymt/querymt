@@ -2,7 +2,7 @@
 //!
 //! Provides a common trait for both single agents and multi-agent quorums.
 
-use crate::api::Agent;
+use crate::api::{Agent, AgentInfra};
 use crate::config::{Config, ConfigSource, load_config};
 use crate::events::EventEnvelope;
 #[cfg(feature = "api")]
@@ -298,10 +298,36 @@ impl From<AgentRunner> for Box<dyn ChatRunner> {
 /// ```
 pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner> {
     let config = load_config(source).await?;
+    build_runner_from_config(config, None).await
+}
 
+/// Build a runner from config while reusing caller-provided infrastructure.
+pub async fn from_config_with_infra(
+    source: impl Into<ConfigSource>,
+    infra: AgentInfra,
+) -> Result<AgentRunner> {
+    let config = load_config(source).await?;
+    build_runner_from_config(config, Some(infra)).await
+}
+
+/// Build a runner from an already-loaded config while reusing caller-provided infrastructure.
+pub async fn from_config_value_with_infra(
+    config: Config,
+    infra: AgentInfra,
+) -> Result<AgentRunner> {
+    build_runner_from_config(config, Some(infra)).await
+}
+
+async fn build_runner_from_config(
+    config: Config,
+    infra: Option<AgentInfra>,
+) -> Result<AgentRunner> {
     match config {
         Config::Single(single_config) => {
-            let agent = Agent::from_single_config(single_config).await?;
+            let agent = match infra {
+                Some(infra) => Agent::from_single_config_with_infra(single_config, infra).await?,
+                None => Agent::from_single_config(single_config).await?,
+            };
             Ok(AgentRunner::new(agent))
         }
         Config::Multi(quorum_config) => {
@@ -327,13 +353,27 @@ pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner>
                             result.registry.list_agents().len()
                         );
                         let auto_fallback = quorum_config.mesh.auto_fallback;
-                        let agent = Agent::from_quorum_config_with_registry(
-                            quorum_config,
-                            Some(Arc::new(result.registry)),
-                            Some(result.mesh.clone()),
-                            auto_fallback,
-                        )
-                        .await?;
+                        let agent = match infra {
+                            Some(infra) => {
+                                Agent::from_quorum_config_with_registry_and_infra(
+                                    quorum_config,
+                                    Some(Arc::new(result.registry)),
+                                    Some(result.mesh.clone()),
+                                    auto_fallback,
+                                    infra,
+                                )
+                                .await?
+                            }
+                            None => {
+                                Agent::from_quorum_config_with_registry(
+                                    quorum_config,
+                                    Some(Arc::new(result.registry)),
+                                    Some(result.mesh.clone()),
+                                    auto_fallback,
+                                )
+                                .await?
+                            }
+                        };
                         // Now that we have an AgentConfig, spawn and register the
                         // RemoteNodeManager and ProviderHostActor so remote peers can
                         // discover this node in the DHT and create sessions here.
@@ -350,7 +390,10 @@ pub async fn from_config(source: impl Into<ConfigSource>) -> Result<AgentRunner>
                 }
             }
 
-            let agent = Agent::from_quorum_config(quorum_config).await?;
+            let agent = match infra {
+                Some(infra) => Agent::from_quorum_config_with_infra(quorum_config, infra).await?,
+                None => Agent::from_quorum_config(quorum_config).await?,
+            };
             Ok(AgentRunner::new(agent))
         }
     }

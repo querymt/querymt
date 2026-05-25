@@ -5,7 +5,6 @@
 
 [quorum]
 cwd = "/Users/wiking/qmt/querymt"
-db = "/tmp/test.db"
 delegation = true
 verification = false
 snapshot_policy = "diff"
