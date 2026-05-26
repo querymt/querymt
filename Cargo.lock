@@ -639,7 +639,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16e2cdb6d5ed835199484bb92bb8b3edd526effe995c61732580439c1a67e2e9"
 dependencies = [
  "base64 0.22.1",
- "http 1.4.0",
+ "http 1.4.1",
  "log",
  "url",
 ]
@@ -756,7 +756,7 @@ dependencies = [
  "bytes",
  "form_urlencoded",
  "futures-util",
- "http 1.4.0",
+ "http 1.4.1",
  "http-body 1.0.1",
  "http-body-util",
  "hyper 1.9.0",
@@ -789,7 +789,7 @@ checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
 dependencies = [
  "bytes",
  "futures-core",
- "http 1.4.0",
+ "http 1.4.1",
  "http-body 1.0.1",
  "http-body-util",
  "mime",
@@ -5307,7 +5307,7 @@ dependencies = [
  "fnv",
  "futures-core",
  "futures-sink",
- "http 1.4.0",
+ "http 1.4.1",
  "indexmap 2.14.0",
  "slab",
  "tokio",
@@ -5473,7 +5473,7 @@ checksum = "629d8f3bbeda9d148036d6b0de0a3ab947abd08ce90626327fc3547a49d59d97"
 dependencies = [
  "dirs 6.0.0",
  "futures",
- "http 1.4.0",
+ "http 1.4.1",
  "indicatif 0.17.11",
  "libc",
  "log",
@@ -5496,7 +5496,7 @@ checksum = "aef3982638978efa195ff11b305f51f1f22f4f0a6cabee7af79b383ebee6a213"
 dependencies = [
  "dirs 6.0.0",
  "futures",
- "http 1.4.0",
+ "http 1.4.1",
  "indicatif 0.18.4",
  "libc",
  "log",
@@ -5526,7 +5526,7 @@ dependencies = [
  "futures-util",
  "h2 0.4.14",
  "hickory-proto 0.26.0-beta.4",
- "http 1.4.0",
+ "http 1.4.1",
  "idna",
  "ipnet",
  "jni",
@@ -5724,9 +5724,9 @@ dependencies = [
 
 [[package]]
 name = "http"
-version = "1.4.0"
+version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3ba2a386d7f85a81f119ad7498ebe444d2e22c2af0b86b069416ace48b3311a"
+checksum = "8be7462df143984c4598a256ef469b251d7d7f9e271135073e78fc535414f3d0"
 dependencies = [
  "bytes",
  "itoa",
@@ -5759,7 +5759,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1efedce1fb8e6913f23e0c92de8e62cd5b772a67e7b3946df930a62566c93184"
 dependencies = [
  "bytes",
- "http 1.4.0",
+ "http 1.4.1",
 ]
 
 [[package]]
@@ -5770,7 +5770,7 @@ checksum = "b021d93e26becf5dc7e1b75b1bed1fd93124b374ceb73f43d4d4eafec896a64a"
 dependencies = [
  "bytes",
  "futures-core",
- "http 1.4.0",
+ "http 1.4.1",
  "http-body 1.0.1",
  "pin-project-lite",
 ]
@@ -5781,7 +5781,7 @@ version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "665c24b8e7e21688dc74edb228f07c1815bbc7ff3b48a3ee72fa20937fbde095"
 dependencies = [
- "http 1.4.0",
+ "http 1.4.1",
  "serde",
 ]
 
@@ -5847,7 +5847,7 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "h2 0.4.14",
- "http 1.4.0",
+ "http 1.4.1",
  "http-body 1.0.1",
  "httparse",
  "httpdate",
@@ -5878,7 +5878,7 @@ version = "0.27.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
 dependencies = [
- "http 1.4.0",
+ "http 1.4.1",
  "hyper 1.9.0",
  "hyper-util",
  "rustls 0.23.40",
@@ -5911,7 +5911,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-util",
- "http 1.4.0",
+ "http 1.4.1",
  "http-body 1.0.1",
  "hyper 1.9.0",
  "ipnet",
@@ -6114,7 +6114,7 @@ dependencies = [
  "attohttpc",
  "bytes",
  "futures",
- "http 1.4.0",
+ "http 1.4.1",
  "http-body-util",
  "hyper 1.9.0",
  "hyper-util",
@@ -6430,7 +6430,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.2",
  "hickory-resolver 0.26.0-beta.4",
- "http 1.4.0",
+ "http 1.4.1",
  "ipnet",
  "iroh-base",
  "iroh-dns",
@@ -6543,7 +6543,7 @@ dependencies = [
  "derive_more",
  "getrandom 0.4.2",
  "hickory-resolver 0.26.0-beta.4",
- "http 1.4.0",
+ "http 1.4.1",
  "http-body-util",
  "hyper 1.9.0",
  "hyper-util",
@@ -8154,7 +8154,7 @@ dependencies = [
  "hf-hub 0.4.3",
  "hound",
  "html2text",
- "http 1.4.0",
+ "http 1.4.1",
  "image",
  "indexmap 2.14.0",
  "indicatif 0.18.4",
@@ -8238,7 +8238,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "futures-util",
- "http 1.4.0",
+ "http 1.4.1",
  "reqwest 0.13.3",
  "rust-mcp-schema",
  "serde",
@@ -9021,7 +9021,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "getrandom 0.2.17",
- "http 1.4.0",
+ "http 1.4.1",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "serde",
@@ -9152,7 +9152,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures-util",
- "http 1.4.0",
+ "http 1.4.1",
  "http-auth",
  "jwt",
  "lazy_static",
@@ -9365,7 +9365,7 @@ dependencies = [
  "dyn-clone",
  "ed25519-dalek 2.2.0",
  "hmac",
- "http 1.4.0",
+ "http 1.4.1",
  "itertools 0.10.5",
  "log",
  "oauth2",
@@ -9426,7 +9426,7 @@ checksum = "5683015d09e2df236ef005b17f6f196f0d5f6313c4fa43a7b6a53b52776e4331"
 dependencies = [
  "async-trait",
  "bytes",
- "http 1.4.0",
+ "http 1.4.1",
  "opentelemetry",
  "reqwest 0.13.3",
 ]
@@ -9437,7 +9437,7 @@ version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9966929966d17620d7c316c643ba62631826e10021409357772d5eea84f62c35"
 dependencies = [
- "http 1.4.0",
+ "http 1.4.1",
  "opentelemetry",
  "opentelemetry-http",
  "opentelemetry-proto",
@@ -10658,7 +10658,7 @@ name = "qmt-alibaba"
 version = "0.4.0"
 dependencies = [
  "extism-pdk",
- "http 1.4.0",
+ "http 1.4.1",
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
@@ -10674,7 +10674,7 @@ version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "extism-pdk",
- "http 1.4.0",
+ "http 1.4.1",
  "querymt",
  "querymt-extism-macros",
  "schemars 1.2.1",
@@ -10690,7 +10690,7 @@ dependencies = [
  "base64 0.22.1",
  "extism-pdk",
  "heck 0.5.0",
- "http 1.4.0",
+ "http 1.4.1",
  "log",
  "querymt",
  "querymt-extism-macros",
@@ -10705,7 +10705,7 @@ name = "qmt-deepseek"
 version = "0.4.0"
 dependencies = [
  "extism-pdk",
- "http 1.4.0",
+ "http 1.4.1",
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
@@ -10721,7 +10721,7 @@ version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "extism-pdk",
- "http 1.4.0",
+ "http 1.4.1",
  "querymt",
  "querymt-extism-macros",
  "schemars 1.2.1",
@@ -10735,7 +10735,7 @@ name = "qmt-groq"
 version = "0.4.0"
 dependencies = [
  "extism-pdk",
- "http 1.4.0",
+ "http 1.4.1",
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
@@ -10766,7 +10766,7 @@ name = "qmt-kimi-code"
 version = "0.4.0"
 dependencies = [
  "extism-pdk",
- "http 1.4.0",
+ "http 1.4.1",
  "kimi-auth",
  "log",
  "qmt-openai",
@@ -10803,7 +10803,7 @@ name = "qmt-mistral"
 version = "0.4.0"
 dependencies = [
  "extism-pdk",
- "http 1.4.0",
+ "http 1.4.1",
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
@@ -10818,7 +10818,7 @@ name = "qmt-moonshot"
 version = "0.4.0"
 dependencies = [
  "extism-pdk",
- "http 1.4.0",
+ "http 1.4.1",
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
@@ -10853,7 +10853,7 @@ version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "extism-pdk",
- "http 1.4.0",
+ "http 1.4.1",
  "querymt",
  "querymt-extism-macros",
  "schemars 1.2.1",
@@ -10869,7 +10869,7 @@ dependencies = [
  "either",
  "extism-pdk",
  "heck 0.5.0",
- "http 1.4.0",
+ "http 1.4.1",
  "querymt",
  "querymt-extism-macros",
  "schemars 1.2.1",
@@ -10883,7 +10883,7 @@ name = "qmt-openrouter"
 version = "0.4.0"
 dependencies = [
  "extism-pdk",
- "http 1.4.0",
+ "http 1.4.1",
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
@@ -10899,7 +10899,7 @@ version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "extism-pdk",
- "http 1.4.0",
+ "http 1.4.1",
  "qmt-codex",
  "qmt-openai",
  "querymt",
@@ -10915,7 +10915,7 @@ name = "qmt-zai"
 version = "0.4.0"
 dependencies = [
  "extism-pdk",
- "http 1.4.0",
+ "http 1.4.1",
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
@@ -10958,7 +10958,7 @@ dependencies = [
  "flate2",
  "futures",
  "hex",
- "http 1.4.0",
+ "http 1.4.1",
  "http-serde-ext",
  "httpdate",
  "humantime",
@@ -11009,7 +11009,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "hex",
- "http 1.4.0",
+ "http 1.4.1",
  "iana-time-zone",
  "ignore",
  "imagesize",
@@ -11114,7 +11114,7 @@ version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "extism-pdk",
- "http 1.4.0",
+ "http 1.4.1",
  "http-serde-ext",
  "log",
  "querymt",
@@ -11761,7 +11761,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "h2 0.4.14",
- "http 1.4.0",
+ "http 1.4.1",
  "http-body 1.0.1",
  "http-body-util",
  "hyper 1.9.0",
@@ -11807,7 +11807,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "h2 0.4.14",
- "http 1.4.0",
+ "http 1.4.1",
  "http-body 1.0.1",
  "http-body-util",
  "hyper 1.9.0",
@@ -11884,7 +11884,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures",
- "http 1.4.0",
+ "http 1.4.1",
  "pastey 0.2.2",
  "pin-project-lite",
  "process-wrap",
@@ -14373,7 +14373,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "getrandom 0.4.2",
- "http 1.4.0",
+ "http 1.4.1",
  "httparse",
  "rand 0.10.1",
  "ring",
@@ -14537,7 +14537,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
- "http 1.4.0",
+ "http 1.4.1",
  "http-body 1.0.1",
  "http-body-util",
  "hyper 1.9.0",
@@ -14643,7 +14643,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
- "http 1.4.0",
+ "http 1.4.1",
  "http-body 1.0.1",
  "http-body-util",
  "pin-project-lite",
@@ -14920,7 +14920,7 @@ checksum = "8628dcc84e5a09eb3d8423d6cb682965dea9133204e8fb3efee74c2a0c259442"
 dependencies = [
  "bytes",
  "data-encoding",
- "http 1.4.0",
+ "http 1.4.1",
  "httparse",
  "log",
  "rand 0.9.4",
@@ -14937,7 +14937,7 @@ checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
 dependencies = [
  "bytes",
  "data-encoding",
- "http 1.4.0",
+ "http 1.4.1",
  "httparse",
  "log",
  "rand 0.9.4",
@@ -15234,7 +15234,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e994ba84b0bd1b1b0cf92878b7ef898a5c1760108fe7b6010327e274917a808c"
 dependencies = [
  "base64 0.22.1",
- "http 1.4.0",
+ "http 1.4.1",
  "httparse",
  "log",
 ]
@@ -16732,7 +16732,7 @@ dependencies = [
  "base64 0.22.1",
  "deadpool",
  "futures",
- "http 1.4.0",
+ "http 1.4.1",
  "http-body-util",
  "hyper 1.9.0",
  "hyper-util",
