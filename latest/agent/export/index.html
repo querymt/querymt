@@ -1848,7 +1848,7 @@
 
 
 <h1 id="session-data-export">Session Data Export</h1>
-<p>QueryMT Agent records every session interaction in its database (<code>~/.qmt/agent.db</code>). The export system lets you extract this data in standardized formats for analysis, compliance, and — most notably — <strong>fine-tuning LLMs</strong> on your own agent trajectories.</p>
+<p>QueryMT Agent records every session interaction in its database (<code>~/.qmt/sessions.db</code>). The export system lets you extract this data in standardized formats for analysis, compliance, and — most notably — <strong>fine-tuning LLMs</strong> on your own agent trajectories.</p>
 <h2 id="export-formats">Export Formats</h2>
 <h3 id="atif-agent-trajectory-interchange-format">ATIF (Agent Trajectory Interchange Format)</h3>
 <p>The <a href="https://github.com/laude-institute/harbor">ATIF v1.5</a> format exports sessions as structured agent trajectories with steps, tool calls, observations, and metrics. Useful for interoperability with other agent systems and trajectory analysis.</p>
@@ -1879,7 +1879,7 @@
 <h2 id="architecture">Architecture</h2>
 <p>Both exporters share a common <strong>turn materialization</strong> layer that walks the event journal and produces structured <code>Turn</code> objects:</p>
 <pre class="mermaid"><code>graph LR
-    DB[(agent.db&lt;br/&gt;event_journal)] --&gt; MT[materialize_turns]
+    DB[(sessions.db&lt;br/&gt;event_journal)] --&gt; MT[materialize_turns]
     MT --&gt; ATIF[ATIF Exporter]
     MT --&gt; SFT[SFT Exporter]
     SFT --&gt; OAI[OpenAI JSONL]
@@ -1932,7 +1932,7 @@
 <span class="normal"><a href="#__codelineno-1-16">16</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1"></a>export_sft [OPTIONS]
 <a id="__codelineno-1-2" name="__codelineno-1-2"></a>
 <a id="__codelineno-1-3" name="__codelineno-1-3"></a>OPTIONS:
-<a id="__codelineno-1-4" name="__codelineno-1-4"></a>    --db &lt;path&gt;                Path to agent.db (default: ~/.qmt/agent.db)
+<a id="__codelineno-1-4" name="__codelineno-1-4"></a>    --db &lt;path&gt;                Path to sessions.db (default: ~/.qmt/sessions.db)
 <a id="__codelineno-1-5" name="__codelineno-1-5"></a>    --output, -o &lt;path&gt;        Output file (default: stdout)
 <a id="__codelineno-1-6" name="__codelineno-1-6"></a>    --format, -f &lt;fmt&gt;         Output format: openai (default), sharegpt
 <a id="__codelineno-1-7" name="__codelineno-1-7"></a>    --stats                    Show export stats without writing data
