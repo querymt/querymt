@@ -8,7 +8,7 @@ use querymt::{
     HTTPLLMProvider,
     chat::{
         ChatMessage, ChatResponse, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
-        http::HTTPChatProvider,
+        http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -19,7 +19,7 @@ use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use url::Url;
 
 fn normalize_base_url(mut url: Url) -> Url {
@@ -62,11 +62,6 @@ pub struct Zai {
     pub json_schema: Option<StructuredOutputFormat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_body: Option<serde_json::Map<String, Value>>,
-    /// Internal buffer for streaming tool state (not serialized)
-    #[serde(skip)]
-    #[schemars(skip)]
-    #[serde(default = "Zai::default_tool_state_buffer")]
-    pub tool_state_buffer: Arc<Mutex<HashMap<usize, OpenAIToolUseState>>>,
 }
 
 impl OpenAIProviderConfig for Zai {
@@ -148,6 +143,16 @@ impl HTTPChatProvider for Zai {
         openai_chat_request(self, messages, tools)
     }
 
+    fn chat_stream_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<Request<Vec<u8>>, LLMError> {
+        let mut cfg = self.clone();
+        cfg.stream = Some(true);
+        openai_chat_request(&cfg, messages, tools)
+    }
+
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         openai_parse_chat(self, response)
     }
@@ -156,9 +161,19 @@ impl HTTPChatProvider for Zai {
         true
     }
 
-    fn parse_chat_stream_chunk(&self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        let mut tool_states = self.tool_state_buffer.lock().unwrap();
-        parse_openai_sse_chunk(chunk, &mut tool_states)
+    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        Ok(Box::new(ZaiStreamParser::default()))
+    }
+}
+
+#[derive(Default)]
+struct ZaiStreamParser {
+    tool_states: HashMap<usize, OpenAIToolUseState>,
+}
+
+impl ChatStreamParser for ZaiStreamParser {
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+        parse_openai_sse_chunk(chunk, &mut self.tool_states)
     }
 }
 
@@ -191,10 +206,6 @@ impl HTTPLLMProvider for Zai {
 impl Zai {
     fn default_base_url() -> Url {
         Url::parse("https://api.z.ai/api/paas/v4/").unwrap()
-    }
-
-    fn default_tool_state_buffer() -> Arc<Mutex<HashMap<usize, OpenAIToolUseState>>> {
-        Arc::new(Mutex::new(HashMap::new()))
     }
 }
 
