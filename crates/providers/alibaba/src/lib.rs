@@ -1,4 +1,4 @@
-use http::{Method, Request, Response, header::CONTENT_TYPE};
+use http::{Request, Response};
 use qmt_openai::api::{
     OpenAIProviderConfig, openai_chat_request, openai_embed_request, openai_parse_chat,
     openai_parse_embed, url_schema,
@@ -168,6 +168,52 @@ impl Alibaba {
     }
 }
 
+fn alibaba_models() -> Vec<String> {
+    vec![
+        "qwq-plus",
+        "qwen-max",
+        "qwen-max-latest",
+        "qwen-max-2025-01-25",
+        "qwen-plus",
+        "qwen-plus-latest",
+        "qwen-plus-2025-01-25",
+        "qwen-plus-2025-04-28",
+        "qwen-turbo",
+        "qwen-turbo-latest",
+        "qwen-turbo-2024-11-01",
+        "qwen-turbo-2025-04-28",
+        "qwen3-235b-a22b",
+        "qwen3-32b",
+        "qwen3-30b-a3b",
+        "qwen3-14b",
+        "qwen3-8b",
+        "qwen3-4b",
+        "qwen3-1.7b",
+        "qwen3-0.6b",
+        "qwen2.5-14b-instruct-1m",
+        "qwen2.5-7b-instruct-1m",
+        "qwen2.5-72b-instruct",
+        "qwen2.5-32b-instruct",
+        "qwen2.5-14b-instruct",
+        "qwen2.5-7b-instruct",
+        "qwen2-72b-instruct",
+        "qwen2-57b-a14b-instruct",
+        "qwen2-7b-instruct",
+        "qwen1.5-110b-chat",
+        "qwen1.5-72b-chat",
+        "qwen1.5-32b-chat",
+        "qwen1.5-14b-chat",
+        "qwen1.5-7b-chat",
+        "qwen2.5-omni-7b",
+        "qvq-max",
+        "qvq-max-latest",
+        "qvq-max-2025-03-25",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
 struct AlibabaFactory;
 
 impl HTTPLLMProviderFactory for AlibabaFactory {
@@ -179,58 +225,18 @@ impl HTTPLLMProviderFactory for AlibabaFactory {
         Some("ALIBABA_API_KEY".into())
     }
 
+    fn list_models_static(&self, _cfg: &str) -> Option<Result<Vec<String>, LLMError>> {
+        Some(Ok(alibaba_models()))
+    }
+
     fn list_models_request(&self, _cfg: &str) -> Result<Request<Vec<u8>>, LLMError> {
-        Ok(Request::builder()
-            .method(Method::GET)
-            .uri(Alibaba::default_base_url().as_str().to_string())
-            .header(CONTENT_TYPE, "application/json")
-            .body(Vec::new())?)
+        Err(LLMError::NotImplemented(
+            "Alibaba model list is static and does not require HTTP".to_string(),
+        ))
     }
 
     fn parse_list_models(&self, _resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
-        Ok(vec![
-            "qwq-plus",
-            "qwen-max",
-            "qwen-max-latest",
-            "qwen-max-2025-01-25",
-            "qwen-plus",
-            "qwen-plus-latest",
-            "qwen-plus-2025-01-25",
-            "qwen-plus-2025-04-28",
-            "qwen-turbo",
-            "qwen-turbo-latest",
-            "qwen-turbo-2024-11-01",
-            "qwen-turbo-2025-04-28",
-            "qwen3-235b-a22b",
-            "qwen3-32b",
-            "qwen3-30b-a3b",
-            "qwen3-14b",
-            "qwen3-8b",
-            "qwen3-4b",
-            "qwen3-1.7b",
-            "qwen3-0.6b",
-            "qwen2.5-14b-instruct-1m",
-            "qwen2.5-7b-instruct-1m",
-            "qwen2.5-72b-instruct",
-            "qwen2.5-32b-instruct",
-            "qwen2.5-14b-instruct",
-            "qwen2.5-7b-instruct",
-            "qwen2-72b-instruct",
-            "qwen2-57b-a14b-instruct",
-            "qwen2-7b-instruct",
-            "qwen1.5-110b-chat",
-            "qwen1.5-72b-chat",
-            "qwen1.5-32b-chat",
-            "qwen1.5-14b-chat",
-            "qwen1.5-7b-chat",
-            "qwen2.5-omni-7b",
-            "qvq-max",
-            "qvq-max-latest",
-            "qvq-max-2025-03-25",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect())
+        Ok(alibaba_models())
     }
 
     fn config_schema(&self) -> String {

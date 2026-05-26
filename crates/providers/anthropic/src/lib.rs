@@ -3,7 +3,6 @@
 //! This module provides integration with Anthropic's Claude models through their API.
 
 use std::collections::HashMap;
-use std::sync::Mutex as StdMutex;
 
 /// Tool name prefix used for OAuth requests to avoid conflicts with server-side tools
 const TOOL_PREFIX: &str = "mcp_";
@@ -21,7 +20,8 @@ use querymt::{
     auth::ApiKeyResolver,
     chat::{
         ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort, Tool,
-        ToolChoice, http::HTTPChatProvider,
+        ToolChoice,
+        http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -123,22 +123,6 @@ pub struct Anthropic {
     #[serde(skip)]
     #[schemars(skip)]
     pub key_resolver: Option<Arc<dyn ApiKeyResolver>>,
-    /// Per-request accumulator for streaming tool-use blocks.
-    ///
-    /// Keyed by the SSE `index` field.  Entries are inserted on
-    /// `content_block_start` (type `tool_use`) and removed (with a
-    /// `ToolUseComplete` chunk emitted) on `content_block_stop`.
-    #[serde(skip, default = "Anthropic::default_tool_state_buffer")]
-    #[schemars(skip)]
-    pub(crate) tool_state_buffer: Arc<StdMutex<HashMap<usize, AnthropicToolUseState>>>,
-    /// Per-request accumulator for streaming thinking signatures.
-    ///
-    /// Keyed by the SSE `index` field. Entries are inserted on
-    /// `content_block_start` (type `thinking`) and removed on
-    /// `content_block_stop` once a signature is available.
-    #[serde(skip, default = "Anthropic::default_thinking_state_buffer")]
-    #[schemars(skip)]
-    pub(crate) thinking_state_buffer: Arc<StdMutex<HashMap<usize, AnthropicThinkingState>>>,
 }
 
 /// Per-block accumulator used while streaming tool-use content.
@@ -671,14 +655,6 @@ impl Anthropic {
         Url::parse("https://api.anthropic.com/v1/").unwrap()
     }
 
-    fn default_tool_state_buffer() -> Arc<StdMutex<HashMap<usize, AnthropicToolUseState>>> {
-        Arc::new(StdMutex::new(HashMap::new()))
-    }
-
-    fn default_thinking_state_buffer() -> Arc<StdMutex<HashMap<usize, AnthropicThinkingState>>> {
-        Arc::new(StdMutex::new(HashMap::new()))
-    }
-
     /// Returns the current API key, using the resolver if available.
     fn resolved_key(&self) -> String {
         if let Some(ref resolver) = self.key_resolver {
@@ -1037,6 +1013,16 @@ impl HTTPChatProvider for Anthropic {
         Ok(builder.body(json_req)?)
     }
 
+    fn chat_stream_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<Request<Vec<u8>>, LLMError> {
+        let mut cfg = self.clone();
+        cfg.stream = Some(true);
+        cfg.chat_request(messages, tools)
+    }
+
     fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         handle_http_error!(resp);
 
@@ -1059,10 +1045,23 @@ impl HTTPChatProvider for Anthropic {
         true
     }
 
-    fn parse_chat_stream_chunk(
-        &self,
-        chunk: &[u8],
-    ) -> Result<Vec<querymt::chat::StreamChunk>, LLMError> {
+    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        Ok(Box::new(AnthropicStreamParser {
+            oauth: self.is_oauth(),
+            tool_state_buffer: HashMap::new(),
+            thinking_state_buffer: HashMap::new(),
+        }))
+    }
+}
+
+struct AnthropicStreamParser {
+    oauth: bool,
+    tool_state_buffer: HashMap<usize, AnthropicToolUseState>,
+    thinking_state_buffer: HashMap<usize, AnthropicThinkingState>,
+}
+
+impl ChatStreamParser for AnthropicStreamParser {
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<querymt::chat::StreamChunk>, LLMError> {
         let text = std::str::from_utf8(chunk).map_err(|e| LLMError::GenericError(e.to_string()))?;
         let mut chunks = Vec::new();
 
@@ -1090,36 +1089,31 @@ impl HTTPChatProvider for Anthropic {
                             (stream_resp.index, stream_resp.content_block)
                         {
                             if block.block_type == "tool_use" {
-                                // Strip tool prefix from name for OAuth responses
                                 let name = block.name.unwrap_or_default();
-                                let name = if self.is_oauth() {
-                                    Self::strip_tool_prefix(&name)
+                                let name = if self.oauth {
+                                    Anthropic::strip_tool_prefix(&name)
                                 } else {
                                     name
                                 };
                                 let id = block.id.unwrap_or_default();
 
-                                // Insert accumulator entry for this block index
-                                if let Ok(mut buf) = self.tool_state_buffer.lock() {
-                                    buf.insert(
-                                        index,
-                                        AnthropicToolUseState {
-                                            id: id.clone(),
-                                            name: name.clone(),
-                                            arguments_buffer: String::new(),
-                                        },
-                                    );
-                                }
+                                self.tool_state_buffer.insert(
+                                    index,
+                                    AnthropicToolUseState {
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                        arguments_buffer: String::new(),
+                                    },
+                                );
 
                                 chunks.push(querymt::chat::StreamChunk::ToolUseStart {
                                     index,
                                     id,
                                     name,
                                 });
-                            } else if block.block_type == "thinking"
-                                && let Ok(mut buf) = self.thinking_state_buffer.lock()
-                            {
-                                buf.insert(index, AnthropicThinkingState::default());
+                            } else if block.block_type == "thinking" {
+                                self.thinking_state_buffer
+                                    .insert(index, AnthropicThinkingState::default());
                             }
                         }
                     }
@@ -1130,16 +1124,11 @@ impl HTTPChatProvider for Anthropic {
                             } else if let Some(thinking) = delta.thinking {
                                 chunks.push(querymt::chat::StreamChunk::Thinking(thinking));
                             } else if let Some(signature) = delta.signature {
-                                if let Ok(mut buf) = self.thinking_state_buffer.lock()
-                                    && let Some(state) = buf.get_mut(&index)
-                                {
+                                if let Some(state) = self.thinking_state_buffer.get_mut(&index) {
                                     state.signature.push_str(&signature);
                                 }
                             } else if let Some(partial_json) = delta.partial_json {
-                                // Accumulate into the state buffer
-                                if let Ok(mut buf) = self.tool_state_buffer.lock()
-                                    && let Some(state) = buf.get_mut(&index)
-                                {
+                                if let Some(state) = self.tool_state_buffer.get_mut(&index) {
                                     state.arguments_buffer.push_str(&partial_json);
                                 }
 
@@ -1152,11 +1141,7 @@ impl HTTPChatProvider for Anthropic {
                     }
                     "content_block_stop" => {
                         if let Some(index) = stream_resp.index {
-                            // If this block was a tool-use block, emit ToolUseComplete with
-                            // the fully assembled arguments.
-                            if let Ok(mut buf) = self.tool_state_buffer.lock()
-                                && let Some(state) = buf.remove(&index)
-                            {
+                            if let Some(state) = self.tool_state_buffer.remove(&index) {
                                 chunks.push(querymt::chat::StreamChunk::ToolUseComplete {
                                     index,
                                     tool_call: querymt::ToolCall {
@@ -1174,9 +1159,7 @@ impl HTTPChatProvider for Anthropic {
                                 });
                             }
 
-                            // Emit thinking signature once the thinking block closes.
-                            if let Ok(mut buf) = self.thinking_state_buffer.lock()
-                                && let Some(state) = buf.remove(&index)
+                            if let Some(state) = self.thinking_state_buffer.remove(&index)
                                 && !state.signature.is_empty()
                             {
                                 chunks.push(querymt::chat::StreamChunk::ThinkingSignature(
@@ -1186,8 +1169,6 @@ impl HTTPChatProvider for Anthropic {
                         }
                     }
                     "message_delta" => {
-                        // Emit Usage before Done so consumers that break on
-                        // Done still capture the output_tokens update.
                         if let Some(usage) = stream_resp.usage {
                             chunks.push(querymt::chat::StreamChunk::Usage(usage));
                         }
@@ -1195,7 +1176,7 @@ impl HTTPChatProvider for Anthropic {
                         if let Some(delta) = stream_resp.delta
                             && let Some(stop_reason) = delta.stop_reason
                         {
-                            let finish_reason = Self::map_stop_reason(&stop_reason);
+                            let finish_reason = Anthropic::map_stop_reason(&stop_reason);
                             chunks.push(querymt::chat::StreamChunk::Done { finish_reason });
                         }
                     }
@@ -1270,8 +1251,6 @@ mod tests {
             reasoning_effort: None,
             reasoning_budget_tokens: None,
             key_resolver: None,
-            tool_state_buffer: Anthropic::default_tool_state_buffer(),
-            thinking_state_buffer: Anthropic::default_thinking_state_buffer(),
         }
     }
 
@@ -1618,13 +1597,16 @@ mod tests {
         // silently ignored during deserialization as they're not part of Usage struct
     }
 
-    /// Feed a sequence of raw SSE lines through `parse_chat_stream_chunk` and
+    /// Feed a sequence of raw SSE lines through a fresh stream parser and
     /// collect all emitted `StreamChunk`s.
     fn collect_chunks(anthropic: &Anthropic, lines: &[&str]) -> Vec<querymt::chat::StreamChunk> {
+        let mut parser = anthropic
+            .chat_stream_parser()
+            .expect("stream parser should initialize");
         let mut out = Vec::new();
         for line in lines {
             let bytes = line.as_bytes();
-            let parsed = anthropic.parse_chat_stream_chunk(bytes).unwrap();
+            let parsed = parser.parse_chunk(bytes).unwrap();
             out.extend(parsed);
         }
         out
@@ -1703,11 +1685,7 @@ mod tests {
             chunks[4]
         );
 
-        // State buffer should be empty after the stream completes
-        assert!(
-            anthropic.tool_state_buffer.lock().unwrap().is_empty(),
-            "tool_state_buffer should be empty after content_block_stop"
-        );
+        // Parser state is per-stream and dropped with the parser instance.
     }
 
     #[test]
@@ -1752,8 +1730,7 @@ mod tests {
         assert!(names.contains("read_file"));
         assert!(names.contains("write_file"));
 
-        // Buffer should be drained
-        assert!(anthropic.tool_state_buffer.lock().unwrap().is_empty());
+        // Parser state is per-stream and dropped with the parser instance.
     }
 
     #[test]
@@ -1879,6 +1856,6 @@ mod tests {
                 .any(|c| matches!(c, querymt::chat::StreamChunk::Text(t) if t == "Hello!")),
             "expected a Text chunk"
         );
-        assert!(anthropic.tool_state_buffer.lock().unwrap().is_empty());
+        // Parser state is per-stream and dropped with the parser instance.
     }
 }

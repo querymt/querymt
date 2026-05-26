@@ -1,8 +1,10 @@
 mod interface;
 pub use interface::{
-    BinaryCodec, ExtismChatChunk, ExtismChatRequest, ExtismChatResponse, ExtismCompleteRequest,
-    ExtismEmbedRequest, ExtismLogRecord, ExtismSttRequest, ExtismSttResponse, ExtismTtsRequest,
-    ExtismTtsResponse, ExtismVoiceConfig, PluginError, StreamOpenResult,
+    BinaryCodec, ExtismChatChunk, ExtismChatChunkParseRequest, ExtismChatParseRequest,
+    ExtismChatRequest, ExtismChatResponse, ExtismCompleteParseRequest, ExtismCompleteRequest,
+    ExtismEmbedParseRequest, ExtismEmbedRequest, ExtismListModelsParseRequest,
+    ExtismListModelsRequest, ExtismLogRecord, ExtismSttRequest, ExtismSttResponse,
+    ExtismTtsRequest, ExtismTtsResponse, ExtismVoiceConfig, PluginError, StreamOpenResult,
 };
 
 #[cfg(feature = "extism_host")]

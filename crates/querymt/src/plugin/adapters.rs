@@ -51,8 +51,11 @@ impl LLMProviderFactory for HTTPFactoryAdapter {
         let cloned_cfg = cfg.to_string();
 
         async move {
-            let req: Request<Vec<u8>> = inner.list_models_request(&cloned_cfg)?;
+            if let Some(result) = inner.list_models_static(&cloned_cfg) {
+                return result;
+            }
 
+            let req: Request<Vec<u8>> = inner.list_models_request(&cloned_cfg)?;
             let resp: Response<Vec<u8>> = call_outbound(req).await?;
 
             inner
