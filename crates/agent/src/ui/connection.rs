@@ -18,7 +18,7 @@
 #[cfg(feature = "remote")]
 use crate::agent::utils::u32_from_usize;
 
-use super::messages::{RoutingMode, UiClientMessage, UiServerMessage};
+use super::messages::{RoutingMode, SlashCommandEntry, UiClientMessage, UiServerMessage};
 use super::session::{
     PRIMARY_AGENT_ID, active_profile_id, build_agent_list, list_profiles, mode_for_session,
     reasoning_effort_for_session, session_ref_for_profile,
@@ -258,6 +258,35 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
         },
     )
     .await;
+
+    // Push available slash commands so the UI can show autocomplete.
+    send_available_commands(state, tx).await;
+}
+
+/// Collect slash commands from the agent config registry and push them to the client.
+pub async fn send_available_commands(state: &ServerState, tx: &mpsc::Sender<String>) {
+    let registry = &state.agent.config.slash_command_registry;
+
+    let mut commands: Vec<SlashCommandEntry> = registry
+        .all()
+        .map(|cmd| SlashCommandEntry {
+            name: cmd.name.clone(),
+            description: cmd.description.clone(),
+            argument_hint: cmd.argument_hint.clone(),
+        })
+        .collect();
+
+    for rtc in registry.all_runtime() {
+        commands.push(SlashCommandEntry {
+            name: rtc.descriptor.name.to_string(),
+            description: rtc.descriptor.description.to_string(),
+            argument_hint: rtc.descriptor.argument_hint.map(|s| s.to_string()),
+        });
+    }
+
+    commands.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let _ = send_message(tx, UiServerMessage::AvailableCommands { commands }).await;
 }
 
 /// Send a message to the client.

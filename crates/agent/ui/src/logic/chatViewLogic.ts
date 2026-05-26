@@ -8,26 +8,31 @@
 import { EventItem, EventRow, DelegationGroupInfo, Turn, RateLimitState, TurnCompaction, UiPromptBlock } from '../types';
 
 const FILE_MENTION_MARKUP_RE = /@\{(file|dir):([^}]+)\}/g;
+const SLASH_COMMAND_MARKUP_RE = /\/\{([^}]+)\}/g;
 
 /**
  * Parse user input text into prompt blocks, extracting file mention markup
- * into resource_link blocks.
+ * into resource_link blocks and stripping slash command markup to plain text.
  */
 export function buildPromptBlocksFromInput(input: string): UiPromptBlock[] {
   const links = new Map<string, UiPromptBlock>();
-  const normalizedText = input.replace(FILE_MENTION_MARKUP_RE, (_match, _kind: string, rawPath: string) => {
-    const path = String(rawPath).trim();
-    if (!path) {
-      return '';
-    }
-    if (!links.has(path)) {
-      links.set(path, {
-        type: 'resource_link',
-        data: { name: path, uri: path },
-      });
-    }
-    return `@${path}`;
-  });
+  const normalizedText = input
+    .replace(FILE_MENTION_MARKUP_RE, (_match, _kind: string, rawPath: string) => {
+      const path = String(rawPath).trim();
+      if (!path) {
+        return '';
+      }
+      if (!links.has(path)) {
+        links.set(path, {
+          type: 'resource_link',
+          data: { name: path, uri: path },
+        });
+      }
+      return `@${path}`;
+    })
+    .replace(SLASH_COMMAND_MARKUP_RE, (_match, name: string) => {
+      return `/${name}`;
+    });
 
   return [
     { type: 'text', data: { text: normalizedText } },

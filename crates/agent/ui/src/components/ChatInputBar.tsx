@@ -11,7 +11,7 @@
 import { type RefObject, useCallback } from 'react';
 import { Send, Loader, Square, Mic, MicOff } from 'lucide-react';
 import { MentionInput } from './MentionInput';
-import type { RateLimitState } from '../types';
+import type { RateLimitState, SlashCommandEntry } from '../types';
 import type { FileIndexEntry } from '../generated/types';
 import { useVoiceInput } from '../hooks/useVoiceInput';
 import { useVoiceStore } from '../store/voiceStore';
@@ -34,6 +34,8 @@ interface ChatInputBarProps {
   allFiles: FileIndexEntry[];
   requestIndex: () => void;
   isLoadingFiles: boolean;
+  /** Available slash commands for / autocomplete */
+  slashCommands: SlashCommandEntry[];
 }
 
 export function ChatInputBar({
@@ -52,6 +54,7 @@ export function ChatInputBar({
   allFiles,
   requestIndex,
   isLoadingFiles,
+  slashCommands = [],
 }: ChatInputBarProps) {
   const isThinking = sessionThinkingAgentId !== null;
   const canSend = !loading && connected && !!sessionId && !!prompt.trim() && !rateLimitState?.isRateLimited;
@@ -149,6 +152,7 @@ export function ChatInputBar({
         isLoadingFiles={isLoadingFiles}
         showIndexBuilding={activeIndexStatus === 'building'}
         actionButton={buttons}
+        slashCommands={slashCommands}
       />
     </div>
   );

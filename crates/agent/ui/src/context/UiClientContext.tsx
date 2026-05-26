@@ -27,6 +27,7 @@ import type {
   ConsolidationInfo,
   MeshInviteInfo,
   MeshInviteCreated,
+  SlashCommandEntry,
 } from '../types';
 
 // ---------------------------------------------------------------------------
@@ -193,6 +194,7 @@ export interface UiClientConfigContextValue {
   workspacePathDialogOpen: boolean;
   workspacePathDialogDefaultValue: string;
   audioCapabilities: { stt_models: { provider: string; model: string }[]; tts_models: { provider: string; model: string }[] };
+  slashCommands: SlashCommandEntry[];
 }
 
 const UiClientConfigContext = createContext<UiClientConfigContextValue | undefined>(undefined);
@@ -396,6 +398,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     workspacePathDialogOpen: uiClient.workspacePathDialogOpen,
     workspacePathDialogDefaultValue: uiClient.workspacePathDialogDefaultValue,
     audioCapabilities: uiClient.audioCapabilities,
+    slashCommands: uiClient.slashCommands,
   }), [
     uiClient.allModels,
     uiClient.providerCapabilities,
@@ -414,6 +417,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     uiClient.workspacePathDialogOpen,
     uiClient.workspacePathDialogDefaultValue,
     uiClient.audioCapabilities,
+    uiClient.slashCommands,
   ]);
 
   return (

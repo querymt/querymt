@@ -33,6 +33,7 @@ import {
   ConsolidationInfo,
   MeshInviteInfo,
   MeshInviteCreated,
+  SlashCommandEntry,
 } from '../types';
 import { debugLog, debugTrace } from '../utils/debugLog';
 
@@ -225,6 +226,7 @@ export function useUiClient() {
     latestEntryAt: string | null;
     latestConsolidationAt: string | null;
   } | null>(null);
+  const [slashCommands, setSlashCommands] = useState<SlashCommandEntry[]>([]);
   const [defaultCwd, setDefaultCwd] = useState<string | null>(null);
   const [workspacePathDialogOpen, setWorkspacePathDialogOpen] = useState(false);
   const [workspacePathDialogDefaultValue, setWorkspacePathDialogDefaultValue] = useState('');
@@ -1378,6 +1380,10 @@ export function useUiClient() {
         setAudioCapabilities(msg.data);
         break;
       }
+      case 'available_commands': {
+        setSlashCommands(msg.data.commands);
+        break;
+      }
       default:
         break;
     }
@@ -2069,6 +2075,8 @@ export function useUiClient() {
     setTranscribeCallback,
     setSpeechCallback,
     setSpeechErrorCallback,
+    // Slash commands
+    slashCommands,
   };
 }
 

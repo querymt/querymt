@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef, useEffect, forwardRef, useImperativeHandle, type ReactNode } from 'react';
 import { MentionsInput, Mention, SuggestionDataItem, type MentionsInputStyle } from 'react-mentions';
-import { Loader, File, Folder } from 'lucide-react';
-import { FileIndexEntry } from '../types';
+import { Loader, File, Folder, Terminal } from 'lucide-react';
+import { FileIndexEntry, SlashCommandEntry } from '../types';
 
 interface MentionInputProps {
   value: string;
@@ -15,6 +15,8 @@ interface MentionInputProps {
   showIndexBuilding?: boolean;
   /** Action button rendered inside the input, bottom-right corner */
   actionButton?: ReactNode;
+  /** Available slash commands for `/` autocomplete */
+  slashCommands?: SlashCommandEntry[];
 }
 
 // Clean input styles — the outer container in ChatInputBar owns the visual
@@ -157,6 +159,7 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
     isLoadingFiles = false,
     showIndexBuilding = false,
     actionButton,
+    slashCommands = [],
   }, ref) {
   const [isFocused, setIsFocused] = useState(false);
   const callbackRef = useRef<((data: SuggestionDataItem[]) => void) | null>(null);
@@ -349,6 +352,63 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
     input.style.overflowY = input.scrollHeight > maxInputHeight ? 'auto' : 'hidden';
   }, [value, maxInputHeight]);
 
+  // Slash command suggestion data
+  const slashCommandData = useCallback((search: string, callback: (data: SuggestionDataItem[]) => void) => {
+    if (slashCommands.length === 0) {
+      callback([]);
+      return;
+    }
+    const searchLower = search.toLowerCase();
+    const filtered = searchLower
+      ? slashCommands.filter(cmd => cmd.name.toLowerCase().startsWith(searchLower))
+      : slashCommands;
+    const data: SuggestionDataItem[] = filtered.map(cmd => ({
+      id: cmd.name,
+      display: cmd.name,
+      description: cmd.description,
+      argument_hint: cmd.argument_hint,
+    }));
+    callback(data);
+  }, [slashCommands]);
+
+  // Custom render for slash command suggestions
+  const renderSlashCommandSuggestion = useCallback((
+    suggestion: SuggestionDataItem,
+    _search: string,
+    _highlightedDisplay: React.ReactNode,
+    _index: number,
+    focused: boolean
+  ) => {
+    const desc = (suggestion as any).description || '';
+    const hint = (suggestion as any).argument_hint;
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', width: '100%' }}>
+        <Terminal className="w-3.5 h-3.5 flex-shrink-0" style={{ color: focused ? 'rgb(var(--accent-primary-rgb))' : 'rgb(var(--ui-text-secondary-rgb))' }} />
+        <span style={{
+          fontFamily: "'Monaco', 'Menlo', 'Ubuntu Mono', monospace",
+          fontSize: '12px',
+          color: focused ? 'rgb(var(--accent-primary-rgb))' : 'rgb(var(--ui-text-primary-rgb))',
+          whiteSpace: 'nowrap',
+          fontWeight: 600,
+        }}>
+          /{suggestion.display}{hint ? ` ${hint}` : ''}
+        </span>
+        {desc && (
+          <span style={{
+            fontSize: '11px',
+            color: 'rgb(var(--ui-text-muted-rgb))',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+            flex: 1,
+          }}>
+            {desc}
+          </span>
+        )}
+      </div>
+    );
+  }, []);
+
   // Convert FileIndexEntry[] to react-mentions format or use function
   const mentionData = useCallback((search: string, callback: (data: SuggestionDataItem[]) => void) => {
     // Store refs for when files arrive
@@ -498,7 +558,7 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
             if (colonIndex > -1) {
               const type = id.slice(0, colonIndex);
               const path = id.slice(colonIndex + 1);
-              const icon = type === 'dir' ? '📁' : '📄';
+              const icon = type === 'dir' ? '\ud83d\udcc1' : '\ud83d\udcc4';
               return `${icon} ${path}`;
             }
             return display;
@@ -510,6 +570,23 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
             if (id === '__loading__') {
               return false;
             }
+          }}
+        />
+        <Mention
+          trigger={/^(\/([^\s]*))$/}
+          data={slashCommandData}
+          style={{
+            backgroundColor: 'rgba(var(--accent-primary-rgb), 0.15)',
+            borderRadius: '4px',
+            boxShadow: 'inset 0 0 0 1px rgba(var(--accent-primary-rgb), 0.4)',
+          }}
+          markup="/{__id__}"
+          regex={/\/\{([^}]+)\}/}
+          displayTransform={(id: string, _display: string) => `/${id}`}
+          renderSuggestion={renderSlashCommandSuggestion}
+          appendSpaceOnAdd={true}
+          onAdd={(_id: string | number) => {
+            // noop
           }}
         />
       </MentionsInput>

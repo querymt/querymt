@@ -79,6 +79,7 @@ export type {
   KnowledgeEntryInfo,
   ConsolidationInfo,
   AudioModelInfo,
+  SlashCommandEntry,
 } from './generated/types';
 
 // FileIndexEntry is now generated from Rust via typeshare — re-exported above.

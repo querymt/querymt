@@ -129,7 +129,7 @@ export function ChatView() {
   } = useUiStore();
 
   const isMobile = useIsMobile();
-  const { audioCapabilities } = useUiClientConfig();
+  const { audioCapabilities, slashCommands } = useUiClientConfig();
   const { ttsProvider, ttsModel, ttsVoice } = useVoiceStore();
 
   const { speak: speakTts } = useVoiceOutput({
@@ -1022,6 +1022,7 @@ export function ChatView() {
         allFiles={fileMention.allFiles}
         requestIndex={fileMention.requestIndex}
         isLoadingFiles={fileMention.isLoading}
+        slashCommands={slashCommands}
       />
 
       {/* Tool Detail Modal */}

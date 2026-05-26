@@ -92,6 +92,12 @@ pub(crate) struct ExecutionContext {
 
     /// Optional work packet store for the packet tools.
     pub work_packet_store: Option<Arc<dyn WorkPacketStore>>,
+
+    /// Deferred response from a runtime slash command.
+    /// Set during slash-command dispatch, consumed after user message storage
+    /// so that the slash command turn appears in the transcript before the
+    /// assistant response.
+    pub pending_slash_response: Option<String>,
 }
 
 impl ExecutionContext {
@@ -115,6 +121,7 @@ impl ExecutionContext {
             event_sink: None,
             workspace_query_bridge: None,
             work_packet_store: None,
+            pending_slash_response: None,
         }
     }
 

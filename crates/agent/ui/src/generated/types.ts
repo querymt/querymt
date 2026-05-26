@@ -833,6 +833,16 @@ export interface SessionLoadSnapshot {
 	cursor: StreamCursor;
 }
 
+/** A slash command exposed to the UI for autocomplete and discovery. */
+export interface SlashCommandEntry {
+	/** Command name (without the leading `/`). */
+	name: string;
+	/** Human-readable description shown in suggestions. */
+	description: string;
+	/** Optional hint for the arguments slot (e.g. "<packet id or search query>"). */
+	argument_hint?: string;
+}
+
 /**
  * Mirror of `querymt::chat::Tool` for typeshare generation.
  * Note: kept for typeshare output; may be unused in Rust code paths.
@@ -1524,5 +1534,9 @@ export type UiServerMessage =
 	| { type: "audio_capabilities", data: {
 	stt_models: AudioModelInfo[];
 	tts_models: AudioModelInfo[];
+}}
+	/** Available slash commands (sent during init and when registry changes) */
+	| { type: "available_commands", data: {
+	commands: SlashCommandEntry[];
 }};
 

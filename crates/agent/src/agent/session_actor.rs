@@ -1728,7 +1728,7 @@ async fn execute_prompt_detached(
     .with_event_sink(config.event_sink.clone())
     .with_workspace_query_bridge(bridge.clone());
 
-    // 4. Slash command dispatch: try runtime commands first, then prompt expansion.
+    // 4. Slash command dispatch: try prompt expansion first.
     let mut req = req;
     if let Some(agent_client_protocol::schema::ContentBlock::Text(text_content)) =
         req.prompt.first()
@@ -1748,7 +1748,8 @@ async fn execute_prompt_detached(
             }
         }
 
-        // 4a. Try runtime command dispatch (deterministic, no LLM)
+        // 4a. Try runtime command dispatch — but defer the response until after
+        //     user message storage so the turn appears in the transcript.
         let host = SessionSlashCommandHost {
             session_id: &session_id,
             session_handle: &exec_ctx.session_handle,
@@ -1766,36 +1767,17 @@ async fn execute_prompt_detached(
                     "Session {}: runtime slash command handled (no LLM)",
                     session_id
                 );
-                // Send the response directly via bridge and return.
-                if let Some(ref bridge) = bridge {
-                    let notification = agent_client_protocol::schema::SessionNotification::new(
-                        agent_client_protocol::schema::SessionId::from(session_id.clone()),
-                        SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                            agent_client_protocol::schema::ContentBlock::Text(
-                                agent_client_protocol::schema::TextContent::new(response),
-                            ),
-                        )),
-                    );
-                    let _ = bridge.notify(notification).await;
-                }
-                return Ok(PromptResponse::new(StopReason::EndTurn));
+                // Defer response: first store user message, then emit assistant response.
+                exec_ctx.pending_slash_response = Some(response);
             }
             Some(crate::slash_commands::SlashCommandExecution::Hybrid { response, prompt }) => {
                 log::info!(
                     "Session {}: hybrid slash command — deterministic prelude + LLM continuation",
                     session_id
                 );
-                // Send the deterministic prelude response if any.
-                if let (Some(resp_text), Some(bridge)) = (&response, &bridge) {
-                    let notification = agent_client_protocol::schema::SessionNotification::new(
-                        agent_client_protocol::schema::SessionId::from(session_id.clone()),
-                        SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                            agent_client_protocol::schema::ContentBlock::Text(
-                                agent_client_protocol::schema::TextContent::new(resp_text.clone()),
-                            ),
-                        )),
-                    );
-                    let _ = bridge.notify(notification).await;
+                // Store the prelude for emission after user message storage.
+                if response.is_some() {
+                    exec_ctx.pending_slash_response = response;
                 }
                 // Replace the first text block with the continuation prompt.
                 req.prompt[0] = agent_client_protocol::schema::ContentBlock::Text(
@@ -1892,6 +1874,73 @@ async fn execute_prompt_detached(
     );
 
     config.emit_event(&session_id, AgentEventKind::TurnStarted);
+
+    // 5a. Emit deferred runtime slash-command response (if any).
+    //     This runs after user message storage so the slash command turn
+    //     appears in the transcript before the assistant response.
+    let mut slash_handled = false;
+    if let Some(response) = exec_ctx.pending_slash_response.take() {
+        let response_id = Uuid::new_v4().to_string();
+
+        // Emit streaming delta for immediate UI display.
+        config.emit_event(
+            &session_id,
+            AgentEventKind::AssistantContentDelta {
+                content: response.clone(),
+                message_id: response_id.clone(),
+            },
+        );
+
+        // Notify ACP bridge clients (if connected).
+        if let Some(ref bridge) = bridge {
+            let notification = agent_client_protocol::schema::SessionNotification::new(
+                agent_client_protocol::schema::SessionId::from(session_id.clone()),
+                SessionUpdate::AgentMessageChunk(
+                    ContentChunk::new(agent_client_protocol::schema::ContentBlock::Text(
+                        agent_client_protocol::schema::TextContent::new(response.clone()),
+                    ))
+                    .message_id(Some(response_id.clone())),
+                ),
+            );
+            let _ = bridge.notify(notification).await;
+        }
+
+        // Store as a durable assistant message so it appears in session history.
+        let assistant_msg = AgentMessage {
+            id: response_id.clone(),
+            session_id: session_id.clone(),
+            role: ChatRole::Assistant,
+            parts: vec![MessagePart::Prompt {
+                blocks: vec![agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new(response.clone()),
+                )],
+            }],
+            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        if let Err(e) = exec_ctx.add_message(assistant_msg).await {
+            log::warn!("Failed to store runtime slash-command response: {}", e);
+        }
+
+        config.emit_event(
+            &session_id,
+            AgentEventKind::AssistantMessageStored {
+                content: response,
+                thinking: None,
+                message_id: Some(response_id),
+            },
+        );
+
+        // Mark as handled — skip LLM execution below.
+        slash_handled = true;
+    }
+
+    // If a runtime slash command was fully handled, skip the LLM cycle.
+    if slash_handled {
+        return Ok(PromptResponse::new(StopReason::EndTurn));
+    }
 
     debug!(
         "Session {}: user_message_stored, starting pre-turn snapshot",

@@ -740,6 +740,19 @@ pub enum OAuthFlowKindTs {
     DevicePoll,
 }
 
+/// A slash command exposed to the UI for autocomplete and discovery.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlashCommandEntry {
+    /// Command name (without the leading `/`).
+    pub name: String,
+    /// Human-readable description shown in suggestions.
+    pub description: String,
+    /// Optional hint for the arguments slot (e.g. "<packet id or search query>").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argument_hint: Option<String>,
+}
+
 /// Mirror of `querymt::mcp::config::McpServerConfig` for typeshare generation.
 /// Note: kept for typeshare output; may be unused in Rust code paths.
 #[allow(dead_code)]
@@ -1050,6 +1063,11 @@ pub enum UiServerMessage {
         stt_models: Vec<AudioModelInfo>,
         tts_models: Vec<AudioModelInfo>,
     },
+    /// Available slash commands (sent during init and when registry changes)
+    #[serde(rename = "available_commands")]
+    AvailableCommands {
+        commands: Vec<SlashCommandEntry>,
+    },
     // NOTE: `speech_result` is sent as a **binary WebSocket frame**, not a JSON
     // text frame. The binary envelope contains a length-prefixed JSON header
     // `{"type":"speech_result","data":{"mime_type":"audio/wav"}}` followed by
@@ -1100,6 +1118,7 @@ impl UiServerMessage {
             Self::KnowledgeStatsResult { .. } => "knowledge_stats_result",
             Self::TranscribeResult { .. } => "transcribe_result",
             Self::AudioCapabilities { .. } => "audio_capabilities",
+            Self::AvailableCommands { .. } => "available_commands",
         }
     }
 }
