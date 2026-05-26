@@ -1,5 +1,6 @@
 use querymt::dynamic::PluginRegistryDynamicExt;
 use querymt::plugin::host::PluginRegistry;
+use querymt::provider_config::provider_static_config_json;
 
 use crate::cli_args::CliArgs;
 use crate::secret_store::SecretStore;
@@ -26,13 +27,26 @@ pub fn get_provider_info(args: &CliArgs) -> Option<(String, Option<String>)> {
     None
 }
 
+fn provider_has_explicit_api_key(registry: &PluginRegistry, provider: &str) -> bool {
+    provider_static_config_json(registry, provider)
+        .ok()
+        .and_then(|cfg| {
+            cfg.get("api_key")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .map(str::to_string)
+        })
+        .is_some_and(|s| !s.is_empty())
+}
+
 /// Try to resolve an API key from CLI args, OAuth tokens, secret store, or environment
 ///
 /// Priority order:
 /// 1. CLI args (--api-key)
-/// 2. OAuth tokens (if provider supports OAuth and tokens are valid)
-/// 3. Secret store (API key)
-/// 4. Environment variable
+/// 2. providers.toml [providers.config].api_key (if explicitly set)
+/// 3. OAuth tokens (if provider supports OAuth and tokens are valid)
+/// 4. Secret store (API key)
+/// 5. Environment variable
 pub async fn get_api_key(
     provider: &str,
     args: &CliArgs,
@@ -43,7 +57,17 @@ pub async fn get_api_key(
         return Some(key.clone());
     }
 
-    // 2. Check for OAuth tokens (prefer OAuth over API keys)
+    // 2. Respect provider-specific static configuration from providers.toml.
+    // If an API key is explicitly set there, do not override it from OAuth/secret/env.
+    if provider_has_explicit_api_key(registry, provider) {
+        log::debug!(
+            "Provider '{}' has explicit api_key in providers config; skipping external key fallback",
+            provider
+        );
+        return None;
+    }
+
+    // 3. Check for OAuth tokens (prefer OAuth over API keys when no explicit config key exists)
     if let Ok(oauth_provider) = querymt_utils::oauth::get_oauth_provider(provider, None)
         && let Ok(mut store) = SecretStore::new()
     {
@@ -56,7 +80,7 @@ pub async fn get_api_key(
         }
     }
 
-    // 3. Fall back to API key from secret store or environment
+    // 4. Fall back to API key from secret store or environment
     if let Some(factory) = registry.get(provider).await
         && let Some(http_factory) = factory.as_http()
         && let Some(name) = http_factory.api_key_name()
