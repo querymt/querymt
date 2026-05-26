@@ -1763,6 +1763,14 @@ impl LocalAgentHandle {
             return Ok(());
         }
 
+        if matches!(status, SessionRuntimeStatus::CancelRequested) {
+            tracing::warn!(
+                "Session {} stop: still CancelRequested after {:?}; escalating to force-stop",
+                session_id,
+                STOP_ESCALATION_TIMEOUT
+            );
+        }
+
         self.config.emit_event(
             session_id,
             AgentEventKind::SessionForceStopped {
@@ -3458,7 +3466,28 @@ mod tests {
         }
     }
 
+    impl LocalAgentHandle {
+        fn should_return_without_force_stop(
+            status: crate::agent::messages::SessionRuntimeStatus,
+        ) -> bool {
+            matches!(status, crate::agent::messages::SessionRuntimeStatus::Idle)
+        }
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_should_return_without_force_stop_only_for_idle() {
+        assert!(LocalAgentHandle::should_return_without_force_stop(
+            crate::agent::messages::SessionRuntimeStatus::Idle
+        ));
+        assert!(!LocalAgentHandle::should_return_without_force_stop(
+            crate::agent::messages::SessionRuntimeStatus::Running
+        ));
+        assert!(!LocalAgentHandle::should_return_without_force_stop(
+            crate::agent::messages::SessionRuntimeStatus::CancelRequested
+        ));
+    }
 
     #[tokio::test]
     async fn test_from_config_creates_empty_registry() {

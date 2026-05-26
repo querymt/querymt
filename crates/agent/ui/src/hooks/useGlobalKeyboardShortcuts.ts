@@ -5,7 +5,7 @@ import { toggleDebugLog } from '../utils/debugLog';
 /**
  * Centralizes all global keyboard shortcuts previously inline in AppShell.
  *
- * - Ctrl/Cmd+X gateway (chords: T, P, N, A, U, S, D)
+ * - Ctrl/Cmd+X gateway (chords: T, P, G, N, A, U, S, D)
  * - Ctrl/Cmd+E cycle agent mode
  * - Ctrl/Cmd+; cycle reasoning effort
  * - Ctrl/Cmd+Shift+M toggle model picker
@@ -90,6 +90,13 @@ export function useGlobalKeyboardShortcuts({
         return;
       }
 
+      if (shortcutGatewayOpen && !e.altKey && !e.shiftKey && normalizedKey === 'g') {
+        e.preventDefault();
+        setShortcutGatewayOpen(false);
+        useUiStore.getState().togglePerfMode();
+        return;
+      }
+
       if (shortcutGatewayOpen && !e.altKey && !e.shiftKey && normalizedKey === 'n') {
         e.preventDefault();
         setShortcutGatewayOpen(false);
@@ -160,12 +167,6 @@ export function useGlobalKeyboardShortcuts({
         setSessionSwitcherOpen(!sessionSwitcherOpen);
       }
 
-      // Ctrl+Shift+P / Cmd+Shift+P — Toggle performance mode
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && normalizedKey === 'p') {
-        e.preventDefault();
-        useUiStore.getState().togglePerfMode();
-        return;
-      }
     };
 
     window.addEventListener('keydown', handleKeyDown);
