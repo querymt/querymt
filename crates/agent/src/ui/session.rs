@@ -587,8 +587,9 @@ mod tests {
         resolve_profile_id_for_session,
     };
     use crate::agent::core::AgentMode;
+    use crate::api::AgentInfra;
     use crate::profiles::{LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager};
-    use crate::test_utils::TestServerState;
+    use crate::test_utils::{TestServerState, empty_plugin_registry};
     use std::path::Path;
     use std::sync::Arc;
 
@@ -635,11 +636,15 @@ system = "inline"
                 .local_dir(dir.path())
                 .build(),
         );
-        let profiles = Arc::new(
-            ProfileRuntimeManager::with_default_infra_boxed(catalog, "alpha")
-                .await
-                .expect("profiles manager should initialize"),
-        );
+        let (registry, _registry_dir) = empty_plugin_registry().expect("empty plugin registry");
+        let infra = AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(fixture.agent.storage.clone()),
+            session_mcp_attachment_source: None,
+        };
+        let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+            catalog, "alpha", infra,
+        ));
         fixture.state.profiles = Some(profiles.clone());
         (fixture, profiles, dir)
     }
