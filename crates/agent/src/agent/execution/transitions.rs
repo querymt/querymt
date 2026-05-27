@@ -18,6 +18,7 @@ use crate::middleware::{
 };
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::{TaskKind, TaskStatus};
+use crate::slash_commands::runtime::{CommandOutput, PostTurnAction};
 use agent_client_protocol::schema::{ContentBlock, ContentChunk, SessionUpdate, TextContent};
 use anyhow::Context as _;
 use futures_util::StreamExt;
@@ -30,6 +31,84 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{Instrument, info_span, instrument};
 use uuid::Uuid;
+
+async fn run_post_turn_action(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+    assistant_msg: &AgentMessage,
+    response_content: &str,
+    action: &PostTurnAction,
+) -> Result<CommandOutput, anyhow::Error> {
+    match action {
+        PostTurnAction::CreatePlanPacket {
+            objective,
+            command_name,
+            ..
+        } => {
+            let store = exec_ctx.work_packet_store.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("No work packet store configured for this session.")
+            })?;
+            let title = crate::work_packet::slash_commands::derive_title(
+                crate::work_packet::WorkPacketKind::Plan,
+                response_content,
+            );
+            let summary = crate::work_packet::slash_commands::derive_summary(response_content);
+            let created = store
+                .create(crate::work_packet::CreateWorkPacket {
+                    scope: exec_ctx.session_id.clone(),
+                    kind: crate::work_packet::WorkPacketKind::Plan,
+                    title,
+                    summary,
+                    body_markdown: response_content.to_string(),
+                    metadata_json: Some(serde_json::json!({
+                        "source_command": command_name,
+                        "objective": objective,
+                        "assistant_message_id": assistant_msg.id,
+                    })),
+                    origin_session_id: Some(exec_ctx.session_id.clone()),
+                    parent_packet_id: None,
+                    source_delegation_id: None,
+                    target_delegation_id: None,
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to create plan packet: {}", e))?;
+            let updated = store
+                .update(
+                    &created.public_id,
+                    crate::work_packet::UpdateWorkPacket {
+                        status: Some(crate::work_packet::WorkPacketStatus::Ready),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("Plan created but failed to mark ready: {}", e))?;
+            store
+                .set_active_packet(&exec_ctx.session_id, Some(&updated.public_id))
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("Plan created but failed to set active packet: {}", e)
+                })?;
+
+            let output = CommandOutput::success(format!(
+                "Created plan packet `{}` (status: {}).\n\nTitle: {}\nSummary: {}\n\nResume later with: `/resume {}`",
+                updated.public_id,
+                updated.status,
+                updated.title,
+                updated.summary,
+                updated.public_id,
+            ));
+            config.emit_event(
+                &exec_ctx.session_id,
+                AgentEventKind::RuntimeCommandFinished {
+                    command_id: action.command_id().to_string(),
+                    command: action.command_name().to_string(),
+                    output: output.clone(),
+                },
+            );
+            Ok(output)
+        }
+    }
+}
 
 /// Transition from BeforeLlmCall to CallLlm.
 ///
@@ -779,6 +858,11 @@ pub(super) async fn transition_after_llm(
             message_id: Some(assistant_msg.id.clone()),
         },
     );
+
+    let is_final_response = !matches!(response.finish_reason, Some(FinishReason::ToolCalls));
+    if is_final_response && let Some(action) = exec_ctx.post_turn_action.as_ref() {
+        run_post_turn_action(config, exec_ctx, &assistant_msg, &response.content, action).await?;
+    }
 
     let mut messages = (*context.messages).to_vec();
     messages.push(assistant_msg.to_chat_message());

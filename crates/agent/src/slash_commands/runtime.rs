@@ -7,19 +7,140 @@
 use crate::session::provider::SessionHandle;
 use crate::slash_commands::types::SlashCommandInvocation;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use typeshare::typeshare;
+
+#[derive(Debug, Clone)]
+pub enum PostTurnAction {
+    CreatePlanPacket {
+        command_id: String,
+        command_name: String,
+        objective: Option<String>,
+    },
+}
+
+impl PostTurnAction {
+    pub fn command_id(&self) -> &str {
+        match self {
+            Self::CreatePlanPacket { command_id, .. } => command_id,
+        }
+    }
+
+    pub fn command_name(&self) -> &str {
+        match self {
+            Self::CreatePlanPacket { command_name, .. } => command_name,
+        }
+    }
+}
+
+// ── Command output ────────────────────────────────────────────────────────────
+
+/// Severity level of command output.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandOutputLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+/// How the command output body should be rendered.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandOutputDisplay {
+    Text,
+    Markdown,
+}
+
+/// Generic structured output from a runtime slash command.
+///
+/// This is intentionally domain-agnostic: work packets, git, MCP, debug, etc.
+/// all return the same displayable output shape. Domain-specific effects
+/// (e.g. work packet creation) persist through their own stores/events;
+/// this struct is only for UI display.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandOutput {
+    /// Optional title shown above the body (e.g. "Active packet").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Main content.
+    pub body: String,
+    /// Severity level.
+    pub level: CommandOutputLevel,
+    /// How to render the body.
+    pub display: CommandOutputDisplay,
+}
+
+impl CommandOutput {
+    /// Convenience constructor for plain text output.
+    pub fn text(body: impl Into<String>) -> Self {
+        Self {
+            title: None,
+            body: body.into(),
+            level: CommandOutputLevel::Info,
+            display: CommandOutputDisplay::Text,
+        }
+    }
+
+    /// Convenience constructor for markdown output.
+    pub fn markdown(body: impl Into<String>) -> Self {
+        Self {
+            title: None,
+            body: body.into(),
+            level: CommandOutputLevel::Info,
+            display: CommandOutputDisplay::Markdown,
+        }
+    }
+
+    /// Convenience constructor for success output.
+    pub fn success(body: impl Into<String>) -> Self {
+        Self {
+            title: None,
+            body: body.into(),
+            level: CommandOutputLevel::Success,
+            display: CommandOutputDisplay::Markdown,
+        }
+    }
+
+    /// Convenience constructor for error output.
+    pub fn error(body: impl Into<String>) -> Self {
+        Self {
+            title: None,
+            body: body.into(),
+            level: CommandOutputLevel::Error,
+            display: CommandOutputDisplay::Text,
+        }
+    }
+
+    /// Builder: set title.
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+}
+
+// ── Slash command execution result ────────────────────────────────────────────
 
 /// What happened after processing a slash command.
 #[derive(Debug, Clone)]
 pub enum SlashCommandExecution {
     /// Fully handled by runtime code — no LLM turn needed.
-    Handled { response: String },
+    Handled { output: CommandOutput },
     /// Needs an LLM turn with the given prompt text.
-    Prompt { prompt: String },
+    Prompt {
+        prompt: String,
+        post_turn_action: Option<PostTurnAction>,
+    },
     /// Runtime code did deterministic setup, then wants an LLM continuation.
     Hybrid {
-        response: Option<String>,
+        output: Option<CommandOutput>,
         prompt: String,
+        post_turn_action: Option<PostTurnAction>,
     },
     /// Not recognised; allow other backends to try.
     NotHandled,

@@ -14,19 +14,18 @@
 use crate::model::AgentMessage;
 use crate::session::provider::SessionHandle;
 use crate::slash_commands::runtime::{
-    RuntimeCommandDescriptor, RuntimeSlashCommandPlugin, SlashCommandExecution, SlashCommandHost,
+    CommandOutput, RuntimeCommandDescriptor, RuntimeSlashCommandPlugin, SlashCommandExecution,
+    SlashCommandHost,
 };
 use crate::slash_commands::types::SlashCommandInvocation;
 use crate::work_packet::brief_generator::{BriefGenerator, BriefGeneratorConfig, BriefMode};
 use crate::work_packet::service::{
     PacketResolution, PacketSelector, ResumeOrResolution, WorkPacketService,
 };
-use crate::work_packet::{
-    CreateWorkPacket, UpdateWorkPacket, WorkPacket, WorkPacketKind, WorkPacketStatus,
-    WorkPacketStore,
-};
+use crate::work_packet::{CreateWorkPacket, WorkPacket, WorkPacketKind, WorkPacketStore};
 use async_trait::async_trait;
 use std::sync::Arc;
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Work-packet command state machine
@@ -99,109 +98,17 @@ impl WorkPacketSlashPlugin {
     async fn execute_plan(
         &self,
         objective: Option<String>,
-        host: &dyn SlashCommandHost,
+        _host: &dyn SlashCommandHost,
     ) -> SlashCommandExecution {
-        let history = match host.session_handle().get_effective_agent_history().await {
-            Ok(h) => h,
-            Err(e) => {
-                return SlashCommandExecution::Handled {
-                    response: format!("Failed to load session history: {}", e),
-                };
-            }
-        };
-
-        let llm_config = match host.session_handle().llm_config() {
-            Some(cfg) => cfg.clone(),
-            None => {
-                return SlashCommandExecution::Handled {
-                    response: "No LLM configuration available for this session.".to_string(),
-                };
-            }
-        };
-
-        let body = match generate_body(
-            host.session_handle(),
-            &history,
-            objective
-                .as_deref()
-                .unwrap_or("Create a structured implementation plan"),
-            BriefMode::Plan,
-            &llm_config,
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(e) => {
-                return SlashCommandExecution::Handled {
-                    response: format!("Failed to generate plan: {}", e),
-                };
-            }
-        };
-
-        let title = derive_title(WorkPacketKind::Plan, &body);
-        let summary = derive_summary(&body);
-
-        let created = match self
-            .store
-            .create(CreateWorkPacket {
-                scope: host.session_id().to_string(),
-                kind: WorkPacketKind::Plan,
-                title,
-                summary,
-                body_markdown: body,
-                metadata_json: None,
-                origin_session_id: Some(host.session_id().to_string()),
-                parent_packet_id: None,
-                source_delegation_id: None,
-                target_delegation_id: None,
-            })
-            .await
-        {
-            Ok(pkt) => pkt,
-            Err(e) => {
-                return SlashCommandExecution::Handled {
-                    response: format!("Failed to create plan packet: {}", e),
-                };
-            }
-        };
-
-        let updated = match self
-            .store
-            .update(
-                &created.public_id,
-                UpdateWorkPacket {
-                    status: Some(WorkPacketStatus::Ready),
-                    ..Default::default()
+        let command_id = Uuid::new_v4().to_string();
+        SlashCommandExecution::Prompt {
+            prompt: format_plan_prompt(objective.as_deref()),
+            post_turn_action: Some(
+                crate::slash_commands::runtime::PostTurnAction::CreatePlanPacket {
+                    command_id,
+                    command_name: "plan".to_string(),
+                    objective,
                 },
-            )
-            .await
-        {
-            Ok(pkt) => pkt,
-            Err(e) => {
-                return SlashCommandExecution::Handled {
-                    response: format!("Plan created but failed to mark ready: {}", e),
-                };
-            }
-        };
-
-        if let Err(e) = self
-            .store
-            .set_active_packet(host.session_id(), Some(&updated.public_id))
-            .await
-        {
-            return SlashCommandExecution::Handled {
-                response: format!("Plan created but failed to set active packet: {}", e),
-            };
-        }
-
-        SlashCommandExecution::Handled {
-            response: format!(
-                "Created plan packet `{}` (status: {}).\n\nTitle: {}\nSummary: {}\n\nResume later with: `/resume {}`",
-                updated.public_id,
-                updated.status,
-                updated.title,
-                updated.summary,
-                updated.public_id,
             ),
         }
     }
@@ -215,7 +122,7 @@ impl WorkPacketSlashPlugin {
             Ok(h) => h,
             Err(e) => {
                 return SlashCommandExecution::Handled {
-                    response: format!("Failed to load session history: {}", e),
+                    output: CommandOutput::error(format!("Failed to load session history: {}", e)),
                 };
             }
         };
@@ -224,7 +131,9 @@ impl WorkPacketSlashPlugin {
             Some(cfg) => cfg.clone(),
             None => {
                 return SlashCommandExecution::Handled {
-                    response: "No LLM configuration available for this session.".to_string(),
+                    output: CommandOutput::text(
+                        "No LLM configuration available for this session.".to_string(),
+                    ),
                 };
             }
         };
@@ -243,7 +152,7 @@ impl WorkPacketSlashPlugin {
             Ok(body) => body,
             Err(e) => {
                 return SlashCommandExecution::Handled {
-                    response: format!("Failed to generate handoff: {}", e),
+                    output: CommandOutput::error(format!("Failed to generate handoff: {}", e)),
                 };
             }
         };
@@ -254,7 +163,10 @@ impl WorkPacketSlashPlugin {
             Ok(id) => id,
             Err(e) => {
                 return SlashCommandExecution::Handled {
-                    response: format!("Failed to determine active packet: {}", e),
+                    output: CommandOutput::error(format!(
+                        "Failed to determine active packet: {}",
+                        e
+                    )),
                 };
             }
         };
@@ -278,13 +190,13 @@ impl WorkPacketSlashPlugin {
             Ok(pkt) => pkt,
             Err(e) => {
                 return SlashCommandExecution::Handled {
-                    response: format!("Failed to create handoff packet: {}", e),
+                    output: CommandOutput::error(format!("Failed to create handoff packet: {}", e)),
                 };
             }
         };
 
         SlashCommandExecution::Handled {
-            response: if let Some(parent_id) = parent_id {
+            output: CommandOutput::success(if let Some(parent_id) = parent_id {
                 format!(
                     "Created handoff packet `{}` linked to active packet `{}`.\n\nResume later with: `/resume {}`",
                     created.public_id, parent_id, created.public_id
@@ -294,7 +206,7 @@ impl WorkPacketSlashPlugin {
                     "Created handoff packet `{}`.\n\nResume later with: `/resume {}`",
                     created.public_id, created.public_id
                 )
-            },
+            }),
         }
     }
 
@@ -307,16 +219,20 @@ impl WorkPacketSlashPlugin {
             Ok(id) => id,
             Err(e) => {
                 return SlashCommandExecution::Handled {
-                    response: format!("Failed to determine active packet: {}", e),
+                    output: CommandOutput::error(format!(
+                        "Failed to determine active packet: {}",
+                        e
+                    )),
                 };
             }
         };
 
         let Some(parent_id) = parent_id else {
             return SlashCommandExecution::Handled {
-                response:
+                output: CommandOutput::error(
                     "No active packet. Use `/resume <packet>` first before creating a checkpoint."
                         .to_string(),
+                ),
             };
         };
 
@@ -324,7 +240,7 @@ impl WorkPacketSlashPlugin {
             Ok(h) => h,
             Err(e) => {
                 return SlashCommandExecution::Handled {
-                    response: format!("Failed to load session history: {}", e),
+                    output: CommandOutput::error(format!("Failed to load session history: {}", e)),
                 };
             }
         };
@@ -333,7 +249,9 @@ impl WorkPacketSlashPlugin {
             Some(cfg) => cfg.clone(),
             None => {
                 return SlashCommandExecution::Handled {
-                    response: "No LLM configuration available for this session.".to_string(),
+                    output: CommandOutput::text(
+                        "No LLM configuration available for this session.".to_string(),
+                    ),
                 };
             }
         };
@@ -352,7 +270,7 @@ impl WorkPacketSlashPlugin {
             Ok(body) => body,
             Err(e) => {
                 return SlashCommandExecution::Handled {
-                    response: format!("Failed to generate checkpoint: {}", e),
+                    output: CommandOutput::error(format!("Failed to generate checkpoint: {}", e)),
                 };
             }
         };
@@ -379,16 +297,19 @@ impl WorkPacketSlashPlugin {
             Ok(pkt) => pkt,
             Err(e) => {
                 return SlashCommandExecution::Handled {
-                    response: format!("Failed to create checkpoint packet: {}", e),
+                    output: CommandOutput::error(format!(
+                        "Failed to create checkpoint packet: {}",
+                        e
+                    )),
                 };
             }
         };
 
         SlashCommandExecution::Handled {
-            response: format!(
+            output: CommandOutput::success(format!(
                 "Created checkpoint packet `{}` linked to active packet `{}`.",
                 created.public_id, parent_id
-            ),
+            )),
         }
     }
 
@@ -404,32 +325,37 @@ impl WorkPacketSlashPlugin {
             .await
         {
             Ok(ResumeOrResolution::Resumed(result)) => {
-                let response = format_resume_response(&result);
+                let output = CommandOutput::markdown(format_resume_response(&result));
                 match continue_mode {
                     ContinueMode::Continue => SlashCommandExecution::Hybrid {
-                        response: Some(response),
+                        output: Some(output),
                         prompt: format_continue_prompt(&result.packet),
+                        post_turn_action: None,
                     },
                     ContinueMode::NextStep => SlashCommandExecution::Hybrid {
-                        response: Some(response),
+                        output: Some(output),
                         prompt: format_next_step_prompt(&result.packet),
+                        post_turn_action: None,
                     },
-                    ContinueMode::NoLlm => SlashCommandExecution::Handled { response },
+                    ContinueMode::NoLlm => SlashCommandExecution::Handled { output },
                 }
             }
             Ok(ResumeOrResolution::NeedsDisambiguation(PacketResolution::None { query })) => {
                 SlashCommandExecution::Handled {
-                    response: format!("No packet found for: {}", query),
+                    output: CommandOutput::error(format!("No packet found for: {}", query)),
                 }
             }
             Ok(ResumeOrResolution::NeedsDisambiguation(PacketResolution::Many(packets))) => {
                 SlashCommandExecution::Handled {
-                    response: format_packet_list("Multiple packets matched", &packets),
+                    output: CommandOutput::markdown(format_packet_list(
+                        "Multiple packets matched",
+                        &packets,
+                    )),
                 }
             }
             Ok(ResumeOrResolution::NeedsDisambiguation(PacketResolution::One(_))) => unreachable!(),
             Err(e) => SlashCommandExecution::Handled {
-                response: format!("Error resuming packet: {}", e),
+                output: CommandOutput::error(format!("Error resuming packet: {}", e)),
             },
         }
     }
@@ -437,7 +363,7 @@ impl WorkPacketSlashPlugin {
     async fn execute_status(&self, host: &dyn SlashCommandHost) -> SlashCommandExecution {
         match self.service.active_status(host.session_id()).await {
             Ok(Some(packet)) => SlashCommandExecution::Handled {
-                response: format!(
+                output: CommandOutput::markdown(format!(
                     "**Active packet:** `{}` [{}] {}\n\n**Status:** {}\n**Scope:** {}\n**Updated:** {}\n\n{}",
                     packet.public_id,
                     packet.kind,
@@ -446,13 +372,13 @@ impl WorkPacketSlashPlugin {
                     packet.scope,
                     packet.updated_at,
                     packet.summary,
-                ),
+                )),
             },
             Ok(None) => SlashCommandExecution::Handled {
-                response: "No active work packet for this session.".to_string(),
+                output: CommandOutput::text("No active work packet for this session.".to_string()),
             },
             Err(e) => SlashCommandExecution::Handled {
-                response: format!("Error reading active packet: {}", e),
+                output: CommandOutput::error(format!("Error reading active packet: {}", e)),
             },
         }
     }
@@ -460,16 +386,19 @@ impl WorkPacketSlashPlugin {
     async fn execute_show(&self, selector: PacketSelector) -> SlashCommandExecution {
         match self.service.show(&selector).await {
             Ok(PacketResolution::One(pkt)) => SlashCommandExecution::Handled {
-                response: format_show_packet(&pkt),
+                output: CommandOutput::markdown(format_show_packet(&pkt)),
             },
             Ok(PacketResolution::None { query }) => SlashCommandExecution::Handled {
-                response: format!("No packet found for: {}", query),
+                output: CommandOutput::error(format!("No packet found for: {}", query)),
             },
             Ok(PacketResolution::Many(packets)) => SlashCommandExecution::Handled {
-                response: format_packet_list("Multiple packets matched", &packets),
+                output: CommandOutput::markdown(format_packet_list(
+                    "Multiple packets matched",
+                    &packets,
+                )),
             },
             Err(e) => SlashCommandExecution::Handled {
-                response: format!("Error loading packet: {}", e),
+                output: CommandOutput::error(format!("Error loading packet: {}", e)),
             },
         }
     }
@@ -477,13 +406,13 @@ impl WorkPacketSlashPlugin {
     async fn execute_list(&self, query: Option<String>) -> SlashCommandExecution {
         match self.service.list(query.as_deref(), 20).await {
             Ok(packets) if packets.is_empty() => SlashCommandExecution::Handled {
-                response: "No work packets found.".to_string(),
+                output: CommandOutput::text("No work packets found.".to_string()),
             },
             Ok(packets) => SlashCommandExecution::Handled {
-                response: format_packet_list("Work packets", &packets),
+                output: CommandOutput::markdown(format_packet_list("Work packets", &packets)),
             },
             Err(e) => SlashCommandExecution::Handled {
-                response: format!("Error listing packets: {}", e),
+                output: CommandOutput::error(format!("Error listing packets: {}", e)),
             },
         }
     }
@@ -622,7 +551,18 @@ async fn generate_body(
         .map_err(|e| e.to_string())
 }
 
-fn derive_title(kind: WorkPacketKind, body: &str) -> String {
+fn format_plan_prompt(objective: Option<&str>) -> String {
+    let focus = objective
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("current discussion");
+
+    format!(
+        "The user invoked /plan.\n\nCreate a durable implementation plan from the current conversation and the user's focus:\n{focus}\n\nUse the full session context. Preserve concrete details, decisions, filenames, constraints, rejected alternatives, and open questions. Do not compress the conversation into a generic brief.\n\nWrite the plan as markdown suitable for saving as a Work Packet.\n\nInclude:\n- Goal\n- Current understanding\n- Relevant files/modules\n- Key decisions and rationale\n- Rejected alternatives\n- Implementation phases\n- Risks and tradeoffs\n- Verification strategy\n- Open questions\n\nIf essential information is missing, ask concise clarifying questions instead of inventing details."
+    )
+}
+
+pub(crate) fn derive_title(kind: WorkPacketKind, body: &str) -> String {
     for line in body.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("# ") {
@@ -643,7 +583,7 @@ fn derive_title(kind: WorkPacketKind, body: &str) -> String {
     format!("{} packet", kind)
 }
 
-fn derive_summary(body: &str) -> String {
+pub(crate) fn derive_summary(body: &str) -> String {
     let text = body
         .lines()
         .map(str::trim)

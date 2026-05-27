@@ -186,7 +186,9 @@ pub struct LocalAgentHandle {
 }
 
 impl LocalAgentHandle {
-    fn should_return_without_force_stop(status: crate::agent::messages::SessionRuntimeStatus) -> bool {
+    fn should_return_without_force_stop(
+        status: crate::agent::messages::SessionRuntimeStatus,
+    ) -> bool {
         matches!(status, crate::agent::messages::SessionRuntimeStatus::Idle)
     }
 

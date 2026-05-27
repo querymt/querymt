@@ -118,6 +118,24 @@ where
                         "Session {} transient setup error on attempt {}, retrying in {}s: {}",
                         session_id, attempt, wait_secs, e
                     );
+
+                    // Emit LLM retrying event so UI can show the retry.
+                    config.emit_event(
+                        session_id,
+                        AgentEventKind::LlmRetrying {
+                            phase: "setup".to_string(),
+                            message: e.to_string(),
+                            attempt: u32_from_usize(attempt, "attempt", Some(session_id)),
+                            max_attempts: u32_from_usize(
+                                max_retries,
+                                "max_retries",
+                                Some(session_id),
+                            ),
+                            wait_secs,
+                            message_id: None,
+                        },
+                    );
+
                     let cancelled = wait_with_cancellation(wait_secs, cancel_token).await;
                     if cancelled {
                         return Err(anyhow::anyhow!("Cancelled during retry wait"));
@@ -271,6 +289,24 @@ where
                         "Session {} transient stream error on attempt {}, retrying in {}s: {}",
                         session_id, attempt, wait_secs, e
                     );
+
+                    // Emit LLM retrying event so UI can show the retry.
+                    config.emit_event(
+                        session_id,
+                        AgentEventKind::LlmRetrying {
+                            phase: "stream_creation".to_string(),
+                            message: e.to_string(),
+                            attempt: u32_from_usize(attempt, "attempt", Some(session_id)),
+                            max_attempts: u32_from_usize(
+                                max_retries,
+                                "max_retries",
+                                Some(session_id),
+                            ),
+                            wait_secs,
+                            message_id: None,
+                        },
+                    );
+
                     let cancelled = wait_with_cancellation(wait_secs, cancel_token).await;
                     if cancelled {
                         return Err(anyhow::anyhow!("Cancelled during retry wait"));

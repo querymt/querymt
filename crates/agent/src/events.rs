@@ -423,6 +423,52 @@ pub enum AgentEventKind {
         /// Which attempt is now being made
         attempt: u32,
     },
+    // ── Runtime slash command events (ephemeral, live-only) ────────────
+    /// Emitted when a runtime slash command begins execution.
+    RuntimeCommandStarted {
+        /// Unique id for correlating started/finished events.
+        command_id: String,
+        /// The full command line the user typed (e.g. "/status", "/plan foo").
+        command_line: String,
+        /// The command name (e.g. "status", "plan").
+        command: String,
+    },
+    /// Emitted when a runtime slash command finishes successfully.
+    RuntimeCommandFinished {
+        /// Correlates with RuntimeCommandStarted.
+        command_id: String,
+        /// The command name.
+        command: String,
+        /// Structured output for UI display.
+        #[typeshare(serialized_as = "any")]
+        output: crate::slash_commands::runtime::CommandOutput,
+    },
+    /// Emitted when a runtime slash command fails.
+    RuntimeCommandFailed {
+        /// Correlates with RuntimeCommandStarted.
+        command_id: String,
+        /// The command name.
+        command: String,
+        /// Human-readable error message.
+        message: String,
+    },
+    /// Transient signal for non-rate-limit LLM retries.
+    LlmRetrying {
+        /// Phase: "setup" (stream creation) or "mid_stream".
+        phase: String,
+        /// Human-readable error message.
+        message: String,
+        /// Current attempt (1-indexed).
+        attempt: u32,
+        /// Maximum attempts configured.
+        max_attempts: u32,
+        /// Seconds to wait before retry.
+        #[typeshare(serialized_as = "number")]
+        wait_secs: u64,
+        /// If associated with a specific message.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
     /// Emitted on the remote node once its workspace index has finished
     /// building and is available via `GetFileIndex`.  Flows through the
     /// EventForwarder → EventRelayActor → local EventSink chain so the
@@ -681,6 +727,13 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         AgentEventKind::RemoteStreamReconnected { .. } => Durability::Ephemeral,
         AgentEventKind::RemoteProviderHeartbeat { .. } => Durability::Ephemeral,
         AgentEventKind::StreamRecovering { .. } => Durability::Ephemeral,
+        // Rationale: runtime slash commands are control-plane UI feedback,
+        // not conversation history. The domain effects persist elsewhere.
+        AgentEventKind::RuntimeCommandStarted { .. } => Durability::Ephemeral,
+        AgentEventKind::RuntimeCommandFinished { .. } => Durability::Ephemeral,
+        AgentEventKind::RuntimeCommandFailed { .. } => Durability::Ephemeral,
+        // Rationale: transient retry notices are only useful live.
+        AgentEventKind::LlmRetrying { .. } => Durability::Ephemeral,
 
         // Everything else is durable by default.
         _ => Durability::Durable,

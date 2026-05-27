@@ -25,6 +25,7 @@ import { ChatInputBar } from './ChatInputBar';
 import { ChatTabBar } from './ChatTabBar';
 import { ToolDetailModal } from './ToolDetailModal';
 import { TurnCard } from './TurnCard';
+import { CommandCard } from './CommandCard';
 import { DelegationsView } from './DelegationsView';
 import { DelegationDrawer } from './DelegationDrawer';
 import { TodoRail } from './TodoRail';
@@ -378,8 +379,42 @@ export function ChatView() {
     // For now, show all turns. We can add turn-level filtering later if needed
     return turns;
   }, [turns]);
-  const hasTurns = filteredTurns.length > 0;
   const hasDelegations = delegations.length > 0;
+
+  // Extract runtime command events (ephemeral, live-only).
+  const commandEvents = useMemo(
+    () => events.filter((event: EventItem) => event.type === 'command'),
+    [events]
+  );
+
+  // Timeline item: either a Turn or a Command event.
+  type TimelineItem =
+    | { kind: 'turn'; turn: Turn; index: number }
+    | { kind: 'command'; command: EventItem };
+
+  // Build combined timeline of turns and commands, sorted by timestamp.
+  const timelineItems = useMemo((): TimelineItem[] => {
+    const items: TimelineItem[] = [];
+
+    filteredTurns.forEach((turn, index) => {
+      items.push({ kind: 'turn', turn, index });
+    });
+
+    commandEvents.forEach((command) => {
+      items.push({ kind: 'command', command });
+    });
+
+    // Sort by timestamp so commands appear interleaved with turns.
+    items.sort((a, b) => {
+      const tsA = a.kind === 'turn' ? a.turn.startTime : a.command.timestamp;
+      const tsB = b.kind === 'turn' ? b.turn.startTime : b.command.timestamp;
+      return tsA - tsB;
+    });
+
+    return items;
+  }, [filteredTurns, commandEvents]);
+
+  const hasTimelineItems = timelineItems.length > 0;
 
   // --- Pinned user-message bar (DOM-based scroll detection) ---
   const scrollerNodeRef = useRef<HTMLElement | null>(null);
@@ -790,22 +825,27 @@ export function ChatView() {
   // only changes when the maps or scalar dependencies change — NOT on every
   // ChatView render.  This lets Virtuoso's internal memo wrapper bail out
   // for items whose data hasn't changed.
-  const renderTurnItem = useCallback((index: number, turn: Turn) => {
-    const undoProps = turnUndoPropsMap.get(index);
-    const isLastTurn = index === filteredTurns.length - 1;
+  const renderTimelineItem = useCallback((_index: number, item: TimelineItem) => {
+    if (item.kind === 'command') {
+      return <CommandCard key={item.command.id} commandEvent={item.command} />;
+    }
+
+    const { turn, index: turnIndex } = item;
+    const undoProps = turnUndoPropsMap.get(turnIndex);
+    const isLastTurn = turnIndex === filteredTurns.length - 1;
 
     return (
       <TurnCard
         key={turn.id}
         turn={turn}
-        turnIndex={index}
+        turnIndex={turnIndex}
         agents={agents}
         onToolClick={handleToolClick}
         onDelegateClick={handleDelegateClick}
         showModelLabel={sessionHasMultipleModels}
         llmConfigCache={llmConfigCache}
         requestLlmConfig={requestLlmConfig}
-        canUndo={index === undoTurnIndex}
+        canUndo={turnIndex === undoTurnIndex}
         isUndone={undoProps?.isUndone ?? false}
         isUndoPending={undoProps?.isUndoPending ?? false}
         isStackedUndone={undoProps?.isStackedUndone ?? false}
@@ -819,6 +859,7 @@ export function ChatView() {
       />
     );
   }, [
+    timelineItems.length,
     filteredTurns.length,
     turnUndoPropsMap,
     agents,
@@ -866,7 +907,7 @@ export function ChatView() {
               llmConfigCache={llmConfigCache}
               requestLlmConfig={requestLlmConfig}
             />
-          ) : !hasTurns ? (
+          ) : !hasTimelineItems ? (
             <div className="flex items-center justify-center h-full">
                {!sessionId ? (
                 // No active session
@@ -907,8 +948,8 @@ export function ChatView() {
           ) : (
             <Virtuoso
               ref={virtuosoRef}
-              data={filteredTurns}
-              itemContent={renderTurnItem}
+              data={timelineItems}
+              itemContent={renderTimelineItem}
               atBottomStateChange={handleAtBottomStateChange}
               scrollerRef={scrollerRefCallback}
               className="h-full"
@@ -923,7 +964,7 @@ export function ChatView() {
             />
           )}
         </div>
-        {activeTimelineView === 'chat' && hasTurns && !isAtBottom && (
+        {activeTimelineView === 'chat' && hasTimelineItems && !isAtBottom && (
           <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-10">
             <button
               type="button"

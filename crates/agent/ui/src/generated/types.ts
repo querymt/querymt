@@ -272,6 +272,48 @@ export type AgentEventKind =
 	/** Which attempt is now being made */
 	attempt: number;
 }}
+	/** Emitted when a runtime slash command begins execution. */
+	| { type: "runtime_command_started", data: {
+	/** Unique id for correlating started/finished events. */
+	command_id: string;
+	/** The full command line the user typed (e.g. "/status", "/plan foo"). */
+	command_line: string;
+	/** The command name (e.g. "status", "plan"). */
+	command: string;
+}}
+	/** Emitted when a runtime slash command finishes successfully. */
+	| { type: "runtime_command_finished", data: {
+	/** Correlates with RuntimeCommandStarted. */
+	command_id: string;
+	/** The command name. */
+	command: string;
+	/** Structured output for UI display. */
+	output: any;
+}}
+	/** Emitted when a runtime slash command fails. */
+	| { type: "runtime_command_failed", data: {
+	/** Correlates with RuntimeCommandStarted. */
+	command_id: string;
+	/** The command name. */
+	command: string;
+	/** Human-readable error message. */
+	message: string;
+}}
+	/** Transient signal for non-rate-limit LLM retries. */
+	| { type: "llm_retrying", data: {
+	/** Phase: "setup" (stream creation) or "mid_stream". */
+	phase: string;
+	/** Human-readable error message. */
+	message: string;
+	/** Current attempt (1-indexed). */
+	attempt: number;
+	/** Maximum attempts configured. */
+	max_attempts: number;
+	/** Seconds to wait before retry. */
+	wait_secs: number;
+	/** If associated with a specific message. */
+	message_id?: string;
+}}
 	/**
 	 * Emitted on the remote node once its workspace index has finished
 	 * building and is available via `GetFileIndex`.  Flows through the
@@ -547,6 +589,39 @@ export interface AuthProviderEntry {
 	supports_oauth: boolean;
 	/** User's preferred auth method (`None` = auto/default) */
 	preferred_method?: AuthMethod;
+}
+
+/** Severity level of command output. */
+export enum CommandOutputLevel {
+	Info = "info",
+	Success = "success",
+	Warning = "warning",
+	Error = "error",
+}
+
+/** How the command output body should be rendered. */
+export enum CommandOutputDisplay {
+	Text = "text",
+	Markdown = "markdown",
+}
+
+/**
+ * Generic structured output from a runtime slash command.
+ * 
+ * This is intentionally domain-agnostic: work packets, git, MCP, debug, etc.
+ * all return the same displayable output shape. Domain-specific effects
+ * (e.g. work packet creation) persist through their own stores/events;
+ * this struct is only for UI display.
+ */
+export interface CommandOutput {
+	/** Optional title shown above the body (e.g. "Active packet"). */
+	title?: string;
+	/** Main content. */
+	body: string;
+	/** Severity level. */
+	level: CommandOutputLevel;
+	/** How to render the body. */
+	display: CommandOutputDisplay;
 }
 
 /** Knowledge consolidation DTO for the UI (read-only). */

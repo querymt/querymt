@@ -53,8 +53,8 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         apply: migration_0010_profile_bindings,
     },
     Migration {
-        version: "0011_delegation_input_packet_id",
-        apply: migration_0011_delegation_input_packet_id,
+        version: "0011_working_packets",
+        apply: migration_0011_working_packets,
     },
 ];
 
@@ -437,13 +437,89 @@ fn migration_0010_profile_bindings(conn: &mut Connection) -> Result<(), rusqlite
     Ok(())
 }
 
-fn migration_0011_delegation_input_packet_id(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+fn migration_0011_working_packets(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     // Idempotent: fresh DB already has the column from init_schema.
     // Ignore "duplicate column name" errors for existing DBs that ran this migration.
     let result = conn.execute_batch("ALTER TABLE delegations ADD COLUMN input_packet_id TEXT;");
     match result {
-        Ok(()) => Ok(()),
-        Err(ref e) if e.to_string().contains("duplicate column name") => Ok(()),
-        Err(e) => Err(e),
+        Ok(()) => {}
+        Err(ref e) if e.to_string().contains("duplicate column name") => {}
+        Err(e) => return Err(e),
     }
+
+    // Backfill work packet tables for pre-existing databases that ran an
+    // earlier version of this migration without creating these objects.
+    // Fresh installs already get these from init_schema.
+    conn.execute_batch(
+        r#"
+            CREATE TABLE IF NOT EXISTS work_packets (
+                id INTEGER PRIMARY KEY,
+                public_id TEXT UNIQUE NOT NULL,
+                scope TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'draft',
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                body_markdown TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT,
+                origin_session_id TEXT,
+                parent_packet_id TEXT,
+                source_delegation_id TEXT,
+                target_delegation_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_work_packets_public_id
+                ON work_packets(public_id);
+            CREATE INDEX IF NOT EXISTS idx_work_packets_scope
+                ON work_packets(scope);
+            CREATE INDEX IF NOT EXISTS idx_work_packets_kind
+                ON work_packets(kind);
+            CREATE INDEX IF NOT EXISTS idx_work_packets_status
+                ON work_packets(status);
+            CREATE INDEX IF NOT EXISTS idx_work_packets_parent
+                ON work_packets(parent_packet_id);
+            CREATE INDEX IF NOT EXISTS idx_work_packets_origin_session
+                ON work_packets(origin_session_id);
+            CREATE INDEX IF NOT EXISTS idx_work_packets_updated
+                ON work_packets(updated_at DESC);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS work_packets_fts USING fts5(
+                title, summary, body_markdown,
+                content='work_packets',
+                content_rowid='id',
+                tokenize='porter unicode61'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS work_packets_ai AFTER INSERT ON work_packets BEGIN
+                INSERT INTO work_packets_fts(rowid, title, summary, body_markdown)
+                VALUES (new.id, new.title, new.summary, new.body_markdown);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS work_packets_au AFTER UPDATE ON work_packets BEGIN
+                INSERT INTO work_packets_fts(work_packets_fts, rowid, title, summary, body_markdown)
+                VALUES ('delete', old.id, old.title, old.summary, old.body_markdown);
+                INSERT INTO work_packets_fts(rowid, title, summary, body_markdown)
+                VALUES (new.id, new.title, new.summary, new.body_markdown);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS work_packets_ad AFTER DELETE ON work_packets BEGIN
+                INSERT INTO work_packets_fts(work_packets_fts, rowid, title, summary, body_markdown)
+                VALUES ('delete', old.id, old.title, old.summary, old.body_markdown);
+            END;
+
+            CREATE TABLE IF NOT EXISTS active_work_packets (
+                session_public_id TEXT NOT NULL PRIMARY KEY,
+                packet_public_id TEXT NOT NULL,
+                set_at TEXT NOT NULL,
+                FOREIGN KEY(packet_public_id) REFERENCES work_packets(public_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_active_work_packets_packet
+                ON active_work_packets(packet_public_id);
+        "#,
+    )?;
+
+    Ok(())
 }

@@ -12,7 +12,7 @@ use crate::ui::handlers::{
     ListSessionsRequest, handle_delete_session, handle_fork_session, handle_list_session_children,
     handle_list_sessions, handle_load_session, handle_ui_message,
 };
-use crate::ui::messages::UiClientMessage;
+use crate::ui::messages::{UiClientMessage, UiPromptBlock};
 use anyhow::Result;
 use kameo::actor::Spawn;
 use querymt::chat::ChatRole;
@@ -855,6 +855,80 @@ async fn handle_set_session_model_uses_bound_profile_after_active_profile_change
     let llm_cfg = llm_cfg.expect("session llm config should be set");
     assert_eq!(llm_cfg.provider, "mock");
     assert_eq!(llm_cfg.model, "new-model");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn prompt_after_force_stop_reuses_session_with_db_cwd() -> Result<()> {
+    let f = crate::test_utils::TestServerState::new().await;
+    let cwd = PathBuf::from("/tmp/querymt-test-cwd");
+    let store = f.agent.storage.session_store();
+    let session = store
+        .create_session(
+            Some("cwd-session".to_string()),
+            Some(cwd.clone()),
+            None,
+            None,
+        )
+        .await?;
+    let session_id = session.public_id.clone();
+    insert_test_actor(&f.agent.handle, &session_id).await;
+
+    let (tx, _rx) = f.add_connection("conn-cwd-prompt").await;
+    let (bin_tx, _bin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+
+    {
+        let mut connections = f.state.connections.lock().await;
+        let conn = connections
+            .get_mut("conn-cwd-prompt")
+            .expect("connection should exist");
+        conn.sessions
+            .insert("primary".to_string(), session_id.clone());
+    }
+    {
+        let mut agents = f.state.session_agents.lock().await;
+        agents.insert(session_id.clone(), "primary".to_string());
+    }
+
+    // Force-stop removes the runtime actor, leaving a stale binding.
+    {
+        let mut registry = f.agent.handle.registry.lock().await;
+        registry.remove(&session_id);
+    }
+
+    handle_ui_message(
+        &f.state,
+        "conn-cwd-prompt",
+        &tx,
+        &bin_tx,
+        UiClientMessage::Prompt {
+            prompt: vec![UiPromptBlock::Text {
+                text: "hello".to_string(),
+            }],
+        },
+    )
+    .await;
+
+    // Allow the spawned prompt task to materialize the stale session.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Prompt should reload the same session using the persisted CWD.
+    let connections = f.state.connections.lock().await;
+    let conn = connections
+        .get("conn-cwd-prompt")
+        .expect("connection should still exist");
+    assert_eq!(conn.sessions.get("primary"), Some(&session_id));
+    drop(connections);
+
+    let cwds = f.state.session_cwds.lock().await;
+    assert_eq!(cwds.get(&session_id), Some(&cwd));
+
+    let registry = f.agent.handle.registry.lock().await;
+    assert!(
+        registry.get(&session_id).is_some(),
+        "force-stopped session should be re-materialized for reuse"
+    );
 
     Ok(())
 }

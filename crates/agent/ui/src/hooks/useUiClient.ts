@@ -2367,6 +2367,68 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
     };
   }
 
+  // ── Runtime command events (ephemeral, live-only) ────────────────────
+  if (kind === 'runtime_command_started') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'command',
+      content: kindData.command_line ?? `/${kindData.command}`,
+      timestamp,
+      commandId: kindData.command_id,
+      commandLine: kindData.command_line,
+      commandName: kindData.command,
+      commandStatus: 'running',
+    };
+  }
+
+  if (kind === 'runtime_command_finished') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'command',
+      content: kindData.output?.body ?? '',
+      timestamp,
+      commandId: kindData.command_id,
+      commandName: kindData.command,
+      commandStatus: 'completed',
+      commandOutput: kindData.output,
+    };
+  }
+
+  if (kind === 'runtime_command_failed') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'command',
+      content: kindData.message ?? 'Command failed',
+      timestamp,
+      commandId: kindData.command_id,
+      commandName: kindData.command,
+      commandStatus: 'failed',
+      commandError: kindData.message,
+    };
+  }
+
+  // ── LLM retry event ──────────────────────────────────────────────────
+  if (kind === 'llm_retrying') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'system',
+      content: kindData.message ?? `Retrying (${kindData.phase})...`,
+      timestamp,
+      llmRetryPhase: kindData.phase,
+      llmRetryAttempt: kindData.attempt,
+      llmRetryMaxAttempts: kindData.max_attempts,
+      llmRetryWaitSecs: kindData.wait_secs,
+    };
+  }
+
   return {
     id,
     agentId,

@@ -165,20 +165,36 @@ pub async fn ensure_session(
         // After a force-stop the session is removed, making the binding stale.
         let existing_profile_id =
             resolve_profile_id_for_session(state, Some(session_id), profile_id).await?;
-        let still_alive = if let Ok(agent) =
+        let (still_alive, db_cwd) = if let Ok(agent) =
             agent_for_profile_and_id(state, existing_profile_id.as_deref(), agent_id).await
         {
-            agent
+            let db_cwd = state
+                .session_store
+                .get_session(session_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|s| s.cwd);
+            let cwd = db_cwd.clone().unwrap_or_default();
+            let alive = agent
                 .load_session(LoadSessionRequest::new(
                     SessionId::from(session_id.clone()),
-                    PathBuf::new(),
+                    cwd,
                 ))
                 .await
-                .is_ok()
+                .is_ok();
+            (alive, db_cwd)
         } else {
-            false
+            (false, None)
         };
         if still_alive {
+            // Ensure session_cwds is populated from the DB CWD. This covers the
+            // case where a force-stopped session was re-materialized via
+            // load_session above and the CWD map was not yet populated.
+            if let Some(cwd_path) = db_cwd {
+                let mut cwds = state.session_cwds.lock().await;
+                cwds.entry(session_id.clone()).or_insert(cwd_path);
+            }
             return Ok(session_id.clone());
         }
         // Session was destroyed (force-stopped) — clear the stale binding
@@ -195,7 +211,10 @@ pub async fn ensure_session(
     let agent = agent_for_profile_and_id(state, selected_profile_id.as_deref(), agent_id).await?;
 
     // Use empty PathBuf as sentinel for "no cwd" to work with ACP protocol
-    let cwd_for_request = cwd.cloned().unwrap_or_else(PathBuf::new);
+    let cwd_for_request = cwd
+        .cloned()
+        .or_else(|| state.default_cwd.clone())
+        .unwrap_or_default();
     let response = agent
         .new_session(NewSessionRequest::new(cwd_for_request))
         .await

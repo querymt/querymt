@@ -12,11 +12,14 @@ use crate::test_utils::{
     TestProviderFactory, mock_llm_config, mock_plugin_registry, mock_querymt_tool_call,
     mock_session,
 };
+use crate::work_packet::sqlite::SqliteWorkPacketStore;
+use crate::work_packet::{WorkPacketFilter, WorkPacketKind, WorkPacketStore};
 use agent_client_protocol::schema::StopReason;
 use mockall::Sequence;
 use querymt::LLMParams;
 use querymt::chat::{Content, FunctionTool, Tool};
 use querymt::error::LLMError;
+use rusqlite::Connection;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -45,6 +48,15 @@ impl TestHarness {
         history: Vec<crate::model::AgentMessage>,
         delegation_sender: Option<oneshot::Sender<String>>,
         tools: Vec<Tool>,
+    ) -> Self {
+        Self::new_with_tools_and_work_packet_store(history, delegation_sender, tools, None).await
+    }
+
+    async fn new_with_tools_and_work_packet_store(
+        history: Vec<crate::model::AgentMessage>,
+        delegation_sender: Option<oneshot::Sender<String>>,
+        tools: Vec<Tool>,
+        work_packet_store: Option<Arc<dyn WorkPacketStore>>,
     ) -> Self {
         let session_id = "sess-test".to_string();
         let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
@@ -160,14 +172,15 @@ impl TestHarness {
                 .expect("create event journal storage"),
         );
 
-        let config = Arc::new(
-            crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
-                provider_context,
-                event_journal_storage.event_journal(),
-            )
-            .with_tool_policy(ToolPolicy::ProviderOnly)
-            .build(),
-        );
+        let mut builder = crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+            provider_context,
+            event_journal_storage.event_journal(),
+        )
+        .with_tool_policy(ToolPolicy::ProviderOnly);
+        if let Some(store) = work_packet_store.clone() {
+            builder = builder.with_work_packet_store(store);
+        }
+        let config = Arc::new(builder.build());
 
         // Create a SessionRuntime for the execution context
         let session_runtime = crate::agent::core::SessionRuntime::new(
@@ -182,7 +195,8 @@ impl TestHarness {
             runtime_context,
             context,
             crate::agent::core::ToolConfig::default(),
-        );
+        )
+        .with_work_packet_store(work_packet_store);
 
         Self {
             config,
@@ -202,6 +216,10 @@ impl TestHarness {
         )
         .await
         .expect("state machine")
+    }
+
+    async fn with_work_packet_store(store: Arc<dyn WorkPacketStore>) -> Self {
+        Self::new_with_tools_and_work_packet_store(vec![], None, Vec::new(), Some(store)).await
     }
 
     async fn provider_mut(&self) -> tokio::sync::MutexGuard<'_, MockLlmProvider> {
@@ -228,6 +246,85 @@ async fn test_simple_completion_no_tools() {
     let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Completed);
+}
+
+#[tokio::test]
+async fn test_plan_post_turn_action_ignores_intermediate_tool_call_responses() {
+    let conn = Arc::new(StdMutex::new(
+        Connection::open_in_memory().expect("open in-memory sqlite"),
+    ));
+    {
+        let mut conn = conn.lock().expect("lock sqlite");
+        crate::session::schema::init_schema(&mut conn).expect("initialize schema");
+    }
+    let packet_store = Arc::new(SqliteWorkPacketStore::new(conn));
+    let mut harness = TestHarness::with_work_packet_store(packet_store.clone()).await;
+    let tool_call = mock_querymt_tool_call("call-plan-1", "remote_tool", "{}");
+    let mut seq = Sequence::new();
+
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |_| {
+            Ok(Box::new(MockChatResponse::with_tools(
+                "",
+                vec![tool_call.clone()],
+            )))
+        });
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(|_| {
+            Ok(Box::new(MockChatResponse::text_only(
+                "# Final Plan\n\nDo the work.",
+            )))
+        });
+    harness
+        .provider_mut()
+        .await
+        .expect_call_tool()
+        .returning(|_, _| Ok(vec![Content::text("tool output")]))
+        .times(1);
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    harness.exec_ctx.post_turn_action = Some(
+        crate::slash_commands::runtime::PostTurnAction::CreatePlanPacket {
+            command_id: "cmd-plan".to_string(),
+            command_name: "plan".to_string(),
+            objective: Some("worktrees".to_string()),
+        },
+    );
+
+    let outcome = harness.run().await;
+    assert_eq!(outcome, CycleOutcome::Completed);
+
+    let packets = packet_store
+        .list(&WorkPacketFilter {
+            scope: Some(harness.session_id.clone()),
+            kind: Some(WorkPacketKind::Plan),
+            ..Default::default()
+        })
+        .await
+        .expect("list packets");
+
+    assert_eq!(
+        packets.len(),
+        1,
+        "only final assistant response should create a plan packet"
+    );
+    assert_eq!(packets[0].title, "Final Plan");
+    assert_eq!(packets[0].body_markdown, "# Final Plan\n\nDo the work.");
 }
 
 #[tokio::test]
