@@ -90,6 +90,10 @@ pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) 
             },
         );
     }
+    {
+        let mut senders = state.connection_senders.lock().await;
+        senders.insert(conn_id.clone(), tx.clone());
+    }
 
     spawn_event_forwarders(state.clone(), conn_id.clone(), tx.clone());
     #[cfg(feature = "remote")]
@@ -198,6 +202,10 @@ pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) 
         {
             handle.abort();
         }
+    }
+    {
+        let mut senders = state.connection_senders.lock().await;
+        senders.remove(&conn_id);
     }
 
     // Clean up OAuth state (pending flows + callback listener) for this connection.
@@ -629,6 +637,9 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                             );
                             // Invalidate cache — topology changed.
                             state.invalidate_remote_node_cache().await;
+                            // Also invalidate remote model inventory so model list
+                            // is refreshed when the peer becomes visible.
+                            state.agent.model_inventory.invalidate_remote().await;
                             true
                         }
                         PeerEvent::Expired(peer_id) => {
@@ -637,6 +648,9 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                             );
                             // Invalidate cache — topology changed.
                             state.invalidate_remote_node_cache().await;
+                            // Also invalidate remote model inventory so stale
+                            // remote models are removed from the list.
+                            state.agent.model_inventory.invalidate_remote().await;
                             false
                         }
                         _ => {
@@ -816,6 +830,7 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                     // We missed some events — re-query immediately to catch up.
                     log::warn!("spawn_peer_event_watcher: lagged by {n} events, re-querying");
                     state.invalidate_remote_node_cache().await;
+                    state.agent.model_inventory.invalidate_remote().await;
                     let nodes = state.get_remote_nodes_cached().await;
                     let msg = UiServerMessage::RemoteNodes {
                         nodes: nodes

@@ -7,7 +7,7 @@ use arc_swap::ArcSwap;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::agent::agent_config::AgentConfig;
 #[cfg(feature = "remote")]
@@ -180,6 +180,10 @@ struct ModelInventoryInner {
     mesh: parking_lot::RwLock<Option<MeshRuntimeHandle>>,
     /// Inventory configuration
     inv_config: ModelInventoryConfig,
+    /// Broadcast a monotonically-increasing version after every successful refresh cycle.
+    /// Subscribers can use this to avoid polling `get_snapshot()` on a timer.
+    update_version_tx: broadcast::Sender<u64>,
+    update_version: std::sync::atomic::AtomicU64,
 }
 
 /// Main inventory service for non-blocking model listing.
@@ -207,6 +211,7 @@ impl ModelInventory {
 
     /// Create a new ModelInventory with custom configuration
     pub fn with_config(config: Arc<AgentConfig>, inv_config: ModelInventoryConfig) -> Self {
+        let (update_version_tx, _rx) = broadcast::channel(16);
         Self {
             inner: Arc::new(ModelInventoryInner {
                 local_snapshot: ArcSwap::from(Arc::new(Vec::new())),
@@ -226,6 +231,8 @@ impl ModelInventory {
                 #[cfg(feature = "remote")]
                 mesh: parking_lot::RwLock::new(None),
                 inv_config,
+                update_version_tx,
+                update_version: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -411,6 +418,15 @@ impl ModelInventory {
         models
     }
 
+    /// Subscribe to model-inventory update notifications.
+    ///
+    /// The returned receiver gets a monotonically-increasing version number each
+    /// time a refresh cycle completes successfully. It intentionally drops the
+    /// oldest pending version if the subscriber falls behind.
+    pub fn subscribe_updates(&self) -> broadcast::Receiver<u64> {
+        self.inner.update_version_tx.subscribe()
+    }
+
     /// Get the current mesh handle (if any).
     #[cfg(feature = "remote")]
     pub fn mesh(&self) -> Option<MeshRuntimeHandle> {
@@ -491,6 +507,12 @@ impl ModelInventory {
         let rerun = state.refresh_requested_after_current;
         state.refresh_requested_after_current = false;
         let _ = state.refresh_done_tx.send(true);
+        let next_version = self
+            .inner
+            .update_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let _ = self.inner.update_version_tx.send(next_version);
 
         if rerun {
             state.last_triggered_at = Some(Instant::now());

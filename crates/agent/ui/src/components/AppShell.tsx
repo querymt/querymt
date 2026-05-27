@@ -84,6 +84,8 @@ export function AppShell() {
 
   const {
     allModels,
+    modelsRefreshing,
+    modelsLoadedOnce,
     providerCapabilities,
     recentModelsByWorkspace,
     authProviders,
@@ -298,6 +300,8 @@ export function AppShell() {
         sessionsByAgent={sessionsByAgent}
         agents={agents}
         allModels={allModels}
+        modelsRefreshing={modelsRefreshing}
+        modelsLoadedOnce={modelsLoadedOnce}
         activeAgentModel={activeAgentModel}
         remoteNodes={remoteNodes}
         currentWorkspace={currentWorkspace}
@@ -329,6 +333,8 @@ export function AppShell() {
           sessionsByAgent={sessionsByAgent}
           agents={agents}
           allModels={allModels}
+          modelsRefreshing={modelsRefreshing}
+          modelsLoadedOnce={modelsLoadedOnce}
           activeAgentModel={activeAgentModel}
           remoteNodes={remoteNodes}
           currentWorkspace={currentWorkspace}

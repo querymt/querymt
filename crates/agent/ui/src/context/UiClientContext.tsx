@@ -177,6 +177,8 @@ const UiClientSessionContext = createContext<UiClientSessionContextValue | undef
 
 export interface UiClientConfigContextValue {
   allModels: ModelEntry[];
+  modelsRefreshing: boolean;
+  modelsLoadedOnce: boolean;
   providerCapabilities: Record<string, ProviderCapabilityEntry>;
   recentModelsByWorkspace: Record<string, RecentModelEntry[]>;
   authProviders: AuthProviderEntry[];
@@ -380,6 +382,8 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
   // -- Config (low frequency) --
   const configCtx = useMemo<UiClientConfigContextValue>(() => ({
     allModels: uiClient.allModels,
+    modelsRefreshing: uiClient.modelsRefreshing,
+    modelsLoadedOnce: uiClient.modelsLoadedOnce,
     providerCapabilities: uiClient.providerCapabilities,
     recentModelsByWorkspace: uiClient.recentModelsByWorkspace,
     authProviders: uiClient.authProviders,
@@ -398,6 +402,8 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     audioCapabilities: uiClient.audioCapabilities,
   }), [
     uiClient.allModels,
+    uiClient.modelsRefreshing,
+    uiClient.modelsLoadedOnce,
     uiClient.providerCapabilities,
     uiClient.recentModelsByWorkspace,
     uiClient.authProviders,

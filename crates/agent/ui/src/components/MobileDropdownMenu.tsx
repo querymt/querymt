@@ -20,6 +20,8 @@ interface MobileDropdownMenuProps {
   sessionsByAgent: Record<string, string>;
   agents: UiAgentInfo[];
   allModels: any;
+  modelsRefreshing?: boolean;
+  modelsLoadedOnce?: boolean;
   activeAgentModel: { provider?: string; model?: string; node?: string } | undefined;
   remoteNodes: any;
   currentWorkspace: string | null;
@@ -60,6 +62,8 @@ export function MobileDropdownMenu(props: MobileDropdownMenuProps) {
           sessionsByAgent={props.sessionsByAgent}
           agents={props.agents}
           allModels={props.allModels}
+          modelsRefreshing={props.modelsRefreshing}
+          modelsLoadedOnce={props.modelsLoadedOnce}
           currentProvider={props.activeAgentModel?.provider}
           currentModel={props.activeAgentModel?.model}
           currentNode={props.activeAgentModel?.node}

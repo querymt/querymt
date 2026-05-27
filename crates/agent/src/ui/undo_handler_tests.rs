@@ -41,6 +41,7 @@ fn test_server_state(
         event_sources: vec![],
         profiles: None,
         connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        connection_senders: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         workspace_manager: crate::index::WorkspaceIndexManagerActor::new(

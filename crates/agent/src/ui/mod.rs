@@ -39,6 +39,7 @@ use crate::index::WorkspaceIndexManagerActor;
 use crate::profiles::{ProfileCatalog, ProfileRuntimeManager};
 use crate::session::projection::ViewStore;
 use crate::session::store::SessionStore;
+use crate::ui::messages::UiServerMessage;
 use axum::{
     Router,
     extract::{State, ws::WebSocketUpgrade},
@@ -52,7 +53,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 /// UI WebSocket server.
@@ -64,6 +65,7 @@ pub struct UiServer {
     event_sources: Vec<Arc<EventFanout>>,
     profiles: Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>>,
     connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
+    connection_senders: Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>,
     session_agents: Arc<Mutex<HashMap<String, String>>>,
     session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
     workspace_manager: ActorRef<WorkspaceIndexManagerActor>,
@@ -108,6 +110,9 @@ pub(crate) struct ServerState {
     pub event_sources: Vec<Arc<EventFanout>>,
     pub profiles: Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>>,
     pub connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
+    /// Registered senders for broadcasting generic UI server messages to all
+    /// connected clients. Inserted on WebSocket connect, removed on disconnect.
+    pub connection_senders: Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>,
     pub session_agents: Arc<Mutex<HashMap<String, String>>>,
     pub session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
     pub workspace_manager: ActorRef<WorkspaceIndexManagerActor>,
@@ -115,6 +120,38 @@ pub(crate) struct ServerState {
     /// Cache for remote node DHT discovery results with a short TTL.
     #[cfg(feature = "remote")]
     pub remote_node_cache: Arc<Mutex<Option<RemoteNodeCache>>>,
+}
+
+impl ServerState {
+    /// Broadcast a serialized UI message to every connected WebSocket client.
+    ///
+    /// Closed senders are removed opportunistically.
+    pub async fn broadcast_message(&self, message: UiServerMessage) {
+        let payload = match serde_json::to_string(&message) {
+            Ok(json) => json,
+            Err(err) => {
+                log::error!(
+                    "broadcast_message: failed to serialize {}: {}",
+                    message.type_name(),
+                    err
+                );
+                return;
+            }
+        };
+
+        let mut senders = self.connection_senders.lock().await;
+        senders.retain(|_conn_id, tx| !tx.is_closed());
+        for tx in senders.values() {
+            let _ = tx.try_send(payload.clone());
+        }
+    }
+
+    /// Send the current model inventory snapshot to all connected UI clients.
+    pub async fn broadcast_model_snapshot(&self) {
+        let models = self.agent.model_inventory.get_all_models().await;
+        self.broadcast_message(UiServerMessage::AllModelsList { models })
+            .await;
+    }
 }
 
 impl ServerState {
@@ -206,6 +243,7 @@ impl UiServer {
             event_sources,
             profiles,
             connections: Arc::new(Mutex::new(HashMap::new())),
+            connection_senders: Arc::new(Mutex::new(HashMap::new())),
             session_agents: Arc::new(Mutex::new(HashMap::new())),
             session_cwds: Arc::new(Mutex::new(HashMap::new())),
             workspace_manager: agent.workspace_manager_actor(),
@@ -223,6 +261,7 @@ impl UiServer {
             event_sources: self.event_sources,
             profiles: self.profiles,
             connections: self.connections,
+            connection_senders: self.connection_senders,
             session_agents: self.session_agents,
             session_cwds: self.session_cwds,
             workspace_manager: self.workspace_manager,
@@ -231,9 +270,31 @@ impl UiServer {
             remote_node_cache: Arc::new(Mutex::new(None)),
         };
 
-        Router::new()
+        let router = Router::new()
             .route("/ws", get(websocket_handler))
-            .with_state(state)
+            .with_state(state.clone());
+
+        // Spawn a single model-inventory broadcast loop so all connected UI
+        // clients receive updated model lists automatically.
+        let broadcast_state = state;
+        tokio::spawn(async move {
+            let mut rx = broadcast_state.agent.model_inventory.subscribe_updates();
+            // Drop the pending initial value so we only react to future refreshes.
+            let _ = rx.try_recv();
+            loop {
+                match rx.recv().await {
+                    Ok(_version) => {
+                        broadcast_state.broadcast_model_snapshot().await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        broadcast_state.broadcast_model_snapshot().await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        router
     }
 }
 
