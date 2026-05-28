@@ -2827,7 +2827,7 @@ impl SendAgent for LocalAgentHandle {
                             "transport": if mesh.is_iroh_transport_internal() { "iroh" } else { "lan" },
                             "known_peer_count": mesh.known_peer_ids().len(),
                             "has_invite_store": mesh.invite_store().is_some(),
-                            "has_membership_store": mesh.membership_store().is_some(),
+                            "has_mesh_state_store": mesh.mesh_state_store().is_some(),
                         });
                         return ext_json_response(&result);
                     }

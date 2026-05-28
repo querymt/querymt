@@ -36,6 +36,9 @@ pub mod mesh_provider;
 pub mod mesh_runtime_config;
 
 #[cfg(feature = "remote")]
+pub mod mesh_state;
+
+#[cfg(feature = "remote")]
 pub mod runtime_handle;
 
 #[cfg(feature = "remote")]
@@ -111,6 +114,8 @@ pub use mesh::{
 };
 #[cfg(feature = "remote")]
 pub use mesh_provider::MeshChatProvider;
+#[cfg(feature = "remote")]
+pub use mesh_state::{MeshLocalRole, MeshStateEntry, MeshStateStore, MeshStatus};
 pub use node_id::NodeId;
 pub use node_manager::{AvailableModel, ListRemoteSessionsResponse, NodeInfo, RemoteSessionInfo};
 #[cfg(feature = "remote")]

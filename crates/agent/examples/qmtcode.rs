@@ -16,13 +16,14 @@
 //! cargo run --example qmtcode --features dashboard -- --dashboard
 //! cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
 //!
-//! # Mesh mode: LAN plus any previously joined Iroh meshes
+//! # Mesh mode: LAN plus any previously joined/hosted Iroh meshes
 //! cargo run --example qmtcode --features remote -- --mesh
 //! cargo run --example qmtcode --features remote -- --mesh=/ip4/0.0.0.0/tcp/0
+//! cargo run --example qmtcode --features remote -- --mesh --mesh-no-lan
 //!
-//! # Dashboard mode with mesh enabled (LAN + stored Iroh memberships)
+//! # Dashboard mode with mesh enabled
 //! cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh
-//! cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh=/ip4/0.0.0.0/tcp/0
+//! cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh --mesh-no-lan
 //!
 //! # Internet mesh: host and print a new invite token
 //! cargo run --example qmtcode --features "remote" -- --mesh --mesh-invite
@@ -125,7 +126,7 @@ struct Cli {
     /// Enable mesh networking for cross-machine sessions.
     ///
     /// Starts LAN discovery/listening and also reconnects any previously joined
-    /// Iroh meshes persisted in `~/.qmt/memberships.json`.
+    /// or hosted Iroh meshes persisted in `~/.qmt/mesh_state.json`.
     ///
     /// Optionally specify the LAN multiaddr to listen on
     /// (default: /ip4/0.0.0.0/tcp/0).
@@ -139,6 +140,14 @@ struct Cli {
     #[cfg(feature = "remote")]
     #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_MESH_ADDR)]
     mesh: Option<String>,
+
+    /// Disable LAN listen/mDNS when running mesh mode.
+    ///
+    /// Useful for cloud deployments that should only reconnect hosted/joined
+    /// Iroh meshes and must not use mDNS.
+    #[cfg(feature = "remote")]
+    #[arg(long)]
+    mesh_no_lan: bool,
 
     /// Create and print a signed mesh invite token, then host that Iroh mesh.
     ///
@@ -455,14 +464,13 @@ async fn register_mesh_actors(
 #[cfg(feature = "remote")]
 fn load_stored_iroh_scopes()
 -> anyhow::Result<Vec<querymt_agent::agent::remote::mesh_runtime_config::IrohMeshConfig>> {
-    use querymt_agent::agent::remote::invite::MembershipStore;
-    use querymt_agent::agent::remote::invite::default_membership_store_path;
     use querymt_agent::agent::remote::mesh_runtime_config::IrohMeshConfig;
+    use querymt_agent::agent::remote::mesh_state::{MeshStateStore, default_mesh_state_path};
 
-    let path = default_membership_store_path()?;
-    let store = MembershipStore::load_or_create(&path)?;
+    let path = default_mesh_state_path()?;
+    let store = MeshStateStore::load_or_create(&path)?;
     Ok(store
-        .mesh_ids()
+        .active_mesh_ids()
         .into_iter()
         .map(|mesh_id| IrohMeshConfig {
             mesh_id,
@@ -658,12 +666,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let runtime_config = MeshRuntimeConfig {
             enabled: true,
-            lan: Some(LanMeshConfig {
-                listen: Some(mesh_addr.clone()),
-                discovery: LanDiscovery::Mdns,
-                directory:
-                    querymt_agent::agent::remote::mesh_runtime_config::DirectoryMode::default(),
-            }),
+            lan: if cli.mesh_no_lan {
+                None
+            } else {
+                Some(LanMeshConfig {
+                    listen: Some(mesh_addr.clone()),
+                    discovery: LanDiscovery::Mdns,
+                    directory:
+                        querymt_agent::agent::remote::mesh_runtime_config::DirectoryMode::default(),
+                })
+            },
             iroh_scopes,
             identity_file: None,
             request_timeout: DEFAULT_MESH_REQUEST_TIMEOUT,
@@ -677,14 +689,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(runtime) => {
                 let mesh = runtime.as_mesh_handle().clone();
                 eprintln!("Kameo mesh bootstrapped: peer_id={}", mesh.peer_id());
-                eprintln!("Mesh listening on: {}", mesh_addr);
-                if runtime_config.iroh_scopes.is_empty() {
-                    eprintln!("Mesh transports: LAN");
-                } else {
-                    eprintln!(
+                if runtime_config.lan.is_some() {
+                    eprintln!("Mesh listening on: {}", mesh_addr);
+                }
+                match (
+                    runtime_config.lan.is_some(),
+                    runtime_config.iroh_scopes.is_empty(),
+                ) {
+                    (true, true) => eprintln!("Mesh transports: LAN"),
+                    (true, false) => eprintln!(
                         "Mesh transports: LAN + {} stored/hosted Iroh scope(s)",
                         runtime_config.iroh_scopes.len()
-                    );
+                    ),
+                    (false, false) => eprintln!(
+                        "Mesh transports: Iroh ({} stored/hosted scope(s))",
+                        runtime_config.iroh_scopes.len()
+                    ),
+                    (false, true) => eprintln!("Mesh transports: none"),
                 }
 
                 if let Some(name) = &cli.mesh_invite {

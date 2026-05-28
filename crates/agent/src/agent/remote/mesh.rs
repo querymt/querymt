@@ -420,11 +420,8 @@ pub struct MeshHandle {
     /// `Arc<RwLock<..>>` for shared access from the mesh handle and
     /// the admission handler in `RemoteNodeManager`.
     invite_store: Option<Arc<RwLock<super::invite::InviteStore>>>,
-    /// Joiner-side membership store: persists tokens + cached peer addresses.
-    ///
-    /// `None` when the node never joined via an invite, or when the store
-    /// could not be loaded from disk.
-    membership_store: Option<Arc<RwLock<super::invite::MembershipStore>>>,
+    /// Unified mesh state store for joined/hosted scopes and reconnect peers.
+    mesh_state_store: Option<Arc<RwLock<super::mesh_state::MeshStateStore>>>,
     /// Active transport mode used by this mesh handle.
     transport_mode: MeshTransportMode,
     /// Channel for sending commands to the swarm event loop.
@@ -447,7 +444,7 @@ impl std::fmt::Debug for MeshHandle {
             .field("local_hostname", &self.local_hostname)
             .field("re_register_fns_count", &self.re_register_fns.read().len())
             .field("has_invite_store", &self.invite_store.is_some())
-            .field("has_membership_store", &self.membership_store.is_some())
+            .field("has_mesh_state_store", &self.mesh_state_store.is_some())
             .field("transport_mode", &self.transport_mode)
             .finish_non_exhaustive()
     }
@@ -463,7 +460,7 @@ impl MeshHandle {
         re_register_fns: Arc<RwLock<HashMap<String, ReRegisterFn>>>,
         keypair: libp2p::identity::Keypair,
         invite_store: Option<Arc<RwLock<super::invite::InviteStore>>>,
-        membership_store: Option<Arc<RwLock<super::invite::MembershipStore>>>,
+        mesh_state_store: Option<Arc<RwLock<super::mesh_state::MeshStateStore>>>,
         transport_mode: MeshTransportMode,
         swarm_cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
         stream_reconnect_grace: std::time::Duration,
@@ -476,7 +473,7 @@ impl MeshHandle {
             re_register_fns,
             keypair: Arc::new(keypair),
             invite_store,
-            membership_store,
+            mesh_state_store,
             transport_mode,
             swarm_cmd_tx,
             stream_reconnect_grace,
@@ -806,9 +803,9 @@ impl MeshHandle {
         // authoritative and guarantee scoped DHT names exist from startup.
         scopes.extend(self.config_scopes.read().iter().cloned());
 
-        // Union with persisted Iroh memberships (joins from invites).
-        if let Some(store) = &self.membership_store {
-            for mesh_id in store.read().mesh_ids() {
+        // Union with persisted Iroh mesh state (joined and hosted scopes).
+        if let Some(store) = &self.mesh_state_store {
+            for mesh_id in store.read().active_mesh_ids() {
                 let scope = MeshScopeId::Iroh { mesh_id };
                 if !scopes.contains(&scope) {
                     scopes.push(scope);
@@ -840,12 +837,12 @@ impl MeshHandle {
 
     /// Return joined Iroh scopes only (deterministic order).
     pub fn joined_iroh_scopes(&self) -> Vec<MeshScopeId> {
-        let Some(store) = &self.membership_store else {
+        let Some(store) = &self.mesh_state_store else {
             return Vec::new();
         };
         store
             .read()
-            .mesh_ids()
+            .active_mesh_ids()
             .into_iter()
             .map(|mesh_id| MeshScopeId::Iroh { mesh_id })
             .collect()
@@ -856,10 +853,10 @@ impl MeshHandle {
     /// This removes scope membership and asks the swarm loop to stop
     /// scope-associated reconnect attempts. It does not tear down the swarm.
     pub fn leave_iroh_scope(&self, mesh_id: &str) -> Result<bool, super::invite::InviteError> {
-        let Some(store) = &self.membership_store else {
+        let Some(store) = &self.mesh_state_store else {
             return Ok(false);
         };
-        let removed = store.write().remove_membership(mesh_id)?;
+        let removed = store.write().mark_left(mesh_id)?;
         if !removed {
             return Ok(false);
         }
@@ -961,22 +958,18 @@ impl MeshHandle {
         self.invite_store.as_ref()
     }
 
-    /// Return a reference to the membership store (if any).
-    pub fn membership_store(&self) -> Option<&Arc<RwLock<super::invite::MembershipStore>>> {
-        self.membership_store.as_ref()
+    /// Return a reference to the unified mesh state store (if any).
+    pub fn mesh_state_store(&self) -> Option<&Arc<RwLock<super::mesh_state::MeshStateStore>>> {
+        self.mesh_state_store.as_ref()
     }
 
-    /// Update the cached peer list for a mesh membership entry.
-    ///
-    /// Called from the swarm event loop whenever peers are discovered, so that
-    /// the joiner always has a fresh list for reconnection without the original
-    /// inviter.
-    pub fn update_membership_peers(&self, mesh_id: &str, peers: Vec<super::invite::PeerEntry>) {
-        if let Some(ref store) = self.membership_store
+    /// Update the cached peer list for a mesh entry.
+    pub fn update_mesh_state_peers(&self, mesh_id: &str, peers: Vec<super::invite::PeerEntry>) {
+        if let Some(ref store) = self.mesh_state_store
             && let Err(e) = store.write().update_known_peers(mesh_id, peers)
         {
             log::warn!(
-                "Failed to update membership peer cache for {}: {}",
+                "Failed to update mesh-state peer cache for {}: {}",
                 mesh_id,
                 e
             );
@@ -1227,11 +1220,11 @@ fn connection_route_plan(
     plan
 }
 
-fn refresh_membership_known_peers(
-    membership_store: &Option<Arc<RwLock<super::invite::MembershipStore>>>,
+fn refresh_mesh_state_known_peers(
+    mesh_state_store: &Option<Arc<RwLock<super::mesh_state::MeshStateStore>>>,
     routes: &RouteTable,
 ) {
-    let Some(ms) = membership_store.as_ref() else {
+    let Some(ms) = mesh_state_store.as_ref() else {
         return;
     };
 
@@ -1247,11 +1240,8 @@ fn refresh_membership_known_peers(
     let ms = Arc::clone(ms);
     tokio::spawn(async move {
         let mut store = ms.write();
-        for (mid, _) in store
-            .all()
-            .map(|(k, _)| (k.to_string(), ()))
-            .collect::<Vec<_>>()
-        {
+        let mesh_ids = store.active_mesh_ids();
+        for mid in mesh_ids {
             let _ = store.update_known_peers(&mid, peers.clone());
         }
     });
@@ -1337,32 +1327,6 @@ fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
         Protocol::P2p(peer_id) => Some(peer_id),
         _ => None,
     })
-}
-
-fn admitted_peer_ids_for_local_mesh(
-    store: &super::invite::InviteStore,
-    local_peer_id: &PeerId,
-    local_mesh_id: Option<&str>,
-) -> Vec<PeerId> {
-    let local_peer = local_peer_id.to_string();
-    let local_mesh_prefix = format!("{}:", local_peer);
-
-    store
-        .admitted_memberships()
-        .filter_map(|(_peer_id, token)| {
-            if token.admitted_by != local_peer {
-                return None;
-            }
-            if let Some(mesh_id) = local_mesh_id {
-                if token.mesh_id != mesh_id {
-                    return None;
-                }
-            } else if !token.mesh_id.starts_with(&local_mesh_prefix) {
-                return None;
-            }
-            token.peer_id.parse::<PeerId>().ok()
-        })
-        .collect()
 }
 
 fn reconnect_backoff_duration(attempt: u32) -> std::time::Duration {
@@ -1563,21 +1527,19 @@ fn finalize_bootstrap(
         }
     };
 
-    // Try to load or create the membership store at the default path.
-    let membership_store = match super::invite::default_membership_store_path() {
-        Ok(path) => match super::invite::MembershipStore::load_or_create(&path) {
+    // Try to load or create the unified mesh state store.
+    let mesh_state_store = match super::mesh_state::default_mesh_state_path() {
+        Ok(path) => match super::mesh_state::MeshStateStore::load_or_create(&path) {
             Ok(store) => Some(Arc::new(RwLock::new(store))),
             Err(e) => {
                 log::warn!(
-                    "Failed to load membership store: {e}; reconnection tokens will not be persisted"
+                    "Failed to load mesh state store: {e}; iroh state will not be persisted"
                 );
                 None
             }
         },
         Err(e) => {
-            log::warn!(
-                "Cannot determine membership store path: {e}; reconnection tokens will not be persisted"
-            );
+            log::warn!("Cannot determine mesh state path: {e}; iroh state will not be persisted");
             None
         }
     };
@@ -1590,7 +1552,7 @@ fn finalize_bootstrap(
         ctx.re_register_fns,
         ctx.keypair,
         invite_store,
-        membership_store,
+        mesh_state_store,
         transport_mode,
         swarm_cmd_tx,
         stream_reconnect_grace,
@@ -1807,17 +1769,12 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
         )
     });
 
-    // Load the membership store now so the event loop can update cached peers
-    // whenever new peers are discovered.  Failures are non-fatal.
-    let membership_store_loop: Option<Arc<RwLock<super::invite::MembershipStore>>> =
-        super::invite::default_membership_store_path()
+    // Load the unified mesh state store now so the event loop can update cached peers
+    // whenever new peers are discovered. Failures are non-fatal.
+    let mesh_state_store_loop: Option<Arc<RwLock<super::mesh_state::MeshStateStore>>> =
+        super::mesh_state::default_mesh_state_path()
             .ok()
-            .and_then(|p| super::invite::MembershipStore::load_or_create(&p).ok())
-            .map(|s| Arc::new(RwLock::new(s)));
-    let invite_store_loop: Option<Arc<RwLock<super::invite::InviteStore>>> =
-        super::invite::default_invite_store_path()
-            .ok()
-            .and_then(|p| super::invite::InviteStore::load_or_create(&p).ok())
+            .and_then(|p| super::mesh_state::MeshStateStore::load_or_create(&p).ok())
             .map(|s| Arc::new(RwLock::new(s)));
 
     // ── Build the iroh-backed libp2p transport ─────────────────────────────────
@@ -1930,33 +1887,20 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
         }
     }
 
-    if let Some(ref ms) = membership_store_loop {
+    if let Some(ref ms) = mesh_state_store_loop {
         let store = ms.read();
         if let Some(mesh_id) = local_mesh_id.as_deref() {
-            if let Some(membership) = store.get_membership(mesh_id) {
-                for peer in &membership.known_peers {
-                    if let Ok(pid) = peer.peer_id.parse::<PeerId>() {
-                        reconnect_targets.insert(pid);
-                    }
+            for peer in store.reconnect_peers_for_mesh(mesh_id) {
+                if let Ok(pid) = peer.peer_id.parse::<PeerId>() {
+                    reconnect_targets.insert(pid);
                 }
             }
         } else {
-            for (_, membership) in store.all() {
-                for peer in &membership.known_peers {
-                    if let Ok(pid) = peer.peer_id.parse::<PeerId>() {
-                        reconnect_targets.insert(pid);
-                    }
+            for (_, peer) in store.all_reconnect_peers() {
+                if let Ok(pid) = peer.peer_id.parse::<PeerId>() {
+                    reconnect_targets.insert(pid);
                 }
             }
-        }
-    }
-
-    if let Some(ref is) = invite_store_loop {
-        let store = is.read();
-        for pid in
-            admitted_peer_ids_for_local_mesh(&store, &local_peer_id, local_mesh_id.as_deref())
-        {
-            reconnect_targets.insert(pid);
         }
     }
 
@@ -2080,7 +2024,7 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
                         priority,
                     );
 
-                    refresh_membership_known_peers(&membership_store_loop, &routes_loop);
+                    refresh_mesh_state_known_peers(&mesh_state_store_loop, &routes_loop);
                 }
                 SwarmEvent::ConnectionClosed {
                     peer_id,
@@ -2286,19 +2230,13 @@ async fn bootstrap_composite_mesh(config: &MeshConfig) -> Result<MeshHandle, Mes
         )
     });
 
-    let membership_store_loop: Option<Arc<RwLock<super::invite::MembershipStore>>> =
-        super::invite::default_membership_store_path()
+    let mesh_state_store_loop: Option<Arc<RwLock<super::mesh_state::MeshStateStore>>> =
+        super::mesh_state::default_mesh_state_path()
             .ok()
-            .and_then(|p| super::invite::MembershipStore::load_or_create(&p).ok())
+            .and_then(|p| super::mesh_state::MeshStateStore::load_or_create(&p).ok())
             .map(|s| Arc::new(RwLock::new(s)));
 
-    let invite_store_loop: Option<Arc<RwLock<super::invite::InviteStore>>> =
-        super::invite::default_invite_store_path()
-            .ok()
-            .and_then(|p| super::invite::InviteStore::load_or_create(&p).ok())
-            .map(|s| Arc::new(RwLock::new(s)));
-
-    // Build reconnect targets from invite, bootstrap peers, membership, and admitted peers.
+    // Build reconnect targets from invite, bootstrap peers, and mesh state.
     let mut reconnect_targets: HashSet<PeerId> = HashSet::new();
 
     if let Some(ref invite) = config.invite
@@ -2315,33 +2253,20 @@ async fn bootstrap_composite_mesh(config: &MeshConfig) -> Result<MeshHandle, Mes
         }
     }
 
-    if let Some(ref ms) = membership_store_loop {
+    if let Some(ref ms) = mesh_state_store_loop {
         let store = ms.read();
         if let Some(mesh_id) = local_mesh_id.as_deref() {
-            if let Some(membership) = store.get_membership(mesh_id) {
-                for peer in &membership.known_peers {
-                    if let Ok(pid) = peer.peer_id.parse::<PeerId>() {
-                        reconnect_targets.insert(pid);
-                    }
+            for peer in store.reconnect_peers_for_mesh(mesh_id) {
+                if let Ok(pid) = peer.peer_id.parse::<PeerId>() {
+                    reconnect_targets.insert(pid);
                 }
             }
         } else {
-            for (_, membership) in store.all() {
-                for peer in &membership.known_peers {
-                    if let Ok(pid) = peer.peer_id.parse::<PeerId>() {
-                        reconnect_targets.insert(pid);
-                    }
+            for (_, peer) in store.all_reconnect_peers() {
+                if let Ok(pid) = peer.peer_id.parse::<PeerId>() {
+                    reconnect_targets.insert(pid);
                 }
             }
-        }
-    }
-
-    if let Some(ref is) = invite_store_loop {
-        let store = is.read();
-        for pid in
-            admitted_peer_ids_for_local_mesh(&store, &local_peer_id, local_mesh_id.as_deref())
-        {
-            reconnect_targets.insert(pid);
         }
     }
 
@@ -2477,7 +2402,7 @@ async fn bootstrap_composite_mesh(config: &MeshConfig) -> Result<MeshHandle, Mes
                             100,
                         );
 
-                        refresh_membership_known_peers(&membership_store_loop, &routes_loop);
+                        refresh_mesh_state_known_peers(&mesh_state_store_loop, &routes_loop);
                     }
                     SwarmEvent::ConnectionClosed {
                         peer_id,
@@ -2633,20 +2558,12 @@ pub async fn bootstrap_mesh_runtime(
         Vec::new()
     };
 
-    // ── Load membership / invite stores for iroh reconnect ──────────────────
-    let membership_store_loop: Option<Arc<RwLock<super::invite::MembershipStore>>> = if has_iroh {
-        super::invite::default_membership_store_path()
+    // ── Load unified mesh state store for iroh reconnect ──────────────────
+    let mesh_state_store_loop: Option<Arc<RwLock<super::mesh_state::MeshStateStore>>> = if has_iroh
+    {
+        super::mesh_state::default_mesh_state_path()
             .ok()
-            .and_then(|p| super::invite::MembershipStore::load_or_create(&p).ok())
-            .map(|s| Arc::new(RwLock::new(s)))
-    } else {
-        None
-    };
-
-    let invite_store_loop: Option<Arc<RwLock<super::invite::InviteStore>>> = if has_iroh {
-        super::invite::default_invite_store_path()
-            .ok()
-            .and_then(|p| super::invite::InviteStore::load_or_create(&p).ok())
+            .and_then(|p| super::mesh_state::MeshStateStore::load_or_create(&p).ok())
             .map(|s| Arc::new(RwLock::new(s)))
     } else {
         None
@@ -2875,36 +2792,17 @@ pub async fn bootstrap_mesh_runtime(
         }
     }
 
-    if let Some(ref ms) = membership_store_loop {
+    if let Some(ref ms) = mesh_state_store_loop {
         let store = ms.read();
-        for (mesh_id, membership) in store.all() {
-            for peer in &membership.known_peers {
+        for mesh_id in store.active_mesh_ids() {
+            for peer in store.reconnect_peers_for_mesh(&mesh_id) {
                 if let Ok(pid) = peer.peer_id.parse::<PeerId>() {
                     reconnect_targets.insert(pid);
                     reconnect_targets_by_scope
-                        .entry(mesh_id.to_string())
+                        .entry(mesh_id.clone())
                         .or_default()
                         .insert(pid);
                 }
-            }
-        }
-    }
-
-    if let Some(ref is) = invite_store_loop {
-        let store = is.read();
-        // Collect admitted peer IDs across all iroh scope mesh_ids
-        let mesh_ids: Vec<String> = config
-            .iroh_scopes
-            .iter()
-            .map(|s| s.mesh_id.clone())
-            .collect();
-        for mesh_id in &mesh_ids {
-            for pid in admitted_peer_ids_for_local_mesh(&store, &local_peer_id, Some(mesh_id)) {
-                reconnect_targets.insert(pid);
-                reconnect_targets_by_scope
-                    .entry(mesh_id.clone())
-                    .or_default()
-                    .insert(pid);
             }
         }
     }
@@ -3082,7 +2980,7 @@ pub async fn bootstrap_mesh_runtime(
                             );
                         }
 
-                        refresh_membership_known_peers(&membership_store_loop, &routes_loop);
+                        refresh_mesh_state_known_peers(&mesh_state_store_loop, &routes_loop);
                     }
                     SwarmEvent::ConnectionClosed {
                         peer_id,
@@ -3189,9 +3087,7 @@ pub async fn join_mesh_via_invite(
     invite: &super::invite::SignedInviteGrant,
     identity_file: Option<std::path::PathBuf>,
 ) -> Result<MeshHandle, MeshError> {
-    use super::invite::{
-        MembershipStore, MeshMembership, PeerEntry, default_membership_store_path, mesh_id_for,
-    };
+    use super::invite::{PeerEntry, mesh_id_for};
     use crate::agent::remote::node_manager::{AdmissionRequest, AdmissionResponse};
 
     // ── 1. Verify invite offline ──────────────────────────────────────────────
@@ -3205,18 +3101,27 @@ pub async fn join_mesh_via_invite(
     );
 
     // ── 2. Check for existing membership (reconnect vs first join) ────────────
-    let membership_path =
-        default_membership_store_path().map_err(|e| MeshError::SwarmError(e.to_string()))?;
-    let mut membership_store = MembershipStore::load_or_create(&membership_path)
+    let mesh_state_path = super::mesh_state::default_mesh_state_path()
+        .map_err(|e| MeshError::SwarmError(e.to_string()))?;
+    let mut mesh_state = super::mesh_state::MeshStateStore::load_or_create(&mesh_state_path)
         .map_err(|e| MeshError::SwarmError(e.to_string()))?;
 
-    let (existing_token, fallback_peers) = match membership_store.get_membership(&mesh_id) {
-        Some(m) if !m.token.is_expired() => {
+    let (existing_token, fallback_peers) = match mesh_state.get(&mesh_id) {
+        Some(entry)
+            if entry.status == super::mesh_state::MeshStatus::Active
+                && entry
+                    .membership_token
+                    .as_ref()
+                    .is_some_and(|token| !token.is_expired()) =>
+        {
             log::info!(
-                "Found existing membership for mesh '{}', attempting reconnect",
+                "Found existing mesh state for mesh '{}', attempting reconnect",
                 mesh_id
             );
-            (Some(m.token.clone()), m.known_peers.clone())
+            (
+                entry.membership_token.clone(),
+                entry.known_peers.values().cloned().collect(),
+            )
         }
         _ => (None, vec![]),
     };
@@ -3333,19 +3238,9 @@ pub async fn join_mesh_via_invite(
                 })
                 .collect();
 
-            membership_store
-                .store_membership(
-                    mesh_id.clone(),
-                    MeshMembership {
-                        token: membership_token,
-                        known_peers,
-                        last_connected: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                    },
-                )
-                .map_err(|e| MeshError::SwarmError(format!("failed to persist membership: {e}")))?;
+            mesh_state
+                .upsert_joined_mesh(membership_token, known_peers)
+                .map_err(|e| MeshError::SwarmError(format!("failed to persist mesh state: {e}")))?;
 
             let _ = mesh
                 .peer_events_tx
@@ -3370,10 +3265,10 @@ pub async fn join_mesh_via_invite(
                 }
             }
 
-            membership_store
-                .touch_last_connected(&mesh_id)
+            mesh_state
+                .update_known_peers(&mesh_id, fallback_peers.clone())
                 .map_err(|e| {
-                    MeshError::SwarmError(format!("failed to update membership timestamp: {e}"))
+                    MeshError::SwarmError(format!("failed to update mesh state timestamp: {e}"))
                 })?;
 
             let _ = mesh
@@ -3390,12 +3285,9 @@ pub async fn join_mesh_via_invite(
         }
     }
 
-    // ── 6. Seed the membership store into the mesh handle ─────────────────────
-    // The handle's membership_store was loaded from disk during finalize_bootstrap.
-    // Overwrite it with the now-updated in-memory store so future
-    // update_membership_peers() calls see the right mesh_id entry.
-    if let Some(ref store_arc) = mesh.membership_store {
-        let fresh = MembershipStore::load_or_create(&membership_path)
+    // ── 6. Seed the mesh state store into the mesh handle ─────────────────────
+    if let Some(ref store_arc) = mesh.mesh_state_store {
+        let fresh = super::mesh_state::MeshStateStore::load_or_create(&mesh_state_path)
             .map_err(|e| MeshError::SwarmError(e.to_string()))?;
         *store_arc.write() = fresh;
     }
@@ -3463,78 +3355,77 @@ fn resolve_local_hostname() -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::peer_id_from_multiaddr;
     use super::{
         MeshEvent, MeshHandle, MeshScopeId, MeshTransportKind, MeshTransportMode, RouteTable,
         SwarmCommand, connection_route_plan,
     };
-    use super::{admitted_peer_ids_for_local_mesh, peer_id_from_multiaddr};
     use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
-    fn admitted_peer_ids_filters_to_specific_local_mesh() {
+    fn reconnect_peers_for_mesh_filters_to_specific_local_mesh() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("invites.json");
-        let mut store = crate::agent::remote::invite::InviteStore::load_or_create(&path).unwrap();
+        let path = dir.path().join("mesh_state.json");
+        let mut store =
+            crate::agent::remote::mesh_state::MeshStateStore::load_or_create(&path).unwrap();
 
         let host_kp = libp2p::identity::Keypair::generate_ed25519();
         let host_peer_id = host_kp.public().to_peer_id().to_string();
 
-        let mesh_a = store
-            .create_invite(
-                &host_kp,
-                &host_peer_id,
+        let mesh_a_id = crate::agent::remote::invite::mesh_id_for(&host_peer_id, Some("mesh-a"));
+        store
+            .upsert_hosted_mesh(
+                mesh_a_id.clone(),
                 Some("mesh-a".to_string()),
-                None,
-                1,
-                crate::agent::remote::invite::InvitePermissions::default(),
+                Some("invite-a".to_string()),
             )
             .unwrap();
         let peer_a_kp = libp2p::identity::Keypair::generate_ed25519();
         let peer_a_id = peer_a_kp.public().to_peer_id().to_string();
-        store
-            .admit_peer(
-                &mesh_a.grant.invite_id,
-                &peer_a_id,
-                &host_kp,
-                Some("mesh-a"),
-            )
-            .unwrap();
+        let token_a = crate::agent::remote::invite::MembershipToken::issue(
+            mesh_a_id.clone(),
+            &peer_a_id,
+            &host_kp,
+            "invite-a".to_string(),
+            crate::agent::remote::invite::InvitePermissions::default(),
+            u64::MAX,
+        )
+        .unwrap();
+        store.add_admitted_peer(&mesh_a_id, token_a).unwrap();
 
-        let mesh_b = store
-            .create_invite(
-                &host_kp,
-                &host_peer_id,
+        let mesh_b_id = crate::agent::remote::invite::mesh_id_for(&host_peer_id, Some("mesh-b"));
+        store
+            .upsert_hosted_mesh(
+                mesh_b_id.clone(),
                 Some("mesh-b".to_string()),
-                None,
-                1,
-                crate::agent::remote::invite::InvitePermissions::default(),
+                Some("invite-b".to_string()),
             )
             .unwrap();
         let peer_b_kp = libp2p::identity::Keypair::generate_ed25519();
         let peer_b_id = peer_b_kp.public().to_peer_id().to_string();
-        store
-            .admit_peer(
-                &mesh_b.grant.invite_id,
-                &peer_b_id,
-                &host_kp,
-                Some("mesh-b"),
-            )
-            .unwrap();
+        let token_b = crate::agent::remote::invite::MembershipToken::issue(
+            mesh_b_id.clone(),
+            &peer_b_id,
+            &host_kp,
+            "invite-b".to_string(),
+            crate::agent::remote::invite::InvitePermissions::default(),
+            u64::MAX,
+        )
+        .unwrap();
+        store.add_admitted_peer(&mesh_b_id, token_b).unwrap();
 
-        let host_pid: libp2p::PeerId = host_peer_id.parse().unwrap();
-        let local_mesh_id =
-            crate::agent::remote::invite::mesh_id_for(&host_peer_id, Some("mesh-a"));
-        let local = admitted_peer_ids_for_local_mesh(&store, &host_pid, Some(&local_mesh_id));
+        let local_mesh_id = mesh_a_id;
+        let local = store.reconnect_peers_for_mesh(&local_mesh_id);
 
         assert_eq!(
             local.len(),
             1,
             "should include only local mesh admitted peers"
         );
-        assert_eq!(local[0].to_string(), peer_a_id);
+        assert_eq!(local[0].peer_id, peer_a_id);
     }
 
     #[test]
@@ -3556,9 +3447,9 @@ mod tests {
         tokio::sync::mpsc::UnboundedReceiver<SwarmCommand>,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let membership_path = dir.path().join("memberships.json");
-        let mut membership_store =
-            crate::agent::remote::invite::MembershipStore::load_or_create(&membership_path)
+        let mesh_state_path = dir.path().join("mesh_state.json");
+        let mut mesh_state =
+            crate::agent::remote::mesh_state::MeshStateStore::load_or_create(&mesh_state_path)
                 .unwrap();
 
         let host_kp = libp2p::identity::Keypair::generate_ed25519();
@@ -3574,16 +3465,7 @@ mod tests {
                 u64::MAX,
             )
             .unwrap();
-            membership_store
-                .store_membership(
-                    (*mesh_id).to_string(),
-                    crate::agent::remote::invite::MeshMembership {
-                        token,
-                        known_peers: Vec::new(),
-                        last_connected: 0,
-                    },
-                )
-                .unwrap();
+            mesh_state.upsert_joined_mesh(token, Vec::new()).unwrap();
         }
 
         let (peer_events_tx, peer_events_rx) = tokio::sync::broadcast::channel::<MeshEvent>(16);
@@ -3599,7 +3481,7 @@ mod tests {
             re_register_fns,
             host_kp,
             None,
-            Some(Arc::new(RwLock::new(membership_store))),
+            Some(Arc::new(RwLock::new(mesh_state))),
             MeshTransportMode::Composite,
             swarm_cmd_tx,
             Duration::from_secs(30),

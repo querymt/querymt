@@ -287,146 +287,6 @@ pub struct PeerEntry {
     pub addrs: Vec<String>,
 }
 
-/// One mesh that this node is a member of.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MeshMembership {
-    /// The signed membership certificate.
-    pub token: MembershipToken,
-    /// Peer addresses known at last disconnect — tried on reconnect.
-    pub known_peers: Vec<PeerEntry>,
-    /// Unix timestamp of last successful connection to this mesh.
-    pub last_connected: u64,
-}
-
-/// File-backed store at `~/.qmt/memberships.json`.
-///
-/// Persists membership tokens and cached peer addresses so a joining node can
-/// rejoin a mesh without re-presenting the original invite token — and without
-/// needing the original inviter to be online.
-pub struct MembershipStore {
-    path: PathBuf,
-    memberships: HashMap<String, MeshMembership>,
-}
-
-impl MembershipStore {
-    /// Load an existing store from disk, or create an empty one.
-    pub fn load_or_create(path: &Path) -> Result<Self, InviteError> {
-        if path.exists() {
-            let data = std::fs::read_to_string(path).map_err(|e| {
-                InviteError::StoreError(format!("failed to read {}: {e}", path.display()))
-            })?;
-            let memberships: HashMap<String, MeshMembership> = serde_json::from_str(&data)
-                .map_err(|e| {
-                    InviteError::StoreError(format!("failed to parse {}: {e}", path.display()))
-                })?;
-            Ok(Self {
-                path: path.to_path_buf(),
-                memberships,
-            })
-        } else {
-            Ok(Self {
-                path: path.to_path_buf(),
-                memberships: HashMap::new(),
-            })
-        }
-    }
-
-    /// Store or overwrite the membership for a mesh.
-    pub fn store_membership(
-        &mut self,
-        mesh_id: String,
-        membership: MeshMembership,
-    ) -> Result<(), InviteError> {
-        self.memberships.insert(mesh_id, membership);
-        self.save()
-    }
-
-    /// Look up an existing membership by mesh ID.
-    pub fn get_membership(&self, mesh_id: &str) -> Option<&MeshMembership> {
-        self.memberships.get(mesh_id)
-    }
-
-    /// Update the cached peer list for a mesh (called while connected).
-    pub fn update_known_peers(
-        &mut self,
-        mesh_id: &str,
-        peers: Vec<PeerEntry>,
-    ) -> Result<(), InviteError> {
-        if let Some(m) = self.memberships.get_mut(mesh_id) {
-            m.known_peers = peers;
-            m.last_connected = now_secs();
-            self.save()?;
-        }
-        Ok(())
-    }
-
-    /// Touch the `last_connected` timestamp for a mesh.
-    pub fn touch_last_connected(&mut self, mesh_id: &str) -> Result<(), InviteError> {
-        if let Some(m) = self.memberships.get_mut(mesh_id) {
-            m.last_connected = now_secs();
-            self.save()?;
-        }
-        Ok(())
-    }
-
-    /// Iterate all stored memberships.
-    pub fn all(&self) -> impl Iterator<Item = (&str, &MeshMembership)> {
-        self.memberships.iter().map(|(k, v)| (k.as_str(), v))
-    }
-
-    /// Remove the membership for a mesh ID.
-    ///
-    /// Returns `true` when an entry was removed.
-    pub fn remove_membership(&mut self, mesh_id: &str) -> Result<bool, InviteError> {
-        let removed = self.memberships.remove(mesh_id).is_some();
-        if removed {
-            self.save()?;
-        }
-        Ok(removed)
-    }
-
-    /// Return all joined mesh IDs in deterministic order.
-    pub fn mesh_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.memberships.keys().cloned().collect();
-        ids.sort();
-        ids
-    }
-
-    fn save(&self) -> Result<(), InviteError> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                InviteError::StoreError(format!(
-                    "failed to create directory {}: {e}",
-                    parent.display()
-                ))
-            })?;
-        }
-        let json = serde_json::to_string_pretty(&self.memberships)
-            .map_err(|e| InviteError::StoreError(format!("serialization failed: {e}")))?;
-        std::fs::write(&self.path, json).map_err(|e| {
-            InviteError::StoreError(format!("failed to write {}: {e}", self.path.display()))
-        })
-    }
-}
-
-/// Return the default membership store path: `<config_dir>/memberships.json`.
-///
-/// Respects `QMT_CONFIG_DIR` / `QMT_HOME` env vars, falling back to `~/.qmt`.
-pub fn default_membership_store_path() -> Result<PathBuf, InviteError> {
-    let cfg_dir = querymt_utils::providers::config_dir()
-        .map_err(|e| InviteError::StoreError(format!("cannot determine config dir: {e}")))?;
-    Ok(cfg_dir.join("memberships.json"))
-}
-
-/// Return the default admitted-peers store path: `<config_dir>/admitted_peers.json`.
-///
-/// Respects `QMT_CONFIG_DIR` / `QMT_HOME` env vars, falling back to `~/.qmt`.
-pub fn default_admitted_peers_path() -> Result<PathBuf, InviteError> {
-    let cfg_dir = querymt_utils::providers::config_dir()
-        .map_err(|e| InviteError::StoreError(format!("cannot determine config dir: {e}")))?;
-    Ok(cfg_dir.join("admitted_peers.json"))
-}
-
 /// Errors that can occur when working with invite tokens.
 #[derive(Debug, thiserror::Error)]
 pub enum InviteError {
@@ -812,38 +672,21 @@ pub struct InviteRecord {
 /// File-backed invite store at `~/.qmt/invites.json`.
 ///
 /// Tracks all invites created by this host for audit, use-limit enforcement,
-/// and revocation.  Admitted peers are persisted separately in
-/// `~/.qmt/admitted_peers.json` so the two files can evolve independently.
+/// and revocation.
 pub struct InviteStore {
     /// Path to `invites.json`.
     path: PathBuf,
     records: HashMap<String, InviteRecord>,
-    /// Path to `admitted_peers.json` — sidecar file for membership tokens.
-    admitted_path: PathBuf,
-    /// Membership tokens keyed by the joiner's PeerId string.
-    admitted_peers: HashMap<String, MembershipToken>,
 }
 
 impl InviteStore {
-    /// Load (or create) both `invites.json` and `admitted_peers.json`.
+    /// Load (or create) `invites.json`.
     pub fn load_or_create(path: &Path) -> Result<Self, InviteError> {
-        // Derive the sidecar path from the primary path's parent directory.
-        let admitted_path = path
-            .parent()
-            .ok_or_else(|| {
-                InviteError::StoreError("invite store path has no parent directory".to_string())
-            })?
-            .join("admitted_peers.json");
-
         let records = load_json_file::<HashMap<String, InviteRecord>>(path)?.unwrap_or_default();
-        let admitted_peers =
-            load_json_file::<HashMap<String, MembershipToken>>(&admitted_path)?.unwrap_or_default();
 
         Ok(Self {
             path: path.to_path_buf(),
             records,
-            admitted_path,
-            admitted_peers,
         })
     }
 
@@ -894,7 +737,7 @@ impl InviteStore {
     /// 1. Checks the invite is valid (not revoked, not expired, uses remaining).
     /// 2. Decrements `uses_remaining` (marking `Consumed` when it hits zero).
     /// 3. Signs a `MembershipToken` with the host's keypair.
-    /// 4. Persists the token to `admitted_peers.json`.
+    /// 4. Returns the token for the caller to persist into mesh state.
     ///
     /// The returned token is self-contained — any mesh member can verify it
     /// without contacting the issuer.
@@ -955,23 +798,7 @@ impl InviteStore {
             expires_at,
         )?;
 
-        self.admitted_peers
-            .insert(joiner_peer_id.to_string(), token.clone());
-        self.save_admitted()?;
-
         Ok(token)
-    }
-
-    /// Look up a previously admitted peer by their PeerId.
-    pub fn is_peer_admitted(&self, peer_id: &str) -> Option<&MembershipToken> {
-        self.admitted_peers.get(peer_id)
-    }
-
-    /// Iterate all admitted peers and their membership tokens.
-    pub fn admitted_memberships(&self) -> impl Iterator<Item = (&str, &MembershipToken)> {
-        self.admitted_peers
-            .iter()
-            .map(|(peer_id, token)| (peer_id.as_str(), token))
     }
 
     /// Verify a membership token presented by a reconnecting peer.
@@ -1048,10 +875,6 @@ impl InviteStore {
 
     fn save_records(&self) -> Result<(), InviteError> {
         save_json_file(&self.path, &self.records)
-    }
-
-    fn save_admitted(&self) -> Result<(), InviteError> {
-        save_json_file(&self.admitted_path, &self.admitted_peers)
     }
 }
 
@@ -1742,51 +1565,6 @@ mod tests {
 
         // Invite is now consumed.
         assert_eq!(store.records[&invite_id].status, InviteStatus::Consumed);
-
-        // Admitted peer is persisted.
-        assert!(store.is_peer_admitted(&joiner_peer_id).is_some());
-
-        // Sidecar file exists on disk.
-        assert!(dir.path().join("admitted_peers.json").exists());
-    }
-
-    #[cfg(feature = "remote")]
-    #[test]
-    fn admitted_memberships_lists_all_admitted_peers() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("invites.json");
-        let mut store = InviteStore::load_or_create(&path).unwrap();
-
-        let host_kp = libp2p::identity::Keypair::generate_ed25519();
-        let host_peer_id = host_kp.public().to_peer_id().to_string();
-
-        let signed = store
-            .create_invite(
-                &host_kp,
-                &host_peer_id,
-                Some("Mesh".to_string()),
-                None,
-                2,
-                InvitePermissions::default(),
-            )
-            .unwrap();
-        let invite_id = signed.grant.invite_id.clone();
-
-        store
-            .admit_peer(&invite_id, "peer-A", &host_kp, Some("Mesh"))
-            .unwrap();
-        store
-            .admit_peer(&invite_id, "peer-B", &host_kp, Some("Mesh"))
-            .unwrap();
-
-        let admitted: std::collections::HashSet<String> = store
-            .admitted_memberships()
-            .map(|(peer_id, _)| peer_id.to_string())
-            .collect();
-
-        assert_eq!(admitted.len(), 2);
-        assert!(admitted.contains("peer-A"));
-        assert!(admitted.contains("peer-B"));
     }
 
     #[cfg(feature = "remote")]
@@ -1887,103 +1665,5 @@ mod tests {
             mesh_id_for(&host_peer_id, Some("named-mesh")),
             "named invites must issue tokens for the named mesh"
         );
-    }
-
-    // ── MembershipStore tests ──────────────────────────────────────────────────
-
-    #[cfg(feature = "remote")]
-    #[test]
-    fn membership_store_persistence_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("memberships.json");
-
-        let kp = libp2p::identity::Keypair::generate_ed25519();
-        let joiner_kp = libp2p::identity::Keypair::generate_ed25519();
-        let admitter_peer_id = kp.public().to_peer_id().to_string();
-        let joiner_peer_id = joiner_kp.public().to_peer_id().to_string();
-
-        let mid = mesh_id_for(&admitter_peer_id, Some("Persist"));
-        let token = MembershipToken::issue(
-            mid.clone(),
-            &joiner_peer_id,
-            &kp,
-            "inv".to_string(),
-            InvitePermissions::default(),
-            0,
-        )
-        .unwrap();
-
-        {
-            let mut store = MembershipStore::load_or_create(&path).unwrap();
-            store
-                .store_membership(
-                    mid.clone(),
-                    MeshMembership {
-                        token: token.clone(),
-                        known_peers: vec![PeerEntry {
-                            peer_id: admitter_peer_id.clone(),
-                            addrs: vec!["/p2p/12D3KooWXXX".to_string()],
-                        }],
-                        last_connected: 9999,
-                    },
-                )
-                .unwrap();
-        }
-
-        let store2 = MembershipStore::load_or_create(&path).unwrap();
-        let m = store2.get_membership(&mid).unwrap();
-        assert_eq!(m.token, token);
-        assert_eq!(m.known_peers.len(), 1);
-        assert_eq!(m.last_connected, 9999);
-    }
-
-    #[cfg(feature = "remote")]
-    #[test]
-    fn membership_store_update_known_peers() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("memberships.json");
-
-        let kp = libp2p::identity::Keypair::generate_ed25519();
-        let joiner_kp = libp2p::identity::Keypair::generate_ed25519();
-        let admitter_peer_id = kp.public().to_peer_id().to_string();
-        let joiner_peer_id = joiner_kp.public().to_peer_id().to_string();
-
-        let mid = mesh_id_for(&admitter_peer_id, None);
-        let token = MembershipToken::issue(
-            mid.clone(),
-            &joiner_peer_id,
-            &kp,
-            "inv".to_string(),
-            InvitePermissions::default(),
-            0,
-        )
-        .unwrap();
-
-        let mut store = MembershipStore::load_or_create(&path).unwrap();
-        store
-            .store_membership(
-                mid.clone(),
-                MeshMembership {
-                    token,
-                    known_peers: vec![],
-                    last_connected: 0,
-                },
-            )
-            .unwrap();
-
-        let new_peers = vec![
-            PeerEntry {
-                peer_id: "peer-C".to_string(),
-                addrs: vec![],
-            },
-            PeerEntry {
-                peer_id: "peer-D".to_string(),
-                addrs: vec![],
-            },
-        ];
-        store.update_known_peers(&mid, new_peers.clone()).unwrap();
-
-        let m = store.get_membership(&mid).unwrap();
-        assert_eq!(m.known_peers, new_peers);
     }
 }
