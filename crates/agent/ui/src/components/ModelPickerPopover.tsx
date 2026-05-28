@@ -29,6 +29,8 @@ interface ModelPickerPopoverProps {
   sessionsByAgent: Record<string, string>;
   agents: UiAgentInfo[];
   allModels: ModelEntry[];
+  modelsRefreshing?: boolean;
+  modelsLoadedOnce?: boolean;
   currentProvider?: string;
   currentModel?: string;
   /** Mesh node running the current provider, if any. Absent for local providers. */
@@ -162,6 +164,8 @@ interface ModelPickerPanelProps {
   sessionsByAgent: Record<string, string>;
   agents: UiAgentInfo[];
   allModels: ModelEntry[];
+  modelsRefreshing?: boolean;
+  modelsLoadedOnce?: boolean;
   currentProvider?: string;
   currentModel?: string;
   currentNode?: string;
@@ -190,6 +194,8 @@ const ModelPickerPanel = memo(function ModelPickerPanel({
   sessionsByAgent,
   agents,
   allModels,
+  modelsRefreshing = false,
+  modelsLoadedOnce = false,
   currentProvider,
   currentModel,
   currentNode,
@@ -553,10 +559,16 @@ const ModelPickerPanel = memo(function ModelPickerPanel({
         <Command.List ref={commandListRef} className="flex-1 overflow-y-auto px-1 py-1 max-h-[240px]">
           {allModels.length === 0 ? (
             <Command.Loading className="px-3 py-6 text-center text-xs text-ui-muted">
-              Loading models...
+              {modelsRefreshing ? 'Refreshing models...' : modelsLoadedOnce ? 'No models available' : 'Loading models...'}
             </Command.Loading>
           ) : (
             <>
+              {/* Show refresh indicator when models are being refreshed */}
+              {modelsRefreshing && (
+                <div className="px-3 py-1.5 text-center text-[10px] text-ui-muted animate-pulse">
+                  Refreshing model list...
+                </div>
+              )}
               <Command.Empty className="px-3 py-6 text-center text-xs text-ui-muted">
                 No models match your search
               </Command.Empty>
@@ -692,6 +704,8 @@ export const ModelPickerPopover = memo(function ModelPickerPopover({
   sessionsByAgent,
   agents,
   allModels,
+  modelsRefreshing = false,
+  modelsLoadedOnce = false,
   currentProvider,
   currentModel,
   currentNode,
@@ -733,6 +747,8 @@ export const ModelPickerPopover = memo(function ModelPickerPopover({
     sessionsByAgent,
     agents,
     allModels,
+    modelsRefreshing,
+    modelsLoadedOnce,
     currentProvider,
     currentModel,
     currentNode,

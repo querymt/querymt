@@ -178,6 +178,8 @@ export function useUiClient() {
   // Mark as loaded whenever we receive a non-empty session list
   if (sessionGroups.length > 0) sessionGroupsLoadedRef.current = true;
   const [allModels, setAllModels] = useState<ModelEntry[]>([]);
+  const [modelsRefreshing, setModelsRefreshing] = useState<boolean>(false);
+  const [modelsLoadedOnce, setModelsLoadedOnce] = useState<boolean>(false);
   const [providerCapabilities, setProviderCapabilities] = useState<Record<string, ProviderCapabilityEntry>>({});
   const [recentModelsByWorkspace, setRecentModelsByWorkspace] = useState<Record<string, RecentModelEntry[]>>({});
   const [authProviders, setAuthProviders] = useState<AuthProviderEntry[]>([]);
@@ -1099,6 +1101,9 @@ export function useUiClient() {
       case 'all_models_list': {
         const d = msg.data;
         setAllModels(d.models);
+        setModelsLoadedOnce(true);
+        // An all_models_list message means a refresh cycle completed.
+        setModelsRefreshing(false);
         break;
       }
       case 'provider_capabilities': {
@@ -1569,6 +1574,7 @@ export function useUiClient() {
   }, []);
 
   const refreshAllModels = useCallback(() => {
+    setModelsRefreshing(true);
     sendMessage({ type: 'list_all_models', data: { refresh: true } });
   }, []);
 
@@ -1971,6 +1977,8 @@ export function useUiClient() {
     sessionChildrenLoading,
     sessionsEverLoaded,
     allModels,
+    modelsRefreshing,
+    modelsLoadedOnce,
     providerCapabilities,
     modelDownloads,
     recentModelsByWorkspace,

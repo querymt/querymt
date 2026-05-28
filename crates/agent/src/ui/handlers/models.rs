@@ -183,23 +183,22 @@ pub async fn handle_set_auth_method(
 
 /// Handle model listing request using the shared `ModelInventory`.
 ///
-/// When `refresh` is requested or the snapshot is empty, triggers a background
-/// refresh and **waits** for it to complete (up to 5 s) so the UI receives
-/// populated data instead of a transiently-empty snapshot.
+/// Returns the current snapshot immediately and triggers a background refresh
+/// when `refresh` is requested or the snapshot is empty. The global UI-server
+/// broadcast loop (see `UiServer::router`) will push the updated model list to
+/// all connected clients once the refresh completes.
 pub async fn handle_list_all_models(state: &ServerState, refresh: bool, tx: &mpsc::Sender<String>) {
-    let (models, _meta) = state.agent.model_inventory.get_snapshot().await;
+    let (models, _) = state.agent.model_inventory.get_snapshot().await;
 
     let needs_refresh = refresh || models.is_empty();
 
     if needs_refresh {
         // trigger_refresh() is idempotent — if a refresh is already in progress
         // it returns a handle to the *existing* cycle, so we never duplicate work.
-        let handle = state.agent.model_inventory.trigger_refresh().await;
-        let timeout = std::time::Duration::from_secs(5);
-        let _ = tokio::time::timeout(timeout, handle.wait()).await;
+        // We do NOT wait here — the global broadcast loop will push updated
+        // models to all clients once the refresh completes.
+        let _ = state.agent.model_inventory.trigger_refresh().await;
     }
-
-    let models = state.agent.model_inventory.get_all_models().await;
 
     let _ = send_message(tx, UiServerMessage::AllModelsList { models }).await;
     let capabilities = fetch_provider_capabilities(state).await;

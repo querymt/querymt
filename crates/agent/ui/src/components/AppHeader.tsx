@@ -42,6 +42,8 @@ interface AppHeaderProps {
   sessionsByAgent: Record<string, string>;
   agents: UiAgentInfo[];
   allModels: any;
+  modelsRefreshing: boolean;
+  modelsLoadedOnce: boolean;
   activeAgentModel: { provider?: string; model?: string; node?: string } | undefined;
   remoteNodes: any;
   currentWorkspace: string | null;
@@ -194,6 +196,8 @@ export function AppHeader(props: AppHeaderProps) {
                 sessionsByAgent={props.sessionsByAgent}
                 agents={props.agents}
                 allModels={props.allModels}
+                modelsRefreshing={props.modelsRefreshing}
+                modelsLoadedOnce={props.modelsLoadedOnce}
                 currentProvider={activeAgentModel?.provider}
                 currentModel={activeAgentModel?.model}
                 currentNode={activeAgentModel?.node}

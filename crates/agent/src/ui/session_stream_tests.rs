@@ -174,6 +174,7 @@ async fn forwarder_drops_event_when_seq_is_at_or_below_cursor() -> Result<()> {
         event_sources: vec![fanout.clone()],
         profiles: None,
         connections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        connection_senders: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         session_agents: Arc::new(tokio::sync::Mutex::new(HashMap::from([(
             session_id.clone(),
             super::session::PRIMARY_AGENT_ID.to_string(),
@@ -304,6 +305,7 @@ async fn forwarder_picks_up_lazily_materialized_profile_runtime_events() -> Resu
         event_sources: vec![],
         profiles: Some(profiles.clone()),
         connections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        connection_senders: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         session_agents: Arc::new(tokio::sync::Mutex::new(HashMap::from([(
             session_id.clone(),
             super::session::PRIMARY_AGENT_ID.to_string(),
@@ -412,6 +414,7 @@ async fn forwarder_does_not_drop_ephemeral_events_despite_cursor() -> Result<()>
         event_sources: vec![fanout.clone()],
         profiles: None,
         connections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        connection_senders: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         session_agents: Arc::new(tokio::sync::Mutex::new(HashMap::from([(
             session_id.clone(),
             super::session::PRIMARY_AGENT_ID.to_string(),
