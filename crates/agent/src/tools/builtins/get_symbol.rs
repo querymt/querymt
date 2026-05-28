@@ -162,12 +162,37 @@ impl Tool for GetSymbolTool {
 }
 
 /// Parse explicit symbol read requests.
+/// Handles the common case where LLMs pass a single object instead of an array.
 fn parse_requests(args: &Value) -> Result<Vec<SymbolRequest>, ToolError> {
-    let requests = args
+    let requests_value = args
         .get("requests")
-        .and_then(Value::as_array)
-        .ok_or_else(|| ToolError::InvalidRequest("requests must be an array".to_string()))?;
+        .ok_or_else(|| ToolError::InvalidRequest("requests parameter is required".to_string()))?;
 
+    // Auto-detect: if requests is an object instead of an array, wrap it in an array.
+    // This handles the common LLM mistake of passing {"path": "...", "symbol": "..."}
+    // instead of [{"path": "...", "symbol": "..."}].
+    if requests_value.is_object() {
+        let single_request = vec![requests_value];
+        return parse_request_array(&single_request);
+    }
+
+    let requests = requests_value.as_array().ok_or_else(|| {
+        ToolError::InvalidRequest(
+            "requests must be an array of objects or a single object".to_string(),
+        )
+    })?;
+
+    if requests.is_empty() {
+        return Err(ToolError::InvalidRequest(
+            "requests must include at least one entry".to_string(),
+        ));
+    }
+
+    parse_request_array(&requests.iter().collect::<Vec<_>>())
+}
+
+/// Parse an array of request values into SymbolRequest objects.
+fn parse_request_array(requests: &[&Value]) -> Result<Vec<SymbolRequest>, ToolError> {
     if requests.is_empty() {
         return Err(ToolError::InvalidRequest(
             "requests must include at least one entry".to_string(),
@@ -702,5 +727,29 @@ mod tests {
 
         assert!(result.contains("Config::validate kind=method"));
         assert!(result.contains("00002|   def validate"));
+    }
+
+    #[tokio::test]
+    async fn auto_wraps_object_request_in_array() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("lib.rs");
+        tokio::fs::write(&path, "struct Config {\n    name: String,\n}\n")
+            .await
+            .unwrap();
+        let context =
+            AgentToolContext::basic("session".to_string(), Some(dir.path().to_path_buf()));
+        let tool = GetSymbolTool::new();
+
+        // Test the common LLM mistake: passing requests as object instead of array
+        let result = text_content(
+            tool.call(
+                json!({"requests": {"path": "lib.rs", "symbol": "Config", "kind": "struct"}, "root": dir.path()}),
+                &context,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(result.contains("kind=struct"));
+        assert!(result.contains("00001| struct Config"));
     }
 }
