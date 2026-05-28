@@ -365,18 +365,20 @@ impl SessionRegistry {
         self.sessions.is_empty()
     }
 
-    /// Return `(session_id, peer_label)` pairs for all remote sessions.
+    /// Return `(session_id, peer_label, remote_node_id)` tuples for all remote sessions.
     ///
     /// Used by the UI session-list handler to include remote sessions in the
     /// session picker alongside local (persisted) sessions.
     #[cfg(feature = "remote")]
-    pub fn remote_sessions(&self) -> Vec<(String, String)> {
+    pub fn remote_sessions(&self) -> Vec<(String, String, Option<String>)> {
         self.sessions
             .iter()
             .filter_map(|(id, r)| match r {
-                SessionActorRef::Remote { peer_label, .. } => {
-                    Some((id.clone(), peer_label.clone()))
-                }
+                SessionActorRef::Remote {
+                    peer_label,
+                    remote_node_id,
+                    ..
+                } => Some((id.clone(), peer_label.clone(), remote_node_id.clone())),
                 SessionActorRef::Local(_) => None,
             })
             .collect()
@@ -423,6 +425,7 @@ impl SessionRegistry {
         let session_ref = SessionActorRef::Remote {
             actor_ref: remote_ref,
             peer_label: peer_label.clone(),
+            remote_node_id: remote_node_id.clone(),
         };
 
         // 2. Spawn a local EventRelayActor for this session.

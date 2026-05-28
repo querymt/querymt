@@ -62,78 +62,63 @@ pub async fn prompt_for_mode(
         RoutingMode::Single => {
             let agent_id = current_active_agent(state, conn_id).await?;
             let session_id = ensure_session(state, conn_id, &agent_id, cwd, tx, None, None).await?;
-            let profile_id = resolve_profile_id_for_session(state, Some(&session_id), None).await?;
-            let agent = agent_for_profile_and_id(state, profile_id.as_deref(), &agent_id).await?;
-            let session_cwd = session_cwd_for(state, &session_id).await.or(cwd.cloned());
-            let session_ref =
-                session_ref_for_profile(state, profile_id.as_deref(), &session_id).await;
-            let prompt_blocks = super::mentions::build_prompt_blocks(
-                &state.workspace_manager,
-                session_cwd.as_ref(),
-                prompt,
-                session_ref.as_ref(),
-            )
-            .await;
-            let prompt_target = session_ref
-                .as_ref()
-                .map(|sr| {
-                    if sr.is_remote() {
-                        format!("remote node '{}'", sr.node_label())
-                    } else {
-                        "local session".to_string()
-                    }
-                })
-                .unwrap_or_else(|| "unresolved session".to_string());
-            send_prompt(agent, session_id, prompt_blocks, &prompt_target).await?;
+            prompt_session(state, &session_id, prompt, cwd).await?;
         }
         RoutingMode::Broadcast => {
             let agent_ids = list_agent_ids(state);
             for agent_id in agent_ids {
                 let session_id =
                     ensure_session(state, conn_id, &agent_id, cwd, tx, None, None).await?;
-                let profile_id =
-                    resolve_profile_id_for_session(state, Some(&session_id), None).await?;
-                let agent =
-                    agent_for_profile_and_id(state, profile_id.as_deref(), &agent_id).await?;
-                let session_cwd = session_cwd_for(state, &session_id).await.or(cwd.cloned());
-                let session_ref =
-                    session_ref_for_profile(state, profile_id.as_deref(), &session_id).await;
-                let prompt_blocks = super::mentions::build_prompt_blocks(
-                    &state.workspace_manager,
-                    session_cwd.as_ref(),
-                    prompt,
-                    session_ref.as_ref(),
-                )
-                .await;
-                let prompt_target = session_ref
-                    .as_ref()
-                    .map(|sr| {
-                        if sr.is_remote() {
-                            format!("remote node '{}'", sr.node_label())
-                        } else {
-                            "local session".to_string()
-                        }
-                    })
-                    .unwrap_or_else(|| "unresolved session".to_string());
-                send_prompt(agent, session_id, prompt_blocks, &prompt_target).await?;
+                prompt_session(state, &session_id, prompt, cwd).await?;
             }
         }
     }
     Ok(())
 }
 
-/// Send a prompt to a specific agent session.
+async fn prompt_session(
+    state: &ServerState,
+    session_id: &str,
+    prompt: &[UiPromptBlock],
+    cwd: Option<&PathBuf>,
+) -> Result<(), String> {
+    let session_ref = session_ref_for_session(state, session_id)
+        .await
+        .ok_or_else(|| {
+            format_prompt_error(session_id, "unresolved session", "session not found")
+        })?;
+    let session_cwd = session_cwd_for(state, session_id).await.or(cwd.cloned());
+    let prompt_blocks = super::mentions::build_prompt_blocks(
+        &state.workspace_manager,
+        session_cwd.as_ref(),
+        prompt,
+        Some(&session_ref),
+    )
+    .await;
+    let prompt_target = prompt_target_for_session_ref(&session_ref);
+    send_prompt(session_ref, session_id, prompt_blocks, &prompt_target).await
+}
+
+fn prompt_target_for_session_ref(session_ref: &SessionActorRef) -> String {
+    if session_ref.is_remote() {
+        format!("remote node '{}'", session_ref.node_label())
+    } else {
+        "local session".to_string()
+    }
+}
+
+/// Send a prompt to a specific session actor.
 async fn send_prompt(
-    agent: Arc<dyn AgentHandleTrait>,
-    session_id: String,
+    session_ref: SessionActorRef,
+    session_id: &str,
     prompt: Vec<ContentBlock>,
     prompt_target: &str,
 ) -> Result<(), String> {
-    let request = PromptRequest::new(session_id.clone(), prompt);
-    agent
+    let request = PromptRequest::new(session_id.to_string(), prompt);
+    session_ref
         .prompt(request)
         .await
-        .map_err(|err| format_prompt_error(&session_id, prompt_target, &err.message))?;
+        .map_err(|err| format_prompt_error(session_id, prompt_target, &err.message))?;
     Ok(())
 }
 
@@ -161,6 +146,17 @@ pub async fn ensure_session(
             .and_then(|conn| conn.sessions.get(agent_id).cloned())
     };
     if let Some(session_id) = &existing {
+        let root_session_ref = {
+            let registry = state.agent.registry.lock().await;
+            registry.get(session_id).cloned()
+        };
+        if root_session_ref
+            .as_ref()
+            .is_some_and(SessionActorRef::is_remote)
+        {
+            return Ok(session_id.clone());
+        }
+
         // Verify the session still exists in the registry.
         // After a force-stop the session is removed, making the binding stale.
         let existing_profile_id =
@@ -445,10 +441,24 @@ pub async fn session_ref_for_session(
     state: &ServerState,
     session_id: &str,
 ) -> Option<SessionActorRef> {
+    let root_session_ref = {
+        let registry = state.agent.registry.lock().await;
+        registry.get(session_id).cloned()
+    };
+
+    if root_session_ref
+        .as_ref()
+        .is_some_and(SessionActorRef::is_remote)
+    {
+        return root_session_ref;
+    }
+
     let profile_id = resolve_profile_id_for_session(state, Some(session_id), None)
         .await
         .ok()?;
-    session_ref_for_profile(state, profile_id.as_deref(), session_id).await
+    session_ref_for_profile(state, profile_id.as_deref(), session_id)
+        .await
+        .or(root_session_ref)
 }
 
 pub async fn default_mode_for_session(state: &ServerState, session_id: Option<&str>) -> AgentMode {
@@ -583,15 +593,26 @@ pub fn collect_event_sources(
 #[cfg(test)]
 mod tests {
     use super::{
-        default_mode_for_session, default_reasoning_effort_for_session, format_prompt_error,
-        resolve_profile_id_for_session,
+        PRIMARY_AGENT_ID, default_mode_for_session, default_reasoning_effort_for_session,
+        ensure_session, format_prompt_error, prompt_for_mode, resolve_profile_id_for_session,
+        session_ref_for_session,
     };
     use crate::agent::core::AgentMode;
     use crate::api::AgentInfra;
     use crate::profiles::{LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager};
     use crate::test_utils::{TestServerState, empty_plugin_registry};
+    use crate::ui::messages::UiPromptBlock;
+    #[cfg(feature = "remote")]
+    use crate::{
+        agent::SessionActor, agent::core::SessionRuntime,
+        agent::remote::test_helpers::fixtures::get_test_mesh,
+    };
+    #[cfg(feature = "remote")]
+    use kameo::actor::Spawn;
     use std::path::Path;
     use std::sync::Arc;
+    #[cfg(feature = "remote")]
+    use uuid::Uuid;
 
     fn write_profile(dir: &Path, name: &str) {
         std::fs::write(
@@ -711,6 +732,143 @@ system = "inline"
         assert_eq!(
             default_reasoning_effort_for_session(&fixture.state, Some("session-1")).await,
             Some(querymt::chat::ReasoningEffort::Low)
+        );
+    }
+
+    #[cfg(feature = "remote")]
+    async fn attach_test_remote_session(fixture: &TestServerState, session_id: &str) {
+        let mesh = get_test_mesh().await.clone();
+        let runtime = SessionRuntime::new(
+            None,
+            Default::default(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let actor = SessionActor::new(
+            fixture.agent.config.clone(),
+            session_id.to_string(),
+            runtime,
+        )
+        .with_mesh(Some(mesh.clone()));
+        let local_ref = SessionActor::spawn(actor);
+        let dht_name = crate::agent::remote::scope::scoped_session(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            session_id,
+        );
+        mesh.register_actor(local_ref, dht_name.clone()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let remote_ref = mesh
+            .lookup_actor::<SessionActor>(&dht_name)
+            .await
+            .expect("DHT lookup should succeed")
+            .expect("remote actor should be available");
+
+        fixture
+            .agent
+            .handle
+            .attach_remote_session(
+                session_id.to_string(),
+                remote_ref,
+                "remote-peer".to_string(),
+                None,
+                None,
+            )
+            .await;
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn session_ref_for_session_prefers_root_remote_actor_over_local_profile_runtime() {
+        let (fixture, profiles, _dir) = profile_fixture().await;
+        let session_id = format!("remote-profile-{}", Uuid::now_v7());
+        attach_test_remote_session(&fixture, &session_id).await;
+
+        profiles
+            .bind_session_to_profile(&session_id, "alpha")
+            .await
+            .expect("session should bind to active local profile");
+        profiles
+            .set_active_profile("beta")
+            .await
+            .expect("beta should become active for new sessions");
+
+        let session_ref = session_ref_for_session(&fixture.state, &session_id)
+            .await
+            .expect("remote session should resolve");
+        assert!(session_ref.is_remote());
+        assert_eq!(session_ref.node_label(), "remote-peer");
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn ensure_session_reuses_attached_remote_session_without_profile_runtime() {
+        let (fixture, profiles, _dir) = profile_fixture().await;
+        let conn_id = "conn-remote-ensure";
+        let (tx, _rx) = fixture.add_connection(conn_id).await;
+        let session_id = format!("remote-ensure-{}", Uuid::now_v7());
+        attach_test_remote_session(&fixture, &session_id).await;
+        profiles
+            .set_active_profile("beta")
+            .await
+            .expect("beta should become active for new sessions");
+
+        {
+            let mut connections = fixture.state.connections.lock().await;
+            let conn = connections.get_mut(conn_id).expect("connection exists");
+            conn.sessions
+                .insert(PRIMARY_AGENT_ID.to_string(), session_id.clone());
+        }
+
+        let resolved = ensure_session(
+            &fixture.state,
+            conn_id,
+            PRIMARY_AGENT_ID,
+            None,
+            &tx,
+            None,
+            None,
+        )
+        .await
+        .expect("attached remote session should be reused");
+
+        assert_eq!(resolved, session_id);
+        assert!(profiles.session_binding(&resolved).await.is_none());
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn prompt_for_mode_uses_root_remote_actor_when_connection_session_is_remote() {
+        let (fixture, _profiles, _dir) = profile_fixture().await;
+        let conn_id = "conn-remote-prompt";
+        let (tx, _rx) = fixture.add_connection(conn_id).await;
+        let session_id = format!("remote-prompt-{}", Uuid::now_v7());
+        attach_test_remote_session(&fixture, &session_id).await;
+
+        {
+            let mut connections = fixture.state.connections.lock().await;
+            let conn = connections.get_mut(conn_id).expect("connection exists");
+            conn.sessions
+                .insert(PRIMARY_AGENT_ID.to_string(), session_id.clone());
+        }
+
+        let err = prompt_for_mode(
+            &fixture.state,
+            conn_id,
+            &[UiPromptBlock::Text {
+                text: "hello remote".to_string(),
+            }],
+            None,
+            &tx,
+        )
+        .await
+        .expect_err("test remote actor has no provider, but prompt should target remote actor");
+
+        assert!(
+            err.contains("remote node 'remote-peer'"),
+            "expected remote prompt target, got: {err}"
+        );
+        assert!(
+            !err.contains("local session"),
+            "remote prompt must not be routed through local profile runtime: {err}"
         );
     }
 }

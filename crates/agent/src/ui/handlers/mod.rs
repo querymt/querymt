@@ -24,6 +24,8 @@ pub use models::handle_add_custom_model_from_hf;
 pub use models::handle_delete_custom_model;
 pub use models::handle_list_all_models;
 pub use models::handle_list_auth_providers;
+#[cfg(all(test, feature = "remote"))]
+pub(crate) use models::handle_set_session_model;
 pub use oauth::handle_complete_oauth_login;
 pub use oauth::handle_disconnect_oauth;
 pub use oauth::handle_start_oauth_login;
@@ -67,7 +69,9 @@ use super::connection::{send_error, send_state};
 use super::error::format_prefixed_error_chain;
 use super::messages::{UiClientMessage, UiPromptBlock};
 use super::session::{ensure_sessions_for_mode_with_profile, prompt_for_mode, resolve_cwd};
-use models::{handle_get_recent_models, handle_set_session_model};
+use models::handle_get_recent_models;
+#[cfg(not(all(test, feature = "remote")))]
+use models::handle_set_session_model;
 use std::time::Instant;
 
 use tokio::sync::mpsc;

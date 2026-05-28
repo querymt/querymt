@@ -670,6 +670,7 @@ mod remote_session_lifecycle_integration_tests {
         let session_ref = SessionActorRef::Remote {
             actor_ref: remote_ref,
             peer_label: "beta".to_string(),
+            remote_node_id: None,
         };
 
         assert!(session_ref.is_remote());
@@ -726,6 +727,7 @@ mod remote_session_lifecycle_integration_tests {
         let session_ref = SessionActorRef::Remote {
             actor_ref: remote_ref,
             peer_label: "beta".to_string(),
+            remote_node_id: None,
         };
 
         within_timeout("set_mode", session_ref.set_mode(AgentMode::Plan))
@@ -821,6 +823,7 @@ mod remote_session_lifecycle_integration_tests {
         let session_ref = SessionActorRef::Remote {
             actor_ref: remote_ref,
             peer_label: "beta".to_string(),
+            remote_node_id: None,
         };
 
         session_ref
@@ -886,6 +889,7 @@ mod remote_session_lifecycle_integration_tests {
         let session_ref = SessionActorRef::Remote {
             actor_ref: remote_ref,
             peer_label: "beta".to_string(),
+            remote_node_id: None,
         };
 
         let result = session_ref.cancel().await;

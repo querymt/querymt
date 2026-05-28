@@ -572,7 +572,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(mesh) => {
                 eprintln!("Joined mesh: peer_id={}", mesh.peer_id());
                 register_mesh_actors(&runner, &mesh).await;
-                runner.handle().set_mesh(mesh);
+                runner.handle().set_mesh(mesh.clone());
+                if let Some(manager) = &profile_manager {
+                    manager.set_mesh(mesh).await;
+                }
             }
             Err(e) => {
                 eprintln!("Warning: mesh join failed: {}", e);
@@ -701,7 +704,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 register_mesh_actors(&runner, &mesh).await;
-                runner.handle().set_mesh(mesh);
+                runner.handle().set_mesh(mesh.clone());
+                if let Some(manager) = &profile_manager {
+                    manager.set_mesh(mesh).await;
+                }
             }
             Err(e) => {
                 eprintln!("Warning: mesh bootstrap failed: {}", e);

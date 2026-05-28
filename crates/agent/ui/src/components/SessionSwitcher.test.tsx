@@ -67,6 +67,32 @@ describe('SessionSwitcher', () => {
     expect(screen.getByText('Active Session')).toBeInTheDocument();
   });
 
+  it('keeps the quick selector local-only by filtering remote sessions', () => {
+    render(
+      <SessionSwitcher
+        {...defaultProps}
+        groups={[
+          {
+            cwd: '/workspace/project-1',
+            sessions: [
+              ...mockGroups[0].sessions,
+              {
+                session_id: 'remote-session-999',
+                title: 'Remote Session',
+                node: 'remote-node',
+                updated_at: new Date(Date.now() - 300000).toISOString(),
+              },
+            ],
+          },
+        ]}
+      />
+    );
+
+    expect(screen.getByText('First Session')).toBeInTheDocument();
+    expect(screen.queryByText('Remote Session')).not.toBeInTheDocument();
+    expect(screen.queryByText('remote-node')).not.toBeInTheDocument();
+  });
+
   it('marks the active session with an "active" badge', () => {
     render(<SessionSwitcher {...defaultProps} />);
     const activeBadges = screen.getAllByText('active');

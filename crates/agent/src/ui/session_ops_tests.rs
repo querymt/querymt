@@ -7,12 +7,18 @@ use crate::profiles::{LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager
 use crate::session::backend::StorageBackend;
 use crate::session::domain::ForkOrigin;
 use crate::session::projection::SessionScope;
+#[cfg(feature = "remote")]
+use crate::session::store::RemoteSessionBookmark;
 use crate::test_utils::empty_plugin_registry;
 use crate::ui::handlers::{
     ListSessionsRequest, handle_delete_session, handle_fork_session, handle_list_session_children,
     handle_list_sessions, handle_load_session, handle_ui_message,
 };
 use crate::ui::messages::UiClientMessage;
+#[cfg(feature = "remote")]
+use crate::{
+    agent::remote::test_helpers::fixtures::get_test_mesh, ui::handlers::handle_set_session_model,
+};
 use anyhow::Result;
 use kameo::actor::Spawn;
 use querymt::chat::ChatRole;
@@ -22,6 +28,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::time::{Duration, timeout};
+#[cfg(feature = "remote")]
+use uuid::Uuid;
 
 struct SeededSessions {
     root: String,
@@ -183,6 +191,58 @@ async fn insert_test_actor(agent: &Arc<crate::agent::LocalAgentHandle>, session_
         .lock()
         .await
         .insert(session_id.to_string(), actor_ref);
+}
+
+#[cfg(feature = "remote")]
+async fn attach_remote_session(
+    fixture: &crate::test_utils::TestServerState,
+    session_id: &str,
+    peer_label: &str,
+) {
+    attach_remote_session_with_node_id(fixture, session_id, peer_label, None).await;
+}
+
+#[cfg(feature = "remote")]
+async fn attach_remote_session_with_node_id(
+    fixture: &crate::test_utils::TestServerState,
+    session_id: &str,
+    peer_label: &str,
+    remote_node_id: Option<&str>,
+) {
+    let mesh = get_test_mesh().await.clone();
+    let actor = SessionActor::new(
+        fixture.agent.config.clone(),
+        session_id.to_string(),
+        SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        ),
+    )
+    .with_mesh(Some(mesh.clone()));
+    let local_ref = SessionActor::spawn(actor);
+    let dht_name = crate::agent::remote::scope::scoped_session(
+        &crate::agent::remote::scope::MeshScopeId::lan_default(),
+        session_id,
+    );
+    mesh.register_actor(local_ref, dht_name.clone()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let remote_ref = mesh
+        .lookup_actor::<SessionActor>(&dht_name)
+        .await
+        .expect("DHT lookup should succeed")
+        .expect("remote actor should be available");
+    fixture
+        .agent
+        .handle
+        .attach_remote_session(
+            session_id.to_string(),
+            remote_ref,
+            peer_label.to_string(),
+            None,
+            remote_node_id.map(str::to_string),
+        )
+        .await;
 }
 
 #[tokio::test]
@@ -855,6 +915,172 @@ async fn handle_set_session_model_uses_bound_profile_after_active_profile_change
     let llm_cfg = llm_cfg.expect("session llm config should be set");
     assert_eq!(llm_cfg.provider, "mock");
     assert_eq!(llm_cfg.model, "new-model");
+
+    Ok(())
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn handle_load_session_succeeds_for_attached_remote_session_with_local_profiles() -> Result<()>
+{
+    let mut f = crate::test_utils::TestServerState::new().await;
+    let dir = TempDir::new()?;
+    write_profile(dir.path(), "alpha.toml");
+    write_profile(dir.path(), "beta.toml");
+    let profiles = attach_profiles(&mut f, "alpha", dir.path()).await;
+    let session_id = format!("remote-load-{}", Uuid::now_v7());
+
+    attach_remote_session(&f, &session_id, "remote-peer").await;
+    profiles
+        .bind_session_to_profile(&session_id, "alpha")
+        .await
+        .expect("session should bind to local profile");
+    profiles
+        .set_active_profile("beta")
+        .await
+        .expect("beta should become active for new sessions");
+
+    let (tx, mut rx) = f.add_connection("conn-remote-load").await;
+    handle_load_session(&f.state, "conn-remote-load", &session_id, &tx).await;
+
+    let loaded = next_message_of_type(&mut rx, "session_loaded").await;
+    assert_eq!(loaded["data"]["session_id"], session_id);
+
+    Ok(())
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn handle_set_session_model_prefers_attached_remote_over_profile_local_actor() -> Result<()> {
+    let mut f = crate::test_utils::TestServerState::new().await;
+    let dir = TempDir::new()?;
+    write_profile(dir.path(), "alpha.toml");
+    write_profile(dir.path(), "beta.toml");
+    let profiles = attach_profiles(&mut f, "alpha", dir.path()).await;
+    let session_id = f
+        .agent
+        .storage
+        .session_store()
+        .create_session(Some("remote-model".to_string()), None, None, None)
+        .await?
+        .public_id;
+
+    attach_remote_session(&f, &session_id, "remote-peer").await;
+    profiles
+        .bind_session_to_profile(&session_id, "alpha")
+        .await
+        .expect("session should bind to local profile");
+    profiles
+        .set_active_profile("beta")
+        .await
+        .expect("beta should become active for new sessions");
+
+    let profile_runtime = profiles.runtime_for_profile("alpha").await?;
+    insert_test_actor(&profile_runtime.agent().handle(), &session_id).await;
+
+    handle_set_session_model(&f.state, &session_id, "mock/new-model", None)
+        .await
+        .expect("set_session_model should succeed for attached remote session");
+
+    let local_llm_cfg = f
+        .agent
+        .storage
+        .session_store()
+        .get_session_llm_config(&session_id)
+        .await?;
+    let local_llm_cfg = local_llm_cfg.expect("session llm config should be set");
+    assert_eq!(
+        local_llm_cfg.model, "new-model",
+        "remote actor should update shared session config instead of profile-local actor"
+    );
+    assert_eq!(
+        local_llm_cfg.provider_node_id,
+        f.agent
+            .handle
+            .mesh()
+            .map(|mesh| crate::agent::remote::NodeId::from_peer_id(*mesh.peer_id()).to_string()),
+        "remote actor should route local provider calls back to the local mesh peer"
+    );
+
+    Ok(())
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn list_sessions_returns_detached_remote_bookmarks_without_attaching() -> Result<()> {
+    let f = crate::test_utils::TestServerState::new().await;
+    let session_id = format!("remote-bookmark-{}", Uuid::now_v7());
+    f.agent
+        .storage
+        .session_store()
+        .save_remote_session_bookmark(&RemoteSessionBookmark {
+            session_id: session_id.clone(),
+            node_id: "node-bookmark".to_string(),
+            peer_label: "remote-peer".to_string(),
+            cwd: Some("/remote/workspace".to_string()),
+            created_at: 123,
+            title: Some("Bookmarked remote".to_string()),
+        })
+        .await?;
+
+    let (tx, mut rx) = f.add_connection("conn-remote-bookmark").await;
+    handle_list_sessions(
+        &f.state,
+        &tx,
+        ListSessionsRequest {
+            include_remote: true,
+            ..ListSessionsRequest::root_browse()
+        },
+    )
+    .await;
+
+    let listed = next_message_of_type(&mut rx, "session_list").await;
+    let summary = find_session(&listed, &session_id);
+    assert_eq!(summary["attached"], false);
+    assert_eq!(summary["runtime_state"], "stopped");
+    assert!(
+        f.agent
+            .handle
+            .registry
+            .lock()
+            .await
+            .get(&session_id)
+            .is_none(),
+        "listing a bookmark must not attach or mutate the registry"
+    );
+
+    Ok(())
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn list_sessions_uses_attached_remote_node_id_over_hostname_lookup() -> Result<()> {
+    let f = crate::test_utils::TestServerState::new().await;
+    let session_id = format!("remote-node-id-{}", Uuid::now_v7());
+
+    attach_remote_session_with_node_id(
+        &f,
+        &session_id,
+        "shared-hostname",
+        Some("stable-remote-node"),
+    )
+    .await;
+
+    let (tx, mut rx) = f.add_connection("conn-remote-node-id").await;
+    handle_list_sessions(
+        &f.state,
+        &tx,
+        ListSessionsRequest {
+            include_remote: true,
+            ..ListSessionsRequest::root_browse()
+        },
+    )
+    .await;
+
+    let listed = next_message_of_type(&mut rx, "session_list").await;
+    let summary = find_session(&listed, &session_id);
+    assert_eq!(summary["node"], "shared-hostname");
+    assert_eq!(summary["node_id"], "stable-remote-node");
 
     Ok(())
 }

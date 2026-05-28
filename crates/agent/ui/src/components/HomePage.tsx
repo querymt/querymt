@@ -32,7 +32,7 @@ export function HomePage() {
   const [loading, setLoading] = useState(false);
 
   const handleLoadMoreSessions = useCallback(() => {
-    loadMoreSessions(20);
+    loadMoreSessions(20, { includeRemote: true });
   }, [loadMoreSessions]);
 
   const handleLoadMoreGroupSessions = useCallback((cwd: string | null) => {
@@ -40,7 +40,7 @@ export function HomePage() {
   }, [loadMoreGroupSessions]);
 
   const handleSearchSessions = useCallback((q: string) => {
-    searchSessions(q, 30);
+    searchSessions(q, 30, { includeRemote: true });
   }, [searchSessions]);
 
   const handleNewSession = async () => {

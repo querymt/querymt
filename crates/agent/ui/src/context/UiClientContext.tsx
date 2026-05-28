@@ -42,9 +42,9 @@ export interface UiClientActionsContextValue {
   attachRemoteSession: (nodeId: string, sessionId: string, sessionLabel?: string) => void;
   refreshAllModels: () => void;
   fetchRecentModels: () => void;
-  loadMoreSessions: (limit?: number) => void;
+  loadMoreSessions: (limit?: number, options?: { includeRemote?: boolean }) => void;
   loadMoreGroupSessions: (cwd: string | null, limit?: number) => void;
-  searchSessions: (query: string, limit?: number) => void;
+  searchSessions: (query: string, limit?: number, options?: { includeRemote?: boolean }) => void;
   loadSessionChildren: (parentSessionId: string, limitOrCursor?: number | string | null, cursor?: string | null) => void;
   requestAuthProviders: () => void;
   startOAuthLogin: (provider: string) => void;

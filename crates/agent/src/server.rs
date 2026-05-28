@@ -50,8 +50,17 @@ impl AgentServer {
         mut self,
         profiles: Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>,
     ) -> Self {
+        #[cfg(feature = "remote")]
+        if let Some(mesh) = self.agent.mesh() {
+            profiles.set_mesh_handle(mesh);
+        }
         self.profiles = Some(profiles);
         self
+    }
+
+    #[cfg(all(test, feature = "remote"))]
+    pub(crate) fn profiles(&self) -> Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>> {
+        self.profiles.clone()
     }
 
     pub async fn run(self, addr: &str, mode: ServerMode) -> anyhow::Result<()> {
@@ -297,6 +306,79 @@ async fn handle_sft_export(
         )
         .body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+#[cfg(all(test, feature = "remote"))]
+mod tests {
+    use super::*;
+    use crate::api::AgentInfra;
+    use crate::profiles::LocalProfileCatalog;
+    use crate::session::sqlite_storage::SqliteStorage;
+    use crate::test_utils::empty_plugin_registry;
+
+    #[tokio::test]
+    async fn with_profiles_bridges_existing_root_mesh_to_profile_manager() {
+        let (registry, _registry_dir) = empty_plugin_registry().expect("empty registry");
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("in-memory storage"),
+        );
+        let root = crate::api::Agent::single()
+            .provider("test", "test-model")
+            .infra(AgentInfra {
+                plugin_registry: Arc::new(registry),
+                storage: Some(storage.clone()),
+                session_mcp_attachment_source: None,
+            })
+            .build()
+            .await
+            .expect("root agent builds");
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh()
+            .await
+            .clone();
+        root.handle().set_mesh(mesh);
+
+        let dir = tempfile::Builder::new()
+            .prefix("querymt-server-profiles-")
+            .tempdir()
+            .expect("temp profile dir");
+        std::fs::write(
+            dir.path().join("alpha.toml"),
+            r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "inline"
+"#,
+        )
+        .expect("write profile");
+        let catalog = LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(dir.path())
+            .build();
+        let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+            Arc::new(catalog),
+            "alpha",
+            AgentInfra {
+                plugin_registry: root.handle().config.provider.plugin_registry(),
+                storage: Some(storage.clone()),
+                session_mcp_attachment_source: None,
+            },
+        ));
+
+        let server = root.server().with_profiles(profiles);
+        let profiles = server.profiles().expect("profiles attached");
+        let runtime = profiles
+            .runtime_for_profile("alpha")
+            .await
+            .expect("runtime materializes");
+        assert!(
+            runtime.agent().handle().mesh().is_some(),
+            "profile manager should synchronously store root mesh for future runtimes"
+        );
+        profiles.shutdown().await;
+    }
 }
 
 /// [`Write`](std::io::Write) adapter backed by a tokio mpsc channel.

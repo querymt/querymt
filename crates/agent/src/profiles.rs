@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 use tracing::warn;
 
@@ -482,6 +482,8 @@ pub struct ProfileRuntimeManager<C = Arc<dyn ProfileCatalog>> {
     active_profile_id: Mutex<String>,
     runtimes: Mutex<HashMap<String, Arc<ProfileRuntime>>>,
     session_bindings: Mutex<HashMap<String, SessionProfileBinding>>,
+    #[cfg(feature = "remote")]
+    mesh: StdMutex<Option<crate::agent::remote::MeshHandle>>,
 }
 
 impl<C> ProfileRuntimeManager<C>
@@ -510,6 +512,8 @@ where
             active_profile_id: Mutex::new(active_profile_id.into()),
             runtimes: Mutex::new(HashMap::new()),
             session_bindings: Mutex::new(HashMap::new()),
+            #[cfg(feature = "remote")]
+            mesh: StdMutex::new(None),
         }
     }
 
@@ -543,10 +547,18 @@ where
         // in case another task won the race.
         let document = self.catalog.load_profile(profile_id).await?;
         let runtime = Arc::new(build_profile_runtime(document, self.shared_infra.clone()).await?);
+        #[cfg(feature = "remote")]
+        if let Some(mesh) = self.mesh_handle() {
+            runtime.agent().handle().set_mesh(mesh);
+        }
 
         let mut runtimes = self.runtimes.lock().await;
         if let Some(existing) = runtimes.get(profile_id) {
             return Ok(existing.clone());
+        }
+        #[cfg(feature = "remote")]
+        if let Some(mesh) = self.mesh_handle() {
+            runtime.agent().handle().set_mesh(mesh);
         }
         runtimes.insert(profile_id.to_string(), runtime.clone());
         Ok(runtime)
@@ -633,6 +645,27 @@ where
         self.runtimes.lock().await.values().cloned().collect()
     }
 
+    #[cfg(feature = "remote")]
+    pub fn set_mesh_handle(&self, mesh: crate::agent::remote::MeshHandle) {
+        *self.mesh.lock().expect("profile mesh mutex poisoned") = Some(mesh);
+    }
+
+    #[cfg(feature = "remote")]
+    fn mesh_handle(&self) -> Option<crate::agent::remote::MeshHandle> {
+        self.mesh
+            .lock()
+            .expect("profile mesh mutex poisoned")
+            .clone()
+    }
+
+    #[cfg(feature = "remote")]
+    pub async fn set_mesh(&self, mesh: crate::agent::remote::MeshHandle) {
+        self.set_mesh_handle(mesh.clone());
+        for runtime in self.runtimes.lock().await.values() {
+            runtime.agent().handle().set_mesh(mesh.clone());
+        }
+    }
+
     pub async fn forget_session_binding(&self, session_id: &str) -> Option<SessionProfileBinding> {
         let removed = self.session_bindings.lock().await.remove(session_id);
         if let Some(storage) = &self.shared_infra.storage
@@ -682,6 +715,8 @@ impl ProfileRuntimeManager<Arc<dyn ProfileCatalog>> {
             active_profile_id: Mutex::new(active_profile_id.into()),
             runtimes: Mutex::new(HashMap::new()),
             session_bindings: Mutex::new(HashMap::new()),
+            #[cfg(feature = "remote")]
+            mesh: StdMutex::new(None),
         }
     }
 }
@@ -801,9 +836,15 @@ fn source_sort_key(source: &ProfileSource) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "remote")]
+    use crate::agent::remote::test_helpers::fixtures::{get_test_mesh, random_node_id};
     use crate::session::sqlite_storage::SqliteStorage;
     use crate::test_utils::empty_plugin_registry;
+    #[cfg(feature = "remote")]
+    use querymt::error::LLMError;
     use std::sync::Arc;
+    #[cfg(feature = "remote")]
+    use std::time::Duration;
 
     fn temp_profile_dir() -> tempfile::TempDir {
         tempfile::Builder::new()
@@ -833,6 +874,33 @@ mod tests {
             },
             temp_dir,
         )
+    }
+
+    #[cfg(feature = "remote")]
+    async fn remote_provider_call_error(runtime: &ProfileRuntime) -> String {
+        let exec_config = crate::session::store::SessionExecutionConfig::default();
+        let provider = &runtime.agent().handle().config.provider;
+        let session_handle = provider
+            .create_session(None, None, &exec_config)
+            .await
+            .expect("create session");
+        let session_id = session_handle.session().public_id.clone();
+        runtime
+            .agent()
+            .storage_backend()
+            .session_store()
+            .set_session_provider_node_id(&session_id, Some(&random_node_id()))
+            .await
+            .expect("set provider_node_id");
+
+        let provider = provider
+            .build_provider_for_session(&session_id)
+            .await
+            .expect("mesh-backed provider should build");
+        match provider.chat_with_tools(&[], None).await {
+            Err(LLMError::ProviderError(message)) => message,
+            other => panic!("expected provider error from mesh lookup; got: {other:?}"),
+        }
     }
 
     #[test]
@@ -1355,6 +1423,126 @@ system = "inline"
         assert_eq!(manager.cached_runtime_count().await, 1);
         manager.shutdown().await;
         assert_eq!(manager.cached_runtime_count().await, 0);
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn set_mesh_applies_to_materialized_profile_runtime() {
+        let dir = temp_profile_dir();
+        write_profile(
+            dir.path(),
+            "alpha.toml",
+            r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "inline"
+"#,
+        );
+        let (infra, _registry_dir) = test_infra().await;
+        let catalog = LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(dir.path())
+            .build();
+        let manager = ProfileRuntimeManager::with_infra(catalog, "alpha", infra);
+        let runtime = manager
+            .runtime_for_profile("alpha")
+            .await
+            .expect("runtime materializes");
+
+        manager.set_mesh(get_test_mesh().await.clone()).await;
+        let message = remote_provider_call_error(&runtime).await;
+
+        assert!(
+            !message.contains("no mesh handle available"),
+            "profile runtime did not receive root mesh: {message}"
+        );
+        assert!(
+            message.contains("provider_host::"),
+            "expected mesh lookup error after propagation; got: {message}"
+        );
+        manager.shutdown().await;
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn runtime_for_profile_cannot_miss_concurrent_mesh_set() {
+        let dir = temp_profile_dir();
+        write_profile(
+            dir.path(),
+            "alpha.toml",
+            r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "inline"
+"#,
+        );
+        let (infra, _registry_dir) = test_infra().await;
+        let catalog = LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(dir.path())
+            .build();
+        let manager = Arc::new(ProfileRuntimeManager::with_infra(catalog, "alpha", infra));
+        let mesh = get_test_mesh().await.clone();
+
+        let runtime_task = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.runtime_for_profile("alpha").await })
+        };
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        manager.set_mesh(mesh).await;
+
+        let runtime = runtime_task
+            .await
+            .expect("runtime task should not panic")
+            .expect("runtime materializes");
+        let message = remote_provider_call_error(&runtime).await;
+
+        assert!(
+            !message.contains("no mesh handle available"),
+            "runtime created during set_mesh race missed root mesh: {message}"
+        );
+        manager.shutdown().await;
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn set_mesh_applies_to_future_profile_runtime() {
+        let dir = temp_profile_dir();
+        write_profile(
+            dir.path(),
+            "alpha.toml",
+            r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "inline"
+"#,
+        );
+        let (infra, _registry_dir) = test_infra().await;
+        let catalog = LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(dir.path())
+            .build();
+        let manager = ProfileRuntimeManager::with_infra(catalog, "alpha", infra);
+
+        manager.set_mesh(get_test_mesh().await.clone()).await;
+        let runtime = manager
+            .runtime_for_profile("alpha")
+            .await
+            .expect("runtime materializes");
+        let message = remote_provider_call_error(&runtime).await;
+
+        assert!(
+            !message.contains("no mesh handle available"),
+            "future profile runtime did not receive root mesh: {message}"
+        );
+        assert!(
+            message.contains("provider_host::"),
+            "expected mesh lookup error after propagation; got: {message}"
+        );
+        manager.shutdown().await;
     }
 
     #[tokio::test]

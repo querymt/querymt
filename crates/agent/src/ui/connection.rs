@@ -734,7 +734,7 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                             registry.remote_sessions()
                         };
 
-                        for (session_id, peer_label) in remote_sessions {
+                        for (session_id, peer_label, _) in remote_sessions {
                             if !available_hostnames.contains(peer_label.as_str()) {
                                 match state.agent.get_session_llm_config(&session_id).await {
                                     Ok(Some(config)) => {
