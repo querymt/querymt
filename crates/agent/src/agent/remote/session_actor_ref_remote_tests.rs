@@ -57,6 +57,7 @@ mod session_actor_ref_remote_tests {
         let session_ref = SessionActorRef::Remote {
             actor_ref: remote_ref,
             peer_label: label.to_string(),
+            remote_node_id: None,
         };
 
         (session_ref, local_ref)

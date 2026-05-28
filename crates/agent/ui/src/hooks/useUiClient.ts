@@ -843,7 +843,7 @@ export function useUiClient() {
           pendingDeleteLabelsRef.current.clear();
           pushSessionActionNotice('error', d.message);
           pendingGroupLoadRef.current = null;
-          sendMessage({ type: 'list_sessions', data: { mode: 'browse', session_scope: SessionScope.Root } } as UiClientMessage);
+          sendMessage({ type: 'list_sessions', data: { mode: 'browse', session_scope: SessionScope.Root, include_remote: true } } as UiClientMessage);
           setSessionPageLoading(false);
         }
 
@@ -861,7 +861,7 @@ export function useUiClient() {
             setLastLoadErrorSessionId(failedSessionId);
           }
           pendingGroupLoadRef.current = null;
-          sendMessage({ type: 'list_sessions', data: { mode: 'browse', session_scope: SessionScope.Root } } as UiClientMessage);
+          sendMessage({ type: 'list_sessions', data: { mode: 'browse', session_scope: SessionScope.Root, include_remote: true } } as UiClientMessage);
         }
 
         if (isSessionChildrenError && pendingSessionChildrenRef.current.size > 0) {

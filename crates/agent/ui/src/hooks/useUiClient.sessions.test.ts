@@ -200,4 +200,40 @@ describe('useUiClient - session listing', () => {
     expect(request?.data).toMatchObject({ mode: 'group', cwd: '/workspace/project' });
     expect(request?.data.include_remote).toBeUndefined();
   });
+
+  it('requests remote sessions after delete error recovery', async () => {
+    const { result } = await renderConnectedHook();
+
+    await act(async () => {
+      result.current.deleteSession('s1', 'Session One');
+    });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'error',
+        data: { message: 'Failed to delete session: denied' },
+      });
+    });
+
+    const request = sentListSessions().at(-1);
+    expect(request?.data).toMatchObject({ mode: 'browse', include_remote: true });
+  });
+
+  it('requests remote sessions after load error recovery', async () => {
+    const { result } = await renderConnectedHook();
+
+    await act(async () => {
+      result.current.loadSession('s1', 'Session One');
+    });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'error',
+        data: { message: 'Failed to load session: missing' },
+      });
+    });
+
+    const request = sentListSessions().at(-1);
+    expect(request?.data).toMatchObject({ mode: 'browse', include_remote: true });
+  });
 });

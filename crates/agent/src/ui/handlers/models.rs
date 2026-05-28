@@ -14,7 +14,7 @@ use super::super::messages::{
 use super::session_ops::ensure_session_loaded;
 use crate::agent::remote::SessionActorRef;
 use crate::session::store::CustomModel;
-use crate::ui::session::{resolve_profile_id_for_session, session_ref_for_profile};
+use crate::ui::session::session_ref_for_session;
 use querymt_provider_common::{
     DownloadProgress, DownloadStatus, HfModelRef, canonical_id_from_file, canonical_id_from_hf,
     download_hf_gguf_with_progress, parse_gguf_metadata,
@@ -534,15 +534,7 @@ async fn session_ref_for_set_model(
     state: &ServerState,
     session_id: &str,
 ) -> Result<Option<SessionActorRef>, String> {
-    let profile_id = resolve_profile_id_for_session(state, Some(session_id), None).await?;
-    if let Some(session_ref) =
-        session_ref_for_profile(state, profile_id.as_deref(), session_id).await
-    {
-        return Ok(Some(session_ref));
-    }
-
-    let registry = state.agent.registry.lock().await;
-    Ok(registry.get(session_id).cloned())
+    Ok(session_ref_for_session(state, session_id).await)
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

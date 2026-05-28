@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 use tracing::warn;
 
@@ -483,7 +483,7 @@ pub struct ProfileRuntimeManager<C = Arc<dyn ProfileCatalog>> {
     runtimes: Mutex<HashMap<String, Arc<ProfileRuntime>>>,
     session_bindings: Mutex<HashMap<String, SessionProfileBinding>>,
     #[cfg(feature = "remote")]
-    mesh: Mutex<Option<crate::agent::remote::MeshHandle>>,
+    mesh: StdMutex<Option<crate::agent::remote::MeshHandle>>,
 }
 
 impl<C> ProfileRuntimeManager<C>
@@ -513,7 +513,7 @@ where
             runtimes: Mutex::new(HashMap::new()),
             session_bindings: Mutex::new(HashMap::new()),
             #[cfg(feature = "remote")]
-            mesh: Mutex::new(None),
+            mesh: StdMutex::new(None),
         }
     }
 
@@ -548,13 +548,17 @@ where
         let document = self.catalog.load_profile(profile_id).await?;
         let runtime = Arc::new(build_profile_runtime(document, self.shared_infra.clone()).await?);
         #[cfg(feature = "remote")]
-        if let Some(mesh) = self.mesh.lock().await.clone() {
+        if let Some(mesh) = self.mesh_handle() {
             runtime.agent().handle().set_mesh(mesh);
         }
 
         let mut runtimes = self.runtimes.lock().await;
         if let Some(existing) = runtimes.get(profile_id) {
             return Ok(existing.clone());
+        }
+        #[cfg(feature = "remote")]
+        if let Some(mesh) = self.mesh_handle() {
+            runtime.agent().handle().set_mesh(mesh);
         }
         runtimes.insert(profile_id.to_string(), runtime.clone());
         Ok(runtime)
@@ -642,8 +646,21 @@ where
     }
 
     #[cfg(feature = "remote")]
+    pub fn set_mesh_handle(&self, mesh: crate::agent::remote::MeshHandle) {
+        *self.mesh.lock().expect("profile mesh mutex poisoned") = Some(mesh);
+    }
+
+    #[cfg(feature = "remote")]
+    fn mesh_handle(&self) -> Option<crate::agent::remote::MeshHandle> {
+        self.mesh
+            .lock()
+            .expect("profile mesh mutex poisoned")
+            .clone()
+    }
+
+    #[cfg(feature = "remote")]
     pub async fn set_mesh(&self, mesh: crate::agent::remote::MeshHandle) {
-        *self.mesh.lock().await = Some(mesh.clone());
+        self.set_mesh_handle(mesh.clone());
         for runtime in self.runtimes.lock().await.values() {
             runtime.agent().handle().set_mesh(mesh.clone());
         }
@@ -699,7 +716,7 @@ impl ProfileRuntimeManager<Arc<dyn ProfileCatalog>> {
             runtimes: Mutex::new(HashMap::new()),
             session_bindings: Mutex::new(HashMap::new()),
             #[cfg(feature = "remote")]
-            mesh: Mutex::new(None),
+            mesh: StdMutex::new(None),
         }
     }
 }
@@ -826,6 +843,8 @@ mod tests {
     #[cfg(feature = "remote")]
     use querymt::error::LLMError;
     use std::sync::Arc;
+    #[cfg(feature = "remote")]
+    use std::time::Duration;
 
     fn temp_profile_dir() -> tempfile::TempDir {
         tempfile::Builder::new()
@@ -1441,6 +1460,48 @@ system = "inline"
         assert!(
             message.contains("provider_host::"),
             "expected mesh lookup error after propagation; got: {message}"
+        );
+        manager.shutdown().await;
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn runtime_for_profile_cannot_miss_concurrent_mesh_set() {
+        let dir = temp_profile_dir();
+        write_profile(
+            dir.path(),
+            "alpha.toml",
+            r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "inline"
+"#,
+        );
+        let (infra, _registry_dir) = test_infra().await;
+        let catalog = LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(dir.path())
+            .build();
+        let manager = Arc::new(ProfileRuntimeManager::with_infra(catalog, "alpha", infra));
+        let mesh = get_test_mesh().await.clone();
+
+        let runtime_task = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.runtime_for_profile("alpha").await })
+        };
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        manager.set_mesh(mesh).await;
+
+        let runtime = runtime_task
+            .await
+            .expect("runtime task should not panic")
+            .expect("runtime materializes");
+        let message = remote_provider_call_error(&runtime).await;
+
+        assert!(
+            !message.contains("no mesh handle available"),
+            "runtime created during set_mesh race missed root mesh: {message}"
         );
         manager.shutdown().await;
     }

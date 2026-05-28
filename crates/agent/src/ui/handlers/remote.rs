@@ -361,7 +361,7 @@ pub(crate) async fn finalize_remote_session_attach(
     .await;
 
     super::super::connection::send_state(state, conn_id, tx).await;
-    handle_list_sessions(state, tx, ListSessionsRequest::root_browse()).await;
+    handle_list_sessions(state, tx, ListSessionsRequest::root_browse_with_remote()).await;
 
     log::info!(
         "handle_attach_remote_session: attached session {} from node_id '{}'",
@@ -566,7 +566,7 @@ pub async fn handle_dismiss_remote_session(
     }
 
     // 3. Refresh session list
-    handle_list_sessions(state, tx, ListSessionsRequest::root_browse()).await;
+    handle_list_sessions(state, tx, ListSessionsRequest::root_browse_with_remote()).await;
 }
 
 /// Create a mesh invite token on the local node.

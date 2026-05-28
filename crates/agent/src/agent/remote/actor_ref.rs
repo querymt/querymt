@@ -36,6 +36,8 @@ pub enum SessionActorRef {
         actor_ref: kameo::actor::RemoteActorRef<SessionActor>,
         /// Human-readable label for the peer, e.g. "dev-gpu". Used in UI display.
         peer_label: String,
+        /// Stable node id for routing/identity; display should continue using `peer_label`.
+        remote_node_id: Option<String>,
     },
 }
 
@@ -57,6 +59,7 @@ impl SessionActorRef {
         Self::Remote {
             actor_ref,
             peer_label,
+            remote_node_id: None,
         }
     }
 }
@@ -79,6 +82,14 @@ impl SessionActorRef {
             Self::Local(_) => "local",
             #[cfg(feature = "remote")]
             Self::Remote { peer_label, .. } => peer_label,
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    pub fn remote_node_id(&self) -> Option<&str> {
+        match self {
+            Self::Remote { remote_node_id, .. } => remote_node_id.as_deref(),
+            Self::Local(_) => None,
         }
     }
 }
