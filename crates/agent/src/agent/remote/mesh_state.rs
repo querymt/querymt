@@ -372,4 +372,69 @@ mod tests {
         assert!(active.contains(&hosted_mesh_id));
         assert!(active.contains(&joined_mesh_id));
     }
+
+    #[test]
+    fn hosted_mesh_persists_admitted_peers_for_reconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mesh_state.json");
+
+        // Simulate host creating a mesh
+        let host_kp = libp2p::identity::Keypair::generate_ed25519();
+        let host_peer_id = host_kp.public().to_peer_id().to_string();
+        let joiner_peer_id = "12D3KooWJoiner".to_string();
+
+        let mesh_id = format!("{host_peer_id}:test-mesh");
+        let invite_id = "invite-123".to_string();
+
+        // Host creates mesh and persists it
+        {
+            let mut store = MeshStateStore::load_or_create(&path).unwrap();
+            store
+                .upsert_hosted_mesh(
+                    mesh_id.clone(),
+                    Some("Test Mesh".to_string()),
+                    Some(invite_id.clone()),
+                )
+                .unwrap();
+
+            // Admit a peer
+            let token = MembershipToken::issue(
+                mesh_id.clone(),
+                &joiner_peer_id,
+                &host_kp,
+                invite_id.clone(),
+                InvitePermissions::default(),
+                0,
+            )
+            .unwrap();
+            store.add_admitted_peer(&mesh_id, token).unwrap();
+        }
+
+        // Simulate host restart - reload from disk
+        {
+            let store = MeshStateStore::load_or_create(&path).unwrap();
+
+            // Verify mesh is persisted
+            let entry = store.get(&mesh_id).expect("mesh should be persisted");
+            assert_eq!(entry.mesh_id, mesh_id);
+            assert_eq!(entry.name, Some("Test Mesh".to_string()));
+            assert_eq!(entry.role, MeshLocalRole::Host);
+            assert_eq!(entry.status, MeshStatus::Active);
+            assert!(entry.invite_ids.contains(&invite_id));
+
+            // Verify admitted peer is persisted
+            assert!(entry.admitted_peers.contains_key(&joiner_peer_id));
+
+            // Verify reconnect logic returns the admitted peer
+            let reconnect_peers = store.reconnect_peers_for_mesh(&mesh_id);
+            assert_eq!(reconnect_peers.len(), 1);
+            assert_eq!(reconnect_peers[0].peer_id, joiner_peer_id);
+
+            // Verify all_reconnect_peers works
+            let all_peers = store.all_reconnect_peers();
+            assert_eq!(all_peers.len(), 1);
+            assert_eq!(all_peers[0].0, mesh_id);
+            assert_eq!(all_peers[0].1.peer_id, joiner_peer_id);
+        }
+    }
 }

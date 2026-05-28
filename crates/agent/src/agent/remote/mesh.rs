@@ -941,7 +941,21 @@ impl MeshHandle {
 
         let mesh_id =
             super::invite::mesh_id_for(&self.peer_id.to_string(), mesh_name_for_scope.as_deref());
-        self.ensure_scope(MeshScopeId::Iroh { mesh_id });
+        self.ensure_scope(MeshScopeId::Iroh {
+            mesh_id: mesh_id.clone(),
+        });
+
+        // Persist hosted mesh to mesh_state.json for reconnection support
+        if let Some(ref store) = self.mesh_state_store
+            && let Err(e) = store.write().upsert_hosted_mesh(
+                mesh_id.clone(),
+                mesh_name_for_scope.clone(),
+                Some(invite.grant.invite_id.clone()),
+            )
+        {
+            log::warn!("Failed to persist hosted mesh state for {}: {}", mesh_id, e);
+        }
+
         Ok(invite)
     }
 

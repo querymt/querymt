@@ -1683,6 +1683,19 @@ impl LocalAgentHandle {
             .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
     }
 
+    async fn session_ref_for_agent_session(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionActorRef, Error> {
+        let registry = self.registry.lock().await;
+        registry.get(session_id).cloned().ok_or_else(|| {
+            Error::invalid_params().data(serde_json::json!({
+                "message": "unknown session",
+                "sessionId": session_id,
+            }))
+        })
+    }
+
     pub async fn stop_session(&self, session_id: &str) -> Result<(), Error> {
         use crate::agent::messages::SessionRuntimeStatus;
 
@@ -1711,14 +1724,19 @@ impl LocalAgentHandle {
             .get_runtime_status()
             .await
             .unwrap_or(SessionRuntimeStatus::Running);
-        if matches!(
-            status,
-            SessionRuntimeStatus::Idle | SessionRuntimeStatus::CancelRequested
-        ) {
+        if status == SessionRuntimeStatus::Idle {
             tracing::debug!(
-                "Session {} stop: status={:?}, graceful shutdown — returning without force-stop",
+                "Session {} stop: status=Idle, graceful shutdown — returning without force-stop",
                 session_id,
-                status
+            );
+            return Ok(());
+        }
+        // For remote sessions, CancelRequested doesn't mean the prompt is done —
+        // the provider stream might still be active on the remote node.
+        if status == SessionRuntimeStatus::CancelRequested && !session_ref.is_remote() {
+            tracing::debug!(
+                "Session {} stop: status=CancelRequested (local), graceful shutdown — returning without force-stop",
+                session_id,
             );
             return Ok(());
         }
@@ -2233,22 +2251,17 @@ impl SendAgent for LocalAgentHandle {
 
     async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, Error> {
         let session_id = req.session_id.to_string();
-        let session_ref = {
-            let registry = self.registry.lock().await;
-            registry.get(&session_id).cloned().ok_or_else(|| {
-                Error::invalid_params().data(serde_json::json!({
-                    "message": "unknown session",
-                    "sessionId": session_id,
-                }))
-            })?
-        };
-
+        let session_ref = self.session_ref_for_agent_session(&session_id).await?;
         session_ref.prompt(req).await
     }
 
     async fn cancel(&self, notif: CancelNotification) -> Result<(), Error> {
         let session_id = notif.session_id.to_string();
-        self.stop_session(&session_id).await
+        let Ok(session_ref) = self.session_ref_for_agent_session(&session_id).await else {
+            // Keep ACP cancel semantics as best-effort/no-op for unknown sessions.
+            return Ok(());
+        };
+        session_ref.cancel().await.map_err(Error::from)
     }
 
     async fn load_session(&self, req: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
@@ -3317,6 +3330,7 @@ fn ext_json_response<T: serde::Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::SessionActor;
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
     use crate::send_agent::SendAgent;
@@ -3334,6 +3348,9 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    #[cfg(feature = "remote")]
+    use kameo::actor::Spawn;
 
     // ── Shared fixture ───────────────────────────────────────────────────────
 
@@ -3469,6 +3486,66 @@ mod tests {
                 .delete
                 .is_some()
         );
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn test_cancel_known_remote_session_routes_cancel_to_session_ref() {
+        use crate::agent::core::SessionRuntime;
+        use crate::agent::remote::scope::{MeshScopeId, scoped_session};
+
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let f = HandleFixture::new().await;
+        f.handle.set_mesh(mesh.clone());
+
+        let session_id = "remote-cancel-known".to_string();
+        let actor = SessionActor::new(
+            f.handle.config.clone(),
+            session_id.clone(),
+            SessionRuntime::new(
+                None,
+                std::collections::HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        )
+        .with_mesh(Some(mesh.clone()));
+        let local_ref = SessionActor::spawn(actor);
+        let dht_name = scoped_session(&MeshScopeId::lan_default(), &session_id);
+        mesh.register_actor(local_ref, dht_name.clone()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let remote_ref = mesh
+            .lookup_actor::<SessionActor>(&dht_name)
+            .await
+            .expect("DHT lookup should succeed")
+            .expect("remote actor should be available");
+
+        f.handle
+            .attach_remote_session(
+                session_id.clone(),
+                remote_ref,
+                "remote-peer".to_string(),
+                None,
+                None,
+            )
+            .await;
+
+        let mut rx = f.handle.subscribe_events();
+        let notif = CancelNotification::new(SessionId::from(session_id.clone()));
+        SendAgent::cancel(&f.handle, notif)
+            .await
+            .expect("cancel should succeed");
+
+        let event = tokio::time::timeout(tokio::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("should receive event in time")
+            .expect("event channel should remain open");
+
+        assert_eq!(event.session_id(), session_id);
+        assert!(matches!(
+            event.kind(),
+            crate::events::AgentEventKind::Cancelled
+        ));
     }
 
     #[cfg(feature = "remote")]

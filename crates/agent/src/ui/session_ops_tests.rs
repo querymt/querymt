@@ -1,5 +1,6 @@
 //! Focused tests for session list UI handlers and dispatch.
 
+use crate::agent::messages::SessionRuntimeStatus;
 use crate::agent::{SessionActor, core::SessionRuntime};
 use crate::api::AgentInfra;
 use crate::model::{AgentMessage, MessagePart};
@@ -9,8 +10,8 @@ use crate::session::domain::ForkOrigin;
 use crate::session::projection::SessionScope;
 use crate::test_utils::empty_plugin_registry;
 use crate::ui::handlers::{
-    ListSessionsRequest, handle_delete_session, handle_fork_session, handle_list_session_children,
-    handle_list_sessions, handle_load_session, handle_ui_message,
+    ListSessionsRequest, handle_cancel_session, handle_delete_session, handle_fork_session,
+    handle_list_session_children, handle_list_sessions, handle_load_session, handle_ui_message,
 };
 use crate::ui::messages::UiClientMessage;
 #[cfg(feature = "remote")]
@@ -967,6 +968,69 @@ async fn handle_set_session_model_succeeds_for_attached_remote_session_with_loca
     handle_set_session_model(&f.state, &session_id, "mock/new-model", None)
         .await
         .expect("set_session_model should succeed for attached remote session");
+
+    Ok(())
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn handle_cancel_session_uses_root_remote_session_ref_even_with_stale_profile_binding()
+-> Result<()> {
+    let mut f = crate::test_utils::TestServerState::new().await;
+    let dir = TempDir::new()?;
+    write_profile(dir.path(), "alpha.toml");
+    attach_profiles(&mut f, "alpha", dir.path()).await;
+    let session_id = format!("remote-cancel-{}", Uuid::now_v7());
+
+    attach_remote_session(&f, &session_id, "remote-peer").await;
+
+    let (tx, mut rx) = f.add_connection("conn-cancel-remote").await;
+
+    {
+        let mut connections = f.state.connections.lock().await;
+        let conn = connections
+            .get_mut("conn-cancel-remote")
+            .expect("test connection should exist");
+        conn.active_agent_id = "primary".to_string();
+        conn.sessions
+            .insert("primary".to_string(), session_id.clone());
+    }
+
+    // Simulate a stale DB profile binding that no longer has a runtime.
+    f.agent
+        .storage
+        .session_store()
+        .set_profile_binding(&session_id, "missing-profile")
+        .await?;
+
+    handle_cancel_session(&f.state, "conn-cancel-remote", &tx).await;
+
+    let recv = timeout(Duration::from_millis(200), rx.recv()).await;
+    assert!(
+        recv.is_err(),
+        "unexpected UI message during remote cancel: {:?}",
+        recv.ok().flatten()
+    );
+
+    let session_ref = {
+        let registry = f.agent.handle.registry.lock().await;
+        registry
+            .get(&session_id)
+            .cloned()
+            .expect("remote session should remain attached")
+    };
+    let status = session_ref
+        .get_runtime_status()
+        .await
+        .expect("status query should succeed");
+    assert!(
+        matches!(
+            status,
+            SessionRuntimeStatus::Idle | SessionRuntimeStatus::CancelRequested
+        ),
+        "unexpected runtime status after cancel: {:?}",
+        status
+    );
 
     Ok(())
 }

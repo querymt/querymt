@@ -1118,6 +1118,25 @@ mod remote_impl {
                                 peer_id,
                                 invite_id
                             );
+
+                            // Persist admitted peer to mesh_state.json for reconnection support
+                            if let Some(mesh_state_store) = mesh.mesh_state_store() {
+                                let mesh_id = crate::agent::remote::invite::mesh_id_for(
+                                    &mesh.peer_id().to_string(),
+                                    mesh_name.as_deref(),
+                                );
+                                if let Err(e) = mesh_state_store
+                                    .write()
+                                    .add_admitted_peer(&mesh_id, token.clone())
+                                {
+                                    log::warn!(
+                                        "Failed to persist admitted peer {} to mesh state: {}",
+                                        peer_id,
+                                        e
+                                    );
+                                }
+                            }
+
                             let existing_peers: Vec<String> = mesh
                                 .known_peer_ids()
                                 .iter()

@@ -875,16 +875,20 @@ pub async fn handle_cancel_session(state: &ServerState, conn_id: &str, tx: &mpsc
         return;
     };
 
-    let agent = match local_agent_for_session(state, Some(&session_id), None).await {
-        Ok(agent) => agent,
-        Err(e) => {
-            let _ = send_error(tx, format!("Failed to resolve session runtime: {}", e)).await;
+    let session_ref = match session_ref_for_session(state, &session_id).await {
+        Some(session_ref) => session_ref,
+        None => {
+            let _ = send_error(
+                tx,
+                format!("No active session runtime for '{}'", session_id),
+            )
+            .await;
             return;
         }
     };
 
-    if let Err(e) = agent.stop_session(&session_id).await {
-        let _ = send_error(tx, format!("Failed to stop session: {}", e)).await;
+    if let Err(e) = session_ref.cancel().await {
+        let _ = send_error(tx, format!("Failed to cancel session: {}", e)).await;
     }
 }
 
