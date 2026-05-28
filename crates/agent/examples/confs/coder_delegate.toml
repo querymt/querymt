@@ -22,7 +22,23 @@ max_parallel_delegations = 5
 [planner]
 provider = "codex"
 model = "gpt-5.5"
-tools = ["delegate", "create_task", "todowrite", "todoread", "question", "search_text", "glob", "ls", "index", "read_tool", "shell", "browse"]
+tools = [
+  # File operations
+  "read_tool",
+  # Search & navigation
+  "glob", "search_text", "ls", "index", "get_symbol", "get_function",
+  # Execution
+  "shell",
+  # Task management
+  "create_task", "todowrite", "todoread",
+  # Sub-agent delegation
+  "delegate",
+  # User interaction
+  "question",
+  # Web browsing
+  "browse",
+]
+
 system = [
   { file = "../prompts/default_system.txt" },
   { file = "../prompts/code_meta.jinja2" }
@@ -103,9 +119,23 @@ provider = "codex"
 model = "gpt-5.4"
 description = "Specialized in implementation and code writing"
 capabilities = ["rust", "python"]
-tools = ["question", "edit", "todowrite", "todoread", "glob", "search_text", "ls", "index", "shell", "read_tool", "write_file"]
+mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
+tools = [
+  # File operations
+  "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
+  # Search & navigation
+  "glob", "search_text", "ls", "index", "get_symbol", "get_function",
+  # Execution
+  "shell",
+  # Task management
+  "todowrite", "todoread",
+  # User interaction
+  "question",
+  # Web browsing
+  "browse",
+]
+
 assume_mutating = false
-mutating_tools = ["edit", "write_file", "shell"]
 system = [
   { file = "../prompts/default_system.txt" }
 ]
@@ -135,7 +165,21 @@ provider = "codex"
 model = "gpt-5.4"
 description = "Specialized in reviewing and understanding and summarizing code."
 capabilities = ["rust", "python"]
-tools = ["question", "todowrite", "todoread", "glob", "search_text", "ls", "index", "shell", "read_tool", "browse"]
+tools = [
+  # File operations
+  "read_tool",
+  # Search & navigation
+  "glob", "search_text", "ls", "index", "get_symbol", "get_function",
+  # Execution
+  "shell",
+  # Task management
+  "todowrite", "todoread",
+  # User interaction
+  "question",
+  # Web browsing
+  "browse",
+]
+
 assume_mutating = false
 mutating_tools = []
 system = ["""You are a file search specialist. You excel at thoroughly navigating and exploring codebases.
@@ -150,6 +194,8 @@ Guidelines:
 - Use `search_text` for searching file contents with regex
 - Use `read_tool` when you know the specific file path you need to read
 - Use `shell` for file operations like copying, moving, or listing directory contents
+- Use `get_symbol` to get info about symbols and their metadata
+- Use `get_function` to read one or more functions
 - Adapt your search approach based on the thoroughness level specified by the caller
 - Return file paths as absolute paths in your final response
 - For clear communication, avoid using emojis
