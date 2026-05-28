@@ -62,6 +62,7 @@
           typeshare
           libgcc
           gdb
+          bun
         ];
 
         agentUi = pkgs.buildNpmPackage {
