@@ -771,6 +771,17 @@ pub(super) async fn ensure_session_loaded(
     profile_id: Option<&str>,
     op_name: &'static str,
 ) -> Result<(), String> {
+    if state
+        .agent
+        .registry
+        .lock()
+        .await
+        .get(session_id)
+        .is_some_and(|session_ref| session_ref.is_remote())
+    {
+        return Ok(());
+    }
+
     let selected_profile_id = if let Some(profile_id) = profile_id {
         Some(profile_id.to_string())
     } else if let Some(profiles) = &state.profiles {

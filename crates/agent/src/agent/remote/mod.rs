@@ -68,7 +68,7 @@ mod tests;
 // ── Test modules (remote feature) ────────────────────────────────────────────
 
 #[cfg(all(test, feature = "remote"))]
-mod test_helpers;
+pub(crate) mod test_helpers;
 
 #[cfg(all(test, feature = "remote"))]
 mod provider_host_tests;
