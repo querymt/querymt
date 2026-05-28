@@ -723,8 +723,7 @@ mod build_provider_for_session_tests {
 
 #[cfg(all(test, feature = "remote"))]
 mod set_mesh_after_build_tests {
-    use crate::agent::remote::NodeId;
-    use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
+    use crate::agent::remote::test_helpers::fixtures::{get_test_mesh, random_node_id};
     use crate::session::backend::StorageBackend as _;
     use crate::session::provider::SessionProvider;
     use crate::session::sqlite_storage::SqliteStorage;
@@ -733,15 +732,6 @@ mod set_mesh_after_build_tests {
     use querymt::plugin::host::PluginRegistry;
     use std::sync::Arc;
     use tempfile::TempDir;
-
-    fn random_node_id() -> String {
-        NodeId::from_peer_id(
-            libp2p::identity::Keypair::generate_ed25519()
-                .public()
-                .to_peer_id(),
-        )
-        .to_string()
-    }
 
     // ── K.1 — set_mesh after Arc is shared makes mesh visible to build_provider ─
 

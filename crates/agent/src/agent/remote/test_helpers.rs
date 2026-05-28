@@ -15,6 +15,7 @@
 pub(crate) mod fixtures {
     use crate::agent::agent_config::AgentConfig;
     use crate::agent::agent_config_builder::AgentConfigBuilder;
+    use crate::agent::remote::NodeId;
     use crate::agent::remote::mesh::{MeshConfig, MeshDiscovery, MeshHandle, bootstrap_mesh};
     use crate::agent::remote::node_manager::RemoteNodeManager;
     use crate::agent::remote::provider_host::ProviderHostActor;
@@ -74,6 +75,15 @@ pub(crate) mod fixtures {
     /// The mesh swarm event loop is pinned to a dedicated long-lived runtime
     /// (`MESH_RUNTIME`) so it survives the teardown of individual per-test
     /// runtimes created by `#[tokio::test]`.
+    pub fn random_node_id() -> String {
+        NodeId::from_peer_id(
+            libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .to_peer_id(),
+        )
+        .to_string()
+    }
+
     pub async fn get_test_mesh() -> &'static MeshHandle {
         TEST_MESH
             .get_or_init(|| async {
