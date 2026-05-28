@@ -8,7 +8,9 @@ use crate::session::error::SessionResult;
 use crate::session::provider::SessionHandle;
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::{LLMConfig, SessionExecutionConfig};
+use crate::slash_commands::runtime::PostTurnAction;
 use crate::tools::AgentToolContext;
+use crate::work_packet::WorkPacketStore;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -88,6 +90,12 @@ pub(crate) struct ExecutionContext {
     /// definitions, symbols, hover docs, and type definitions through the
     /// editor's language server.
     pub workspace_query_bridge: Option<ClientBridgeSender>,
+
+    /// Optional work packet store for the packet tools.
+    pub work_packet_store: Option<Arc<dyn WorkPacketStore>>,
+
+    /// Optional slash-command follow-up action to run after the final assistant reply is stored.
+    pub post_turn_action: Option<PostTurnAction>,
 }
 
 impl ExecutionContext {
@@ -110,6 +118,8 @@ impl ExecutionContext {
             knowledge_store: None,
             event_sink: None,
             workspace_query_bridge: None,
+            work_packet_store: None,
+            post_turn_action: None,
         }
     }
 
@@ -128,6 +138,18 @@ impl ExecutionContext {
     /// Set the knowledge store for this context.
     pub fn with_knowledge_store(mut self, store: Option<Arc<dyn KnowledgeStore>>) -> Self {
         self.knowledge_store = store;
+        self
+    }
+
+    /// Set the work packet store for this context.
+    pub fn with_work_packet_store(mut self, store: Option<Arc<dyn WorkPacketStore>>) -> Self {
+        self.work_packet_store = store;
+        self
+    }
+
+    /// Set an optional slash-command follow-up action for the turn.
+    pub fn with_post_turn_action(mut self, action: Option<PostTurnAction>) -> Self {
+        self.post_turn_action = action;
         self
     }
 
@@ -187,6 +209,9 @@ impl ExecutionContext {
 
         if let Some(ref ks) = self.knowledge_store {
             ctx.with_knowledge_store(ks.clone());
+        }
+        if let Some(ref wps) = self.work_packet_store {
+            ctx.with_work_packet_store(wps.clone());
         }
         if let Some(ref sink) = self.event_sink {
             ctx.with_event_sink(sink.clone());

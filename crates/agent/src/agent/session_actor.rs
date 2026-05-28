@@ -17,6 +17,7 @@ use crate::events::{AgentEventKind, SessionLimits};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::LLMConfig;
+use crate::slash_commands::SlashCommandHost;
 use agent_client_protocol::schema::{
     ContentChunk, ExtResponse, PromptResponse, SessionUpdate, SetSessionModelResponse, StopReason,
 };
@@ -1723,25 +1724,166 @@ async fn execute_prompt_detached(
     .with_cancellation_token(cancel_token.clone())
     .with_execution_origin(execution_origin)
     .with_knowledge_store(config.knowledge_store())
+    .with_work_packet_store(config.work_packet_store())
     .with_event_sink(config.event_sink.clone())
     .with_workspace_query_bridge(bridge.clone());
 
-    // 4. Slash command expansion (before storing user messages)
+    // 4. Slash command dispatch: try prompt expansion first.
     let mut req = req;
     if let Some(agent_client_protocol::schema::ContentBlock::Text(text_content)) =
         req.prompt.first()
-        && let Some(expansion) =
-            crate::slash_commands::try_expand(&text_content.text, &config.slash_command_registry)
     {
-        log::info!(
-            "Session {}: expanding slash command '/{}'",
-            session_id,
-            expansion.invocation.name
-        );
-        // Replace the first text block with the expanded prompt
-        req.prompt[0] = agent_client_protocol::schema::ContentBlock::Text(
-            agent_client_protocol::schema::TextContent::new(expansion.prompt_text),
-        );
+        struct SessionSlashCommandHost<'a> {
+            session_id: &'a str,
+            session_handle: &'a crate::session::provider::SessionHandle,
+        }
+
+        impl SlashCommandHost for SessionSlashCommandHost<'_> {
+            fn session_id(&self) -> &str {
+                self.session_id
+            }
+
+            fn session_handle(&self) -> &crate::session::provider::SessionHandle {
+                self.session_handle
+            }
+        }
+
+        // 4a. Try runtime command dispatch.
+        //     Runtime commands are control-plane actions — they bypass chat history.
+        //     Only domain effects (work packets, etc.) persist; the command and its
+        //     output are emitted as ephemeral live-only events for UI display.
+        let host = SessionSlashCommandHost {
+            session_id: &session_id,
+            session_handle: &exec_ctx.session_handle,
+        };
+        let runtime_result = crate::slash_commands::try_dispatch_runtime(
+            &text_content.text,
+            &config.slash_command_registry,
+            &host,
+        )
+        .await;
+
+        match runtime_result {
+            Some(crate::slash_commands::SlashCommandExecution::Handled { output }) => {
+                let command_id = Uuid::new_v4().to_string();
+                let command_name = crate::slash_commands::expander::try_parse_invocation(
+                    &text_content.text,
+                    &config.slash_command_registry,
+                )
+                .map(|inv| inv.name.clone())
+                .unwrap_or_default();
+
+                log::info!(
+                    "Session {}: runtime command '{}' handled (no LLM)",
+                    session_id,
+                    command_name
+                );
+
+                // Emit ephemeral command lifecycle events (live-only, no persistence).
+                config.emit_event(
+                    &session_id,
+                    AgentEventKind::RuntimeCommandStarted {
+                        command_id: command_id.clone(),
+                        command_line: text_content.text.clone(),
+                        command: command_name.clone(),
+                    },
+                );
+                config.emit_event(
+                    &session_id,
+                    AgentEventKind::RuntimeCommandFinished {
+                        command_id,
+                        command: command_name,
+                        output,
+                    },
+                );
+
+                // Return immediately — no chat messages, no LLM turn.
+                return Ok(PromptResponse::new(StopReason::EndTurn));
+            }
+            Some(crate::slash_commands::SlashCommandExecution::Hybrid {
+                output,
+                prompt,
+                post_turn_action,
+            }) => {
+                let command_id = Uuid::new_v4().to_string();
+                let command_name = crate::slash_commands::expander::try_parse_invocation(
+                    &text_content.text,
+                    &config.slash_command_registry,
+                )
+                .map(|inv| inv.name.clone())
+                .unwrap_or_default();
+
+                log::info!(
+                    "Session {}: hybrid command '{}' — deterministic output + LLM continuation",
+                    session_id,
+                    command_name
+                );
+
+                // Emit ephemeral command events for the deterministic part.
+                config.emit_event(
+                    &session_id,
+                    AgentEventKind::RuntimeCommandStarted {
+                        command_id: command_id.clone(),
+                        command_line: text_content.text.clone(),
+                        command: command_name.clone(),
+                    },
+                );
+                if let Some(output) = output {
+                    config.emit_event(
+                        &session_id,
+                        AgentEventKind::RuntimeCommandFinished {
+                            command_id,
+                            command: command_name,
+                            output,
+                        },
+                    );
+                }
+
+                // Replace the first text block with the continuation prompt.
+                // This becomes the user message for the LLM turn.
+                req.prompt[0] = agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new(prompt),
+                );
+                exec_ctx = exec_ctx.with_post_turn_action(post_turn_action);
+            }
+            Some(crate::slash_commands::SlashCommandExecution::Prompt {
+                prompt,
+                post_turn_action,
+            }) => {
+                if let Some(action) = post_turn_action.as_ref() {
+                    config.emit_event(
+                        &session_id,
+                        AgentEventKind::RuntimeCommandStarted {
+                            command_id: action.command_id().to_string(),
+                            command_line: text_content.text.clone(),
+                            command: action.command_name().to_string(),
+                        },
+                    );
+                }
+
+                // A prompt variant that needs LLM processing — treat like template expansion.
+                req.prompt[0] = agent_client_protocol::schema::ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new(prompt),
+                );
+                exec_ctx = exec_ctx.with_post_turn_action(post_turn_action);
+            }
+            Some(crate::slash_commands::SlashCommandExecution::NotHandled) | None => {
+                // 4b. Not a runtime command — try prompt expansion (LLM template).
+                if let Some(expansion) = crate::slash_commands::try_expand(
+                    &text_content.text,
+                    &config.slash_command_registry,
+                ) {
+                    log::info!(
+                        "Session {}: expanding slash command '/{}'",
+                        session_id,
+                        expansion.invocation.name
+                    );
+                    req.prompt[0] = agent_client_protocol::schema::ContentBlock::Text(
+                        agent_client_protocol::schema::TextContent::new(expansion.prompt_text),
+                    );
+                }
+            }
+        }
     }
 
     // 5. Store User Messages

@@ -5,8 +5,10 @@ use agent_client_protocol::schema::{
 };
 
 /// Convert the registry into an ACP `AvailableCommandsUpdate`.
+///
+/// Includes both prompt-template commands and runtime command descriptors.
 pub fn registry_to_acp_update(registry: &SlashCommandRegistry) -> AvailableCommandsUpdate {
-    let commands: Vec<AvailableCommand> = registry
+    let mut commands: Vec<AvailableCommand> = registry
         .all()
         .map(|cmd| {
             let mut acp_cmd = AvailableCommand::new(format!("/{}", cmd.name), &cmd.description);
@@ -20,6 +22,18 @@ pub fn registry_to_acp_update(registry: &SlashCommandRegistry) -> AvailableComma
             acp_cmd
         })
         .collect();
+
+    // Add runtime command descriptors.
+    for command in registry.all_runtime() {
+        let desc = &command.descriptor;
+        let mut acp_cmd = AvailableCommand::new(format!("/{}", desc.name), desc.description);
+        if let Some(hint) = desc.argument_hint {
+            acp_cmd = acp_cmd.input(AvailableCommandInput::Unstructured(
+                UnstructuredCommandInput::new(hint.to_string()),
+            ));
+        }
+        commands.push(acp_cmd);
+    }
 
     AvailableCommandsUpdate::new(commands)
 }

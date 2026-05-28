@@ -271,7 +271,7 @@ export function ShortcutGateway({
 
               <Command.Item
                 value="performance mode"
-                keywords={['perf', 'performance', 'gpu', 'power', 'battery', 'p']}
+                keywords={['perf', 'performance', 'gpu', 'power', 'battery', 'g']}
                 onSelect={() => { togglePerfMode(); close(); }}
                 className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-surface-border/20 cursor-pointer transition-colors data-[selected=true]:bg-accent-primary/15 data-[selected=true]:border-accent-primary/35 hover:bg-surface-elevated/60 hover:border-surface-border/40"
               >
@@ -285,7 +285,7 @@ export function ShortcutGateway({
                   </div>
                 </div>
                 <kbd className="px-2 py-1 text-[10px] font-mono bg-surface-canvas border border-surface-border rounded text-ui-secondary">
-                  {perfMode ? 'On' : 'P'}
+                  {perfMode ? 'On' : 'G'}
                 </kbd>
               </Command.Item>
             </Command.Group>

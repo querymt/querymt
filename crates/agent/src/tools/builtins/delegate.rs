@@ -59,6 +59,10 @@ impl ToolTrait for DelegateTool {
                         "expected_output": {
                             "type": "string",
                             "description": "What the delegated agent is expected to produce."
+                        },
+                        "input_packet_id": {
+                            "type": "string",
+                            "description": "Optional work packet ID to use as planning context for the delegated agent. The packet body will be injected into the child session."
                         }
                     },
                     "required": ["target_agent_id", "objective"]

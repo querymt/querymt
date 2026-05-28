@@ -98,6 +98,39 @@ fn migration_0004_adds_session_kind_column() {
 }
 
 #[test]
+fn migration_0011_creates_work_packet_tables() {
+    let mut conn = Connection::open_in_memory().expect("in-memory db");
+    apply_migrations(&mut conn).expect("apply migrations");
+
+    let work_packets_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='work_packets'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check work_packets table");
+    assert_eq!(work_packets_exists, 1);
+
+    let work_packets_fts_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='work_packets_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check work_packets_fts table");
+    assert_eq!(work_packets_fts_exists, 1);
+
+    let active_work_packets_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='active_work_packets'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check active_work_packets table");
+    assert_eq!(active_work_packets_exists, 1);
+}
+
+#[test]
 fn migrations_are_idempotent() {
     let mut conn = Connection::open_in_memory().expect("in-memory db");
     apply_migrations(&mut conn).expect("first migration run");

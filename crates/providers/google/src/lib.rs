@@ -45,8 +45,9 @@ use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort,
-        StructuredOutputFormat, Tool, ToolChoice, http::HTTPChatProvider,
+        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort, StreamChunk,
+        StructuredOutputFormat, Tool, ToolChoice,
+        http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -64,7 +65,7 @@ use url::Url;
 ///
 /// This struct holds the configuration and state needed to make requests to the Gemini API.
 /// It implements the [`ChatProvider`], [`CompletionProvider`], and [`EmbeddingProvider`] traits.
-#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Google {
     /// API key for authentication with Google's API
@@ -97,45 +98,11 @@ pub struct Google {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub thinking_budget: Option<u32>,
     pub cached_content: Option<String>,
-    /// Buffer for accumulating incomplete streaming JSON chunks
-    /// This field is not serialized and uses interior mutability to allow
-    /// buffering across multiple parse_chat_stream_chunk calls
-    #[serde(skip, default = "default_stream_buffer")]
-    #[schemars(skip)]
-    stream_buffer: std::sync::Mutex<String>,
+
     /// Optional resolver for dynamic credential refresh (e.g., OAuth tokens).
     #[serde(skip)]
     #[schemars(skip)]
     pub key_resolver: Option<Arc<dyn ApiKeyResolver>>,
-}
-
-fn default_stream_buffer() -> std::sync::Mutex<String> {
-    std::sync::Mutex::new(String::new())
-}
-
-impl Clone for Google {
-    fn clone(&self) -> Self {
-        Self {
-            api_key: self.api_key.clone(),
-            model: self.model.clone(),
-            max_tokens: self.max_tokens,
-            temperature: self.temperature,
-            system: self.system.clone(),
-            timeout_seconds: self.timeout_seconds,
-            stream: self.stream,
-            top_p: self.top_p,
-            top_k: self.top_k,
-            json_schema: self.json_schema.clone(),
-            tools: self.tools.clone(),
-            tool_choice: self.tool_choice.clone(),
-            reasoning_effort: self.reasoning_effort,
-            thinking_budget: self.thinking_budget,
-            cached_content: self.cached_content.clone(),
-            // Create a new empty buffer for the cloned instance
-            stream_buffer: std::sync::Mutex::new(String::new()),
-            key_resolver: self.key_resolver.clone(),
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -935,6 +902,16 @@ impl HTTPChatProvider for Google {
             .body(json_body)?)
     }
 
+    fn chat_stream_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<Request<Vec<u8>>, LLMError> {
+        let mut cfg = self.clone();
+        cfg.stream = Some(true);
+        cfg.chat_request(messages, tools)
+    }
+
     fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         handle_http_error!(resp);
 
@@ -957,36 +934,8 @@ impl HTTPChatProvider for Google {
         true
     }
 
-    fn parse_chat_stream_chunk(
-        &self,
-        chunk: &[u8],
-    ) -> Result<Vec<querymt::chat::StreamChunk>, LLMError> {
-        let text =
-            std::str::from_utf8(chunk).map_err(|e| LLMError::GenericError(format!("{:#}", e)))?;
-
-        // Get mutable access to buffer
-        let mut buffer = self.stream_buffer.lock().unwrap();
-
-        // Append new chunk to buffer
-        buffer.push_str(text);
-
-        // Process the buffer to extract complete JSON objects
-        let (extracted_chunks, bytes_consumed) = extract_complete_json_objects(&buffer)?;
-
-        if bytes_consumed > 0 {
-            // Remove the consumed portion from the buffer
-            buffer.drain(..bytes_consumed);
-        }
-
-        // If we found a finish_reason, clear the buffer for next request
-        for chunk in &extracted_chunks {
-            if matches!(chunk, querymt::chat::StreamChunk::Done { .. }) {
-                buffer.clear();
-                break;
-            }
-        }
-
-        Ok(extracted_chunks)
+    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        Ok(Box::new(GoogleStreamParser::default()))
     }
 }
 
@@ -1068,6 +1017,35 @@ impl HTTPLLMProvider for Google {
 
     fn set_key_resolver(&mut self, resolver: Arc<dyn ApiKeyResolver>) {
         self.key_resolver = Some(resolver);
+    }
+}
+
+#[derive(Default)]
+struct GoogleStreamParser {
+    buffer: String,
+}
+
+impl ChatStreamParser for GoogleStreamParser {
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<querymt::chat::StreamChunk>, LLMError> {
+        let text =
+            std::str::from_utf8(chunk).map_err(|e| LLMError::GenericError(format!("{:#}", e)))?;
+
+        self.buffer.push_str(text);
+
+        let (extracted_chunks, bytes_consumed) = extract_complete_json_objects(&self.buffer)?;
+
+        if bytes_consumed > 0 {
+            self.buffer.drain(..bytes_consumed);
+        }
+
+        for chunk in &extracted_chunks {
+            if matches!(chunk, querymt::chat::StreamChunk::Done { .. }) {
+                self.buffer.clear();
+                break;
+            }
+        }
+
+        Ok(extracted_chunks)
     }
 }
 

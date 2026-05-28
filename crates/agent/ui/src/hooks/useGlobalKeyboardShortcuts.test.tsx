@@ -65,6 +65,29 @@ describe('useGlobalKeyboardShortcuts', () => {
     expect(setProfilePickerOpen).toHaveBeenCalledWith(true);
   });
 
+  it('toggles performance mode from the Ctrl+X G chord in the shortcut gateway', () => {
+    const setShortcutGatewayOpen = vi.fn();
+    const togglePerfMode = vi.fn();
+    useUiStore.setState({ togglePerfMode });
+
+    renderHook(() => useGlobalKeyboardShortcuts({
+      ...defaultProps,
+      shortcutGatewayOpen: true,
+      setShortcutGatewayOpen,
+    }));
+
+    const event = new KeyboardEvent('keydown', { key: 'g', bubbles: true });
+    const preventDefault = vi.spyOn(event, 'preventDefault');
+
+    act(() => {
+      window.dispatchEvent(event);
+    });
+
+    expect(preventDefault).toHaveBeenCalledTimes(1);
+    expect(setShortcutGatewayOpen).toHaveBeenCalledWith(false);
+    expect(togglePerfMode).toHaveBeenCalledTimes(1);
+  });
+
   it('does not intercept P in the shortcut gateway when profiles are unavailable', () => {
     const setShortcutGatewayOpen = vi.fn();
     const setProfilePickerOpen = vi.fn();

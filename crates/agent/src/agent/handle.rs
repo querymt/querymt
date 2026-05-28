@@ -186,6 +186,12 @@ pub struct LocalAgentHandle {
 }
 
 impl LocalAgentHandle {
+    fn should_return_without_force_stop(
+        status: crate::agent::messages::SessionRuntimeStatus,
+    ) -> bool {
+        matches!(status, crate::agent::messages::SessionRuntimeStatus::Idle)
+    }
+
     /// Construct a `LocalAgentHandle` from a shared `AgentConfig`.
     ///
     /// This is the canonical way to create a `LocalAgentHandle` after building
@@ -1599,16 +1605,21 @@ impl LocalAgentHandle {
             .get_runtime_status()
             .await
             .unwrap_or(SessionRuntimeStatus::Running);
-        if matches!(
-            status,
-            SessionRuntimeStatus::Idle | SessionRuntimeStatus::CancelRequested
-        ) {
+        if Self::should_return_without_force_stop(status) {
             tracing::debug!(
                 "Session {} stop: status={:?}, graceful shutdown — returning without force-stop",
                 session_id,
                 status
             );
             return Ok(());
+        }
+
+        if matches!(status, SessionRuntimeStatus::CancelRequested) {
+            tracing::warn!(
+                "Session {} stop: still CancelRequested after {:?}; escalating to force-stop",
+                session_id,
+                STOP_ESCALATION_TIMEOUT
+            );
         }
 
         self.config.emit_event(
@@ -3307,6 +3318,19 @@ mod tests {
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_should_return_without_force_stop_only_for_idle() {
+        assert!(LocalAgentHandle::should_return_without_force_stop(
+            crate::agent::messages::SessionRuntimeStatus::Idle
+        ));
+        assert!(!LocalAgentHandle::should_return_without_force_stop(
+            crate::agent::messages::SessionRuntimeStatus::Running
+        ));
+        assert!(!LocalAgentHandle::should_return_without_force_stop(
+            crate::agent::messages::SessionRuntimeStatus::CancelRequested
+        ));
+    }
 
     #[tokio::test]
     async fn test_from_config_creates_empty_registry() {

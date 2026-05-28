@@ -16,6 +16,13 @@ pub trait HTTPLLMProviderFactory: Send + Sync {
     /// Schema for plugin config
     fn config_schema(&self) -> String;
 
+    /// Return model names without network access when provider has a static/model-local catalog.
+    ///
+    /// Returning `Some` short-circuits HTTP list-models flow.
+    fn list_models_static(&self, _cfg: &str) -> Option<Result<Vec<String>, LLMError>> {
+        None
+    }
+
     /// Build the HTTP request that lists models.
     fn list_models_request(&self, cfg: &str) -> Result<Request<Vec<u8>>, LLMError>;
 

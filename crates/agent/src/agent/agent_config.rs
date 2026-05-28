@@ -87,6 +87,8 @@ pub struct AgentConfig {
     pub schedule_repository: Option<Arc<dyn crate::session::repo_schedule::ScheduleRepository>>,
     /// Knowledge store for the knowledge tools.
     pub knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
+    /// Work packet store for the packet tools.
+    pub work_packet_store: Option<Arc<dyn crate::work_packet::WorkPacketStore>>,
     /// Slash command registry for prompt expansion and ACP advertising.
     pub slash_command_registry: crate::slash_commands::SlashCommandRegistry,
 }
@@ -232,6 +234,11 @@ impl AgentConfig {
     /// Access the knowledge store, if configured.
     pub fn knowledge_store(&self) -> Option<Arc<dyn crate::knowledge::KnowledgeStore>> {
         self.knowledge_store.clone()
+    }
+
+    /// Convenience: work packet store (clones the Option).
+    pub fn work_packet_store(&self) -> Option<Arc<dyn crate::work_packet::WorkPacketStore>> {
+        self.work_packet_store.clone()
     }
 
     /// Determines if a tool should trigger snapshotting.

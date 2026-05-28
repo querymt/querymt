@@ -79,6 +79,7 @@ export type {
   KnowledgeEntryInfo,
   ConsolidationInfo,
   AudioModelInfo,
+  SlashCommandEntry,
 } from './generated/types';
 
 // FileIndexEntry is now generated from Rust via typeshare — re-exported above.
@@ -106,7 +107,7 @@ export interface EventItem {
   agentId?: string;
   sessionId?: string;
   seq?: number;
-  type: 'user' | 'agent' | 'tool_call' | 'tool_result' | 'system';
+  type: 'user' | 'agent' | 'tool_call' | 'tool_result' | 'system' | 'command';
   content: string;
   timestamp: number;
   isMessage?: boolean;  // True for actual user/assistant messages (not internal events)
@@ -170,6 +171,23 @@ export interface EventItem {
   isStreamDelta?: boolean;    // True while this is a live streaming accumulator
   isThinkingDelta?: boolean;  // True if accumulating thinking deltas (no text yet)
   streamMessageId?: string;   // Links delta events to the final message_id for replacement
+  // Runtime command event fields (live-only, not persisted)
+  commandId?: string;         // Correlation ID for started/finished pairs
+  commandLine?: string;       // The raw command the user typed (e.g. "/status")
+  commandName?: string;       // The command name (e.g. "status")
+  commandStatus?: 'running' | 'completed' | 'failed';
+  commandOutput?: {           // Structured output from CommandOutput
+    title?: string;
+    body: string;
+    level: 'info' | 'success' | 'warning' | 'error';
+    display: 'text' | 'markdown';
+  };
+  commandError?: string;      // Error message for failed commands
+  // LLM retry event fields
+  llmRetryPhase?: string;     // "setup" or "stream_creation"
+  llmRetryAttempt?: number;
+  llmRetryMaxAttempts?: number;
+  llmRetryWaitSecs?: number;
 }
 
 export interface RateLimitState {

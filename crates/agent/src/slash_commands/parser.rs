@@ -3,7 +3,7 @@ use crate::slash_commands::types::{
     is_valid_command_name,
 };
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Parse a command `.md` file into a [`SlashCommand`].
 ///
@@ -26,34 +26,44 @@ pub fn parse_command_file(
         .unwrap_or("")
         .to_string();
 
-    if !is_valid_command_name(&file_name) {
+    parse_command_content(&file_name, &content, path.to_path_buf(), source)
+}
+
+/// Parse command content from a string (no filesystem required).
+///
+/// Used for built-in commands embedded via `include_str!`.
+/// The `pseudo_path` is used for diagnostics and display only.
+pub fn parse_command_content(
+    name: &str,
+    content: &str,
+    pseudo_path: PathBuf,
+    source: SlashCommandSource,
+) -> Result<SlashCommand, SlashCommandDiagnostic> {
+    if !is_valid_command_name(name) {
         return Err(SlashCommandDiagnostic {
-            path: path.to_path_buf(),
+            path: pseudo_path,
             message: format!(
-                "Invalid command name derived from filename: '{}'. \
-                 Must match [a-zA-Z][a-zA-Z0-9_-]*",
-                file_name
+                "Invalid command name: '{}'. Must match [a-zA-Z][a-zA-Z0-9_-]*",
+                name
             ),
         });
     }
 
     let parsed = gray_matter::Matter::<gray_matter::engine::YAML>::new()
-        .parse::<CommandFrontmatter>(&content)
+        .parse::<CommandFrontmatter>(content)
         .map_err(|e| SlashCommandDiagnostic {
-            path: path.to_path_buf(),
-            message: format!("Failed to parse file: {}", e),
+            path: pseudo_path.clone(),
+            message: format!("Failed to parse content: {}", e),
         })?;
 
-    // Extract and validate frontmatter
     let metadata: CommandFrontmatter = parsed.data.ok_or_else(|| SlashCommandDiagnostic {
-        path: path.to_path_buf(),
+        path: pseudo_path.clone(),
         message: "Missing YAML frontmatter".to_string(),
     })?;
 
-    // Validate required description
     if metadata.description.trim().is_empty() {
         return Err(SlashCommandDiagnostic {
-            path: path.to_path_buf(),
+            path: pseudo_path,
             message: "Field 'description' is required and cannot be empty".to_string(),
         });
     }
@@ -65,18 +75,18 @@ pub fn parse_command_file(
         && script.path.is_absolute()
     {
         return Err(SlashCommandDiagnostic {
-            path: path.to_path_buf(),
+            path: pseudo_path,
             message: format!(
-                "Script path must be relative to the command file directory, got: {}",
+                "Script path must be relative, got: {}",
                 script.path.display()
             ),
         });
     }
 
     Ok(SlashCommand {
-        name: file_name,
+        name: name.to_string(),
         source,
-        path: path.to_path_buf(),
+        path: pseudo_path,
         description: metadata.description.trim().to_string(),
         argument_hint: metadata.argument_hint,
         tags: metadata.tags,

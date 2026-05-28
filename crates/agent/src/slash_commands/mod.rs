@@ -35,13 +35,18 @@ pub mod discovery;
 pub mod expander;
 pub mod parser;
 pub mod registry;
+pub mod runtime;
 pub mod script;
 pub mod types;
 
-pub use discovery::{default_search_paths, discover_all, discover_from_source};
-pub use expander::{expand_invocation, try_expand, try_parse_invocation};
-pub use parser::parse_command_file;
+pub use discovery::{default_search_paths, discover_all, discover_builtin, discover_from_source};
+pub use expander::{expand_invocation, try_dispatch_runtime, try_expand, try_parse_invocation};
+pub use parser::{parse_command_content, parse_command_file};
 pub use registry::SlashCommandRegistry;
+pub use runtime::{
+    RegisteredRuntimeCommand, RuntimeCommandDescriptor, RuntimeSlashCommandPlugin,
+    SlashCommandExecution, SlashCommandHost,
+};
 pub use types::{
     CommandFrontmatter, SlashCommand, SlashCommandDiagnostic, SlashCommandExpansion,
     SlashCommandInvocation, SlashCommandScriptsConfig, SlashCommandSource, is_valid_command_name,

@@ -3,6 +3,7 @@ use crate::{
     chat::{ChatMessage, ChatResponse, FinishReason, Tool},
     completion::CompletionRequest,
     error::{LLMError, LLMErrorPayload},
+    plugin::extism_impl::SerializableHttpResponse,
     stt, tts,
 };
 use serde::{Deserialize, Serialize};
@@ -132,10 +133,44 @@ pub struct ExtismChatRequest<C> {
     pub tools: Option<Vec<Tool>>,
 }
 
+#[derive(Deserialize, Serialize)]
+pub struct ExtismChatParseRequest<C> {
+    pub cfg: C,
+    pub resp: SerializableHttpResponse,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ExtismChatChunkParseRequest {
+    pub parser_id: i64,
+    pub chunk: Vec<u8>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ExtismCompleteParseRequest<C> {
+    pub cfg: C,
+    pub resp: SerializableHttpResponse,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ExtismEmbedParseRequest<C> {
+    pub cfg: C,
+    pub resp: SerializableHttpResponse,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ExtismListModelsParseRequest {
+    pub resp: SerializableHttpResponse,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct ExtismEmbedRequest<C> {
     pub cfg: C,
     pub inputs: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ExtismListModelsRequest {
+    pub cfg: serde_json::Value,
 }
 
 #[derive(Deserialize, Serialize)]

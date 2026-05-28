@@ -153,7 +153,7 @@ macro_rules! impl_extism_http_plugin {
         };
         use querymt::{
             HTTPLLMProvider,
-            chat::http::HTTPChatProvider,
+            chat::{StreamChunk, http::HTTPChatProvider},
             completion::{CompletionResponse, http::HTTPCompletionProvider},
             embedding::http::HTTPEmbeddingProvider,
             plugin::{
@@ -216,189 +216,191 @@ macro_rules! impl_extism_http_plugin {
             Ok(Json(native_cfg))
         }
 
-        // list models
+        // list models (new request/parse split)
         #[plugin_fn]
-        pub fn list_models(cfg: Json<Value>) -> FnResult<Json<Vec<String>>> {
-            let cfg_str = serde_json::to_string(&cfg.0).map_err(PdkError::new)?;
+        pub fn list_models_static(
+            Json(input): Json<querymt::plugin::extism_impl::ExtismListModelsRequest>,
+        ) -> FnResult<Json<Option<Vec<String>>>> {
+            let cfg_str = serde_json::to_string(&input.cfg).map_err(PdkError::new)?;
+            match HTTPLLMProviderFactory::list_models_static(&$Factory, &cfg_str) {
+                Some(Ok(models)) => Ok(Json(Some(models))),
+                Some(Err(err)) => Err(llm_err_to_pdk(err)),
+                None => Ok(Json(None)),
+            }
+        }
+
+        #[plugin_fn]
+        pub fn list_models_request(
+            Json(input): Json<querymt::plugin::extism_impl::ExtismListModelsRequest>,
+        ) -> FnResult<Json<querymt::plugin::extism_impl::SerializableHttpRequest>> {
+            let cfg_str = serde_json::to_string(&input.cfg).map_err(PdkError::new)?;
             let req = HTTPLLMProviderFactory::list_models_request(&$Factory, &cfg_str)
                 .map_err(llm_err_to_pdk)?;
-            let native_resp = qmt_http_request_wrapper(&req)?;
+            Ok(Json(querymt::plugin::extism_impl::SerializableHttpRequest { req }))
+        }
 
-            let models = HTTPLLMProviderFactory::parse_list_models(&$Factory, native_resp)
+        #[plugin_fn]
+        pub fn parse_list_models_response(
+            Json(input): Json<querymt::plugin::extism_impl::ExtismListModelsParseRequest>,
+        ) -> FnResult<Json<Vec<String>>> {
+            let models = HTTPLLMProviderFactory::parse_list_models(&$Factory, input.resp.resp)
                 .map_err(llm_err_to_pdk)?;
             Ok(Json(models))
         }
 
-        // chat_request wrapper
         #[plugin_fn]
-        pub fn chat(
+        pub fn chat_request(
             Json(input): Json<ExtismChatRequest<$Config>>,
-        ) -> FnResult<Json<ExtismChatResponse>> {
+        ) -> FnResult<Json<querymt::plugin::extism_impl::SerializableHttpRequest>> {
             let req = input
                 .cfg
                 .chat_request(&input.messages, input.tools.as_deref())
                 .map_err(llm_err_to_pdk)?;
-            let native_resp = qmt_http_request_wrapper(&req)?;
-
-            let chat_response = input.cfg.parse_chat(native_resp).map_err(llm_err_to_pdk)?;
-            let dto: ExtismChatResponse = chat_response.into();
-            Ok(Json(dto))
+            Ok(Json(querymt::plugin::extism_impl::SerializableHttpRequest { req }))
         }
 
-        // chat_stream wrapper (wireframe implementation)
         #[plugin_fn]
-        pub fn chat_stream(Json(input): Json<ExtismChatRequest<$Config>>) -> FnResult<()> {
-            use querymt::chat::{FinishReason, StreamChunk};
-            use querymt::plugin::extism_impl::ExtismChatChunk;
-            use $crate::{
-                qmt_http_stream_close_wrapper, qmt_http_stream_next_wrapper,
-                qmt_http_stream_open_wrapper, qmt_yield_chunk_wrapper,
-            };
-
+        pub fn chat_stream_request(
+            Json(input): Json<ExtismChatRequest<$Config>>,
+        ) -> FnResult<Json<querymt::plugin::extism_impl::SerializableHttpRequest>> {
             let req = input
                 .cfg
-                .chat_request(&input.messages, input.tools.as_deref())
+                .chat_stream_request(&input.messages, input.tools.as_deref())
                 .map_err(llm_err_to_pdk)?;
+            Ok(Json(querymt::plugin::extism_impl::SerializableHttpRequest { req }))
+        }
 
-            use querymt::plugin::extism_impl::StreamOpenResult;
+        #[plugin_fn]
+        pub fn parse_chat_response(
+            Json(input): Json<querymt::plugin::extism_impl::ExtismChatParseRequest<$Config>>,
+        ) -> FnResult<Json<ExtismChatResponse>> {
+            let chat_response = input
+                .cfg
+                .parse_chat(input.resp.resp)
+                .map_err(llm_err_to_pdk)?;
+            Ok(Json(chat_response.into()))
+        }
 
-            let stream_id = match qmt_http_stream_open_wrapper(&req)? {
-                StreamOpenResult::Ok { stream_id } => stream_id,
-                StreamOpenResult::Cancelled => {
-                    // Cancelled during stream open - yield Done and return
-                    qmt_yield_chunk_wrapper(&ExtismChatChunk {
-                        chunk: StreamChunk::Done {
-                            finish_reason: FinishReason::Stop,
-                        },
-                        usage: None,
-                    })?;
-                    return Ok(());
-                }
-                StreamOpenResult::Error {
-                    plugin_error,
-                    error_code,
-                } => {
-                    // HTTP error occurred - decode and propagate via WithReturnCode
-                    let llm_error = PluginError::decode(error_code, &plugin_error);
-                    return Err(llm_err_to_pdk(llm_error));
-                }
-            };
+        thread_local! {
+            static STREAM_PARSERS: std::cell::RefCell<std::collections::HashMap<i64, Box<dyn querymt::chat::http::ChatStreamParser>>> =
+                std::cell::RefCell::new(std::collections::HashMap::new());
+            static NEXT_STREAM_PARSER_ID: std::cell::Cell<i64> = const { std::cell::Cell::new(1) };
+        }
 
-            let mut buffer = Vec::new();
-            let mut done_received = false;
+        #[plugin_fn]
+        pub fn chat_stream_parser_start(Json(cfg): Json<$Config>) -> FnResult<Json<i64>> {
+            let parser = cfg.chat_stream_parser().map_err(llm_err_to_pdk)?;
+            let parser_id = NEXT_STREAM_PARSER_ID.with(|next| {
+                let id = next.get();
+                next.set(id + 1);
+                id
+            });
+            STREAM_PARSERS.with(|parsers| {
+                parsers.borrow_mut().insert(parser_id, parser);
+            });
+            Ok(Json(parser_id))
+        }
 
-            while let Some(raw_chunk) = qmt_http_stream_next_wrapper(stream_id)? {
-                buffer.extend_from_slice(&raw_chunk);
+        #[plugin_fn]
+        pub fn chat_stream_parser_parse(
+            Json(input): Json<querymt::plugin::extism_impl::ExtismChatChunkParseRequest>,
+        ) -> FnResult<Json<Vec<querymt::plugin::extism_impl::ExtismChatChunk>>> {
+            let chunks = STREAM_PARSERS.with(|parsers| {
+                let mut parsers = parsers.borrow_mut();
+                let parser = parsers.get_mut(&input.parser_id).ok_or_else(|| {
+                    PdkError::msg(format!("Unknown parser id {}", input.parser_id))
+                })?;
+                parser.parse_chunk(&input.chunk).map_err(llm_err_to_pdk)
+            })?;
 
-                // Process complete lines from the buffer
-                if let Some(last_newline_pos) = buffer.iter().rposition(|&b| b == b'\n') {
-                    let to_process = &buffer[..=last_newline_pos];
-                    let chunks = input.cfg.parse_chat_stream_chunk(to_process).map_err(|e| {
-                        PdkError::msg(format!("parse_chat_stream_chunk failed: {}", e))
-                    })?;
+            let out = chunks
+                .into_iter()
+                .map(|chunk| {
+                    let usage = match &chunk {
+                        StreamChunk::Usage(usage) => Some(usage.clone()),
+                        _ => None,
+                    };
+                    querymt::plugin::extism_impl::ExtismChatChunk { chunk, usage }
+                })
+                .collect();
+            Ok(Json(out))
+        }
 
-                    for chunk in chunks.iter() {
-                        // Extract usage if this is a Usage chunk
-                        let usage_to_send = match &chunk {
-                            StreamChunk::Usage(usage) => Some(usage.clone()),
-                            _ => None,
-                        };
+        #[plugin_fn]
+        pub fn chat_stream_parser_finish(
+            Json(parser_id): Json<i64>,
+        ) -> FnResult<Json<Vec<querymt::plugin::extism_impl::ExtismChatChunk>>> {
+            let chunks = STREAM_PARSERS.with(|parsers| {
+                let mut parsers = parsers.borrow_mut();
+                let parser = parsers.get_mut(&parser_id).ok_or_else(|| {
+                    PdkError::msg(format!("Unknown parser id {}", parser_id))
+                })?;
+                parser.finish().map_err(llm_err_to_pdk)
+            })?;
 
-                        qmt_yield_chunk_wrapper(&ExtismChatChunk {
-                            chunk: chunk.clone(),
-                            usage: usage_to_send,
-                        })?;
+            let out = chunks
+                .into_iter()
+                .map(|chunk| {
+                    let usage = match &chunk {
+                        StreamChunk::Usage(usage) => Some(usage.clone()),
+                        _ => None,
+                    };
+                    querymt::plugin::extism_impl::ExtismChatChunk { chunk, usage }
+                })
+                .collect();
+            Ok(Json(out))
+        }
 
-                        // Check for Done AFTER yielding it
-                        if matches!(chunk, StreamChunk::Done { .. }) {
-                            done_received = true;
-                            break; // Stop yielding more chunks after Done
-                        }
-                    }
-                    buffer.drain(..=last_newline_pos);
-                }
-
-                if done_received {
-                    break;
-                }
-            }
-
-            // Stream ended without Done.
-            //
-            // We intentionally avoid introducing a new host API just to propagate an explicit
-            // "cancelled" signal across the WASM boundary. Instead, we rely on a convention:
-            // normal streaming completion emits a Done signal, while cancellation causes the host
-            // stream to terminate early (EOF) without Done. Maybe this can be improved in the
-            // future by introducing a specific calls to do a propet cancellation.
-            if !done_received {
-                // Best effort: try parsing any remaining bytes. If parsing fails, treat it as
-                // cancellation/truncation (common when cancellation happens mid-line).
-                if !buffer.is_empty() {
-                    if let Ok(chunks) = input.cfg.parse_chat_stream_chunk(&buffer) {
-                        for chunk in chunks {
-                            let usage_to_send = match &chunk {
-                                StreamChunk::Usage(usage) => Some(usage.clone()),
-                                _ => None,
-                            };
-
-                            qmt_yield_chunk_wrapper(&ExtismChatChunk {
-                                chunk: chunk.clone(),
-                                usage: usage_to_send,
-                            })?;
-
-                            if matches!(chunk, StreamChunk::Done { .. }) {
-                                done_received = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // If we still didn't see Done, emit a clean cancellation termination.
-                if !done_received {
-                    qmt_yield_chunk_wrapper(&ExtismChatChunk {
-                        chunk: StreamChunk::Done {
-                            finish_reason: FinishReason::Stop,
-                        },
-                        usage: None,
-                    })?;
-                }
-            }
-
-            qmt_http_stream_close_wrapper(stream_id)?;
+        #[plugin_fn]
+        pub fn chat_stream_parser_close(Json(parser_id): Json<i64>) -> FnResult<()> {
+            STREAM_PARSERS.with(|parsers| {
+                parsers.borrow_mut().remove(&parser_id);
+            });
             Ok(())
         }
 
-        // embed wrapper
         #[plugin_fn]
-        pub fn embed(
+        pub fn embed_request(
             Json(input): Json<ExtismEmbedRequest<$Config>>,
-        ) -> FnResult<Json<Vec<Vec<f32>>>> {
+        ) -> FnResult<Json<querymt::plugin::extism_impl::SerializableHttpRequest>> {
             let req = input
                 .cfg
                 .embed_request(&input.inputs)
                 .map_err(llm_err_to_pdk)?;
-            let native_resp = qmt_http_request_wrapper(&req)?;
-
-            let embed_response = input.cfg.parse_embed(native_resp).map_err(llm_err_to_pdk)?;
-            Ok(Json(embed_response))
+            Ok(Json(querymt::plugin::extism_impl::SerializableHttpRequest { req }))
         }
 
         #[plugin_fn]
-        pub fn complete(
+        pub fn parse_embed_response(
+            Json(input): Json<querymt::plugin::extism_impl::ExtismEmbedParseRequest<$Config>>,
+        ) -> FnResult<Json<Vec<Vec<f32>>>> {
+            let out = input
+                .cfg
+                .parse_embed(input.resp.resp)
+                .map_err(llm_err_to_pdk)?;
+            Ok(Json(out))
+        }
+
+        #[plugin_fn]
+        pub fn complete_request(
             Json(input): Json<ExtismCompleteRequest<$Config>>,
-        ) -> FnResult<Json<CompletionResponse>> {
+        ) -> FnResult<Json<querymt::plugin::extism_impl::SerializableHttpRequest>> {
             let req = input
                 .cfg
                 .complete_request(&input.req)
                 .map_err(llm_err_to_pdk)?;
-            let native_resp = qmt_http_request_wrapper(&req)?;
+            Ok(Json(querymt::plugin::extism_impl::SerializableHttpRequest { req }))
+        }
 
-            let complete_response = input
+        #[plugin_fn]
+        pub fn parse_complete_response(
+            Json(input): Json<querymt::plugin::extism_impl::ExtismCompleteParseRequest<$Config>>,
+        ) -> FnResult<Json<CompletionResponse>> {
+            let out = input
                 .cfg
-                .parse_complete(native_resp)
+                .parse_complete(input.resp.resp)
                 .map_err(llm_err_to_pdk)?;
-            Ok(Json(complete_response))
+            Ok(Json(out))
         }
 
         #[plugin_fn]

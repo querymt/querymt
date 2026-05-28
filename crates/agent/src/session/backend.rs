@@ -10,6 +10,7 @@ use crate::session::projection::{EventJournal, ViewStore};
 use crate::session::repo_schedule::ScheduleRepository;
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::session::store::SessionStore;
+use crate::work_packet::WorkPacketStore;
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -83,6 +84,12 @@ pub trait StorageBackend: Send + Sync {
     fn knowledge_store(&self) -> Option<Arc<dyn KnowledgeStore>> {
         None
     }
+
+    /// Work packet store for the packet tools.
+    /// Returns None if backend doesn't support work packet storage.
+    fn work_packet_store(&self) -> Option<Arc<dyn WorkPacketStore>> {
+        None
+    }
 }
 
 /// SQLite implementation of StorageBackend.
@@ -112,6 +119,12 @@ impl StorageBackend for SqliteStorage {
     fn knowledge_store(&self) -> Option<Arc<dyn KnowledgeStore>> {
         Some(Arc::new(
             crate::knowledge::sqlite::SqliteKnowledgeStore::new(self.conn()),
+        ))
+    }
+
+    fn work_packet_store(&self) -> Option<Arc<dyn WorkPacketStore>> {
+        Some(Arc::new(
+            crate::work_packet::sqlite::SqliteWorkPacketStore::new(self.conn()),
         ))
     }
 }

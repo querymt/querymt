@@ -29,6 +29,8 @@ pub struct SlashCommand {
 /// Where a command was discovered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommandSource {
+    /// Embedded in the querymt-agent crate (always available, lowest priority).
+    Builtin,
     /// `~/.qmt/commands`
     Global(PathBuf),
     /// `<PROJECT_ROOT>/.qmt/commands`
@@ -41,6 +43,7 @@ impl SlashCommandSource {
     /// Priority for deduplication (higher = overrides lower).
     pub fn priority(&self) -> u8 {
         match self {
+            SlashCommandSource::Builtin => 0,
             SlashCommandSource::Global(_) => 1,
             SlashCommandSource::Project(_) => 2,
             SlashCommandSource::Configured(_) => 3,
@@ -204,10 +207,12 @@ mod tests {
 
     #[test]
     fn test_source_priority() {
+        let builtin = SlashCommandSource::Builtin;
         let global = SlashCommandSource::Global(PathBuf::from("/global"));
         let project = SlashCommandSource::Project(PathBuf::from("/project"));
         let configured = SlashCommandSource::Configured(PathBuf::from("/config"));
 
+        assert!(global.priority() > builtin.priority());
         assert!(project.priority() > global.priority());
         assert!(configured.priority() > project.priority());
     }

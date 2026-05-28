@@ -33,6 +33,7 @@ import {
   ConsolidationInfo,
   MeshInviteInfo,
   MeshInviteCreated,
+  SlashCommandEntry,
 } from '../types';
 import { debugLog, debugTrace } from '../utils/debugLog';
 
@@ -227,6 +228,7 @@ export function useUiClient() {
     latestEntryAt: string | null;
     latestConsolidationAt: string | null;
   } | null>(null);
+  const [slashCommands, setSlashCommands] = useState<SlashCommandEntry[]>([]);
   const [defaultCwd, setDefaultCwd] = useState<string | null>(null);
   const [workspacePathDialogOpen, setWorkspacePathDialogOpen] = useState(false);
   const [workspacePathDialogDefaultValue, setWorkspacePathDialogDefaultValue] = useState('');
@@ -1383,6 +1385,10 @@ export function useUiClient() {
         setAudioCapabilities(msg.data);
         break;
       }
+      case 'available_commands': {
+        setSlashCommands(msg.data.commands);
+        break;
+      }
       default:
         break;
     }
@@ -2077,6 +2083,8 @@ export function useUiClient() {
     setTranscribeCallback,
     setSpeechCallback,
     setSpeechErrorCallback,
+    // Slash commands
+    slashCommands,
   };
 }
 
@@ -2364,6 +2372,68 @@ function translateAgentEvent(agentId: string, event: any): EventItem {
       content: kindData.message ?? 'Error',
       timestamp,
       isMessage: true,
+    };
+  }
+
+  // ── Runtime command events (ephemeral, live-only) ────────────────────
+  if (kind === 'runtime_command_started') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'command',
+      content: kindData.command_line ?? `/${kindData.command}`,
+      timestamp,
+      commandId: kindData.command_id,
+      commandLine: kindData.command_line,
+      commandName: kindData.command,
+      commandStatus: 'running',
+    };
+  }
+
+  if (kind === 'runtime_command_finished') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'command',
+      content: kindData.output?.body ?? '',
+      timestamp,
+      commandId: kindData.command_id,
+      commandName: kindData.command,
+      commandStatus: 'completed',
+      commandOutput: kindData.output,
+    };
+  }
+
+  if (kind === 'runtime_command_failed') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'command',
+      content: kindData.message ?? 'Command failed',
+      timestamp,
+      commandId: kindData.command_id,
+      commandName: kindData.command,
+      commandStatus: 'failed',
+      commandError: kindData.message,
+    };
+  }
+
+  // ── LLM retry event ──────────────────────────────────────────────────
+  if (kind === 'llm_retrying') {
+    return {
+      id,
+      agentId,
+      seq,
+      type: 'system',
+      content: kindData.message ?? `Retrying (${kindData.phase})...`,
+      timestamp,
+      llmRetryPhase: kindData.phase,
+      llmRetryAttempt: kindData.attempt,
+      llmRetryMaxAttempts: kindData.max_attempts,
+      llmRetryWaitSecs: kindData.wait_secs,
     };
   }
 

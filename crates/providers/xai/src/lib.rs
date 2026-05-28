@@ -19,7 +19,8 @@ use querymt::{
     auth::ApiKeyResolver,
     chat::{
         ChatMessage, ChatResponse, ChatRole, Content, ReasoningEffort, StreamChunk,
-        StructuredOutputFormat, Tool, ToolChoice, http::HTTPChatProvider,
+        StructuredOutputFormat, Tool, ToolChoice,
+        http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -64,16 +65,7 @@ pub struct Xai {
     pub reasoning_effort: Option<querymt::chat::ReasoningEffort>,
     /// JSON schema for structured output
     pub json_schema: Option<StructuredOutputFormat>,
-    /// Internal buffer for streaming tool state (Responses/Codex path)
-    #[serde(skip)]
-    #[schemars(skip)]
-    #[serde(default = "Xai::default_tool_state_buffer")]
-    pub tool_state_buffer: Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
-    /// Internal buffer for OpenAI-style streaming tool state (fallback)
-    #[serde(skip)]
-    #[schemars(skip)]
-    #[serde(default = "Xai::default_openai_tool_state_buffer")]
-    pub openai_tool_state_buffer: Arc<Mutex<HashMap<usize, qmt_openai::api::OpenAIToolUseState>>>,
+
     /// Optional resolver for dynamic credential refresh (e.g., OAuth tokens).
     #[serde(skip)]
     #[schemars(skip)]
@@ -213,9 +205,40 @@ impl HTTPChatProvider for Xai {
         Ok(request)
     }
 
+    fn chat_stream_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<Request<Vec<u8>>, LLMError> {
+        let mut cfg = self.with_resolved_key();
+        cfg.stream = Some(true);
+        let use_responses = cfg.should_use_responses_api();
+        let mut request = if use_responses {
+            xai_responses_chat_request(&cfg, messages, tools)?
+        } else {
+            openai_chat_request(&cfg, messages, tools)?
+        };
+        let host = cfg.base_url.host_str().unwrap_or("");
+        let auto_inject = use_responses || host.contains("x.ai");
+        if auto_inject {
+            let conv_id = cfg
+                .conversation_id
+                .clone()
+                .unwrap_or_else(|| "session-auto".to_string());
+            let (mut parts, body) = request.into_parts();
+            parts.headers.insert(
+                http::header::HeaderName::from_static("x-grok-conv-id"),
+                conv_id.parse().unwrap(),
+            );
+            request = Request::from_parts(parts, body);
+        }
+        Ok(request)
+    }
+
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         if self.should_use_responses_api() {
-            codex_parse_chat_with_state(response, &self.tool_state_buffer)
+            let tool_state_buffer = Arc::new(Mutex::new(HashMap::new()));
+            codex_parse_chat_with_state(response, &tool_state_buffer)
         } else {
             openai_parse_chat(self, response)
         }
@@ -225,13 +248,10 @@ impl HTTPChatProvider for Xai {
         true
     }
 
-    fn parse_chat_stream_chunk(&self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        if self.should_use_responses_api() {
-            codex_parse_stream_chunk_with_state(chunk, &self.tool_state_buffer)
-        } else {
-            let mut tool_states = self.openai_tool_state_buffer.lock().unwrap();
-            parse_openai_sse_chunk(chunk, &mut tool_states)
-        }
+    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        Ok(Box::new(XaiStreamParser::new(
+            self.should_use_responses_api(),
+        )))
     }
 }
 
@@ -315,6 +335,32 @@ impl HTTPCompletionProvider for Xai {
     }
 }
 
+struct XaiStreamParser {
+    use_responses_api: bool,
+    codex_tool_state: Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
+    openai_tool_state: HashMap<usize, qmt_openai::api::OpenAIToolUseState>,
+}
+
+impl XaiStreamParser {
+    fn new(use_responses_api: bool) -> Self {
+        Self {
+            use_responses_api,
+            codex_tool_state: Arc::new(Mutex::new(HashMap::new())),
+            openai_tool_state: HashMap::new(),
+        }
+    }
+}
+
+impl ChatStreamParser for XaiStreamParser {
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+        if self.use_responses_api {
+            codex_parse_stream_chunk_with_state(chunk, &self.codex_tool_state)
+        } else {
+            parse_openai_sse_chunk(chunk, &mut self.openai_tool_state)
+        }
+    }
+}
+
 impl HTTPLLMProvider for Xai {
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
@@ -342,15 +388,6 @@ impl Xai {
             return true;
         }
         matches!(self.auth_type, Some(AuthType::OAuth))
-    }
-
-    fn default_tool_state_buffer() -> Arc<Mutex<HashMap<usize, CodexToolUseState>>> {
-        Arc::new(Mutex::new(HashMap::new()))
-    }
-
-    fn default_openai_tool_state_buffer()
-    -> Arc<Mutex<HashMap<usize, qmt_openai::api::OpenAIToolUseState>>> {
-        Arc::new(Mutex::new(HashMap::new()))
     }
 
     fn resolved_key(&self) -> String {
@@ -847,8 +884,6 @@ mod tests {
             embedding_dimensions: None,
             reasoning_effort: None,
             json_schema: None,
-            tool_state_buffer: Xai::default_tool_state_buffer(),
-            openai_tool_state_buffer: Xai::default_openai_tool_state_buffer(),
             key_resolver: None,
             conversation_id: None,
         }
@@ -912,6 +947,20 @@ mod tests {
             .expect("chat request should build");
 
         assert_eq!(auth_header(&req), Some("Bearer resolver-token"));
+    }
+
+    #[test]
+    fn chat_stream_request_forces_stream_true_on_openai_chat_completions_path() {
+        let mut xai = test_xai("xai-key");
+        xai.base_url = Url::parse("https://api.openai-compatible.test/v1/").unwrap();
+
+        let messages = vec![ChatMessage::user().text("hello").build()];
+        let req = xai
+            .chat_stream_request(&messages, None)
+            .expect("chat stream request should build");
+        let body: Value = serde_json::from_slice(req.body()).expect("body should be JSON");
+
+        assert_eq!(body["stream"], Value::Bool(true));
     }
 
     #[test]

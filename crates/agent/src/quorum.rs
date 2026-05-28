@@ -335,7 +335,8 @@ impl AgentQuorumBuilder {
             .with_wait_timeout_secs(self.wait_timeout_secs)
             .with_cancel_grace_secs(self.cancel_grace_secs)
             .with_max_parallel_delegations(self.max_parallel_delegations)
-            .with_summarizer(self.delegation_summarizer.clone());
+            .with_summarizer(self.delegation_summarizer.clone())
+            .with_work_packet_store(self.storage.work_packet_store());
             if let Some(snap) = self.routing_snapshot {
                 orch = orch.with_routing_snapshot(snap);
             }
