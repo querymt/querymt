@@ -132,7 +132,7 @@ pub use registry_exchange::{
 pub use remote_handle::RemoteAgentHandle;
 #[cfg(feature = "remote")]
 pub use remote_setup::{
-    LocalMeshActorRefs, MeshSetupResult, setup_mesh_from_config,
+    LocalMeshActorRefs, MeshSetupResult, register_local_mesh_actor_scope, setup_mesh_from_config,
     spawn_and_register_local_mesh_actors, spawn_and_register_local_mesh_actors_with_name,
 };
 pub use routing::{

@@ -167,6 +167,11 @@ pub struct LocalAgentHandle {
     #[cfg(feature = "remote")]
     pub mesh: StdMutex<Option<crate::agent::remote::MeshHandle>>,
 
+    /// Keepalive refs for mesh-visible local actors so new scopes can re-register
+    /// the existing node manager/provider host without respawning them.
+    #[cfg(feature = "remote")]
+    pub local_mesh_actor_refs: StdMutex<Option<crate::agent::remote::LocalMeshActorRefs>>,
+
     #[cfg(feature = "remote")]
     remote_node_cache: Arc<RemoteNodeMetadataCache>,
 
@@ -210,6 +215,8 @@ impl LocalAgentHandle {
             default_reasoning_effort: ArcSwap::from_pointee(None),
             #[cfg(feature = "remote")]
             mesh: StdMutex::new(None),
+            #[cfg(feature = "remote")]
+            local_mesh_actor_refs: StdMutex::new(None),
             #[cfg(feature = "remote")]
             remote_node_cache: Arc::new(RemoteNodeMetadataCache::new()),
             model_inventory,
@@ -1174,7 +1181,7 @@ impl LocalAgentHandle {
     #[cfg(feature = "remote")]
     pub async fn list_remote_nodes(&self) -> Vec<crate::agent::remote::NodeInfo> {
         use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
-        use futures_util::{StreamExt, stream::FuturesUnordered};
+        use futures_util::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 
         let Some(mesh) = self.mesh() else {
             log::debug!("list_remote_nodes: mesh not bootstrapped");
@@ -1189,8 +1196,24 @@ impl LocalAgentHandle {
         let semaphore = Arc::new(Semaphore::new(concurrency));
 
         let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
-        let mut lookups = FuturesUnordered::new();
+        let mut lookups: FuturesUnordered<
+            BoxFuture<
+                'static,
+                (
+                    String,
+                    Option<libp2p::PeerId>,
+                    Result<
+                        Result<
+                            crate::agent::remote::NodeInfo,
+                            kameo::error::RemoteSendError<crate::error::AgentError>,
+                        >,
+                        tokio::time::error::Elapsed,
+                    >,
+                ),
+            >,
+        > = FuturesUnordered::new();
         let mut cached_nodes = Vec::new();
+        let mut scheduled_cache_keys = std::collections::HashSet::new();
 
         let scopes = runtime.active_scopes();
         let alive_peers: Vec<_> = mesh.known_peer_ids();
@@ -1200,6 +1223,86 @@ impl LocalAgentHandle {
             alive_peers.len(),
             local_peer_id,
         );
+
+        for scope in &scopes {
+            for peer_id in &alive_peers {
+                if *peer_id == local_peer_id {
+                    continue;
+                }
+                let peer_id = *peer_id;
+                let dht_name =
+                    crate::agent::remote::scope::scoped_node_manager_for_peer(scope, &peer_id);
+                log::debug!(
+                    "list_remote_nodes: querying per-peer DHT name '{}'",
+                    dht_name
+                );
+                match runtime
+                    .lookup_actor::<RemoteNodeManager>(dht_name.clone())
+                    .await
+                {
+                    Ok(Some(node_manager_ref)) => {
+                        log::debug!(
+                            "list_remote_nodes: per-peer DHT hit for peer {} under '{}'",
+                            peer_id,
+                            dht_name
+                        );
+                        let cache_key = Self::peer_cache_key(
+                            Some(peer_id),
+                            node_manager_ref.id().sequence_id(),
+                        );
+                        if !scheduled_cache_keys.insert(cache_key.clone()) {
+                            log::debug!(
+                                "list_remote_nodes: duplicate discovery for peer {:?} under '{}'",
+                                Some(peer_id),
+                                dht_name
+                            );
+                            continue;
+                        }
+
+                        if let Some(info) = self.get_cached_remote_node(&cache_key) {
+                            log::debug!(
+                                "list_remote_nodes: cache hit for peer {:?} under '{}'",
+                                Some(peer_id),
+                                dht_name
+                            );
+                            cached_nodes.push(info);
+                            continue;
+                        }
+
+                        log::debug!(
+                            "list_remote_nodes: enqueuing GetNodeInfo for peer {:?} under '{}'",
+                            Some(peer_id),
+                            dht_name
+                        );
+                        let semaphore = Arc::clone(&semaphore);
+                        lookups.push(Box::pin(async move {
+                            let permit = semaphore.acquire_owned().await.ok();
+                            let res = tokio::time::timeout(
+                                timeout,
+                                node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
+                            )
+                            .await;
+                            drop(permit);
+                            (cache_key, Some(peer_id), res)
+                        }));
+                    }
+                    Ok(None) => {
+                        log::debug!(
+                            "list_remote_nodes: per-peer DHT miss for peer {} under '{}'",
+                            peer_id,
+                            dht_name
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "list_remote_nodes: per-peer lookup error for '{}': {}",
+                            dht_name,
+                            e
+                        );
+                    }
+                }
+            }
+        }
 
         for scope in &scopes {
             let dht_name = crate::agent::remote::scope::scoped_node_manager(scope);
@@ -1232,6 +1335,15 @@ impl LocalAgentHandle {
 
                         let cache_key =
                             Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
+                        if !scheduled_cache_keys.insert(cache_key.clone()) {
+                            log::debug!(
+                                "list_remote_nodes: duplicate discovery for peer {:?} under '{}'",
+                                peer_id,
+                                dht_name
+                            );
+                            continue;
+                        }
+
                         if let Some(info) = self.get_cached_remote_node(&cache_key) {
                             log::debug!(
                                 "list_remote_nodes: cache hit for peer {:?} under '{}'",
@@ -1248,7 +1360,7 @@ impl LocalAgentHandle {
                             dht_name
                         );
                         let semaphore = Arc::clone(&semaphore);
-                        lookups.push(async move {
+                        lookups.push(Box::pin(async move {
                             let permit = semaphore.acquire_owned().await.ok();
                             let res = tokio::time::timeout(
                                 timeout,
@@ -1257,7 +1369,7 @@ impl LocalAgentHandle {
                             .await;
                             drop(permit);
                             (cache_key, peer_id, res)
-                        });
+                        }));
                     }
                     Err(e) => {
                         log::warn!("list_remote_nodes: lookup error for '{}': {}", dht_name, e)
@@ -3219,6 +3331,7 @@ mod tests {
         ListSessionsRequest, ProtocolVersion, SessionId,
     };
     use querymt::LLMParams;
+    use std::collections::HashSet;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -3355,6 +3468,43 @@ mod tests {
                 .session_capabilities
                 .delete
                 .is_some()
+        );
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn test_list_remote_nodes_prefers_per_peer_lookup() {
+        use crate::agent::remote::RemoteNodeManager;
+        use crate::agent::remote::scope::{MeshScopeId, scoped_node_manager_for_peer};
+        use kameo::actor::Spawn;
+
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let f = HandleFixture::new().await;
+        f.handle.set_mesh(mesh.clone());
+
+        let remote_cfg = HandleFixture::new().await;
+        let peer_id = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let node_manager = RemoteNodeManager::new(
+            remote_cfg.handle.config.clone(),
+            remote_cfg.handle.registry.clone(),
+            Some(mesh.clone()),
+        )
+        .with_node_name("peer-alpha".to_string());
+        let node_manager_ref = RemoteNodeManager::spawn(node_manager);
+
+        let per_peer_name = scoped_node_manager_for_peer(&MeshScopeId::lan_default(), &peer_id);
+        mesh.register_actor(node_manager_ref, per_peer_name).await;
+        mesh.inject_known_peer_for_test(peer_id);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let nodes = f.handle.list_remote_nodes().await;
+        let labels: HashSet<_> = nodes.into_iter().map(|node| node.hostname).collect();
+
+        assert!(
+            labels.contains("peer-alpha"),
+            "per-peer DHT registrations should be visible in list_remote_nodes"
         );
     }
 

@@ -600,6 +600,32 @@ pub async fn handle_create_mesh_invite(
 
         match mesh.create_invite(mesh_name.clone(), ttl_secs, max_uses, false) {
             Ok(invite) => {
+                let scope = crate::agent::remote::scope::MeshScopeId::Iroh {
+                    mesh_id: crate::agent::remote::invite::mesh_id_for(
+                        &invite.grant.inviter_peer_id,
+                        invite.grant.mesh_name.as_deref(),
+                    ),
+                };
+                let actor_refs = state
+                    .agent
+                    .local_mesh_actor_refs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let Some(actor_refs) = actor_refs {
+                    crate::agent::remote::register_local_mesh_actor_scope(
+                        &mesh,
+                        &actor_refs,
+                        &scope,
+                    )
+                    .await;
+                } else {
+                    log::warn!(
+                        "handle_create_mesh_invite: local mesh actors unavailable for scope {}",
+                        scope
+                    );
+                }
+
                 let url = invite.to_url();
                 let qr_code = crate::agent::remote::qr::render_to_terminal(&url);
                 let _ = send_message(

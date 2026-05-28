@@ -1734,6 +1734,11 @@ mod tests {
         assert_eq!(token.peer_id, joiner_peer_id);
         assert_eq!(token.admitted_by, host_peer_id);
         assert_eq!(token.invite_id, invite_id);
+        assert_eq!(
+            token.mesh_id,
+            mesh_id_for(&host_peer_id, Some("Mesh")),
+            "token mesh_id should preserve the invite mesh name"
+        );
 
         // Invite is now consumed.
         assert_eq!(store.records[&invite_id].status, InviteStatus::Consumed);
@@ -1845,6 +1850,43 @@ mod tests {
 
         let result = store.admit_peer(&invite_id, "peer-overflow", &host_kp, None);
         assert!(matches!(result.unwrap_err(), InviteError::InviteConsumed));
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn admit_peer_named_invite_uses_named_mesh_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invites.json");
+        let mut store = InviteStore::load_or_create(&path).unwrap();
+
+        let host_kp = libp2p::identity::Keypair::generate_ed25519();
+        let host_peer_id = host_kp.public().to_peer_id().to_string();
+
+        let signed = store
+            .create_invite(
+                &host_kp,
+                &host_peer_id,
+                Some("named-mesh".to_string()),
+                None,
+                1,
+                InvitePermissions::default(),
+            )
+            .unwrap();
+
+        let token = store
+            .admit_peer(
+                &signed.grant.invite_id,
+                "peer-A",
+                &host_kp,
+                signed.grant.mesh_name.as_deref(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            token.mesh_id,
+            mesh_id_for(&host_peer_id, Some("named-mesh")),
+            "named invites must issue tokens for the named mesh"
+        );
     }
 
     // ── MembershipStore tests ──────────────────────────────────────────────────

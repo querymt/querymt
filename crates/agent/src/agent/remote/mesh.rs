@@ -437,7 +437,7 @@ pub struct MeshHandle {
     stream_reconnect_grace: std::time::Duration,
     /// Cached union of config-derived scopes (e.g. from MeshRuntimeConfig)
     /// and currently joined Iroh scopes persisted in the membership store.
-    config_scopes: Vec<MeshScopeId>,
+    config_scopes: Arc<RwLock<Vec<MeshScopeId>>>,
 }
 
 impl std::fmt::Debug for MeshHandle {
@@ -480,7 +480,7 @@ impl MeshHandle {
             transport_mode,
             swarm_cmd_tx,
             stream_reconnect_grace,
-            config_scopes: Vec::new(),
+            config_scopes: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -782,7 +782,21 @@ impl MeshHandle {
     /// authoritative for DHT registration/lookup even before persistable
     /// membership stores have been populated.
     pub fn set_config_scopes(&mut self, scopes: Vec<MeshScopeId>) {
-        self.config_scopes = scopes;
+        let mut guard = self.config_scopes.write();
+        *guard = scopes;
+        guard.sort_by_key(|s| s.to_string());
+        guard.dedup();
+    }
+
+    pub fn ensure_scope(&self, scope: MeshScopeId) -> bool {
+        let mut guard = self.config_scopes.write();
+        if guard.contains(&scope) {
+            return false;
+        }
+        guard.push(scope);
+        guard.sort_by_key(|s| s.to_string());
+        guard.dedup();
+        true
     }
 
     pub fn active_scopes(&self) -> Vec<MeshScopeId> {
@@ -790,7 +804,7 @@ impl MeshHandle {
 
         // Always include the config-derived scopes first — these are
         // authoritative and guarantee scoped DHT names exist from startup.
-        scopes.extend(self.config_scopes.iter().cloned());
+        scopes.extend(self.config_scopes.read().iter().cloned());
 
         // Union with persisted Iroh memberships (joins from invites).
         if let Some(store) = &self.membership_store {
@@ -813,10 +827,9 @@ impl MeshHandle {
             }
         }
 
-        // Legacy backward compat: when no scopes are configured at all AND
-        // transport_mode doesn't advertise LAN (shouldn't happen in practice),
-        // fall back to Lan.
-        if scopes.is_empty() {
+        // For Iroh-only runtimes, an empty scope set is a configuration bug.
+        // Returning LAN here causes invite joins to query the wrong DHT namespace.
+        if scopes.is_empty() && self.transport_mode.has_lan() {
             scopes.push(MeshScopeId::lan_default());
         }
 
@@ -899,7 +912,8 @@ impl MeshHandle {
             role: "member".to_string(),
         };
 
-        if let Some(ref store) = self.invite_store {
+        let mesh_name_for_scope = mesh_name.clone();
+        let invite = if let Some(ref store) = self.invite_store {
             store.write().create_invite(
                 &self.keypair,
                 &self.peer_id.to_string(),
@@ -926,7 +940,12 @@ impl MeshHandle {
                 permissions,
             };
             grant.sign(&self.keypair)
-        }
+        }?;
+
+        let mesh_id =
+            super::invite::mesh_id_for(&self.peer_id.to_string(), mesh_name_for_scope.as_deref());
+        self.ensure_scope(MeshScopeId::Iroh { mesh_id });
+        Ok(invite)
     }
 
     /// Return a reference to the node's identity keypair.
@@ -3236,6 +3255,9 @@ pub async fn join_mesh_via_invite(
     );
 
     let mesh = bootstrap_mesh(&config).await?;
+    mesh.ensure_scope(MeshScopeId::Iroh {
+        mesh_id: mesh_id.clone(),
+    });
     let my_peer_id = mesh.peer_id().to_string();
 
     // ── 4. Admission handshake ────────────────────────────────────────────────
@@ -3247,6 +3269,7 @@ pub async fn join_mesh_via_invite(
         },
         None => AdmissionRequest::Invite {
             invite_id: invite.grant.invite_id.clone(),
+            mesh_name: invite.grant.mesh_name.clone(),
             peer_id: my_peer_id.clone(),
         },
     };
@@ -3395,8 +3418,11 @@ async fn find_admission_target(
     // Give the swarm a moment to complete the connection before querying the DHT.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
+    let active_scopes = mesh.active_scopes();
+    log::debug!("find_admission_target: active scopes = {:?}", active_scopes);
+
     // Try the inviter first.
-    for scope in mesh.active_scopes() {
+    for scope in active_scopes.clone() {
         let inviter_dht = scoped_node_manager_for_peer(&scope, &inviter_peer_id.to_string());
         if let Ok(Some(nm)) = mesh.lookup_actor::<RemoteNodeManager>(&inviter_dht).await {
             log::debug!("Admission target: inviter ({})", inviter_peer_id);
@@ -3406,7 +3432,7 @@ async fn find_admission_target(
 
     // Fall back to cached peers.
     for peer in fallback_peers {
-        for scope in mesh.active_scopes() {
+        for scope in active_scopes.clone() {
             let dht = scoped_node_manager_for_peer(&scope, &peer.peer_id);
             if let Ok(Some(nm)) = mesh.lookup_actor::<RemoteNodeManager>(&dht).await {
                 log::debug!("Admission target: cached peer ({})", peer.peer_id);
@@ -3624,6 +3650,57 @@ mod tests {
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
         assert!(swarm_cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn create_invite_adds_iroh_scope_to_active_scopes() {
+        let (_dir, mut mesh, _events_rx, _swarm_cmd_rx) = test_mesh_with_memberships(&[]);
+        mesh.set_config_scopes(vec![MeshScopeId::lan_default()]);
+
+        let invite = mesh
+            .create_invite(Some("mesh-a".to_string()), None, Some(1), false)
+            .unwrap();
+
+        assert_eq!(
+            invite.grant.mesh_name.as_deref(),
+            Some("mesh-a"),
+            "invite should preserve the requested mesh name"
+        );
+        assert!(mesh.active_scopes().contains(&MeshScopeId::Iroh {
+            mesh_id: crate::agent::remote::invite::mesh_id_for(
+                &mesh.peer_id().to_string(),
+                Some("mesh-a"),
+            )
+        }));
+    }
+
+    #[test]
+    fn active_scopes_does_not_fallback_to_lan_for_iroh_only_mesh() {
+        let host_kp = libp2p::identity::Keypair::generate_ed25519();
+        let (peer_events_tx, _peer_events_rx) = tokio::sync::broadcast::channel::<MeshEvent>(16);
+        let routes = Arc::new(RouteTable::new(Duration::from_secs(90)));
+        let re_register_fns = Arc::new(RwLock::new(HashMap::new()));
+        let (swarm_cmd_tx, _swarm_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mesh = MeshHandle::new(
+            host_kp.public().to_peer_id(),
+            peer_events_tx,
+            routes,
+            "test-host".to_string(),
+            re_register_fns,
+            host_kp,
+            None,
+            None,
+            MeshTransportMode::Iroh,
+            swarm_cmd_tx,
+            Duration::from_secs(30),
+        );
+
+        assert_eq!(
+            mesh.active_scopes(),
+            Vec::<MeshScopeId>::new(),
+            "iroh-only handles must not silently fall back to lan scope"
+        );
     }
 
     #[test]

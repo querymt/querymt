@@ -16,20 +16,21 @@
 //! cargo run --example qmtcode --features dashboard -- --dashboard
 //! cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
 //!
-//! # LAN mesh-only mode (runs until Ctrl+C)
+//! # Mesh mode: LAN plus any previously joined Iroh meshes
 //! cargo run --example qmtcode --features remote -- --mesh
 //! cargo run --example qmtcode --features remote -- --mesh=/ip4/0.0.0.0/tcp/0
 //!
-//! # Dashboard mode with kameo mesh enabled (cross-machine sessions)
+//! # Dashboard mode with mesh enabled (LAN + stored Iroh memberships)
 //! cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh
 //! cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh=/ip4/0.0.0.0/tcp/0
 //!
-//! # Internet mesh: host a mesh and generate an invite token
+//! # Internet mesh: host and print a new invite token
 //! cargo run --example qmtcode --features "remote" -- --mesh --mesh-invite
 //! cargo run --example qmtcode --features "remote" -- --mesh --mesh-invite="My Dev Mesh"
 //!
-//! # Internet mesh: join via invite token
+//! # Internet mesh: first-time join via invite token
 //! cargo run --example qmtcode --features "remote" -- --mesh-join=qmt://mesh/join/TOKEN
+//! # Future runs after joining only need --mesh
 //!
 //! # Running a built binary with embedded default config
 //! ./qmtcode --mesh
@@ -54,6 +55,11 @@ use std::sync::Arc;
 const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:3000";
 #[cfg(feature = "remote")]
 const DEFAULT_MESH_ADDR: &str = "/ip4/0.0.0.0/tcp/0";
+#[cfg(feature = "remote")]
+const DEFAULT_MESH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+#[cfg(feature = "remote")]
+const DEFAULT_MESH_STREAM_RECONNECT_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(120);
 const EMBEDDED_SINGLE_CODER_CONFIG: &str = include_str!("confs/single_coder.toml");
 const EMBEDDED_CODER_DELEGATE_CONFIG: &str = include_str!("confs/coder_delegate.toml");
 
@@ -116,12 +122,13 @@ struct Cli {
     #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_SERVER_ADDR)]
     dashboard: Option<String>,
 
-    /// Enable kameo mesh networking for cross-machine sessions.
+    /// Enable mesh networking for cross-machine sessions.
     ///
-    /// Starts a libp2p swarm with mDNS peer discovery and registers this node
-    /// as a `RemoteNodeManager` so remote peers can create sessions here.
+    /// Starts LAN discovery/listening and also reconnects any previously joined
+    /// Iroh meshes persisted in `~/.qmt/memberships.json`.
     ///
-    /// Optionally specify the multiaddr to listen on (default: /ip4/0.0.0.0/tcp/0).
+    /// Optionally specify the LAN multiaddr to listen on
+    /// (default: /ip4/0.0.0.0/tcp/0).
     ///
     /// Examples:
     ///   --mesh                          → listen on /ip4/0.0.0.0/tcp/0 (OS-assigned random port)
@@ -133,7 +140,7 @@ struct Cli {
     #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_MESH_ADDR)]
     mesh: Option<String>,
 
-    /// Create and print a signed mesh invite token, then start as an iroh mesh host.
+    /// Create and print a signed mesh invite token, then host that Iroh mesh.
     ///
     /// Requires --mesh. The invite is signed with the node's ed25519 identity
     /// keypair (~/.qmt/mesh_identity.key). Optionally specify a human-readable
@@ -162,8 +169,8 @@ struct Cli {
 
     /// Join an existing mesh using an invite token.
     ///
-    /// Starts the node with iroh transport, dials the inviter from the token,
-    /// and joins the mesh. Implies --mesh (no need to specify separately).
+    /// This is the first-join path. After a successful join, future runs only
+    /// need `--mesh`, which reloads stored memberships automatically.
     ///
     /// Examples:
     ///   --mesh-join=qmt://mesh/join/eyJpbnZ...
@@ -435,8 +442,34 @@ async fn register_mesh_actors(
     runner: &querymt_agent::prelude::AgentRunner,
     mesh: &querymt_agent::agent::remote::MeshHandle,
 ) {
-    querymt_agent::agent::remote::spawn_and_register_local_mesh_actors(&runner.handle(), mesh)
-        .await;
+    let actor_refs =
+        querymt_agent::agent::remote::spawn_and_register_local_mesh_actors(&runner.handle(), mesh)
+            .await;
+    *runner
+        .handle()
+        .local_mesh_actor_refs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(actor_refs);
+}
+
+#[cfg(feature = "remote")]
+fn load_stored_iroh_scopes()
+-> anyhow::Result<Vec<querymt_agent::agent::remote::mesh_runtime_config::IrohMeshConfig>> {
+    use querymt_agent::agent::remote::invite::MembershipStore;
+    use querymt_agent::agent::remote::invite::default_membership_store_path;
+    use querymt_agent::agent::remote::mesh_runtime_config::IrohMeshConfig;
+
+    let path = default_membership_store_path()?;
+    let store = MembershipStore::load_or_create(&path)?;
+    Ok(store
+        .mesh_ids()
+        .into_iter()
+        .map(|mesh_id| IrohMeshConfig {
+            mesh_id,
+            invite: None,
+            name: None,
+        })
+        .collect())
 }
 
 #[tokio::main]
@@ -538,12 +571,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Phase 6: Mesh Bootstrap ───────────────────────────────────────────────
     //
-    // Three mesh modes:
-    //   1. --mesh (LAN): TCP + QUIC + mDNS, same-subnet discovery
-    //   2. --mesh --mesh-invite (iroh host): start iroh mesh, print invite token
-    //   3. --mesh-join=TOKEN (iroh join): join existing mesh via invite token
+    // Simplified mesh modes:
+    //   1. --mesh: LAN + any stored Iroh memberships
+    //   2. --mesh --mesh-invite: same as --mesh, plus create/print a new invite
+    //   3. --mesh-join=TOKEN: first-time join via invite token
     //
-    // Modes 2 and 3 require the `remote` feature.
+    // After a successful --mesh-join, future runs only need --mesh.
 
     // ── Mode 3: Join via invite token ─────────────────────────────────────────
     #[cfg(feature = "remote")]
@@ -584,10 +617,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // ── Mode 2: Host with invite token ────────────────────────────────────────
-    #[cfg(feature = "remote")]
-    let mesh_invite_handled = cli.mesh_join.is_some();
-
     #[cfg(feature = "remote")]
     let effective_mesh = cli.mesh.clone().or_else(|| {
         if has_mesh_invite {
@@ -599,65 +628,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "remote")]
     if let Some(ref mesh_addr) = effective_mesh
-        && !mesh_invite_handled
+        && cli.mesh_join.is_none()
     {
-        use querymt_agent::agent::remote::mesh::{
-            MeshConfig, MeshDiscovery, MeshTransportMode, bootstrap_mesh,
+        use querymt_agent::agent::remote::bootstrap_mesh_runtime;
+        use querymt_agent::agent::remote::mesh_runtime_config::{
+            IrohMeshConfig, LanDiscovery, LanMeshConfig, MeshRuntimeConfig,
         };
 
-        // Check if --mesh-invite was passed (iroh host mode).
-        let is_iroh_host = cli.mesh_invite.is_some();
-
-        let transport = if is_iroh_host {
-            MeshTransportMode::Iroh
-        } else {
-            MeshTransportMode::Lan
-        };
-
-        let mesh_config = MeshConfig {
-            listen: if is_iroh_host {
-                None
-            } else {
-                Some(mesh_addr.clone())
-            },
-            discovery: if is_iroh_host {
-                MeshDiscovery::None
-            } else {
-                MeshDiscovery::Mdns
-            },
-            bootstrap_peers: vec![],
-            directory: querymt_agent::agent::remote::mesh::DirectoryMode::default(),
-            request_timeout: std::time::Duration::from_secs(300),
-            stream_reconnect_grace: std::time::Duration::from_secs(120),
-            transport,
-            identity_file: None,
-            invite: None,
-        };
-
-        match bootstrap_mesh(&mesh_config).await {
-            Ok(mesh) => {
-                eprintln!("Kameo mesh bootstrapped: peer_id={}", mesh.peer_id());
-                if is_iroh_host {
-                    eprintln!("Mesh transport: iroh (internet-capable)");
+        let mut iroh_scopes = load_stored_iroh_scopes()?;
+        if cli.mesh_invite.is_some() && iroh_scopes.is_empty() {
+            let identity = querymt_agent::agent::remote::identity::load_or_generate_keypair(None)?;
+            let host_peer_id = identity.public().to_peer_id().to_string();
+            let mesh_name = cli.mesh_invite.as_ref().and_then(|name| {
+                if name.is_empty() {
+                    None
                 } else {
-                    eprintln!("Mesh listening on: {}", mesh_addr);
+                    Some(name.as_str())
+                }
+            });
+            iroh_scopes.push(IrohMeshConfig {
+                mesh_id: querymt_agent::agent::remote::invite::mesh_id_for(
+                    &host_peer_id,
+                    mesh_name,
+                ),
+                invite: None,
+                name: cli.mesh_invite.clone().filter(|name| !name.is_empty()),
+            });
+        }
+
+        let runtime_config = MeshRuntimeConfig {
+            enabled: true,
+            lan: Some(LanMeshConfig {
+                listen: Some(mesh_addr.clone()),
+                discovery: LanDiscovery::Mdns,
+                directory:
+                    querymt_agent::agent::remote::mesh_runtime_config::DirectoryMode::default(),
+            }),
+            iroh_scopes,
+            identity_file: None,
+            request_timeout: DEFAULT_MESH_REQUEST_TIMEOUT,
+            stream_reconnect_grace: DEFAULT_MESH_STREAM_RECONNECT_GRACE,
+            node_name: None,
+            peers: Vec::new(),
+            auto_fallback: false,
+        };
+
+        match bootstrap_mesh_runtime(&runtime_config).await {
+            Ok(runtime) => {
+                let mesh = runtime.as_mesh_handle().clone();
+                eprintln!("Kameo mesh bootstrapped: peer_id={}", mesh.peer_id());
+                eprintln!("Mesh listening on: {}", mesh_addr);
+                if runtime_config.iroh_scopes.is_empty() {
+                    eprintln!("Mesh transports: LAN");
+                } else {
+                    eprintln!(
+                        "Mesh transports: LAN + {} stored/hosted Iroh scope(s)",
+                        runtime_config.iroh_scopes.len()
+                    );
                 }
 
-                // If hosting with iroh, generate and print the signed invite token.
-                #[cfg(feature = "remote")]
                 if let Some(name) = &cli.mesh_invite {
                     let mesh_name = if name.is_empty() {
                         None
                     } else {
                         Some(name.clone())
                     };
-
-                    // Parse TTL from CLI flag.
                     let ttl_secs = cli
                         .invite_ttl
                         .as_deref()
                         .and_then(querymt_agent::agent::remote::invite::parse_duration_secs);
-
                     let max_uses = cli.invite_uses;
 
                     match mesh.create_invite(mesh_name, ttl_secs, max_uses, false) {
@@ -674,7 +713,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Some(n) => format!("{n} uses"),
                                 None => "single-use".to_string(),
                             };
-
                             let url = invite.to_url();
 
                             eprintln!();
@@ -683,8 +721,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!();
                             eprintln!("  {url}");
                             eprintln!();
-
-                            // Render QR code if the terminal supports it.
                             if let Some(qr) =
                                 querymt_agent::agent::remote::qr::render_to_terminal(&url)
                             {
@@ -693,7 +729,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 eprintln!();
                             }
-
                             eprintln!("────────────────────────────────────────────");
                             eprintln!();
                         }

@@ -742,7 +742,13 @@ async fn build_profile_runtime(
                     infra,
                 )
                 .await?;
-                let _ = spawn_and_register_local_mesh_actors(&agent.handle(), &result.mesh).await;
+                let actor_refs =
+                    spawn_and_register_local_mesh_actors(&agent.handle(), &result.mesh).await;
+                *agent
+                    .handle()
+                    .local_mesh_actor_refs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(actor_refs);
                 agent
             } else {
                 Agent::from_quorum_config_with_infra(config, infra).await?

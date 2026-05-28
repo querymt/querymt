@@ -216,6 +216,8 @@ mod remote_impl {
         Invite {
             /// The `invite_id` field from the `SignedInviteGrant`.
             invite_id: String,
+            /// Optional human-readable mesh name from the invite grant.
+            mesh_name: Option<String>,
             /// The joiner's own PeerId (self-declared; baked into the token on success).
             peer_id: String,
         },
@@ -1079,7 +1081,11 @@ mod remote_impl {
 
             match msg {
                 // ── First join: consume the invite, issue a membership token ──
-                AdmissionRequest::Invite { invite_id, peer_id } => {
+                AdmissionRequest::Invite {
+                    invite_id,
+                    mesh_name,
+                    peer_id,
+                } => {
                     tracing::Span::current()
                         .record("variant", "Invite")
                         .record("peer_id", &peer_id);
@@ -1097,7 +1103,6 @@ mod remote_impl {
                     };
 
                     let keypair = mesh.keypair().clone();
-                    let mesh_name: Option<String> = None;
 
                     let result = store_arc.write().admit_peer(
                         &invite_id,
