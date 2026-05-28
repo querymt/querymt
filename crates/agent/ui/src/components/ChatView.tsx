@@ -884,9 +884,9 @@ export function ChatView() {
                     onSelectSession={handleSelectSession}
                     onDeleteSession={handleDeleteSession}
                     onNewSession={handleNewSession}
-                    onLoadMoreSessions={() => loadMoreSessions(20)}
+                    onLoadMoreSessions={() => loadMoreSessions(20, { includeRemote: true })}
                     onLoadMoreGroupSessions={(cwd) => loadMoreGroupSessions(cwd, 20)}
-                    onSearchSessions={(q) => searchSessions(q, 30)}
+                    onSearchSessions={(q) => searchSessions(q, 30, { includeRemote: true })}
                     onLoadSessionChildren={loadSessionChildren}
                     sessionChildrenLoading={sessionChildrenLoading}
                     disabled={!connected || loading}

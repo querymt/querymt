@@ -69,7 +69,7 @@ export function SessionSwitcher({
       .flatMap((group) => {
         const cwd = group.cwd || 'No workspace';
         return (group.sessions as SessionWithChildren[])
-          .filter((session) => session.fork_origin !== 'delegation')
+          .filter((session) => session.fork_origin !== 'delegation' && !session.node)
           .map((session) => ({ session, cwd }));
       })
       .sort((a, b) => {

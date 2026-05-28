@@ -301,7 +301,7 @@ export function useUiClient() {
         sendOnSocket(socket, { type: 'list_mesh_invites' } as UiClientMessage);
         sendOnSocket(socket, {
           type: 'list_sessions',
-          data: { mode: 'browse', limit: 20, session_scope: SessionScope.Root },
+          data: { mode: 'browse', limit: 20, session_scope: SessionScope.Root, include_remote: true },
         } as UiClientMessage);
 
         // If we had an active session before disconnect, re-subscribe so
@@ -1610,7 +1610,7 @@ export function useUiClient() {
     sendMessage({ type: 'get_recent_models', data: { limit_per_workspace: 10 } });
   }, []);
 
-  const loadMoreSessions = useCallback((limit: number = 50) => {
+  const loadMoreSessions = useCallback((limit: number = 50, options?: { includeRemote?: boolean }) => {
     const cursor = sessionNextCursorRef.current;
     if (sessionPageLoadingRef.current || !cursor) {
       return;
@@ -1619,7 +1619,13 @@ export function useUiClient() {
     setSessionPageLoading(true);
     sendMessage({
       type: 'list_sessions',
-      data: { mode: 'browse', cursor, limit, session_scope: SessionScope.Root },
+      data: {
+        mode: 'browse',
+        cursor,
+        limit,
+        session_scope: SessionScope.Root,
+        ...(options?.includeRemote ? { include_remote: true } : {}),
+      },
     } as UiClientMessage);
   }, []);
 
@@ -1637,19 +1643,34 @@ export function useUiClient() {
     } as UiClientMessage);
   }, []);
 
-  const searchSessions = useCallback((query: string, limit: number = 30) => {
+  const searchSessions = useCallback((query: string, limit: number = 30, options?: { includeRemote?: boolean }) => {
     pendingGroupLoadRef.current = null;
     pendingBrowseCursorRef.current = null;
+    const includeRemote = options?.includeRemote === true;
     if (!query.trim()) {
       // When search is cleared, reload the full browse list so sessions reappear.
       setSessionPageLoading(true);
-      sendMessage({ type: 'list_sessions', data: { mode: 'browse', limit: 20, session_scope: SessionScope.Root } } as UiClientMessage);
+      sendMessage({
+        type: 'list_sessions',
+        data: {
+          mode: 'browse',
+          limit: 20,
+          session_scope: SessionScope.Root,
+          ...(includeRemote ? { include_remote: true } : {}),
+        },
+      } as UiClientMessage);
       return;
     }
     setSessionPageLoading(true);
     sendMessage({
       type: 'list_sessions',
-      data: { mode: 'search', query, limit, session_scope: SessionScope.Root },
+      data: {
+        mode: 'search',
+        query,
+        limit,
+        session_scope: SessionScope.Root,
+        ...(includeRemote ? { include_remote: true } : {}),
+      },
     } as UiClientMessage);
   }, []);
 
