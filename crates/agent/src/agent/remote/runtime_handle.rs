@@ -313,16 +313,16 @@ impl MeshRuntimeHandle {
         self.inner.invite_store()
     }
 
-    /// Return a reference to the membership store (if any).
-    pub fn membership_store(
+    /// Return a reference to the unified mesh state store (if any).
+    pub fn mesh_state_store(
         &self,
-    ) -> Option<&std::sync::Arc<parking_lot::RwLock<super::invite::MembershipStore>>> {
-        self.inner.membership_store()
+    ) -> Option<&std::sync::Arc<parking_lot::RwLock<super::mesh_state::MeshStateStore>>> {
+        self.inner.mesh_state_store()
     }
 
-    /// Update cached peer list for a mesh membership entry.
-    pub fn update_membership_peers(&self, mesh_id: &str, peers: Vec<super::invite::PeerEntry>) {
-        self.inner.update_membership_peers(mesh_id, peers)
+    /// Update cached peer list for a mesh-state entry.
+    pub fn update_mesh_state_peers(&self, mesh_id: &str, peers: Vec<super::invite::PeerEntry>) {
+        self.inner.update_mesh_state_peers(mesh_id, peers)
     }
 
     /// Return joined Iroh scopes in deterministic order.

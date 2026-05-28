@@ -377,11 +377,16 @@ async fn build_runner_from_config(
                         // Now that we have an AgentConfig, spawn and register the
                         // RemoteNodeManager and ProviderHostActor so remote peers can
                         // discover this node in the DHT and create sessions here.
-                        let _ = crate::agent::remote::remote_setup::spawn_and_register_local_mesh_actors(
+                        let actor_refs = crate::agent::remote::remote_setup::spawn_and_register_local_mesh_actors(
                             &agent.handle(),
                             &result.mesh,
                         )
                         .await;
+                        *agent
+                            .handle()
+                            .local_mesh_actor_refs
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = Some(actor_refs);
                         return Ok(AgentRunner::new(agent));
                     }
                     Err(e) => {

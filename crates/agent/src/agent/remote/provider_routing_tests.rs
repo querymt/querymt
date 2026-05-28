@@ -20,7 +20,7 @@ mod provider_routing_integration_tests {
     use crate::agent::remote::RemoteNodeManager;
     use crate::agent::remote::mesh_provider::MeshChatProvider;
     use crate::agent::remote::node_manager::CreateRemoteSession;
-    use crate::agent::remote::provider_host::{ProviderChatRequest, ProviderStreamRequest};
+    use crate::agent::remote::provider_host::ProviderChatRequest;
     use crate::agent::remote::test_helpers::fixtures::{
         AgentConfigFixture, ProviderHostFixture, ProviderRoutingFixture, get_test_mesh,
     };
@@ -325,48 +325,42 @@ mod provider_routing_integration_tests {
         );
     }
 
-    // ── H.9 — ProviderHostActor streaming sends chunks to router ──────────────
+    // ── H.9 — MeshChatProvider surfaces streaming setup failures in-stream ───
 
     #[tokio::test]
-    async fn test_provider_host_actor_streaming_sends_chunks_to_router() {
-        use crate::agent::remote::session_stream_router::SessionStreamRouterActor;
+    async fn test_mesh_chat_provider_streaming_unknown_provider_yields_provider_error() {
+        use futures_util::StreamExt as _;
 
         let test_id = Uuid::now_v7().to_string();
-        let _mesh = get_test_mesh().await;
-        let f = ProviderHostFixture::new().await;
+        let f = ProviderRoutingFixture::new(&test_id).await;
+        let node_name = format!("alpha-{}", test_id);
+        let provider = MeshChatProvider::new(f.mesh, &node_name, "nonexistent-h9", "test");
 
-        let session_id = format!("session-h9-{}", test_id);
-        let request_id = format!("h9-{}", test_id);
+        let stream = provider
+            .chat_stream_with_tools(&[], None)
+            .await
+            .expect("stream setup should succeed and report provider failures in-stream");
 
-        // Create a session stream router (Phase 3: stable per-session router)
-        let router = SessionStreamRouterActor::new(None, None);
-        let router_ref = SessionStreamRouterActor::spawn(router);
-        let remote_router_ref = router_ref.into_remote_ref().await;
+        let first_item = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+            let mut stream = stream;
+            stream.next().await
+        })
+        .await
+        .expect("stream should yield a terminal provider error promptly");
 
-        let stream_req = ProviderStreamRequest {
-            provider: "nonexistent-h9".to_string(),
-            model: "test".to_string(),
-            messages: vec![],
-            tools: None,
-            session_id,
-            request_id,
-            stream_router_ref: remote_router_ref,
-            reconnect_grace_secs: 120,
-            heartbeat_interval_secs: 10,
-            lease_ttl_secs: 60,
-            params: None,
-        };
-
-        // tell() — fire and forget. The handler will fail building the provider
-        // and return an error, but the actor itself should not crash.
-        use kameo::actor::Spawn as _;
-        let result = f.actor_ref.ask(stream_req).await;
-        // We get a handler error (provider not found).
-        use kameo::error::SendError;
-        assert!(
-            matches!(result, Err(SendError::HandlerError(_))),
-            "streaming with unknown provider should return handler error"
-        );
+        match first_item {
+            Some(Err(LLMError::ProviderError(msg))) => {
+                assert!(
+                    msg.contains("nonexistent-h9") || msg.contains("provider"),
+                    "stream error should mention the unknown provider, got: {}",
+                    msg
+                );
+            }
+            other => panic!(
+                "expected first stream item to be ProviderError for unknown provider, got {:?}",
+                other
+            ),
+        }
     }
 
     // ── H.10 — StreamReceiverActor channel close handling ─────────────────────

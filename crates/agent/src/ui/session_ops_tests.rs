@@ -1,5 +1,6 @@
 //! Focused tests for session list UI handlers and dispatch.
 
+use crate::agent::messages::SessionRuntimeStatus;
 use crate::agent::{SessionActor, core::SessionRuntime};
 use crate::api::AgentInfra;
 use crate::model::{AgentMessage, MessagePart};
@@ -11,8 +12,8 @@ use crate::session::projection::SessionScope;
 use crate::session::store::RemoteSessionBookmark;
 use crate::test_utils::empty_plugin_registry;
 use crate::ui::handlers::{
-    ListSessionsRequest, handle_delete_session, handle_fork_session, handle_list_session_children,
-    handle_list_sessions, handle_load_session, handle_ui_message,
+    ListSessionsRequest, handle_cancel_session, handle_delete_session, handle_fork_session,
+    handle_list_session_children, handle_list_sessions, handle_load_session, handle_ui_message,
 };
 use crate::ui::messages::UiClientMessage;
 #[cfg(feature = "remote")]
@@ -421,6 +422,40 @@ async fn handle_ui_message_dispatches_list_sessions() -> Result<()> {
     assert_eq!(msg["type"], "session_list");
     assert_eq!(session_ids(&msg), vec![seeded.root]);
     assert_eq!(msg["data"]["total_count"], 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn handle_ui_message_list_sessions_with_remote_flag_returns_local_list_immediately()
+-> Result<()> {
+    let f = crate::test_utils::TestServerState::new().await;
+    let seeded = seed_sessions(&f).await?;
+    let (tx, mut rx) = f.add_connection("conn-dispatch-list-remote").await;
+    let (bin_tx, _bin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+
+    handle_ui_message(
+        &f.state,
+        "conn-dispatch-list-remote",
+        &tx,
+        &bin_tx,
+        UiClientMessage::ListSessions {
+            mode: Some("browse".to_string()),
+            cursor: None,
+            limit: Some(20),
+            cwd: None,
+            query: None,
+            session_scope: Some(SessionScope::Root),
+            include_remote: Some(true),
+        },
+    )
+    .await;
+
+    let msg = timeout(Duration::from_secs(2), next_json(&mut rx)).await?;
+    assert_eq!(msg["type"], "session_list");
+    let ids = session_ids(&msg);
+    assert!(ids.contains(&seeded.root));
+    assert_eq!(msg["data"]["total_count"], 2);
 
     Ok(())
 }
@@ -1081,6 +1116,69 @@ async fn list_sessions_uses_attached_remote_node_id_over_hostname_lookup() -> Re
     let summary = find_session(&listed, &session_id);
     assert_eq!(summary["node"], "shared-hostname");
     assert_eq!(summary["node_id"], "stable-remote-node");
+
+    Ok(())
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn handle_cancel_session_uses_root_remote_session_ref_even_with_stale_profile_binding()
+-> Result<()> {
+    let mut f = crate::test_utils::TestServerState::new().await;
+    let dir = TempDir::new()?;
+    write_profile(dir.path(), "alpha.toml");
+    attach_profiles(&mut f, "alpha", dir.path()).await;
+    let session_id = format!("remote-cancel-{}", Uuid::now_v7());
+
+    attach_remote_session(&f, &session_id, "remote-peer").await;
+
+    let (tx, mut rx) = f.add_connection("conn-cancel-remote").await;
+
+    {
+        let mut connections = f.state.connections.lock().await;
+        let conn = connections
+            .get_mut("conn-cancel-remote")
+            .expect("test connection should exist");
+        conn.active_agent_id = "primary".to_string();
+        conn.sessions
+            .insert("primary".to_string(), session_id.clone());
+    }
+
+    // Simulate a stale DB profile binding that no longer has a runtime.
+    f.agent
+        .storage
+        .session_store()
+        .set_profile_binding(&session_id, "missing-profile")
+        .await?;
+
+    handle_cancel_session(&f.state, "conn-cancel-remote", &tx).await;
+
+    let recv = timeout(Duration::from_millis(200), rx.recv()).await;
+    assert!(
+        recv.is_err(),
+        "unexpected UI message during remote cancel: {:?}",
+        recv.ok().flatten()
+    );
+
+    let session_ref = {
+        let registry = f.agent.handle.registry.lock().await;
+        registry
+            .get(&session_id)
+            .cloned()
+            .expect("remote session should remain attached")
+    };
+    let status = session_ref
+        .get_runtime_status()
+        .await
+        .expect("status query should succeed");
+    assert!(
+        matches!(
+            status,
+            SessionRuntimeStatus::Idle | SessionRuntimeStatus::CancelRequested
+        ),
+        "unexpected runtime status after cancel: {:?}",
+        status
+    );
 
     Ok(())
 }

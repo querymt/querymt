@@ -505,8 +505,9 @@ mod node_manager_tests {
     use super::*;
     use crate::agent::messages::GetMode;
     use crate::agent::remote::node_manager::{
-        CreateRemoteSession, ForkRemoteSession, GetNodeInfo, ListRemoteSessions, RemoteNodeManager,
-        ResumeRemoteSession, SessionHandoff, StopRemoteSessionRuntime,
+        AdmissionRequest, AdmissionResponse, CreateRemoteSession, ForkRemoteSession, GetNodeInfo,
+        ListRemoteSessions, RemoteNodeManager, ResumeRemoteSession, SessionHandoff,
+        StopRemoteSessionRuntime,
     };
     use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
     use crate::model::{AgentMessage, MessagePart};
@@ -536,6 +537,47 @@ mod node_manager_tests {
         let nm = RemoteNodeManager::new(config.clone(), registry, Some(mesh.clone()));
         let actor_ref = RemoteNodeManager::spawn(nm);
         (actor_ref, config, td)
+    }
+
+    #[tokio::test]
+    async fn test_admission_request_invite_preserves_mesh_name() {
+        let mesh = get_test_mesh().await;
+        let (config, _td) = test_agent_config().await;
+        let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
+        let nm_ref =
+            RemoteNodeManager::spawn(RemoteNodeManager::new(config, registry, Some(mesh.clone())));
+
+        let invite = mesh
+            .create_invite(Some("named-mesh".to_string()), None, Some(1), false)
+            .unwrap();
+        let joiner_peer_id = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_string();
+
+        let response = nm_ref
+            .ask(AdmissionRequest::Invite {
+                invite_id: invite.grant.invite_id.clone(),
+                mesh_name: invite.grant.mesh_name.clone(),
+                peer_id: joiner_peer_id,
+            })
+            .await
+            .expect("admission request should succeed");
+
+        match response {
+            AdmissionResponse::Admitted {
+                membership_token, ..
+            } => {
+                assert_eq!(
+                    membership_token.mesh_id,
+                    crate::agent::remote::invite::mesh_id_for(
+                        &mesh.peer_id().to_string(),
+                        Some("named-mesh"),
+                    )
+                );
+            }
+            other => panic!("expected admitted response, got {other:?}"),
+        }
     }
 
     #[tokio::test]
