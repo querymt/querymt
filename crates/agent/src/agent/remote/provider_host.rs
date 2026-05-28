@@ -815,7 +815,9 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                     }).send();
                     // Clean up the stale OpeningUpstream entry.
                     remove_active_stream(&cleanup_streams, &cleanup_session_id, &cleanup_request_id);
-                    return Err(e);
+                    // The terminal stream error has already been routed back to the requester,
+                    // so complete this handler without propagating an actor-level error.
+                    return Ok(());
                 }
             };
 

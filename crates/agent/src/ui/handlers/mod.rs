@@ -214,20 +214,20 @@ pub async fn handle_ui_message(
             session_scope,
             include_remote,
         } => {
-            handle_list_sessions(
-                state,
-                tx,
-                ListSessionsRequest {
-                    mode,
-                    cursor,
-                    limit,
-                    cwd,
-                    query,
-                    session_scope,
-                    include_remote: include_remote.unwrap_or(false),
-                },
-            )
-            .await;
+            let request = ListSessionsRequest {
+                mode,
+                cursor,
+                limit,
+                cwd,
+                query,
+                session_scope,
+                include_remote: include_remote.unwrap_or(false),
+            };
+            let state = state.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                handle_list_sessions(&state, &tx, request).await;
+            });
         }
         UiClientMessage::ListSessionChildren {
             parent_session_id,
@@ -330,7 +330,11 @@ pub async fn handle_ui_message(
             handle_get_reasoning_effort(state, conn_id, tx).await;
         }
         UiClientMessage::ListRemoteNodes => {
-            handle_list_remote_nodes(state, tx).await;
+            let state = state.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                handle_list_remote_nodes(&state, &tx).await;
+            });
         }
         UiClientMessage::ListRemoteSessions {
             node_id,

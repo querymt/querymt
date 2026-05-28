@@ -167,6 +167,11 @@ pub struct LocalAgentHandle {
     #[cfg(feature = "remote")]
     pub mesh: StdMutex<Option<crate::agent::remote::MeshHandle>>,
 
+    /// Keepalive refs for mesh-visible local actors so new scopes can re-register
+    /// the existing node manager/provider host without respawning them.
+    #[cfg(feature = "remote")]
+    pub local_mesh_actor_refs: StdMutex<Option<crate::agent::remote::LocalMeshActorRefs>>,
+
     #[cfg(feature = "remote")]
     remote_node_cache: Arc<RemoteNodeMetadataCache>,
 
@@ -184,6 +189,25 @@ pub struct LocalAgentHandle {
     /// Guard to ensure `shutdown()` only runs its body once.
     shutdown_done: AtomicBool,
 }
+
+// ── Remote node lookup type aliases ─────────────────────────────────────────
+// These aliases improve readability of the complex async types used for
+// concurrent remote node discovery operations.
+
+#[cfg(feature = "remote")]
+type RemoteNodeInfoResult = Result<
+    Result<crate::agent::remote::NodeInfo, kameo::error::RemoteSendError<crate::error::AgentError>>,
+    tokio::time::error::Elapsed,
+>;
+
+#[cfg(feature = "remote")]
+type RemoteNodeLookupResult = (String, Option<libp2p::PeerId>, RemoteNodeInfoResult);
+
+#[cfg(feature = "remote")]
+type RemoteNodeLookupFuture = futures_util::future::BoxFuture<'static, RemoteNodeLookupResult>;
+
+#[cfg(feature = "remote")]
+type RemoteNodeLookupQueue = futures_util::stream::FuturesUnordered<RemoteNodeLookupFuture>;
 
 impl LocalAgentHandle {
     /// Construct a `LocalAgentHandle` from a shared `AgentConfig`.
@@ -210,6 +234,8 @@ impl LocalAgentHandle {
             default_reasoning_effort: ArcSwap::from_pointee(None),
             #[cfg(feature = "remote")]
             mesh: StdMutex::new(None),
+            #[cfg(feature = "remote")]
+            local_mesh_actor_refs: StdMutex::new(None),
             #[cfg(feature = "remote")]
             remote_node_cache: Arc::new(RemoteNodeMetadataCache::new()),
             model_inventory,
@@ -1094,6 +1120,16 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
+    fn should_skip_stale_dht_record(
+        scope: &crate::agent::remote::scope::MeshScopeId,
+        is_peer_alive: bool,
+    ) -> bool {
+        // LAN discovery can transiently lose route liveness while DHT registrations
+        // remain valid, so we still probe LAN entries instead of dropping them.
+        !is_peer_alive && scope.is_iroh()
+    }
+
+    #[cfg(feature = "remote")]
     fn peer_cache_key(peer_id: Option<libp2p::PeerId>, fallback_actor_id: u64) -> String {
         if let Some(pid) = peer_id {
             format!("peer:{pid}")
@@ -1189,8 +1225,9 @@ impl LocalAgentHandle {
         let semaphore = Arc::new(Semaphore::new(concurrency));
 
         let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
-        let mut lookups = FuturesUnordered::new();
+        let mut lookups: RemoteNodeLookupQueue = FuturesUnordered::new();
         let mut cached_nodes = Vec::new();
+        let mut scheduled_cache_keys = std::collections::HashSet::new();
 
         let scopes = runtime.active_scopes();
         let alive_peers: Vec<_> = mesh.known_peer_ids();
@@ -1200,6 +1237,86 @@ impl LocalAgentHandle {
             alive_peers.len(),
             local_peer_id,
         );
+
+        for scope in &scopes {
+            for peer_id in &alive_peers {
+                if *peer_id == local_peer_id {
+                    continue;
+                }
+                let peer_id = *peer_id;
+                let dht_name =
+                    crate::agent::remote::scope::scoped_node_manager_for_peer(scope, &peer_id);
+                log::debug!(
+                    "list_remote_nodes: querying per-peer DHT name '{}'",
+                    dht_name
+                );
+                match runtime
+                    .lookup_actor_no_retry::<RemoteNodeManager>(dht_name.clone())
+                    .await
+                {
+                    Ok(Some(node_manager_ref)) => {
+                        log::debug!(
+                            "list_remote_nodes: per-peer DHT hit for peer {} under '{}'",
+                            peer_id,
+                            dht_name
+                        );
+                        let cache_key = Self::peer_cache_key(
+                            Some(peer_id),
+                            node_manager_ref.id().sequence_id(),
+                        );
+                        if !scheduled_cache_keys.insert(cache_key.clone()) {
+                            log::debug!(
+                                "list_remote_nodes: duplicate discovery for peer {:?} under '{}'",
+                                Some(peer_id),
+                                dht_name
+                            );
+                            continue;
+                        }
+
+                        if let Some(info) = self.get_cached_remote_node(&cache_key) {
+                            log::debug!(
+                                "list_remote_nodes: cache hit for peer {:?} under '{}'",
+                                Some(peer_id),
+                                dht_name
+                            );
+                            cached_nodes.push(info);
+                            continue;
+                        }
+
+                        log::debug!(
+                            "list_remote_nodes: enqueuing GetNodeInfo for peer {:?} under '{}'",
+                            Some(peer_id),
+                            dht_name
+                        );
+                        let semaphore = Arc::clone(&semaphore);
+                        lookups.push(Box::pin(async move {
+                            let permit = semaphore.acquire_owned().await.ok();
+                            let res = tokio::time::timeout(
+                                timeout,
+                                node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
+                            )
+                            .await;
+                            drop(permit);
+                            (cache_key, Some(peer_id), res)
+                        }));
+                    }
+                    Ok(None) => {
+                        log::debug!(
+                            "list_remote_nodes: per-peer DHT miss for peer {} under '{}'",
+                            peer_id,
+                            dht_name
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "list_remote_nodes: per-peer lookup error for '{}': {}",
+                            dht_name,
+                            e
+                        );
+                    }
+                }
+            }
+        }
 
         for scope in &scopes {
             let dht_name = crate::agent::remote::scope::scoped_node_manager(scope);
@@ -1217,21 +1334,38 @@ impl LocalAgentHandle {
                             continue;
                         }
 
-                        if let Some(pid) = peer_id
-                            && !mesh.is_peer_alive(&pid)
-                        {
-                            let key = format!("peer:{pid}");
-                            self.remote_node_cache.by_label.write().remove(&key);
-                            log::warn!(
-                                "list_remote_nodes: skipping stale DHT record for peer {pid} \
-                             (is_peer_alive=false, dht_name='{}')",
+                        if let Some(pid) = peer_id {
+                            let is_peer_alive = mesh.is_peer_alive(&pid);
+                            if Self::should_skip_stale_dht_record(scope, is_peer_alive) {
+                                let key = format!("peer:{pid}");
+                                self.remote_node_cache.by_label.write().remove(&key);
+                                log::warn!(
+                                    "list_remote_nodes: skipping stale DHT record for peer {pid} \
+                                 (is_peer_alive=false, scope=iroh, dht_name='{}')",
+                                    dht_name
+                                );
+                                continue;
+                            }
+
+                            if !is_peer_alive {
+                                log::debug!(
+                                    "list_remote_nodes: keeping LAN DHT record for peer {pid} despite is_peer_alive=false (dht_name='{}')",
+                                    dht_name
+                                );
+                            }
+                        }
+
+                        let cache_key =
+                            Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
+                        if !scheduled_cache_keys.insert(cache_key.clone()) {
+                            log::debug!(
+                                "list_remote_nodes: duplicate discovery for peer {:?} under '{}'",
+                                peer_id,
                                 dht_name
                             );
                             continue;
                         }
 
-                        let cache_key =
-                            Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
                         if let Some(info) = self.get_cached_remote_node(&cache_key) {
                             log::debug!(
                                 "list_remote_nodes: cache hit for peer {:?} under '{}'",
@@ -1248,7 +1382,7 @@ impl LocalAgentHandle {
                             dht_name
                         );
                         let semaphore = Arc::clone(&semaphore);
-                        lookups.push(async move {
+                        lookups.push(Box::pin(async move {
                             let permit = semaphore.acquire_owned().await.ok();
                             let res = tokio::time::timeout(
                                 timeout,
@@ -1257,7 +1391,7 @@ impl LocalAgentHandle {
                             .await;
                             drop(permit);
                             (cache_key, peer_id, res)
-                        });
+                        }));
                     }
                     Err(e) => {
                         log::warn!("list_remote_nodes: lookup error for '{}': {}", dht_name, e)
@@ -1571,6 +1705,19 @@ impl LocalAgentHandle {
             .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
     }
 
+    async fn session_ref_for_agent_session(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionActorRef, Error> {
+        let registry = self.registry.lock().await;
+        registry.get(session_id).cloned().ok_or_else(|| {
+            Error::invalid_params().data(serde_json::json!({
+                "message": "unknown session",
+                "sessionId": session_id,
+            }))
+        })
+    }
+
     pub async fn stop_session(&self, session_id: &str) -> Result<(), Error> {
         use crate::agent::messages::SessionRuntimeStatus;
 
@@ -1599,14 +1746,19 @@ impl LocalAgentHandle {
             .get_runtime_status()
             .await
             .unwrap_or(SessionRuntimeStatus::Running);
-        if matches!(
-            status,
-            SessionRuntimeStatus::Idle | SessionRuntimeStatus::CancelRequested
-        ) {
+        if status == SessionRuntimeStatus::Idle {
             tracing::debug!(
-                "Session {} stop: status={:?}, graceful shutdown — returning without force-stop",
+                "Session {} stop: status=Idle, graceful shutdown — returning without force-stop",
                 session_id,
-                status
+            );
+            return Ok(());
+        }
+        // For remote sessions, CancelRequested doesn't mean the prompt is done —
+        // the provider stream might still be active on the remote node.
+        if status == SessionRuntimeStatus::CancelRequested && !session_ref.is_remote() {
+            tracing::debug!(
+                "Session {} stop: status=CancelRequested (local), graceful shutdown — returning without force-stop",
+                session_id,
             );
             return Ok(());
         }
@@ -2121,22 +2273,17 @@ impl SendAgent for LocalAgentHandle {
 
     async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, Error> {
         let session_id = req.session_id.to_string();
-        let session_ref = {
-            let registry = self.registry.lock().await;
-            registry.get(&session_id).cloned().ok_or_else(|| {
-                Error::invalid_params().data(serde_json::json!({
-                    "message": "unknown session",
-                    "sessionId": session_id,
-                }))
-            })?
-        };
-
+        let session_ref = self.session_ref_for_agent_session(&session_id).await?;
         session_ref.prompt(req).await
     }
 
     async fn cancel(&self, notif: CancelNotification) -> Result<(), Error> {
         let session_id = notif.session_id.to_string();
-        self.stop_session(&session_id).await
+        let Ok(session_ref) = self.session_ref_for_agent_session(&session_id).await else {
+            // Keep ACP cancel semantics as best-effort/no-op for unknown sessions.
+            return Ok(());
+        };
+        session_ref.cancel().await.map_err(Error::from)
     }
 
     async fn load_session(&self, req: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
@@ -2715,7 +2862,7 @@ impl SendAgent for LocalAgentHandle {
                             "transport": if mesh.is_iroh_transport_internal() { "iroh" } else { "lan" },
                             "known_peer_count": mesh.known_peer_ids().len(),
                             "has_invite_store": mesh.invite_store().is_some(),
-                            "has_membership_store": mesh.membership_store().is_some(),
+                            "has_mesh_state_store": mesh.mesh_state_store().is_some(),
                         });
                         return ext_json_response(&result);
                     }
@@ -3205,6 +3352,7 @@ fn ext_json_response<T: serde::Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::SessionActor;
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
     use crate::send_agent::SendAgent;
@@ -3219,8 +3367,12 @@ mod tests {
         ListSessionsRequest, ProtocolVersion, SessionId,
     };
     use querymt::LLMParams;
+    use std::collections::HashSet;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    #[cfg(feature = "remote")]
+    use kameo::actor::Spawn;
 
     // ── Shared fixture ───────────────────────────────────────────────────────
 
@@ -3355,6 +3507,103 @@ mod tests {
                 .session_capabilities
                 .delete
                 .is_some()
+        );
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn test_cancel_known_remote_session_routes_cancel_to_session_ref() {
+        use crate::agent::core::SessionRuntime;
+        use crate::agent::remote::scope::{MeshScopeId, scoped_session};
+
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let f = HandleFixture::new().await;
+        f.handle.set_mesh(mesh.clone());
+
+        let session_id = "remote-cancel-known".to_string();
+        let actor = SessionActor::new(
+            f.handle.config.clone(),
+            session_id.clone(),
+            SessionRuntime::new(
+                None,
+                std::collections::HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        )
+        .with_mesh(Some(mesh.clone()));
+        let local_ref = SessionActor::spawn(actor);
+        let dht_name = scoped_session(&MeshScopeId::lan_default(), &session_id);
+        mesh.register_actor(local_ref, dht_name.clone()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let remote_ref = mesh
+            .lookup_actor::<SessionActor>(&dht_name)
+            .await
+            .expect("DHT lookup should succeed")
+            .expect("remote actor should be available");
+
+        f.handle
+            .attach_remote_session(
+                session_id.clone(),
+                remote_ref,
+                "remote-peer".to_string(),
+                None,
+                None,
+            )
+            .await;
+
+        let mut rx = f.handle.subscribe_events();
+        let notif = CancelNotification::new(SessionId::from(session_id.clone()));
+        SendAgent::cancel(&f.handle, notif)
+            .await
+            .expect("cancel should succeed");
+
+        let event = tokio::time::timeout(tokio::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("should receive event in time")
+            .expect("event channel should remain open");
+
+        assert_eq!(event.session_id(), session_id);
+        assert!(matches!(
+            event.kind(),
+            crate::events::AgentEventKind::Cancelled
+        ));
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn test_list_remote_nodes_prefers_per_peer_lookup() {
+        use crate::agent::remote::RemoteNodeManager;
+        use crate::agent::remote::scope::{MeshScopeId, scoped_node_manager_for_peer};
+        use kameo::actor::Spawn;
+
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let f = HandleFixture::new().await;
+        f.handle.set_mesh(mesh.clone());
+
+        let remote_cfg = HandleFixture::new().await;
+        let peer_id = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let node_manager = RemoteNodeManager::new(
+            remote_cfg.handle.config.clone(),
+            remote_cfg.handle.registry.clone(),
+            Some(mesh.clone()),
+        )
+        .with_node_name("peer-alpha".to_string());
+        let node_manager_ref = RemoteNodeManager::spawn(node_manager);
+
+        let per_peer_name = scoped_node_manager_for_peer(&MeshScopeId::lan_default(), &peer_id);
+        mesh.register_actor(node_manager_ref, per_peer_name).await;
+        mesh.inject_known_peer_for_test(peer_id);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let nodes = f.handle.list_remote_nodes().await;
+        let labels: HashSet<_> = nodes.into_iter().map(|node| node.hostname).collect();
+
+        assert!(
+            labels.contains("peer-alpha"),
+            "per-peer DHT registrations should be visible in list_remote_nodes"
         );
     }
 
@@ -3765,6 +4014,19 @@ mod tests {
         );
         assert_eq!(LocalAgentHandle::remote_node_lookup_parallelism(), 8);
         assert_eq!(LocalAgentHandle::remote_node_cache_ttl().as_millis(), 10000);
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn test_should_skip_stale_dht_record_keeps_lan_but_skips_iroh() {
+        let lan = crate::agent::remote::scope::MeshScopeId::lan_default();
+        let iroh = crate::agent::remote::scope::MeshScopeId::Iroh {
+            mesh_id: "mesh-a".to_string(),
+        };
+
+        assert!(!LocalAgentHandle::should_skip_stale_dht_record(&lan, false));
+        assert!(LocalAgentHandle::should_skip_stale_dht_record(&iroh, false));
+        assert!(!LocalAgentHandle::should_skip_stale_dht_record(&iroh, true));
     }
 
     // ── Registration contract tests ───────────────────────────────────────────

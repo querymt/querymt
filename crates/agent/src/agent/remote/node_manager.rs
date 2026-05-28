@@ -216,6 +216,8 @@ mod remote_impl {
         Invite {
             /// The `invite_id` field from the `SignedInviteGrant`.
             invite_id: String,
+            /// Optional human-readable mesh name from the invite grant.
+            mesh_name: Option<String>,
             /// The joiner's own PeerId (self-declared; baked into the token on success).
             peer_id: String,
         },
@@ -1079,7 +1081,11 @@ mod remote_impl {
 
             match msg {
                 // ── First join: consume the invite, issue a membership token ──
-                AdmissionRequest::Invite { invite_id, peer_id } => {
+                AdmissionRequest::Invite {
+                    invite_id,
+                    mesh_name,
+                    peer_id,
+                } => {
                     tracing::Span::current()
                         .record("variant", "Invite")
                         .record("peer_id", &peer_id);
@@ -1097,7 +1103,6 @@ mod remote_impl {
                     };
 
                     let keypair = mesh.keypair().clone();
-                    let mesh_name: Option<String> = None;
 
                     let result = store_arc.write().admit_peer(
                         &invite_id,
@@ -1113,6 +1118,25 @@ mod remote_impl {
                                 peer_id,
                                 invite_id
                             );
+
+                            // Persist admitted peer to mesh_state.json for reconnection support
+                            if let Some(mesh_state_store) = mesh.mesh_state_store() {
+                                let mesh_id = crate::agent::remote::invite::mesh_id_for(
+                                    &mesh.peer_id().to_string(),
+                                    mesh_name.as_deref(),
+                                );
+                                if let Err(e) = mesh_state_store
+                                    .write()
+                                    .add_admitted_peer(&mesh_id, token.clone())
+                                {
+                                    log::warn!(
+                                        "Failed to persist admitted peer {} to mesh state: {}",
+                                        peer_id,
+                                        e
+                                    );
+                                }
+                            }
+
                             let existing_peers: Vec<String> = mesh
                                 .known_peer_ids()
                                 .iter()

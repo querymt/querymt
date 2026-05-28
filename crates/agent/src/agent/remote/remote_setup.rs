@@ -38,9 +38,40 @@ pub struct MeshSetupResult {
 
 /// Keepalive refs for local mesh actors registered after an agent is built.
 #[cfg(feature = "remote")]
+#[derive(Clone)]
 pub struct LocalMeshActorRefs {
     pub node_manager: kameo::actor::ActorRef<crate::agent::remote::RemoteNodeManager>,
     pub provider_host: kameo::actor::ActorRef<ProviderHostActor>,
+}
+
+#[cfg(feature = "remote")]
+pub async fn register_local_mesh_actor_scope(
+    mesh: &crate::agent::remote::MeshHandle,
+    actor_refs: &LocalMeshActorRefs,
+    scope: &crate::agent::remote::scope::MeshScopeId,
+) {
+    let runtime = MeshRuntimeHandle::from(mesh.clone());
+
+    let node_name = scoped_node_manager(scope);
+    runtime
+        .register_actor(actor_refs.node_manager.clone(), node_name.clone())
+        .await;
+    log::info!("RemoteNodeManager registered in DHT as '{}'", node_name);
+
+    let per_peer_name = scoped_node_manager_for_peer(scope, mesh.peer_id());
+    runtime
+        .register_actor(actor_refs.node_manager.clone(), per_peer_name.clone())
+        .await;
+    log::info!(
+        "RemoteNodeManager also registered in DHT as '{}'",
+        per_peer_name
+    );
+
+    let ph_dht_name = scoped_provider_host(scope, mesh.peer_id());
+    runtime
+        .register_actor(actor_refs.provider_host.clone(), ph_dht_name.clone())
+        .await;
+    log::info!("ProviderHostActor registered in DHT as '{}'", ph_dht_name);
 }
 
 /// Spawn and register the local mesh-facing actors for an already-built agent.
@@ -77,39 +108,20 @@ pub async fn spawn_and_register_local_mesh_actors_with_name(
         None => node_manager,
     };
     let node_manager_ref = RemoteNodeManager::spawn(node_manager);
-    let runtime = MeshRuntimeHandle::from(mesh.clone());
-
-    for scope in runtime.active_scopes() {
-        let node_name = scoped_node_manager(&scope);
-        runtime
-            .register_actor(node_manager_ref.clone(), node_name.clone())
-            .await;
-        log::info!("RemoteNodeManager registered in DHT as '{}'", node_name);
-
-        let per_peer_name = scoped_node_manager_for_peer(&scope, mesh.peer_id());
-        runtime
-            .register_actor(node_manager_ref.clone(), per_peer_name.clone())
-            .await;
-        log::info!(
-            "RemoteNodeManager also registered in DHT as '{}'",
-            per_peer_name
-        );
-    }
 
     let provider_host = ProviderHostActor::new(handle.config.clone());
     let provider_host_ref = ProviderHostActor::spawn(provider_host);
-    for scope in runtime.active_scopes() {
-        let ph_dht_name = scoped_provider_host(&scope, mesh.peer_id());
-        runtime
-            .register_actor(provider_host_ref.clone(), ph_dht_name.clone())
-            .await;
-        log::info!("ProviderHostActor registered in DHT as '{}'", ph_dht_name);
-    }
-
-    LocalMeshActorRefs {
+    let actor_refs = LocalMeshActorRefs {
         node_manager: node_manager_ref,
         provider_host: provider_host_ref,
+    };
+
+    let runtime = MeshRuntimeHandle::from(mesh.clone());
+    for scope in runtime.active_scopes() {
+        register_local_mesh_actor_scope(mesh, &actor_refs, &scope).await;
     }
+
+    actor_refs
 }
 
 /// Bootstrap the kameo mesh and register remote agents from TOML config.

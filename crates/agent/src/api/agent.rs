@@ -859,7 +859,13 @@ impl Agent {
                 let agent = builder.build().await?;
                 agent.inner.set_mesh_fallback(auto_fallback);
                 agent.inner.set_mesh(result.mesh.clone());
-                let _ = spawn_and_register_local_mesh_actors(&agent.handle(), &result.mesh).await;
+                let actor_refs =
+                    spawn_and_register_local_mesh_actors(&agent.handle(), &result.mesh).await;
+                *agent
+                    .handle()
+                    .local_mesh_actor_refs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(actor_refs);
                 return Ok(agent);
             }
         }
