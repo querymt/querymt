@@ -386,6 +386,322 @@ See the `examples/confs/` directory for complete examples:
 - `coder_agent.toml` - Coder agent with full features
 - `multi_agent.toml` - Planner-delegate configuration
 
+## Profiles Configuration
+
+Profiles allow you to save and switch between different agent configurations.
+
+### Profile Metadata
+
+Add optional profile metadata to any configuration:
+
+```toml
+[profile]
+id = "coder"
+name = "Full-Featured Coder"
+description = "Complete coding agent with all tools enabled"
+tags = ["coding", "development", "full-access"]
+
+[agent]
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+# ... rest of agent configuration
+```
+
+### Profile Storage
+
+Profiles can be stored in:
+
+1. **User profiles** (global): `~/.qmt/profiles/`
+2. **Project profiles** (team-shared): `.qmt/profiles/`
+3. **Embedded profiles**: Built-in with QueryMT
+
+### Using Profiles
+
+```bash
+# List available profiles
+cargo run --example qmtcode --list-profiles
+
+# Use specific profile
+cargo run --example qmtcode --profile coder
+
+# Use custom profiles directory
+cargo run --example qmtcode --profiles-dir ./my-profiles --profile custom
+```
+
+### Profile Configuration Examples
+
+**Minimal profile:**
+```toml
+[agent]
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+tools = ["read_tool", "edit", "write_file"]
+```
+
+**Full profile with metadata:**
+```toml
+[profile]
+id = "reviewer"
+name = "Code Reviewer"
+description = "Read-only code review specialist"
+tags = ["review", "read-only"]
+
+[agent]
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+tools = ["read_tool", "glob", "search_text", "question"]
+system = "You are a code review specialist."
+
+[[middleware]]
+type = "agent_mode"
+default = "review"
+```
+
+For complete profiles documentation, see [Profiles Guide](profiles.md).
+
+## Slash Commands Configuration
+
+Slash commands extend the CLI with custom functionality.
+
+### Command Locations
+
+1. **User commands** (global): `~/.qmt/commands/`
+2. **Project commands** (team-shared): `.qmt/commands/`
+
+### Command File Format
+
+Commands are markdown files with optional YAML frontmatter:
+
+```markdown
+---
+description: "Analyze and optimize code"
+argument-hint: "<file-path>"
+model: "claude-sonnet-4-5-20250929"
+allowed-tools: ["read_tool", "glob", "search_text"]
+---
+
+Please analyze and optimize the code in $1.
+
+Focus on performance, memory efficiency, and readability.
+```
+
+### Built-in Commands
+
+QueryMT includes several built-in commands:
+
+- `/help [command]` - Show help information
+- `/mcp <subcommand>` - Manage MCP servers
+- `/clear` - Clear screen
+- `/exit` - Exit application
+
+### Using Slash Commands
+
+```bash
+# Type / to see available commands
+> /optimize src/main.rs
+
+# Tab completion
+> /opt<TAB>  # Completes to /optimize
+
+# Arguments
+> /review HEAD --focus security
+```
+
+For complete slash commands documentation, see [Slash Commands Guide](slash-commands.md).
+
+## New Tools Reference
+
+QueryMT includes several new code intelligence tools:
+
+### Code Structure Tools
+
+#### `index`
+
+Produce a compact structural skeleton of source files:
+
+```bash
+# Example tool call
+index(path="src/main.rs")
+```
+
+**Returns:**
+- Imports, types, classes, traits, impls, functions, tests
+- Line ranges for each item
+- Supports Rust, Python, TypeScript, JavaScript, Go, Java, C, C++
+
+#### `get_symbol`
+
+Read structured AST symbols from source files:
+
+```bash
+# Example tool call
+get_symbol(requests=[{path: "src/lib.rs", symbol: "MyStruct", kind: "struct"}])
+```
+
+**Parameters:**
+- `path`: File path
+- `symbol`: Symbol name or qualified name
+- `kind`: Symbol kind filter (function, method, class, struct, enum, trait, impl, type, const, module, test, any)
+- `occurrence`: 0-based occurrence when multiple symbols match
+- `context_lines`: Number of surrounding lines to include
+
+#### `get_function`
+
+Read one or more functions from source files by name:
+
+```bash
+# Example tool call
+get_function(paths=["src/lib.rs"], names=["my_function", "helper"])
+```
+
+**Returns:**
+- Line-numbered function bodies
+- Digest metadata
+- Context lines (configurable)
+
+#### `replace_symbol`
+
+Replace entire symbol bodies using AST byte ranges:
+
+```bash
+# Example tool call
+replace_symbol(replacements=[{
+    path: "src/lib.rs",
+    symbol: "my_function",
+    newText: "fn my_function() -> i32 { 42 }"
+}])
+```
+
+**Features:**
+- AST-aware replacement
+- Resolves all replacements before writing
+- Rejects overlapping replacements
+- Rejects stale writes (hash mismatch)
+
+#### `find_references`
+
+Find references to symbols across the codebase:
+
+```bash
+# Example tool call
+find_references(symbol="MyStruct", path="src/lib.rs")
+```
+
+**Returns:**
+- All references to the symbol
+- File paths and line numbers
+- Reference context
+
+### Tool Configuration
+
+Tools are configured in the `[agent]` section:
+
+```toml
+[agent]
+tools = [
+    # File operations
+    "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
+    
+    # Search & navigation
+    "glob", "search_text", "ls", "index", "get_symbol", "get_function", "find_references",
+    
+    # Execution
+    "shell",
+    
+    # Task management
+    "create_task", "todowrite", "todoread",
+    
+    # User interaction
+    "question",
+    
+    # Web browsing
+    "browse",
+    
+    # Code intelligence
+    "index", "get_symbol", "get_function", "replace_symbol"
+]
+```
+
+### Tool Permissions
+
+Configure which tools are mutating:
+
+```toml
+[agent]
+assume_mutating = false
+mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
+```
+
+## Scheduled Tasks Configuration
+
+QueryMT supports scheduled tasks for autonomous recurring work. Schedules are created at runtime through the dashboard UI or API, not through static TOML configuration.
+
+### Schedule Types
+
+#### Interval Schedules
+
+Run tasks at fixed intervals. Trigger JSON format:
+
+```json
+{ "type": "interval", "seconds": 3600 }
+```
+
+#### Event-Driven Schedules
+
+Run tasks when accumulated events meet a threshold. Trigger JSON format:
+
+```json
+{
+  "type": "event_driven",
+  "event_filter": {
+    "event_kinds": ["knowledge_ingested"],
+    "threshold": 10,
+    "session_public_id": null
+  },
+  "debounce_seconds": 120
+}
+```
+
+#### One-Time Schedules
+
+Fire exactly once at a specified time. Trigger JSON format:
+
+```json
+{ "type": "once_at", "at": "2026-06-01T09:00:00Z" }
+```
+
+### Creating Schedules
+
+Schedules are created through the dashboard UI (Session > Schedules > Create Schedule) or via the WebSocket API using the `create_schedule` message:
+
+```json
+{
+  "type": "create_schedule",
+  "session_id": "<session-public-id>",
+  "prompt": "Check for updates and summarize changes",
+  "trigger": { "type": "interval", "seconds": 3600 },
+  "max_steps": 50,
+  "max_cost_usd": 0.10,
+  "max_runs": null
+}
+```
+
+### Example Configurations for Scheduled Agents
+
+See `examples/confs/watchdog.toml`, `examples/confs/standup_bot.toml`, and `examples/confs/research_journal.toml` for agent configurations designed for scheduled use. These agents are configured with appropriate execution limits for autonomous scheduled cycles.
+
+## VS Code / Language Intelligence
+
+QueryMT can provide language intelligence (LSP-like features) when connected to a VS Code client. This is not configured via TOML; instead, the VS Code extension connects to QueryMT via ACP and provides workspace query support for tools like `language_query`.
+
+The `language_query` tool is available in the built-in tools list and can query the connected editor for:
+- Hover information
+- Go-to-definition
+- Find references
+- Completions
+
+This requires a VS Code extension that implements the workspace query bridge.
+
 ## Migration Notes
 
 ### From Old Config Format
@@ -395,3 +711,30 @@ If you have old configurations, note these changes:
 - `execution` section is nested under agent/planner/delegate
 - Middleware uses `type` field instead of direct fields
 - Mesh configuration moved to top-level `[mesh]` section
+- Profiles added with `[profile]` section
+- Slash commands stored in `.qmt/commands/`
+- New tools: `index`, `get_symbol`, `get_function`, `replace_symbol`, `find_references`
+- Scheduled tasks created via dashboard UI/API, not TOML config
+
+### New Features Since Last Documentation Update
+
+1. **Profiles**: Save and switch between configurations
+2. **Slash Commands**: Custom commands via markdown files
+3. **Internet Mesh**: iroh transport with invite tokens
+4. **Remote Sessions**: Forking, resuming, recovery
+5. **Code Intelligence Tools**: AST-aware code analysis
+6. **Scheduled Tasks**: Autonomous recurring work via dashboard/API
+7. **Language Intelligence**: VS Code integration via `language_query` tool
+8. **Streaming Stability**: Robust stream handling with reconnection
+9. **Multi-Transport**: LAN + Internet mesh simultaneously
+
+## Related Documentation
+
+- [Overview](index.md) - Architecture and concepts
+- [Mesh Networking](mesh.md) - Cross-machine collaboration
+- [Profiles](profiles.md) - Configuration profiles
+- [Slash Commands](slash-commands.md) - Custom commands
+- [Delegation](delegation.md) - Multi-agent configuration
+- [Middleware](middleware.md) - Processing pipeline
+- [Examples](examples.md) - Configuration examples
+- [API Reference](api_reference.md) - Rust API documentation
