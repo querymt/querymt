@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
   deployments: write
   id-token: write
@@ -115,8 +115,22 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            TAG_NAME="${GITHUB_REF_NAME}"
+            if [[ "$TAG_NAME" == v* ]]; then
+              TAG_NAME="${TAG_NAME#v}"
+            fi
+            IMAGE_TAG="stable"
+            PROVIDER_VERSION="${TAG_NAME}"
+          else
+            IMAGE_TAG="latest"
+            PROVIDER_VERSION="latest"
+          fi
+
           output="providers.json"
+          versioned="providers.versioned.json"
           echo '{"providers":[' > "$output"
+          echo '{"providers":[' > "$versioned"
 
           first=1
           for toml in crates/providers/*/Cargo.toml; do
@@ -140,48 +154,49 @@ jobs:
               continue
             fi
 
-            if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-              pkg="qmt-$name"
-              version=$(cargo pkgid -p "$pkg" | sed -E 's/.*@([^ ]+)$/\1/')
-              if [[ -z "$version" ]] || [[ "$version" == *" "* ]] || [[ "$version" == *"="* ]] || [[ "$version" == *"workspace"* ]]; then
-                echo "Invalid resolved version for $pkg: '$version'" >&2
-                exit 1
-              fi
-              image_tag="$version"
-            else
-              image_tag="latest"
-            fi
-
             if [[ "$first" -eq 0 ]]; then
               echo ',' >> "$output"
+              echo ',' >> "$versioned"
             fi
-            echo "{\"name\":\"$name\",\"path\":\"oci://ghcr.io/${{ github.repository_owner }}/$name:$image_tag\"}" >> "$output"
+            echo "{\"name\":\"$name\",\"path\":\"oci://ghcr.io/${{ github.repository_owner }}/$name:${IMAGE_TAG}\"}" >> "$output"
+            echo "{\"name\":\"$name\",\"path\":\"oci://ghcr.io/${{ github.repository_owner }}/$name:${PROVIDER_VERSION}\"}" >> "$versioned"
             first=0
           done
 
           echo ']}' >> "$output"
+          echo ']}' >> "$versioned"
           cat "$output"
+          cat "$versioned"
 
-      - name: Prepare JSON asset
+          echo "PROVIDER_VERSION=${PROVIDER_VERSION}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+
+      - name: Check out provider index branch
+        uses: actions/checkout@v6
+        with:
+          ref: provider-index
+          path: provider-index
+          fetch-depth: 1
+
+      - name: Prepare provider index workspace
         shell: bash
         run: |
           set -euo pipefail
-          target="latest.json"
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            target="stable.json"
+          cp providers.json "provider-index/${IMAGE_TAG}.json"
+          if [[ "$PROVIDER_VERSION" != "latest" ]]; then
+            cp providers.versioned.json "provider-index/${PROVIDER_VERSION}.json"
           fi
-          mkdir -p deploy
-          cp providers.json "deploy/$target"
 
-      - name: Upload to Cloudflare Pages
-        uses: cloudflare/pages-action@v1
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          projectName: ${{ secrets.CLOUDFLARE_REPO_PROJECT }}
-          directory: deploy
-          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
-          wranglerVersion: "3"
+      - name: Commit and push provider index changes
+        working-directory: provider-index
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --cached --quiet && exit 0
+          git commit -m "update provider index for ${GITHUB_REF_NAME}"
+          git push origin provider-index
 
   publish-plugins:
     needs: detect-changes
@@ -246,12 +261,18 @@ jobs:
         run: |
           IMAGE_BASE="ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}"
 
-          echo "Pushing Wasm artifact to ${IMAGE_BASE} with tags ${{ env.VERSION }} and latest"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            ALIAS_TAG="stable"
+          else
+            ALIAS_TAG="latest"
+          fi
+
+          echo "Pushing Wasm artifact to ${IMAGE_BASE} with tags ${{ env.VERSION }} and ${ALIAS_TAG}"
 
           WASM_NAME=$(echo "qmt_${{ matrix.crate }}" | tr '-' '_')
           cp "target/wasm32-wasip1/release/${WASM_NAME}.wasm" "plugin.wasm"
 
-          oras push "${IMAGE_BASE}:${{ env.VERSION }},latest" \
+          oras push "${IMAGE_BASE}:${{ env.VERSION }},${ALIAS_TAG}" \
             --config wasm-config.json:application/vnd.wasm.v1.config+json \
             --annotation "mt.query.plugin.type=extism" \
             --annotation "org.opencontainers.image.version=${{ env.VERSION }}" \
@@ -269,7 +290,7 @@ jobs:
           IMAGE_BASE="ghcr.io/${{ github.repository_owner }}/${{ matrix.crate }}"
 
           # Resolve the digest of the just-pushed image for deterministic signing.
-          # Both the version and latest tags point to the same digest, so one
+          # Both the version and stable/latest tags point to the same digest, so one
           # signature covers both.
           DIGEST=$(oras resolve "${IMAGE_BASE}:${{ env.VERSION }}")
           echo "Signing digest: ${DIGEST}"

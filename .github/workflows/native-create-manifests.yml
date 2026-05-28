@@ -7,6 +7,11 @@ on:
         description: Provider name (used to filter manifest artifacts)
         required: true
         type: string
+      is_tagged_release:
+        description: Whether triggered by a version tag
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -82,6 +87,12 @@ jobs:
           if [[ $build_count -eq 0 ]]; then
             echo "No builds to aggregate, skipping"
             exit 0
+          fi
+
+          if [[ "${{ inputs.is_tagged_release }}" == "true" ]]; then
+            ALIAS_TAG="stable"
+          else
+            ALIAS_TAG="latest"
           fi
 
           echo "Found $build_count builds to aggregate"
@@ -322,9 +333,9 @@ jobs:
             versioned_tag="${base}:${version}-${feature_tag}"
             create_index "$versioned_tag" "${refs[@]}" || exit 1
 
-            # 2. Create/update latest-{feature} tag (e.g., latest-metal)
-            latest_feature_tag="${base}:latest-${feature_tag}"
-            create_index "$latest_feature_tag" "${refs[@]}" || exit 1
+            # 2. Create/update alias-{feature} tag (e.g., stable-metal or latest-metal)
+            alias_feature_tag="${base}:${ALIAS_TAG}-${feature_tag}"
+            create_index "$alias_feature_tag" "${refs[@]}" || exit 1
 
             # 3. For "default" feature, also create plain version tag (e.g., 0.1.0)
             if [[ "$feature_tag" == "default" ]]; then
@@ -335,17 +346,17 @@ jobs:
             echo ""
           done
 
-          # 4. Create plain "latest" tag for each provider (points to default features)
-          echo "=== Creating 'latest' tags ==="
+          # 4. Create plain alias tag for each provider (points to default features)
+          echo "=== Creating '${ALIAS_TAG}' tags ==="
           for provider in "${!provider_versions[@]}"; do
             group_key="${provider}|default"
             if [[ -n "${groups[$group_key]:-}" ]]; then
               IFS=' ' read -ra refs <<< "${groups[$group_key]}"
               base="ghcr.io/${{ github.repository_owner }}/${provider}"
-              latest_tag="${base}:latest"
-              create_index "$latest_tag" "${refs[@]}" || exit 1
+              alias_tag="${base}:${ALIAS_TAG}"
+              create_index "$alias_tag" "${refs[@]}" || exit 1
             else
-              echo "  Skipping ${provider}:latest (no 'default' feature set found)"
+              echo "  Skipping ${provider}:${ALIAS_TAG} (no 'default' feature set found)"
             fi
           done
 
@@ -358,7 +369,7 @@ jobs:
               ((total_manifests++))
             fi
           done
-          # Count providers with default feature for latest tags
+          # Count providers with default feature for alias tags
           for provider in "${!provider_versions[@]}"; do
             if [[ -n "${groups[${provider}|default]:-}" ]]; then
               ((total_manifests++))
@@ -377,6 +388,12 @@ jobs:
           set -euo pipefail
 
           echo "=== Signing multi-platform index manifests ==="
+
+          if [[ "${{ inputs.is_tagged_release }}" == "true" ]]; then
+            ALIAS_TAG="stable"
+          else
+            ALIAS_TAG="latest"
+          fi
 
           # Collect unique (provider, feature_tag) pairs and versions
           declare -A provider_versions
@@ -418,8 +435,8 @@ jobs:
             # Sign version-feature tag (e.g., 0.1.0-metal)
             sign_tag "${base}:${version}-${feature_tag}"
 
-            # Sign latest-feature tag (e.g., latest-metal)
-            sign_tag "${base}:latest-${feature_tag}"
+            # Sign alias-feature tag (e.g., stable-metal or latest-metal)
+            sign_tag "${base}:${ALIAS_TAG}-${feature_tag}"
 
             # Sign plain version tag for default feature
             if [[ "$feature_tag" == "default" ]]; then
@@ -427,10 +444,10 @@ jobs:
             fi
           done
 
-          # Sign plain "latest" tags
+          # Sign plain alias tags
           for provider in "${!provider_versions[@]}"; do
             if [[ -n "${groups[${provider}|default]:-}" ]]; then
-              sign_tag "ghcr.io/${{ github.repository_owner }}/${provider}:latest"
+              sign_tag "ghcr.io/${{ github.repository_owner }}/${provider}:${ALIAS_TAG}"
             fi
           done
 
@@ -441,6 +458,12 @@ jobs:
         run: |
           #!/bin/bash
           set -euo pipefail
+
+          if [[ "${{ inputs.is_tagged_release }}" == "true" ]]; then
+            ALIAS_TAG="stable"
+          else
+            ALIAS_TAG="latest"
+          fi
 
           echo "=== Validating multi-platform manifests ==="
           echo "Verifying that platform fields are properly set..."
@@ -474,7 +497,7 @@ jobs:
           for key in "${!provider_features[@]}"; do
             IFS='|' read -r provider feature_tag <<< "$key"
             base="ghcr.io/${{ github.repository_owner }}/${provider}"
-            tag="${base}:latest-${feature_tag}"
+            tag="${base}:${ALIAS_TAG}-${feature_tag}"
 
             echo "Validating: $tag"
 

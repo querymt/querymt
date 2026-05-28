@@ -3,6 +3,7 @@ name: "Build & Publish: llama-cpp Provider"
 on:
   push:
     branches: [main]
+    tags: [ 'v*.*.*' ]
     paths:
       - 'crates/providers/llama-cpp/**'
       - 'crates/querymt/**'
@@ -195,4 +196,5 @@ jobs:
     uses: ./.github/workflows/native-create-manifests.yml
     with:
       provider: llama-cpp
+      is_tagged_release: ${{ github.ref_type == 'tag' }}
     secrets: inherit
