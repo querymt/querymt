@@ -71,7 +71,7 @@ export interface UiClientActionsContextValue {
   setFileIndexErrorCallback: (callback: ((message: string) => void) | null) => void;
   requestFileIndex: () => void;
   requestLlmConfig: (configId: number, callback: (config: LlmConfigDetails) => void) => void;
-  sendElicitationResponse: (elicitationId: string, action: 'accept' | 'decline' | 'cancel', content?: Record<string, unknown>) => void;
+  sendElicitationResponse: (elicitationId: string, sessionId: string, action: 'accept' | 'decline' | 'cancel', content?: Record<string, unknown>) => void;
   setAgentMode: (mode: string) => void;
   cycleAgentMode: () => void;
   setReasoningEffort: (effort: string | null) => void;

@@ -368,8 +368,14 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         .on_receive_request(
             {
                 let agent = agent.clone();
-                async move |req: PromptRequest, responder, _cx| {
-                    responder.respond_with_result(agent.prompt(req).await)
+                async move |req: PromptRequest, responder, cx| {
+                    // Prompt execution can run for a long time, so spawn it and
+                    // return immediately to keep ACP able to process cancel.
+                    let agent = agent.clone();
+                    cx.spawn(
+                        async move { responder.respond_with_result(agent.prompt(req).await) },
+                    )?;
+                    Ok(())
                 }
             },
             acp::on_receive_request!(),
@@ -548,9 +554,14 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
 
 #[cfg(test)]
 mod stdio_tests {
-    use super::agent_ext_request;
-    use agent_client_protocol::JsonRpcMessage;
-    use agent_client_protocol::schema::AgentRequest;
+    use super::{CancelNotification, PromptRequest, agent_ext_request};
+    use agent_client_protocol::schema::{AgentRequest, PromptResponse, StopReason};
+    use agent_client_protocol::{Agent, ByteStreams, JsonRpcMessage};
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
+    use tokio::sync::{Mutex, Notify};
+    use tokio::time::{Duration, timeout};
+    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
     #[test]
     fn outbound_workspace_query_preserves_wire_extension_method() {
@@ -570,5 +581,90 @@ mod stdio_tests {
 
         let untyped = request.to_untyped_message().expect("untyped ext request");
         assert_eq!(untyped.method, "_workspace/query");
+    }
+
+    #[tokio::test]
+    async fn spawned_prompt_handler_keeps_cancel_unblocked() {
+        let prompt_started = Arc::new(Notify::new());
+        let release_prompt = Arc::new(Notify::new());
+        let cancel_seen = Arc::new(Notify::new());
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        let prompt_started_for_handler = prompt_started.clone();
+        let release_prompt_for_handler = release_prompt.clone();
+        let cancel_seen_for_handler = cancel_seen.clone();
+        let cancel_flag_for_handler = cancel_flag.clone();
+
+        let (client, server) = tokio::io::duplex(4096);
+        let (client_read, mut client_write) = split(client);
+        let (server_read, server_write) = split(server);
+
+        let server_task = tokio::spawn(async move {
+            Agent
+                .builder()
+                .on_receive_request(
+                    async move |_req: PromptRequest, responder, cx| {
+                        let prompt_started = prompt_started_for_handler.clone();
+                        let release_prompt = release_prompt_for_handler.clone();
+                        cx.spawn(async move {
+                            prompt_started.notify_one();
+                            release_prompt.notified().await;
+                            responder.respond(PromptResponse::new(StopReason::Cancelled))
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_notification(
+                    async move |_notif: CancelNotification, _cx| {
+                        *cancel_flag_for_handler.lock().await = true;
+                        cancel_seen_for_handler.notify_one();
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_to(ByteStreams::new(
+                    server_write.compat_write(),
+                    server_read.compat(),
+                ))
+                .await
+                .expect("server should run")
+        });
+
+        let mut reader = BufReader::new(client_read);
+
+        client_write
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s-1","prompt":[{"type":"text","text":"long task"}]}}
+{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s-1"}}
+"#,
+            )
+            .await
+            .expect("requests should write");
+
+        timeout(Duration::from_secs(2), prompt_started.notified())
+            .await
+            .expect("prompt handler should start");
+        timeout(Duration::from_secs(2), cancel_seen.notified())
+            .await
+            .expect("cancel should be processed while prompt is blocked");
+        assert!(
+            *cancel_flag.lock().await,
+            "cancel should be processed before the prompt is released"
+        );
+
+        release_prompt.notify_one();
+
+        let mut response = String::new();
+        timeout(Duration::from_secs(2), reader.read_line(&mut response))
+            .await
+            .expect("response should arrive")
+            .expect("response should read");
+        assert!(response.contains("\"stopReason\":\"cancelled\""));
+
+        drop(reader);
+        drop(client_write);
+        server_task.abort();
+        let _ = server_task.await;
     }
 }

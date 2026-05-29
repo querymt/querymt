@@ -1079,6 +1079,7 @@ export type UiClientMessage =
 	/** Respond to an elicitation request */
 	| { type: "elicitation_response", data: {
 	elicitation_id: string;
+	session_id?: string;
 	action: string;
 	content: any;
 }}

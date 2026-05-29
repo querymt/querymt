@@ -311,6 +311,8 @@ pub enum UiClientMessage {
     /// Respond to an elicitation request
     ElicitationResponse {
         elicitation_id: String,
+        #[serde(default)]
+        session_id: Option<String>,
         action: String,
         #[typeshare(serialized_as = "any")]
         content: Option<serde_json::Value>,

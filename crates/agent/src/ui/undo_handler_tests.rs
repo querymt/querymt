@@ -17,6 +17,10 @@ use crate::ui::handlers::{
     handle_elicitation_response, handle_load_session, handle_ui_message, handle_undo,
 };
 use crate::ui::messages::UiClientMessage;
+use crate::{
+    api::AgentInfra,
+    profiles::{LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager},
+};
 use anyhow::Result;
 use querymt::LLMParams;
 use querymt::chat::ChatRole;
@@ -689,6 +693,7 @@ async fn test_elicitation_response_routes_to_delegate_pending_map() -> Result<()
     handle_elicitation_response(
         &state,
         &elicitation_id,
+        None,
         "accept",
         Some(&serde_json::json!({"selection": "allow_once"})),
     )
@@ -701,6 +706,78 @@ async fn test_elicitation_response_routes_to_delegate_pending_map() -> Result<()
     assert_eq!(
         response.content,
         Some(serde_json::json!({"selection": "allow_once"}))
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_elicitation_response_routes_via_session_profile_runtime() -> Result<()> {
+    let mut f = TestServerState::new().await;
+    let dir = TempDir::new()?;
+    std::fs::write(
+        dir.path().join("alpha.toml"),
+        r#"
+[profile]
+id = "alpha"
+name = "Alpha"
+description = "alpha"
+
+[agent]
+provider = "mock"
+model = "test-model"
+system = "inline"
+"#,
+    )?;
+
+    let (registry, _config_dir) = empty_plugin_registry()?;
+    let infra = AgentInfra {
+        plugin_registry: Arc::new(registry),
+        storage: Some(f.agent.storage.clone()),
+        session_mcp_attachment_source: None,
+    };
+    let catalog: Arc<dyn ProfileCatalog> = Arc::new(
+        LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(dir.path())
+            .build(),
+    );
+    let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+        catalog, "alpha", infra,
+    ));
+    f.state.profiles = Some(profiles.clone());
+
+    let runtime = profiles.runtime_for_profile("alpha").await?;
+    let profile_agent = runtime.agent().handle();
+    let session_id = f.agent.create_session().await;
+    profiles
+        .bind_session_to_profile(session_id.clone(), "alpha")
+        .await?;
+
+    let elicitation_id = "profile-runtime-elicitation-1".to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    profile_agent
+        .pending_elicitations()
+        .lock()
+        .await
+        .insert(elicitation_id.clone(), tx);
+
+    handle_elicitation_response(
+        &f.state,
+        &elicitation_id,
+        Some(&session_id),
+        "accept",
+        Some(&serde_json::json!({"selection": "profile-bound"})),
+    )
+    .await;
+
+    let response = rx
+        .await
+        .expect("profile runtime elicitation response should be delivered");
+    assert_eq!(response.action, ElicitationAction::Accept);
+    assert_eq!(
+        response.content,
+        Some(serde_json::json!({"selection": "profile-bound"}))
     );
 
     Ok(())

@@ -300,10 +300,18 @@ pub async fn handle_ui_message(
         }
         UiClientMessage::ElicitationResponse {
             elicitation_id,
+            session_id,
             action,
             content,
         } => {
-            handle_elicitation_response(state, &elicitation_id, &action, content.as_ref()).await;
+            handle_elicitation_response(
+                state,
+                &elicitation_id,
+                session_id.as_deref(),
+                &action,
+                content.as_ref(),
+            )
+            .await;
         }
         UiClientMessage::ListAuthProviders => {
             handle_list_auth_providers(state, tx).await;

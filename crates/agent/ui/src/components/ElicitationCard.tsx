@@ -125,10 +125,10 @@ export function ElicitationCard({ data }: ElicitationCardProps) {
         }
       }
       
-      sendElicitationResponse(data.elicitationId, submitAction, content);
+      sendElicitationResponse(data.elicitationId, data.sessionId, submitAction, content);
     } else {
       // For decline/cancel, no content needed
-      sendElicitationResponse(data.elicitationId, submitAction);
+      sendElicitationResponse(data.elicitationId, data.sessionId, submitAction);
     }
     
     setSubmitted(true);

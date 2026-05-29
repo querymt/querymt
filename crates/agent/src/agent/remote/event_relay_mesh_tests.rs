@@ -769,15 +769,19 @@ mod event_relay_mesh_tests {
         // Give the forwarder task time to be aborted
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Re-subscribe to get a clean receiver
+        // Re-subscribe to get a clean receiver after unsubscribe handling.
         let mut rx2 = f.config.event_sink.fanout().subscribe();
 
-        // Publish event — it should NOT be relayed back anymore
+        // Publish a fresh event — it should NOT be relayed back anymore.
+        // Only treat a Remote-origin copy of this specific post-detach event
+        // as a failure so delayed delivery of an earlier probe event does not
+        // make the test flaky under suite load.
+        let post_detach_event_id = "e-f7-post";
         f.config
             .event_sink
             .fanout()
             .publish(EventEnvelope::Durable(crate::events::DurableEvent {
-                event_id: "e-f7-post".into(),
+                event_id: post_detach_event_id.into(),
                 stream_seq: 99,
                 session_id: session_id.clone(),
                 timestamp: 999,
@@ -786,13 +790,16 @@ mod event_relay_mesh_tests {
                 kind: AgentEventKind::SessionCreated,
             }));
 
-        // We should see the local publish but NO Remote-origin relay copy
+        // We should see the local publish but NO Remote-origin relay copy of
+        // the post-detach event.
         let mut saw_remote = false;
         let check_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         while tokio::time::Instant::now() < check_deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(200), rx2.recv()).await {
                 Ok(Ok(EventEnvelope::Durable(de)))
-                    if matches!(de.origin, EventOrigin::Remote) && de.session_id == session_id =>
+                    if matches!(de.origin, EventOrigin::Remote)
+                        && de.session_id == session_id
+                        && de.event_id == post_detach_event_id =>
                 {
                     saw_remote = true;
                     break;

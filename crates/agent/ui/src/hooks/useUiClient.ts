@@ -1882,10 +1882,14 @@ export function useUiClient() {
 
   const sendElicitationResponse = useCallback((
     elicitationId: string,
+    sessionId: string,
     action: 'accept' | 'decline' | 'cancel',
     content?: Record<string, unknown>
   ) => {
-    sendMessage({ type: 'elicitation_response', data: { elicitation_id: elicitationId, action, content } });
+    sendMessage({
+      type: 'elicitation_response',
+      data: { elicitation_id: elicitationId, session_id: sessionId, action, content }
+    });
   }, []);
 
   const setAgentMode = useCallback((mode: string) => {
