@@ -515,7 +515,7 @@ mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
 tools = [
   "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
   "glob", "search_text", "ls", "index", "get_symbol", "get_function",
-  "find_references", "shell", "create_task", "todowrite", "todoread",
+  "find_symbol_references", "shell", "create_task", "todowrite", "todoread",
   "question", "browse"
 ]
 system = [
@@ -710,7 +710,7 @@ mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
 tools = [
     "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
     "glob", "search_text", "ls", "index", "get_symbol", "get_function",
-    "find_references", "shell", "create_task", "todowrite", "todoread",
+    "find_symbol_references", "shell", "create_task", "todowrite", "todoread",
     "question", "browse"
 ]
 system = [
@@ -746,7 +746,7 @@ model = "claude-sonnet-4-5-20250929"
 assume_mutating = false
 tools = [
     "read_tool", "glob", "search_text", "ls", "index",
-    "get_symbol", "get_function", "find_references",
+    "get_symbol", "get_function", "find_symbol_references",
     "question"
 ]
 system = """You are a code review specialist. Analyze code for:
@@ -930,7 +930,7 @@ Tests: [85-120]
 ### Example: Find All References
 
 ```bash
-> find_references(symbol="MyStruct", path="src/lib.rs")
+> find_symbol_references(paths=["src/lib.rs"], symbols=["MyStruct"])
 ```
 
 **Output:**
@@ -1102,7 +1102,4 @@ cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh
 - [Delegation](delegation.md) — Multi-agent coordination
 - [Middleware](middleware.md) — Processing pipeline
 - [API Reference](api_reference.md) — Rust API docs
-- [API Reference](api_reference.md) — Public API types
 - [Agent Modes](agent_modes.md) — Build/Plan/Review modes
-- [Delegation Guide](delegation.md) — Multi-agent workflows
-- [Mesh Networking](mesh.md) — Cross-machine collaboration
