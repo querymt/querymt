@@ -91,7 +91,7 @@ tools = [
 ]
 system = [
     { file = "prompts/coder_system.txt" },
-    { file = "prompts/code_meta.jinja2" ]
+    { file = "prompts/code_meta.jinja2" }
 ]
 
 # Middleware stack
@@ -346,7 +346,7 @@ mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
 tools = [
     "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
     "glob", "search_text", "ls", "index", "get_symbol", "get_function",
-    "find_references", "shell", "create_task", "todowrite", "todoread",
+    "find_symbol_references", "shell", "create_task", "todowrite", "todoread",
     "question", "browse"
 ]
 system = [
@@ -388,7 +388,7 @@ model = "claude-sonnet-4-5-20250929"
 assume_mutating = false
 tools = [
     "read_tool", "glob", "search_text", "ls", "index",
-    "get_symbol", "get_function", "find_references",
+    "get_symbol", "get_function", "find_symbol_references",
     "question"
 ]
 system = """You are a code review specialist. Analyze code for:

@@ -1547,11 +1547,6 @@ cargo run --features remote -- --mesh=/ip4/192.168.1.100/tcp/9000
 
 ## Related Documentation
 
-- [Delegation Guide](delegation.md) - Remote delegation
-- [Configuration Guide](configuration.md) - Mesh configuration
-- [API Reference](api_reference.md) - Mesh API types
-## Related Documentation
-
 - [Configuration Guide](configuration.md) - Mesh configuration options
 - [Profiles](profiles.md) - Mesh-enabled profiles
 - [Delegation](delegation.md) - Remote delegation patterns

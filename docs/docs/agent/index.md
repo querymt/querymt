@@ -149,7 +149,7 @@ QueryMT implements a 3-layer context management system:
 
 - **AST-aware analysis**: `index`, `get_symbol`, `get_function`
 - **Safe refactoring**: `replace_symbol` with AST-based replacement
-- **Symbol references**: `find_references` across codebase
+- **Symbol references**: `find_symbol_references` across codebase
 - **Multi-language support**: Rust, Python, TypeScript, Go, Java, C/C++
 
 ### Scheduled Tasks
@@ -213,5 +213,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - [QueryMaTe Main Documentation](https://docs.query.mt)
 - [MCP Integration](../mcp.md) - Model Context Protocol
 - [Agent Examples](examples.md)
-- [Configuration Examples](configuration.md)
 - [Configuration Examples](configuration.md)

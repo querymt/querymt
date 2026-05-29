@@ -578,13 +578,13 @@ replace_symbol(replacements=[{
 - Rejects overlapping replacements
 - Rejects stale writes (hash mismatch)
 
-#### `find_references`
+#### `find_symbol_references`
 
 Find references to symbols across the codebase:
 
 ```bash
 # Example tool call
-find_references(symbol="MyStruct", path="src/lib.rs")
+find_symbol_references(paths=["src/lib.rs"], symbols=["MyStruct"])
 ```
 
 **Returns:**
@@ -603,7 +603,7 @@ tools = [
     "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
     
     # Search & navigation
-    "glob", "search_text", "ls", "index", "get_symbol", "get_function", "find_references",
+    "glob", "search_text", "ls",
     
     # Execution
     "shell",
@@ -618,7 +618,7 @@ tools = [
     "browse",
     
     # Code intelligence
-    "index", "get_symbol", "get_function", "replace_symbol"
+    "index", "get_symbol", "get_function", "replace_symbol", "find_symbol_references"
 ]
 ```
 
@@ -713,7 +713,7 @@ If you have old configurations, note these changes:
 - Mesh configuration moved to top-level `[mesh]` section
 - Profiles added with `[profile]` section
 - Slash commands stored in `.qmt/commands/`
-- New tools: `index`, `get_symbol`, `get_function`, `replace_symbol`, `find_references`
+- New tools: `index`, `get_symbol`, `get_function`, `replace_symbol`, `find_symbol_references`
 - Scheduled tasks created via dashboard UI/API, not TOML config
 
 ### New Features Since Last Documentation Update
