@@ -15,11 +15,11 @@ use std::sync::Arc;
 use tracing::instrument;
 
 pub struct LLMProviderFromHTTP {
-    inner: Arc<dyn HTTPLLMProvider>,
+    inner: Box<dyn HTTPLLMProvider>,
 }
 
 impl LLMProviderFromHTTP {
-    pub fn new(inner: Arc<dyn HTTPLLMProvider>) -> Self {
+    pub fn new(inner: Box<dyn HTTPLLMProvider>) -> Self {
         Self { inner }
     }
 
@@ -102,10 +102,15 @@ impl ChatProvider for LLMProviderFromHTTP {
 
         let s = stream
             .map(move |res: reqwest::Result<bytes::Bytes>| res.map_err(LLMError::from))
-            .chain(futures::stream::once(futures::future::ready(Ok(
-                bytes::Bytes::from_static(b"\n"),
-            ))))
-            .scan(Vec::new(), move |buffer, res| {
+            .chain(futures::stream::iter([
+                Ok(bytes::Bytes::from_static(b"\n")),
+                Ok(bytes::Bytes::new()),
+            ]))
+            .scan((Vec::new(), false), move |(buffer, done), res| {
+                if *done {
+                    return futures::future::ready(None);
+                }
+
                 let res = match res {
                     Ok(bytes) => {
                         if !bytes.is_empty() {
@@ -127,6 +132,8 @@ impl ChatProvider for LLMProviderFromHTTP {
                                             String::from_utf8_lossy(line),
                                             e
                                         );
+                                        *done = true;
+                                        return futures::future::ready(Some(Err(e)));
                                     }
                                 }
                                 start = i + 1;
@@ -135,6 +142,7 @@ impl ChatProvider for LLMProviderFromHTTP {
                         *buffer = buffer[start..].to_vec();
 
                         if bytes.is_empty() {
+                            *done = true;
                             match parser.finish() {
                                 Ok(mut tail) => chunks.append(&mut tail),
                                 Err(e) => return futures::future::ready(Some(Err(e))),
@@ -143,7 +151,10 @@ impl ChatProvider for LLMProviderFromHTTP {
 
                         Ok(chunks)
                     }
-                    Err(e) => Err(e),
+                    Err(e) => {
+                        *done = true;
+                        Err(e)
+                    }
                 };
                 futures::future::ready(Some(res))
             })
@@ -199,11 +210,7 @@ impl LLMProvider for LLMProviderFromHTTP {
     }
 
     fn set_key_resolver(&mut self, resolver: Arc<dyn crate::auth::ApiKeyResolver>) {
-        // The adapter wraps providers behind Arc so forwarding is only possible
-        // while construction ownership is unique.
-        if let Some(inner) = Arc::get_mut(&mut self.inner) {
-            inner.set_key_resolver(resolver);
-        }
+        self.inner.set_key_resolver(resolver);
     }
 
     fn key_resolver(&self) -> Option<&Arc<dyn crate::auth::ApiKeyResolver>> {
@@ -402,7 +409,7 @@ mod tests {
 
     #[test]
     fn set_key_resolver_forwards_to_inner_provider() {
-        let inner: Arc<dyn HTTPLLMProvider> = Arc::new(DummyHttpProvider { resolver: None });
+        let inner: Box<dyn HTTPLLMProvider> = Box::new(DummyHttpProvider { resolver: None });
         let mut adapter = LLMProviderFromHTTP::new(inner);
         let resolver = static_key("resolver-token");
 
@@ -417,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_credential_fresh_resolves_before_request_building() {
         let resolver = Arc::new(CountingResolver::new());
-        let inner: Arc<dyn HTTPLLMProvider> = Arc::new(ResolveAwareHttpProvider {
+        let inner: Box<dyn HTTPLLMProvider> = Box::new(ResolveAwareHttpProvider {
             resolver: resolver.clone(),
         });
         let adapter = LLMProviderFromHTTP::new(inner);

@@ -332,7 +332,7 @@ macro_rules! impl_extism_http_plugin {
         ) -> FnResult<Json<Vec<querymt::plugin::extism_impl::ExtismChatChunk>>> {
             let chunks = STREAM_PARSERS.with(|parsers| {
                 let mut parsers = parsers.borrow_mut();
-                let parser = parsers.get_mut(&parser_id).ok_or_else(|| {
+                let mut parser = parsers.remove(&parser_id).ok_or_else(|| {
                     PdkError::msg(format!("Unknown parser id {}", parser_id))
                 })?;
                 parser.finish().map_err(llm_err_to_pdk)

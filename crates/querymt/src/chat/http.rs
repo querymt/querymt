@@ -22,10 +22,12 @@ pub trait HTTPChatProvider: Send + Sync {
 
     fn chat_stream_request(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
+        _messages: &[ChatMessage],
+        _tools: Option<&[Tool]>,
     ) -> Result<Request<Vec<u8>>, LLMError> {
-        self.chat_request(messages, tools)
+        Err(LLMError::NotImplemented(
+            "Streaming request construction not supported by this HTTP provider".into(),
+        ))
     }
 
     fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError>;

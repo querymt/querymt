@@ -26,7 +26,7 @@ plugin_host = ["dirs", "toml", "serde_yaml"]
 model-registry = ["dirs", "http-client"]
 native = ["plugin_host", "http-client", "libloading", "once_cell"]
 mcp = ["rmcp", "toml", "tokio", "jsonschema", "reqwest"]
-extism_host = ["plugin_host", "http-client", "dep:extism", "docker_credential", "sigstore", "oci-client", "tar", "flate2", "sha2", "serde_yaml", "dirs", "hex", "tempfile"]
+extism_host = ["plugin_host", "http-client", "tracing", "dep:extism", "docker_credential", "sigstore", "oci-client", "tar", "flate2", "sha2", "serde_yaml", "dirs", "hex", "tempfile"]
 extism_plugin = ["http-serde-ext"]
 tracing = ["dep:tracing"]
 

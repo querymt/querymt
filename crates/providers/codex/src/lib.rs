@@ -150,6 +150,14 @@ impl HTTPChatProvider for Codex {
         api::codex_parse_chat_with_state(response, &tool_state_buffer)
     }
 
+    fn chat_stream_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<Request<Vec<u8>>, LLMError> {
+        api::codex_chat_request(self, messages, tools)
+    }
+
     fn supports_streaming(&self) -> bool {
         true
     }

@@ -1,3 +1,5 @@
+#[cfg(not(feature = "model-registry"))]
+use crate::providers::ProvidersRegistry;
 use crate::{
     HTTPLLMProvider, LLMProvider,
     adapters::LLMProviderFromHTTP,
@@ -22,7 +24,6 @@ use crate::{
             SerializableHttpResponse,
         },
     },
-    providers::read_providers_from_cache,
     stt, tts,
 };
 
@@ -56,6 +57,7 @@ fn decode_plugin_error(e: extism::Error, code: i32) -> LLMError {
     PluginError::decode(code, &raw)
 }
 
+#[cfg(debug_assertions)]
 fn header_token_hint(value: Option<&http::HeaderValue>) -> String {
     let Some(value) = value else {
         return "<missing>".to_string();
@@ -69,20 +71,7 @@ fn header_token_hint(value: Option<&http::HeaderValue>) -> String {
     if token.is_empty() {
         return format!("{scheme} <empty>");
     }
-    let len = token.chars().count();
-    if len <= 10 {
-        return format!("{scheme} <redacted>");
-    }
-    let prefix: String = token.chars().take(6).collect();
-    let suffix: String = token
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    format!("{scheme} {prefix}...{suffix}")
+    format!("{scheme} <redacted>")
 }
 
 fn decode_stream_item(item: Result<Vec<u8>, LLMError>) -> Result<StreamChunk, LLMError> {
@@ -245,10 +234,15 @@ impl ExtismFactory {
     ) -> Result<Self, LLMError> {
         let mut env_map: HashMap<_, _> = std::env::vars().collect();
 
-        let v = read_providers_from_cache()?;
+        #[cfg(feature = "model-registry")]
+        let providers_registry = crate::providers::read_providers_from_cache()?;
+        #[cfg(not(feature = "model-registry"))]
+        let providers_registry = ProvidersRegistry {
+            providers: HashMap::new(),
+        };
         env_map.insert(
             "PROVIDERS_REGISTRY_DATA".to_string(),
-            serde_json::to_string(&v)?,
+            serde_json::to_string(&providers_registry)?,
         );
 
         let initial_manifest =
@@ -407,7 +401,7 @@ impl LLMProviderFactory for ExtismFactory {
         };
 
         if self.supports_http_adapter_abi() {
-            let http_provider: Arc<dyn HTTPLLMProvider> = Arc::new(provider);
+            let http_provider: Box<dyn HTTPLLMProvider> = Box::new(provider);
             return Ok(Box::new(LLMProviderFromHTTP::new(http_provider)));
         }
 
@@ -1125,13 +1119,33 @@ impl LLMProvider for ExtismProvider {
 struct ExtismStreamParser {
     plugin: Arc<Mutex<Plugin>>,
     parser_id: i64,
+    closed: bool,
+}
+
+impl ExtismStreamParser {
+    fn close(&mut self) -> Result<(), LLMError> {
+        if self.closed {
+            return Ok(());
+        }
+        let mut plug = self.plugin.lock().map_err(|_| {
+            LLMError::PluginError("Extism stream parser close lock poisoned".into())
+        })?;
+        let _: () = plug
+            .call_get_error_code("chat_stream_parser_close", Json(self.parser_id))
+            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+        self.closed = true;
+        Ok(())
+    }
 }
 
 impl Drop for ExtismStreamParser {
     fn drop(&mut self) {
-        if let Ok(mut plug) = self.plugin.lock() {
-            let _: Result<(), (extism::Error, i32)> =
-                plug.call_get_error_code("chat_stream_parser_close", Json(self.parser_id));
+        if let Err(e) = self.close() {
+            log::warn!(
+                "Failed to close Extism stream parser {}: {:#}",
+                self.parser_id,
+                e
+            );
         }
     }
 }
@@ -1156,6 +1170,8 @@ impl ChatStreamParser for ExtismStreamParser {
         let out: Json<Vec<ExtismChatChunk>> = plug
             .call_get_error_code("chat_stream_parser_finish", Json(self.parser_id))
             .map_err(|(e, code)| decode_plugin_error(e, code))?;
+        drop(plug);
+        self.close()?;
         Ok(out.0.into_iter().map(|item| item.chunk).collect())
     }
 }
@@ -1179,16 +1195,19 @@ impl HTTPChatProvider for ExtismProvider {
                 )
                 .map_err(|(e, code)| decode_plugin_error(e, code))?;
             let req = req.0.req;
-            let auth_header = req.headers().get(http::header::AUTHORIZATION);
-            let auth_hint = header_token_hint(auth_header);
-            log::debug!(
-                "Extism HTTP chat_request built: method={} uri={} has_authorization={} auth_hint={} body_len={}",
-                req.method(),
-                req.uri(),
-                auth_header.is_some(),
-                auth_hint,
-                req.body().len()
-            );
+            #[cfg(debug_assertions)]
+            {
+                let auth_header = req.headers().get(http::header::AUTHORIZATION);
+                let auth_hint = header_token_hint(auth_header);
+                log::debug!(
+                    "Extism HTTP chat_request built: method={} uri={} has_authorization={} auth_hint={} body_len={}",
+                    req.method(),
+                    req.uri(),
+                    auth_header.is_some(),
+                    auth_hint,
+                    req.body().len()
+                );
+            }
             Ok(req)
         })
     }
@@ -1211,16 +1230,19 @@ impl HTTPChatProvider for ExtismProvider {
                 )
                 .map_err(|(e, code)| decode_plugin_error(e, code))?;
             let req = req.0.req;
-            let auth_header = req.headers().get(http::header::AUTHORIZATION);
-            let auth_hint = header_token_hint(auth_header);
-            log::debug!(
-                "Extism HTTP chat_stream_request built: method={} uri={} has_authorization={} auth_hint={} body_len={}",
-                req.method(),
-                req.uri(),
-                auth_header.is_some(),
-                auth_hint,
-                req.body().len()
-            );
+            #[cfg(debug_assertions)]
+            {
+                let auth_header = req.headers().get(http::header::AUTHORIZATION);
+                let auth_hint = header_token_hint(auth_header);
+                log::debug!(
+                    "Extism HTTP chat_stream_request built: method={} uri={} has_authorization={} auth_hint={} body_len={}",
+                    req.method(),
+                    req.uri(),
+                    auth_header.is_some(),
+                    auth_hint,
+                    req.body().len()
+                );
+            }
             Ok(req)
         })
     }
@@ -1263,6 +1285,7 @@ impl HTTPChatProvider for ExtismProvider {
         Ok(Box::new(ExtismStreamParser {
             plugin: self.plugin.clone(),
             parser_id,
+            closed: false,
         }))
     }
 }
@@ -1344,6 +1367,14 @@ impl HTTPEmbeddingProvider for ExtismProvider {
 impl HTTPLLMProvider for ExtismProvider {
     fn tools(&self) -> Option<&[Tool]> {
         None
+    }
+
+    fn set_key_resolver(&mut self, resolver: Arc<dyn ApiKeyResolver>) {
+        self.key_resolver = Some(resolver);
+    }
+
+    fn key_resolver(&self) -> Option<&Arc<dyn ApiKeyResolver>> {
+        self.key_resolver.as_ref()
     }
 }
 
