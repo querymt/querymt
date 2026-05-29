@@ -90,7 +90,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "uuid 1.23.1",
+ "uuid 1.23.2",
 ]
 
 [[package]]
@@ -1579,7 +1579,7 @@ checksum = "d38f2da7a0a2c4ccf0065be06397cc26a81f4e528be095826eee9d4adbb8c60f"
 dependencies = [
  "byteorder",
  "fnv",
- "uuid 1.23.1",
+ "uuid 1.23.2",
 ]
 
 [[package]]
@@ -2721,7 +2721,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.117",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -2787,7 +2787,7 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bef552e6f588e446098f6ba40d89ac146c8c7b64aade83c051ee00bb5d2bc18d"
 dependencies = [
- "uuid 1.23.1",
+ "uuid 1.23.2",
 ]
 
 [[package]]
@@ -3507,7 +3507,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq 3.3.0",
  "url",
- "uuid 1.23.1",
+ "uuid 1.23.2",
  "wasi-common",
  "wasmtime",
  "wiggle",
@@ -6699,7 +6699,7 @@ dependencies = [
  "tokio-stream",
  "toml 0.8.23",
  "tracing",
- "uuid 1.23.1",
+ "uuid 1.23.2",
  "zip",
 ]
 
@@ -6970,7 +6970,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "url",
- "uuid 1.23.1",
+ "uuid 1.23.2",
 ]
 
 [[package]]
@@ -8212,7 +8212,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "urlencoding",
- "uuid 1.23.1",
+ "uuid 1.23.2",
  "variantly",
  "vob",
 ]
@@ -8247,7 +8247,7 @@ dependencies = [
  "tokio-tungstenite 0.28.0",
  "tracing",
  "utoipa",
- "uuid 1.23.1",
+ "uuid 1.23.2",
 ]
 
 [[package]]
@@ -8353,7 +8353,7 @@ dependencies = [
  "portable-atomic",
  "smallvec 1.15.1",
  "tagptr",
- "uuid 1.23.1",
+ "uuid 1.23.2",
 ]
 
 [[package]]
@@ -9224,7 +9224,7 @@ dependencies = [
  "toml 0.8.23",
  "ureq 2.12.1",
  "url",
- "uuid 1.23.1",
+ "uuid 1.23.2",
  "walkdir",
 ]
 
@@ -10517,7 +10517,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -10982,7 +10982,7 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "url",
- "uuid 1.23.1",
+ "uuid 1.23.2",
  "which 8.0.2",
 ]
 
@@ -11078,7 +11078,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "typeshare",
- "uuid 1.23.1",
+ "uuid 1.23.2",
  "whatlang",
 ]
 
@@ -12020,7 +12020,7 @@ dependencies = [
  "smallvec 1.15.1",
  "sqlite-wasm-rs",
  "time",
- "uuid 1.23.1",
+ "uuid 1.23.2",
 ]
 
 [[package]]
@@ -13211,7 +13211,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -13957,7 +13957,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.59.0",
@@ -15322,9 +15322,9 @@ dependencies = [
 
 [[package]]
 name = "uuid"
-version = "1.23.1"
+version = "1.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
+checksum = "d258b83ceec21034727ecee8c382cfa6c3e133699b0742c64571814fb420c9f7"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
