@@ -126,9 +126,37 @@ QueryMT implements a 3-layer context management system:
 ### Mesh Networking
 
 - **Cross-machine sessions**: Share sessions across multiple machines
-- **Peer discovery**: mDNS or Kademlia DHT for finding peers
-- **Remote agents**: Access agents running on other machines
-- **Provider routing**: Route LLM calls to specific nodes
+- **Internet-capable transport**: iroh-based NAT traversal with invite tokens
+- **Multi-transport**: LAN + Internet mesh simultaneously
+- **Remote session management**: Forking, resuming, and recovery
+- **Streaming stability**: Robust handling of network interruptions
+
+### Profiles
+
+- **Multiple configurations**: Switch between different agent setups instantly
+- **Task-specific settings**: Different profiles for coding, reviewing, planning
+- **Team collaboration**: Share profiles via version control
+- **Session binding**: Sessions remember their profile
+
+### Slash Commands
+
+- **Custom commands**: Define commands in markdown files
+- **Tab completion**: Fuzzy matching for fast command lookup
+- **Argument substitution**: Dynamic prompts with `$1`, `$2`, `$ARGUMENTS`
+- **Team sharing**: Share commands via `.qmt/commands/`
+
+### Code Intelligence Tools
+
+- **AST-aware analysis**: `index`, `get_symbol`, `get_function`
+- **Safe refactoring**: `replace_symbol` with AST-based replacement
+- **Symbol references**: `find_symbol_references` across codebase
+- **Multi-language support**: Rust, Python, TypeScript, Go, Java, C/C++
+
+### Scheduled Tasks
+
+- **Interval schedules**: Run tasks at fixed intervals
+- **Event-driven schedules**: Trigger on file changes, knowledge ingestion
+- **Automation**: Background tasks for maintenance and analysis
 
 ## Getting Started
 
@@ -169,13 +197,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Documentation Structure
 
 - **Overview** (this document): Architecture and concepts
-- **Configuration Guide**: TOML configuration reference
-- **API Reference**: Rust API documentation
-- **Middleware Guide**: Custom middleware development
-- **Examples**: Usage examples and patterns
+- **[Configuration Guide](configuration.md)**: TOML configuration reference
+- **[Mesh Networking Guide](mesh.md)**: Cross-machine collaboration and internet mesh
+- **[Profiles Guide](profiles.md)**: Save and switch between configurations
+- **[Slash Commands Guide](slash-commands.md)**: Custom commands and workflows
+- **[Delegation Guide](delegation.md)**: Multi-agent coordination
+- **[Middleware Guide](middleware.md)**: Custom middleware development
+- **[Agent Modes](agent_modes.md)**: Build, plan, and review modes
+- **[Export Guide](export.md)**: Session export for fine-tuning
+- **[API Reference](api_reference.md)**: Rust API documentation
+- **[Examples](examples.md)**: Usage examples and patterns
 
 ## Related Documentation
 
 - [QueryMaTe Main Documentation](https://docs.query.mt)
+- [MCP Integration](../mcp.md) - Model Context Protocol
 - [Agent Examples](examples.md)
 - [Configuration Examples](configuration.md)
