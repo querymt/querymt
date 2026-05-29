@@ -38,7 +38,7 @@ pub async fn ensure_sessions_for_mode_with_profile(
             ensure_session(state, conn_id, &agent_id, cwd, tx, request_id, profile_id).await?;
         }
         RoutingMode::Broadcast => {
-            let agent_ids = list_agent_ids(state);
+            let agent_ids = list_agent_ids(state).await;
             for (i, agent_id) in agent_ids.iter().enumerate() {
                 // Only pass request_id to the first agent in broadcast mode
                 let req_id = if i == 0 { request_id } else { None };
@@ -65,7 +65,7 @@ pub async fn prompt_for_mode(
             prompt_session(state, &session_id, prompt, cwd).await?;
         }
         RoutingMode::Broadcast => {
-            let agent_ids = list_agent_ids(state);
+            let agent_ids = list_agent_ids(state).await;
             for agent_id in agent_ids {
                 let session_id =
                     ensure_session(state, conn_id, &agent_id, cwd, tx, None, None).await?;
@@ -543,15 +543,29 @@ pub async fn current_mode(state: &ServerState, conn_id: &str) -> Result<RoutingM
 }
 
 /// List all agent IDs (primary + registered agents).
-pub fn list_agent_ids(state: &ServerState) -> Vec<String> {
-    let registry = state.agent.agent_registry();
-    let mut ids = vec![PRIMARY_AGENT_ID.to_string()];
-    ids.extend(registry.list_agents().into_iter().map(|info| info.id));
-    ids
+pub async fn list_agent_ids(state: &ServerState) -> Vec<String> {
+    build_agent_list(state)
+        .await
+        .into_iter()
+        .map(|info| info.id)
+        .collect()
 }
 
 /// Build the list of agent info for the UI.
-pub fn build_agent_list(state: &ServerState) -> Vec<UiAgentInfo> {
+pub async fn build_agent_list(state: &ServerState) -> Vec<UiAgentInfo> {
+    let registry = if let Some(profiles) = &state.profiles {
+        profiles
+            .active_runtime()
+            .await
+            .map(|runtime| runtime.agent().handle().agent_registry())
+            .unwrap_or_else(|err| {
+                log::warn!("Failed to load active profile for UI agent list: {err}");
+                state.agent.agent_registry()
+            })
+    } else {
+        state.agent.agent_registry()
+    };
+
     let mut agents = Vec::new();
     agents.push(UiAgentInfo {
         id: PRIMARY_AGENT_ID.to_string(),
@@ -559,7 +573,6 @@ pub fn build_agent_list(state: &ServerState) -> Vec<UiAgentInfo> {
         description: "Main agent for the current session.".to_string(),
         capabilities: Vec::new(),
     });
-    let registry = state.agent.agent_registry();
     for info in registry.list_agents() {
         agents.push(UiAgentInfo {
             id: info.id,

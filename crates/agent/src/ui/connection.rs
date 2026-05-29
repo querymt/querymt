@@ -233,7 +233,7 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
         }
     };
 
-    let agents = build_agent_list(state);
+    let agents = build_agent_list(state).await;
     let profiles = match list_profiles(state).await {
         Ok(profiles) => profiles,
         Err(message) => {
@@ -1056,6 +1056,46 @@ pub async fn subscribe_to_file_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::AgentInfra;
+    use crate::profiles::{LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager};
+    use crate::test_utils::{TestServerState, empty_plugin_registry};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn write_quorum_profile(dir: &Path) {
+        std::fs::write(
+            dir.join("delegates.toml"),
+            r#"
+[profile]
+id = "delegates"
+name = "Delegates"
+
+[quorum]
+
+[planner]
+provider = "test"
+model = "planner-model"
+system = "plan"
+
+[[delegates]]
+id = "coder"
+provider = "test"
+model = "coder-model"
+description = "Writes code."
+capabilities = ["coding"]
+system = "code"
+
+[[delegates]]
+id = "explorer"
+provider = "test"
+model = "explorer-model"
+description = "Explores code."
+capabilities = ["exploration"]
+system = "explore"
+"#,
+        )
+        .expect("profile should be written");
+    }
 
     // ── Binary frame envelope tests ─────────────────────────────────────────
 
@@ -1164,5 +1204,46 @@ mod tests {
         assert_eq!(&encoded[4..9], b"hello");
         // Remaining: payload
         assert_eq!(&encoded[9..], b"world");
+    }
+
+    #[tokio::test]
+    async fn send_state_reports_delegates_from_active_profile_runtime() {
+        let mut fixture = TestServerState::new().await;
+        let dir = tempfile::TempDir::new().expect("temp profile dir");
+        write_quorum_profile(dir.path());
+        let catalog: Arc<dyn ProfileCatalog> = Arc::new(
+            LocalProfileCatalog::builder()
+                .include_embedded_default(false)
+                .local_dir(dir.path())
+                .build(),
+        );
+        let (registry, _registry_dir) = empty_plugin_registry().expect("empty plugin registry");
+        let infra = AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(fixture.agent.storage.clone()),
+            session_mcp_attachment_source: None,
+        };
+        fixture.state.profiles = Some(Arc::new(ProfileRuntimeManager::with_infra_boxed(
+            catalog,
+            "delegates",
+            infra,
+        )));
+        let conn_id = "conn-state-profile-agents";
+        let (tx, mut rx) = fixture.add_connection(conn_id).await;
+
+        send_state(&fixture.state, conn_id, &tx).await;
+
+        let raw = rx.recv().await.expect("state message should be sent");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("state should be JSON");
+        let mut agent_ids: Vec<String> = value["data"]["agents"]
+            .as_array()
+            .expect("agents should be an array")
+            .iter()
+            .map(|agent| agent["id"].as_str().expect("agent id").to_string())
+            .collect();
+
+        assert_eq!(agent_ids.remove(0), "primary");
+        agent_ids.sort();
+        assert_eq!(agent_ids, vec!["coder", "explorer"]);
     }
 }
