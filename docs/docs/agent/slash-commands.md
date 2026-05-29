@@ -761,13 +761,12 @@ Create a semantic commit for the current changes.
    - **build**: Build system changes
 
 5. Generate commit message following Conventional Commits:
-   ```
-   <type>[optional scope]: <description>
-   
-   [optional body]
-   
-   [optional footer(s)]
-   ```
+
+       <type>[optional scope]: <description>
+
+       [optional body]
+
+       [optional footer(s)]
 
 6. Ask for confirmation before committing
 7. Create the commit

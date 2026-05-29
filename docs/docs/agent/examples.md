@@ -997,7 +997,7 @@ let resumed = agent
 let nodes = agent.list_remote_nodes().await;
 ```
 
-For complete remote session documentation, see [Mesh Networking Guide](mesh.md#remote-sessions).
+For complete remote session documentation, see [Mesh Networking Guide](mesh.md#session-management).
 
 ---
 
