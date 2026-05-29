@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[cfg(feature = "remote")]
-fn select_relay_scope(
+pub(crate) fn select_relay_scope(
     active_scopes: &[MeshScopeId],
     preferred_scope: Option<MeshScopeId>,
 ) -> MeshScopeId {
