@@ -1,7 +1,13 @@
+#[cfg(not(feature = "model-registry"))]
+use crate::providers::ProvidersRegistry;
 use crate::{
     HTTPLLMProvider, LLMProvider,
+    adapters::LLMProviderFromHTTP,
     auth::ApiKeyResolver,
-    chat::{ChatMessage, ChatProvider, ChatResponse, StreamChunk, Tool, http::HTTPChatProvider},
+    chat::{
+        ChatMessage, ChatProvider, ChatResponse, StreamChunk, Tool,
+        http::{ChatStreamParser, HTTPChatProvider},
+    },
     completion::{
         CompletionProvider, CompletionRequest, CompletionResponse, http::HTTPCompletionProvider,
     },
@@ -10,11 +16,14 @@ use crate::{
     plugin::{
         Fut, HTTPLLMProviderFactory, LLMProviderFactory,
         extism_impl::{
-            ExtismChatRequest, ExtismChatResponse, ExtismEmbedRequest, ExtismSttRequest,
-            ExtismSttResponse, ExtismTtsRequest, ExtismTtsResponse, ExtismVoiceConfig,
+            ExtismChatChunk, ExtismChatChunkParseRequest, ExtismChatParseRequest,
+            ExtismChatRequest, ExtismChatResponse, ExtismCompleteParseRequest,
+            ExtismEmbedParseRequest, ExtismEmbedRequest, ExtismListModelsParseRequest,
+            ExtismListModelsRequest, ExtismSttRequest, ExtismSttResponse, ExtismTtsRequest,
+            ExtismTtsResponse, ExtismVoiceConfig, SerializableHttpRequest,
+            SerializableHttpResponse,
         },
     },
-    providers::read_providers_from_cache,
     stt, tts,
 };
 
@@ -46,6 +55,23 @@ use super::{ExtismCompleteRequest, PluginError};
 fn decode_plugin_error(e: extism::Error, code: i32) -> LLMError {
     let raw = format!("{:#}", e);
     PluginError::decode(code, &raw)
+}
+
+#[cfg(debug_assertions)]
+fn header_token_hint(value: Option<&http::HeaderValue>) -> String {
+    let Some(value) = value else {
+        return "<missing>".to_string();
+    };
+    let Ok(value_str) = value.to_str() else {
+        return "<non-utf8>".to_string();
+    };
+    let mut parts = value_str.splitn(2, ' ');
+    let scheme = parts.next().unwrap_or("<unknown>");
+    let token = parts.next().unwrap_or("");
+    if token.is_empty() {
+        return format!("{scheme} <empty>");
+    }
+    format!("{scheme} <redacted>")
 }
 
 fn decode_stream_item(item: Result<Vec<u8>, LLMError>) -> Result<StreamChunk, LLMError> {
@@ -208,10 +234,15 @@ impl ExtismFactory {
     ) -> Result<Self, LLMError> {
         let mut env_map: HashMap<_, _> = std::env::vars().collect();
 
-        let v = read_providers_from_cache()?;
+        #[cfg(feature = "model-registry")]
+        let providers_registry = crate::providers::read_providers_from_cache()?;
+        #[cfg(not(feature = "model-registry"))]
+        let providers_registry = ProvidersRegistry {
+            providers: HashMap::new(),
+        };
         env_map.insert(
             "PROVIDERS_REGISTRY_DATA".to_string(),
-            serde_json::to_string(&v)?,
+            serde_json::to_string(&providers_registry)?,
         );
 
         let initial_manifest =
@@ -332,6 +363,17 @@ fn validate_runtime_base_url(
     )))
 }
 
+impl ExtismFactory {
+    fn supports_http_adapter_abi(&self) -> bool {
+        let plug = self.plugin.lock().unwrap();
+        plug.function_exists("chat_request")
+            && plug.function_exists("chat_stream_request")
+            && plug.function_exists("parse_chat_response")
+            && plug.function_exists("list_models_request")
+            && plug.function_exists("parse_list_models_response")
+    }
+}
+
 impl LLMProviderFactory for ExtismFactory {
     fn name(&self) -> &str {
         &self.name
@@ -357,6 +399,12 @@ impl LLMProviderFactory for ExtismFactory {
             user_data: self.user_data.clone(),
             key_resolver: None,
         };
+
+        if self.supports_http_adapter_abi() {
+            let http_provider: Box<dyn HTTPLLMProvider> = Box::new(provider);
+            return Ok(Box::new(LLMProviderFromHTTP::new(http_provider)));
+        }
+
         Ok(Box::new(provider))
     }
 
@@ -374,6 +422,23 @@ impl LLMProviderFactory for ExtismFactory {
                 });
             }
         };
+
+        if self.supports_http_adapter_abi() {
+            if let Some(result) = <Self as HTTPLLMProviderFactory>::list_models_static(self, cfg) {
+                return Box::pin(async move { result });
+            }
+
+            let req = match <Self as HTTPLLMProviderFactory>::list_models_request(self, cfg) {
+                Ok(req) => req,
+                Err(e) => return Box::pin(async move { Err(e) }),
+            };
+            return async move {
+                let resp = crate::outbound::call_outbound(req).await?;
+                <Self as HTTPLLMProviderFactory>::parse_list_models(self, resp)
+            }
+            .boxed();
+        }
+
         let plugin = self.plugin.clone();
         let user_data = self.user_data.clone();
         let caller_span = tracing::Span::current();
@@ -408,10 +473,7 @@ impl LLMProviderFactory for ExtismFactory {
     fn as_http(&self) -> Option<&dyn crate::plugin::http::HTTPLLMProviderFactory> {
         // Only return Some if the plugin is HTTP-based
         // Check if plugin exports the api_key_name function (exported by impl_extism_http_plugin!)
-        let is_http_based = {
-            let plug = self.plugin.lock().unwrap();
-            plug.function_exists("api_key_name")
-        };
+        let is_http_based = self.supports_http_adapter_abi();
 
         if is_http_based {
             log::debug!(
@@ -456,16 +518,61 @@ impl HTTPLLMProviderFactory for ExtismFactory {
         Ok(Box::new(provider))
     }
 
-    fn list_models_request(&self, _cfg: &str) -> Result<http::Request<Vec<u8>>, LLMError> {
-        Err(LLMError::PluginError(
-            "ExtismProvider should not be used as HTTPLLMProviderFactory".into(),
-        ))
+    fn list_models_static(&self, cfg: &str) -> Option<Result<Vec<String>, LLMError>> {
+        let cfg_value: Value = match serde_json::from_str(cfg) {
+            Ok(v) => v,
+            Err(e) => {
+                return Some(Err(LLMError::PluginError(format!(
+                    "Invalid JSON config: {:#}",
+                    e
+                ))));
+            }
+        };
+
+        let mut plug = self.plugin.lock().unwrap();
+        if !plug.function_exists("list_models_static") {
+            return None;
+        }
+
+        let out: Result<Json<Option<Vec<String>>>, (extism::Error, i32)> = plug
+            .call_get_error_code(
+                "list_models_static",
+                Json(ExtismListModelsRequest { cfg: cfg_value }),
+            );
+
+        match out {
+            Ok(Json(Some(models))) => Some(Ok(models)),
+            Ok(Json(None)) => None,
+            Err((e, code)) => Some(Err(decode_plugin_error(e, code))),
+        }
     }
 
-    fn parse_list_models(&self, _resp: http::Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
-        Err(LLMError::PluginError(
-            "ExtismProvider should not be used as HTTPLLMProviderFactory".into(),
-        ))
+    fn list_models_request(&self, cfg: &str) -> Result<http::Request<Vec<u8>>, LLMError> {
+        let cfg_value: Value = serde_json::from_str(cfg)
+            .map_err(|e| LLMError::PluginError(format!("Invalid JSON config: {:#}", e)))?;
+        self.validate_runtime_base_url(&cfg_value)?;
+
+        let mut plug = self.plugin.lock().unwrap();
+        let req: Json<SerializableHttpRequest> = plug
+            .call_get_error_code(
+                "list_models_request",
+                Json(ExtismListModelsRequest { cfg: cfg_value }),
+            )
+            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+        Ok(req.0.req)
+    }
+
+    fn parse_list_models(&self, resp: http::Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
+        let mut plug = self.plugin.lock().unwrap();
+        let out: Json<Vec<String>> = plug
+            .call_get_error_code(
+                "parse_list_models_response",
+                Json(ExtismListModelsParseRequest {
+                    resp: SerializableHttpResponse { resp },
+                }),
+            )
+            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+        Ok(out.0)
     }
 
     fn api_key_name(&self) -> Option<String> {
@@ -487,6 +594,27 @@ impl ExtismProvider {
         self.user_data
             .clone()
             .ok_or_else(|| LLMError::PluginError("No UserData found for Extism provider".into()))
+    }
+
+    fn effective_config(&self) -> Result<Value, LLMError> {
+        let mut cfg = self.config.clone();
+        if let Some(ref resolver) = self.key_resolver
+            && let Some(obj) = cfg.as_object_mut()
+        {
+            obj.insert(
+                "api_key".to_string(),
+                serde_json::Value::String(resolver.current()),
+            );
+        }
+        Ok(cfg)
+    }
+
+    fn call_short_blocking<T, F>(&self, op: &'static str, f: F) -> Result<T, LLMError>
+    where
+        F: FnOnce(&mut Plugin) -> Result<T, LLMError>,
+    {
+        let mut plug = self.plugin.lock().unwrap();
+        f(&mut plug).map_err(|e| LLMError::PluginError(format!("Extism {op} failed: {:#}", e)))
     }
 
     async fn call_blocking_with_cancel<T, F>(&self, op: &'static str, f: F) -> Result<T, LLMError>
@@ -988,64 +1116,265 @@ impl LLMProvider for ExtismProvider {
     }
 }
 
+struct ExtismStreamParser {
+    plugin: Arc<Mutex<Plugin>>,
+    parser_id: i64,
+    closed: bool,
+}
+
+impl ExtismStreamParser {
+    fn close(&mut self) -> Result<(), LLMError> {
+        if self.closed {
+            return Ok(());
+        }
+        let mut plug = self.plugin.lock().map_err(|_| {
+            LLMError::PluginError("Extism stream parser close lock poisoned".into())
+        })?;
+        let _: () = plug
+            .call_get_error_code("chat_stream_parser_close", Json(self.parser_id))
+            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+        self.closed = true;
+        Ok(())
+    }
+}
+
+impl Drop for ExtismStreamParser {
+    fn drop(&mut self) {
+        if let Err(e) = self.close() {
+            log::warn!(
+                "Failed to close Extism stream parser {}: {:#}",
+                self.parser_id,
+                e
+            );
+        }
+    }
+}
+
+impl ChatStreamParser for ExtismStreamParser {
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+        let mut plug = self.plugin.lock().unwrap();
+        let out: Json<Vec<ExtismChatChunk>> = plug
+            .call_get_error_code(
+                "chat_stream_parser_parse",
+                Json(ExtismChatChunkParseRequest {
+                    parser_id: self.parser_id,
+                    chunk: chunk.to_vec(),
+                }),
+            )
+            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+        Ok(out.0.into_iter().map(|item| item.chunk).collect())
+    }
+
+    fn finish(&mut self) -> Result<Vec<StreamChunk>, LLMError> {
+        let mut plug = self.plugin.lock().unwrap();
+        let out: Json<Vec<ExtismChatChunk>> = plug
+            .call_get_error_code("chat_stream_parser_finish", Json(self.parser_id))
+            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+        drop(plug);
+        self.close()?;
+        Ok(out.0.into_iter().map(|item| item.chunk).collect())
+    }
+}
+
 impl HTTPChatProvider for ExtismProvider {
     fn chat_request(
         &self,
-        _messages: &[ChatMessage],
-        _tools: Option<&[Tool]>,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
     ) -> Result<http::Request<Vec<u8>>, LLMError> {
-        Err(LLMError::NotImplemented(
-            "Extism plugins don't expose HTTP requests".into(),
-        ))
+        let cfg = self.effective_config()?;
+        self.call_short_blocking("chat_request", move |plug| {
+            let req: Json<SerializableHttpRequest> = plug
+                .call_get_error_code(
+                    "chat_request",
+                    Json(ExtismChatRequest {
+                        cfg,
+                        messages: messages.to_vec(),
+                        tools: tools.map(|v| v.to_vec()),
+                    }),
+                )
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            let req = req.0.req;
+            #[cfg(debug_assertions)]
+            {
+                let auth_header = req.headers().get(http::header::AUTHORIZATION);
+                let auth_hint = header_token_hint(auth_header);
+                log::debug!(
+                    "Extism HTTP chat_request built: method={} uri={} has_authorization={} auth_hint={} body_len={}",
+                    req.method(),
+                    req.uri(),
+                    auth_header.is_some(),
+                    auth_hint,
+                    req.body().len()
+                );
+            }
+            Ok(req)
+        })
     }
 
-    fn parse_chat(
+    fn chat_stream_request(
         &self,
-        _resp: http::Response<Vec<u8>>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
-        Err(LLMError::NotImplemented(
-            "Extism plugins don't parse HTTP responses".into(),
-        ))
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<http::Request<Vec<u8>>, LLMError> {
+        let cfg = self.effective_config()?;
+        self.call_short_blocking("chat_stream_request", move |plug| {
+            let req: Json<SerializableHttpRequest> = plug
+                .call_get_error_code(
+                    "chat_stream_request",
+                    Json(ExtismChatRequest {
+                        cfg,
+                        messages: messages.to_vec(),
+                        tools: tools.map(|v| v.to_vec()),
+                    }),
+                )
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            let req = req.0.req;
+            #[cfg(debug_assertions)]
+            {
+                let auth_header = req.headers().get(http::header::AUTHORIZATION);
+                let auth_hint = header_token_hint(auth_header);
+                log::debug!(
+                    "Extism HTTP chat_stream_request built: method={} uri={} has_authorization={} auth_hint={} body_len={}",
+                    req.method(),
+                    req.uri(),
+                    auth_header.is_some(),
+                    auth_hint,
+                    req.body().len()
+                );
+            }
+            Ok(req)
+        })
+    }
+
+    fn parse_chat(&self, resp: http::Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+        let cfg = self.effective_config()?;
+        let out = self.call_short_blocking("parse_chat_response", move |plug| {
+            let out: Json<ExtismChatResponse> = plug
+                .call_get_error_code(
+                    "parse_chat_response",
+                    Json(ExtismChatParseRequest {
+                        cfg,
+                        resp: SerializableHttpResponse { resp },
+                    }),
+                )
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            Ok(out.0)
+        })?;
+
+        Ok(Box::new(out) as Box<dyn ChatResponse>)
+    }
+
+    fn supports_streaming(&self) -> bool {
+        let plug = self.plugin.lock().unwrap();
+        plug.function_exists("chat_stream_parser_start")
+            && plug.function_exists("chat_stream_parser_parse")
+            && plug.function_exists("chat_stream_parser_finish")
+            && plug.function_exists("chat_stream_parser_close")
+    }
+
+    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        let cfg = self.effective_config()?;
+        let parser_id = self.call_short_blocking("chat_stream_parser_start", move |plug| {
+            let out: Json<i64> = plug
+                .call_get_error_code("chat_stream_parser_start", Json(cfg))
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            Ok(out.0)
+        })?;
+
+        Ok(Box::new(ExtismStreamParser {
+            plugin: self.plugin.clone(),
+            parser_id,
+            closed: false,
+        }))
     }
 }
 
 impl HTTPCompletionProvider for ExtismProvider {
     fn complete_request(
         &self,
-        _req: &CompletionRequest,
+        req: &CompletionRequest,
     ) -> Result<http::Request<Vec<u8>>, LLMError> {
-        Err(LLMError::NotImplemented(
-            "Extism plugins don't expose HTTP requests".into(),
-        ))
+        let cfg = self.effective_config()?;
+        self.call_short_blocking("complete_request", move |plug| {
+            let out: Json<SerializableHttpRequest> = plug
+                .call_get_error_code(
+                    "complete_request",
+                    Json(ExtismCompleteRequest {
+                        cfg,
+                        req: req.clone(),
+                    }),
+                )
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            Ok(out.0.req)
+        })
     }
 
     fn parse_complete(
         &self,
-        _resp: http::Response<Vec<u8>>,
+        resp: http::Response<Vec<u8>>,
     ) -> Result<CompletionResponse, LLMError> {
-        Err(LLMError::NotImplemented(
-            "Extism plugins don't parse HTTP responses".into(),
-        ))
+        let cfg = self.effective_config()?;
+        self.call_short_blocking("parse_complete_response", move |plug| {
+            let out: Json<CompletionResponse> = plug
+                .call_get_error_code(
+                    "parse_complete_response",
+                    Json(ExtismCompleteParseRequest {
+                        cfg,
+                        resp: SerializableHttpResponse { resp },
+                    }),
+                )
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            Ok(out.0)
+        })
     }
 }
 
 impl HTTPEmbeddingProvider for ExtismProvider {
-    fn embed_request(&self, _inputs: &[String]) -> Result<http::Request<Vec<u8>>, LLMError> {
-        Err(LLMError::NotImplemented(
-            "Extism plugins don't expose HTTP requests".into(),
-        ))
+    fn embed_request(&self, inputs: &[String]) -> Result<http::Request<Vec<u8>>, LLMError> {
+        let cfg = self.effective_config()?;
+        self.call_short_blocking("embed_request", move |plug| {
+            let out: Json<SerializableHttpRequest> = plug
+                .call_get_error_code(
+                    "embed_request",
+                    Json(ExtismEmbedRequest {
+                        cfg,
+                        inputs: inputs.to_vec(),
+                    }),
+                )
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            Ok(out.0.req)
+        })
     }
 
-    fn parse_embed(&self, _resp: http::Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, LLMError> {
-        Err(LLMError::NotImplemented(
-            "Extism plugins don't parse HTTP responses".into(),
-        ))
+    fn parse_embed(&self, resp: http::Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, LLMError> {
+        let cfg = self.effective_config()?;
+        self.call_short_blocking("parse_embed_response", move |plug| {
+            let out: Json<Vec<Vec<f32>>> = plug
+                .call_get_error_code(
+                    "parse_embed_response",
+                    Json(ExtismEmbedParseRequest {
+                        cfg,
+                        resp: SerializableHttpResponse { resp },
+                    }),
+                )
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            Ok(out.0)
+        })
     }
 }
 
 impl HTTPLLMProvider for ExtismProvider {
     fn tools(&self) -> Option<&[Tool]> {
         None
+    }
+
+    fn set_key_resolver(&mut self, resolver: Arc<dyn ApiKeyResolver>) {
+        self.key_resolver = Some(resolver);
+    }
+
+    fn key_resolver(&self) -> Option<&Arc<dyn ApiKeyResolver>> {
+        self.key_resolver.as_ref()
     }
 }
 

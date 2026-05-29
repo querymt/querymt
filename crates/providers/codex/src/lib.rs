@@ -1,10 +1,13 @@
 //! Codex (ChatGPT backend) provider for QueryMT.
 
-use http::{Method, Request, Response};
+use http::{Request, Response};
 use querymt::{
     HTTPLLMProvider,
     auth::ApiKeyResolver,
-    chat::{ChatMessage, ChatResponse, StreamChunk, Tool, ToolChoice, http::HTTPChatProvider},
+    chat::{
+        ChatMessage, ChatResponse, StreamChunk, Tool, ToolChoice,
+        http::{ChatStreamParser, HTTPChatProvider},
+    },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
@@ -51,11 +54,6 @@ pub struct Codex {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_body: Option<serde_json::Map<String, Value>>,
 
-    /// Internal buffer for streaming tool state (not serialized)
-    #[serde(skip)]
-    #[schemars(skip)]
-    #[serde(default = "Codex::default_tool_state_buffer")]
-    pub tool_state_buffer: Arc<Mutex<HashMap<usize, api::CodexToolUseState>>>,
     /// Optional resolver for dynamic credential refresh (e.g., OAuth tokens).
     #[serde(skip)]
     #[schemars(skip)]
@@ -65,10 +63,6 @@ pub struct Codex {
 impl Codex {
     fn default_base_url() -> Url {
         Url::parse("https://chatgpt.com/backend-api/codex/").unwrap()
-    }
-
-    fn default_tool_state_buffer() -> Arc<Mutex<HashMap<usize, api::CodexToolUseState>>> {
-        Arc::new(Mutex::new(HashMap::new()))
     }
 }
 
@@ -152,15 +146,35 @@ impl HTTPChatProvider for Codex {
     }
 
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
-        api::codex_parse_chat_with_state(response, &self.tool_state_buffer)
+        let tool_state_buffer = Arc::new(Mutex::new(HashMap::new()));
+        api::codex_parse_chat_with_state(response, &tool_state_buffer)
+    }
+
+    fn chat_stream_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<Request<Vec<u8>>, LLMError> {
+        api::codex_chat_request(self, messages, tools)
     }
 
     fn supports_streaming(&self) -> bool {
         true
     }
 
-    fn parse_chat_stream_chunk(&self, _chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        api::codex_parse_stream_chunk_with_state(_chunk, &self.tool_state_buffer)
+    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        Ok(Box::new(CodexStreamParser::default()))
+    }
+}
+
+#[derive(Default)]
+struct CodexStreamParser {
+    tool_states: Arc<Mutex<HashMap<usize, api::CodexToolUseState>>>,
+}
+
+impl ChatStreamParser for CodexStreamParser {
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+        api::codex_parse_stream_chunk_with_state(chunk, &self.tool_states)
     }
 }
 
@@ -206,6 +220,28 @@ impl HTTPLLMProvider for Codex {
     }
 }
 
+fn codex_models() -> Vec<String> {
+    vec![
+        "gpt-5.1-codex-max".to_string(),
+        "gpt-5.1-codex".to_string(),
+        "gpt-5.1-codex-mini".to_string(),
+        "gpt-5.2-codex".to_string(),
+        "gpt-5.3-codex".to_string(),
+        "gpt-5.3-codex-spark".to_string(),
+        "gpt-5.4".to_string(),
+        "gpt-5.4-mini".to_string(),
+        "gpt-5.5".to_string(),
+        "gpt-5.2".to_string(),
+        "gpt-5.1".to_string(),
+        "gpt-5-codex".to_string(),
+        "gpt-5".to_string(),
+        "gpt-5-codex-mini".to_string(),
+        "codex-mini-latest".to_string(),
+        "bengalfox".to_string(),
+        "boomslang".to_string(),
+    ]
+}
+
 struct CodexFactory;
 
 impl HTTPLLMProviderFactory for CodexFactory {
@@ -217,34 +253,18 @@ impl HTTPLLMProviderFactory for CodexFactory {
         None
     }
 
+    fn list_models_static(&self, _cfg: &str) -> Option<Result<Vec<String>, LLMError>> {
+        Some(Ok(codex_models()))
+    }
+
     fn list_models_request(&self, _cfg: &str) -> Result<Request<Vec<u8>>, LLMError> {
-        Ok(Request::builder()
-            .method(Method::GET)
-            .uri(Codex::default_base_url().as_str().to_string())
-            .header("Content-Type", "application/json")
-            .body(Vec::new())?)
+        Err(LLMError::NotImplemented(
+            "Codex model list is static and does not require HTTP".to_string(),
+        ))
     }
 
     fn parse_list_models(&self, _resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
-        Ok(vec![
-            "gpt-5.1-codex-max".to_string(),
-            "gpt-5.1-codex".to_string(),
-            "gpt-5.1-codex-mini".to_string(),
-            "gpt-5.2-codex".to_string(),
-            "gpt-5.3-codex".to_string(),
-            "gpt-5.3-codex-spark".to_string(),
-            "gpt-5.4".to_string(),
-            "gpt-5.4-mini".to_string(),
-            "gpt-5.5".to_string(),
-            "gpt-5.2".to_string(),
-            "gpt-5.1".to_string(),
-            "gpt-5-codex".to_string(),
-            "gpt-5".to_string(),
-            "gpt-5-codex-mini".to_string(),
-            "codex-mini-latest".to_string(),
-            "bengalfox".to_string(),
-            "boomslang".to_string(),
-        ])
+        Ok(codex_models())
     }
 
     fn config_schema(&self) -> String {

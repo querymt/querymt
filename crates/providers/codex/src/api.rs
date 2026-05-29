@@ -1371,7 +1371,6 @@ mod tests {
             tool_choice: None,
             reasoning_effort: None,
             extra_body: None,
-            tool_state_buffer: crate::Codex::default_tool_state_buffer(),
             key_resolver: None,
         }
     }

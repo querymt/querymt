@@ -30,6 +30,10 @@ type ProviderCacheEntry = (i64, Option<String>, bool, Arc<dyn LLMProvider>);
 /// writes (model switch, mesh fallback toggle) use `ArcSwap::store`.
 type ProviderCache = Arc<ArcSwap<Option<ProviderCacheEntry>>>;
 
+fn is_non_billable_oauth_provider(provider: &str) -> bool {
+    matches!(provider, "codex" | "kimi-code")
+}
+
 /// A wrapper around a `SessionStore` that resolves providers dynamically.
 ///
 /// # Provider Caching
@@ -359,13 +363,19 @@ impl SessionProvider {
             .get_session_llm_config(session_id)
             .await?;
 
-        Ok(llm_config
-            .and_then(|config| get_model_info(&config.provider, &config.model))
-            .map(|info| info.pricing))
+        Ok(llm_config.and_then(|config| {
+            if is_non_billable_oauth_provider(&config.provider) {
+                return None;
+            }
+            get_model_info(&config.provider, &config.model).map(|info| info.pricing)
+        }))
     }
 
     /// Get pricing information for a specific provider and model
     pub fn get_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
+        if is_non_billable_oauth_provider(provider) {
+            return None;
+        }
         get_model_info(provider, model).map(|info| info.pricing)
     }
 
@@ -597,9 +607,7 @@ impl SessionProvider {
                     model
                 );
 
-                let arc_provider: std::sync::Arc<dyn querymt::HTTPLLMProvider> =
-                    std::sync::Arc::from(http_provider);
-                let adapter = querymt::adapters::LLMProviderFromHTTP::new(arc_provider);
+                let adapter = querymt::adapters::LLMProviderFromHTTP::new(http_provider);
                 return Ok(Arc::from(Box::new(adapter) as Box<dyn LLMProvider>));
             }
 
@@ -811,13 +819,21 @@ impl SessionHandle {
 
     /// Get pricing information for this session's model.
     ///
-    /// Returns `None` for OAuth sessions (no per-token cost) or when
-    /// pricing information is unavailable for the model.
+    /// Returns `None` for non-billable OAuth providers or OAuth sessions
+    /// (no per-token cost), or when pricing information is unavailable for the model.
     ///
     /// OAuth is detected by checking whether the cached provider has a key
     /// resolver attached — OAuth providers always do, static-key providers
     /// never do. This avoids threading a boolean through the provider stack.
     pub fn get_pricing(&self) -> Option<ModelPricing> {
+        if self
+            .llm_config
+            .as_ref()
+            .is_some_and(|config| is_non_billable_oauth_provider(&config.provider))
+        {
+            return None;
+        }
+
         if let Some(provider) = self.cached_llm_provider.get()
             && provider.key_resolver().is_some()
         {
@@ -1295,5 +1311,18 @@ pub mod tests {
         .await;
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn static_pricing_omits_non_billable_oauth_providers() {
+        assert!(SessionProvider::get_pricing("codex", "gpt-5").is_none());
+        assert!(SessionProvider::get_pricing("kimi-code", "kimi-k2.5").is_none());
+    }
+
+    #[test]
+    fn helper_marks_non_billable_oauth_providers() {
+        assert!(is_non_billable_oauth_provider("codex"));
+        assert!(is_non_billable_oauth_provider("kimi-code"));
+        assert!(!is_non_billable_oauth_provider("openai"));
     }
 }

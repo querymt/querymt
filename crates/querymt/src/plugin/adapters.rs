@@ -1,8 +1,5 @@
 use super::{Fut, LLMProviderFactory, http::HTTPLLMProviderFactory};
-use crate::{
-    HTTPLLMProvider, LLMProvider, adapters::LLMProviderFromHTTP, error::LLMError,
-    outbound::call_outbound,
-};
+use crate::{LLMProvider, adapters::LLMProviderFromHTTP, error::LLMError, outbound::call_outbound};
 use futures::future::FutureExt;
 use http::{Request, Response};
 use std::{ops::Deref, sync::Arc};
@@ -40,8 +37,7 @@ impl LLMProviderFactory for HTTPFactoryAdapter {
             .from_config(cfg)
             .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
 
-        let arc_provider: Arc<dyn HTTPLLMProvider> = Arc::from(sync_provider);
-        let adapter = LLMProviderFromHTTP::new(arc_provider);
+        let adapter = LLMProviderFromHTTP::new(sync_provider);
         Ok(Box::new(adapter))
     }
 
@@ -51,8 +47,11 @@ impl LLMProviderFactory for HTTPFactoryAdapter {
         let cloned_cfg = cfg.to_string();
 
         async move {
-            let req: Request<Vec<u8>> = inner.list_models_request(&cloned_cfg)?;
+            if let Some(result) = inner.list_models_static(&cloned_cfg) {
+                return result;
+            }
 
+            let req: Request<Vec<u8>> = inner.list_models_request(&cloned_cfg)?;
             let resp: Response<Vec<u8>> = call_outbound(req).await?;
 
             inner
