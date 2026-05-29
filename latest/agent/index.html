@@ -1440,6 +1440,50 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#profiles" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Profiles
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#slash-commands" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Slash Commands
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#code-intelligence-tools" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Code Intelligence Tools
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#scheduled-tasks" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Scheduled Tasks
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1930,9 +1974,37 @@
 <h3 id="mesh-networking">Mesh Networking</h3>
 <ul>
 <li><strong>Cross-machine sessions</strong>: Share sessions across multiple machines</li>
-<li><strong>Peer discovery</strong>: mDNS or Kademlia DHT for finding peers</li>
-<li><strong>Remote agents</strong>: Access agents running on other machines</li>
-<li><strong>Provider routing</strong>: Route LLM calls to specific nodes</li>
+<li><strong>Internet-capable transport</strong>: iroh-based NAT traversal with invite tokens</li>
+<li><strong>Multi-transport</strong>: LAN + Internet mesh simultaneously</li>
+<li><strong>Remote session management</strong>: Forking, resuming, and recovery</li>
+<li><strong>Streaming stability</strong>: Robust handling of network interruptions</li>
+</ul>
+<h3 id="profiles">Profiles</h3>
+<ul>
+<li><strong>Multiple configurations</strong>: Switch between different agent setups instantly</li>
+<li><strong>Task-specific settings</strong>: Different profiles for coding, reviewing, planning</li>
+<li><strong>Team collaboration</strong>: Share profiles via version control</li>
+<li><strong>Session binding</strong>: Sessions remember their profile</li>
+</ul>
+<h3 id="slash-commands">Slash Commands</h3>
+<ul>
+<li><strong>Custom commands</strong>: Define commands in markdown files</li>
+<li><strong>Tab completion</strong>: Fuzzy matching for fast command lookup</li>
+<li><strong>Argument substitution</strong>: Dynamic prompts with <code>$1</code>, <code>$2</code>, <code>$ARGUMENTS</code></li>
+<li><strong>Team sharing</strong>: Share commands via <code>.qmt/commands/</code></li>
+</ul>
+<h3 id="code-intelligence-tools">Code Intelligence Tools</h3>
+<ul>
+<li><strong>AST-aware analysis</strong>: <code>index</code>, <code>get_symbol</code>, <code>get_function</code></li>
+<li><strong>Safe refactoring</strong>: <code>replace_symbol</code> with AST-based replacement</li>
+<li><strong>Symbol references</strong>: <code>find_symbol_references</code> across codebase</li>
+<li><strong>Multi-language support</strong>: Rust, Python, TypeScript, Go, Java, C/C++</li>
+</ul>
+<h3 id="scheduled-tasks">Scheduled Tasks</h3>
+<ul>
+<li><strong>Interval schedules</strong>: Run tasks at fixed intervals</li>
+<li><strong>Event-driven schedules</strong>: Trigger on file changes, knowledge ingestion</li>
+<li><strong>Automation</strong>: Background tasks for maintenance and analysis</li>
 </ul>
 <h2 id="getting-started">Getting Started</h2>
 <h3 id="quick-start">Quick Start</h3>
@@ -1988,14 +2060,21 @@
 <h2 id="documentation-structure">Documentation Structure</h2>
 <ul>
 <li><strong>Overview</strong> (this document): Architecture and concepts</li>
-<li><strong>Configuration Guide</strong>: TOML configuration reference</li>
-<li><strong>API Reference</strong>: Rust API documentation</li>
-<li><strong>Middleware Guide</strong>: Custom middleware development</li>
-<li><strong>Examples</strong>: Usage examples and patterns</li>
+<li><strong><a href="configuration/">Configuration Guide</a></strong>: TOML configuration reference</li>
+<li><strong><a href="mesh/">Mesh Networking Guide</a></strong>: Cross-machine collaboration and internet mesh</li>
+<li><strong><a href="profiles/">Profiles Guide</a></strong>: Save and switch between configurations</li>
+<li><strong><a href="slash-commands/">Slash Commands Guide</a></strong>: Custom commands and workflows</li>
+<li><strong><a href="delegation/">Delegation Guide</a></strong>: Multi-agent coordination</li>
+<li><strong><a href="middleware/">Middleware Guide</a></strong>: Custom middleware development</li>
+<li><strong><a href="agent_modes/">Agent Modes</a></strong>: Build, plan, and review modes</li>
+<li><strong><a href="export/">Export Guide</a></strong>: Session export for fine-tuning</li>
+<li><strong><a href="api_reference/">API Reference</a></strong>: Rust API documentation</li>
+<li><strong><a href="examples/">Examples</a></strong>: Usage examples and patterns</li>
 </ul>
 <h2 id="related-documentation">Related Documentation</h2>
 <ul>
 <li><a href="https://docs.query.mt">QueryMaTe Main Documentation</a></li>
+<li><a href="../mcp/">MCP Integration</a> - Model Context Protocol</li>
 <li><a href="examples/">Agent Examples</a></li>
 <li><a href="configuration/">Configuration Examples</a></li>
 </ul>
