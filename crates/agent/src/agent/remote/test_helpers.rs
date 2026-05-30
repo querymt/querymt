@@ -30,6 +30,7 @@ pub(crate) mod fixtures {
     use querymt::embedding::EmbeddingProvider;
     use querymt::error::LLMError;
     use querymt::plugin::host::PluginRegistry;
+    use std::path::PathBuf;
     use std::pin::Pin;
     use std::sync::{Arc, OnceLock};
     use tempfile::TempDir;
@@ -66,6 +67,20 @@ pub(crate) mod fixtures {
     // ── Single shared mesh ────────────────────────────────────────────────────
 
     static TEST_MESH: OnceCell<MeshHandle> = OnceCell::const_new();
+    static TEST_CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+    fn ensure_remote_test_config_dir() -> &'static PathBuf {
+        TEST_CONFIG_DIR.get_or_init(|| {
+            let config_dir = tempfile::tempdir()
+                .expect("failed to create temp dir for remote test config")
+                .keep();
+            // Route remote test state away from ~/.qmt.
+            unsafe {
+                std::env::set_var("QMT_CONFIG_DIR", &config_dir);
+            }
+            config_dir
+        })
+    }
 
     /// Return the process-wide test mesh, bootstrapping it on first call.
     ///
@@ -91,6 +106,10 @@ pub(crate) mod fixtures {
                 // event-loop task is owned by a runtime that never shuts down.
                 mesh_runtime()
                     .spawn(async {
+                        // Ensure remote tests write config-backed state to an
+                        // isolated location instead of ~/.qmt.
+                        let _ = ensure_remote_test_config_dir();
+
                         // Use a temp directory for the identity file so tests
                         // don't pollute ~/.qmt/mesh_identity.key and each test
                         // suite run gets a fresh PeerId (no stale Kademlia state).
@@ -533,5 +552,13 @@ pub(crate) mod fixtures {
                 _tempdir: nm_fixture._tempdir,
             }
         }
+    }
+
+    #[test]
+    fn remote_test_config_dir_overrides_mesh_state_path() {
+        let config_dir = ensure_remote_test_config_dir();
+        let mesh_state_path = crate::agent::remote::mesh_state::default_mesh_state_path()
+            .expect("mesh state path should resolve");
+        assert_eq!(mesh_state_path, config_dir.join("mesh_state.json"));
     }
 }
