@@ -468,26 +468,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Commands::Update => {
                 let _span = ::tracing::info_span!("cli.update").entered();
-                println!("{}", "Updating providers config...".bright_blue());
-                match querymt_utils::providers::fetch_providers_repository(None).await {
-                    Ok(content) => {
-                        let cfg_path =
-                            querymt_utils::providers::config_dir()?.join("providers.json");
-                        std::fs::write(cfg_path.clone(), content)?;
-                        println!(
-                            "{} {}",
-                            "✓".bright_green(),
-                            format!("Providers config updated at {}", cfg_path.display())
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("{} {}", "Error:".bright_red(), e);
-                    }
-                }
 
                 println!("{}", "Updating OCI provider plugins...".bright_blue());
+                let mut oci_provider_count = 0usize;
                 for provider_cfg in &registry.config.providers {
                     if provider_cfg.path.starts_with("oci://") {
+                        oci_provider_count += 1;
                         let name = provider_cfg.name.clone();
                         let mut spinner =
                             Spinner::new(Spinners::Dots, format!("Updating {}...", name.bold()));
@@ -547,6 +533,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+
+                if oci_provider_count == 0 {
+                    println!(
+                        "{}",
+                        "No OCI providers configured; nothing to update.".bright_yellow()
+                    );
+                }
+
                 println!("{}", "Update check complete.".bright_blue());
                 return Ok(());
             }

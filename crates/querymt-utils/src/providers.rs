@@ -2,10 +2,33 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 
-const DEFAULT_PROVIDERS_URL: &str = "https://repo.query.mt/latest.json";
+const LATEST_PROVIDERS_URL: &str = "https://repo.query.mt/latest.json";
+const STABLE_PROVIDERS_URL: &str = "https://repo.query.mt/stable.json";
+
+fn is_ascii_digits(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_stable_release_version(version: &str) -> bool {
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let mut parts = version.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(major), Some(minor), Some(patch), None)
+            if is_ascii_digits(major) && is_ascii_digits(minor) && is_ascii_digits(patch)
+    )
+}
+
+pub fn default_remote_url_for_version(version: &str) -> &'static str {
+    if is_stable_release_version(version) {
+        STABLE_PROVIDERS_URL
+    } else {
+        LATEST_PROVIDERS_URL
+    }
+}
 
 pub fn default_remote_url() -> String {
-    std::env::var("QMT_PROVIDERS_URL").unwrap_or_else(|_| DEFAULT_PROVIDERS_URL.to_string())
+    default_remote_url_for_version(crate::BUILD_VERSION).to_string()
 }
 
 pub async fn fetch_providers_repository(url_override: Option<String>) -> Result<String> {
@@ -79,5 +102,44 @@ pub async fn get_providers_config(provider_config: Option<String>) -> Result<Pat
                 .with_context(|| format!("Failed to write providers config to {:?}", target))?;
             Ok(target)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stable_release_versions_use_stable_url() {
+        assert_eq!(
+            default_remote_url_for_version("0.4.2"),
+            STABLE_PROVIDERS_URL
+        );
+        assert_eq!(
+            default_remote_url_for_version("v0.4.2"),
+            STABLE_PROVIDERS_URL
+        );
+    }
+
+    #[test]
+    fn non_release_versions_use_latest_url() {
+        assert_eq!(
+            default_remote_url_for_version("0.4.2-3-gabcdef"),
+            LATEST_PROVIDERS_URL
+        );
+        assert_eq!(
+            default_remote_url_for_version("0.4.2-dirty"),
+            LATEST_PROVIDERS_URL
+        );
+        assert_eq!(
+            default_remote_url_for_version("0.5.0-beta.1"),
+            LATEST_PROVIDERS_URL
+        );
+        assert_eq!(
+            default_remote_url_for_version("abcdef"),
+            LATEST_PROVIDERS_URL
+        );
+        assert_eq!(default_remote_url_for_version("0.4"), LATEST_PROVIDERS_URL);
+        assert_eq!(default_remote_url_for_version(""), LATEST_PROVIDERS_URL);
     }
 }
