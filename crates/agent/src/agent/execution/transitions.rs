@@ -18,7 +18,6 @@ use crate::middleware::{
 };
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::{TaskKind, TaskStatus};
-use agent_client_protocol::schema::{ContentBlock, ContentChunk, SessionUpdate, TextContent};
 use anyhow::Context as _;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
@@ -658,7 +657,7 @@ pub(super) async fn transition_call_llm(
 /// and determines next state based on finish reason and tool calls.
 #[instrument(
     name = "agent.transition.after_llm",
-    skip(config, response, context, exec_ctx, bridge),
+    skip(config, response, context, exec_ctx),
     fields(session_id = %exec_ctx.session_id, has_tool_calls = response.has_tool_calls())
 )]
 pub(super) async fn transition_after_llm(
@@ -666,7 +665,6 @@ pub(super) async fn transition_after_llm(
     response: &Arc<LlmResponse>,
     context: &Arc<crate::middleware::ConversationContext>,
     exec_ctx: &mut ExecutionContext,
-    bridge: Option<&ClientBridgeSender>,
 ) -> Result<ExecutionState, anyhow::Error> {
     debug!(
         "AfterLlm: session={}, has_tool_calls={}",
@@ -723,15 +721,6 @@ pub(super) async fn transition_after_llm(
     }
 
     if !response.content.is_empty() {
-        super::bridge::send_session_update(
-            bridge,
-            &exec_ctx.session_id,
-            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                TextContent::new(response.content.clone()),
-            ))),
-            Some(&exec_ctx.cancellation_token),
-        )
-        .await;
         parts.push(MessagePart::Text {
             content: response.content.clone(),
         });

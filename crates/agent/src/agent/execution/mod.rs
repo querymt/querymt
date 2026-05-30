@@ -10,9 +10,7 @@
 //! - `wait` — Event waiting and delegation completion handling
 //! - `llm_retry` — LLM retry logic with rate limit handling
 //! - `maintenance` — Pruning and AI compaction
-//! - `bridge` — Client communication helpers
 
-mod bridge;
 mod llm_retry;
 mod maintenance;
 mod tool_calls;
@@ -203,14 +201,8 @@ pub(crate) async fn execute_cycle_state_machine(
                         ref response,
                         ref context,
                     } => {
-                        transitions::transition_after_llm(
-                            config,
-                            response,
-                            context,
-                            exec_ctx,
-                            bridge.as_ref(),
-                        )
-                        .await?
+                        transitions::transition_after_llm(config, response, context, exec_ctx)
+                            .await?
                     }
                     other => other,
                 }
@@ -356,5 +348,3 @@ pub(crate) async fn execute_cycle_state_machine(
 // ── LLM retry logic moved to llm_retry.rs ────────────────────────────────
 
 // ── Pruning and AI compaction moved to maintenance.rs ────────────────────
-
-// ── Session update helper moved to bridge.rs ─────────────────────────────

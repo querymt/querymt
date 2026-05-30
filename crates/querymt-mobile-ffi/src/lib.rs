@@ -531,6 +531,7 @@ pub unsafe extern "C" fn qmt_ffi_acp_open(agent_handle: u64, out_connection: *mu
         let conn_id_cloned = conn_id.clone();
         let owners_cloned = session_owners.clone();
         runtime::global_runtime().spawn(async move {
+            let mut translator = querymt_agent::acp::shared::AcpLiveEventTranslator::new();
             while let Ok(event) = rx.recv().await {
                 if !querymt_agent::acp::shared::is_event_owned(
                     &owners_cloned,
@@ -541,8 +542,7 @@ pub unsafe extern "C" fn qmt_ffi_acp_open(agent_handle: u64, out_connection: *mu
                 {
                     continue;
                 }
-                if let Some(notification) =
-                    querymt_agent::acp::shared::translate_event_to_notification(&event)
+                if let Some(notification) = translator.translate_notification(&event)
                     && let Ok(json) = serde_json::to_string(&notification)
                 {
                     push_acp_message(connection_handle, &outbox_cloned, json).await;

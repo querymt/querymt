@@ -18,7 +18,7 @@ use crate::model::{AgentMessage, MessagePart};
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::LLMConfig;
 use agent_client_protocol::schema::{
-    ContentChunk, ExtResponse, PromptResponse, SessionUpdate, SetSessionModelResponse, StopReason,
+    ExtResponse, PromptResponse, SetSessionModelResponse, StopReason,
 };
 use kameo::Actor;
 use kameo::message::{Context, Message};
@@ -374,20 +374,6 @@ impl SessionActor {
     pub fn with_mesh(mut self, mesh: Option<crate::agent::remote::MeshHandle>) -> Self {
         self.mesh = mesh;
         self
-    }
-
-    /// Sends a session update notification to the client.
-    #[allow(dead_code)]
-    pub(crate) async fn send_session_update(&self, session_id: &str, update: SessionUpdate) {
-        if let Some(ref bridge) = self.bridge {
-            let notification = agent_client_protocol::schema::SessionNotification::new(
-                agent_client_protocol::schema::SessionId::from(session_id.to_string()),
-                update,
-            );
-            if let Err(e) = bridge.notify(notification).await {
-                log::debug!("Failed to send session update: {}", e);
-            }
-        }
     }
 
     /// Helper method to extract system prompt from current session config.
@@ -1753,27 +1739,6 @@ async fn execute_prompt_detached(
 
     let message_id = Uuid::new_v4().to_string();
 
-    for block in &req.prompt {
-        if cancel_token.is_cancelled() {
-            break;
-        }
-        if let Some(ref bridge) = bridge {
-            let notification = agent_client_protocol::schema::SessionNotification::new(
-                agent_client_protocol::schema::SessionId::from(session_id.clone()),
-                SessionUpdate::UserMessageChunk(
-                    ContentChunk::new(block.clone()).message_id(Some(message_id.clone())),
-                ),
-            );
-            tokio::select! {
-                _ = cancel_token.cancelled() => break,
-                res = bridge.notify(notification) => {
-                    if let Err(e) = res {
-                        log::debug!("Failed to send session update: {}", e);
-                    }
-                }
-            }
-        }
-    }
     config.emit_event(
         &session_id,
         AgentEventKind::PromptReceived {

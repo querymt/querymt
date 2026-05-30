@@ -36,6 +36,7 @@
 //! ```
 
 use crate::acp::client_bridge::{ClientBridgeMessage, ClientBridgeSender};
+use crate::acp::shared::{AcpLiveEventTranslator, replay_agent_events_to_session_notifications};
 use crate::acp::shutdown;
 use crate::event_fanout::EventFanout;
 use crate::send_agent::SendAgent;
@@ -215,12 +216,13 @@ fn spawn_event_bridge_forwarder(
         let mut events = event_fanout.subscribe();
 
         let mut forwarded_count = 0u64;
+        let mut translator = AcpLiveEventTranslator::new();
 
         loop {
             match events.recv().await {
                 Ok(event) => {
-                    // Translate event to SessionUpdate
-                    if let Some(update) = crate::acp::shared::translate_event_to_update(&event) {
+                    // Translate event to a live ACP SessionUpdate
+                    if let Some(update) = translator.translate_update(&event) {
                         let notification = SessionNotification::new(
                             SessionId::from(event.session_id().to_owned()),
                             update,
@@ -390,8 +392,46 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         .on_receive_request(
             {
                 let agent = agent.clone();
+                let bridge_sender = bridge_sender.clone();
                 async move |req: LoadSessionRequest, responder, _cx| {
-                    responder.respond_with_result(agent.load_session(req).await)
+                    let session_id = req.session_id.to_string();
+                    let response = agent.load_session(req).await;
+                    if response.is_ok() {
+                        let session_ref = {
+                            let registry = agent.registry.lock().await;
+                            registry.get(&session_id).cloned()
+                        };
+                        match session_ref {
+                            Some(session_ref) => match session_ref.get_event_stream().await {
+                                Ok(events) => {
+                                    for notification in replay_agent_events_to_session_notifications(&session_id, events) {
+                                        if let Err(err) = bridge_sender.notify(notification).await {
+                                            log::warn!(
+                                                "Failed to send session/load replay notification for {}: {}",
+                                                session_id,
+                                                err
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    log::warn!(
+                                        "Failed to load session/load replay events for {}: {}",
+                                        session_id,
+                                        err
+                                    );
+                                }
+                            },
+                            None => {
+                                log::warn!(
+                                    "Loaded session {} but no runtime session ref was available for replay",
+                                    session_id
+                                );
+                            }
+                        }
+                    }
+                    responder.respond_with_result(response)
                 }
             },
             acp::on_receive_request!(),

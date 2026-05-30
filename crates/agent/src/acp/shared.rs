@@ -6,7 +6,7 @@
 
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::event_fanout::EventFanout;
-use crate::events::{AgentEventKind, EventEnvelope};
+use crate::events::{AgentEvent, AgentEventKind, EventEnvelope};
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
 use agent_client_protocol::schema::{
@@ -16,7 +16,7 @@ use agent_client_protocol::schema::{
 };
 use agent_client_protocol_schema::AGENT_METHOD_NAMES;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
@@ -139,14 +139,133 @@ where
 {
     events
         .into_iter()
-        .filter_map(|event| translate_event_to_notification(&event))
+        .filter_map(|event| translate_replay_event_to_notification(&event))
         .collect()
 }
 
-/// Translate an internal agent event to a JSON-RPC notification.
+pub fn replay_agent_events_to_session_notifications<I>(
+    session_id: &str,
+    events: I,
+) -> Vec<agent_client_protocol::schema::SessionNotification>
+where
+    I: IntoIterator<Item = AgentEvent>,
+{
+    events
+        .into_iter()
+        .filter_map(|event| {
+            let envelope = EventEnvelope::from(event);
+            translate_replay_event_to_update(&envelope).map(|update| {
+                agent_client_protocol::schema::SessionNotification::new(
+                    agent_client_protocol::schema::SessionId::from(session_id.to_string()),
+                    update,
+                )
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcpTranslateMode {
+    Live,
+    Replay,
+}
+
+pub struct AcpLiveEventTranslator {
+    streamed_assistant_messages: HashSet<(String, String)>,
+}
+
+impl Default for AcpLiveEventTranslator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AcpLiveEventTranslator {
+    pub fn new() -> Self {
+        Self {
+            streamed_assistant_messages: HashSet::new(),
+        }
+    }
+
+    pub fn translate_notification(&mut self, event: &EventEnvelope) -> Option<serde_json::Value> {
+        // Handle ElicitationRequested specially - it's a custom notification, not a session/update
+        if let AgentEventKind::ElicitationRequested {
+            elicitation_id,
+            session_id,
+            message,
+            requested_schema,
+            source,
+        } = event.kind()
+        {
+            return Some(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "elicitation/requested",
+                "params": {
+                    "elicitationId": elicitation_id,
+                    "sessionId": session_id,
+                    "message": message,
+                    "requestedSchema": requested_schema,
+                    "source": source,
+                }
+            }));
+        }
+
+        let session_id = event.session_id().to_owned();
+        let update = self.translate_update(event)?;
+
+        Some(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": update
+            }
+        }))
+    }
+
+    pub fn translate_update(&mut self, event: &EventEnvelope) -> Option<SessionUpdate> {
+        match event.kind() {
+            AgentEventKind::AssistantContentDelta {
+                content,
+                message_id,
+            } => {
+                if content.is_empty() {
+                    return None;
+                }
+                self.streamed_assistant_messages
+                    .insert((event.session_id().to_owned(), message_id.clone()));
+                Some(SessionUpdate::AgentMessageChunk(
+                    ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
+                        .message_id(Some(message_id.clone())),
+                ))
+            }
+            AgentEventKind::AssistantMessageStored {
+                content,
+                message_id: Some(message_id),
+                ..
+            } => {
+                if content.is_empty() {
+                    return None;
+                }
+                let key = (event.session_id().to_owned(), message_id.clone());
+                if self.streamed_assistant_messages.remove(&key) {
+                    None
+                } else {
+                    Some(SessionUpdate::AgentMessageChunk(
+                        ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
+                            .message_id(Some(message_id.clone())),
+                    ))
+                }
+            }
+            _ => translate_event_to_update_for_mode(event, AcpTranslateMode::Live),
+        }
+    }
+}
+
+/// Translate an internal agent event to a replay JSON-RPC notification.
 ///
 /// Returns `None` if the event should not be sent to the client.
-pub fn translate_event_to_notification(event: &EventEnvelope) -> Option<serde_json::Value> {
+pub fn translate_replay_event_to_notification(event: &EventEnvelope) -> Option<serde_json::Value> {
     // Handle ElicitationRequested specially - it's a custom notification, not a session/update
     if let AgentEventKind::ElicitationRequested {
         elicitation_id,
@@ -170,7 +289,7 @@ pub fn translate_event_to_notification(event: &EventEnvelope) -> Option<serde_js
     }
 
     let session_id = event.session_id().to_owned();
-    let update = translate_event_to_update(event)?;
+    let update = translate_replay_event_to_update(event)?;
 
     Some(serde_json::json!({
         "jsonrpc": "2.0",
@@ -182,10 +301,17 @@ pub fn translate_event_to_notification(event: &EventEnvelope) -> Option<serde_js
     }))
 }
 
-/// Translate an agent event to a SessionUpdate.
+/// Translate an agent event to a replay SessionUpdate.
 ///
 /// Returns `None` if the event should not be sent to the client.
-pub fn translate_event_to_update(event: &EventEnvelope) -> Option<SessionUpdate> {
+pub fn translate_replay_event_to_update(event: &EventEnvelope) -> Option<SessionUpdate> {
+    translate_event_to_update_for_mode(event, AcpTranslateMode::Replay)
+}
+
+fn translate_event_to_update_for_mode(
+    event: &EventEnvelope,
+    mode: AcpTranslateMode,
+) -> Option<SessionUpdate> {
     match event.kind() {
         AgentEventKind::PromptReceived {
             content,
@@ -199,7 +325,7 @@ pub fn translate_event_to_update(event: &EventEnvelope) -> Option<SessionUpdate>
             message_id,
             ..
         } => {
-            if content.is_empty() {
+            if mode == AcpTranslateMode::Live || content.is_empty() {
                 return None;
             }
             Some(SessionUpdate::AgentMessageChunk(
@@ -212,7 +338,7 @@ pub fn translate_event_to_update(event: &EventEnvelope) -> Option<SessionUpdate>
             content,
             message_id,
         } => {
-            if content.is_empty() {
+            if mode == AcpTranslateMode::Replay || content.is_empty() {
                 return None;
             }
             Some(SessionUpdate::AgentMessageChunk(
@@ -926,7 +1052,8 @@ mod tests {
             },
         });
 
-        let Some(SessionUpdate::UserMessageChunk(chunk)) = translate_event_to_update(&event) else {
+        let Some(SessionUpdate::UserMessageChunk(chunk)) = translate_replay_event_to_update(&event)
+        else {
             panic!("expected user message chunk");
         };
 
@@ -1014,17 +1141,149 @@ mod tests {
         });
 
         let Some(SessionUpdate::AgentMessageChunk(stored_chunk)) =
-            translate_event_to_update(&stored)
+            translate_replay_event_to_update(&stored)
         else {
             panic!("expected stored assistant chunk");
         };
-        let Some(SessionUpdate::AgentMessageChunk(delta_chunk)) = translate_event_to_update(&delta)
+        let Some(SessionUpdate::AgentMessageChunk(delta_chunk)) =
+            AcpLiveEventTranslator::new().translate_update(&delta)
         else {
             panic!("expected delta assistant chunk");
         };
 
         assert_eq!(stored_chunk.message_id.as_deref(), Some("a-1"));
         assert_eq!(delta_chunk.message_id.as_deref(), Some("a-1"));
+    }
+
+    #[test]
+    fn live_translator_suppresses_stored_message_after_streaming_delta() {
+        let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::AssistantContentDelta {
+                content: "ans".to_string(),
+                message_id: "a-1".to_string(),
+            },
+        });
+        let stored = EventEnvelope::Durable(DurableEvent {
+            event_id: "evt-stored".into(),
+            stream_seq: 1,
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::AssistantMessageStored {
+                content: "answer".to_string(),
+                thinking: None,
+                message_id: Some("a-1".to_string()),
+            },
+        });
+
+        let mut translator = AcpLiveEventTranslator::new();
+        assert!(matches!(
+            translator.translate_update(&delta),
+            Some(SessionUpdate::AgentMessageChunk(_))
+        ));
+        assert!(translator.translate_update(&stored).is_none());
+    }
+
+    #[test]
+    fn live_translator_forwards_non_streaming_stored_message() {
+        let stored = EventEnvelope::Durable(DurableEvent {
+            event_id: "evt-stored".into(),
+            stream_seq: 1,
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::AssistantMessageStored {
+                content: "answer".to_string(),
+                thinking: None,
+                message_id: Some("a-1".to_string()),
+            },
+        });
+
+        let mut translator = AcpLiveEventTranslator::new();
+        let Some(SessionUpdate::AgentMessageChunk(chunk)) = translator.translate_update(&stored)
+        else {
+            panic!("expected stored assistant chunk for non-streaming provider");
+        };
+        let ContentBlock::Text(text) = chunk.content else {
+            panic!("expected text content");
+        };
+        assert_eq!(text.text, "answer");
+        assert_eq!(chunk.message_id.as_deref(), Some("a-1"));
+    }
+
+    #[test]
+    fn replay_translation_skips_streaming_deltas() {
+        let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::AssistantContentDelta {
+                content: "ans".to_string(),
+                message_id: "a-1".to_string(),
+            },
+        });
+
+        assert!(translate_replay_event_to_update(&delta).is_none());
+    }
+
+    #[test]
+    fn replay_agent_events_emit_session_notifications() {
+        let notifications = replay_agent_events_to_session_notifications(
+            "s-1",
+            vec![
+                AgentEvent {
+                    seq: 1,
+                    timestamp: 1,
+                    session_id: "s-1".to_string(),
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    kind: AgentEventKind::PromptReceived {
+                        content: "hello".to_string(),
+                        message_id: Some("u-1".to_string()),
+                    },
+                },
+                AgentEvent {
+                    seq: 2,
+                    timestamp: 2,
+                    session_id: "s-1".to_string(),
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    kind: AgentEventKind::AssistantMessageStored {
+                        content: "hi".to_string(),
+                        thinking: None,
+                        message_id: Some("a-1".to_string()),
+                    },
+                },
+                AgentEvent {
+                    seq: 3,
+                    timestamp: 3,
+                    session_id: "s-1".to_string(),
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    kind: AgentEventKind::AssistantContentDelta {
+                        content: "ignored".to_string(),
+                        message_id: "a-1".to_string(),
+                    },
+                },
+            ],
+        );
+
+        assert_eq!(notifications.len(), 2);
+        assert!(matches!(
+            notifications[0].update,
+            SessionUpdate::UserMessageChunk(_)
+        ));
+        assert!(matches!(
+            notifications[1].update,
+            SessionUpdate::AgentMessageChunk(_)
+        ));
     }
 
     #[test]
@@ -1040,7 +1299,7 @@ mod tests {
             }),
         );
 
-        let update = translate_event_to_update(&event);
+        let update = translate_replay_event_to_update(&event);
         let Some(SessionUpdate::Plan(plan)) = update else {
             panic!("expected plan update");
         };
@@ -1063,7 +1322,7 @@ mod tests {
             }),
         );
 
-        let update = translate_event_to_update(&event);
+        let update = translate_replay_event_to_update(&event);
         let Some(SessionUpdate::Plan(plan)) = update else {
             panic!("expected plan update");
         };
@@ -1089,13 +1348,13 @@ mod tests {
             },
         });
 
-        assert!(translate_event_to_update(&event).is_none());
+        assert!(translate_replay_event_to_update(&event).is_none());
     }
 
     #[test]
     fn todo_tools_do_not_emit_tool_call_end_updates() {
-        assert!(translate_event_to_update(&tool_end_event("todowrite")).is_none());
-        assert!(translate_event_to_update(&tool_end_event("mcp_todowrite")).is_none());
+        assert!(translate_replay_event_to_update(&tool_end_event("todowrite")).is_none());
+        assert!(translate_replay_event_to_update(&tool_end_event("mcp_todowrite")).is_none());
     }
 
     #[test]
@@ -1104,11 +1363,11 @@ mod tests {
         let end = tool_end_event("read_tool");
 
         assert!(matches!(
-            translate_event_to_update(&start),
+            translate_replay_event_to_update(&start),
             Some(SessionUpdate::ToolCall(_))
         ));
         assert!(matches!(
-            translate_event_to_update(&end),
+            translate_replay_event_to_update(&end),
             Some(SessionUpdate::ToolCallUpdate(_))
         ));
     }

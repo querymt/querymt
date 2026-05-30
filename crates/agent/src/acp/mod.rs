@@ -21,8 +21,8 @@ pub use stdio::serve_stdio;
 
 // Existing manual JSON-RPC implementation (for dashboard compatibility)
 use crate::acp::shared::{
-    PendingElicitationMap, PermissionMap, RpcRequest, SessionOwnerMap, collect_event_sources,
-    handle_rpc_message, is_event_owned, translate_event_to_notification,
+    AcpLiveEventTranslator, PendingElicitationMap, PermissionMap, RpcRequest, SessionOwnerMap,
+    collect_event_sources, handle_rpc_message, is_event_owned,
 };
 use crate::event_fanout::EventFanout;
 
@@ -240,11 +240,12 @@ fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sender<
         let conn_id_events = conn_id.clone();
         let session_owners = state.session_owners.clone();
         tokio::spawn(async move {
+            let mut translator = AcpLiveEventTranslator::new();
             while let Ok(event) = events.recv().await {
                 if !is_event_owned(&session_owners, &conn_id_events, &event).await {
                     continue;
                 }
-                if let Some(notification) = translate_event_to_notification(&event) {
+                if let Some(notification) = translator.translate_notification(&event) {
                     let json = serde_json::to_string(&notification).unwrap_or_default();
                     if tx_events.send(json).await.is_err() {
                         break;

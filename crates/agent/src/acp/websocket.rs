@@ -23,8 +23,8 @@
 
 use crate::acp::client_bridge::ClientBridgeSender;
 use crate::acp::shared::{
-    PendingElicitationMap, PermissionMap, RpcRequest, SessionOwnerMap, collect_event_sources,
-    handle_rpc_message, is_event_owned, translate_event_to_notification,
+    AcpLiveEventTranslator, PendingElicitationMap, PermissionMap, RpcRequest, SessionOwnerMap,
+    collect_event_sources, handle_rpc_message, is_event_owned,
 };
 use crate::acp::shutdown;
 use crate::event_fanout::EventFanout;
@@ -237,14 +237,15 @@ fn spawn_event_forwarders(state: WsServerState, conn_id: String, tx: mpsc::Sende
         let state_events = state.clone();
 
         tokio::spawn(async move {
+            let mut translator = AcpLiveEventTranslator::new();
             while let Ok(event) = events.recv().await {
                 // Only forward events owned by this connection
                 if !is_event_owned(&state_events.session_owners, &conn_id_events, &event).await {
                     continue;
                 }
 
-                // Translate and send event notification
-                if let Some(notification) = translate_event_to_notification(&event) {
+                // Translate and send live event notification
+                if let Some(notification) = translator.translate_notification(&event) {
                     let json = serde_json::to_string(&notification).unwrap_or_default();
                     if tx_events.send(json).await.is_err() {
                         break;
