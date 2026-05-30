@@ -184,7 +184,7 @@ pub struct LocalAgentHandle {
     pub oauth_service: crate::auth::service::OAuthService,
 
     /// Optional profile runtime manager shared by UI and ACP extension transports.
-    pub profiles: ArcSwap<Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>>>,
+    pub profiles: ProfileRuntimeSlot,
 
     /// Handle to the scheduler actor, set after `start_scheduler()` succeeds.
     /// `None` if scheduling is not enabled or lease was not acquired.
@@ -193,6 +193,10 @@ pub struct LocalAgentHandle {
     /// Guard to ensure `shutdown()` only runs its body once.
     shutdown_done: AtomicBool,
 }
+
+type SharedProfileCatalog = Arc<dyn ProfileCatalog>;
+type ProfileRuntime = Arc<ProfileRuntimeManager<SharedProfileCatalog>>;
+type ProfileRuntimeSlot = ArcSwap<Option<ProfileRuntime>>;
 
 // ── Remote node lookup type aliases ─────────────────────────────────────────
 // These aliases improve readability of the complex async types used for
@@ -255,11 +259,11 @@ impl LocalAgentHandle {
         self.config.event_sink.fanout().subscribe()
     }
 
-    pub fn set_profiles(&self, profiles: Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>) {
+    pub fn set_profiles(&self, profiles: ProfileRuntime) {
         self.profiles.store(Arc::new(Some(profiles)));
     }
 
-    pub fn profiles(&self) -> Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>> {
+    pub fn profiles(&self) -> Option<ProfileRuntime> {
         self.profiles.load_full().as_ref().clone()
     }
 
