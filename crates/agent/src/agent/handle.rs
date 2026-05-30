@@ -17,6 +17,7 @@ use crate::events::{AgentEventKind, EventEnvelope};
 
 use crate::index::WorkspaceIndexManagerActor;
 use crate::middleware::CompositeDriver;
+use crate::profiles::{ProfileCatalog, ProfileRuntimeManager};
 use crate::send_agent::SendAgent;
 use crate::session::store::LLMConfig;
 use crate::tools::ToolRegistry;
@@ -182,6 +183,9 @@ pub struct LocalAgentHandle {
     /// Shared OAuth service for all auth operations across UI and ACP transports.
     pub oauth_service: crate::auth::service::OAuthService,
 
+    /// Optional profile runtime manager shared by UI and ACP extension transports.
+    pub profiles: ArcSwap<Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>>>,
+
     /// Handle to the scheduler actor, set after `start_scheduler()` succeeds.
     /// `None` if scheduling is not enabled or lease was not acquired.
     scheduler_handle: StdMutex<Option<crate::scheduler::SchedulerHandle>>,
@@ -240,6 +244,7 @@ impl LocalAgentHandle {
             remote_node_cache: Arc::new(RemoteNodeMetadataCache::new()),
             model_inventory,
             oauth_service,
+            profiles: ArcSwap::from_pointee(None),
             scheduler_handle: StdMutex::new(None),
             shutdown_done: AtomicBool::new(false),
         }
@@ -248,6 +253,14 @@ impl LocalAgentHandle {
     /// Subscribes to agent events via the fanout (live stream).
     pub fn subscribe_events(&self) -> broadcast::Receiver<crate::events::EventEnvelope> {
         self.config.event_sink.fanout().subscribe()
+    }
+
+    pub fn set_profiles(&self, profiles: Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>) {
+        self.profiles.store(Arc::new(Some(profiles)));
+    }
+
+    pub fn profiles(&self) -> Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>> {
+        self.profiles.load_full().as_ref().clone()
     }
 
     /// Acquire the registry lock with tracing for wait and hold durations.
@@ -2699,6 +2712,46 @@ impl SendAgent for LocalAgentHandle {
                 })?;
                 Ok(ExtResponse::new(Arc::from(raw)))
             }
+            "querymt/profiles" => ext_json_response(&self.profiles_response().await?),
+            "querymt/profile/setActive" => {
+                #[derive(serde::Deserialize)]
+                struct SetActiveProfileRequest {
+                    #[serde(alias = "profileId")]
+                    profile_id: String,
+                }
+
+                let parsed: SetActiveProfileRequest = serde_json::from_str(req.params.get())
+                    .map_err(|e| {
+                        Error::invalid_params().data(serde_json::json!({
+                            "message": format!("invalid profile setActive params: {e}"),
+                        }))
+                    })?;
+                let profile_id = parsed.profile_id.trim();
+                if profile_id.is_empty() {
+                    return Err(Error::invalid_params().data(serde_json::json!({
+                        "message": "profile_id must be a non-empty string",
+                    })));
+                }
+
+                let profiles = self.profiles().ok_or_else(|| {
+                    Error::invalid_params().data(serde_json::json!({
+                        "message": "profiles are not configured",
+                    }))
+                })?;
+                profiles
+                    .set_active_profile(profile_id)
+                    .await
+                    .map_err(|err| {
+                        Error::internal_error().data(serde_json::json!({
+                            "message": format_prefixed_error_chain(
+                                "Failed to set active profile",
+                                &err,
+                            ),
+                        }))
+                    })?;
+
+                ext_json_response(&self.profiles_response().await?)
+            }
             "querymt/refreshModels" => {
                 // Refreshes now stay fully backgrounded so slow provider/model scans
                 // cannot extend the caller's critical path.
@@ -3340,6 +3393,63 @@ impl SendAgent for LocalAgentHandle {
     }
 }
 
+fn format_error_chain(err: &anyhow::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for cause in err.chain() {
+        let message = cause.to_string();
+        if parts.last() != Some(&message) {
+            parts.push(message);
+        }
+    }
+    parts.join(": ")
+}
+
+fn format_prefixed_error_chain(prefix: &str, err: &anyhow::Error) -> String {
+    format!("{prefix}: {}", format_error_chain(err))
+}
+
+impl LocalAgentHandle {
+    async fn profiles_response(&self) -> Result<serde_json::Value, Error> {
+        let Some(profiles) = self.profiles() else {
+            return Ok(serde_json::json!({
+                "profiles": [],
+                "active_profile_id": serde_json::Value::Null,
+            }));
+        };
+
+        let profile_infos: Vec<serde_json::Value> = profiles
+            .list_profiles()
+            .await
+            .map(|profiles| {
+                profiles
+                    .into_iter()
+                    .map(|metadata| {
+                        serde_json::json!({
+                            "id": metadata.id,
+                            "name": metadata.name,
+                            "description": metadata.description,
+                            "tags": metadata.tags,
+                            "config_kind": metadata.config_kind.map(|kind| kind.storage_label()),
+                            "source": metadata.source.storage_label(),
+                            "fingerprint": metadata.fingerprint,
+                        })
+                    })
+                    .collect()
+            })
+            .map_err(|err| {
+                Error::internal_error().data(serde_json::json!({
+                    "message": format_prefixed_error_chain("Failed to list profiles", &err),
+                }))
+            })?;
+        let active_profile_id = profiles.active_profile_id().await;
+
+        Ok(serde_json::json!({
+            "profiles": profile_infos,
+            "active_profile_id": active_profile_id,
+        }))
+    }
+}
+
 /// Helper to build an `ExtResponse` from a serializable value.
 fn ext_json_response<T: serde::Serialize>(
     value: &T,
@@ -3363,12 +3473,13 @@ mod tests {
     use crate::agent::SessionActor;
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
+    use crate::api::AgentInfra;
     use crate::send_agent::SendAgent;
     use crate::session::backend::StorageBackend;
     use crate::session::store::SessionStore;
     use crate::test_utils::{
-        MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
-        mock_plugin_registry, mock_session,
+        MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory,
+        empty_plugin_registry, mock_llm_config, mock_plugin_registry, mock_session,
     };
     use agent_client_protocol::schema::{
         CancelNotification, CloseSessionRequest, DeleteSessionRequest, InitializeRequest,
@@ -3376,6 +3487,7 @@ mod tests {
     };
     use querymt::LLMParams;
     use std::collections::HashSet;
+    use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -3392,6 +3504,27 @@ mod tests {
     impl HandleFixture {
         async fn new() -> Self {
             Self::with_list_sessions(vec![]).await
+        }
+
+        async fn with_profiles(self, active_profile_id: &str, profile_dir: &Path) -> Self {
+            let catalog: Arc<dyn ProfileCatalog> = Arc::new(
+                crate::profiles::LocalProfileCatalog::builder()
+                    .include_embedded_default(false)
+                    .local_dir(profile_dir)
+                    .build(),
+            );
+            let (plugin_registry, _temp_dir) = empty_plugin_registry().expect("plugin registry");
+            let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+                catalog,
+                active_profile_id,
+                AgentInfra {
+                    plugin_registry: Arc::new(plugin_registry),
+                    storage: None,
+                    session_mcp_attachment_source: None,
+                },
+            ));
+            self.handle.set_profiles(profiles);
+            self
         }
 
         async fn with_list_sessions(listed_sessions: Vec<crate::session::store::Session>) -> Self {
@@ -3464,6 +3597,14 @@ mod tests {
                 _temp_dir: temp_dir,
             }
         }
+    }
+
+    fn raw_params(value: &str) -> Arc<serde_json::value::RawValue> {
+        Arc::from(serde_json::value::RawValue::from_string(value.to_string()).unwrap())
+    }
+
+    fn write_profile(dir: &Path, name: &str, content: &str) {
+        std::fs::write(dir.join(name), content).expect("profile should be written");
     }
 
     impl LocalAgentHandle {
@@ -3727,6 +3868,128 @@ mod tests {
         let resp = f.handle.ext_method(req).await.expect("ext_method");
         let value: serde_json::Value = serde_json::from_str(resp.0.get()).expect("valid JSON");
         assert!(value.get("models").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_querymt_profiles_ext_method_returns_empty_without_profiles() {
+        let f = HandleFixture::new().await;
+        let req =
+            agent_client_protocol::schema::ExtRequest::new("querymt/profiles", raw_params("null"));
+
+        let resp = f.handle.ext_method(req).await.expect("profiles ext_method");
+        let value: serde_json::Value = serde_json::from_str(resp.0.get()).expect("valid JSON");
+        assert_eq!(value["profiles"].as_array().unwrap().len(), 0);
+        assert!(value["active_profile_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_querymt_profiles_ext_method_returns_configured_profiles() {
+        let profile_dir = tempfile::tempdir().expect("profile dir");
+        write_profile(
+            profile_dir.path(),
+            "alpha.toml",
+            r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "alpha"
+"#,
+        );
+        write_profile(
+            profile_dir.path(),
+            "beta.toml",
+            r#"
+[profile]
+name = "Beta"
+description = "Beta profile"
+tags = ["fast"]
+
+[agent]
+provider = "test"
+model = "test-model"
+system = "beta"
+"#,
+        );
+        let f = HandleFixture::new()
+            .await
+            .with_profiles("alpha", profile_dir.path())
+            .await;
+        let req =
+            agent_client_protocol::schema::ExtRequest::new("querymt/profiles", raw_params("{}"));
+
+        let resp = f.handle.ext_method(req).await.expect("profiles ext_method");
+        let value: serde_json::Value = serde_json::from_str(resp.0.get()).expect("valid JSON");
+        let profiles = value["profiles"].as_array().expect("profiles array");
+        let ids: HashSet<_> = profiles
+            .iter()
+            .map(|profile| profile["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, HashSet::from(["alpha", "beta"]));
+        assert_eq!(value["active_profile_id"], "alpha");
+        let beta = profiles
+            .iter()
+            .find(|profile| profile["id"] == "beta")
+            .expect("beta profile");
+        assert_eq!(beta["name"], "Beta");
+        assert_eq!(beta["description"], "Beta profile");
+    }
+
+    #[tokio::test]
+    async fn test_querymt_profile_set_active_ext_method_switches_active_profile() {
+        let profile_dir = tempfile::tempdir().expect("profile dir");
+        write_profile(
+            profile_dir.path(),
+            "alpha.toml",
+            r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "alpha"
+"#,
+        );
+        write_profile(
+            profile_dir.path(),
+            "beta.toml",
+            r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "beta"
+"#,
+        );
+        let f = HandleFixture::new()
+            .await
+            .with_profiles("alpha", profile_dir.path())
+            .await;
+        let req = agent_client_protocol::schema::ExtRequest::new(
+            "querymt/profile/setActive",
+            raw_params(r#"{"profile_id":"beta"}"#),
+        );
+
+        let resp = f
+            .handle
+            .ext_method(req)
+            .await
+            .expect("setActive ext_method");
+        let value: serde_json::Value = serde_json::from_str(resp.0.get()).expect("valid JSON");
+        assert_eq!(value["active_profile_id"], "beta");
+        assert_eq!(value["profiles"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_querymt_profile_set_active_ext_method_rejects_missing_profile_id() {
+        let f = HandleFixture::new().await;
+        let req = agent_client_protocol::schema::ExtRequest::new(
+            "querymt/profile/setActive",
+            raw_params("{}"),
+        );
+
+        let err = f
+            .handle
+            .ext_method(req)
+            .await
+            .expect_err("missing profile_id should fail");
+        assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
     }
 
     #[tokio::test]

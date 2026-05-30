@@ -71,7 +71,8 @@ moka = { version = "0.12", features = ["future", "sync"] }
 imara-diff = "0.2"
 rmcp = { version = "1.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-async-rw", "elicitation", "reqwest"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
-rust-embed = { version = "8.6", features = ["axum"] }
+# NOTE: Enabled `debug-embed` for testing debug builds on mobile.
+rust-embed = { version = "8.6", features = ["axum", "include-exclude", "debug-embed"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 mime_guess = "2.0"
 futures-util = "0.3"
