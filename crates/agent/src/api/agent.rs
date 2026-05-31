@@ -1,6 +1,7 @@
 //! Single agent implementation
 
 use super::callbacks::EventCallbacksState;
+use super::mesh::{AgentMesh, Mesh, MeshSpec};
 use super::quorum::QuorumBuilder;
 use super::session::AgentSession;
 use super::utils::{default_registry, latest_assistant_message, to_absolute_path};
@@ -106,6 +107,8 @@ pub struct AgentBuilder {
     pub(super) agent_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
     /// Optional pre-built infrastructure (plugin registry + storage).
     infra: Option<AgentInfra>,
+    #[cfg(feature = "remote")]
+    mesh: Option<Mesh>,
     /// Override: maximum execution steps (forwarded to AgentConfigBuilder).
     max_steps_override: Option<usize>,
     /// Override: maximum prompt bytes (forwarded to AgentConfigBuilder).
@@ -138,6 +141,8 @@ impl AgentBuilder {
             session_mcp_attachment_source: None,
             agent_registry: None,
             infra: None,
+            #[cfg(feature = "remote")]
+            mesh: None,
             max_steps_override: None,
             max_prompt_bytes_override: None,
             execution_timeout_secs_override: None,
@@ -209,6 +214,12 @@ impl AgentBuilder {
     /// SQLite at the default db path).
     pub fn infra(mut self, infra: AgentInfra) -> Self {
         self.infra = Some(infra);
+        self
+    }
+
+    #[cfg(feature = "remote")]
+    pub fn mesh(mut self, mesh: Mesh) -> Self {
+        self.mesh = Some(mesh);
         self
     }
 
@@ -307,7 +318,7 @@ impl AgentBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<Agent> {
+    pub async fn build(mut self) -> Result<Agent> {
         let snapshot_policy = self.snapshot_policy;
         let cwd = if let Some(path) = self.cwd {
             Some(to_absolute_path(path)?)
@@ -351,6 +362,20 @@ impl AgentBuilder {
         .with_snapshot_policy(snapshot_policy);
 
         // Phase 7: inject pre-populated agent registry (remote agents from config).
+        #[cfg(feature = "remote")]
+        if let Some(mesh) = &self.mesh
+            && !mesh.remote_agents().is_empty()
+            && let MeshSpec::Toml(cfg) = mesh.spec_for_internal_use()
+        {
+            let runtime = mesh.start().await?;
+            let registry = crate::agent::remote::register_remote_agents_from_config(
+                runtime.handle().as_mesh_handle(),
+                mesh.remote_agents(),
+                &cfg.peers,
+            )
+            .await?;
+            self.agent_registry = Some(registry);
+        }
         if let Some(registry) = self.agent_registry {
             builder = builder.with_agent_registry(registry);
         }
@@ -535,17 +560,30 @@ impl AgentBuilder {
 
         let handle = Arc::new(AgentHandle::from_config(final_config));
 
+        #[cfg(feature = "remote")]
+        if let Some(mesh) = &self.mesh {
+            let runtime = mesh.start().await?;
+            handle.set_mesh(runtime.handle().as_mesh_handle().clone());
+        }
+
         // Start the scheduler actor if the backend supports scheduling.
         handle.start_scheduler().await;
 
-        Ok(Agent {
+        let agent = Agent {
             inner: handle,
             storage: backend,
             default_session_id: Arc::new(Mutex::new(None)),
             cwd,
             callbacks: Arc::new(EventCallbacksState::new(None)),
             quorum: None,
-        })
+        };
+
+        #[cfg(feature = "remote")]
+        if let Some(mesh) = &self.mesh {
+            agent.inner.ensure_mesh_published(mesh.node_name()).await?;
+        }
+
+        Ok(agent)
     }
 }
 
@@ -577,6 +615,16 @@ impl Agent {
     /// the kameo mesh (e.g., bootstrapping `RemoteNodeManager`).
     pub fn handle(&self) -> Arc<AgentHandle> {
         self.inner.clone()
+    }
+
+    #[cfg(feature = "remote")]
+    pub fn mesh(&self) -> Option<AgentMesh> {
+        self.inner.mesh().map(|mesh| {
+            AgentMesh::new(
+                crate::agent::remote::MeshRuntimeHandle::from(mesh),
+                self.inner.clone(),
+            )
+        })
     }
 
     #[cfg(test)]
@@ -833,39 +881,22 @@ impl Agent {
 
         #[cfg(feature = "remote")]
         {
-            use crate::agent::remote::{
-                setup_mesh_from_config, spawn_and_register_local_mesh_actors,
-            };
-            use crate::delegation::AgentRegistry as _;
-
             if config.mesh.enabled {
-                log::info!("mesh.enabled = true in config, bootstrapping mesh...");
-                let result =
-                    setup_mesh_from_config(&config.mesh, &config.remote_agents, None, None).await?;
-                log::info!(
-                    "mesh bootstrapped, {} remote agent(s) registered",
-                    result.registry.list_agents().len()
-                );
-
                 let auto_fallback = config.mesh.auto_fallback;
-                let mut builder =
-                    Self::builder_from_config(config, Some(Arc::new(result.registry)))?;
+                let mesh_cfg = config.mesh.clone();
+                let remote_agents = config.remote_agents.clone();
+                let mut builder = Self::builder_from_config(config, None)?;
                 if let Some(infra) = infra {
                     builder = builder.infra(infra);
                 }
                 if let Some(source) = attachment_source {
                     builder = builder.with_session_mcp_attachment_source(source);
                 }
-                let agent = builder.build().await?;
+                let agent = builder
+                    .mesh(Mesh::from_toml(mesh_cfg).with_remote_agents(remote_agents))
+                    .build()
+                    .await?;
                 agent.inner.set_mesh_fallback(auto_fallback);
-                agent.inner.set_mesh(result.mesh.clone());
-                let actor_refs =
-                    spawn_and_register_local_mesh_actors(&agent.handle(), &result.mesh).await;
-                *agent
-                    .handle()
-                    .local_mesh_actor_refs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(actor_refs);
                 return Ok(agent);
             }
         }

@@ -46,9 +46,12 @@ let agent = Agent::single()
     .provider("anthropic", "claude-sonnet-4-5-20250929")
     .cwd(".")
     .tools(["read_tool", "shell", "edit"])
+    .mesh(Mesh::hybrid())
     .build()
     .await?;
 ```
+
+Use `Mesh::hybrid()` when you want one process-shared runtime that supports both LAN discovery and later iroh invite joins.
 
 ### Multi-Agent (Quorum)
 
@@ -102,8 +105,26 @@ pub enum Agent {
 | `chat(&self, message: &str) -> Result<String>` | Send a message and get response |
 | `new_session(&self) -> Result<AgentSession>` | Create a new session |
 | `list_sessions(&self) -> Result<Vec<SessionInfo>>` | List active sessions |
+| `mesh(&self) -> Option<AgentMesh>` | Access mesh APIs when the agent was built with mesh support |
 | `subscribe_events(&self) -> Receiver<EventEnvelope>` | Subscribe to events |
 | `shutdown(&self) -> Result<()>` | Gracefully shutdown |
+
+### AgentMesh
+
+Mesh-aware facade returned by `agent.mesh()`.
+
+```rust
+let outcome = agent.mesh().unwrap().join(invite_code).await?;
+println!("joined {}", outcome.mesh_id);
+```
+
+#### Methods
+
+| Method | Description |
+|--------|-------------|
+| `join(&self, invite: impl AsRef<str>) -> Result<MeshJoinOutcome>` | Join an iroh mesh scope on the shared runtime |
+| `ensure_published(&self) -> Result<()>` | Publish local mesh actors for this agent |
+| `runtime(&self) -> &MeshRuntimeHandle` | Access the underlying shared runtime handle |
 
 ### AgentSession
 

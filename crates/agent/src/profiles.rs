@@ -5,8 +5,6 @@
 
 use crate::api::{Agent, AgentInfra};
 use crate::config::{Config, load_config};
-#[cfg(feature = "remote")]
-use crate::delegation::AgentRegistry as _;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use rust_embed::RustEmbed;
@@ -861,42 +859,6 @@ async fn build_profile_runtime(
             #[cfg(not(feature = "remote"))]
             let infra = shared_infra;
 
-            #[cfg(feature = "remote")]
-            if config.mesh.enabled {
-                use crate::agent::remote::remote_setup::{
-                    setup_mesh_from_config, spawn_and_register_local_mesh_actors,
-                };
-
-                log::info!("mesh.enabled = true in profile config, bootstrapping mesh...");
-                let result =
-                    setup_mesh_from_config(&config.mesh, &config.remote_agents, None, None).await?;
-                log::info!(
-                    "mesh bootstrapped, {} remote agent(s) registered",
-                    result.registry.list_agents().len()
-                );
-
-                let auto_fallback = config.mesh.auto_fallback;
-                let agent = Agent::from_quorum_config_with_registry_and_infra(
-                    config,
-                    Some(Arc::new(result.registry)),
-                    Some(result.mesh.clone()),
-                    auto_fallback,
-                    infra,
-                )
-                .await?;
-                let actor_refs =
-                    spawn_and_register_local_mesh_actors(&agent.handle(), &result.mesh).await;
-                *agent
-                    .handle()
-                    .local_mesh_actor_refs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(actor_refs);
-                agent
-            } else {
-                Agent::from_quorum_config_with_infra(config, infra).await?
-            }
-
-            #[cfg(not(feature = "remote"))]
             Agent::from_quorum_config_with_infra(config, infra).await?
         }
     };

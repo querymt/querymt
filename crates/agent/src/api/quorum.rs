@@ -59,6 +59,10 @@ pub struct QuorumBuilder {
     /// `provider_node_id` is not explicitly set.
     #[cfg(feature = "remote")]
     pub(super) mesh_auto_fallback: bool,
+    #[cfg(feature = "remote")]
+    pub(super) mesh_config: Option<crate::config::MeshTomlConfig>,
+    #[cfg(feature = "remote")]
+    pub(super) remote_agents: Vec<crate::config::RemoteAgentConfig>,
 
     /// Delegates that have a `peer` set in their config: `(delegate_id, peer_name)`.
     ///
@@ -98,6 +102,10 @@ impl QuorumBuilder {
             mesh: None,
             #[cfg(feature = "remote")]
             mesh_auto_fallback: false,
+            #[cfg(feature = "remote")]
+            mesh_config: None,
+            #[cfg(feature = "remote")]
+            remote_agents: Vec::new(),
             #[cfg(feature = "remote")]
             peer_delegates: Vec::new(),
             infra: None,
@@ -170,7 +178,7 @@ impl QuorumBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<super::agent::Agent> {
+    pub async fn build(mut self) -> Result<super::agent::Agent> {
         let planner_config = self
             .planner_config
             .ok_or_else(|| anyhow!("Planner configuration is required"))?;
@@ -287,6 +295,32 @@ impl QuorumBuilder {
                 let config = Arc::new(b.build());
                 Arc::new(AgentHandle::from_config(config)) as Arc<dyn AgentHandleTrait>
             });
+        }
+
+        #[cfg(feature = "remote")]
+        if self.mesh.is_none()
+            && let Some(mesh_cfg) = &self.mesh_config
+            && mesh_cfg.enabled
+        {
+            let runtime = crate::api::Mesh::from_toml(mesh_cfg.clone())
+                .start()
+                .await?;
+            self.mesh = Some(runtime.handle().as_mesh_handle().clone());
+        }
+
+        #[cfg(feature = "remote")]
+        if self.initial_registry.is_none()
+            && let (Some(mesh), Some(mesh_cfg)) = (&self.mesh, &self.mesh_config)
+            && !self.remote_agents.is_empty()
+        {
+            self.initial_registry = Some(
+                crate::agent::remote::register_remote_agents_from_config(
+                    mesh,
+                    &self.remote_agents,
+                    &mesh_cfg.peers,
+                )
+                .await?,
+            );
         }
 
         // Create RoutingActor + snapshot handle if there are peer delegates.
@@ -492,6 +526,7 @@ impl QuorumBuilder {
         #[cfg(feature = "remote")]
         if let Some(mesh) = self.mesh {
             planner_handle.set_mesh(mesh.clone());
+            planner_handle.ensure_mesh_published(None).await?;
 
             // Wire peer delegates: set mesh handle on each for connectivity.
             // Routing is handled by the RoutingActor (populated above).
@@ -637,37 +672,6 @@ impl super::agent::Agent {
         builder.build().await
     }
 
-    /// Build an Agent from a quorum config, optionally injecting a pre-populated
-    /// agent registry and mesh handle (config-driven remote agents).
-    #[cfg(feature = "remote")]
-    pub async fn from_quorum_config_with_registry(
-        config: QuorumConfig,
-        initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
-        mesh: Option<crate::agent::remote::MeshHandle>,
-        mesh_auto_fallback: bool,
-    ) -> Result<Self> {
-        let mut builder = Self::builder_from_quorum_config(config, initial_registry)?;
-        builder.mesh = mesh;
-        builder.mesh_auto_fallback = mesh_auto_fallback;
-        builder.build().await
-    }
-
-    /// Build a quorum with both remote registry/mesh wiring and injected infrastructure.
-    #[cfg(feature = "remote")]
-    pub async fn from_quorum_config_with_registry_and_infra(
-        config: QuorumConfig,
-        initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
-        mesh: Option<crate::agent::remote::MeshHandle>,
-        mesh_auto_fallback: bool,
-        infra: super::agent::AgentInfra,
-    ) -> Result<Self> {
-        let mut builder = Self::builder_from_quorum_config(config, initial_registry)?;
-        builder.mesh = mesh;
-        builder.mesh_auto_fallback = mesh_auto_fallback;
-        builder = builder.infra(infra);
-        builder.build().await
-    }
-
     /// Configure a `QuorumBuilder` from a `QuorumConfig`.
     ///
     /// Returns the builder before `build()` is called, allowing further
@@ -796,6 +800,12 @@ impl super::agent::Agent {
 
         builder.snapshot_policy = snapshot_policy;
         builder.initial_registry = initial_registry;
+        #[cfg(feature = "remote")]
+        {
+            builder.mesh_auto_fallback = config.mesh.auto_fallback;
+            builder.mesh_config = Some(config.mesh);
+            builder.remote_agents = config.remote_agents;
+        }
 
         Ok(builder)
     }

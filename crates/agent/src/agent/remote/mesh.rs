@@ -57,6 +57,8 @@ enum SwarmCommand {
     /// `swarm.dial()`.  For iroh transport the relay network resolves the
     /// address; for LAN the peer must already have a known address (mDNS).
     DialPeer(PeerId),
+    /// Join or refresh an iroh scope on the existing runtime.
+    JoinIrohScope { mesh_id: String, peers: Vec<PeerId> },
     /// Drop scope-specific reconnect targets for a left Iroh scope.
     LeaveIrohScope { mesh_id: String },
 }
@@ -794,6 +796,23 @@ impl MeshHandle {
         guard.sort_by_key(|s| s.to_string());
         guard.dedup();
         true
+    }
+
+    /// Join or refresh an iroh scope on the running swarm.
+    pub fn join_iroh_scope(&self, mesh_id: &str, peers: Vec<PeerId>) {
+        self.ensure_scope(MeshScopeId::Iroh {
+            mesh_id: mesh_id.to_string(),
+        });
+        if self
+            .swarm_cmd_tx
+            .send(SwarmCommand::JoinIrohScope {
+                mesh_id: mesh_id.to_string(),
+                peers,
+            })
+            .is_err()
+        {
+            log::warn!("join_iroh_scope: swarm event loop has shut down");
+        }
     }
 
     pub fn active_scopes(&self) -> Vec<MeshScopeId> {
@@ -2007,6 +2026,11 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
                                 }
                             }
                         }
+                        SwarmCommand::JoinIrohScope { peers, .. } => {
+                            for peer_id in peers {
+                                reconnect_targets.insert(peer_id);
+                            }
+                        }
                         SwarmCommand::LeaveIrohScope { .. } => {
                             // Single-scope iroh bootstrap does not track per-scope reconnect sets.
                         }
@@ -2374,6 +2398,11 @@ async fn bootstrap_composite_mesh(config: &MeshConfig) -> Result<MeshHandle, Mes
                                     );
                                     log::warn!("Failed to dial peer {} (composite): {}", peer_id, e);
                                 }
+                            }
+                        }
+                        SwarmCommand::JoinIrohScope { peers, .. } => {
+                            for peer_id in peers {
+                                reconnect_targets.insert(peer_id);
                             }
                         }
                         SwarmCommand::LeaveIrohScope { .. } => {
@@ -2833,22 +2862,6 @@ pub async fn bootstrap_mesh_runtime(
 
     reconnect_targets.remove(&local_peer_id);
 
-    // Build a reverse lookup: peer_id → MeshScopeId so the connection
-    // established handler can tag routes with the correct scope.
-    let peer_iroh_scope: HashMap<PeerId, MeshScopeId> = reconnect_targets_by_scope
-        .iter()
-        .flat_map(|(mesh_id, pids)| {
-            pids.iter().map(move |pid| {
-                (
-                    *pid,
-                    MeshScopeId::Iroh {
-                        mesh_id: mesh_id.clone(),
-                    },
-                )
-            })
-        })
-        .collect();
-
     let (swarm_cmd_tx, mut swarm_cmd_rx) = mpsc::unbounded_channel::<SwarmCommand>();
 
     // ── Unified swarm event loop ────────────────────────────────────────────
@@ -2856,11 +2869,23 @@ pub async fn bootstrap_mesh_runtime(
     // messaging, and iroh reconnect logic — all in one loop.
     let has_lan_loop = has_lan;
     let has_iroh_loop = has_iroh;
-    let peer_iroh_scope_loop = peer_iroh_scope;
     tokio::spawn(async move {
         let mut pending_dials: HashSet<PeerId> = HashSet::new();
         let mut reconnect_attempts: HashMap<PeerId, u32> = HashMap::new();
         let mut reconnect_next_due: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
+        let mut peer_iroh_scope_loop: HashMap<PeerId, MeshScopeId> = reconnect_targets_by_scope
+            .iter()
+            .flat_map(|(mesh_id, pids)| {
+                pids.iter().map(move |pid| {
+                    (
+                        *pid,
+                        MeshScopeId::Iroh {
+                            mesh_id: mesh_id.clone(),
+                        },
+                    )
+                })
+            })
+            .collect();
         let mut reconnect_tick = tokio::time::interval(std::time::Duration::from_secs(5));
         reconnect_tick.tick().await;
 
@@ -2948,6 +2973,42 @@ pub async fn bootstrap_mesh_runtime(
                                 }
                             }
                         }
+                        SwarmCommand::JoinIrohScope { mesh_id, peers } => {
+                            let scope = MeshScopeId::Iroh {
+                                mesh_id: mesh_id.clone(),
+                            };
+                            let scoped_peers = reconnect_targets_by_scope.entry(mesh_id).or_default();
+                            for peer_id in peers {
+                                if peer_id == local_peer_id {
+                                    continue;
+                                }
+                                reconnect_targets.insert(peer_id);
+                                scoped_peers.insert(peer_id);
+                                peer_iroh_scope_loop.insert(peer_id, scope.clone());
+                                reconnect_next_due.remove(&peer_id);
+                                if pending_dials.contains(&peer_id) || routes_loop.is_peer_alive(&peer_id) {
+                                    continue;
+                                }
+                                let addr: Multiaddr = format!("/p2p/{peer_id}")
+                                    .parse()
+                                    .expect("PeerId always produces a valid /p2p/ multiaddr");
+                                match swarm.dial(addr) {
+                                    Ok(_) => {
+                                        log::info!("Dialing peer for joined scope (unified): {}", peer_id);
+                                        pending_dials.insert(peer_id);
+                                    }
+                                    Err(e) => {
+                                        let attempt = reconnect_attempts.entry(peer_id).or_insert(0);
+                                        *attempt = attempt.saturating_add(1);
+                                        reconnect_next_due.insert(
+                                            peer_id,
+                                            tokio::time::Instant::now() + reconnect_backoff_duration(*attempt),
+                                        );
+                                        log::warn!("Failed to dial peer {} for joined scope (unified): {}", peer_id, e);
+                                    }
+                                }
+                            }
+                        }
                         SwarmCommand::LeaveIrohScope { mesh_id } => {
                             if let Some(peers) = reconnect_targets_by_scope.remove(&mesh_id) {
                                 for pid in peers {
@@ -2955,6 +3016,7 @@ pub async fn bootstrap_mesh_runtime(
                                     pending_dials.remove(&pid);
                                     reconnect_attempts.remove(&pid);
                                     reconnect_next_due.remove(&pid);
+                                    peer_iroh_scope_loop.remove(&pid);
                                 }
                             }
                         }
@@ -3333,7 +3395,7 @@ pub async fn join_mesh_via_invite(
 ///
 /// Tries the original inviter first (per-peer DHT name), then falls back to
 /// cached peers in order.  Returns the first one that responds.
-async fn find_admission_target(
+pub(crate) async fn find_admission_target(
     mesh: &MeshHandle,
     inviter_peer_id: &str,
     fallback_peers: &[super::invite::PeerEntry],

@@ -60,6 +60,7 @@
 mod agent;
 mod callbacks;
 mod config;
+pub mod mesh;
 mod quorum;
 mod session;
 mod utils;
@@ -67,6 +68,7 @@ mod utils;
 // Re-export public API types
 pub use agent::{Agent, AgentBuilder, AgentInfra};
 pub use config::{DelegateConfigBuilder, PlannerConfigBuilder};
+pub use mesh::{AgentMesh, Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec};
 pub use quorum::QuorumBuilder;
 pub use session::AgentSession;
 

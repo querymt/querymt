@@ -553,6 +553,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         querymt_agent::agent::remote::mesh_runtime_config::DirectoryMode::default(),
                 })
             },
+            iroh_enabled: true,
             iroh_scopes,
             identity_file: None,
             request_timeout: DEFAULT_MESH_REQUEST_TIMEOUT,
