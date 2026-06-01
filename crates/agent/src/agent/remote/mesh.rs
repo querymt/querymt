@@ -880,6 +880,17 @@ impl MeshHandle {
             return Ok(false);
         }
 
+        let scope = MeshScopeId::Iroh {
+            mesh_id: mesh_id.to_string(),
+        };
+        let prefix = scope.dht_prefix();
+        self.re_register_fns
+            .write()
+            .retain(|name, _| !name.starts_with(&prefix));
+        self.config_scopes
+            .write()
+            .retain(|existing| existing != &scope);
+
         let _ = self
             .peer_events_tx
             .send(MeshEvent::ScopeLeft(MeshScopeId::Iroh {

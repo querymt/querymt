@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 #[cfg(feature = "remote")]
 use tokio::sync::Semaphore;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, OnceCell, broadcast};
 
 // ══════════════════════════════════════════════════════════════════════════
 //  AgentHandle trait — the unified interface for local and remote agents
@@ -171,7 +171,13 @@ pub struct LocalAgentHandle {
     /// Keepalive refs for mesh-visible local actors so new scopes can re-register
     /// the existing node manager/provider host without respawning them.
     #[cfg(feature = "remote")]
-    pub local_mesh_actor_refs: StdMutex<Option<crate::agent::remote::LocalMeshActorRefs>>,
+    pub local_mesh_actor_refs: OnceCell<crate::agent::remote::LocalMeshActorRefs>,
+
+    #[cfg(feature = "remote")]
+    local_mesh_node_name: StdMutex<Option<String>>,
+
+    #[cfg(feature = "remote")]
+    published_mesh_scopes: StdMutex<std::collections::HashSet<crate::agent::remote::MeshScopeId>>,
 
     #[cfg(feature = "remote")]
     remote_node_cache: Arc<RemoteNodeMetadataCache>,
@@ -243,7 +249,11 @@ impl LocalAgentHandle {
             #[cfg(feature = "remote")]
             mesh: StdMutex::new(None),
             #[cfg(feature = "remote")]
-            local_mesh_actor_refs: StdMutex::new(None),
+            local_mesh_actor_refs: OnceCell::new(),
+            #[cfg(feature = "remote")]
+            local_mesh_node_name: StdMutex::new(None),
+            #[cfg(feature = "remote")]
+            published_mesh_scopes: StdMutex::new(std::collections::HashSet::new()),
             #[cfg(feature = "remote")]
             remote_node_cache: Arc::new(RemoteNodeMetadataCache::new()),
             model_inventory,
@@ -1164,26 +1174,29 @@ impl LocalAgentHandle {
 
     #[cfg(feature = "remote")]
     pub async fn ensure_mesh_published(&self, node_name: Option<String>) -> anyhow::Result<()> {
-        if self
-            .local_mesh_actor_refs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
-        {
-            return Ok(());
+        if node_name.is_some() {
+            *self
+                .local_mesh_node_name
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = node_name;
         }
 
         let mesh = self
             .mesh()
             .ok_or_else(|| anyhow::anyhow!("mesh not bootstrapped"))?;
-        let refs = crate::agent::remote::spawn_and_register_local_mesh_actors_with_name(
-            self, &mesh, node_name,
-        )
-        .await;
-        *self
-            .local_mesh_actor_refs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(refs);
+        self.local_mesh_actor_refs
+            .get_or_init(|| async {
+                let node_name = self
+                    .local_mesh_node_name
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                crate::agent::remote::spawn_and_register_local_mesh_actors_with_name(
+                    self, &mesh, node_name,
+                )
+                .await
+            })
+            .await;
         Ok(())
     }
 
@@ -1195,12 +1208,12 @@ impl LocalAgentHandle {
     ) -> anyhow::Result<()> {
         self.ensure_mesh_published(None).await?;
 
-        let refs = self
-            .local_mesh_actor_refs
+        let should_publish = self
+            .published_mesh_scopes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if let Some(refs) = refs.as_ref() {
+            .insert(scope.clone());
+        if should_publish && let Some(refs) = self.local_mesh_actor_refs.get() {
             crate::agent::remote::register_local_mesh_actor_scope(
                 runtime.as_mesh_handle(),
                 refs,
@@ -1251,24 +1264,25 @@ impl LocalAgentHandle {
             .any(|scope| matches!(scope, crate::agent::remote::MeshScopeId::Iroh { mesh_id: ref existing } if existing == &mesh_id));
 
         if !already_joined {
-            let existing = runtime
-                .mesh_state_store()
-                .and_then(|store| store.read().get(&mesh_id).cloned());
+            let mut mesh_for_admission = mesh.clone();
+            crate::api::mesh::admit_via_invite_on_runtime(&mut mesh_for_admission, &invite).await?;
+
             let mut peers = Vec::new();
             if let Ok(inviter_pid) = invite.grant.inviter_peer_id.parse() {
                 peers.push(inviter_pid);
             }
-            if let Some(entry) = existing {
+            if let Some(entry) = runtime
+                .mesh_state_store()
+                .and_then(|store| store.read().get(&mesh_id).cloned())
+            {
                 for peer in entry.known_peers.values() {
                     if let Ok(pid) = peer.peer_id.parse() {
                         peers.push(pid);
                     }
                 }
             }
-
             mesh.join_iroh_scope(&mesh_id, peers);
-            let mut mesh_for_admission = mesh.clone();
-            crate::api::mesh::admit_via_invite_on_runtime(&mut mesh_for_admission, &invite).await?;
+
             self.set_mesh(mesh.clone());
             self.publish_mesh_scope(
                 &crate::agent::remote::MeshRuntimeHandle::from(mesh.clone()),
@@ -3492,6 +3506,20 @@ impl SendAgent for LocalAgentHandle {
                             Error::internal_error()
                                 .data(serde_json::json!({"error": format!("{e}")}))
                         })?;
+                    let scope = crate::agent::remote::scope::MeshScopeId::Iroh {
+                        mesh_id: crate::agent::remote::invite::mesh_id_for(
+                            &invite.grant.inviter_peer_id,
+                            invite.grant.mesh_name.as_deref(),
+                        ),
+                    };
+                    self.publish_mesh_scope(
+                        &crate::agent::remote::MeshRuntimeHandle::from(mesh.clone()),
+                        &scope,
+                    )
+                    .await
+                    .map_err(|e| {
+                        Error::internal_error().data(serde_json::json!({"error": format!("{e}")}))
+                    })?;
 
                     let qr_code = crate::agent::remote::qr::render_to_terminal(&invite.to_url());
 

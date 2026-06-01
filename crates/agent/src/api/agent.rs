@@ -219,7 +219,7 @@ impl AgentBuilder {
 
     #[cfg(feature = "remote")]
     pub fn mesh(mut self, mesh: Mesh) -> Self {
-        self.mesh = Some(mesh);
+        self.mesh = if mesh.is_disabled() { None } else { Some(mesh) };
         self
     }
 
@@ -561,6 +561,9 @@ impl AgentBuilder {
         let handle = Arc::new(AgentHandle::from_config(final_config));
 
         #[cfg(feature = "remote")]
+        let mesh_node_name = self.mesh.as_ref().and_then(|mesh| mesh.node_name());
+
+        #[cfg(feature = "remote")]
         if let Some(mesh) = &self.mesh {
             let runtime = mesh.start().await?;
             handle.set_mesh(runtime.handle().as_mesh_handle().clone());
@@ -579,8 +582,8 @@ impl AgentBuilder {
         };
 
         #[cfg(feature = "remote")]
-        if let Some(mesh) = &self.mesh {
-            agent.inner.ensure_mesh_published(mesh.node_name()).await?;
+        if self.mesh.is_some() {
+            agent.inner.ensure_mesh_published(mesh_node_name).await?;
         }
 
         Ok(agent)

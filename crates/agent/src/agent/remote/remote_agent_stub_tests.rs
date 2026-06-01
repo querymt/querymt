@@ -23,7 +23,11 @@ mod remote_agent_stub_tests {
         peer_label: &str,
         mesh: &crate::agent::remote::mesh::MeshHandle,
     ) -> Arc<RemoteAgentHandle> {
-        Arc::new(RemoteAgentHandle::new(peer_label.to_string(), mesh.clone()))
+        Arc::new(RemoteAgentHandle::new(
+            peer_label.to_string(),
+            None,
+            mesh.clone(),
+        ))
     }
 
     // ── C.1 — new_session delegates to mesh ──────────────────────────────────

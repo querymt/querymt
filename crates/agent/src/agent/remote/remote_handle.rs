@@ -35,6 +35,7 @@ use crate::error::AgentError;
 /// remote `SessionActorRef`.
 pub struct RemoteAgentHandle {
     peer_label: String,
+    target_node_id: Option<String>,
     mesh: MeshHandle,
     event_fanout: Arc<EventFanout>,
     sessions: Mutex<HashMap<String, SessionActorRef>>,
@@ -42,9 +43,10 @@ pub struct RemoteAgentHandle {
 
 impl RemoteAgentHandle {
     /// Create a new `RemoteAgentHandle` for a remote peer.
-    pub fn new(peer_label: String, mesh: MeshHandle) -> Self {
+    pub fn new(peer_label: String, target_node_id: Option<String>, mesh: MeshHandle) -> Self {
         Self {
             peer_label,
+            target_node_id,
             mesh,
             event_fanout: Arc::new(EventFanout::new()),
             sessions: Mutex::new(HashMap::new()),
@@ -147,9 +149,25 @@ impl RemoteAgentHandle {
     async fn lookup_remote_node_manager(
         &self,
     ) -> Result<kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>, Error> {
+        let target_node_id = match self.target_node_id.clone() {
+            Some(node_id) => Some(node_id),
+            None => self
+                .mesh
+                .resolve_peer_node_id(&self.peer_label)
+                .await
+                .map(|node_id| node_id.to_string()),
+        };
+
         let mut node_manager = None;
+        let mut last_lookup_key = None;
         for scope in self.mesh.active_scopes() {
-            let dht_name = crate::agent::remote::scope::scoped_node_manager(&scope);
+            let dht_name = match target_node_id.as_ref() {
+                Some(node_id) => {
+                    crate::agent::remote::scope::scoped_node_manager_for_peer(&scope, node_id)
+                }
+                None => crate::agent::remote::scope::scoped_node_manager(&scope),
+            };
+            last_lookup_key = Some(dht_name.clone());
             match self
                 .mesh
                 .lookup_actor::<crate::agent::remote::RemoteNodeManager>(dht_name.clone())
@@ -173,8 +191,9 @@ impl RemoteAgentHandle {
             Error::new(
                 -32001,
                 format!(
-                    "Remote peer '{}' not found in scoped DHT (is the mesh running on that machine?)",
-                    self.peer_label
+                    "Remote peer '{}' not found in scoped DHT via {:?} (is the mesh running on that machine?)",
+                    self.peer_label,
+                    last_lookup_key
                 ),
             )
         })

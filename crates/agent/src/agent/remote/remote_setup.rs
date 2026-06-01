@@ -130,7 +130,7 @@ pub async fn register_remote_agents_from_config(
         };
 
         match register_remote_agent(mesh, remote, peer_addr).await {
-            Ok(agent_info) => {
+            Ok((agent_info, target_node_id)) => {
                 log::info!(
                     "Registered remote agent '{}' (peer='{}')",
                     agent_info.id,
@@ -138,6 +138,7 @@ pub async fn register_remote_agents_from_config(
                 );
                 let remote_handle = Arc::new(super::remote_handle::RemoteAgentHandle::new(
                     remote.peer.clone(),
+                    target_node_id,
                     mesh.clone(),
                 ));
                 registry.register_handle(agent_info, remote_handle);
@@ -172,75 +173,78 @@ async fn register_remote_agent(
     mesh: &MeshHandle,
     remote: &RemoteAgentConfig,
     _peer_addr: &str,
-) -> Result<AgentInfo> {
+) -> Result<(AgentInfo, Option<String>)> {
     use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
 
-    // Look up the remote node's manager via scoped DHT names.
-    // Give up after a short timeout if the peer is not yet discoverable.
+    // Prefer peer-specific DHT names so multi-peer meshes do not bind to the
+    // first generic node_manager provider returned by the DHT.
     let lookup_timeout = std::time::Duration::from_secs(5);
     let runtime = super::runtime_handle::MeshRuntimeHandle::from(mesh.clone());
     let mut found_ref = None;
+    let mut target_node_id = None;
 
-    for scope in runtime.active_scopes() {
-        let lookup_result = tokio::time::timeout(
-            lookup_timeout,
-            runtime.lookup_actor::<RemoteNodeManager>(super::scope::scoped_node_manager(&scope)),
-        )
-        .await;
+    if let Some(resolved) = mesh.resolve_peer_node_id(&remote.peer).await {
+        let resolved_id = resolved.to_string();
+        target_node_id = Some(resolved_id.clone());
+        for scope in runtime.active_scopes() {
+            let dht_name = super::scope::scoped_node_manager_for_peer(&scope, &resolved_id);
+            let lookup_result = tokio::time::timeout(
+                lookup_timeout,
+                runtime.lookup_actor::<RemoteNodeManager>(dht_name.clone()),
+            )
+            .await;
 
-        match lookup_result {
-            Ok(Ok(Some(node_manager_ref))) => {
-                found_ref = Some(node_manager_ref);
-                break;
+            match lookup_result {
+                Ok(Ok(Some(node_manager_ref))) => {
+                    found_ref = Some(node_manager_ref);
+                    break;
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => {
+                    log::debug!(
+                        "DHT lookup error for peer '{}' under '{}': {}",
+                        remote.peer,
+                        dht_name,
+                        e
+                    );
+                }
+                Err(_timeout) => {}
             }
-            Ok(Ok(None)) => {}
-            Ok(Err(e)) => {
-                log::debug!(
-                    "DHT lookup error for peer '{}' in scope '{}': {}",
-                    remote.peer,
-                    scope,
-                    e
-                );
-            }
-            Err(_timeout) => {}
         }
     }
 
     match found_ref {
-        Some(node_manager_ref) => {
-            // Confirm the peer is reachable by calling GetNodeInfo.
-            match node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
-                Ok(node_info) => {
-                    tracing::Span::current()
-                        .record("reachable", true)
-                        .record("peer_hostname", &node_info.hostname);
-                    log::debug!(
-                        "Peer '{}' reachable (hostname='{}')",
-                        remote.peer,
-                        node_info.hostname
-                    );
-                }
-                Err(e) => {
-                    tracing::Span::current().record("reachable", false);
-                    log::debug!(
-                        "GetNodeInfo failed for peer '{}': {} (registering anyway)",
-                        remote.peer,
-                        e
-                    );
-                }
+        Some(node_manager_ref) => match node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
+            Ok(node_info) => {
+                tracing::Span::current()
+                    .record("reachable", true)
+                    .record("peer_hostname", &node_info.hostname);
+                target_node_id = Some(node_info.node_id.to_string());
+                log::debug!(
+                    "Peer '{}' reachable (hostname='{}')",
+                    remote.peer,
+                    node_info.hostname
+                );
             }
-        }
+            Err(e) => {
+                tracing::Span::current().record("reachable", false);
+                log::debug!(
+                    "GetNodeInfo failed for peer '{}': {} (registering anyway)",
+                    remote.peer,
+                    e
+                );
+            }
+        },
         None => {
             tracing::Span::current().record("reachable", false);
             log::debug!(
-                "Peer '{}' not yet in scoped DHT; registering remote agent '{}' speculatively",
+                "Peer '{}' not yet in peer-specific scoped DHT; registering remote agent '{}' speculatively",
                 remote.peer,
                 remote.id
             );
         }
     }
 
-    // Build the AgentInfo regardless — the peer might become available later.
     let info = AgentInfo {
         id: remote.id.clone(),
         name: remote.name.clone(),
@@ -250,8 +254,9 @@ async fn register_remote_agent(
         meta: Some(serde_json::json!({
             "remote": true,
             "peer": remote.peer,
+            "node_id": target_node_id,
         })),
     };
 
-    Ok(info)
+    Ok((info, target_node_id))
 }

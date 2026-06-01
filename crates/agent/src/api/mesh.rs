@@ -1,5 +1,7 @@
 use anyhow::{Result, anyhow};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+#[cfg(feature = "remote")]
+use tokio::sync::OnceCell;
 
 use crate::agent::LocalAgentHandle;
 #[cfg(feature = "remote")]
@@ -82,11 +84,11 @@ pub struct MeshJoinOutcome {
 #[derive(Clone, Debug)]
 struct SharedMeshState {
     runtime: MeshRuntimeHandle,
-    spec: MeshSpec,
+    config: MeshRuntimeConfig,
 }
 
 #[cfg(feature = "remote")]
-static SHARED_MESH: OnceLock<Mutex<Option<SharedMeshState>>> = OnceLock::new();
+static SHARED_MESH: OnceLock<OnceCell<SharedMeshState>> = OnceLock::new();
 
 #[cfg(feature = "remote")]
 impl Mesh {
@@ -146,6 +148,10 @@ impl Mesh {
         self.spec.node_name()
     }
 
+    pub(crate) fn is_disabled(&self) -> bool {
+        matches!(self.spec, MeshSpec::Disabled)
+    }
+
     pub async fn start(&self) -> Result<MeshRuntime> {
         MeshRuntime::shared(self.spec.clone()).await
     }
@@ -172,6 +178,10 @@ impl Mesh {
     pub fn shared() -> Self {
         Self
     }
+
+    pub(crate) fn is_disabled(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(feature = "remote")]
@@ -183,7 +193,7 @@ impl MeshSpec {
         }
     }
 
-    pub fn into_toml(self) -> MeshTomlConfig {
+    pub(crate) fn into_toml(self) -> MeshTomlConfig {
         match self {
             MeshSpec::Disabled => MeshTomlConfig::default(),
             MeshSpec::Lan => {
@@ -220,67 +230,43 @@ impl MeshSpec {
             MeshSpec::Toml(cfg) => cfg,
         }
     }
-
-    fn compatibility_label(&self) -> &'static str {
-        match self {
-            MeshSpec::Disabled => "disabled",
-            MeshSpec::Lan => "lan",
-            MeshSpec::Iroh => "iroh",
-            MeshSpec::Hybrid => "hybrid",
-            MeshSpec::Toml(cfg) => {
-                if !cfg.enabled {
-                    "disabled"
-                } else if cfg.lan.as_ref().is_some_and(|lan| lan.enabled)
-                    && (cfg.transport == MeshTransportConfig::Iroh
-                        || cfg.invite.is_some()
-                        || cfg.iroh.iter().any(|iroh| iroh.enabled))
-                {
-                    "hybrid"
-                } else if cfg.transport == MeshTransportConfig::Iroh
-                    || cfg.invite.is_some()
-                    || cfg.iroh.iter().any(|iroh| iroh.enabled)
-                {
-                    "iroh"
-                } else {
-                    "lan"
-                }
-            }
-        }
-    }
 }
 
 #[cfg(feature = "remote")]
 impl MeshRuntime {
     pub async fn shared(spec: MeshSpec) -> Result<Self> {
-        let state = SHARED_MESH.get_or_init(|| Mutex::new(None));
-
-        {
-            let guard = state.lock().unwrap();
-            if let Some(existing) = guard.as_ref() {
-                if !spec_compatible(&existing.spec, &spec) {
-                    return Err(anyhow!(
-                        "shared mesh runtime already started as {}; requested {}",
-                        existing.spec.compatibility_label(),
-                        spec.compatibility_label()
-                    ));
-                }
-                return Ok(Self {
-                    runtime: existing.runtime.clone(),
-                });
-            }
-        }
-
         if matches!(spec, MeshSpec::Disabled) {
             return Err(anyhow!(
                 "cannot start a shared mesh runtime from Mesh::disabled()"
             ));
         }
 
-        let runtime_cfg = runtime_config_from_spec(spec.clone())?;
-        let runtime = bootstrap_mesh_runtime(&runtime_cfg).await?;
-        let cloned = runtime.clone();
-        *state.lock().unwrap() = Some(SharedMeshState { runtime, spec });
-        Ok(Self { runtime: cloned })
+        let requested_cfg = runtime_config_from_spec(spec.clone())?;
+        let state = SHARED_MESH.get_or_init(OnceCell::new);
+        let existing = state
+            .get_or_try_init(|| {
+                let requested_cfg = requested_cfg.clone();
+                async move {
+                    let runtime = bootstrap_mesh_runtime(&requested_cfg).await?;
+                    Ok::<SharedMeshState, anyhow::Error>(SharedMeshState {
+                        runtime,
+                        config: requested_cfg,
+                    })
+                }
+            })
+            .await?;
+
+        if !runtime_configs_compatible(&existing.config, &requested_cfg) {
+            return Err(anyhow!(
+                "shared mesh runtime already started with {}; requested {}",
+                runtime_config_label(&existing.config),
+                runtime_config_label(&requested_cfg)
+            ));
+        }
+
+        Ok(Self {
+            runtime: existing.runtime.clone(),
+        })
     }
 
     pub fn handle(&self) -> MeshRuntimeHandle {
@@ -305,41 +291,53 @@ impl AgentMesh {
     pub async fn join(&self, invite: impl AsRef<str>) -> Result<MeshJoinOutcome> {
         self.ensure_published().await?;
         let invite = crate::agent::remote::invite::SignedInviteGrant::decode(invite.as_ref())?;
-        let inviter_peer_id = invite.grant.inviter_peer_id.clone();
-        let mesh_name = invite.grant.mesh_name.clone();
-        let mesh_id = crate::agent::remote::invite::mesh_id_for(
-            &invite.grant.inviter_peer_id,
-            invite.grant.mesh_name.as_deref(),
-        );
-
-        let already_joined = self
-            .runtime
-            .joined_iroh_scopes()
-            .into_iter()
-            .any(|scope| matches!(scope, MeshScopeId::Iroh { mesh_id: ref existing } if existing == &mesh_id));
-
-        if !already_joined {
-            self.agent.join_mesh_invite(invite.clone()).await?;
-        }
-
-        Ok(MeshJoinOutcome {
-            mesh_id,
-            mesh_name,
-            inviter_peer_id,
-            already_joined,
-        })
+        self.agent.join_mesh_invite(invite).await
     }
 }
 
 #[cfg(feature = "remote")]
-fn spec_compatible(existing: &MeshSpec, requested: &MeshSpec) -> bool {
-    match (
-        existing.compatibility_label(),
-        requested.compatibility_label(),
-    ) {
-        ("hybrid", _) => true,
-        (a, b) => a == b,
-    }
+fn runtime_configs_compatible(existing: &MeshRuntimeConfig, requested: &MeshRuntimeConfig) -> bool {
+    existing.enabled == requested.enabled
+        && existing
+            .lan
+            .as_ref()
+            .map(|lan| (&lan.listen, lan.discovery, lan.directory))
+            == requested
+                .lan
+                .as_ref()
+                .map(|lan| (&lan.listen, lan.discovery, lan.directory))
+        && existing.iroh_enabled == requested.iroh_enabled
+        && existing.identity_file == requested.identity_file
+        && existing.request_timeout == requested.request_timeout
+        && existing.stream_reconnect_grace == requested.stream_reconnect_grace
+        && existing.node_name == requested.node_name
+        && existing.peers == requested.peers
+        && existing.auto_fallback == requested.auto_fallback
+        && existing
+            .iroh_scopes
+            .iter()
+            .map(|scope| (&scope.mesh_id, &scope.invite, &scope.name))
+            .eq(requested
+                .iroh_scopes
+                .iter()
+                .map(|scope| (&scope.mesh_id, &scope.invite, &scope.name)))
+}
+
+#[cfg(feature = "remote")]
+fn runtime_config_label(config: &MeshRuntimeConfig) -> String {
+    let transports = match (config.lan.is_some(), config.iroh_enabled) {
+        (true, true) => "hybrid",
+        (true, false) => "lan",
+        (false, true) => "iroh",
+        (false, false) => "disabled",
+    };
+    format!(
+        "{transports} mesh (identity={:?}, node_name={:?}, peers={}, iroh_scopes={})",
+        config.identity_file,
+        config.node_name,
+        config.peers.len(),
+        config.iroh_scopes.len()
+    )
 }
 
 #[cfg(feature = "remote")]
@@ -363,7 +361,7 @@ fn runtime_config_from_spec(spec: MeshSpec) -> Result<MeshRuntimeConfig> {
 }
 
 #[cfg(feature = "remote")]
-pub async fn admit_via_invite_on_runtime(
+pub(crate) async fn admit_via_invite_on_runtime(
     mesh: &mut crate::agent::remote::MeshHandle,
     invite: &crate::agent::remote::invite::SignedInviteGrant,
 ) -> Result<()> {
@@ -427,15 +425,19 @@ pub async fn admit_via_invite_on_runtime(
             existing_peers,
         } => {
             let known_peers = known_peers_from_strings(mesh, &existing_peers);
+            let admitted_peer_ids = peer_ids_from_strings(&existing_peers);
             mesh_state
                 .upsert_joined_mesh(membership_token, known_peers)
                 .map_err(|e| anyhow!("failed to persist mesh state: {e}"))?;
+            mesh.join_iroh_scope(&mesh_id, admitted_peer_ids);
         }
         AdmissionResponse::Readmitted { existing_peers } => {
             let known_peers = known_peers_from_strings(mesh, &existing_peers);
+            let admitted_peer_ids = peer_ids_from_strings(&existing_peers);
             mesh_state
                 .update_known_peers(&mesh_id, known_peers)
                 .map_err(|e| anyhow!("failed to update mesh state: {e}"))?;
+            mesh.join_iroh_scope(&mesh_id, admitted_peer_ids);
         }
         AdmissionResponse::Rejected { reason } => {
             return Err(anyhow!("admission rejected: {reason}"));
@@ -453,6 +455,14 @@ pub async fn admit_via_invite_on_runtime(
     });
     let _ = mesh.subscribe_peer_events().resubscribe().try_recv();
     Ok(())
+}
+
+#[cfg(feature = "remote")]
+fn peer_ids_from_strings(existing_peers: &[String]) -> Vec<libp2p::PeerId> {
+    existing_peers
+        .iter()
+        .filter_map(|peer_str| peer_str.parse().ok())
+        .collect()
 }
 
 #[cfg(feature = "remote")]

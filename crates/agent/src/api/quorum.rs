@@ -227,6 +227,32 @@ impl QuorumBuilder {
             builder = builder.cwd(cwd_path);
         }
 
+        #[cfg(feature = "remote")]
+        if self.mesh.is_none()
+            && let Some(mesh_cfg) = &self.mesh_config
+            && mesh_cfg.enabled
+        {
+            let runtime = crate::api::Mesh::from_toml(mesh_cfg.clone())
+                .start()
+                .await?;
+            self.mesh = Some(runtime.handle().as_mesh_handle().clone());
+        }
+
+        #[cfg(feature = "remote")]
+        if self.initial_registry.is_none()
+            && let (Some(mesh), Some(mesh_cfg)) = (&self.mesh, &self.mesh_config)
+            && !self.remote_agents.is_empty()
+        {
+            self.initial_registry = Some(
+                crate::agent::remote::register_remote_agents_from_config(
+                    mesh,
+                    &self.remote_agents,
+                    &mesh_cfg.peers,
+                )
+                .await?,
+            );
+        }
+
         // Phase 7: inject pre-registered remote agents into the quorum's delegate registry.
         if let Some(ref initial_reg) = self.initial_registry {
             for info in initial_reg.list_agents() {
@@ -295,32 +321,6 @@ impl QuorumBuilder {
                 let config = Arc::new(b.build());
                 Arc::new(AgentHandle::from_config(config)) as Arc<dyn AgentHandleTrait>
             });
-        }
-
-        #[cfg(feature = "remote")]
-        if self.mesh.is_none()
-            && let Some(mesh_cfg) = &self.mesh_config
-            && mesh_cfg.enabled
-        {
-            let runtime = crate::api::Mesh::from_toml(mesh_cfg.clone())
-                .start()
-                .await?;
-            self.mesh = Some(runtime.handle().as_mesh_handle().clone());
-        }
-
-        #[cfg(feature = "remote")]
-        if self.initial_registry.is_none()
-            && let (Some(mesh), Some(mesh_cfg)) = (&self.mesh, &self.mesh_config)
-            && !self.remote_agents.is_empty()
-        {
-            self.initial_registry = Some(
-                crate::agent::remote::register_remote_agents_from_config(
-                    mesh,
-                    &self.remote_agents,
-                    &mesh_cfg.peers,
-                )
-                .await?,
-            );
         }
 
         // Create RoutingActor + snapshot handle if there are peer delegates.

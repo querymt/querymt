@@ -328,14 +328,10 @@ async fn register_mesh_actors(
     runner: &querymt_agent::prelude::AgentRunner,
     mesh: &querymt_agent::agent::remote::MeshHandle,
 ) {
-    let actor_refs =
-        querymt_agent::agent::remote::spawn_and_register_local_mesh_actors(&runner.handle(), mesh)
-            .await;
-    *runner
-        .handle()
-        .local_mesh_actor_refs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(actor_refs);
+    runner.handle().set_mesh(mesh.clone());
+    if let Err(e) = runner.handle().ensure_mesh_published(None).await {
+        eprintln!("Warning: failed to publish mesh actors: {e}");
+    }
 }
 
 #[cfg(feature = "remote")]
