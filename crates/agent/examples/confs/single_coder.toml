@@ -23,7 +23,7 @@ tools = [
   # File operations
   "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
   # Search & navigation
-  "glob", "search_text", "ls", "index", "get_symbol", "get_function", "find_references", "skill",
+  "glob", "search_text", "ls", "index", "get_symbol", "get_function", "find_symbol_references", "skill",
   # Execution
   "shell",
   # Task management

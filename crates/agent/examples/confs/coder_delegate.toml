@@ -26,7 +26,7 @@ tools = [
   # File operations
   "read_tool",
   # Search & navigation
-  "glob", "search_text", "ls", "index", "get_symbol", "get_function",
+  "glob", "search_text", "ls", "index", "get_symbol", "get_function", "find_symbol_references",
   # Execution
   "shell",
   # Task management
@@ -124,7 +124,7 @@ tools = [
   # File operations
   "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
   # Search & navigation
-  "glob", "search_text", "ls", "index", "get_symbol", "get_function",
+  "glob", "search_text", "ls", "index", "get_symbol", "get_function", "find_symbol_references",
   # Execution
   "shell",
   # Task management
@@ -169,7 +169,7 @@ tools = [
   # File operations
   "read_tool",
   # Search & navigation
-  "glob", "search_text", "ls", "index", "get_symbol", "get_function",
+  "glob", "search_text", "ls", "index", "get_symbol", "get_function", "find_symbol_references",
   # Execution
   "shell",
   # Task management
