@@ -1924,8 +1924,8 @@ export function useUiClient() {
 
   // ── Schedule management ──────────────────────────────────────────────────
 
-  const listSchedules = useCallback((sessionId?: string) => {
-    sendMessage({ type: 'list_schedules', data: { session_id: sessionId } });
+  const listSchedules = useCallback((sessionId?: string, nodeId?: string) => {
+    sendMessage({ type: 'list_schedules', data: { session_id: sessionId, node_id: nodeId } });
   }, []);
 
   const createSchedule = useCallback((
@@ -1933,11 +1933,13 @@ export function useUiClient() {
     prompt: string,
     trigger: any,
     opts?: { maxSteps?: number; maxCostUsd?: number; maxRuns?: number },
+    nodeId?: string,
   ) => {
     sendMessage({
       type: 'create_schedule',
       data: {
         session_id: sessionId,
+        node_id: nodeId,
         prompt,
         trigger,
         max_steps: opts?.maxSteps,
@@ -1947,20 +1949,20 @@ export function useUiClient() {
     });
   }, []);
 
-  const pauseSchedule = useCallback((schedulePublicId: string) => {
-    sendMessage({ type: 'pause_schedule', data: { schedule_public_id: schedulePublicId } });
+  const pauseSchedule = useCallback((schedulePublicId: string, nodeId?: string, sessionId?: string) => {
+    sendMessage({ type: 'pause_schedule', data: { schedule_public_id: schedulePublicId, node_id: nodeId, session_id: sessionId } });
   }, []);
 
-  const resumeSchedule = useCallback((schedulePublicId: string) => {
-    sendMessage({ type: 'resume_schedule', data: { schedule_public_id: schedulePublicId } });
+  const resumeSchedule = useCallback((schedulePublicId: string, nodeId?: string, sessionId?: string) => {
+    sendMessage({ type: 'resume_schedule', data: { schedule_public_id: schedulePublicId, node_id: nodeId, session_id: sessionId } });
   }, []);
 
-  const triggerScheduleNow = useCallback((schedulePublicId: string) => {
-    sendMessage({ type: 'trigger_schedule', data: { schedule_public_id: schedulePublicId } });
+  const triggerScheduleNow = useCallback((schedulePublicId: string, nodeId?: string, sessionId?: string) => {
+    sendMessage({ type: 'trigger_schedule', data: { schedule_public_id: schedulePublicId, node_id: nodeId, session_id: sessionId } });
   }, []);
 
-  const deleteSchedule = useCallback((schedulePublicId: string) => {
-    sendMessage({ type: 'delete_schedule', data: { schedule_public_id: schedulePublicId } });
+  const deleteSchedule = useCallback((schedulePublicId: string, nodeId?: string, sessionId?: string) => {
+    sendMessage({ type: 'delete_schedule', data: { schedule_public_id: schedulePublicId, node_id: nodeId, session_id: sessionId } });
   }, []);
 
   const queryKnowledge = useCallback((scope: string, question: string, limit?: number) => {

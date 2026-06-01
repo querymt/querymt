@@ -76,7 +76,7 @@ interface GlobalOverlaysProps {
 
   // Create schedule dialog
   createScheduleDialogOpen: boolean;
-  createSchedule: (sessionId: string, cron: string, prompt: string) => void;
+  createSchedule: (sessionId: string, prompt: string, trigger: any, opts?: { maxSteps?: number; maxCostUsd?: number; maxRuns?: number }) => void;
 
   // Stats drawer
   statsDrawerOpen: boolean;

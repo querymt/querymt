@@ -424,6 +424,9 @@ pub enum UiClientMessage {
     #[serde(rename = "create_schedule")]
     CreateSchedule {
         session_id: String,
+        /// Optional remote node that owns the session/schedule.
+        #[serde(default)]
+        node_id: Option<String>,
         /// Prompt text for each cycle (becomes the task's expected_deliverable)
         prompt: String,
         /// Trigger configuration as JSON (ScheduleTrigger)
@@ -443,26 +446,44 @@ pub enum UiClientMessage {
     ListSchedules {
         #[serde(default)]
         session_id: Option<String>,
+        #[serde(default)]
+        node_id: Option<String>,
     },
     /// Pause a schedule
     #[serde(rename = "pause_schedule")]
     PauseSchedule {
         schedule_public_id: String,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        node_id: Option<String>,
     },
     /// Resume a paused schedule
     #[serde(rename = "resume_schedule")]
     ResumeSchedule {
         schedule_public_id: String,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        node_id: Option<String>,
     },
     /// Trigger a schedule to fire immediately
     #[serde(rename = "trigger_schedule")]
     TriggerSchedule {
         schedule_public_id: String,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        node_id: Option<String>,
     },
     /// Delete a schedule
     #[serde(rename = "delete_schedule")]
     DeleteSchedule {
         schedule_public_id: String,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        node_id: Option<String>,
     },
     /// Create a new mesh invite token
     #[serde(rename = "create_mesh_invite")]
@@ -566,6 +587,8 @@ pub struct ScheduleInfo {
     pub public_id: String,
     pub task_public_id: String,
     pub session_public_id: String,
+    #[serde(default)]
+    pub node_id: Option<String>,
     /// Serialized trigger config
     #[typeshare(serialized_as = "any")]
     pub trigger: serde_json::Value,
@@ -1002,12 +1025,16 @@ pub enum UiServerMessage {
     #[serde(rename = "schedule_list")]
     ScheduleList {
         schedules: Vec<ScheduleInfo>,
+        #[serde(default)]
+        node_id: Option<String>,
     },
     /// Schedule created successfully
     #[serde(rename = "schedule_created_result")]
     ScheduleCreatedResult {
         success: bool,
         schedule_public_id: Option<String>,
+        #[serde(default)]
+        node_id: Option<String>,
         message: Option<String>,
     },
     /// Schedule action result (pause/resume/trigger/delete)
@@ -1016,6 +1043,8 @@ pub enum UiServerMessage {
         success: bool,
         schedule_public_id: String,
         action: String,
+        #[serde(default)]
+        node_id: Option<String>,
         message: Option<String>,
     },
     /// Knowledge query result (entries + consolidations)

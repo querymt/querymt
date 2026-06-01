@@ -123,6 +123,10 @@ export function AppShell() {
   const location = useLocation();
   const isHomePage = location.pathname === '/';
   const visibleSessionId = isHomePage ? null : sessionId;
+  const currentSession = sessionGroups
+    .flatMap((group) => group.sessions)
+    .find((session) => session.session_id === visibleSessionId);
+  const visibleSessionNodeId = currentSession?.node_id;
   const isMobile = useIsMobile();
   const [shortcutGatewayOpen, setShortcutGatewayOpen] = useState(false);
   const [themeSwitcherOpen, setThemeSwitcherOpen] = useState(false);
@@ -416,7 +420,7 @@ export function AppShell() {
         submitWorkspacePathDialog={submitWorkspacePathDialog}
         cancelWorkspacePathDialog={cancelWorkspacePathDialog}
         createScheduleDialogOpen={createScheduleDialogOpen}
-        createSchedule={createSchedule}
+        createSchedule={(sessionId, prompt, trigger, opts) => createSchedule(sessionId, prompt, trigger, opts, visibleSessionNodeId)}
         statsDrawerOpen={statsDrawerOpen}
         setStatsDrawerOpen={setStatsDrawerOpen}
         agents={agents}

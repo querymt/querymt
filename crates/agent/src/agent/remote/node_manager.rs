@@ -72,10 +72,12 @@ pub struct AvailableModel {
 
 #[cfg(feature = "remote")]
 pub use remote_impl::{
-    AdmissionRequest, AdmissionResponse, CreateRemoteSession, CreateRemoteSessionResponse,
-    ForkRemoteSession, ForkRemoteSessionResponse, GetNodeInfo, ListAvailableModels,
-    ListRemoteSessions, RemoteNodeManager, RemoteNodeManagerState, ResumeRemoteSession,
-    SessionHandoff, StopRemoteSessionRuntime,
+    AdmissionRequest, AdmissionResponse, CreateRemoteSchedule, CreateRemoteScheduleResponse,
+    CreateRemoteSession, CreateRemoteSessionResponse, DeleteRemoteSchedule, ForkRemoteSession,
+    ForkRemoteSessionResponse, GetNodeInfo, ListAvailableModels, ListRemoteSchedules,
+    ListRemoteSchedulesResponse, ListRemoteSessions, PauseRemoteSchedule, RemoteNodeManager,
+    RemoteNodeManagerState, ResumeRemoteSchedule, ResumeRemoteSession, SessionHandoff,
+    StopRemoteSessionRuntime, TriggerRemoteSchedule,
 };
 
 #[cfg(feature = "remote")]
@@ -87,6 +89,7 @@ mod remote_impl {
     use crate::agent::session_actor::SessionActor;
     use crate::agent::session_registry::SessionRegistry;
     use crate::error::AgentError;
+    use crate::session::domain_schedule::{Schedule, ScheduleExecutionLimits, ScheduleTrigger};
     use futures_util::FutureExt;
     use kameo::Actor;
     use kameo::message::{Context, Message};
@@ -180,6 +183,57 @@ mod remote_impl {
     /// List all provider/model pairs this node can serve (has valid credentials for).
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ListAvailableModels;
+
+    /// Create a new schedule owned by this node.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct CreateRemoteSchedule {
+        pub session_id: String,
+        pub prompt: String,
+        pub trigger: ScheduleTrigger,
+        #[serde(default)]
+        pub max_steps: Option<u32>,
+        #[serde(default)]
+        pub max_cost_usd: Option<f64>,
+        #[serde(default)]
+        pub max_runs: Option<u32>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct CreateRemoteScheduleResponse {
+        pub schedule_public_id: String,
+    }
+
+    /// List schedules owned by this node, optionally filtered by session.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ListRemoteSchedules {
+        #[serde(default)]
+        pub session_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ListRemoteSchedulesResponse {
+        pub schedules: Vec<Schedule>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct PauseRemoteSchedule {
+        pub schedule_public_id: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ResumeRemoteSchedule {
+        pub schedule_public_id: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct TriggerRemoteSchedule {
+        pub schedule_public_id: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct DeleteRemoteSchedule {
+        pub schedule_public_id: String,
+    }
 
     /// Shut down the live runtime actor for a session on this node.
     ///
@@ -280,6 +334,8 @@ mod remote_impl {
         pub materialization_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
         /// Cached model inventory for fast model listing without blocking the actor mailbox.
         pub model_inventory: crate::model_inventory::ModelInventory,
+        /// Lazily started local scheduler used for schedules hosted on this node.
+        pub scheduler_handle: Arc<std::sync::Mutex<Option<crate::scheduler::SchedulerHandle>>>,
     }
 
     // ── Actor ─────────────────────────────────────────────────────────────────
@@ -333,6 +389,7 @@ mod remote_impl {
                 mesh,
                 materialization_locks: Arc::new(Mutex::new(HashMap::new())),
                 model_inventory,
+                scheduler_handle: Arc::new(std::sync::Mutex::new(None)),
             };
 
             // Prewarm model inventory in the background so first remote model
@@ -362,6 +419,215 @@ mod remote_impl {
     }
 
     impl RemoteNodeManagerState {
+        fn scheduler_unavailable_error() -> AgentError {
+            AgentError::Internal("scheduler unavailable".to_string())
+        }
+
+        fn is_actor_not_running_error(error_message: &str) -> bool {
+            error_message.contains("actor not running")
+        }
+
+        fn scheduler_handle(&self) -> Option<crate::scheduler::SchedulerHandle> {
+            self.scheduler_handle
+                .lock()
+                .ok()
+                .and_then(|guard| (*guard).clone())
+        }
+
+        fn clear_scheduler_handle(&self) {
+            if let Ok(mut guard) = self.scheduler_handle.lock() {
+                *guard = None;
+            }
+        }
+
+        async fn start_scheduler(&self) -> bool {
+            let schedule_repo = match &self.config.schedule_repository {
+                Some(repo) => repo.clone(),
+                None => return false,
+            };
+
+            let handle = crate::scheduler::SchedulerActor::spawn(
+                schedule_repo,
+                self.config.provider.history_store(),
+                self.registry.clone(),
+                self.config.clone(),
+                crate::scheduler::SchedulerConfig::default(),
+            )
+            .await;
+
+            match handle {
+                Some(h) => {
+                    if let Ok(mut guard) = self.scheduler_handle.lock() {
+                        *guard = Some(h);
+                    }
+                    true
+                }
+                None => false,
+            }
+        }
+
+        async fn get_or_start_scheduler(&self) -> Option<crate::scheduler::SchedulerHandle> {
+            if let Some(scheduler) = self.scheduler_handle() {
+                return Some(scheduler);
+            }
+
+            if self.start_scheduler().await {
+                return self.scheduler_handle();
+            }
+
+            None
+        }
+
+        async fn create_schedule(
+            &self,
+            session_public_id: &str,
+            prompt: &str,
+            trigger: ScheduleTrigger,
+            max_steps: Option<u32>,
+            max_cost_usd: Option<f64>,
+            max_runs: Option<u32>,
+        ) -> Result<String, AgentError> {
+            use crate::session::domain::{Task, TaskKind, TaskStatus};
+
+            let store = self.config.provider.history_store();
+            let session = store
+                .get_session(session_public_id)
+                .await
+                .map_err(|e| AgentError::Internal(e.to_string()))?
+                .ok_or_else(|| AgentError::SessionNotFound {
+                    session_id: session_public_id.to_string(),
+                })?;
+
+            let now = time::OffsetDateTime::now_utc();
+            let task = Task {
+                id: 0,
+                public_id: String::new(),
+                session_id: session.id,
+                kind: TaskKind::Recurring,
+                status: TaskStatus::Active,
+                expected_deliverable: Some(prompt.to_string()),
+                acceptance_criteria: None,
+                created_at: now,
+                updated_at: now,
+            };
+            let task = store
+                .create_task(task)
+                .await
+                .map_err(|e| AgentError::Internal(e.to_string()))?;
+
+            let mut schedule = Schedule::new(
+                task.public_id.clone(),
+                session_public_id.to_string(),
+                trigger,
+            );
+            schedule.task_id = task.id;
+            schedule.session_id = session.id;
+
+            if max_runs.is_some() {
+                schedule.config.max_runs = max_runs;
+            }
+            if max_steps.is_some() || max_cost_usd.is_some() {
+                schedule.config.execution_limits = Some(ScheduleExecutionLimits {
+                    max_steps,
+                    max_cost_usd,
+                });
+            }
+
+            let schedule_public_id = schedule.public_id.clone();
+            let scheduler = self
+                .get_or_start_scheduler()
+                .await
+                .ok_or_else(Self::scheduler_unavailable_error)?;
+
+            match scheduler.add_schedule(schedule.clone()).await {
+                Ok(()) => Ok(schedule_public_id),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !Self::is_actor_not_running_error(&msg) {
+                        return Err(AgentError::Internal(msg));
+                    }
+
+                    self.clear_scheduler_handle();
+                    let scheduler = self
+                        .get_or_start_scheduler()
+                        .await
+                        .ok_or_else(Self::scheduler_unavailable_error)?;
+                    scheduler
+                        .add_schedule(schedule)
+                        .await
+                        .map_err(|err| AgentError::Internal(err.to_string()))?;
+                    Ok(schedule_public_id)
+                }
+            }
+        }
+
+        async fn list_schedules(
+            &self,
+            session_public_id: Option<&str>,
+        ) -> Result<Vec<Schedule>, AgentError> {
+            let scheduler = match self.get_or_start_scheduler().await {
+                Some(s) => s,
+                None => return Ok(vec![]),
+            };
+
+            match scheduler.list_schedules(session_public_id).await {
+                Ok(schedules) => Ok(schedules),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !Self::is_actor_not_running_error(&msg) {
+                        return Err(AgentError::Internal(msg));
+                    }
+
+                    self.clear_scheduler_handle();
+                    let scheduler = match self.get_or_start_scheduler().await {
+                        Some(s) => s,
+                        None => return Ok(vec![]),
+                    };
+                    scheduler
+                        .list_schedules(session_public_id)
+                        .await
+                        .or_else(|retry_err| {
+                            if Self::is_actor_not_running_error(&retry_err.to_string()) {
+                                Ok(vec![])
+                            } else {
+                                Err(retry_err)
+                            }
+                        })
+                        .map_err(|retry_err| AgentError::Internal(retry_err.to_string()))
+                }
+            }
+        }
+
+        async fn run_schedule_action<F, Fut>(&self, f: F) -> Result<(), AgentError>
+        where
+            F: Fn(crate::scheduler::SchedulerHandle) -> Fut,
+            Fut: std::future::Future<Output = Result<(), crate::session::error::SessionError>>,
+        {
+            let scheduler = self
+                .get_or_start_scheduler()
+                .await
+                .ok_or_else(Self::scheduler_unavailable_error)?;
+
+            match f(scheduler.clone()).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !Self::is_actor_not_running_error(&msg) {
+                        return Err(AgentError::Internal(msg));
+                    }
+
+                    self.clear_scheduler_handle();
+                    let scheduler = self
+                        .get_or_start_scheduler()
+                        .await
+                        .ok_or_else(Self::scheduler_unavailable_error)?;
+                    f(scheduler)
+                        .await
+                        .map_err(|err| AgentError::Internal(err.to_string()))
+                }
+            }
+        }
+
         /// Build a `SessionHandoff` from an already-spawned local actor ref.
         async fn handoff_for_local_actor(
             &self,
@@ -853,6 +1119,133 @@ mod remote_impl {
         }
     }
 
+    impl Message<CreateRemoteSchedule> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<CreateRemoteScheduleResponse, AgentError>>;
+
+        async fn handle(
+            &mut self,
+            msg: CreateRemoteSchedule,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let shared_state = self.shared_state.clone();
+            ctx.spawn(async move {
+                let schedule_public_id = shared_state
+                    .create_schedule(
+                        &msg.session_id,
+                        &msg.prompt,
+                        msg.trigger,
+                        msg.max_steps,
+                        msg.max_cost_usd,
+                        msg.max_runs,
+                    )
+                    .await?;
+                Ok(CreateRemoteScheduleResponse { schedule_public_id })
+            })
+        }
+    }
+
+    impl Message<ListRemoteSchedules> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<ListRemoteSchedulesResponse, AgentError>>;
+
+        async fn handle(
+            &mut self,
+            msg: ListRemoteSchedules,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let shared_state = self.shared_state.clone();
+            ctx.spawn(async move {
+                let schedules = shared_state
+                    .list_schedules(msg.session_id.as_deref())
+                    .await?;
+                Ok(ListRemoteSchedulesResponse { schedules })
+            })
+        }
+    }
+
+    impl Message<PauseRemoteSchedule> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<(), AgentError>>;
+
+        async fn handle(
+            &mut self,
+            msg: PauseRemoteSchedule,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let shared_state = self.shared_state.clone();
+            let schedule_public_id = msg.schedule_public_id.clone();
+            ctx.spawn(async move {
+                shared_state
+                    .run_schedule_action(|scheduler| {
+                        let schedule_public_id = schedule_public_id.clone();
+                        async move { scheduler.pause_schedule(&schedule_public_id).await }
+                    })
+                    .await
+            })
+        }
+    }
+
+    impl Message<ResumeRemoteSchedule> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<(), AgentError>>;
+
+        async fn handle(
+            &mut self,
+            msg: ResumeRemoteSchedule,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let shared_state = self.shared_state.clone();
+            let schedule_public_id = msg.schedule_public_id.clone();
+            ctx.spawn(async move {
+                shared_state
+                    .run_schedule_action(|scheduler| {
+                        let schedule_public_id = schedule_public_id.clone();
+                        async move { scheduler.resume_schedule(&schedule_public_id).await }
+                    })
+                    .await
+            })
+        }
+    }
+
+    impl Message<TriggerRemoteSchedule> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<(), AgentError>>;
+
+        async fn handle(
+            &mut self,
+            msg: TriggerRemoteSchedule,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let shared_state = self.shared_state.clone();
+            let schedule_public_id = msg.schedule_public_id.clone();
+            ctx.spawn(async move {
+                shared_state
+                    .run_schedule_action(|scheduler| {
+                        let schedule_public_id = schedule_public_id.clone();
+                        async move { scheduler.trigger_now(&schedule_public_id).await }
+                    })
+                    .await
+            })
+        }
+    }
+
+    impl Message<DeleteRemoteSchedule> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<(), AgentError>>;
+
+        async fn handle(
+            &mut self,
+            msg: DeleteRemoteSchedule,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let shared_state = self.shared_state.clone();
+            let schedule_public_id = msg.schedule_public_id.clone();
+            ctx.spawn(async move {
+                shared_state
+                    .run_schedule_action(|scheduler| {
+                        let schedule_public_id = schedule_public_id.clone();
+                        async move { scheduler.remove_schedule(&schedule_public_id).await }
+                    })
+                    .await
+            })
+        }
+    }
+
     impl Message<StopRemoteSessionRuntime> for RemoteNodeManager {
         type Reply = Result<(), AgentError>;
 
@@ -1331,6 +1724,36 @@ mod remote_impl {
         ListAvailableModels,
         "querymt::ListAvailableModels",
         REG_LIST_AVAILABLE_MODELS
+    );
+    remote_node_msg_impl!(
+        CreateRemoteSchedule,
+        "querymt::CreateRemoteSchedule",
+        REG_CREATE_REMOTE_SCHEDULE
+    );
+    remote_node_msg_impl!(
+        ListRemoteSchedules,
+        "querymt::ListRemoteSchedules",
+        REG_LIST_REMOTE_SCHEDULES
+    );
+    remote_node_msg_impl!(
+        PauseRemoteSchedule,
+        "querymt::PauseRemoteSchedule",
+        REG_PAUSE_REMOTE_SCHEDULE
+    );
+    remote_node_msg_impl!(
+        ResumeRemoteSchedule,
+        "querymt::ResumeRemoteSchedule",
+        REG_RESUME_REMOTE_SCHEDULE
+    );
+    remote_node_msg_impl!(
+        TriggerRemoteSchedule,
+        "querymt::TriggerRemoteSchedule",
+        REG_TRIGGER_REMOTE_SCHEDULE
+    );
+    remote_node_msg_impl!(
+        DeleteRemoteSchedule,
+        "querymt::DeleteRemoteSchedule",
+        REG_DELETE_REMOTE_SCHEDULE
     );
     remote_node_msg_impl!(
         AdmissionRequest,

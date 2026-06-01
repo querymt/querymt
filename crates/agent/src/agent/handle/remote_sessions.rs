@@ -272,4 +272,95 @@ impl LocalAgentHandle {
             .await
             .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
     }
+
+    #[cfg(feature = "remote")]
+    pub async fn create_remote_schedule(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        request: crate::agent::remote::CreateRemoteSchedule,
+    ) -> Result<crate::agent::remote::CreateRemoteScheduleResponse, agent_client_protocol::Error>
+    {
+        use crate::error::AgentError;
+
+        node_manager_ref
+            .ask(&request)
+            .await
+            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+    }
+
+    #[cfg(feature = "remote")]
+    pub async fn list_remote_schedules(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        session_id: Option<String>,
+    ) -> Result<crate::agent::remote::ListRemoteSchedulesResponse, agent_client_protocol::Error>
+    {
+        use crate::agent::remote::ListRemoteSchedules;
+        use crate::error::AgentError;
+
+        node_manager_ref
+            .ask(&ListRemoteSchedules { session_id })
+            .await
+            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+    }
+
+    #[cfg(feature = "remote")]
+    pub async fn pause_remote_schedule(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        schedule_public_id: String,
+    ) -> Result<(), agent_client_protocol::Error> {
+        use crate::agent::remote::PauseRemoteSchedule;
+        use crate::error::AgentError;
+
+        node_manager_ref
+            .ask(&PauseRemoteSchedule { schedule_public_id })
+            .await
+            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+    }
+
+    #[cfg(feature = "remote")]
+    pub async fn resume_remote_schedule(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        schedule_public_id: String,
+    ) -> Result<(), agent_client_protocol::Error> {
+        use crate::agent::remote::ResumeRemoteSchedule;
+        use crate::error::AgentError;
+
+        node_manager_ref
+            .ask(&ResumeRemoteSchedule { schedule_public_id })
+            .await
+            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+    }
+
+    #[cfg(feature = "remote")]
+    pub async fn trigger_remote_schedule(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        schedule_public_id: String,
+    ) -> Result<(), agent_client_protocol::Error> {
+        use crate::agent::remote::TriggerRemoteSchedule;
+        use crate::error::AgentError;
+
+        node_manager_ref
+            .ask(&TriggerRemoteSchedule { schedule_public_id })
+            .await
+            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+    }
+
+    #[cfg(feature = "remote")]
+    pub async fn delete_remote_schedule(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        schedule_public_id: String,
+    ) -> Result<(), agent_client_protocol::Error> {
+        use crate::agent::remote::DeleteRemoteSchedule;
+        use crate::error::AgentError;
+
+        node_manager_ref
+            .ask(&DeleteRemoteSchedule { schedule_public_id })
+            .await
+            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+    }
 }

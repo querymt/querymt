@@ -25,6 +25,12 @@ impl LocalAgentHandle {
             "querymt/remote/createSession" => self.handle_ext_remote_create_session(req).await,
             "querymt/remote/attachSession" => self.handle_ext_remote_attach_session(req).await,
             "querymt/remote/dismissSession" => self.handle_ext_remote_dismiss_session(req).await,
+            "querymt/schedules/create" => self.handle_ext_schedule_create(req).await,
+            "querymt/schedules/list" => self.handle_ext_schedule_list(req).await,
+            "querymt/schedules/pause" => self.handle_ext_schedule_pause(req).await,
+            "querymt/schedules/resume" => self.handle_ext_schedule_resume(req).await,
+            "querymt/schedules/trigger" => self.handle_ext_schedule_trigger(req).await,
+            "querymt/schedules/delete" => self.handle_ext_schedule_delete(req).await,
             "querymt/updatePlugins" => self.handle_ext_update_plugins().await,
             _ => Err(Error::method_not_found()),
         }

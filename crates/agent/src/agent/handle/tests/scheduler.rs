@@ -1,5 +1,122 @@
 use super::*;
 
+async fn ext_method_json(
+    handle: &LocalAgentHandle,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let req = agent_client_protocol::schema::ExtRequest::new(
+        method,
+        std::sync::Arc::from(serde_json::value::RawValue::from_string(params.to_string()).unwrap()),
+    );
+    let resp = handle.ext_method(req).await.expect("ext_method");
+    serde_json::from_str(resp.0.get()).expect("valid JSON")
+}
+
+async fn wait_for_condition<F, Fut>(mut f: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if f().await {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition not met before timeout"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn test_querymt_schedule_ext_methods_local() {
+    let f = RealStorageHandleFixture::new().await;
+    let session = f
+        .storage
+        .session_store()
+        .create_session(None, None, None, None)
+        .await
+        .expect("create session");
+    let session_id = session.public_id;
+
+    let created = ext_method_json(
+        &f.handle,
+        "querymt/schedules/create",
+        serde_json::json!({
+            "sessionId": session_id,
+            "prompt": "daily summary",
+            "trigger": { "type": "interval", "seconds": 300 },
+            "maxRuns": 2,
+        }),
+    )
+    .await;
+    let schedule_id = created["schedulePublicId"]
+        .as_str()
+        .expect("schedule id")
+        .to_string();
+
+    wait_for_condition(|| {
+        let storage = f.storage.clone();
+        let session_id = session_id.clone();
+        async move {
+            storage
+                .schedule_repository()
+                .expect("schedule repo")
+                .list_schedules(&session_id)
+                .await
+                .map(|s| s.len() == 1)
+                .unwrap_or(false)
+        }
+    })
+    .await;
+
+    let listed = ext_method_json(
+        &f.handle,
+        "querymt/schedules/list",
+        serde_json::json!({ "sessionId": session_id }),
+    )
+    .await;
+    assert_eq!(listed["schedules"].as_array().map(Vec::len), Some(1));
+
+    let _ = ext_method_json(
+        &f.handle,
+        "querymt/schedules/pause",
+        serde_json::json!({ "schedulePublicId": schedule_id.clone() }),
+    )
+    .await;
+
+    wait_for_condition(|| {
+        let storage = f.storage.clone();
+        let session_id = session_id.clone();
+        let schedule_id = schedule_id.clone();
+        async move {
+            storage
+                .schedule_repository()
+                .expect("schedule repo")
+                .list_schedules(&session_id)
+                .await
+                .map(|schedules| {
+                    schedules.first().is_some_and(|s| {
+                        s.public_id == schedule_id && s.state.to_string() == "paused"
+                    })
+                })
+                .unwrap_or(false)
+        }
+    })
+    .await;
+
+    let listed = ext_method_json(
+        &f.handle,
+        "querymt/schedules/list",
+        serde_json::json!({ "sessionId": session_id }),
+    )
+    .await;
+    assert_eq!(listed["schedules"][0]["state"], "paused");
+}
+
 #[tokio::test]
 async fn test_list_schedules_returns_empty_when_scheduler_actor_stops() {
     let f = HandleFixture::new().await;

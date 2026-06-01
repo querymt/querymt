@@ -29,6 +29,12 @@ struct HandleFixture {
     _temp_dir: tempfile::TempDir,
 }
 
+struct RealStorageHandleFixture {
+    handle: LocalAgentHandle,
+    storage: Arc<crate::session::sqlite_storage::SqliteStorage>,
+    _temp_dir: tempfile::TempDir,
+}
+
 impl HandleFixture {
     async fn new() -> Self {
         Self::with_list_sessions(vec![]).await
@@ -96,6 +102,16 @@ impl HandleFixture {
         store
             .expect_delete_session()
             .returning(|_| Ok(()))
+            .times(0..);
+        store
+            .expect_create_task()
+            .returning(|mut task| {
+                task.id = 1;
+                if task.public_id.is_empty() {
+                    task.public_id = "task-test-1".to_string();
+                }
+                Ok(task)
+            })
             .times(0..);
 
         let store: Arc<dyn SessionStore> = Arc::new(store);
@@ -239,6 +255,43 @@ fn test_profile_metadata(
         },
         config_kind: None,
         fingerprint: None,
+    }
+}
+
+impl RealStorageHandleFixture {
+    async fn new() -> Self {
+        let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
+        let shared = SharedLlmProvider {
+            inner: provider,
+            tools: vec![].into_boxed_slice(),
+        };
+        let factory = Arc::new(TestProviderFactory { provider: shared });
+        let (plugin_registry, temp_dir) = mock_plugin_registry(factory).expect("plugin registry");
+
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("create storage"),
+        );
+
+        let mut builder = AgentConfigBuilder::new(
+            Arc::new(plugin_registry),
+            storage.session_store(),
+            storage.event_journal(),
+            LLMParams::new().provider("mock").model("mock-model"),
+        )
+        .with_tool_policy(ToolPolicy::ProviderOnly);
+
+        if let Some(repo) = storage.schedule_repository() {
+            builder = builder.with_schedule_repository(repo);
+        }
+
+        let config = Arc::new(builder.build());
+        Self {
+            handle: LocalAgentHandle::from_config(config),
+            storage,
+            _temp_dir: temp_dir,
+        }
     }
 }
 
