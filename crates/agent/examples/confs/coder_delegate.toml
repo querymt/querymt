@@ -196,6 +196,7 @@ Guidelines:
 - Use `shell` for file operations like copying, moving, or listing directory contents
 - Use `get_symbol` to get info about symbols and their metadata
 - Use `get_function` to read one or more functions
+- Use `find_symbol_references` to find definitions and references for symbols across files
 - Adapt your search approach based on the thoroughness level specified by the caller
 - Return file paths as absolute paths in your final response
 - For clear communication, avoid using emojis
