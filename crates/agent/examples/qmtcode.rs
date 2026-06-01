@@ -45,11 +45,11 @@ use querymt_agent::prelude::*;
 use querymt_agent::profiles::{
     DEFAULT_EMBEDDED_PROFILE_KEY, LocalProfileCatalog, ProfileCatalog, ProfileConfigKind,
     ProfileMetadata, ProfileRuntimeManager, ProfileSource, ensure_unique_profile_ids,
+    standard_embedded_profile_catalog_builder,
 };
 #[cfg(any(feature = "api", feature = "dashboard"))]
 use querymt_agent::server::ServerMode;
-use rust_embed::RustEmbed;
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[cfg(feature = "api")]
@@ -61,13 +61,6 @@ const DEFAULT_MESH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::f
 #[cfg(feature = "remote")]
 const DEFAULT_MESH_STREAM_RECONNECT_GRACE: std::time::Duration =
     std::time::Duration::from_secs(120);
-const EMBEDDED_SINGLE_CODER_CONFIG: &str = include_str!("confs/single_coder.toml");
-const EMBEDDED_CODER_DELEGATE_CONFIG: &str = include_str!("confs/coder_delegate.toml");
-
-#[derive(RustEmbed)]
-#[folder = "examples/prompts/"]
-struct EmbeddedPromptAssets;
-
 #[derive(Debug, Parser)]
 #[command(name = "qmtcode")]
 #[command(version = env!("QMT_BUILD_VERSION"))]
@@ -189,115 +182,6 @@ struct Cli {
     mesh_join: Option<String>,
 }
 
-fn embedded_profile_config(config_name: &str, config: &str) -> anyhow::Result<String> {
-    use anyhow::Context;
-
-    let mut value: toml::Value = toml::from_str(config)
-        .with_context(|| format!("Failed to parse embedded {config_name}"))?;
-    inline_embedded_system_prompts(&mut value, config_name)?;
-    toml::to_string(&value).with_context(|| format!("Failed to serialize embedded {config_name}"))
-}
-
-fn inline_embedded_system_prompts(
-    value: &mut toml::Value,
-    config_name: &str,
-) -> anyhow::Result<()> {
-    let root = value
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("Embedded {config_name} must be a TOML table"))?;
-
-    if let Some(agent) = root.get_mut("agent").and_then(toml::Value::as_table_mut)
-        && let Some(system) = agent.get_mut("system")
-    {
-        inline_system_prompt_value(system, config_name, "[agent].system")?;
-    }
-
-    if let Some(planner) = root.get_mut("planner").and_then(toml::Value::as_table_mut)
-        && let Some(system) = planner.get_mut("system")
-    {
-        inline_system_prompt_value(system, config_name, "[planner].system")?;
-    }
-
-    if let Some(delegates) = root
-        .get_mut("delegates")
-        .and_then(toml::Value::as_array_mut)
-    {
-        for (index, delegate) in delegates.iter_mut().enumerate() {
-            if let Some(system) = delegate
-                .as_table_mut()
-                .and_then(|delegate| delegate.get_mut("system"))
-            {
-                inline_system_prompt_value(
-                    system,
-                    config_name,
-                    &format!("[[delegates]][{index}].system"),
-                )?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn inline_system_prompt_value(
-    system: &mut toml::Value,
-    config_name: &str,
-    path: &str,
-) -> anyhow::Result<()> {
-    use anyhow::{Context, anyhow};
-
-    match system {
-        toml::Value::String(_) => Ok(()),
-        toml::Value::Array(parts) => {
-            for part in parts {
-                if let toml::Value::Table(table) = part
-                    && let Some(file_ref) = table.get("file").and_then(toml::Value::as_str)
-                {
-                    let asset_key = embedded_prompt_asset_key(file_ref).ok_or_else(|| {
-                        anyhow!("Unsupported embedded prompt path '{file_ref}' in {config_name}")
-                    })?;
-
-                    let embedded = EmbeddedPromptAssets::get(&asset_key).ok_or_else(|| {
-                        anyhow!("Embedded prompt '{file_ref}' not found under examples/prompts")
-                    })?;
-
-                    let prompt =
-                        String::from_utf8(embedded.data.into_owned()).with_context(|| {
-                            format!("Embedded prompt '{file_ref}' is not valid UTF-8")
-                        })?;
-
-                    *part = toml::Value::String(prompt);
-                }
-            }
-            Ok(())
-        }
-        _ => Err(anyhow!(
-            "Embedded {config_name} has unsupported {path} format"
-        )),
-    }
-}
-
-fn embedded_prompt_asset_key(file_ref: &str) -> Option<String> {
-    let joined = Path::new("confs").join(file_ref);
-    let mut normalized_parts: Vec<String> = Vec::new();
-
-    for component in joined.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized_parts.pop()?;
-            }
-            Component::Normal(part) => {
-                normalized_parts.push(part.to_string_lossy().into_owned());
-            }
-            Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-
-    let normalized = normalized_parts.join("/");
-    normalized.strip_prefix("prompts/").map(str::to_owned)
-}
-
 fn qmtcode_profile_catalog(profiles_dirs: &[PathBuf]) -> anyhow::Result<LocalProfileCatalog> {
     qmtcode_profile_catalog_with_user_dir(profiles_dirs, None)
 }
@@ -306,14 +190,7 @@ fn qmtcode_profile_catalog_with_user_dir(
     profiles_dirs: &[PathBuf],
     user_profiles_dir: Option<PathBuf>,
 ) -> anyhow::Result<LocalProfileCatalog> {
-    let embedded_single_coder =
-        embedded_profile_config("single_coder.toml", EMBEDDED_SINGLE_CODER_CONFIG)?;
-    let embedded_coder_delegate =
-        embedded_profile_config("coder_delegate.toml", EMBEDDED_CODER_DELEGATE_CONFIG)?;
-    let mut builder = LocalProfileCatalog::builder()
-        .include_embedded_default(false)
-        .embedded_profile_toml(embedded_single_coder)?
-        .embedded_profile_toml(embedded_coder_delegate)?;
+    let mut builder = standard_embedded_profile_catalog_builder()?;
 
     // ~/.qmt/profiles is the conventional user-local profile directory; missing dirs are ignored.
     builder = match user_profiles_dir {
@@ -826,95 +703,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
-
-    #[test]
-    fn embedded_config_inlines_system_prompts_exactly() {
-        let config = embedded_profile_config("single_coder.toml", EMBEDDED_SINGLE_CODER_CONFIG)
-            .expect("embedded config should load");
-        let value: toml::Value =
-            toml::from_str(&config).expect("embedded config should parse as TOML");
-
-        let system = value
-            .get("agent")
-            .and_then(toml::Value::as_table)
-            .and_then(|agent| agent.get("system"))
-            .and_then(toml::Value::as_array)
-            .expect("embedded config should contain [agent].system array");
-
-        let inlined: Vec<&str> = system
-            .iter()
-            .map(|part| part.as_str().expect("system part must be an inline string"))
-            .collect();
-
-        assert_eq!(
-            inlined,
-            vec![
-                include_str!("prompts/default_system.txt"),
-                include_str!("prompts/code_meta.jinja2"),
-            ]
-        );
-    }
-
-    #[test]
-    fn embedded_coder_delegate_inlines_planner_and_delegate_system_prompts() {
-        let config = embedded_profile_config("coder_delegate.toml", EMBEDDED_CODER_DELEGATE_CONFIG)
-            .expect("embedded config should load");
-        let value: toml::Value =
-            toml::from_str(&config).expect("embedded config should parse as TOML");
-
-        let planner_system = value
-            .get("planner")
-            .and_then(toml::Value::as_table)
-            .and_then(|planner| planner.get("system"))
-            .and_then(toml::Value::as_array)
-            .expect("embedded config should contain [planner].system array");
-        let planner_inlined: Vec<&str> = planner_system
-            .iter()
-            .map(|part| part.as_str().expect("system part must be an inline string"))
-            .collect();
-        assert_eq!(
-            planner_inlined,
-            vec![
-                include_str!("prompts/default_system.txt"),
-                include_str!("prompts/code_meta.jinja2"),
-            ]
-        );
-
-        let delegates = value
-            .get("delegates")
-            .and_then(toml::Value::as_array)
-            .expect("embedded config should contain delegates");
-        let coder_system = delegates[0]
-            .get("system")
-            .and_then(toml::Value::as_array)
-            .expect("coder delegate should contain system array");
-        assert_eq!(
-            coder_system[0]
-                .as_str()
-                .expect("system part must be an inline string"),
-            include_str!("prompts/default_system.txt")
-        );
-        assert!(
-            delegates[1]
-                .get("system")
-                .and_then(toml::Value::as_array)
-                .expect("explorer delegate should contain system array")[0]
-                .is_str()
-        );
-    }
-
-    #[test]
-    fn embedded_prompt_asset_key_rejects_path_escape() {
-        assert_eq!(
-            embedded_prompt_asset_key("../prompts/default_system.txt").as_deref(),
-            Some("default_system.txt")
-        );
-        assert_eq!(
-            embedded_prompt_asset_key("../prompts/code_meta.jinja2").as_deref(),
-            Some("code_meta.jinja2")
-        );
-        assert!(embedded_prompt_asset_key("../../outside.txt").is_none());
-    }
 
     #[test]
     fn profile_args_reject_explicit_config_and_profile() {

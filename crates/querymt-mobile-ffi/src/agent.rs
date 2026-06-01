@@ -7,7 +7,12 @@ use crate::state;
 use crate::types::FfiErrorCode;
 use querymt::plugin::host::PluginRegistry;
 use querymt_agent::config::{Config, ConfigSource};
+use querymt_agent::profiles::{
+    DEFAULT_EMBEDDED_PROFILE_KEY, LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager,
+    standard_embedded_profile_catalog_builder,
+};
 use std::ffi::CStr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Parse inline TOML config using the shared `querymt_agent::config::load_config`
@@ -110,6 +115,20 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
         session_mcp_attachment_source: Some(session_mcp_source),
     };
 
+    let profile_catalog =
+        build_mobile_profile_catalog(resolve_mobile_profiles_dir()).map_err(|e| {
+            set_last_error(
+                FfiErrorCode::RuntimeError,
+                format!("Failed to build profile catalog: {:#}", e),
+            );
+            FfiErrorCode::RuntimeError
+        })?;
+    let profile_manager = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+        Arc::new(profile_catalog) as Arc<dyn ProfileCatalog>,
+        DEFAULT_EMBEDDED_PROFILE_KEY,
+        infra.clone(),
+    ));
+
     let agent = match config {
         Config::Single(single) => {
             querymt_agent::api::Agent::from_single_config_with_infra(single, infra)
@@ -138,6 +157,17 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
 
     let (handle, reused_runtime) = state::attach_or_insert_runtime_agent(agent, storage);
 
+    let inner = state::with_agent_read(handle, |record| Ok(record.agent.inner().clone()))?;
+    inner.set_profiles(profile_manager.clone());
+    match profile_manager.list_profiles().await {
+        Ok(profiles) => log::info!(
+            "ffi.profiles.init: catalog ready profiles={} active={}",
+            profiles.len(),
+            DEFAULT_EMBEDDED_PROFILE_KEY
+        ),
+        Err(e) => log::warn!("ffi.profiles.init: failed to list profile catalog: {e:#}"),
+    }
+
     if reused_runtime {
         log::info!(
             "ffi.agent.attach: attached to existing process runtime (agent_handle={handle})"
@@ -165,8 +195,8 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
             Ok(())
         })?;
 
-        let inner = state::with_agent_read(handle, |record| Ok(record.agent.inner().clone()))?;
         if let Some(mesh) = inner.mesh() {
+            profile_manager.set_mesh(mesh.clone()).await;
             let refs =
                 querymt_agent::agent::remote::spawn_and_register_local_mesh_actors_with_name(
                     inner.as_ref(),
@@ -179,6 +209,35 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
     }
 
     Ok(handle)
+}
+
+fn resolve_mobile_profiles_dir() -> Option<PathBuf> {
+    match querymt_utils::providers::config_dir() {
+        Ok(config_dir) => {
+            let profiles_dir = config_dir.join("profiles");
+            log::info!(
+                "ffi.profiles.init: using mobile profile dir {}",
+                profiles_dir.display()
+            );
+            Some(profiles_dir)
+        }
+        Err(e) => {
+            log::warn!(
+                "ffi.profiles.init: config dir unavailable, using embedded profiles only: {e:#}"
+            );
+            None
+        }
+    }
+}
+
+fn build_mobile_profile_catalog(
+    profiles_dir: Option<PathBuf>,
+) -> anyhow::Result<LocalProfileCatalog> {
+    let mut builder = standard_embedded_profile_catalog_builder()?;
+    if let Some(dir) = profiles_dir {
+        builder = builder.default_user_dir(dir);
+    }
+    Ok(builder.build())
 }
 
 pub fn shutdown_agent_inner(agent_handle: u64) -> Result<(), FfiErrorCode> {
@@ -250,4 +309,49 @@ async fn create_storage_backend(
         })?;
 
     Ok(Arc::new(storage))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mobile_profile_catalog_includes_embedded_default() {
+        let catalog = build_mobile_profile_catalog(None).expect("catalog should build");
+        let profiles = catalog.list_profiles().await.expect("list profiles");
+
+        assert_eq!(profiles.len(), 2);
+        assert!(
+            profiles
+                .iter()
+                .any(|profile| profile.id == DEFAULT_EMBEDDED_PROFILE_KEY),
+            "mobile catalog should include the embedded default profile"
+        );
+        assert!(
+            profiles
+                .iter()
+                .any(|profile| profile.id == "coder-delegate"),
+            "mobile catalog should include the embedded coder delegate profile"
+        );
+    }
+
+    #[tokio::test]
+    async fn mobile_profile_catalog_skips_missing_config_profiles_dir() {
+        let profiles_dir = PathBuf::from("/path/that/should/not/exist/querymt/profiles");
+        let catalog =
+            build_mobile_profile_catalog(Some(profiles_dir)).expect("catalog should build");
+        let profiles = catalog.list_profiles().await.expect("list profiles");
+
+        assert_eq!(profiles.len(), 2);
+        assert!(
+            profiles
+                .iter()
+                .any(|profile| profile.id == DEFAULT_EMBEDDED_PROFILE_KEY)
+        );
+        assert!(
+            profiles
+                .iter()
+                .any(|profile| profile.id == "coder-delegate")
+        );
+    }
 }

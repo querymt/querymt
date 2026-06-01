@@ -54,6 +54,7 @@ impl AgentServer {
         if let Some(mesh) = self.agent.mesh() {
             profiles.set_mesh_handle(mesh);
         }
+        self.agent.set_profiles(profiles.clone());
         self.profiles = Some(profiles);
         self
     }
