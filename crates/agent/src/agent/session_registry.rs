@@ -12,6 +12,7 @@ use crate::agent::remote::runtime_handle::MeshRuntimeHandle;
 use crate::agent::remote::scope::{MeshScopeId, scoped_event_relay, scoped_session};
 use crate::agent::session_actor::SessionActor;
 use crate::error::AgentError;
+use crate::profiles::ProfileMetadata;
 use agent_client_protocol::schema::{
     Error, ListSessionsRequest, ListSessionsResponse, McpServer, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOption, SessionInfo, SessionMode,
@@ -53,10 +54,42 @@ pub fn config_options(
     mode: AgentMode,
     reasoning_effort: Option<querymt::chat::ReasoningEffort>,
 ) -> Vec<SessionConfigOption> {
+    config_options_with_profiles(mode, reasoning_effort, None, &[])
+}
+
+pub fn config_options_with_profiles(
+    mode: AgentMode,
+    reasoning_effort: Option<querymt::chat::ReasoningEffort>,
+    current_profile_id: Option<&str>,
+    profiles: &[ProfileMetadata],
+) -> Vec<SessionConfigOption> {
     let effort_value = reasoning_effort
         .map(|e| e.to_string())
         .unwrap_or_else(|| "auto".to_string());
-    vec![
+    let mut options = Vec::new();
+
+    if !profiles.is_empty() {
+        let profile_value = current_profile_id
+            .map(str::to_string)
+            .unwrap_or_else(|| profiles[0].id.clone());
+        let profile_options: Vec<SessionConfigSelectOption> = profiles
+            .iter()
+            .map(|profile| {
+                let mut option =
+                    SessionConfigSelectOption::new(profile.id.clone(), profile.name.clone());
+                if let Some(description) = profile.description.as_deref() {
+                    option = option.description(description);
+                }
+                option
+            })
+            .collect();
+        options.push(
+            SessionConfigOption::select("profile", "Profile", profile_value, profile_options)
+                .description("Controls the active profile for this session"),
+        );
+    }
+
+    options.extend([
         SessionConfigOption::select(
             "mode",
             "Session Mode",
@@ -89,7 +122,9 @@ pub fn config_options(
         )
         .description("Controls reasoning depth for this session")
         .category(SessionConfigOptionCategory::ThoughtLevel),
-    ]
+    ]);
+
+    options
 }
 
 /// Controls how a materialized session actor is integrated with remote infra.
@@ -1178,6 +1213,7 @@ mod tests {
         assert!(names.contains(&"req-server"));
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn select_relay_scope_uses_preferred_scope_when_present() {
         let scopes = vec![
@@ -1200,6 +1236,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn select_relay_scope_falls_back_to_first_scope_when_preferred_missing() {
         let scopes = vec![

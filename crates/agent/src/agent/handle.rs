@@ -27,8 +27,8 @@ use agent_client_protocol::schema::{
     ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
     LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    ResumeSessionRequest, ResumeSessionResponse, SessionInfo, SetSessionModelRequest,
-    SetSessionModelResponse,
+    ResumeSessionRequest, ResumeSessionResponse, SessionConfigOption, SessionInfo,
+    SetSessionModelRequest, SetSessionModelResponse,
 };
 use anyhow::Result;
 use arc_swap::ArcSwap;
@@ -267,6 +267,49 @@ impl LocalAgentHandle {
         self.profiles.load_full().as_ref().clone()
     }
 
+    async fn session_config_options(
+        &self,
+        session_id: Option<&str>,
+        mode: AgentMode,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<Vec<SessionConfigOption>, Error> {
+        let Some(session_id) = session_id else {
+            return Ok(crate::agent::session_registry::config_options(
+                mode,
+                reasoning_effort,
+            ));
+        };
+
+        let Some(profiles) = self.profiles() else {
+            return Ok(crate::agent::session_registry::config_options(
+                mode,
+                reasoning_effort,
+            ));
+        };
+
+        let Some(binding) = profiles.session_binding(session_id).await else {
+            return Ok(crate::agent::session_registry::config_options(
+                mode,
+                reasoning_effort,
+            ));
+        };
+
+        let profile_list = profiles.list_profiles().await.map_err(|err| {
+            Error::internal_error().data(serde_json::json!({
+                "message": format_prefixed_error_chain("Failed to list profiles", &err),
+            }))
+        })?;
+
+        Ok(
+            crate::agent::session_registry::config_options_with_profiles(
+                mode,
+                reasoning_effort,
+                Some(binding.profile_id.as_str()),
+                &profile_list,
+            ),
+        )
+    }
+
     /// Acquire the registry lock with tracing for wait and hold durations.
     ///
     /// Returns a guard after recording `registry.lock.wait_ms` for lock acquisition.
@@ -456,12 +499,17 @@ impl LocalAgentHandle {
         // Get current mode for response
         let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
 
-        Ok(NewSessionResponse::new(session_id)
-            .modes(crate::agent::session_registry::mode_state(current_mode))
-            .config_options(crate::agent::session_registry::config_options(
+        let config_options = self
+            .session_config_options(
+                Some(&session_id),
                 current_mode,
                 **self.config.default_reasoning_effort.load(),
-            )))
+            )
+            .await?;
+
+        Ok(NewSessionResponse::new(session_id)
+            .modes(crate::agent::session_registry::mode_state(current_mode))
+            .config_options(config_options))
     }
 
     /// Load an existing session. MCP attachments are resolved internally by
@@ -489,12 +537,16 @@ impl LocalAgentHandle {
         if let Some(session_ref) = existing_session_ref {
             // Registry lock is now dropped, safe to make async actor call
             let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
-            return Ok(LoadSessionResponse::new()
-                .modes(crate::agent::session_registry::mode_state(current_mode))
-                .config_options(crate::agent::session_registry::config_options(
+            let config_options = self
+                .session_config_options(
+                    Some(&session_id),
                     current_mode,
                     **self.config.default_reasoning_effort.load(),
-                )));
+                )
+                .await?;
+            return Ok(LoadSessionResponse::new()
+                .modes(crate::agent::session_registry::mode_state(current_mode))
+                .config_options(config_options));
         }
 
         // Phase 1: Prepare session (heavy work, NO registry lock held)
@@ -528,12 +580,17 @@ impl LocalAgentHandle {
         // Get current mode for response
         let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
 
-        Ok(LoadSessionResponse::new()
-            .modes(crate::agent::session_registry::mode_state(current_mode))
-            .config_options(crate::agent::session_registry::config_options(
+        let config_options = self
+            .session_config_options(
+                Some(&session_id),
                 current_mode,
                 **self.config.default_reasoning_effort.load(),
-            )))
+            )
+            .await?;
+
+        Ok(LoadSessionResponse::new()
+            .modes(crate::agent::session_registry::mode_state(current_mode))
+            .config_options(config_options))
     }
 
     /// Gracefully shutdown the agent and all background tasks.
@@ -2410,12 +2467,16 @@ impl SendAgent for LocalAgentHandle {
                 .await
                 .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
-            return Ok(ResumeSessionResponse::new()
-                .modes(crate::agent::session_registry::mode_state(current_mode))
-                .config_options(crate::agent::session_registry::config_options(
+            let config_options = self
+                .session_config_options(
+                    Some(&session_id),
                     current_mode,
                     **self.config.default_reasoning_effort.load(),
-                )));
+                )
+                .await?;
+            return Ok(ResumeSessionResponse::new()
+                .modes(crate::agent::session_registry::mode_state(current_mode))
+                .config_options(config_options));
         }
 
         // Phase 1: Prepare session (heavy work, NO registry lock held)
@@ -2449,12 +2510,17 @@ impl SendAgent for LocalAgentHandle {
         // Get current mode for response
         let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
 
-        Ok(ResumeSessionResponse::new()
-            .modes(crate::agent::session_registry::mode_state(current_mode))
-            .config_options(crate::agent::session_registry::config_options(
+        let config_options = self
+            .session_config_options(
+                Some(&session_id),
                 current_mode,
                 **self.config.default_reasoning_effort.load(),
-            )))
+            )
+            .await?;
+
+        Ok(ResumeSessionResponse::new()
+            .modes(crate::agent::session_registry::mode_state(current_mode))
+            .config_options(config_options))
     }
 
     async fn close_session(&self, req: CloseSessionRequest) -> Result<CloseSessionResponse, Error> {
@@ -2537,7 +2603,6 @@ impl SendAgent for LocalAgentHandle {
         &self,
         req: agent_client_protocol::schema::SetSessionConfigOptionRequest,
     ) -> Result<agent_client_protocol::schema::SetSessionConfigOptionResponse, Error> {
-        use crate::agent::session_registry::config_options;
         use agent_client_protocol::schema::SessionConfigOptionValue;
 
         let config_id = req.config_id.0.as_ref();
@@ -2612,9 +2677,69 @@ impl SendAgent for LocalAgentHandle {
                 let mode = session_ref.get_mode().await.unwrap_or(AgentMode::Build);
                 let effort = session_ref.get_reasoning_effort().await.ok().flatten();
 
+                let config_options = self
+                    .session_config_options(Some(&session_id), mode, effort)
+                    .await?;
                 Ok(
                     agent_client_protocol::schema::SetSessionConfigOptionResponse::new(
-                        config_options(mode, effort),
+                        config_options,
+                    ),
+                )
+            }
+            "profile" => {
+                let profile_id = value_id.0.to_string();
+                let profiles = self.profiles().ok_or_else(|| {
+                    Error::invalid_params().data(serde_json::json!({
+                        "message": "profiles are not configured",
+                    }))
+                })?;
+                let available_profiles = profiles.list_profiles().await.map_err(|err| {
+                    Error::internal_error().data(serde_json::json!({
+                        "message": format_prefixed_error_chain("Failed to list profiles", &err),
+                    }))
+                })?;
+                if !available_profiles
+                    .iter()
+                    .any(|profile| profile.id == profile_id)
+                {
+                    return Err(Error::invalid_params().data(serde_json::json!({
+                        "message": format!("unknown profile: {profile_id}"),
+                        "profileId": profile_id,
+                    })));
+                }
+
+                let Some(binding) = profiles.session_binding(&session_id).await else {
+                    return Err(Error::invalid_params().data(serde_json::json!({
+                        "message": "cannot change profile for an existing unbound session",
+                        "sessionId": session_id,
+                    })));
+                };
+                if binding.profile_id != profile_id {
+                    return Err(Error::invalid_params().data(serde_json::json!({
+                        "message": "cannot change profile for an existing session",
+                        "sessionId": session_id,
+                        "currentProfileId": binding.profile_id,
+                        "requestedProfileId": profile_id,
+                    })));
+                }
+
+                let session_ref = {
+                    let registry = self.registry.lock().await;
+                    registry.get(&session_id).cloned().ok_or_else(|| {
+                        Error::invalid_params().data(serde_json::json!({
+                            "message": "unknown session",
+                            "sessionId": session_id,
+                        }))
+                    })?
+                };
+                let mode = session_ref.get_mode().await.unwrap_or(AgentMode::Build);
+                let effort = session_ref.get_reasoning_effort().await.ok().flatten();
+                let config_options = self
+                    .session_config_options(Some(&session_id), mode, effort)
+                    .await?;
+                Ok(
+                    agent_client_protocol::schema::SetSessionConfigOptionResponse::new(
+                        config_options,
                     ),
                 )
             }
@@ -2636,9 +2761,12 @@ impl SendAgent for LocalAgentHandle {
                 session_ref.set_mode(mode).await.map_err(Error::from)?;
 
                 let effort = session_ref.get_reasoning_effort().await.ok().flatten();
+                let config_options = self
+                    .session_config_options(Some(&session_id), mode, effort)
+                    .await?;
                 Ok(
                     agent_client_protocol::schema::SetSessionConfigOptionResponse::new(
-                        config_options(mode, effort),
+                        config_options,
                     ),
                 )
             }
@@ -2675,10 +2803,13 @@ impl SendAgent for LocalAgentHandle {
                     .map_err(Error::from)?;
 
                 let mode = session_ref.get_mode().await.unwrap_or(AgentMode::Build);
+                let config_options = self
+                    .session_config_options(Some(&session_id), mode, effort)
+                    .await?;
 
                 Ok(
                     agent_client_protocol::schema::SetSessionConfigOptionResponse::new(
-                        config_options(mode, effort),
+                        config_options,
                     ),
                 )
             }
@@ -2715,46 +2846,6 @@ impl SendAgent for LocalAgentHandle {
                     Error::from(crate::error::AgentError::Serialization(e.to_string()))
                 })?;
                 Ok(ExtResponse::new(Arc::from(raw)))
-            }
-            "querymt/profiles" => ext_json_response(&self.profiles_response().await?),
-            "querymt/profile/setActive" => {
-                #[derive(serde::Deserialize)]
-                struct SetActiveProfileRequest {
-                    #[serde(alias = "profileId")]
-                    profile_id: String,
-                }
-
-                let parsed: SetActiveProfileRequest = serde_json::from_str(req.params.get())
-                    .map_err(|e| {
-                        Error::invalid_params().data(serde_json::json!({
-                            "message": format!("invalid profile setActive params: {e}"),
-                        }))
-                    })?;
-                let profile_id = parsed.profile_id.trim();
-                if profile_id.is_empty() {
-                    return Err(Error::invalid_params().data(serde_json::json!({
-                        "message": "profile_id must be a non-empty string",
-                    })));
-                }
-
-                let profiles = self.profiles().ok_or_else(|| {
-                    Error::invalid_params().data(serde_json::json!({
-                        "message": "profiles are not configured",
-                    }))
-                })?;
-                profiles
-                    .set_active_profile(profile_id)
-                    .await
-                    .map_err(|err| {
-                        Error::internal_error().data(serde_json::json!({
-                            "message": format_prefixed_error_chain(
-                                "Failed to set active profile",
-                                &err,
-                            ),
-                        }))
-                    })?;
-
-                ext_json_response(&self.profiles_response().await?)
             }
             "querymt/refreshModels" => {
                 // Refreshes now stay fully backgrounded so slow provider/model scans
@@ -3412,48 +3503,6 @@ fn format_prefixed_error_chain(prefix: &str, err: &anyhow::Error) -> String {
     format!("{prefix}: {}", format_error_chain(err))
 }
 
-impl LocalAgentHandle {
-    async fn profiles_response(&self) -> Result<serde_json::Value, Error> {
-        let Some(profiles) = self.profiles() else {
-            return Ok(serde_json::json!({
-                "profiles": [],
-                "active_profile_id": serde_json::Value::Null,
-            }));
-        };
-
-        let profile_infos: Vec<serde_json::Value> = profiles
-            .list_profiles()
-            .await
-            .map(|profiles| {
-                profiles
-                    .into_iter()
-                    .map(|metadata| {
-                        serde_json::json!({
-                            "id": metadata.id,
-                            "name": metadata.name,
-                            "description": metadata.description,
-                            "tags": metadata.tags,
-                            "config_kind": metadata.config_kind.map(|kind| kind.storage_label()),
-                            "source": metadata.source.storage_label(),
-                            "fingerprint": metadata.fingerprint,
-                        })
-                    })
-                    .collect()
-            })
-            .map_err(|err| {
-                Error::internal_error().data(serde_json::json!({
-                    "message": format_prefixed_error_chain("Failed to list profiles", &err),
-                }))
-            })?;
-        let active_profile_id = profiles.active_profile_id().await;
-
-        Ok(serde_json::json!({
-            "profiles": profile_infos,
-            "active_profile_id": active_profile_id,
-        }))
-    }
-}
-
 /// Helper to build an `ExtResponse` from a serializable value.
 fn ext_json_response<T: serde::Serialize>(
     value: &T,
@@ -3495,7 +3544,6 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
-    #[cfg(feature = "remote")]
     use kameo::actor::Spawn;
 
     // ── Shared fixture ───────────────────────────────────────────────────────
@@ -3607,8 +3655,120 @@ mod tests {
         Arc::from(serde_json::value::RawValue::from_string(value.to_string()).unwrap())
     }
 
+    const ALPHA_PROFILE_TOML: &str = r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "alpha"
+"#;
+
+    const BETA_PROFILE_TOML: &str = r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "beta"
+"#;
+
     fn write_profile(dir: &Path, name: &str, content: &str) {
         std::fs::write(dir.join(name), content).expect("profile should be written");
+    }
+
+    async fn profile_fixture_with_files(
+        files: &[(&str, &str)],
+    ) -> (HandleFixture, tempfile::TempDir) {
+        let profile_dir = tempfile::tempdir().expect("profile dir");
+        for (name, content) in files {
+            write_profile(profile_dir.path(), name, content);
+        }
+        let f = HandleFixture::new()
+            .await
+            .with_profiles("alpha", profile_dir.path())
+            .await;
+        (f, profile_dir)
+    }
+
+    async fn bind_test_profile(f: &HandleFixture, session_id: &str, profile_id: &str) {
+        f.handle
+            .profiles()
+            .unwrap()
+            .set_session_binding(
+                session_id,
+                test_profile_metadata(profile_id, profile_id, None).session_binding(),
+            )
+            .await;
+    }
+
+    async fn register_test_session(f: &HandleFixture, session_id: &str) {
+        let actor = SessionActor::new(
+            f.handle.config.clone(),
+            session_id.to_string(),
+            crate::agent::core::SessionRuntime::new(
+                None,
+                std::collections::HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        );
+        let actor_ref = SessionActor::spawn(actor);
+        f.handle
+            .registry
+            .lock()
+            .await
+            .insert(session_id.to_string(), actor_ref);
+    }
+
+    async fn profile_config_options(
+        f: &HandleFixture,
+        session_id: Option<&str>,
+    ) -> Vec<SessionConfigOption> {
+        f.handle
+            .session_config_options(
+                session_id,
+                AgentMode::Build,
+                **f.handle.config.default_reasoning_effort.load(),
+            )
+            .await
+            .expect("config options")
+    }
+
+    fn select_options(
+        option: &SessionConfigOption,
+    ) -> &[agent_client_protocol::schema::SessionConfigSelectOption] {
+        match &option.kind {
+            agent_client_protocol::schema::SessionConfigKind::Select(select) => {
+                match &select.options {
+                    agent_client_protocol::schema::SessionConfigSelectOptions::Ungrouped(
+                        options,
+                    ) => options,
+                    _ => panic!("expected ungrouped select config option"),
+                }
+            }
+            _ => panic!("expected select config option"),
+        }
+    }
+
+    fn select_option_values(option: &SessionConfigOption) -> Vec<String> {
+        select_options(option)
+            .iter()
+            .map(|option| option.value.0.to_string())
+            .collect()
+    }
+
+    fn test_profile_metadata(
+        id: &str,
+        name: &str,
+        description: Option<&str>,
+    ) -> crate::profiles::ProfileMetadata {
+        crate::profiles::ProfileMetadata {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: description.map(str::to_string),
+            tags: Vec::new(),
+            source: crate::profiles::ProfileSource::EmbeddedToml {
+                key: id.to_string(),
+            },
+            config_kind: None,
+            fingerprint: None,
+        }
     }
 
     impl LocalAgentHandle {
@@ -3848,6 +4008,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_profile_config_option_absent_without_profiles() {
+        let f = HandleFixture::new().await;
+
+        let options = profile_config_options(&f, None).await;
+
+        assert!(
+            !options
+                .iter()
+                .any(|option| option.id.0.as_ref() == "profile")
+        );
+        assert_eq!(options[0].id.0.as_ref(), "mode");
+    }
+
+    #[tokio::test]
+    async fn test_profile_config_option_includes_configured_profiles() {
+        let profile_dir = tempfile::tempdir().expect("profile dir");
+        write_profile(
+            profile_dir.path(),
+            "alpha.toml",
+            r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "alpha"
+"#,
+        );
+        write_profile(
+            profile_dir.path(),
+            "beta.toml",
+            r#"
+[profile]
+name = "Beta"
+description = "Beta profile"
+
+[agent]
+provider = "test"
+model = "test-model"
+system = "beta"
+"#,
+        );
+        let f = HandleFixture::new()
+            .await
+            .with_profiles("alpha", profile_dir.path())
+            .await;
+        register_test_session(&f, "session-1").await;
+        bind_test_profile(&f, "session-1", "alpha").await;
+
+        let options = profile_config_options(&f, Some("session-1")).await;
+
+        assert_eq!(options[0].id.0.as_ref(), "profile");
+        assert_eq!(select_option_values(&options[0]), vec!["alpha", "beta"]);
+        assert_eq!(options[1].id.0.as_ref(), "mode");
+    }
+
+    #[tokio::test]
+    async fn test_profile_config_option_omits_unbound_sessions() {
+        let (f, _profile_dir) =
+            profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
+        register_test_session(&f, "session-1").await;
+
+        let options = profile_config_options(&f, Some("session-1")).await;
+
+        assert!(
+            !options
+                .iter()
+                .any(|option| option.id.0.as_ref() == "profile")
+        );
+        assert_eq!(options[0].id.0.as_ref(), "mode");
+    }
+
+    #[test]
+    fn test_config_options_with_profiles_uses_profile_metadata() {
+        let profiles = vec![
+            test_profile_metadata("alpha", "Alpha", None),
+            test_profile_metadata("beta", "Beta", Some("Beta profile")),
+        ];
+
+        let options = crate::agent::session_registry::config_options_with_profiles(
+            AgentMode::Build,
+            None,
+            Some("beta"),
+            &profiles,
+        );
+
+        assert_eq!(options[0].id.0.as_ref(), "profile");
+        let select = match &options[0].kind {
+            agent_client_protocol::schema::SessionConfigKind::Select(select) => select,
+            _ => panic!("expected select config option"),
+        };
+        assert_eq!(select.current_value.0.as_ref(), "beta");
+        let profile_options = select_options(&options[0]);
+        assert_eq!(profile_options[1].name, "Beta");
+        assert_eq!(
+            profile_options[1].description.as_deref(),
+            Some("Beta profile")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_profile_config_option_rejects_unknown_profile() {
+        let (f, _profile_dir) =
+            profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
+        register_test_session(&f, "session-1").await;
+        bind_test_profile(&f, "session-1", "alpha").await;
+
+        let req = agent_client_protocol::schema::SetSessionConfigOptionRequest::new(
+            "session-1",
+            "profile",
+            "missing",
+        );
+
+        let err = f
+            .handle
+            .set_session_config_option(req)
+            .await
+            .expect_err("unknown profile should fail");
+        assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+    }
+
+    #[tokio::test]
+    async fn test_set_profile_config_option_rejects_different_bound_profile() {
+        let (f, _profile_dir) = profile_fixture_with_files(&[
+            ("alpha.toml", ALPHA_PROFILE_TOML),
+            ("beta.toml", BETA_PROFILE_TOML),
+        ])
+        .await;
+        register_test_session(&f, "session-1").await;
+        bind_test_profile(&f, "session-1", "alpha").await;
+
+        let req = agent_client_protocol::schema::SetSessionConfigOptionRequest::new(
+            "session-1",
+            "profile",
+            "beta",
+        );
+
+        let err = f
+            .handle
+            .set_session_config_option(req)
+            .await
+            .expect_err("different profile should fail");
+        assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+    }
+
+    #[tokio::test]
+    async fn test_set_profile_config_option_accepts_same_bound_profile() {
+        let (f, _profile_dir) =
+            profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
+        register_test_session(&f, "session-1").await;
+        bind_test_profile(&f, "session-1", "alpha").await;
+        let req = agent_client_protocol::schema::SetSessionConfigOptionRequest::new(
+            "session-1",
+            "profile",
+            "alpha",
+        );
+
+        let resp = f
+            .handle
+            .set_session_config_option(req)
+            .await
+            .expect("same profile should succeed");
+
+        assert_eq!(resp.config_options[0].id.0.as_ref(), "profile");
+        assert!(
+            resp.config_options
+                .iter()
+                .any(|option| option.id.0.as_ref() == "mode")
+        );
+        assert!(
+            resp.config_options
+                .iter()
+                .any(|option| option.id.0.as_ref() == "reasoning_effort")
+        );
+    }
+
+    #[tokio::test]
     async fn test_unknown_ext_method_returns_method_not_found() {
         let f = HandleFixture::new().await;
         let null_params = std::sync::Arc::from(
@@ -3875,125 +4210,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_querymt_profiles_ext_method_returns_empty_without_profiles() {
+    async fn test_querymt_profile_ext_methods_return_method_not_found() {
         let f = HandleFixture::new().await;
-        let req =
-            agent_client_protocol::schema::ExtRequest::new("querymt/profiles", raw_params("null"));
-
-        let resp = f.handle.ext_method(req).await.expect("profiles ext_method");
-        let value: serde_json::Value = serde_json::from_str(resp.0.get()).expect("valid JSON");
-        assert_eq!(value["profiles"].as_array().unwrap().len(), 0);
-        assert!(value["active_profile_id"].is_null());
-    }
-
-    #[tokio::test]
-    async fn test_querymt_profiles_ext_method_returns_configured_profiles() {
-        let profile_dir = tempfile::tempdir().expect("profile dir");
-        write_profile(
-            profile_dir.path(),
-            "alpha.toml",
-            r#"
-[agent]
-provider = "test"
-model = "test-model"
-system = "alpha"
-"#,
-        );
-        write_profile(
-            profile_dir.path(),
-            "beta.toml",
-            r#"
-[profile]
-name = "Beta"
-description = "Beta profile"
-tags = ["fast"]
-
-[agent]
-provider = "test"
-model = "test-model"
-system = "beta"
-"#,
-        );
-        let f = HandleFixture::new()
-            .await
-            .with_profiles("alpha", profile_dir.path())
-            .await;
-        let req =
-            agent_client_protocol::schema::ExtRequest::new("querymt/profiles", raw_params("{}"));
-
-        let resp = f.handle.ext_method(req).await.expect("profiles ext_method");
-        let value: serde_json::Value = serde_json::from_str(resp.0.get()).expect("valid JSON");
-        let profiles = value["profiles"].as_array().expect("profiles array");
-        let ids: HashSet<_> = profiles
-            .iter()
-            .map(|profile| profile["id"].as_str().unwrap())
-            .collect();
-        assert_eq!(ids, HashSet::from(["alpha", "beta"]));
-        assert_eq!(value["active_profile_id"], "alpha");
-        let beta = profiles
-            .iter()
-            .find(|profile| profile["id"] == "beta")
-            .expect("beta profile");
-        assert_eq!(beta["name"], "Beta");
-        assert_eq!(beta["description"], "Beta profile");
-    }
-
-    #[tokio::test]
-    async fn test_querymt_profile_set_active_ext_method_switches_active_profile() {
-        let profile_dir = tempfile::tempdir().expect("profile dir");
-        write_profile(
-            profile_dir.path(),
-            "alpha.toml",
-            r#"
-[agent]
-provider = "test"
-model = "test-model"
-system = "alpha"
-"#,
-        );
-        write_profile(
-            profile_dir.path(),
-            "beta.toml",
-            r#"
-[agent]
-provider = "test"
-model = "test-model"
-system = "beta"
-"#,
-        );
-        let f = HandleFixture::new()
-            .await
-            .with_profiles("alpha", profile_dir.path())
-            .await;
-        let req = agent_client_protocol::schema::ExtRequest::new(
-            "querymt/profile/setActive",
-            raw_params(r#"{"profile_id":"beta"}"#),
-        );
-
-        let resp = f
-            .handle
-            .ext_method(req)
-            .await
-            .expect("setActive ext_method");
-        let value: serde_json::Value = serde_json::from_str(resp.0.get()).expect("valid JSON");
-        assert_eq!(value["active_profile_id"], "beta");
-        assert_eq!(value["profiles"].as_array().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_querymt_profile_set_active_ext_method_rejects_missing_profile_id() {
-        let f = HandleFixture::new().await;
-        let req = agent_client_protocol::schema::ExtRequest::new(
-            "querymt/profile/setActive",
-            raw_params("{}"),
-        );
-
-        let err = f
-            .handle
-            .ext_method(req)
-            .await
-            .expect_err("missing profile_id should fail");
-        assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+        for method in ["querymt/profiles", "querymt/profile/setActive"] {
+            let req = agent_client_protocol::schema::ExtRequest::new(method, raw_params("null"));
+            let err = f
+                .handle
+                .ext_method(req)
+                .await
+                .expect_err("profile ext_method should be removed");
+            assert_eq!(err.code, agent_client_protocol::ErrorCode::MethodNotFound);
+        }
     }
 
     #[tokio::test]
