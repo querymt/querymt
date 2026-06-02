@@ -179,4 +179,3 @@ impl LocalAgentHandle {
         session_ref.redo().await
     }
 }
-

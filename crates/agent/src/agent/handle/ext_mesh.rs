@@ -1,5 +1,5 @@
-use super::*;
 use super::utils::ext_json_response;
+use super::*;
 
 impl LocalAgentHandle {
     pub(super) async fn handle_ext_mesh_status(&self) -> Result<ExtResponse, Error> {
@@ -47,7 +47,8 @@ impl LocalAgentHandle {
                 })?;
 
             let mesh = self.mesh().ok_or_else(|| {
-                Error::internal_error().data(serde_json::json!({ "error": "mesh not bootstrapped" }))
+                Error::internal_error()
+                    .data(serde_json::json!({ "error": "mesh not bootstrapped" }))
             })?;
             let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
             let mesh_id = crate::agent::remote::invite::mesh_id_for(
@@ -64,14 +65,14 @@ impl LocalAgentHandle {
                 })?;
             }
 
-            return ext_json_response(&serde_json::json!({
+            ext_json_response(&serde_json::json!({
                 "joined": true,
                 "peer_id": runtime.peer_id().to_string(),
                 "mesh_id": mesh_id,
                 "mesh_name": invite.grant.mesh_name,
                 "inviter_peer_id": invite.grant.inviter_peer_id,
                 "already_joined": already_joined,
-            }));
+            }))
         }
 
         #[cfg(not(feature = "remote"))]
@@ -97,7 +98,7 @@ impl LocalAgentHandle {
                     })
                 })
                 .collect::<Vec<_>>();
-            return ext_json_response(&serde_json::json!({ "nodes": nodes }));
+            ext_json_response(&serde_json::json!({ "nodes": nodes }))
         }
 
         #[cfg(not(feature = "remote"))]
@@ -106,7 +107,10 @@ impl LocalAgentHandle {
         }
     }
 
-    pub(super) async fn handle_ext_mesh_create_invite(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
+    pub(super) async fn handle_ext_mesh_create_invite(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
         #[cfg_attr(not(feature = "remote"), allow(dead_code))]
         #[derive(serde::Deserialize, Default)]
         struct CreateInviteReq {
@@ -166,14 +170,14 @@ impl LocalAgentHandle {
 
             let qr_code = crate::agent::remote::qr::render_to_terminal(&invite.to_url());
 
-            return ext_json_response(&serde_json::json!({
+            ext_json_response(&serde_json::json!({
                 "inviteId": invite.grant.invite_id,
                 "url": invite.to_url(),
                 "qrCode": qr_code,
                 "expiresAt": invite.grant.expires_at,
                 "maxUses": invite.grant.max_uses,
                 "meshName": parsed.mesh_name,
-            }));
+            }))
         }
 
         #[cfg(not(feature = "remote"))]
@@ -216,7 +220,7 @@ impl LocalAgentHandle {
                 Vec::new()
             };
 
-            return ext_json_response(&serde_json::json!({"invites": invites}));
+            ext_json_response(&serde_json::json!({"invites": invites}))
         }
 
         #[cfg(not(feature = "remote"))]
@@ -225,7 +229,10 @@ impl LocalAgentHandle {
         }
     }
 
-    pub(super) async fn handle_ext_mesh_revoke_invite(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
+    pub(super) async fn handle_ext_mesh_revoke_invite(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
         #[cfg_attr(not(feature = "remote"), allow(dead_code))]
         #[derive(serde::Deserialize)]
         struct RevokeInviteReq {
@@ -254,7 +261,7 @@ impl LocalAgentHandle {
                 ))
             };
 
-            return match result {
+            match result {
                 Ok(()) => ext_json_response(&serde_json::json!({
                     "success": true,
                     "message": null,
@@ -263,7 +270,7 @@ impl LocalAgentHandle {
                     "success": false,
                     "message": e.to_string(),
                 })),
-            };
+            }
         }
 
         #[cfg(not(feature = "remote"))]

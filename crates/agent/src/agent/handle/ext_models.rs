@@ -1,5 +1,5 @@
-use super::*;
 use super::utils::ext_json_response;
+use super::*;
 
 impl LocalAgentHandle {
     pub(super) async fn handle_ext_models(&self) -> Result<ExtResponse, Error> {
@@ -39,7 +39,10 @@ impl LocalAgentHandle {
         }))
     }
 
-    pub(super) async fn handle_ext_model_info(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
+    pub(super) async fn handle_ext_model_info(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
         #[derive(serde::Deserialize)]
         struct ModelInfoRequest {
             #[serde(default)]
@@ -52,9 +55,8 @@ impl LocalAgentHandle {
             model: String,
         }
 
-        let parsed: ModelInfoRequest = serde_json::from_str(req.params.get()).map_err(|e| {
-            Error::from(crate::error::AgentError::Serialization(e.to_string()))
-        })?;
+        let parsed: ModelInfoRequest = serde_json::from_str(req.params.get())
+            .map_err(|e| Error::from(crate::error::AgentError::Serialization(e.to_string())))?;
 
         let registry = querymt::providers::read_providers_from_cache();
         let mut info_map = serde_json::Map::new();

@@ -6,11 +6,11 @@ impl LocalAgentHandle {
             "querymt/models" => self.handle_ext_models().await,
             "querymt/refreshModels" => self.handle_ext_refresh_models().await,
             "querymt/modelInfo" => self.handle_ext_model_info(req).await,
-            "querymt/chat" | "querymt/tokenCount" => {
-                Err(Error::from(crate::error::AgentError::MethodNotImplemented {
+            "querymt/chat" | "querymt/tokenCount" => Err(Error::from(
+                crate::error::AgentError::MethodNotImplemented {
                     method: req.method.to_string(),
-                }))
-            }
+                },
+            )),
             "querymt/auth/status" => self.handle_ext_auth_status(req).await,
             "querymt/auth/start" => self.handle_ext_auth_start(req).await,
             "querymt/auth/complete" => self.handle_ext_auth_complete(req).await,
@@ -31,7 +31,10 @@ impl LocalAgentHandle {
     }
 
     #[tracing::instrument(name = "acp.ext_notification", skip_all)]
-    pub(super) async fn handle_ext_notification(&self, _notif: ExtNotification) -> Result<(), Error> {
+    pub(super) async fn handle_ext_notification(
+        &self,
+        _notif: ExtNotification,
+    ) -> Result<(), Error> {
         // OK - extensions not yet implemented
         Ok(())
     }

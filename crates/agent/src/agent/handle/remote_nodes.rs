@@ -143,8 +143,10 @@ impl LocalAgentHandle {
                             }
 
                             if !is_peer_alive && scope.is_lan() {
-                                let cache_key =
-                                    Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
+                                let cache_key = Self::peer_cache_key(
+                                    peer_id,
+                                    node_manager_ref.id().sequence_id(),
+                                );
                                 if self.is_remote_node_temporarily_unreachable(&cache_key) {
                                     log::debug!(
                                         "list_remote_nodes: skipping stale LAN DHT record for peer {pid} due to active negative cache ttl={}ms (dht_name='{}')",

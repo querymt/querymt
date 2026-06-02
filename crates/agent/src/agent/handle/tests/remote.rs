@@ -130,8 +130,7 @@ fn registration_uses_scoped_lan_global_and_per_peer_dht_names() {
     let peer_id = "12D3KooWCMGRXFFXJynyAG9dsgq9dukbVXRv5RofzbTXVEQaUsZv";
     let lan = crate::agent::remote::scope::MeshScopeId::lan_default();
     let global_name = crate::agent::remote::scope::scoped_node_manager(&lan);
-    let per_peer_name =
-        crate::agent::remote::scope::scoped_node_manager_for_peer(&lan, &peer_id);
+    let per_peer_name = crate::agent::remote::scope::scoped_node_manager_for_peer(&lan, &peer_id);
 
     assert_eq!(global_name, "scope::lan::default::node_manager");
     assert_eq!(
@@ -165,8 +164,7 @@ fn registration_uses_scoped_lan_global_and_per_peer_dht_names() {
 fn find_node_manager_fast_path_dht_name_matches_registration_name() {
     let peer_id = "12D3KooWCMGRXFFXJynyAG9dsgq9dukbVXRv5RofzbTXVEQaUsZv";
     let lan = crate::agent::remote::scope::MeshScopeId::lan_default();
-    let fast_path_name =
-        crate::agent::remote::scope::scoped_node_manager_for_peer(&lan, &peer_id);
+    let fast_path_name = crate::agent::remote::scope::scoped_node_manager_for_peer(&lan, &peer_id);
     let registration_name =
         crate::agent::remote::scope::scoped_node_manager_for_peer(&lan, &peer_id);
     assert_eq!(fast_path_name, registration_name);

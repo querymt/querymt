@@ -1,9 +1,12 @@
-use super::*;
 #[cfg(feature = "remote")]
 use super::utils::ext_json_response;
+use super::*;
 
 impl LocalAgentHandle {
-    pub(super) async fn handle_ext_remote_sessions(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
+    pub(super) async fn handle_ext_remote_sessions(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
         #[cfg_attr(not(feature = "remote"), allow(dead_code))]
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -25,12 +28,12 @@ impl LocalAgentHandle {
             let response = self
                 .list_remote_sessions(&nm_ref, parsed.offset, parsed.limit)
                 .await?;
-            return ext_json_response(&serde_json::json!({
+            ext_json_response(&serde_json::json!({
                 "nodeId": parsed.node_id,
                 "sessions": response.sessions,
                 "nextOffset": response.next_offset,
                 "totalCount": response.total_count,
-            }));
+            }))
         }
 
         #[cfg(not(feature = "remote"))]
@@ -40,7 +43,10 @@ impl LocalAgentHandle {
         }
     }
 
-    pub(super) async fn handle_ext_remote_create_session(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
+    pub(super) async fn handle_ext_remote_create_session(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
         #[cfg_attr(not(feature = "remote"), allow(dead_code))]
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -57,14 +63,16 @@ impl LocalAgentHandle {
         #[cfg(feature = "remote")]
         {
             let nm_ref = self.find_node_manager(&parsed.node_id).await?;
-            let resp = self.create_remote_session(&nm_ref, parsed.cwd.clone()).await?;
+            let resp = self
+                .create_remote_session(&nm_ref, parsed.cwd.clone())
+                .await?;
 
-            return ext_json_response(&serde_json::json!({
+            ext_json_response(&serde_json::json!({
                 "sessionId": resp.session_id,
                 "nodeId": parsed.node_id,
                 "attached": false,
                 "configOptions": [],
-            }));
+            }))
         }
 
         #[cfg(not(feature = "remote"))]
@@ -74,7 +82,10 @@ impl LocalAgentHandle {
         }
     }
 
-    pub(super) async fn handle_ext_remote_attach_session(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
+    pub(super) async fn handle_ext_remote_attach_session(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
         #[cfg_attr(not(feature = "remote"), allow(dead_code))]
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -98,7 +109,8 @@ impl LocalAgentHandle {
             let mut matched_scope = None;
             let mut lookup_err = None;
             for scope in runtime.active_scopes() {
-                let dht_name = crate::agent::remote::scope::scoped_session(&scope, &parsed.session_id);
+                let dht_name =
+                    crate::agent::remote::scope::scoped_session(&scope, &parsed.session_id);
                 match runtime
                     .lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name)
                     .await
@@ -125,7 +137,8 @@ impl LocalAgentHandle {
                     let resumed = self
                         .resume_remote_session(&nm_ref, parsed.session_id.clone())
                         .await?;
-                    self.resolve_handoff(&parsed.session_id, resumed.handoff).await?
+                    self.resolve_handoff(&parsed.session_id, resumed.handoff)
+                        .await?
                 }
             };
 
@@ -151,13 +164,13 @@ impl LocalAgentHandle {
                 .await
                 .unwrap_or(serde_json::Value::Null);
 
-            return ext_json_response(&serde_json::json!({
+            ext_json_response(&serde_json::json!({
                 "sessionId": parsed.session_id,
                 "nodeId": parsed.node_id,
                 "attached": true,
                 "configOptions": [],
                 "snapshot": snapshot,
-            }));
+            }))
         }
 
         #[cfg(not(feature = "remote"))]
@@ -167,7 +180,10 @@ impl LocalAgentHandle {
         }
     }
 
-    pub(super) async fn handle_ext_remote_dismiss_session(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
+    pub(super) async fn handle_ext_remote_dismiss_session(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
         #[cfg_attr(not(feature = "remote"), allow(dead_code))]
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -195,7 +211,7 @@ impl LocalAgentHandle {
                     Error::internal_error().data(serde_json::json!({"error": e.to_string()}))
                 })?;
 
-            return ext_json_response(&serde_json::json!({ "success": true }));
+            ext_json_response(&serde_json::json!({ "success": true }))
         }
 
         #[cfg(not(feature = "remote"))]

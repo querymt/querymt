@@ -1,5 +1,5 @@
-use super::*;
 use super::utils::ext_json_response;
+use super::*;
 
 impl LocalAgentHandle {
     pub(super) async fn handle_ext_update_plugins(&self) -> Result<ExtResponse, Error> {

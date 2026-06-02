@@ -283,8 +283,7 @@ system = "beta"
 
 #[tokio::test]
 async fn test_profile_config_option_omits_unbound_sessions() {
-    let (f, _profile_dir) =
-        profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
+    let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
     register_test_session(&f, "session-1").await;
 
     let options = profile_config_options(&f, Some("session-1")).await;
@@ -327,8 +326,7 @@ fn test_config_options_with_profiles_uses_profile_metadata() {
 
 #[tokio::test]
 async fn test_set_profile_config_option_rejects_unknown_profile() {
-    let (f, _profile_dir) =
-        profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
+    let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
     register_test_session(&f, "session-1").await;
     bind_test_profile(&f, "session-1", "alpha").await;
 
@@ -372,8 +370,7 @@ async fn test_set_profile_config_option_rejects_different_bound_profile() {
 
 #[tokio::test]
 async fn test_set_profile_config_option_accepts_same_bound_profile() {
-    let (f, _profile_dir) =
-        profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
+    let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
     register_test_session(&f, "session-1").await;
     bind_test_profile(&f, "session-1", "alpha").await;
     let req = agent_client_protocol::schema::SetSessionConfigOptionRequest::new(

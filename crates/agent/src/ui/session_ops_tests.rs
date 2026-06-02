@@ -1122,7 +1122,8 @@ async fn list_sessions_uses_attached_remote_node_id_over_hostname_lookup() -> Re
 
 #[cfg(feature = "remote")]
 #[tokio::test]
-async fn list_sessions_with_remote_returns_bookmarks_without_waiting_for_second_store_read() -> Result<()> {
+async fn list_sessions_with_remote_returns_bookmarks_without_waiting_for_second_store_read()
+-> Result<()> {
     let f = crate::test_utils::TestServerState::new().await;
     let session_id = format!("remote-fast-bookmark-{}", Uuid::now_v7());
     f.agent
@@ -1149,9 +1150,14 @@ async fn list_sessions_with_remote_returns_bookmarks_without_waiting_for_second_
     )
     .await;
 
-    let listed = timeout(Duration::from_millis(400), next_message_of_type(&mut rx, "session_list"))
-        .await
-        .expect("first session list should not wait on extra remote discovery or duplicate bookmark reads");
+    let listed = timeout(
+        Duration::from_millis(400),
+        next_message_of_type(&mut rx, "session_list"),
+    )
+    .await
+    .expect(
+        "first session list should not wait on extra remote discovery or duplicate bookmark reads",
+    );
     let summary = find_session(&listed, &session_id);
     assert_eq!(summary["attached"], false);
     assert_eq!(summary["node_id"], "node-bookmark");

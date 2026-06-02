@@ -1,5 +1,5 @@
-use super::*;
 use super::utils::format_prefixed_error_chain;
+use super::*;
 
 impl LocalAgentHandle {
     /// Construct a `LocalAgentHandle` from a shared `AgentConfig`.

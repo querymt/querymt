@@ -1,8 +1,11 @@
-use super::*;
 use super::utils::ext_json_response;
+use super::*;
 
 impl LocalAgentHandle {
-    pub(super) async fn handle_ext_auth_status(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
+    pub(super) async fn handle_ext_auth_status(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
         #[derive(serde::Deserialize, Default)]
         struct StatusReq {
             #[serde(default)]
@@ -17,7 +20,10 @@ impl LocalAgentHandle {
         ext_json_response(&serde_json::json!({ "providers": statuses }))
     }
 
-    pub(super) async fn handle_ext_auth_start(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
+    pub(super) async fn handle_ext_auth_start(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
         #[derive(serde::Deserialize)]
         struct StartReq {
             provider: String,
@@ -34,7 +40,10 @@ impl LocalAgentHandle {
         ext_json_response(&result)
     }
 
-    pub(super) async fn handle_ext_auth_complete(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
+    pub(super) async fn handle_ext_auth_complete(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
         #[derive(serde::Deserialize)]
         struct CompleteReq {
             flow_id: String,
@@ -51,7 +60,10 @@ impl LocalAgentHandle {
         ext_json_response(&result)
     }
 
-    pub(super) async fn handle_ext_auth_logout(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
+    pub(super) async fn handle_ext_auth_logout(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
         #[derive(serde::Deserialize)]
         struct LogoutReq {
             provider: String,

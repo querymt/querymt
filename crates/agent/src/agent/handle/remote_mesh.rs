@@ -226,7 +226,11 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
-    pub(super) fn mark_cached_remote_node_unreachable(&self, cache_key: String, ttl: std::time::Duration) {
+    pub(super) fn mark_cached_remote_node_unreachable(
+        &self,
+        cache_key: String,
+        ttl: std::time::Duration,
+    ) {
         self.remote_node_cache.by_label.write().insert(
             cache_key,
             CachedNodeEntry::Unreachable {
@@ -236,7 +240,10 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
-    pub(super) fn peer_cache_key(peer_id: Option<libp2p::PeerId>, fallback_actor_id: u64) -> String {
+    pub(super) fn peer_cache_key(
+        peer_id: Option<libp2p::PeerId>,
+        fallback_actor_id: u64,
+    ) -> String {
         if let Some(pid) = peer_id {
             format!("peer:{pid}")
         } else {
@@ -245,7 +252,10 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
-    pub(super) fn get_cached_remote_node(&self, cache_key: &str) -> Option<crate::agent::remote::NodeInfo> {
+    pub(super) fn get_cached_remote_node(
+        &self,
+        cache_key: &str,
+    ) -> Option<crate::agent::remote::NodeInfo> {
         let now = std::time::Instant::now();
         if let Some(entry) = self
             .remote_node_cache
@@ -255,7 +265,9 @@ impl LocalAgentHandle {
             .cloned()
         {
             match entry {
-                CachedNodeEntry::Ready { info, expires_at } if expires_at > now => return Some(info),
+                CachedNodeEntry::Ready { info, expires_at } if expires_at > now => {
+                    return Some(info);
+                }
                 CachedNodeEntry::Unreachable { .. } => return None,
                 _ => {}
             }
@@ -301,7 +313,11 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
-    pub(super) fn insert_cached_remote_node(&self, cache_key: String, info: crate::agent::remote::NodeInfo) {
+    pub(super) fn insert_cached_remote_node(
+        &self,
+        cache_key: String,
+        info: crate::agent::remote::NodeInfo,
+    ) {
         let ttl = Self::remote_node_cache_ttl();
         self.remote_node_cache.by_label.write().insert(
             cache_key,
@@ -313,7 +329,10 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
-    pub(super) fn ensure_remote_node_cache_invalidation_task(&self, mesh: &crate::agent::remote::MeshHandle) {
+    pub(super) fn ensure_remote_node_cache_invalidation_task(
+        &self,
+        mesh: &crate::agent::remote::MeshHandle,
+    ) {
         if self
             .remote_node_cache
             .invalidation_task_started

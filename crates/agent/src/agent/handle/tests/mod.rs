@@ -62,8 +62,7 @@ impl HandleFixture {
             tools: vec![].into_boxed_slice(),
         };
         let factory = Arc::new(TestProviderFactory { provider: shared });
-        let (plugin_registry, temp_dir) =
-            mock_plugin_registry(factory).expect("plugin registry");
+        let (plugin_registry, temp_dir) = mock_plugin_registry(factory).expect("plugin registry");
 
         let llm_config = mock_llm_config();
         let session = mock_session("test-session");
@@ -149,9 +148,7 @@ fn write_profile(dir: &Path, name: &str, content: &str) {
     std::fs::write(dir.join(name), content).expect("profile should be written");
 }
 
-async fn profile_fixture_with_files(
-    files: &[(&str, &str)],
-) -> (HandleFixture, tempfile::TempDir) {
+async fn profile_fixture_with_files(files: &[(&str, &str)]) -> (HandleFixture, tempfile::TempDir) {
     let profile_dir = tempfile::tempdir().expect("profile dir");
     for (name, content) in files {
         write_profile(profile_dir.path(), name, content);
@@ -210,14 +207,12 @@ fn select_options(
     option: &SessionConfigOption,
 ) -> &[agent_client_protocol::schema::SessionConfigSelectOption] {
     match &option.kind {
-        agent_client_protocol::schema::SessionConfigKind::Select(select) => {
-            match &select.options {
-                agent_client_protocol::schema::SessionConfigSelectOptions::Ungrouped(
-                    options,
-                ) => options,
-                _ => panic!("expected ungrouped select config option"),
+        agent_client_protocol::schema::SessionConfigKind::Select(select) => match &select.options {
+            agent_client_protocol::schema::SessionConfigSelectOptions::Ungrouped(options) => {
+                options
             }
-        }
+            _ => panic!("expected ungrouped select config option"),
+        },
         _ => panic!("expected select config option"),
     }
 }
@@ -256,7 +251,6 @@ impl LocalAgentHandle {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
-
 
 mod core_a;
 mod core_b;

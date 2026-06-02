@@ -3,9 +3,8 @@ use super::*;
 #[tokio::test]
 async fn test_unknown_ext_method_returns_method_not_found() {
     let f = HandleFixture::new().await;
-    let null_params = std::sync::Arc::from(
-        serde_json::value::RawValue::from_string("null".to_string()).unwrap(),
-    );
+    let null_params =
+        std::sync::Arc::from(serde_json::value::RawValue::from_string("null".to_string()).unwrap());
     let req = agent_client_protocol::schema::ExtRequest::new("my_method", null_params);
     let err = f
         .handle
@@ -18,9 +17,8 @@ async fn test_unknown_ext_method_returns_method_not_found() {
 #[tokio::test]
 async fn test_querymt_models_ext_method_returns_models() {
     let f = HandleFixture::new().await;
-    let null_params = std::sync::Arc::from(
-        serde_json::value::RawValue::from_string("null".to_string()).unwrap(),
-    );
+    let null_params =
+        std::sync::Arc::from(serde_json::value::RawValue::from_string("null".to_string()).unwrap());
     let req = agent_client_protocol::schema::ExtRequest::new("querymt/models", null_params);
     let resp = f.handle.ext_method(req).await.expect("ext_method");
     let value: serde_json::Value = serde_json::from_str(resp.0.get()).expect("valid JSON");
@@ -44,11 +42,9 @@ async fn test_querymt_profile_ext_methods_return_method_not_found() {
 #[tokio::test]
 async fn test_querymt_refresh_models_ext_method_returns_immediately_with_trigger_meta() {
     let f = HandleFixture::new().await;
-    let null_params = std::sync::Arc::from(
-        serde_json::value::RawValue::from_string("null".to_string()).unwrap(),
-    );
-    let req =
-        agent_client_protocol::schema::ExtRequest::new("querymt/refreshModels", null_params);
+    let null_params =
+        std::sync::Arc::from(serde_json::value::RawValue::from_string("null".to_string()).unwrap());
+    let req = agent_client_protocol::schema::ExtRequest::new("querymt/refreshModels", null_params);
     let resp = tokio::time::timeout(
         tokio::time::Duration::from_millis(500),
         f.handle.ext_method(req),
@@ -69,9 +65,8 @@ async fn test_querymt_refresh_models_ext_method_returns_immediately_with_trigger
 #[tokio::test]
 async fn test_ext_notification_ok() {
     let f = HandleFixture::new().await;
-    let null_params = std::sync::Arc::from(
-        serde_json::value::RawValue::from_string("null".to_string()).unwrap(),
-    );
+    let null_params =
+        std::sync::Arc::from(serde_json::value::RawValue::from_string("null".to_string()).unwrap());
     let notif = agent_client_protocol::schema::ExtNotification::new("my_event", null_params);
     f.handle
         .ext_notification(notif)

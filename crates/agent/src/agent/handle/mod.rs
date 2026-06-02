@@ -62,9 +62,9 @@ use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 #[cfg(feature = "remote")]
-use tokio::sync::Semaphore;
-#[cfg(feature = "remote")]
 use tokio::sync::OnceCell;
+#[cfg(feature = "remote")]
+use tokio::sync::Semaphore;
 use tokio::sync::{Mutex, broadcast};
 
 /// Trait capturing the interface consumers actually use for agent interaction.

@@ -1,6 +1,7 @@
 //! Single agent implementation
 
 use super::callbacks::EventCallbacksState;
+#[cfg(feature = "remote")]
 use super::mesh::{AgentMesh, Mesh, MeshSpec};
 use super::quorum::QuorumBuilder;
 use super::session::AgentSession;
