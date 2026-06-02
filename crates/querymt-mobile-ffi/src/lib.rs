@@ -606,7 +606,7 @@ pub unsafe extern "C" fn qmt_ffi_acp_send(
         }
     };
 
-    let result = runtime::global_runtime().block_on(async {
+    let result = runtime::block_on_ffi(async move {
         let (
             agent,
             agent_handle,

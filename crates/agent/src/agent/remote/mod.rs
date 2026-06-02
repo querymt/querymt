@@ -12,6 +12,8 @@
 //! `ActorRef<SessionActor>`.
 
 pub mod actor_ref;
+#[cfg(feature = "remote")]
+pub(crate) mod admission;
 pub mod dht_name;
 pub mod event_forwarder;
 pub mod event_relay;

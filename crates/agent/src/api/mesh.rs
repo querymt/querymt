@@ -406,25 +406,43 @@ pub(crate) async fn admit_via_invite_on_runtime(
         },
     };
 
-    let target_nm = crate::agent::remote::mesh::find_admission_target(
-        mesh,
+    let admission_scope = MeshScopeId::Iroh {
+        mesh_id: mesh_id.clone(),
+    };
+    mesh.join_iroh_scope(
+        &mesh_id,
+        crate::agent::remote::admission::admission_candidates(
+            &invite.grant.inviter_peer_id,
+            &fallback_peers,
+        )
+        .map(|candidates| {
+            candidates
+                .into_iter()
+                .map(|candidate| candidate.peer_id)
+                .collect()
+        })
+        .unwrap_or_default(),
+    );
+
+    let response = crate::agent::remote::admission::AdmissionService::new(
+        crate::agent::remote::admission::MeshAdmissionTransport::new(mesh.clone()),
+        crate::agent::remote::admission::AdmissionPolicy::production(),
+    )
+    .admit(
+        &mesh_id,
+        admission_scope,
         &invite.grant.inviter_peer_id,
         &fallback_peers,
+        request.clone(),
     )
-    .await
-    .ok_or_else(|| anyhow!("no reachable peer found for admission handshake"))?;
-
-    let response = target_nm
-        .ask::<AdmissionRequest>(&request)
-        .await
-        .map_err(|e| anyhow!("admission handshake failed: {e}"))?;
+    .await?;
 
     match response {
         AdmissionResponse::Admitted {
             membership_token,
             existing_peers,
         } => {
-            let known_peers = known_peers_from_strings(mesh, &existing_peers);
+            let known_peers = known_peers_from_strings(mesh, &mesh_id, &existing_peers);
             let admitted_peer_ids = peer_ids_from_strings(&existing_peers);
             mesh_state
                 .upsert_joined_mesh(membership_token, known_peers)
@@ -432,7 +450,7 @@ pub(crate) async fn admit_via_invite_on_runtime(
             mesh.join_iroh_scope(&mesh_id, admitted_peer_ids);
         }
         AdmissionResponse::Readmitted { existing_peers } => {
-            let known_peers = known_peers_from_strings(mesh, &existing_peers);
+            let known_peers = known_peers_from_strings(mesh, &mesh_id, &existing_peers);
             let admitted_peer_ids = peer_ids_from_strings(&existing_peers);
             mesh_state
                 .update_known_peers(&mesh_id, known_peers)
@@ -468,6 +486,7 @@ fn peer_ids_from_strings(existing_peers: &[String]) -> Vec<libp2p::PeerId> {
 #[cfg(feature = "remote")]
 fn known_peers_from_strings(
     mesh: &crate::agent::remote::MeshHandle,
+    mesh_id: &str,
     existing_peers: &[String],
 ) -> Vec<crate::agent::remote::invite::PeerEntry> {
     let mut all_peer_strs: Vec<String> = mesh
@@ -477,7 +496,12 @@ fn known_peers_from_strings(
         .collect();
     for peer_str in existing_peers {
         if let Ok(pid) = peer_str.parse() {
-            mesh.dial_peer(&pid);
+            mesh.dial_existing_iroh_peer(
+                &pid,
+                MeshScopeId::Iroh {
+                    mesh_id: mesh_id.to_string(),
+                },
+            );
         }
         if !all_peer_strs.contains(peer_str) {
             all_peer_strs.push(peer_str.clone());

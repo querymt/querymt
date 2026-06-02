@@ -49,14 +49,26 @@ use super::scope::{MeshScopeId, MeshTransportKind};
 /// The event loop owns the `Swarm` and is the only place that can mutate it.
 /// Higher-level code uses `MeshHandle` methods (e.g. `dial_peer`) which
 /// translate intent into a `SwarmCommand` and send it over an `mpsc` channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialReason {
+    Admission,
+    Reconnect,
+    ExistingMeshPeer,
+    Manual,
+}
+
 #[derive(Debug)]
 enum SwarmCommand {
     /// Request the swarm to dial a peer by `PeerId`.
     ///
     /// The event loop converts this to a `/p2p/{peer_id}` multiaddr and calls
-    /// `swarm.dial()`.  For iroh transport the relay network resolves the
-    /// address; for LAN the peer must already have a known address (mDNS).
-    DialPeer(PeerId),
+    /// `swarm.dial()`. Scoped Iroh dials seed reconnect metadata before dialing
+    /// so admission-time peers are not dropped as unknown LAN-only peers.
+    DialPeer {
+        peer_id: PeerId,
+        scope: Option<MeshScopeId>,
+        reason: DialReason,
+    },
     /// Join or refresh an iroh scope on the existing runtime.
     JoinIrohScope { mesh_id: String, peers: Vec<PeerId> },
     /// Drop scope-specific reconnect targets for a left Iroh scope.
@@ -1058,6 +1070,23 @@ impl MeshHandle {
     /// Used for iroh mesh fan-out after invite admission. On LAN, peer discovery
     /// is mDNS-driven and explicit dialing is intentionally a no-op.
     pub fn dial_peer(&self, peer_id: &PeerId) {
+        self.dial_peer_with_scope(peer_id, None, DialReason::Manual);
+    }
+
+    pub(crate) fn dial_peer_for_admission(&self, peer_id: &PeerId, scope: MeshScopeId) {
+        self.dial_peer_with_scope(peer_id, Some(scope), DialReason::Admission);
+    }
+
+    pub(crate) fn dial_existing_iroh_peer(&self, peer_id: &PeerId, scope: MeshScopeId) {
+        self.dial_peer_with_scope(peer_id, Some(scope), DialReason::ExistingMeshPeer);
+    }
+
+    fn dial_peer_with_scope(
+        &self,
+        peer_id: &PeerId,
+        scope: Option<MeshScopeId>,
+        reason: DialReason,
+    ) {
         if peer_id == &self.peer_id {
             return; // Don't dial ourselves.
         }
@@ -1069,7 +1098,11 @@ impl MeshHandle {
 
         if self
             .swarm_cmd_tx
-            .send(SwarmCommand::DialPeer(*peer_id))
+            .send(SwarmCommand::DialPeer {
+                peer_id: *peer_id,
+                scope,
+                reason,
+            })
             .is_err()
         {
             log::warn!("dial_peer: swarm event loop has shut down");
@@ -1383,6 +1416,38 @@ fn should_track_iroh_reconnect(
     peer_iroh_scope: &HashMap<PeerId, MeshScopeId>,
 ) -> bool {
     peer_iroh_scope.contains_key(peer_id)
+}
+
+fn should_dial_peer_command(
+    peer_id: &PeerId,
+    reason: DialReason,
+    peer_iroh_scope: &HashMap<PeerId, MeshScopeId>,
+    has_iroh: bool,
+) -> bool {
+    if !has_iroh {
+        return false;
+    }
+    match reason {
+        DialReason::Admission | DialReason::ExistingMeshPeer => true,
+        DialReason::Reconnect | DialReason::Manual => {
+            should_track_iroh_reconnect(peer_id, peer_iroh_scope)
+        }
+    }
+}
+
+fn seed_scoped_dial_peer(
+    peer_id: PeerId,
+    scope: Option<MeshScopeId>,
+    reconnect_targets_by_scope: &mut HashMap<String, HashSet<PeerId>>,
+    peer_iroh_scope: &mut HashMap<PeerId, MeshScopeId>,
+) {
+    if let Some(MeshScopeId::Iroh { mesh_id }) = scope.clone() {
+        reconnect_targets_by_scope
+            .entry(mesh_id)
+            .or_default()
+            .insert(peer_id);
+        peer_iroh_scope.insert(peer_id, scope.unwrap());
+    }
 }
 
 fn log_kameo_messaging_event(event: &remote::messaging::Event) {
@@ -2012,7 +2077,7 @@ async fn bootstrap_iroh_mesh(config: &MeshConfig) -> Result<MeshHandle, MeshErro
                 }
                 Some(cmd) = swarm_cmd_rx_iroh.recv() => {
                     match cmd {
-                        SwarmCommand::DialPeer(peer_id) => {
+                        SwarmCommand::DialPeer { peer_id, .. } => {
                             reconnect_targets.insert(peer_id);
                             if pending_dials.contains(&peer_id) || routes_loop.is_peer_alive(&peer_id) {
                                 log::debug!("Skipping dial for {} (already connected or pending)", peer_id);
@@ -2386,7 +2451,7 @@ async fn bootstrap_composite_mesh(config: &MeshConfig) -> Result<MeshHandle, Mes
                 }
                 Some(cmd) = swarm_cmd_rx.recv() => {
                     match cmd {
-                        SwarmCommand::DialPeer(peer_id) => {
+                        SwarmCommand::DialPeer { peer_id, .. } => {
                             reconnect_targets.insert(peer_id);
                             if pending_dials.contains(&peer_id) || routes_loop.is_peer_alive(&peer_id) {
                                 log::debug!("Skipping dial for {} (already connected or pending)", peer_id);
@@ -2909,7 +2974,12 @@ pub async fn bootstrap_mesh_runtime(
                         if peer_id == local_peer_id {
                             continue;
                         }
-                        if !should_track_iroh_reconnect(&peer_id, &peer_iroh_scope_loop) {
+                        if !should_dial_peer_command(
+                            &peer_id,
+                            DialReason::Reconnect,
+                            &peer_iroh_scope_loop,
+                            has_iroh_loop,
+                        ) {
                             continue;
                         }
                         if routes_loop.is_peer_alive(&peer_id) || pending_dials.contains(&peer_id) {
@@ -2948,15 +3018,27 @@ pub async fn bootstrap_mesh_runtime(
                 // ── Swarm command ─────────────────────────────────────────────
                 Some(cmd) = swarm_cmd_rx.recv() => {
                     match cmd {
-                        SwarmCommand::DialPeer(peer_id) => {
+                        SwarmCommand::DialPeer { peer_id, scope, reason } => {
                             if !has_iroh_loop {
                                 log::debug!("dial_peer command ignored (no iroh transport)");
                                 continue;
                             }
-                            if !should_track_iroh_reconnect(&peer_id, &peer_iroh_scope_loop) {
+                            seed_scoped_dial_peer(
+                                peer_id,
+                                scope,
+                                &mut reconnect_targets_by_scope,
+                                &mut peer_iroh_scope_loop,
+                            );
+                            if !should_dial_peer_command(
+                                &peer_id,
+                                reason,
+                                &peer_iroh_scope_loop,
+                                has_iroh_loop,
+                            ) {
                                 log::debug!(
-                                    "dial_peer command ignored for LAN-only peer {} (no iroh scope)",
-                                    peer_id
+                                    "dial_peer command ignored for unscoped peer {} (reason={:?})",
+                                    peer_id,
+                                    reason
                                 );
                                 continue;
                             }
@@ -3286,18 +3368,29 @@ pub async fn join_mesh_via_invite(
         },
     };
 
-    // Look up the admission target — prefer the original inviter, fall back to
-    // any cached peer that is reachable.
-    let target_nm = find_admission_target(&mesh, &invite.grant.inviter_peer_id, &fallback_peers)
-        .await
-        .ok_or_else(|| {
-            MeshError::SwarmError("no reachable peer found for admission handshake".to_string())
-        })?;
-
-    let response = target_nm
-        .ask::<AdmissionRequest>(&request)
-        .await
-        .map_err(|e| MeshError::SwarmError(format!("admission handshake failed: {e}")))?;
+    // Look up and contact an admission target — prefer the original inviter,
+    // then fall back to cached peers. The service owns retry/backoff so joins do
+    // not depend on one arbitrary DHT propagation sleep.
+    let admission_scope = MeshScopeId::Iroh {
+        mesh_id: mesh_id.clone(),
+    };
+    mesh.join_iroh_scope(
+        &mesh_id,
+        admission_candidates_for_scope(&invite.grant.inviter_peer_id, &fallback_peers),
+    );
+    let response = super::admission::AdmissionService::new(
+        super::admission::MeshAdmissionTransport::new(mesh.clone()),
+        super::admission::AdmissionPolicy::production(),
+    )
+    .admit(
+        &mesh_id,
+        admission_scope.clone(),
+        &invite.grant.inviter_peer_id,
+        &fallback_peers,
+        request.clone(),
+    )
+    .await
+    .map_err(|e| MeshError::SwarmError(e.to_string()))?;
 
     // ── 5. Handle response ────────────────────────────────────────────────────
     match response {
@@ -3318,7 +3411,7 @@ pub async fn join_mesh_via_invite(
             for peer_str in &existing_peers {
                 if let Ok(pid) = peer_str.parse::<PeerId>() {
                     log::info!("Dialing existing mesh peer: {}", pid);
-                    mesh.dial_peer(&pid);
+                    mesh.dial_existing_iroh_peer(&pid, admission_scope.clone());
                 } else {
                     log::warn!("Ignoring invalid PeerId in existing_peers: {}", peer_str);
                 }
@@ -3366,7 +3459,7 @@ pub async fn join_mesh_via_invite(
             for peer_str in &existing_peers {
                 if let Ok(pid) = peer_str.parse::<PeerId>() {
                     log::info!("Dialing existing mesh peer (readmit): {}", pid);
-                    mesh.dial_peer(&pid);
+                    mesh.dial_existing_iroh_peer(&pid, admission_scope.clone());
                 } else {
                     log::warn!("Ignoring invalid PeerId in existing_peers: {}", peer_str);
                 }
@@ -3406,41 +3499,18 @@ pub async fn join_mesh_via_invite(
 ///
 /// Tries the original inviter first (per-peer DHT name), then falls back to
 /// cached peers in order.  Returns the first one that responds.
-pub(crate) async fn find_admission_target(
-    mesh: &MeshHandle,
+fn admission_candidates_for_scope(
     inviter_peer_id: &str,
     fallback_peers: &[super::invite::PeerEntry],
-) -> Option<kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>> {
-    use crate::agent::remote::RemoteNodeManager;
-    use crate::agent::remote::scope::scoped_node_manager_for_peer;
-
-    // Give the swarm a moment to complete the connection before querying the DHT.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let active_scopes = mesh.active_scopes();
-    log::debug!("find_admission_target: active scopes = {:?}", active_scopes);
-
-    // Try the inviter first.
-    for scope in active_scopes.clone() {
-        let inviter_dht = scoped_node_manager_for_peer(&scope, &inviter_peer_id.to_string());
-        if let Ok(Some(nm)) = mesh.lookup_actor::<RemoteNodeManager>(&inviter_dht).await {
-            log::debug!("Admission target: inviter ({})", inviter_peer_id);
-            return Some(nm);
-        }
-    }
-
-    // Fall back to cached peers.
-    for peer in fallback_peers {
-        for scope in active_scopes.clone() {
-            let dht = scoped_node_manager_for_peer(&scope, &peer.peer_id);
-            if let Ok(Some(nm)) = mesh.lookup_actor::<RemoteNodeManager>(&dht).await {
-                log::debug!("Admission target: cached peer ({})", peer.peer_id);
-                return Some(nm);
-            }
-        }
-    }
-
-    None
+) -> Vec<PeerId> {
+    super::admission::admission_candidates(inviter_peer_id, fallback_peers)
+        .map(|candidates| {
+            candidates
+                .into_iter()
+                .map(|candidate| candidate.peer_id)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Resolve the local hostname (same logic as `RemoteNodeManager::get_hostname`
@@ -3463,10 +3533,13 @@ fn resolve_local_hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
+        DialReason, peer_id_from_multiaddr, seed_scoped_dial_peer, should_dial_peer_command,
+        should_track_iroh_reconnect,
+    };
+    use super::{
         MeshEvent, MeshHandle, MeshScopeId, MeshTransportKind, MeshTransportMode, RouteTable,
         SwarmCommand, connection_route_plan,
     };
-    use super::{peer_id_from_multiaddr, should_track_iroh_reconnect};
     use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -3734,6 +3807,89 @@ mod tests {
 
         assert!(should_track_iroh_reconnect(&iroh_peer, &scopes));
         assert!(!should_track_iroh_reconnect(&lan_only_peer, &scopes));
+    }
+
+    #[test]
+    fn admission_dial_command_is_allowed_before_scope_was_known() {
+        let peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let scopes = HashMap::new();
+
+        assert!(should_dial_peer_command(
+            &peer,
+            DialReason::Admission,
+            &scopes,
+            true
+        ));
+        assert!(!should_dial_peer_command(
+            &peer,
+            DialReason::Manual,
+            &scopes,
+            true
+        ));
+    }
+
+    #[test]
+    fn reconnect_and_manual_dials_require_known_iroh_scope() {
+        let peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let mut scopes = HashMap::new();
+
+        assert!(!should_dial_peer_command(
+            &peer,
+            DialReason::Reconnect,
+            &scopes,
+            true
+        ));
+        assert!(!should_dial_peer_command(
+            &peer,
+            DialReason::Manual,
+            &scopes,
+            true
+        ));
+
+        scopes.insert(
+            peer,
+            MeshScopeId::Iroh {
+                mesh_id: "mesh-a".to_string(),
+            },
+        );
+
+        assert!(should_dial_peer_command(
+            &peer,
+            DialReason::Reconnect,
+            &scopes,
+            true
+        ));
+        assert!(should_dial_peer_command(
+            &peer,
+            DialReason::Manual,
+            &scopes,
+            true
+        ));
+    }
+
+    #[test]
+    fn scoped_dial_seeds_iroh_scope_tracking() {
+        let peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let scope = MeshScopeId::Iroh {
+            mesh_id: "mesh-a".to_string(),
+        };
+        let mut by_scope = HashMap::new();
+        let mut peer_scopes = HashMap::new();
+
+        seed_scoped_dial_peer(peer, Some(scope.clone()), &mut by_scope, &mut peer_scopes);
+
+        assert_eq!(peer_scopes.get(&peer), Some(&scope));
+        assert!(
+            by_scope
+                .get("mesh-a")
+                .is_some_and(|peers| peers.contains(&peer))
+        );
     }
 
     #[test]
