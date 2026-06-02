@@ -48,6 +48,7 @@ use std::sync::{Arc, Mutex};
 ///     .infra(AgentInfra {
 ///         plugin_registry: Arc::new(registry),
 ///         storage: Some(storage),
+///         session_mcp_attachment_source: None,
 ///     })
 ///     .build()
 ///     .await
@@ -849,6 +850,7 @@ impl Agent {
     /// let agent = Agent::from_config(config, AgentInfra {
     ///     plugin_registry: Arc::new(registry),
     ///     storage: Some(storage),
+    ///     session_mcp_attachment_source: None,
     /// }).await.unwrap();
     /// agent.chat("hello").await.unwrap();
     /// # }

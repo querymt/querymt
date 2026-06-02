@@ -150,23 +150,28 @@ impl RemoteAgentHandle {
         &self,
     ) -> Result<kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>, Error> {
         let target_node_id = match self.target_node_id.clone() {
-            Some(node_id) => Some(node_id),
+            Some(node_id) => node_id,
             None => self
                 .mesh
                 .resolve_peer_node_id(&self.peer_label)
                 .await
-                .map(|node_id| node_id.to_string()),
+                .map(|node_id| node_id.to_string())
+                .ok_or_else(|| {
+                    Error::new(
+                        -32001,
+                        format!(
+                            "Remote peer '{}' could not be resolved to a live node id",
+                            self.peer_label
+                        ),
+                    )
+                })?,
         };
 
         let mut node_manager = None;
         let mut last_lookup_key = None;
         for scope in self.mesh.active_scopes() {
-            let dht_name = match target_node_id.as_ref() {
-                Some(node_id) => {
-                    crate::agent::remote::scope::scoped_node_manager_for_peer(&scope, node_id)
-                }
-                None => crate::agent::remote::scope::scoped_node_manager(&scope),
-            };
+            let dht_name =
+                crate::agent::remote::scope::scoped_node_manager_for_peer(&scope, &target_node_id);
             last_lookup_key = Some(dht_name.clone());
             match self
                 .mesh
