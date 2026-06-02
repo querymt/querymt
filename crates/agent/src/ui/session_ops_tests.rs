@@ -1122,6 +1122,45 @@ async fn list_sessions_uses_attached_remote_node_id_over_hostname_lookup() -> Re
 
 #[cfg(feature = "remote")]
 #[tokio::test]
+async fn list_sessions_with_remote_returns_bookmarks_without_waiting_for_second_store_read() -> Result<()> {
+    let f = crate::test_utils::TestServerState::new().await;
+    let session_id = format!("remote-fast-bookmark-{}", Uuid::now_v7());
+    f.agent
+        .storage
+        .session_store()
+        .save_remote_session_bookmark(&RemoteSessionBookmark {
+            session_id: session_id.clone(),
+            node_id: "node-bookmark".to_string(),
+            peer_label: "remote-peer".to_string(),
+            cwd: Some("/remote/workspace".to_string()),
+            created_at: 123,
+            title: Some("Bookmarked remote".to_string()),
+        })
+        .await?;
+
+    let (tx, mut rx) = f.add_connection("conn-remote-bookmark-fast").await;
+    handle_list_sessions(
+        &f.state,
+        &tx,
+        ListSessionsRequest {
+            include_remote: true,
+            ..ListSessionsRequest::root_browse()
+        },
+    )
+    .await;
+
+    let listed = timeout(Duration::from_millis(400), next_message_of_type(&mut rx, "session_list"))
+        .await
+        .expect("first session list should not wait on extra remote discovery or duplicate bookmark reads");
+    let summary = find_session(&listed, &session_id);
+    assert_eq!(summary["attached"], false);
+    assert_eq!(summary["node_id"], "node-bookmark");
+
+    Ok(())
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
 async fn handle_cancel_session_uses_root_remote_session_ref_even_with_stale_profile_binding()
 -> Result<()> {
     let mut f = crate::test_utils::TestServerState::new().await;

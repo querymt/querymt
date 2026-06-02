@@ -121,9 +121,14 @@ pub trait AgentHandle: Send + Sync {
 /// mutable state. Not an actor — just a convenient bundle.
 #[cfg(feature = "remote")]
 #[derive(Clone, Debug)]
-struct CachedNodeEntry {
-    info: crate::agent::remote::NodeInfo,
-    expires_at: std::time::Instant,
+enum CachedNodeEntry {
+    Ready {
+        info: crate::agent::remote::NodeInfo,
+        expires_at: std::time::Instant,
+    },
+    Unreachable {
+        expires_at: std::time::Instant,
+    },
 }
 
 #[cfg(feature = "remote")]
@@ -1337,9 +1342,28 @@ impl LocalAgentHandle {
         scope: &crate::agent::remote::scope::MeshScopeId,
         is_peer_alive: bool,
     ) -> bool {
-        // LAN discovery can transiently lose route liveness while DHT registrations
-        // remain valid, so we still probe LAN entries instead of dropping them.
         !is_peer_alive && scope.is_iroh()
+    }
+
+    #[cfg(feature = "remote")]
+    fn stale_lan_probe_ttl() -> std::time::Duration {
+        let default_ms = 1_500_u64;
+        let ttl_ms = std::env::var("QUERYMT_REMOTE_NODE_STALE_LAN_TTL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default_ms);
+        std::time::Duration::from_millis(ttl_ms)
+    }
+
+    #[cfg(feature = "remote")]
+    fn mark_cached_remote_node_unreachable(&self, cache_key: String, ttl: std::time::Duration) {
+        self.remote_node_cache.by_label.write().insert(
+            cache_key,
+            CachedNodeEntry::Unreachable {
+                expires_at: std::time::Instant::now() + ttl,
+            },
+        );
     }
 
     #[cfg(feature = "remote")]
@@ -1360,18 +1384,51 @@ impl LocalAgentHandle {
             .read()
             .get(cache_key)
             .cloned()
-            && entry.expires_at > now
         {
-            return Some(entry.info);
+            match entry {
+                CachedNodeEntry::Ready { info, expires_at } if expires_at > now => return Some(info),
+                CachedNodeEntry::Unreachable { .. } => return None,
+                _ => {}
+            }
         }
 
-        let mut guard = self.remote_node_cache.by_label.write();
-        if let Some(entry) = guard.get(cache_key)
-            && entry.expires_at <= now
-        {
-            guard.remove(cache_key);
-        }
+        self.prune_expired_remote_node_cache_entry(cache_key);
         None
+    }
+
+    #[cfg(feature = "remote")]
+    fn is_remote_node_temporarily_unreachable(&self, cache_key: &str) -> bool {
+        let now = std::time::Instant::now();
+        if let Some(entry) = self
+            .remote_node_cache
+            .by_label
+            .read()
+            .get(cache_key)
+            .cloned()
+        {
+            match entry {
+                CachedNodeEntry::Unreachable { expires_at } if expires_at > now => return true,
+                CachedNodeEntry::Unreachable { .. } | CachedNodeEntry::Ready { .. } => {}
+            }
+        }
+
+        self.prune_expired_remote_node_cache_entry(cache_key);
+        false
+    }
+
+    #[cfg(feature = "remote")]
+    fn prune_expired_remote_node_cache_entry(&self, cache_key: &str) {
+        let now = std::time::Instant::now();
+        let mut guard = self.remote_node_cache.by_label.write();
+        match guard.get(cache_key) {
+            Some(CachedNodeEntry::Ready { expires_at, .. }) if *expires_at <= now => {
+                guard.remove(cache_key);
+            }
+            Some(CachedNodeEntry::Unreachable { expires_at }) if *expires_at <= now => {
+                guard.remove(cache_key);
+            }
+            _ => {}
+        }
     }
 
     #[cfg(feature = "remote")]
@@ -1379,7 +1436,7 @@ impl LocalAgentHandle {
         let ttl = Self::remote_node_cache_ttl();
         self.remote_node_cache.by_label.write().insert(
             cache_key,
-            CachedNodeEntry {
+            CachedNodeEntry::Ready {
                 info,
                 expires_at: std::time::Instant::now() + ttl,
             },
@@ -1547,6 +1604,7 @@ impl LocalAgentHandle {
                             continue;
                         }
 
+                        let stale_lan_ttl = Self::stale_lan_probe_ttl();
                         if let Some(pid) = peer_id {
                             let is_peer_alive = mesh.is_peer_alive(&pid);
                             if Self::should_skip_stale_dht_record(scope, is_peer_alive) {
@@ -1560,9 +1618,20 @@ impl LocalAgentHandle {
                                 continue;
                             }
 
-                            if !is_peer_alive {
+                            if !is_peer_alive && scope.is_lan() {
+                                let cache_key =
+                                    Self::peer_cache_key(peer_id, node_manager_ref.id().sequence_id());
+                                if self.is_remote_node_temporarily_unreachable(&cache_key) {
+                                    log::debug!(
+                                        "list_remote_nodes: skipping stale LAN DHT record for peer {pid} due to active negative cache ttl={}ms (dht_name='{}')",
+                                        stale_lan_ttl.as_millis(),
+                                        dht_name
+                                    );
+                                    continue;
+                                }
                                 log::debug!(
-                                    "list_remote_nodes: keeping LAN DHT record for peer {pid} despite is_peer_alive=false (dht_name='{}')",
+                                    "list_remote_nodes: probing stale LAN DHT record for peer {pid} with negative cache ttl={}ms (dht_name='{}')",
+                                    stale_lan_ttl.as_millis(),
                                     dht_name
                                 );
                             }
@@ -1631,9 +1700,29 @@ impl LocalAgentHandle {
                     fetched_nodes.push(info);
                 }
                 Ok(Err(e)) => {
+                    if let Some(pid) = peer_id {
+                        self.mark_cached_remote_node_unreachable(
+                            cache_key.clone(),
+                            Self::stale_lan_probe_ttl(),
+                        );
+                        self.mark_cached_remote_node_unreachable(
+                            Self::peer_cache_key(Some(pid), 0),
+                            Self::stale_lan_probe_ttl(),
+                        );
+                    }
                     log::warn!("list_remote_nodes: GetNodeInfo failed: {}", e);
                 }
                 Err(_) => {
+                    if let Some(pid) = peer_id {
+                        self.mark_cached_remote_node_unreachable(
+                            cache_key.clone(),
+                            Self::stale_lan_probe_ttl(),
+                        );
+                        self.mark_cached_remote_node_unreachable(
+                            Self::peer_cache_key(Some(pid), 0),
+                            Self::stale_lan_probe_ttl(),
+                        );
+                    }
                     log::warn!(
                         "list_remote_nodes: GetNodeInfo timed out for peer {:?}",
                         peer_id
@@ -4670,7 +4759,7 @@ system = "beta"
 
         f.handle.remote_node_cache.by_label.write().insert(
             cache_key.clone(),
-            CachedNodeEntry {
+            CachedNodeEntry::Ready {
                 info: crate::agent::remote::NodeInfo {
                     node_id: crate::agent::remote::NodeId::from_peer_id(
                         libp2p::identity::Keypair::generate_ed25519()
@@ -4705,6 +4794,7 @@ system = "beta"
         );
         assert_eq!(LocalAgentHandle::remote_node_lookup_parallelism(), 8);
         assert_eq!(LocalAgentHandle::remote_node_cache_ttl().as_millis(), 10000);
+        assert_eq!(LocalAgentHandle::stale_lan_probe_ttl().as_millis(), 1500);
     }
 
     #[cfg(feature = "remote")]
@@ -4718,6 +4808,31 @@ system = "beta"
         assert!(!LocalAgentHandle::should_skip_stale_dht_record(&lan, false));
         assert!(LocalAgentHandle::should_skip_stale_dht_record(&iroh, false));
         assert!(!LocalAgentHandle::should_skip_stale_dht_record(&iroh, true));
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn test_remote_node_negative_cache_marks_and_expires_unreachable_entries() {
+        let f = HandleFixture::new().await;
+        let cache_key = "peer:negative-cache-peer".to_string();
+
+        f.handle.mark_cached_remote_node_unreachable(
+            cache_key.clone(),
+            std::time::Duration::from_millis(25),
+        );
+        assert!(f.handle.is_remote_node_temporarily_unreachable(&cache_key));
+        assert!(f.handle.get_cached_remote_node(&cache_key).is_none());
+
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+        assert!(!f.handle.is_remote_node_temporarily_unreachable(&cache_key));
+        assert!(
+            !f.handle
+                .remote_node_cache
+                .by_label
+                .read()
+                .contains_key(&cache_key)
+        );
     }
 
     // ── Registration contract tests ───────────────────────────────────────────
