@@ -964,8 +964,9 @@ async fn handle_load_session_succeeds_for_attached_remote_session_with_local_pro
     write_profile(dir.path(), "beta.toml");
     let profiles = attach_profiles(&mut f, "alpha", dir.path()).await;
     let session_id = format!("remote-load-{}", Uuid::now_v7());
+    let remote_node_id = "stable-remote-node";
 
-    attach_remote_session(&f, &session_id, "remote-peer").await;
+    attach_remote_session_with_node_id(&f, &session_id, "remote-peer", Some(remote_node_id)).await;
     profiles
         .bind_session_to_profile(&session_id, "alpha")
         .await
@@ -980,6 +981,7 @@ async fn handle_load_session_succeeds_for_attached_remote_session_with_local_pro
 
     let loaded = next_message_of_type(&mut rx, "session_loaded").await;
     assert_eq!(loaded["data"]["session_id"], session_id);
+    assert_eq!(loaded["data"]["node_id"], remote_node_id);
 
     Ok(())
 }

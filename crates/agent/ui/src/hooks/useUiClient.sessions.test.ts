@@ -51,6 +51,10 @@ function sentListSessions() {
   return MockWebSocket.instance?.sentMessages.filter((message) => message.type === 'list_sessions') ?? [];
 }
 
+function sentScheduleRequests() {
+  return MockWebSocket.instance?.sentMessages.filter((message) => message.type === 'list_schedules') ?? [];
+}
+
 describe('useUiClient - session listing', () => {
   beforeEach(() => {
     MockWebSocket.instance = null;
@@ -235,5 +239,87 @@ describe('useUiClient - session listing', () => {
 
     const request = sentListSessions().at(-1);
     expect(request?.data).toMatchObject({ mode: 'browse', include_remote: true });
+  });
+
+  it('uses loaded remote node ids when listing schedules after session load', async () => {
+    const { result } = await renderConnectedHook();
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'session_loaded',
+        data: {
+          session_id: 'remote-session',
+          agent_id: 'primary',
+          node_id: 'stable-remote-node',
+          audit: { session_id: 'remote-session', events: [], tasks: [], intent_snapshots: [], decisions: [], progress_entries: [], artifacts: [], delegations: [], generated_at: '2026-01-01T00:00:00Z' },
+          undo_stack: [],
+          cursor: { local_seq: 0, remote_seq_by_source: {} },
+        },
+      });
+    });
+
+    await act(async () => {
+      result.current.listSchedules('remote-session');
+    });
+
+    const request = sentScheduleRequests().at(-1);
+    expect(request?.data).toMatchObject({ session_id: 'remote-session', node_id: 'stable-remote-node' });
+  });
+
+  it('stores schedule lists by response key without dropping remote refresh results', async () => {
+    const { result } = await renderConnectedHook();
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'session_loaded',
+        data: {
+          session_id: 'remote-session',
+          agent_id: 'primary',
+          node_id: 'stable-remote-node',
+          audit: { session_id: 'remote-session', events: [], tasks: [], intent_snapshots: [], decisions: [], progress_entries: [], artifacts: [], delegations: [], generated_at: '2026-01-01T00:00:00Z' },
+          undo_stack: [],
+          cursor: { local_seq: 0, remote_seq_by_source: {} },
+        },
+      });
+    });
+
+    await act(async () => {
+      result.current.listSchedules('remote-session');
+    });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'schedule_list',
+        data: {
+          session_id: 'remote-session',
+          node_id: undefined,
+          schedules: [],
+        },
+      });
+      MockWebSocket.instance?.simulateMessage({
+        type: 'schedule_list',
+        data: {
+          session_id: 'remote-session',
+          node_id: 'stable-remote-node',
+          schedules: [
+            {
+              public_id: 'sched-1',
+              task_public_id: 'task-1',
+              session_public_id: 'remote-session',
+              node_id: 'stable-remote-node',
+              trigger: { Interval: { every_seconds: 60 } },
+              state: 'armed',
+              run_count: 1,
+              consecutive_failures: 0,
+              created_at: '2026-01-01T00:00:00Z',
+              updated_at: '2026-01-01T00:00:00Z',
+            },
+          ],
+        },
+      });
+    });
+
+    expect(result.current.schedules).toHaveLength(1);
+    expect(result.current.schedules[0]?.public_id).toBe('sched-1');
   });
 });

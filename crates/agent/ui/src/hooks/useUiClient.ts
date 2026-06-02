@@ -219,7 +219,6 @@ export function useUiClient() {
   const [isUpdatingPlugins, setIsUpdatingPlugins] = useState(false);
   const [schedulesByKey, setSchedulesByKey] = useState<Record<string, ScheduleInfo[]>>({});
   const [loadedSessionNodeIds, setLoadedSessionNodeIds] = useState<Record<string, string | null>>({});
-  const activeScheduleKeyRef = useRef<string | null>(null);
   const scheduleKeyForSession = useCallback(
     (targetSessionId?: string | null, explicitNodeId?: string) => {
       const resolvedNodeId = explicitNodeId ?? (targetSessionId ? loadedSessionNodeIds[targetSessionId] ?? undefined : undefined);
@@ -1354,9 +1353,6 @@ export function useUiClient() {
       case 'schedule_list': {
         const d = msg.data;
         const scheduleKey = `${d.session_id ?? ''}::${d.node_id ?? ''}`;
-        if (activeScheduleKeyRef.current !== scheduleKey) {
-          break;
-        }
         setSchedulesByKey(prev => ({
           ...prev,
           [scheduleKey]: d.schedules,
@@ -1949,9 +1945,9 @@ export function useUiClient() {
   // ── Schedule management ──────────────────────────────────────────────────
 
   const listSchedules = useCallback((sessionId?: string, nodeId?: string) => {
-    activeScheduleKeyRef.current = scheduleKeyForSession(sessionId, nodeId);
-    sendMessage({ type: 'list_schedules', data: { session_id: sessionId, node_id: nodeId } });
-  }, [scheduleKeyForSession]);
+    const resolvedNodeId = nodeId ?? (sessionId ? loadedSessionNodeIds[sessionId] ?? undefined : undefined);
+    sendMessage({ type: 'list_schedules', data: { session_id: sessionId, node_id: resolvedNodeId } });
+  }, [loadedSessionNodeIds]);
 
   const createSchedule = useCallback((
     sessionId: string,

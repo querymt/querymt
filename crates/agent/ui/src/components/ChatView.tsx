@@ -151,13 +151,16 @@ export function ChatView() {
     [sessionGroups, sessionId],
   );
   const currentSessionNodeId = currentSession?.node_id ?? (sessionId ? loadedSessionNodeIds[sessionId] ?? undefined : undefined);
+  const currentSessionIsRemote = Boolean(currentSession?.node || currentSession?.attached !== undefined || currentSession?.runtime_state);
+  const remoteNodeIdPending = currentSessionIsRemote && sessionId && currentSession?.node_id === undefined && !(sessionId in loadedSessionNodeIds);
 
-  // Fetch schedules when session changes.
+  // Fetch schedules when session changes, but wait for remote node resolution first.
   useEffect(() => {
-    if (sessionId) {
-      listSchedules(sessionId, currentSessionNodeId);
+    if (!sessionId || remoteNodeIdPending) {
+      return;
     }
-  }, [sessionId, currentSessionNodeId, listSchedules]);
+    listSchedules(sessionId, currentSessionNodeId);
+  }, [sessionId, currentSessionNodeId, remoteNodeIdPending, listSchedules]);
 
   // Whether to show the schedule panel (has schedules or panel was explicitly opened)
   const showSchedulePanel = schedules.length > 0;
