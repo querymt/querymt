@@ -76,7 +76,14 @@ pub struct MeshRuntimeConfig {
     /// LAN transport configuration.  `None` means LAN is disabled.
     pub lan: Option<LanMeshConfig>,
 
-    /// Iroh transport scopes.  Empty means Iroh is disabled.
+    /// Whether the iroh transport is enabled for this runtime.
+    ///
+    /// This is independent from `iroh_scopes`: a process may enable iroh at
+    /// startup so agents can ad-hoc join invites later, even before any iroh
+    /// mesh scope has been joined.
+    pub iroh_enabled: bool,
+
+    /// Iroh transport scopes that should be active from startup.
     pub iroh_scopes: Vec<IrohMeshConfig>,
 
     /// Path to the persistent ed25519 identity file.
@@ -187,8 +194,8 @@ impl MeshRuntimeConfig {
 
         // Determine LAN and Iroh configs from either old or new syntax.
         // When the mesh is disabled, skip transport config creation.
-        let (lan_config, iroh_configs) = if !enabled {
-            (None, Vec::new())
+        let (lan_config, iroh_enabled, iroh_configs) = if !enabled {
+            (None, false, Vec::new())
         } else if lan.is_some() || !iroh.is_empty() {
             // New syntax — use the structured sub-tables.
             let lan_config = match lan {
@@ -238,7 +245,13 @@ impl MeshRuntimeConfig {
                 });
             }
 
-            (lan_config, iroh_configs)
+            (
+                lan_config,
+                transport == crate::config::MeshTransportConfig::Iroh
+                    || invite.is_some()
+                    || !iroh_configs.is_empty(),
+                iroh_configs,
+            )
         } else {
             // Old syntax — derive from single transport field.
             match transport {
@@ -253,7 +266,7 @@ impl MeshRuntimeConfig {
                         discovery: disc,
                         directory: DirectoryMode::default(),
                     };
-                    (Some(lan_config), Vec::new())
+                    (Some(lan_config), false, Vec::new())
                 }
                 crate::config::MeshTransportConfig::Iroh => {
                     // Derive mesh_id from invite if available
@@ -276,7 +289,7 @@ impl MeshRuntimeConfig {
                         invite,
                         name: None,
                     };
-                    (None, vec![iroh_config])
+                    (None, true, vec![iroh_config])
                 }
             }
         };
@@ -284,6 +297,7 @@ impl MeshRuntimeConfig {
         let config = Self {
             enabled,
             lan: lan_config,
+            iroh_enabled,
             iroh_scopes: iroh_configs,
             identity_file,
             request_timeout,
@@ -305,7 +319,7 @@ impl MeshRuntimeConfig {
 
         // At least one transport must be enabled.
         let has_lan = self.lan.is_some();
-        let has_iroh = !self.iroh_scopes.is_empty();
+        let has_iroh = self.iroh_enabled;
         ensure!(
             has_lan || has_iroh,
             "mesh is enabled but no transport is configured. \
@@ -339,9 +353,9 @@ impl MeshRuntimeConfig {
         self.lan.is_some()
     }
 
-    /// Returns `true` if at least one Iroh scope is enabled.
+    /// Returns `true` if iroh transport is enabled.
     pub fn has_iroh(&self) -> bool {
-        !self.iroh_scopes.is_empty()
+        self.iroh_enabled
     }
 
     /// Returns the list of enabled transport kinds.

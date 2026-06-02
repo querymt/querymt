@@ -53,7 +53,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 
 /// UI WebSocket server.
@@ -82,6 +82,10 @@ pub(crate) struct RemoteNodeCache {
     nodes: Vec<crate::agent::remote::NodeInfo>,
     /// `Instant::now()` when `nodes` was populated.
     refreshed_at: Instant,
+    /// True while a caller is refreshing `nodes` from the mesh.
+    refreshing: bool,
+    /// Wakes waiters when the active refresh completes.
+    refresh_notify: Arc<Notify>,
 }
 
 impl RemoteNodeCache {
@@ -92,11 +96,30 @@ impl RemoteNodeCache {
         Self {
             nodes,
             refreshed_at: Instant::now(),
+            refreshing: false,
+            refresh_notify: Arc::new(Notify::new()),
         }
     }
 
     fn is_fresh(&self) -> bool {
         self.refreshed_at.elapsed().as_secs() < Self::TTL_SECS
+    }
+
+    fn begin_refresh(&mut self) -> Arc<Notify> {
+        self.refreshing = true;
+        self.refresh_notify.clone()
+    }
+
+    fn finish_refresh(&mut self, nodes: Vec<crate::agent::remote::NodeInfo>) {
+        self.nodes = nodes;
+        self.refreshed_at = Instant::now();
+        self.refreshing = false;
+        self.refresh_notify.notify_waiters();
+    }
+
+    fn finish_refresh_without_update(&mut self) {
+        self.refreshing = false;
+        self.refresh_notify.notify_waiters();
     }
 }
 
@@ -161,27 +184,46 @@ impl ServerState {
     /// via [`Self::invalidate_remote_node_cache`].
     #[cfg(feature = "remote")]
     pub async fn get_remote_nodes_cached(&self) -> Vec<crate::agent::remote::NodeInfo> {
-        // Fast path: return cached result if still fresh.
-        {
-            let guard = self.remote_node_cache.lock().await;
-            if let Some(ref cache) = *guard
-                && cache.is_fresh()
-            {
-                return cache.nodes.clone();
-            }
-        }
+        loop {
+            let (refresh_notify, should_refresh) = {
+                let mut guard = self.remote_node_cache.lock().await;
+                match guard.as_mut() {
+                    Some(cache) if cache.is_fresh() => return cache.nodes.clone(),
+                    Some(cache) if cache.refreshing => (cache.refresh_notify.clone(), false),
+                    Some(cache) => (cache.begin_refresh(), true),
+                    None => {
+                        let mut cache = RemoteNodeCache::new(Vec::new());
+                        let notify = cache.begin_refresh();
+                        *guard = Some(cache);
+                        (notify, true)
+                    }
+                }
+            };
 
-        // Slow path: query DHT and update cache.
-        let nodes = self.agent.list_remote_nodes().await;
-        let mut guard = self.remote_node_cache.lock().await;
-        *guard = Some(RemoteNodeCache::new(nodes.clone()));
-        nodes
+            if should_refresh {
+                let nodes = self.agent.list_remote_nodes().await;
+                let mut guard = self.remote_node_cache.lock().await;
+                if let Some(cache) = guard.as_mut() {
+                    cache.finish_refresh(nodes.clone());
+                } else {
+                    *guard = Some(RemoteNodeCache::new(nodes.clone()));
+                }
+                return nodes;
+            }
+
+            refresh_notify.notified().await;
+        }
     }
 
     /// Invalidate the remote-node cache (called on peer topology changes).
     #[cfg(feature = "remote")]
     pub async fn invalidate_remote_node_cache(&self) {
         let mut guard = self.remote_node_cache.lock().await;
+        if let Some(cache) = guard.as_mut()
+            && cache.refreshing
+        {
+            cache.finish_refresh_without_update();
+        }
         *guard = None;
     }
 }

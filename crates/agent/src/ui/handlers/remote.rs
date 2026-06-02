@@ -606,23 +606,18 @@ pub async fn handle_create_mesh_invite(
                         invite.grant.mesh_name.as_deref(),
                     ),
                 };
-                let actor_refs = state
+                if let Err(e) = state
                     .agent
-                    .local_mesh_actor_refs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                if let Some(actor_refs) = actor_refs {
-                    crate::agent::remote::register_local_mesh_actor_scope(
-                        &mesh,
-                        &actor_refs,
+                    .publish_mesh_scope(
+                        &crate::agent::remote::MeshRuntimeHandle::from(mesh.clone()),
                         &scope,
                     )
-                    .await;
-                } else {
+                    .await
+                {
                     log::warn!(
-                        "handle_create_mesh_invite: local mesh actors unavailable for scope {}",
-                        scope
+                        "handle_create_mesh_invite: failed to publish local actors for scope {}: {}",
+                        scope,
+                        e
                     );
                 }
 

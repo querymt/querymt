@@ -29,6 +29,25 @@ flowchart LR
 
 ## Quick Start
 
+### High-Level API
+
+```rust
+use querymt_agent::prelude::*;
+
+let agent = Agent::single()
+    .provider("anthropic", "claude-sonnet-4-5-20250929")
+    .cwd(".")
+    .tools(["read_tool", "shell", "edit"])
+    .mesh(Mesh::hybrid())
+    .build()
+    .await?;
+
+// Join an iroh mesh later without creating a second swarm.
+agent.mesh().unwrap().join(invite_code).await?;
+```
+
+`Mesh::hybrid()` is the recommended default for API users. It starts one process-shared runtime with LAN discovery plus iroh transport enabled, so invites can be joined later on the same runtime.
+
 ### Starting a Mesh Node
 
 ```bash
@@ -57,11 +76,14 @@ cargo run --example qmtcode --features remote -- --mesh=/ip4/192.168.1.100/tcp/9
 [mesh]
 enabled = true
 listen = "/ip4/0.0.0.0/tcp/9000"  # Multiaddr to listen on
-transport = "lan"                  # "lan" | "iroh"
+transport = "iroh"                 # Enable iroh transport for invite joins
 discovery = "mdns"                 # "mdns" | "kademlia" | "none"
 auto_fallback = false              # Allow mesh provider discovery
 node_name = "my-agent-node"        # Optional: human-readable name
 identity_file = "~/.qmt/mesh_identity.key"  # Optional: identity keypair
+
+[mesh.lan]
+enabled = true
 
 # Explicit peers to connect to
 [[mesh.peers]]
@@ -74,6 +96,8 @@ request_timeout_secs = 300
 # Grace period for stream reconnection
 stream_reconnect_grace_secs = 120
 ```
+
+This is the config equivalent of `Mesh::hybrid()`: LAN stays enabled, and iroh transport is available for ad-hoc invite joins.
 
 ### Configuration Reference
 
@@ -748,6 +772,24 @@ invite = "${QMT_MESH_INVITE}"
 ⚠️ **Token exposure**: Treat tokens like passwords - don't commit to git
 ⚠️ **Transport security**: Always use iroh (encrypted) for internet meshes
 ⚠️ **Revocation**: Tokens cannot be revoked before expiry (use short TTLs)
+
+## Ad-Hoc Invite Join
+
+Use ad-hoc joins when the agent is already running and you want to add a new iroh mesh scope later.
+
+```rust
+let mesh = agent.mesh().expect("agent built with mesh support");
+let joined = mesh.join(invite_code).await?;
+
+println!("joined mesh {} via {}", joined.mesh_id, joined.inviter_peer_id);
+```
+
+The returned `MeshJoinOutcome` reports:
+
+- `mesh_id`: the derived logical scope id
+- `mesh_name`: optional invite label
+- `inviter_peer_id`: the inviter peer id from the invite
+- `already_joined`: whether this join was idempotent
 
 ## Remote Agents
 

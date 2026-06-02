@@ -159,6 +159,10 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
 
     let inner = state::with_agent_read(handle, |record| Ok(record.agent.inner().clone()))?;
     inner.set_profiles(profile_manager.clone());
+    #[cfg(feature = "remote")]
+    if let Some(mesh) = inner.mesh() {
+        profile_manager.set_mesh(mesh).await;
+    }
     match profile_manager.list_profiles().await {
         Ok(profiles) => log::info!(
             "ffi.profiles.init: catalog ready profiles={} active={}",
@@ -188,24 +192,11 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
             querymt_agent::config::MeshDiscoveryConfig::Kademlia => "kademlia",
             querymt_agent::config::MeshDiscoveryConfig::None => "none",
         };
-        let node_name = mesh_config.node_name.clone();
         state::with_agent(handle, |record| {
             record.mesh_listen = listen_str;
             record.mesh_discovery = Some(discovery_str.to_string());
             Ok(())
         })?;
-
-        if let Some(mesh) = inner.mesh() {
-            profile_manager.set_mesh(mesh.clone()).await;
-            let refs =
-                querymt_agent::agent::remote::spawn_and_register_local_mesh_actors_with_name(
-                    inner.as_ref(),
-                    &mesh,
-                    node_name,
-                )
-                .await;
-            state::set_local_mesh_actors(handle, refs)?;
-        }
     }
 
     Ok(handle)

@@ -44,10 +44,6 @@ pub struct AgentRecord {
     /// View store shared from the process runtime storage.
     pub view_store: Option<Arc<dyn querymt_agent::session::projection::ViewStore>>,
 
-    /// Keepalive refs for local mesh actors registered by the mobile FFI.
-    #[cfg(feature = "remote")]
-    pub local_mesh_actors: Option<querymt_agent::agent::remote::LocalMeshActorRefs>,
-
     /// Diagnostic: the listen/discovery config used at bootstrap.
     pub mesh_listen: Option<String>,
     pub mesh_discovery: Option<String>,
@@ -108,8 +104,6 @@ pub fn attach_or_insert_runtime_agent(
         AgentRecord {
             agent: agent_arc,
             view_store,
-            #[cfg(feature = "remote")]
-            local_mesh_actors: None,
             mesh_listen: None,
             mesh_discovery: None,
             call_tracker: Arc::new(ActiveCallTracker::new()),
@@ -135,8 +129,6 @@ pub fn attach_existing_runtime_agent() -> Option<AgentHandle> {
         AgentRecord {
             agent: agent_arc,
             view_store,
-            #[cfg(feature = "remote")]
-            local_mesh_actors: None,
             mesh_listen: None,
             mesh_discovery: None,
             call_tracker: Arc::new(ActiveCallTracker::new()),
@@ -343,23 +335,6 @@ pub fn find_session_by_id(
         .values()
         .find(|session| session.session_id == session_id)
         .cloned())
-}
-
-#[cfg(feature = "remote")]
-pub fn set_local_mesh_actors(
-    agent_handle: AgentHandle,
-    refs: querymt_agent::agent::remote::LocalMeshActorRefs,
-) -> Result<(), FfiErrorCode> {
-    let mut state = HANDLE_STATE.lock();
-    let record = state
-        .agents
-        .get_mut(&agent_handle)
-        .ok_or(FfiErrorCode::NotFound)?;
-    if record.shutdown {
-        return Err(FfiErrorCode::NotFound);
-    }
-    record.local_mesh_actors = Some(refs);
-    Ok(())
 }
 
 /// A guard that holds a reference to an agent for the duration of a blocking call.

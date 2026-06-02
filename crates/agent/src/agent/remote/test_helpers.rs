@@ -542,6 +542,7 @@ pub(crate) mod fixtures {
 
             let handle = Arc::new(crate::agent::remote::remote_handle::RemoteAgentHandle::new(
                 format!("stub-{}", test_id),
+                None,
                 mesh.clone(),
             ));
 
