@@ -1,6 +1,20 @@
 use super::*;
 
 impl LocalAgentHandle {
+    #[cfg(feature = "remote")]
+    fn map_remote_node_manager_error(
+        error: kameo::error::RemoteSendError<crate::error::AgentError>,
+    ) -> agent_client_protocol::Error {
+        use crate::error::AgentError;
+
+        match error {
+            kameo::error::RemoteSendError::HandlerError(err) => {
+                agent_client_protocol::Error::from(err)
+            }
+            other => agent_client_protocol::Error::from(AgentError::RemoteActor(other.to_string())),
+        }
+    }
+
     /// Find a `RemoteNodeManager` by its stable node id (PeerId string).
     ///
     /// ## Fast path
@@ -181,11 +195,10 @@ impl LocalAgentHandle {
         agent_client_protocol::Error,
     > {
         use crate::agent::remote::ListRemoteSessions;
-        use crate::error::AgentError;
         node_manager_ref
             .ask(&ListRemoteSessions { offset, limit })
             .await
-            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+            .map_err(Self::map_remote_node_manager_error)
     }
 
     /// Create a session on a remote node and return the owning node's live session ref.
@@ -200,12 +213,11 @@ impl LocalAgentHandle {
     ) -> Result<crate::agent::remote::CreateRemoteSessionResponse, agent_client_protocol::Error>
     {
         use crate::agent::remote::CreateRemoteSession;
-        use crate::error::AgentError;
 
         node_manager_ref
             .ask(&CreateRemoteSession { cwd })
             .await
-            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+            .map_err(Self::map_remote_node_manager_error)
     }
 
     /// Fork a session on a remote node and return the forked child's live session ref.
@@ -217,7 +229,6 @@ impl LocalAgentHandle {
         message_id: String,
     ) -> Result<crate::agent::remote::ForkRemoteSessionResponse, agent_client_protocol::Error> {
         use crate::agent::remote::ForkRemoteSession;
-        use crate::error::AgentError;
 
         node_manager_ref
             .ask(&ForkRemoteSession {
@@ -225,7 +236,7 @@ impl LocalAgentHandle {
                 message_id,
             })
             .await
-            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+            .map_err(Self::map_remote_node_manager_error)
     }
 
     /// Attach an existing remote session (already has a `RemoteActorRef`) to
@@ -265,12 +276,11 @@ impl LocalAgentHandle {
     ) -> Result<crate::agent::remote::CreateRemoteSessionResponse, agent_client_protocol::Error>
     {
         use crate::agent::remote::ResumeRemoteSession;
-        use crate::error::AgentError;
 
         node_manager_ref
             .ask(&ResumeRemoteSession { session_id })
             .await
-            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+            .map_err(Self::map_remote_node_manager_error)
     }
 
     #[cfg(feature = "remote")]
@@ -280,12 +290,10 @@ impl LocalAgentHandle {
         request: crate::agent::remote::CreateRemoteSchedule,
     ) -> Result<crate::agent::remote::CreateRemoteScheduleResponse, agent_client_protocol::Error>
     {
-        use crate::error::AgentError;
-
         node_manager_ref
             .ask(&request)
             .await
-            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+            .map_err(Self::map_remote_node_manager_error)
     }
 
     #[cfg(feature = "remote")]
@@ -296,12 +304,11 @@ impl LocalAgentHandle {
     ) -> Result<crate::agent::remote::ListRemoteSchedulesResponse, agent_client_protocol::Error>
     {
         use crate::agent::remote::ListRemoteSchedules;
-        use crate::error::AgentError;
 
         node_manager_ref
             .ask(&ListRemoteSchedules { session_id })
             .await
-            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+            .map_err(Self::map_remote_node_manager_error)
     }
 
     #[cfg(feature = "remote")]
@@ -311,12 +318,11 @@ impl LocalAgentHandle {
         schedule_public_id: String,
     ) -> Result<(), agent_client_protocol::Error> {
         use crate::agent::remote::PauseRemoteSchedule;
-        use crate::error::AgentError;
 
         node_manager_ref
             .ask(&PauseRemoteSchedule { schedule_public_id })
             .await
-            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+            .map_err(Self::map_remote_node_manager_error)
     }
 
     #[cfg(feature = "remote")]
@@ -326,12 +332,11 @@ impl LocalAgentHandle {
         schedule_public_id: String,
     ) -> Result<(), agent_client_protocol::Error> {
         use crate::agent::remote::ResumeRemoteSchedule;
-        use crate::error::AgentError;
 
         node_manager_ref
             .ask(&ResumeRemoteSchedule { schedule_public_id })
             .await
-            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+            .map_err(Self::map_remote_node_manager_error)
     }
 
     #[cfg(feature = "remote")]
@@ -341,12 +346,11 @@ impl LocalAgentHandle {
         schedule_public_id: String,
     ) -> Result<(), agent_client_protocol::Error> {
         use crate::agent::remote::TriggerRemoteSchedule;
-        use crate::error::AgentError;
 
         node_manager_ref
             .ask(&TriggerRemoteSchedule { schedule_public_id })
             .await
-            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+            .map_err(Self::map_remote_node_manager_error)
     }
 
     #[cfg(feature = "remote")]
@@ -356,11 +360,10 @@ impl LocalAgentHandle {
         schedule_public_id: String,
     ) -> Result<(), agent_client_protocol::Error> {
         use crate::agent::remote::DeleteRemoteSchedule;
-        use crate::error::AgentError;
 
         node_manager_ref
             .ask(&DeleteRemoteSchedule { schedule_public_id })
             .await
-            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+            .map_err(Self::map_remote_node_manager_error)
     }
 }

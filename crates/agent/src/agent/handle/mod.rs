@@ -57,6 +57,7 @@ use anyhow::Result;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use kameo::actor::ActorRef;
+use parking_lot::Mutex as ParkingMutex;
 use querymt::LLMParams;
 use querymt::chat::ReasoningEffort;
 use std::any::Any;
@@ -220,7 +221,7 @@ pub struct LocalAgentHandle {
 
     /// Handle to the scheduler actor, set after `start_scheduler()` succeeds.
     /// `None` if scheduling is not enabled or lease was not acquired.
-    scheduler_handle: StdMutex<Option<crate::scheduler::SchedulerHandle>>,
+    pub(crate) scheduler_handle: SchedulerHandleSlot,
 
     /// Guard to ensure `shutdown()` only runs its body once.
     shutdown_done: AtomicBool,
@@ -229,6 +230,7 @@ pub struct LocalAgentHandle {
 type SharedProfileCatalog = Arc<dyn ProfileCatalog>;
 type ProfileRuntime = Arc<ProfileRuntimeManager<SharedProfileCatalog>>;
 type ProfileRuntimeSlot = ArcSwap<Option<ProfileRuntime>>;
+pub(crate) type SchedulerHandleSlot = Arc<ParkingMutex<Option<crate::scheduler::SchedulerHandle>>>;
 
 // ── Remote node lookup type aliases ─────────────────────────────────────────
 // These aliases improve readability of the complex async types used for

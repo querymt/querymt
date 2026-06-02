@@ -1351,6 +1351,7 @@ export type UiServerMessage =
 	session_id: string;
 	agent_id: string;
 	profile_id?: string;
+	node_id?: string;
 	audit: AuditView;
 	undo_stack: UndoStackFrame[];
 	cursor: StreamCursor;
@@ -1496,6 +1497,7 @@ export type UiServerMessage =
 	/** Schedule list response */
 	| { type: "schedule_list", data: {
 	schedules: ScheduleInfo[];
+	session_id?: string;
 	node_id?: string;
 }}
 	/** Schedule created successfully */

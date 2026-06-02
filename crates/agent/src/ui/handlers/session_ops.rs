@@ -741,6 +741,7 @@ pub async fn handle_load_session(
             session_id: session_id.to_string(),
             agent_id,
             profile_id,
+            node_id: None,
             audit: snapshot.audit,
             undo_stack,
             cursor: cursor.clone(),

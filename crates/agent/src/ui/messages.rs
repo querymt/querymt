@@ -859,6 +859,8 @@ pub enum UiServerMessage {
         session_id: String,
         agent_id: String,
         profile_id: Option<String>,
+        #[serde(default)]
+        node_id: Option<String>,
         audit: AuditView,
         undo_stack: Vec<UndoStackFrame>,
         #[typeshare(serialized_as = "StreamCursor")]
@@ -1025,6 +1027,8 @@ pub enum UiServerMessage {
     #[serde(rename = "schedule_list")]
     ScheduleList {
         schedules: Vec<ScheduleInfo>,
+        #[serde(default)]
+        session_id: Option<String>,
         #[serde(default)]
         node_id: Option<String>,
     },
@@ -1258,6 +1262,7 @@ mod tests {
             session_id: "session-1".to_string(),
             agent_id: "primary".to_string(),
             profile_id: Some("coder".to_string()),
+            node_id: None,
             audit: empty_audit("session-1"),
             undo_stack: Vec::new(),
             cursor: StreamCursor::default(),

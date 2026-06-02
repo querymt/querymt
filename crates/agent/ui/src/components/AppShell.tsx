@@ -80,6 +80,7 @@ export function AppShell() {
     meshInvites,
     lastCreatedMeshInvite,
     sessionChildrenLoading,
+    loadedSessionNodeIds,
   } = useUiClientSession();
 
   const {
@@ -126,7 +127,7 @@ export function AppShell() {
   const currentSession = sessionGroups
     .flatMap((group) => group.sessions)
     .find((session) => session.session_id === visibleSessionId);
-  const visibleSessionNodeId = currentSession?.node_id;
+  const visibleSessionNodeId = currentSession?.node_id ?? (visibleSessionId ? loadedSessionNodeIds[visibleSessionId] ?? undefined : undefined);
   const isMobile = useIsMobile();
   const [shortcutGatewayOpen, setShortcutGatewayOpen] = useState(false);
   const [themeSwitcherOpen, setThemeSwitcherOpen] = useState(false);

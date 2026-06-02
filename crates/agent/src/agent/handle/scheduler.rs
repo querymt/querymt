@@ -5,8 +5,8 @@ impl LocalAgentHandle {
 
     /// Create a recurring task and schedule for a session.
     ///
-    /// Creates the underlying `Task` row first (so FK constraints are satisfied),
-    /// then creates the `Schedule` referencing it and registers it with the scheduler.
+    /// Verifies the scheduler is available, then creates the recurring task row
+    /// and cleans it up again if schedule registration fails.
     ///
     /// Returns the schedule public ID, or an error if the scheduler is not running
     /// or the session cannot be found.
@@ -32,6 +32,11 @@ impl LocalAgentHandle {
                 agent_client_protocol::Error::invalid_params()
                     .data(format!("Session not found: {session_public_id}"))
             })?;
+
+        let scheduler = self
+            .get_or_start_scheduler()
+            .await
+            .ok_or_else(Self::scheduler_unavailable_error)?;
 
         // Create the task row so the schedule FK is satisfied.
         let now = time::OffsetDateTime::now_utc();
@@ -73,28 +78,26 @@ impl LocalAgentHandle {
 
         let schedule_public_id = schedule.public_id.clone();
 
-        let scheduler = self
-            .get_or_start_scheduler()
-            .await
-            .ok_or_else(Self::scheduler_unavailable_error)?;
-
-        match scheduler.add_schedule(schedule.clone()).await {
+        match scheduler.add_schedule(schedule).await {
             Ok(()) => Ok(schedule_public_id),
             Err(e) => {
                 let msg = e.to_string();
-                if !Self::is_actor_not_running_error(&msg) {
-                    return Err(agent_client_protocol::Error::internal_error().data(msg));
+                if Self::is_actor_not_running_error(&msg) {
+                    self.clear_scheduler_handle();
                 }
 
-                self.clear_scheduler_handle();
-                let scheduler = self
-                    .get_or_start_scheduler()
-                    .await
-                    .ok_or_else(Self::scheduler_unavailable_error)?;
-                scheduler.add_schedule(schedule).await.map_err(|err| {
-                    agent_client_protocol::Error::internal_error().data(err.to_string())
-                })?;
-                Ok(schedule_public_id)
+                let cleanup_suffix = match store.delete_task(&task.public_id).await {
+                    Ok(()) => String::new(),
+                    Err(cleanup_err) => {
+                        format!(
+                            "; cleanup failed for task {}: {}",
+                            task.public_id, cleanup_err
+                        )
+                    }
+                };
+
+                Err(agent_client_protocol::Error::internal_error()
+                    .data(format!("{msg}{cleanup_suffix}")))
             }
         }
     }

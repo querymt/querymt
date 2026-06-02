@@ -158,6 +158,7 @@ export interface UiClientSessionContextValue {
   sessionsEverLoaded: boolean;
   lastLoadErrorSessionId: string | null;
   schedules: ScheduleInfo[];
+  loadedSessionNodeIds: Record<string, string | null>;
   knowledgeEntries: KnowledgeEntryInfo[];
   knowledgeConsolidations: ConsolidationInfo[];
   knowledgeStats: {
@@ -336,6 +337,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     lastCreatedMeshInvite: uiClient.lastCreatedMeshInvite,
     lastLoadErrorSessionId: uiClient.lastLoadErrorSessionId,
     schedules: uiClient.schedules,
+    loadedSessionNodeIds: uiClient.loadedSessionNodeIds,
     knowledgeEntries: uiClient.knowledgeEntries,
     knowledgeConsolidations: uiClient.knowledgeConsolidations,
     knowledgeStats: uiClient.knowledgeStats,
@@ -374,6 +376,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     uiClient.lastCreatedMeshInvite,
     uiClient.lastLoadErrorSessionId,
     uiClient.schedules,
+    uiClient.loadedSessionNodeIds,
     uiClient.knowledgeEntries,
     uiClient.knowledgeConsolidations,
     uiClient.knowledgeStats,

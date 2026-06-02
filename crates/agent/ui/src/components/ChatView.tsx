@@ -96,6 +96,7 @@ export function ChatView() {
     llmConfigCache,
     undoState,
     schedules,
+    loadedSessionNodeIds,
   } = useUiClientSession();
 
   // UI state from Zustand store
@@ -149,7 +150,7 @@ export function ChatView() {
     () => sessionGroups.flatMap((group) => group.sessions).find((session) => session.session_id === sessionId),
     [sessionGroups, sessionId],
   );
-  const currentSessionNodeId = currentSession?.node_id;
+  const currentSessionNodeId = currentSession?.node_id ?? (sessionId ? loadedSessionNodeIds[sessionId] ?? undefined : undefined);
 
   // Fetch schedules when session changes.
   useEffect(() => {

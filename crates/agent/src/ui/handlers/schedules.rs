@@ -91,6 +91,7 @@ pub async fn handle_list_schedules(
                     tx,
                     UiServerMessage::ScheduleList {
                         schedules: infos,
+                        session_id: session_id.map(ToOwned::to_owned),
                         node_id: Some(node_id.to_string()),
                     },
                 )
@@ -113,6 +114,7 @@ pub async fn handle_list_schedules(
                 tx,
                 UiServerMessage::ScheduleList {
                     schedules: infos,
+                    session_id: session_id.map(ToOwned::to_owned),
                     node_id: None,
                 },
             )
@@ -170,17 +172,31 @@ pub async fn handle_create_schedule(
             Err(e) => Err(agent_client_protocol::Error::internal_error().data(e)),
         }
     } else {
-        state
+        match state
             .agent
-            .create_scheduled_task(
-                params.session_id,
-                params.prompt,
-                trigger,
-                params.max_steps,
-                params.max_cost_usd,
-                params.max_runs,
-            )
+            .config
+            .provider
+            .history_store()
+            .get_session_provider_node_id(params.session_id)
             .await
+        {
+            Ok(Some(_)) => Err(agent_client_protocol::Error::invalid_params()
+                .data("Remote sessions require node_id for schedule creation".to_string())),
+            Ok(None) => {
+                state
+                    .agent
+                    .create_scheduled_task(
+                        params.session_id,
+                        params.prompt,
+                        trigger,
+                        params.max_steps,
+                        params.max_cost_usd,
+                        params.max_runs,
+                    )
+                    .await
+            }
+            Err(e) => Err(agent_client_protocol::Error::internal_error().data(e.to_string())),
+        }
     };
 
     #[cfg(not(feature = "remote"))]
@@ -282,7 +298,23 @@ async fn handle_schedule_action(
     tx: &mpsc::Sender<String>,
 ) {
     let refresh_session_id = if node_id.is_some() {
-        session_id.map(ToOwned::to_owned)
+        match session_id {
+            Some(session_id) => Some(session_id.to_string()),
+            None => {
+                let _ = send_message(
+                    tx,
+                    UiServerMessage::ScheduleActionResult {
+                        success: false,
+                        schedule_public_id: schedule_public_id.to_string(),
+                        action: action.to_string(),
+                        node_id: node_id.map(ToOwned::to_owned),
+                        message: Some("Remote schedule actions require session_id".to_string()),
+                    },
+                )
+                .await;
+                return;
+            }
+        }
     } else if let Some(session_id) = session_id {
         Some(session_id.to_string())
     } else {

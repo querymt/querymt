@@ -334,8 +334,10 @@ mod remote_impl {
         pub materialization_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
         /// Cached model inventory for fast model listing without blocking the actor mailbox.
         pub model_inventory: crate::model_inventory::ModelInventory,
-        /// Lazily started local scheduler used for schedules hosted on this node.
-        pub scheduler_handle: Arc<std::sync::Mutex<Option<crate::scheduler::SchedulerHandle>>>,
+        /// Shared scheduler owner borrowed from the local agent handle.
+        pub scheduler_handle: crate::agent::handle::SchedulerHandleSlot,
+        /// Serializes first-start attempts so concurrent requests converge on one result.
+        pub scheduler_start_lock: Arc<tokio::sync::Mutex<()>>,
     }
 
     // ── Actor ─────────────────────────────────────────────────────────────────
@@ -368,6 +370,7 @@ mod remote_impl {
             config: Arc<AgentConfig>,
             registry: Arc<Mutex<SessionRegistry>>,
             mesh: Option<MeshHandle>,
+            scheduler_handle: crate::agent::handle::SchedulerHandleSlot,
         ) -> Self {
             let model_inventory = crate::model_inventory::ModelInventory::new(config.clone());
             let session_materializer = Arc::new(
@@ -389,7 +392,8 @@ mod remote_impl {
                 mesh,
                 materialization_locks: Arc::new(Mutex::new(HashMap::new())),
                 model_inventory,
-                scheduler_handle: Arc::new(std::sync::Mutex::new(None)),
+                scheduler_handle,
+                scheduler_start_lock: Arc::new(tokio::sync::Mutex::new(())),
             };
 
             // Prewarm model inventory in the background so first remote model
@@ -409,7 +413,7 @@ mod remote_impl {
         /// OS hostname.  Returns `self` for easy chaining:
         ///
         /// ```rust,ignore
-        /// let nm = RemoteNodeManager::new(config, registry, mesh)
+        /// let nm = RemoteNodeManager::new(config, registry, mesh, scheduler_handle)
         ///     .with_node_name("bob".to_string());
         /// ```
         pub fn with_node_name(mut self, name: String) -> Self {
@@ -428,16 +432,11 @@ mod remote_impl {
         }
 
         fn scheduler_handle(&self) -> Option<crate::scheduler::SchedulerHandle> {
-            self.scheduler_handle
-                .lock()
-                .ok()
-                .and_then(|guard| (*guard).clone())
+            self.scheduler_handle.lock().clone()
         }
 
         fn clear_scheduler_handle(&self) {
-            if let Ok(mut guard) = self.scheduler_handle.lock() {
-                *guard = None;
-            }
+            *self.scheduler_handle.lock() = None;
         }
 
         async fn start_scheduler(&self) -> bool {
@@ -457,9 +456,7 @@ mod remote_impl {
 
             match handle {
                 Some(h) => {
-                    if let Ok(mut guard) = self.scheduler_handle.lock() {
-                        *guard = Some(h);
-                    }
+                    *self.scheduler_handle.lock() = Some(h);
                     true
                 }
                 None => false,
@@ -467,6 +464,11 @@ mod remote_impl {
         }
 
         async fn get_or_start_scheduler(&self) -> Option<crate::scheduler::SchedulerHandle> {
+            if let Some(scheduler) = self.scheduler_handle() {
+                return Some(scheduler);
+            }
+
+            let _start_guard = self.scheduler_start_lock.lock().await;
             if let Some(scheduler) = self.scheduler_handle() {
                 return Some(scheduler);
             }
@@ -497,6 +499,11 @@ mod remote_impl {
                 .ok_or_else(|| AgentError::SessionNotFound {
                     session_id: session_public_id.to_string(),
                 })?;
+
+            let scheduler = self
+                .get_or_start_scheduler()
+                .await
+                .ok_or_else(Self::scheduler_unavailable_error)?;
 
             let now = time::OffsetDateTime::now_utc();
             let task = Task {
@@ -534,29 +541,23 @@ mod remote_impl {
             }
 
             let schedule_public_id = schedule.public_id.clone();
-            let scheduler = self
-                .get_or_start_scheduler()
-                .await
-                .ok_or_else(Self::scheduler_unavailable_error)?;
-
-            match scheduler.add_schedule(schedule.clone()).await {
+            match scheduler.add_schedule(schedule).await {
                 Ok(()) => Ok(schedule_public_id),
                 Err(e) => {
                     let msg = e.to_string();
-                    if !Self::is_actor_not_running_error(&msg) {
-                        return Err(AgentError::Internal(msg));
+                    if Self::is_actor_not_running_error(&msg) {
+                        self.clear_scheduler_handle();
                     }
 
-                    self.clear_scheduler_handle();
-                    let scheduler = self
-                        .get_or_start_scheduler()
-                        .await
-                        .ok_or_else(Self::scheduler_unavailable_error)?;
-                    scheduler
-                        .add_schedule(schedule)
-                        .await
-                        .map_err(|err| AgentError::Internal(err.to_string()))?;
-                    Ok(schedule_public_id)
+                    let cleanup_suffix = match store.delete_task(&task.public_id).await {
+                        Ok(()) => String::new(),
+                        Err(cleanup_err) => format!(
+                            "; cleanup failed for task {}: {}",
+                            task.public_id, cleanup_err
+                        ),
+                    };
+
+                    Err(AgentError::Internal(format!("{msg}{cleanup_suffix}")))
                 }
             }
         }

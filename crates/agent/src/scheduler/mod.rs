@@ -151,7 +151,8 @@ impl SchedulerHandle {
     /// Add a schedule.
     pub async fn add_schedule(&self, schedule: Schedule) -> SessionResult<()> {
         self.actor_ref
-            .tell(AddSchedule { schedule })
+            .ask(AddSchedule { schedule })
+            .send()
             .await
             .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
         Ok(())
@@ -377,14 +378,14 @@ impl Message<TriggerNow> for SchedulerActor {
 // ── AddSchedule (control) ────────────────────────────────────────────────
 
 impl Message<AddSchedule> for SchedulerActor {
-    type Reply = ();
+    type Reply = Result<(), crate::session::error::SessionError>;
 
     async fn handle(
         &mut self,
         msg: AddSchedule,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.handle_add_schedule(msg.schedule).await;
+        self.handle_add_schedule(msg.schedule).await
     }
 }
 
@@ -1365,32 +1366,28 @@ impl SchedulerActor {
     // ── Schedule management ──────────────────────────────────────────────
 
     /// Add a new schedule.
-    pub async fn handle_add_schedule(&mut self, schedule: Schedule) {
+    pub async fn handle_add_schedule(&mut self, schedule: Schedule) -> SessionResult<()> {
         let public_id = schedule.public_id.clone();
         let session_public_id = schedule.session_public_id.clone();
         let task_public_id = schedule.task_public_id.clone();
 
-        match self.schedule_store.create_schedule(schedule).await {
-            Ok(created) => {
-                self.enqueue_schedule(&created);
-                info!(
-                    "SchedulerActor: added schedule {} for task {}",
-                    public_id, task_public_id
-                );
+        let created = self.schedule_store.create_schedule(schedule).await?;
+        self.enqueue_schedule(&created);
+        info!(
+            "SchedulerActor: added schedule {} for task {}",
+            public_id, task_public_id
+        );
 
-                self.config.emit_event(
-                    &session_public_id,
-                    AgentEventKind::ScheduleCreated {
-                        schedule_public_id: created.public_id.clone(),
-                        session_public_id: session_public_id.clone(),
-                        task_public_id,
-                    },
-                );
-            }
-            Err(e) => {
-                warn!("SchedulerActor: failed to create schedule: {}", e);
-            }
-        }
+        self.config.emit_event(
+            &session_public_id,
+            AgentEventKind::ScheduleCreated {
+                schedule_public_id: created.public_id.clone(),
+                session_public_id: session_public_id.clone(),
+                task_public_id,
+            },
+        );
+
+        Ok(())
     }
 
     /// Remove a schedule. If running, defers deletion until after the terminal event.
