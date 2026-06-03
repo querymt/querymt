@@ -99,9 +99,7 @@ impl LocalAgentHandle {
                                     &bookmark.node_id,
                                 );
                             if let Ok(Some(found)) = mesh
-                                .lookup_actor::<crate::agent::remote::provider_host::ProviderHostActor>(
-                                    &provider_host_name,
-                                )
+                                .lookup_actor::<querymt_remote::ProviderHostActor>(&provider_host_name)
                                 .await
                             {
                                 provider_host = Some(found);
@@ -111,7 +109,7 @@ impl LocalAgentHandle {
                         if let Some(provider_host) = provider_host {
                             let status = provider_host
                                 .ask(
-                                    &crate::agent::remote::provider_host::GetProviderStreamStatus {
+                                    &crate::agent::remote::GetProviderStreamStatus {
                                         session_id: session_id.to_string(),
                                         request_id: None,
                                     },
@@ -135,7 +133,7 @@ impl LocalAgentHandle {
                                     "remote stop found active provider stream; issuing provider-host cancel"
                                 );
                                 let _ = provider_host
-                                    .ask(&crate::agent::remote::provider_host::CancelProviderStreamRequest {
+                                    .ask(&crate::agent::remote::CancelProviderStreamRequest {
                                         session_id: session_id.to_string(),
                                         request_id: Some(status.request_id.clone()),
                                         reason: Some("session stop requested".to_string()),
@@ -143,7 +141,7 @@ impl LocalAgentHandle {
                                     .await;
                             } else {
                                 let _ = provider_host
-                                    .ask(&crate::agent::remote::provider_host::CancelProviderStreamRequest {
+                                    .ask(&crate::agent::remote::CancelProviderStreamRequest {
                                         session_id: session_id.to_string(),
                                         request_id: None,
                                         reason: Some("session stop requested without status".to_string()),

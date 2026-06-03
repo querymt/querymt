@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::agent::agent_config::AgentConfig;
 #[cfg(feature = "remote")]
-use crate::agent::remote::runtime_handle::MeshRuntimeHandle;
+use querymt_remote::MeshRuntimeHandle;
 use crate::model_registry::{ModelEntry, enumerate_local_models};
 
 /// Metadata about the current snapshot
@@ -244,6 +244,10 @@ impl ModelInventory {
         M: Into<MeshRuntimeHandle>,
     {
         *self.inner.mesh.write() = Some(mesh.into());
+    }
+
+    pub fn local_snapshot_entries_blocking(&self) -> Vec<ModelEntry> {
+        (*self.inner.local_snapshot.load_full()).clone()
     }
 
     /// Get current model snapshot immediately (never blocks).
@@ -551,7 +555,8 @@ impl ModelInventory {
         )
     )]
     async fn refresh_remote(&self) -> Result<(Vec<ModelEntry>, usize, usize), ()> {
-        use crate::agent::remote::{GetNodeInfo, ListAvailableModels, RemoteNodeManager};
+        use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
+        use querymt_remote::{GetProviderCatalog, ProviderCatalogActor, scoped_provider_catalog};
         use tokio::time::timeout;
 
         let start = Instant::now();
@@ -564,7 +569,7 @@ impl ModelInventory {
         let scopes = mesh.active_scopes();
         let mut node_refs = Vec::new();
 
-        for scope in scopes {
+        for scope in &scopes {
             let mut stream =
                 mesh.lookup_all_actors_scoped::<RemoteNodeManager>(&scope, "node_manager");
 
@@ -595,11 +600,12 @@ impl ModelInventory {
         for node_ref in node_refs {
             let semaphore = semaphore.clone();
             let node_timeout = self.inner.inv_config.remote_node_timeout;
+            let mesh = mesh.clone();
+            let scopes = scopes.clone();
 
             let handle = tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.unwrap();
 
-                // Get node info with timeout
                 let node_info =
                     match timeout(node_timeout, node_ref.ask::<GetNodeInfo>(&GetNodeInfo)).await {
                         Ok(Ok(info)) => info,
@@ -612,46 +618,103 @@ impl ModelInventory {
                                 "GetNodeInfo timed out for node (timeout: {:?})",
                                 node_timeout
                             );
-                            return Some(Err(())); // Timeout
+                            return Some(Err(()));
                         }
                     };
 
-                // Get models with timeout
-                match timeout(
-                    node_timeout,
-                    node_ref.ask::<ListAvailableModels>(&ListAvailableModels),
-                )
-                .await
-                {
-                    Ok(Ok(models)) => {
-                        let entries: Vec<ModelEntry> = models
-                            .into_iter()
-                            .map(|m| ModelEntry {
-                                id: format!("{}/{}", m.provider, m.model),
-                                label: m.model.clone(),
-                                source: "catalog".to_string(),
-                                provider: m.provider,
-                                model: m.model,
-                                node_id: Some(node_info.node_id.to_string()),
-                                node_label: Some(node_info.hostname.clone()),
-                                family: None,
-                                quant: None,
-                            })
-                            .collect();
-                        Some(Ok(entries))
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!("ListAvailableModels failed: {}", e);
-                        None
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            "ListAvailableModels timed out for node (timeout: {:?})",
-                            node_timeout
-                        );
-                        Some(Err(())) // Timeout
+                let Some(peer_id) = node_ref.id().peer_id().copied() else {
+                    return None;
+                };
+
+                for scope in &scopes {
+                    let catalog_name = scoped_provider_catalog(scope, &peer_id);
+                    match timeout(
+                        node_timeout,
+                        mesh.lookup_actor::<ProviderCatalogActor>(catalog_name),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Some(catalog_ref))) => {
+                            match timeout(
+                                node_timeout,
+                                catalog_ref.ask::<GetProviderCatalog>(&GetProviderCatalog),
+                            )
+                            .await
+                            {
+                                Ok(Ok(snapshot)) => {
+                                    let fallback_node_id = node_info.node_id.to_string();
+                                    let resolved_node_id =
+                                        crate::agent::remote::NodeId::parse(&snapshot.node.node_id)
+                                            .ok()
+                                            .map(|id| id.to_string())
+                                            .unwrap_or(fallback_node_id);
+                                    let resolved_label = snapshot
+                                        .node
+                                        .node_label
+                                        .clone()
+                                        .unwrap_or_else(|| node_info.hostname.clone());
+                                    let entries: Vec<ModelEntry> = snapshot
+                                        .providers
+                                        .into_iter()
+                                        .map(|m| {
+                                            let model = m.model.unwrap_or_else(|| "*".to_string());
+                                            let provider = m.provider;
+                                            ModelEntry {
+                                                id: format!("{}/{}", provider, model),
+                                                label: m.label.unwrap_or_else(|| {
+                                                    if model == "*" {
+                                                        format!("{} (all models)", provider)
+                                                    } else {
+                                                        model.clone()
+                                                    }
+                                                }),
+                                                source: "catalog".to_string(),
+                                                provider,
+                                                model,
+                                                node_id: Some(resolved_node_id.clone()),
+                                                node_label: Some(resolved_label.clone()),
+                                                family: m.family,
+                                                quant: m.quant,
+                                            }
+                                        })
+                                        .collect();
+                                    return Some(Ok(entries));
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::debug!(
+                                        "GetProviderCatalog failed for peer {}: {}",
+                                        peer_id,
+                                        e
+                                    );
+                                }
+                                Err(_) => {
+                                    tracing::warn!(
+                                        "GetProviderCatalog timed out for node (timeout: {:?})",
+                                        node_timeout
+                                    );
+                                    return Some(Err(()));
+                                }
+                            }
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(e)) => {
+                            tracing::debug!("ProviderCatalog lookup failed for peer {}: {}", peer_id, e);
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "ProviderCatalog lookup timed out for node (timeout: {:?})",
+                                node_timeout
+                            );
+                            return Some(Err(()));
+                        }
                     }
                 }
+
+                tracing::debug!(
+                    peer_id = %peer_id,
+                    "remote node has no provider catalog registration; skipping model enumeration"
+                );
+                Some(Ok(Vec::new()))
             });
 
             handles.push(handle);

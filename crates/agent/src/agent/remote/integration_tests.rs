@@ -90,23 +90,19 @@ mod node_manager_extended_tests {
     // ── D.5 — No credentials → empty model list ───────────────────────────────
 
     #[tokio::test]
-    async fn test_list_available_models_empty_when_no_credentials() {
-        use crate::agent::remote::node_manager::ListAvailableModels;
-
-        // Keep one no-mesh regression path to ensure non-mesh node manager
-        // behavior remains covered in remote-feature tests.
-        let f = NodeManagerFixture::new().await;
-        let models = f
+    async fn test_node_manager_get_node_info_still_works_without_provider_listing() {
+        // Keep one no-mesh regression path to ensure the node manager still
+        // responds on core control-plane APIs after provider discovery moved out.
+        let f = NodeManagerFixture::new_with_mesh().await;
+        let info = f
             .actor_ref
-            .ask(ListAvailableModels)
+            .ask(GetNodeInfo)
             .await
-            .expect("list_available_models should succeed");
+            .expect("get_node_info should succeed");
 
-        // The test registry has no providers configured → empty list.
         assert!(
-            models.is_empty(),
-            "no providers configured → model list should be empty, got {:?}",
-            models
+            !info.node_id.to_string().is_empty(),
+            "node manager should still expose a stable node id"
         );
     }
 

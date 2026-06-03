@@ -28,11 +28,11 @@
 //! downcast on lookup. This is safe because each entry's actor type is fixed
 //! at insertion time.
 //!
-//! ## `DirectoryMode` integration
+//! ## Directory integration
 //!
-//! `bootstrap_mesh()` returns a `DynMeshTransport`; when
-//! `MeshConfig::directory == DirectoryMode::Cached` it wraps the result in a
-//! `CachedMeshTransport` first.
+//! The runtime config can request cached actor lookup mode through
+//! `querymt_remote::mesh_runtime_config::DirectoryMode::Cached`, which wraps the
+//! underlying `MeshHandle` with `CachedMeshTransport` semantics.
 
 use parking_lot::RwLock;
 use std::any::Any;
@@ -257,7 +257,7 @@ async fn prewarm_cache_for_peer(
     peer_id: PeerId,
 ) {
     use super::node_manager::RemoteNodeManager;
-    use super::provider_host::ProviderHostActor;
+    use querymt_remote::ProviderHostActor;
 
     let exchange_name = RegistryExchangeActor::dht_name(&peer_id);
     let exchange_ref = match handle
@@ -435,11 +435,11 @@ impl CachedDynMeshTransport {
         &self,
         name: &str,
     ) -> Result<
-        Option<RemoteActorRef<super::provider_host::ProviderHostActor>>,
+        Option<RemoteActorRef<querymt_remote::ProviderHostActor>>,
         kameo::error::RegistryError,
     > {
         self.cached
-            .lookup_cached::<super::provider_host::ProviderHostActor>(name)
+            .lookup_cached::<querymt_remote::ProviderHostActor>(name)
             .await
     }
 

@@ -10,9 +10,10 @@
 #[cfg(test)]
 #[cfg(feature = "remote")]
 mod tests {
-    use crate::agent::remote::provider_host::{
+    use querymt_remote::ProviderHostActor;
+    use crate::agent::remote::{
         CancelProviderStreamRequest, GetProviderStreamStatus, ProviderChatRequest,
-        ProviderHostActor, ProviderStreamRequest, RenewProviderStreamLease,
+        ProviderStreamRequest, RenewProviderStreamLease,
     };
     use kameo::message::Message;
 

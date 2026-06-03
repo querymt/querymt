@@ -9,6 +9,9 @@
 #[cfg(all(test, feature = "remote"))]
 #[allow(clippy::module_inception)]
 mod provider_host_tests {
+    use querymt_remote::{
+        keep_stream_message_buffered, relay_message_is_terminal,
+    };
     use tokio::sync::mpsc;
     // ── A.0 — SessionProvider::initial_params() ───────────────────────────────
     //
@@ -90,7 +93,8 @@ mod provider_host_tests {
         // "model must be a local .gguf path" parse error that occurred when
         // params were silently dropped.
         use crate::agent::agent_config_builder::AgentConfigBuilder;
-        use crate::agent::remote::provider_host::{ProviderChatRequest, ProviderHostActor};
+        use crate::agent::remote::ProviderChatRequest;
+        use querymt_remote::ProviderHostActor;
         use crate::session::backend::StorageBackend as _;
         use crate::session::sqlite_storage::SqliteStorage;
         use kameo::actor::Spawn;
@@ -127,7 +131,7 @@ mod provider_host_tests {
             .build(),
         );
 
-        let actor = ProviderHostActor::new(config);
+        let actor = crate::agent::remote::provider_host_backend::provider_host_from_config(config);
         let actor_ref = ProviderHostActor::spawn(actor);
 
         let req = ProviderChatRequest {
@@ -165,11 +169,11 @@ mod provider_host_tests {
             Err(e) => panic!("unexpected error variant: {:?}", e),
         }
     }
-    use crate::agent::remote::provider_host::{
+    use querymt_remote::StreamReceiverActor;
+    use crate::agent::remote::{
         CancelProviderStreamRequest, GetProviderStreamStatus, ProviderChatRequest,
         ProviderChatResponse, ProviderStreamPhase, ProviderStreamStatus, RenewProviderStreamLease,
-        StreamChunkRelay, StreamReceiverActor, StreamRelayMessage, keep_stream_message_buffered,
-        relay_message_is_terminal,
+        StreamChunkRelay, StreamRelayMessage,
     };
     use crate::agent::remote::test_helpers::fixtures::ProviderHostFixture;
     use kameo::actor::Spawn;
@@ -618,7 +622,7 @@ mod provider_host_tests {
 
     #[test]
     fn test_params_for_remote_provider_includes_system_prompt() {
-        use crate::agent::remote::provider_host::params_for_remote_provider;
+        use querymt_remote::params_for_remote_provider;
         use querymt::LLMParams;
 
         let llm = LLMParams::new()
@@ -657,7 +661,7 @@ mod provider_host_tests {
 
     #[test]
     fn test_params_for_remote_provider_empty_when_no_extra_fields() {
-        use crate::agent::remote::provider_host::params_for_remote_provider;
+        use querymt_remote::params_for_remote_provider;
         use querymt::LLMParams;
 
         let llm = LLMParams::new().provider("openai").model("gpt-4");
@@ -671,7 +675,7 @@ mod provider_host_tests {
 
     #[test]
     fn test_params_for_remote_provider_strips_api_key() {
-        use crate::agent::remote::provider_host::params_for_remote_provider;
+        use querymt_remote::params_for_remote_provider;
         use querymt::LLMParams;
 
         let llm = LLMParams::new()
@@ -799,7 +803,7 @@ mod provider_host_tests {
 
     #[test]
     fn test_merge_params_request_overrides_host_defaults() {
-        use crate::agent::remote::provider_host::merge_params;
+        use querymt_remote::merge_remote_provider_params as merge_params;
 
         let host = serde_json::json!({
             "n_ctx": 32768,
@@ -840,7 +844,7 @@ mod provider_host_tests {
 
     #[test]
     fn test_merge_params_strips_api_key_from_request() {
-        use crate::agent::remote::provider_host::merge_params;
+        use querymt_remote::merge_remote_provider_params as merge_params;
 
         let request = serde_json::json!({
             "api_key": "sk-secret-123",
@@ -862,7 +866,7 @@ mod provider_host_tests {
 
     #[test]
     fn test_merge_params_strips_remote_transport_metadata_from_request() {
-        use crate::agent::remote::provider_host::merge_params;
+        use querymt_remote::merge_remote_provider_params as merge_params;
 
         let request = serde_json::json!({
             "_remote_session_id": "session-123",
@@ -881,13 +885,13 @@ mod provider_host_tests {
 
     #[test]
     fn test_merge_params_both_none_returns_none() {
-        use crate::agent::remote::provider_host::merge_params;
+        use querymt_remote::merge_remote_provider_params as merge_params;
         assert!(merge_params(None, None).is_none());
     }
 
     #[test]
     fn test_merge_params_host_only() {
-        use crate::agent::remote::provider_host::merge_params;
+        use querymt_remote::merge_remote_provider_params as merge_params;
 
         let host = serde_json::json!({"n_ctx": 32768});
         let merged = merge_params(None, Some(&host)).expect("should return host defaults");
@@ -895,39 +899,36 @@ mod provider_host_tests {
     }
 
     #[test]
-    fn test_should_ack_relay_message_uses_window_for_chunk_batches() {
-        use crate::agent::remote::provider_host::should_ack_relay_message;
+    fn test_chunk_batch_ack_window_logic() {
         use std::time::Duration;
+
+        let should_ack = |message: &StreamRelayMessage,
+                          unacked_batches: u32,
+                          last_ack_at: Duration,
+                          ack_window_batches: u32,
+                          ack_window_interval: Duration| {
+            let is_terminal = relay_message_is_terminal(message);
+            let is_chunk_batch = matches!(
+                message,
+                StreamRelayMessage::Chunk(_) | StreamRelayMessage::ChunkBatch(_)
+            );
+            is_terminal
+                || !is_chunk_batch
+                || unacked_batches >= ack_window_batches
+                || last_ack_at >= ack_window_interval
+        };
 
         let chunk = StreamRelayMessage::Chunk(StreamChunk::Text("hello".to_string()));
         assert!(
-            !should_ack_relay_message(
-                &chunk,
-                0,
-                Duration::from_millis(5),
-                8,
-                Duration::from_millis(40)
-            ),
+            !should_ack(&chunk, 0, Duration::from_millis(5), 8, Duration::from_millis(40)),
             "fresh chunk batches inside the window should not force an ack"
         );
         assert!(
-            should_ack_relay_message(
-                &chunk,
-                8,
-                Duration::from_millis(5),
-                8,
-                Duration::from_millis(40)
-            ),
+            should_ack(&chunk, 8, Duration::from_millis(5), 8, Duration::from_millis(40)),
             "chunk batches should ack once the batch window is reached"
         );
         assert!(
-            should_ack_relay_message(
-                &chunk,
-                0,
-                Duration::from_millis(40),
-                8,
-                Duration::from_millis(40)
-            ),
+            should_ack(&chunk, 0, Duration::from_millis(40), 8, Duration::from_millis(40)),
             "chunk batches should ack once the time window is reached"
         );
 
@@ -935,13 +936,7 @@ mod provider_host_tests {
             finish_reason: querymt::chat::FinishReason::Stop,
         });
         assert!(
-            should_ack_relay_message(
-                &done,
-                0,
-                Duration::from_millis(0),
-                8,
-                Duration::from_millis(40)
-            ),
+            should_ack(&done, 0, Duration::from_millis(0), 8, Duration::from_millis(40)),
             "terminal messages must always be acked"
         );
 
@@ -952,13 +947,7 @@ mod provider_host_tests {
             chunk_count: 2,
         };
         assert!(
-            should_ack_relay_message(
-                &heartbeat,
-                0,
-                Duration::from_millis(0),
-                8,
-                Duration::from_millis(40)
-            ),
+            should_ack(&heartbeat, 0, Duration::from_millis(0), 8, Duration::from_millis(40)),
             "control messages should stay acked for health signaling"
         );
     }

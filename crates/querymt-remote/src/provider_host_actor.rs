@@ -1,294 +1,22 @@
-//! `ProviderHostActor` — exposes this node's LLM providers as callable mesh services.
-//!
-//! Each mesh node runs one `ProviderHostActor`. Remote nodes send it
-//! `ProviderChatRequest` (non-streaming) or `ProviderStreamRequest` (streaming)
-//! messages to execute LLM calls using the local node's providers and API keys.
-//!
-//! API keys never leave the owning node. Only `ChatMessage`s flow in and
-//! `ProviderChatResponse` / `StreamChunkRelay` flow out.
-//!
-//! Registered in the Kademlia DHT as `"provider_host::peer::{peer_id}"`.
-
-use crate::agent::agent_config::AgentConfig;
-use crate::error::AgentError;
-use crate::session::provider::ProviderRequest;
+use crate::provider_host_error::RemoteProviderHostError;
+use crate::provider_protocol::{
+    CancelProviderStreamRequest, GetProviderStreamStatus, ProviderChatRequest,
+    ProviderChatResponse, ProviderStreamPhase, ProviderStreamRequest, ProviderStreamStatus,
+    RenewProviderStreamLease, StreamRelayMessage, keep_stream_message_buffered,
+    relay_message_is_terminal, should_ack_relay_message,
+};
+use crate::stream_router_protocol::RoutedStreamRelayMessage;
+use crate::{RemoteProviderBackend, build_provider_for_request};
 use kameo::Actor;
 use kameo::message::{Context, Message};
 use kameo::remote::_internal;
 use parking_lot::Mutex;
-use querymt::LLMProvider;
-use querymt::ToolCall;
-use querymt::Usage;
-use querymt::chat::{ChatMessage, ChatResponse, FinishReason, StreamChunk, Tool};
-use querymt::error::LLMErrorPayload;
-use serde::{Deserialize, Serialize};
+use querymt::chat::StreamChunk;
 use std::collections::{HashMap, VecDeque};
-use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
-
-use super::session_stream_router::RoutedStreamRelayMessage;
-
-// ── Wire types ────────────────────────────────────────────────────────────────
-
-/// The concrete, serializable representation of an LLM response.
-///
-/// `Box<dyn ChatResponse>` cannot be sent across the mesh — this type maps
-/// 1:1 to the `ChatResponse` trait methods and is what `ProviderHostActor`
-/// returns for non-streaming calls.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderChatResponse {
-    pub text: Option<String>,
-    pub thinking: Option<String>,
-    pub tool_calls: Vec<ToolCall>,
-    pub usage: Option<querymt::Usage>,
-    pub finish_reason: Option<String>,
-}
-
-impl fmt::Display for ProviderChatResponse {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.text {
-            Some(t) => write!(f, "{}", t),
-            None => write!(f, "[no text]"),
-        }
-    }
-}
-
-impl ChatResponse for ProviderChatResponse {
-    fn text(&self) -> Option<String> {
-        self.text.clone()
-    }
-
-    fn thinking(&self) -> Option<String> {
-        self.thinking.clone()
-    }
-
-    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
-        if self.tool_calls.is_empty() {
-            None
-        } else {
-            Some(self.tool_calls.clone())
-        }
-    }
-
-    fn finish_reason(&self) -> Option<FinishReason> {
-        self.finish_reason.as_deref().map(|r| match r {
-            "Stop" => FinishReason::Stop,
-            "Length" => FinishReason::Length,
-            "ContentFilter" => FinishReason::ContentFilter,
-            "ToolCalls" => FinishReason::ToolCalls,
-            "Error" => FinishReason::Error,
-            "Other" => FinishReason::Other,
-            _ => FinishReason::Unknown,
-        })
-    }
-
-    fn usage(&self) -> Option<Usage> {
-        self.usage.clone()
-    }
-}
-
-/// Stream relay/control payload sent from `ProviderHostActor` to the
-/// `StreamReceiverActor` on the requesting node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum StreamRelayMessage {
-    /// Normal streamed chunk from the upstream provider.
-    Chunk(StreamChunk),
-    /// Batched streamed chunks from the upstream provider.
-    ChunkBatch(Vec<StreamChunk>),
-    /// Liveness pulse from the provider host while waiting on an upstream model.
-    Heartbeat {
-        phase: ProviderStreamPhase,
-        elapsed_ms: u64,
-        idle_ms: u64,
-        chunk_count: u64,
-    },
-    /// Provider/model error produced by the upstream stream.
-    ProviderError { error: LLMErrorPayload },
-    /// The transport path to the requesting node disappeared but may recover.
-    TransportDisconnected { reason: String },
-    /// Delivery has resumed after a temporary transport disconnect.
-    TransportReconnected { buffered_chunks: usize },
-    /// The stream failed permanently because reconnect grace expired.
-    TransportFailed { error: LLMErrorPayload },
-}
-
-/// Thin wrapper around a stream relay/control payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StreamChunkRelay {
-    pub message: StreamRelayMessage,
-}
-
-// ── Message types ─────────────────────────────────────────────────────────────
-
-/// Non-streaming provider call message (use `ask()`).
-///
-/// The requesting node sends this to the `ProviderHostActor` and waits for a
-/// `ProviderChatResponse`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderChatRequest {
-    /// Provider name (e.g. `"anthropic"`, `"openai"`).
-    pub provider: String,
-    /// Model name (e.g. `"claude-sonnet-4-20250514"`).
-    pub model: String,
-    /// The conversation history to send to the model.
-    pub messages: Vec<ChatMessage>,
-    /// Tool definitions, if any.
-    pub tools: Option<Vec<Tool>>,
-    /// Per-session LLM parameters (system prompt, temperature, top_p, etc.)
-    /// forwarded from the requesting node's delegate config.
-    ///
-    /// `None` when the requesting node is an old version that doesn't send
-    /// params — the host falls back to its own `initial_params`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub params: Option<serde_json::Value>,
-}
-
-/// Streaming provider call message (use `tell()`).
-///
-/// The `ProviderHostActor` streams chunks back to the requesting node by
-/// sending `RoutedStreamRelayMessage` messages to the `SessionStreamRouterActor`
-/// via the `stream_router_ref` remote actor reference. The router then forwards
-/// chunks to the appropriate local consumer based on `request_id`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderStreamRequest {
-    /// Provider name.
-    pub provider: String,
-    /// Model name.
-    pub model: String,
-    /// The conversation history.
-    pub messages: Vec<ChatMessage>,
-    /// Tool definitions, if any.
-    pub tools: Option<Vec<Tool>>,
-    /// Stable session id that owns this request.
-    pub session_id: String,
-    /// Unique request id within the session.
-    pub request_id: String,
-    /// Remote actor reference to the `SessionStreamRouterActor` on the requesting node.
-    /// This is a stable per-session router that routes chunks to local consumers
-    /// based on `request_id`, enabling iroh/mobile resilience.
-    pub stream_router_ref:
-        kameo::actor::RemoteActorRef<super::session_stream_router::SessionStreamRouterActor>,
-    /// Grace period in seconds to wait for stream reconnection before failing.
-    pub reconnect_grace_secs: u64,
-    /// How often the provider host should emit liveness heartbeats while waiting.
-    #[serde(default = "default_stream_heartbeat_secs")]
-    pub heartbeat_interval_secs: u64,
-    /// Lease TTL in seconds. The provider host cancels orphaned requests when renewals stop.
-    #[serde(default = "default_stream_lease_ttl_secs")]
-    pub lease_ttl_secs: u64,
-    /// Per-session LLM parameters forwarded from the requesting node.
-    /// See [`ProviderChatRequest::params`] for details.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub params: Option<serde_json::Value>,
-}
-
-fn default_stream_heartbeat_secs() -> u64 {
-    10
-}
-
-fn default_stream_lease_ttl_secs() -> u64 {
-    60
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderStreamPhase {
-    OpeningUpstream,
-    WaitingFirstChunk,
-    Streaming,
-    ReceiverDisconnected,
-    /// Reconnect grace period expired — the receiver did not come back in time.
-    GraceExpired,
-    /// Stream lease expired — the requester stopped renewing.
-    LeaseExpired,
-    /// Cancelled by explicit requester action.
-    Cancelling,
-    Completed,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderStreamStatus {
-    pub session_id: String,
-    pub request_id: String,
-    pub provider: String,
-    pub model: String,
-    pub phase: ProviderStreamPhase,
-    pub elapsed_ms: u64,
-    pub idle_ms: u64,
-    pub chunk_count: u64,
-    pub receiver_connected: bool,
-    pub lease_expires_in_ms: u64,
-    pub last_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CancelProviderStreamRequest {
-    pub session_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RenewProviderStreamLease {
-    pub session_id: String,
-    pub request_id: String,
-    pub lease_ttl_secs: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetProviderStreamStatus {
-    pub session_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
-}
-
-pub(crate) fn keep_stream_message_buffered(message: &StreamRelayMessage) -> bool {
-    !matches!(
-        message,
-        StreamRelayMessage::Heartbeat { .. }
-            | StreamRelayMessage::TransportDisconnected { .. }
-            | StreamRelayMessage::TransportReconnected { .. }
-    )
-}
-
-pub(crate) fn relay_message_is_terminal(message: &StreamRelayMessage) -> bool {
-    matches!(
-        message,
-        StreamRelayMessage::Chunk(StreamChunk::Done { .. })
-            | StreamRelayMessage::ProviderError { .. }
-            | StreamRelayMessage::TransportFailed { .. }
-    ) || matches!(
-        message,
-        StreamRelayMessage::ChunkBatch(chunks)
-            if chunks.iter().any(|chunk| matches!(chunk, StreamChunk::Done { .. }))
-    )
-}
-
-pub(crate) fn should_ack_relay_message(
-    message: &StreamRelayMessage,
-    unacked_batches: u32,
-    last_ack_at: Duration,
-    ack_window_batches: u32,
-    ack_window_interval: Duration,
-) -> bool {
-    let is_terminal = relay_message_is_terminal(message);
-    let is_chunk_batch = matches!(
-        message,
-        StreamRelayMessage::Chunk(_) | StreamRelayMessage::ChunkBatch(_)
-    );
-    is_terminal
-        || !is_chunk_batch
-        || unacked_batches >= ack_window_batches
-        || last_ack_at >= ack_window_interval
-}
 
 fn update_active_stream(
     active_streams: &Arc<Mutex<HashMap<(String, String), ActiveProviderStream>>>,
@@ -311,82 +39,6 @@ fn remove_active_stream(
     active_streams.lock().remove(&key);
 }
 
-// ── StreamReceiverActor ───────────────────────────────────────────────────────
-
-/// Ephemeral actor spawned on the **requesting** node for each streaming call.
-///
-/// Receives `StreamChunkRelay` messages from the `ProviderHostActor` via a
-/// direct `RemoteActorRef` and feeds them into an `mpsc` channel. The consumer
-/// wraps the channel receiver as a `Stream<Item = Result<StreamChunk, LLMError>>`.
-///
-/// Self-destructs when it receives `StreamChunk::Done` or an error relay.
-pub struct StreamReceiverActor {
-    tx: mpsc::Sender<StreamRelayMessage>,
-}
-
-impl kameo::Actor for StreamReceiverActor {
-    type Args = Self;
-    type Error = kameo::error::Infallible;
-
-    async fn on_start(
-        args: Self::Args,
-        _actor_ref: kameo::actor::ActorRef<Self>,
-    ) -> Result<Self, Self::Error> {
-        Ok(args)
-    }
-
-    async fn on_stop(
-        &mut self,
-        _actor_ref: kameo::actor::WeakActorRef<Self>,
-        _reason: kameo::error::ActorStopReason,
-    ) -> Result<(), Self::Error> {
-        // No cleanup needed - receiver is not registered in DHT.
-        // The direct RemoteActorRef is used for communication.
-        Ok(())
-    }
-}
-
-impl StreamReceiverActor {
-    pub fn new(tx: mpsc::Sender<StreamRelayMessage>) -> Self {
-        Self { tx }
-    }
-}
-
-impl Message<StreamChunkRelay> for StreamReceiverActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: StreamChunkRelay,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        let is_terminal = relay_message_is_terminal(&msg.message);
-
-        // Forward to channel (ignore send errors — receiver may have dropped).
-        let _ = self.tx.send(msg.message).await;
-
-        if is_terminal {
-            ctx.actor_ref().kill();
-        }
-    }
-}
-
-// ── ProviderHostActor ─────────────────────────────────────────────────────────
-
-/// Per-node actor that serves LLM provider calls to the mesh.
-///
-/// Spawned once during mesh bootstrap alongside `RemoteNodeManager`.
-/// Registered in the DHT as `"provider_host::peer::{peer_id}"`.
-///
-/// # Provider construction
-///
-/// Each request carries optional per-session `params` (system prompt,
-/// temperature, etc.) from the requesting node.  The host merges these
-/// with its own `initial_params` (hardware config like `n_ctx`,
-/// `flash_attention`, model path) and builds a fresh provider per
-/// request.  This is cheap because expensive model loading is cached
-/// at the factory level (e.g. `LlamaCppFactory` caches the loaded
-/// `Arc<LlamaModel>`).
 #[derive(Debug)]
 struct ActiveProviderStream {
     session_id: String,
@@ -429,16 +81,14 @@ impl ActiveProviderStream {
 
 #[derive(Actor)]
 pub struct ProviderHostActor {
-    config: Arc<AgentConfig>,
-    /// Keyed by `(session_id, request_id)` so that duplicate/replayed
-    /// request IDs from different sessions cannot overwrite each other.
+    backend: Arc<dyn RemoteProviderBackend<Error = RemoteProviderHostError>>,
     active_streams: Arc<Mutex<HashMap<(String, String), ActiveProviderStream>>>,
 }
 
 impl ProviderHostActor {
-    pub fn new(config: Arc<AgentConfig>) -> Self {
+    pub fn new(backend: Arc<dyn RemoteProviderBackend<Error = RemoteProviderHostError>>) -> Self {
         Self {
-            config,
+            backend,
             active_streams: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -469,7 +119,6 @@ impl ProviderHostActor {
         let reason = reason.unwrap_or("cancel requested").to_string();
         let mut streams = self.active_streams.lock();
         let mut cancelled = 0usize;
-        // Collect keys first to avoid borrow issues while mutating.
         let to_cancel: Vec<(String, String)> = streams
             .keys()
             .filter(|(s, r)| s == session_id && request_id.is_none_or(|rid| r == rid))
@@ -497,120 +146,8 @@ impl ProviderHostActor {
     }
 }
 
-/// Build a provider for a single remote request, merging request params with
-/// host defaults.
-///
-/// Request params (system, temperature, top_p, etc.) override host defaults.
-/// `api_key` is always stripped from request params — keys never leave the
-/// owning node.
-#[tracing::instrument(
-    name = "remote.provider_host.build_provider_for_request",
-    skip(config, request_params),
-    fields(provider = %provider_name, model = %model)
-)]
-async fn build_provider_for_request(
-    config: &AgentConfig,
-    provider_name: &str,
-    model: &str,
-    request_params: Option<&serde_json::Value>,
-) -> Result<Arc<dyn LLMProvider>, AgentError> {
-    let host_defaults = params_for_remote_provider(config.provider.initial_params());
-    let merged = merge_params(request_params, host_defaults.as_ref());
-
-    config
-        .provider
-        .build_provider(ProviderRequest::new(provider_name, model).with_params(merged.as_ref()))
-        .await
-        .map_err(|e| {
-            AgentError::Internal(format!(
-                "ProviderHostActor: failed to build provider '{}' model '{}': {}",
-                provider_name, model, e
-            ))
-        })
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Serialize [`LLMParams`] for forwarding to a remote provider, excluding
-/// fields that are passed as separate arguments to
-/// [`SessionProvider::build_provider`] (`provider`, `model`, `name`) and
-/// sensitive credentials (`api_key`) that must never leave the owning node.
-///
-/// This ensures *all* configuration — system prompt, temperature, top_p,
-/// custom provider keys, etc. — reaches the remote provider factory.
-pub(crate) fn params_for_remote_provider(params: &querymt::LLMParams) -> Option<serde_json::Value> {
-    serde_json::to_value(params).ok().and_then(|v| match v {
-        serde_json::Value::Object(mut obj) => {
-            obj.remove("api_key");
-            obj.remove("provider");
-            obj.remove("model");
-            obj.remove("name");
-            if obj.is_empty() {
-                None
-            } else {
-                Some(serde_json::Value::Object(obj))
-            }
-        }
-        _ => None,
-    })
-}
-
-fn sanitized_request_params(request: &serde_json::Value) -> Option<serde_json::Value> {
-    let mut sanitized = request.clone();
-    if let Some(obj) = sanitized.as_object_mut() {
-        // Credentials and transport metadata must not reach provider factories.
-        obj.remove("api_key");
-        obj.remove("_remote_session_id");
-    }
-
-    if sanitized.as_object().is_some_and(|o| o.is_empty()) {
-        None
-    } else {
-        Some(sanitized)
-    }
-}
-
-/// Merge per-request params (from the requesting node's delegate config)
-/// with host defaults (from this node's `initial_params`).
-///
-/// - Start with host defaults (hardware params like `n_ctx`, `flash_attention`,
-///   `kv_cache_type_k/v`, model path, etc.).
-/// - Overlay request params on top (overrides `system`, `temperature`, `top_p`,
-///   etc. with the delegate's per-session values).
-/// - `api_key` and transport-only metadata are always stripped from request
-///   params so they never reach provider factories on the host node.
-///
-/// Returns `None` if neither host defaults nor request params have any fields.
-pub(crate) fn merge_params(
-    request_params: Option<&serde_json::Value>,
-    host_defaults: Option<&serde_json::Value>,
-) -> Option<serde_json::Value> {
-    let request_params = request_params.and_then(sanitized_request_params);
-
-    match (host_defaults, request_params.as_ref()) {
-        (None, None) => None,
-        (Some(defaults), None) => Some(defaults.clone()),
-        (None, Some(request)) => Some(request.clone()),
-        (Some(defaults), Some(request)) => {
-            let mut merged = defaults.clone();
-            if let (Some(base), Some(overlay)) = (merged.as_object_mut(), request.as_object()) {
-                for (key, value) in overlay {
-                    base.insert(key.clone(), value.clone());
-                }
-            }
-            if merged.as_object().is_some_and(|o| o.is_empty()) {
-                None
-            } else {
-                Some(merged)
-            }
-        }
-    }
-}
-
-// ── Non-streaming handler ─────────────────────────────────────────────────────
-
 impl Message<ProviderChatRequest> for ProviderHostActor {
-    type Reply = kameo::reply::DelegatedReply<Result<ProviderChatResponse, AgentError>>;
+    type Reply = kameo::reply::DelegatedReply<Result<ProviderChatResponse, RemoteProviderHostError>>;
 
     #[tracing::instrument(
         name = "remote.provider_host.chat",
@@ -630,43 +167,32 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
         msg: ProviderChatRequest,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // Capture config for the spawned task
-        let config = Arc::clone(&self.config);
+        let backend = Arc::clone(&self.backend);
 
-        // Spawn the heavy provider work as a background task
         ctx.spawn(async move {
             let provider = build_provider_for_request(
-                &config,
+                backend.as_ref(),
                 &msg.provider,
                 &msg.model,
                 msg.params.as_ref(),
             )
-            .await?;
+            .await
+            .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))?;
 
             let tools_slice = msg.tools.as_deref();
-
             let response = provider
                 .chat_with_tools(&msg.messages, tools_slice)
                 .await
-                .map_err(|e| AgentError::ProviderChat {
+                .map_err(|e| RemoteProviderHostError::ProviderChat {
                     operation: "chat_with_tools".to_string(),
                     reason: serde_json::to_string(&e.to_payload()).unwrap_or_else(|_| e.to_string()),
                 })?;
 
             let tool_calls = response.tool_calls().unwrap_or_default();
             let finish_reason = response.finish_reason().map(|r| format!("{:?}", r));
-
             tracing::Span::current()
                 .record("tool_calls_returned", tool_calls.len())
                 .record("finish_reason", finish_reason.as_deref().unwrap_or("none"));
-
-            log::trace!(
-                "ProviderHostActor: non-streaming call to {}/{} complete (tool_calls={}, finish={:?})",
-                msg.provider,
-                msg.model,
-                tool_calls.len(),
-                finish_reason,
-            );
 
             Ok(ProviderChatResponse {
                 text: response.text(),
@@ -679,10 +205,10 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
     }
 }
 
-// ── Streaming handler ─────────────────────────────────────────────────────────
-
-impl Message<ProviderStreamRequest> for ProviderHostActor {
-    type Reply = kameo::reply::DelegatedReply<Result<(), AgentError>>;
+impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderStreamRouterActor>>>
+    for ProviderHostActor
+{
+    type Reply = kameo::reply::DelegatedReply<Result<(), RemoteProviderHostError>>;
 
     #[tracing::instrument(
         name = "remote.provider_host.stream",
@@ -700,14 +226,12 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
     )]
     async fn handle(
         &mut self,
-        msg: ProviderStreamRequest,
+        msg: ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderStreamRouterActor>>,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // Capture shared state for the spawned task
-        let config = Arc::clone(&self.config);
+        let backend = Arc::clone(&self.backend);
         let active_streams = Arc::clone(&self.active_streams);
 
-        // Spawn the heavy provider setup and stream relay as a background task
         ctx.spawn(async move {
             use futures_util::StreamExt;
 
@@ -716,8 +240,6 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
             const ACK_WINDOW_BATCHES: u32 = 8;
             const ACK_WINDOW_INTERVAL: Duration = Duration::from_millis(40);
 
-            // Insert an OpeningUpstream record BEFORE heavy setup for control-plane responsiveness.
-            // This allows cancel/status/lease requests to see the stream exists immediately.
             let provider_name = msg.provider.clone();
             let model = msg.model.clone();
             let session_id = msg.session_id.clone();
@@ -751,79 +273,52 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                 );
             }
 
-            // ── Setup guard: remove active_stream on any setup error ─────────
-            // The OpeningUpstream record was inserted above; if any setup step
-            // fails, we MUST clean it up. Use a owned clone for the cleanup closure.
-            // This guard is "defused" after all setup steps succeed; on error it
-            // removes the stale entry before the error propagates.
             let cleanup_request_id = request_id.clone();
             let cleanup_session_id = session_id.clone();
             let cleanup_streams = Arc::clone(&active_streams);
-
-            // Extract the router ref before setup so it is available in the error path.
             let stream_router_ref = msg.stream_router_ref;
 
-            // Heavy setup work: provider build, stream setup
-            // This happens AFTER the OpeningUpstream record is inserted for responsiveness
-            let setup_result: Result<_, AgentError> = async {
+            let setup_result: Result<_, RemoteProviderHostError> = async {
                 let provider = build_provider_for_request(
-                    &config,
+                    backend.as_ref(),
                     &msg.provider,
                     &msg.model,
                     msg.params.as_ref(),
                 )
-                .await?;
+                .await
+                .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))?;
 
                 let tools_slice = msg.tools.as_deref();
-
                 let stream = provider
                     .chat_stream_with_tools(&msg.messages, tools_slice)
                     .await
-                    .map_err(|e| AgentError::ProviderChat {
+                    .map_err(|e| RemoteProviderHostError::ProviderChat {
                         operation: "chat_stream_with_tools".to_string(),
                         reason: serde_json::to_string(&e.to_payload())
                             .unwrap_or_else(|_| e.to_string()),
                     })?;
 
-                Ok::<_, AgentError>((provider, stream))
+                Ok::<_, RemoteProviderHostError>((provider, stream))
             }
             .await;
 
             let (_provider, mut stream) = match setup_result {
                 Ok(tuple) => tuple,
                 Err(e) => {
-                    tracing::error!(
-                        target: "remote::provider_host::stream",
-                        session_id = %session_id,
-                        request_id = %cleanup_request_id,
-                        error = %e,
-                        "provider setup failed, routing terminal error to requester"
-                    );
-                    // Route a terminal error back to the requester's router so the
-                    // mobile consumer does not spin forever.
-                    let error_payload = match &e {
-                        AgentError::ProviderChat { reason, .. } => {
-                            querymt::error::LLMError::ProviderError(reason.clone()).to_payload()
-                        }
-                        other => {
-                            querymt::error::LLMError::ProviderError(other.to_string()).to_payload()
-                        }
-                    };
-                    let _ = stream_router_ref.tell(&RoutedStreamRelayMessage {
-                        request_id: cleanup_request_id.clone(),
-                        message: StreamRelayMessage::ProviderError { error: error_payload },
-                    }).send();
-                    // Clean up the stale OpeningUpstream entry.
+                    let _ = stream_router_ref
+                        .tell(&RoutedStreamRelayMessage {
+                            request_id: cleanup_request_id.clone(),
+                            message: StreamRelayMessage::ProviderError {
+                                error: e.to_payload(),
+                            },
+                        })
+                        .send();
                     remove_active_stream(&cleanup_streams, &cleanup_session_id, &cleanup_request_id);
-                    // The terminal stream error has already been routed back to the requester,
-                    // so complete this handler without propagating an actor-level error.
                     return Ok(());
                 }
             };
 
             tracing::Span::current().record("receiver_found", true);
-
-            // Relay chunks asynchronously so this handler returns promptly.
             let relay_span = tracing::info_span!(
                 "remote.provider_host.stream.relay",
                 provider = %provider_name,
@@ -836,7 +331,6 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
             );
             tokio::spawn(
                 async move {
-                    let stream_router_ref = stream_router_ref;
                     let mut chunk_count = 0usize;
                     let mut batch_count = 0usize;
                     let mut max_batch_size = 0usize;
@@ -904,14 +398,6 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                     status = Some(stream.status());
                                 });
                                 if lease_expired {
-                                    tracing::warn!(
-                                        target: "remote::provider_host::stream::lease",
-                                        session_id = %session_id,
-                                        request_id = %request_id,
-                                        provider = %provider_name,
-                                        model = %model,
-                                        "stream lease expired, cancelling"
-                                    );
                                     continue;
                                 }
                                 if let Some(status) = status {
@@ -966,21 +452,12 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                             }
                                         }
 
-                        if let Some(_reason) = finish_reason {
-                                tracing::debug!(
-                                    target: "remote::provider_host::stream",
-                                    session_id = %session_id,
-                                    request_id = %request_id,
-                                    provider = %provider_name,
-                                    model = %model,
-                                    chunk_count = chunk_count,
-                                    "stream done from upstream provider"
-                                );
-                                update_active_stream(&active_streams, &session_id, &request_id, |stream| {
-                                    stream.phase = ProviderStreamPhase::Completed;
-                                    stream.last_progress_at = Instant::now();
-                                });
-                            }
+                                        if finish_reason.is_some() {
+                                            update_active_stream(&active_streams, &session_id, &request_id, |stream| {
+                                                stream.phase = ProviderStreamPhase::Completed;
+                                                stream.last_progress_at = Instant::now();
+                                            });
+                                        }
                                     }
                                     None => {
                                         if pending_batch.is_empty() {
@@ -1003,7 +480,6 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
 
                         loop {
                             if disconnected_since.is_some() {
-                                // Retry the same stream router ref (no DHT lookup).
                                 let replay_count = buffered.iter().filter(|msg| keep_stream_message_buffered(msg)).count();
                                 let reconnect_result = stream_router_ref.tell(&RoutedStreamRelayMessage {
                                     request_id: request_id.clone(),
@@ -1012,8 +488,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                     },
                                 }).send_ack().await;
                                 if reconnect_result.is_ok() {
-                                    // Send succeeded, receiver is back online.
-                                    let disconnected_duration = disconnected_since.take().map(|s| s.elapsed());
+                                    let _disconnected_duration = disconnected_since.take().map(|s| s.elapsed());
                                     update_active_stream(&active_streams, &session_id, &request_id, |stream| {
                                         stream.phase = if stream.chunk_count == 0 {
                                             ProviderStreamPhase::WaitingFirstChunk
@@ -1022,18 +497,6 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                         };
                                         stream.receiver_connected = true;
                                     });
-                                    tracing::info!(
-                                        target: "remote::provider_host::stream::reconnect",
-                                        session_id = %session_id,
-                                        request_id = %request_id,
-                                        provider = %provider_name,
-                                        model = %model,
-                                        buffered_chunks = replay_count,
-                                        disconnected_duration_ms = disconnected_duration
-                                            .map(|d| d.as_millis() as u64)
-                                            .unwrap_or(0),
-                                        "receiver reconnected (direct ref)"
-                                    );
                                     unacked_batches = 0;
                                     last_ack_at = Instant::now();
                                 } else {
@@ -1043,7 +506,6 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                         stream.receiver_connected = false;
                                     });
                                     if since.elapsed() >= reconnect_grace {
-                                        let grace_elapsed = since.elapsed();
                                         buffered.push_back(StreamRelayMessage::TransportFailed {
                                             error: querymt::error::LLMError::Transport {
                                                 kind: querymt::error::TransportErrorKind::Timeout,
@@ -1054,17 +516,6 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                             stream.phase = ProviderStreamPhase::GraceExpired;
                                             stream.last_error = Some("reconnect grace expired".to_string());
                                         });
-                                        tracing::warn!(
-                                            target: "remote::provider_host::stream::reconnect",
-                                            session_id = %session_id,
-                                            request_id = %request_id,
-                                            provider = %provider_name,
-                                            model = %model,
-                                            reconnect_grace_secs = reconnect_grace.as_secs(),
-                                            grace_elapsed_ms = grace_elapsed.as_millis() as u64,
-                                            buffered_chunks = buffered.iter().filter(|msg| keep_stream_message_buffered(msg)).count(),
-                                            "reconnect grace expired (direct ref)"
-                                        );
                                         upstream_done = true;
                                     }
                                     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1100,15 +551,6 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                 stream_router_ref.tell(&relay).send().map_err(|e| e.to_string())
                             };
                             if let Err(e) = relay_result {
-                                tracing::warn!(
-                                    target: "remote::provider_host::stream",
-                                    session_id = %session_id,
-                                    request_id = %request_id,
-                                    provider = %provider_name,
-                                    model = %model,
-                                    error = %e,
-                                    "failed to relay chunk to receiver"
-                                );
                                 if disconnected_since.is_none() {
                                     disconnected_since = Some(tokio::time::Instant::now());
                                     let _ = stream_router_ref.tell(&RoutedStreamRelayMessage {
@@ -1122,16 +564,6 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                         stream.receiver_connected = false;
                                         stream.last_error = Some(e.to_string());
                                     });
-                                    tracing::warn!(
-                                        target: "remote::provider_host::stream::reconnect",
-                                        session_id = %session_id,
-                                        request_id = %request_id,
-                                        provider = %provider_name,
-                                        model = %model,
-                                        error = %e,
-                                        reconnect_grace_secs = reconnect_grace.as_secs(),
-                                        "receiver disconnected, entering reconnect grace (direct ref)"
-                                    );
                                 }
                                 tokio::time::sleep(Duration::from_millis(250)).await;
                                 continue;
@@ -1166,19 +598,7 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                                     stream.last_progress_at = Instant::now();
                                 });
                             }
-                            let elapsed_ms = relay_start.elapsed().as_millis();
-                            tracing::trace!(
-                                target: "remote::provider_host::stream",
-                                session_id = %session_id,
-                                request_id = %request_id,
-                                provider = %provider_name,
-                                model = %model,
-                                chunk_index = chunk_count,
-                                relayed_chunks,
-                                elapsed_ms,
-                                is_terminal,
-                                "chunk relayed"
-                            );
+                            let _elapsed_ms = relay_start.elapsed().as_millis();
                             if !keep_stream_message_buffered(&relay.message) {
                                 continue;
                             }
@@ -1196,17 +616,6 @@ impl Message<ProviderStreamRequest> for ProviderHostActor {
                     tracing::Span::current().record("chunk_count", chunk_count);
                     tracing::Span::current().record("batch_count", batch_count);
                     tracing::Span::current().record("max_batch_size", max_batch_size);
-                    tracing::debug!(
-                        target: "remote::provider_host::stream",
-                        session_id = %session_id,
-                        request_id = %request_id,
-                        provider = %provider_name,
-                        model = %model,
-                        chunk_count = chunk_count,
-                        batch_count = batch_count,
-                        max_batch_size = max_batch_size,
-                        "stream relay task completed"
-                    );
                 }
                 .instrument(relay_span),
             );
@@ -1256,8 +665,6 @@ impl Message<GetProviderStreamStatus> for ProviderHostActor {
     }
 }
 
-// ── RemoteActor + RemoteMessage registrations ─────────────────────────────────
-
 impl kameo::remote::RemoteActor for ProviderHostActor {
     const REMOTE_ID: &'static str = "querymt::ProviderHostActor";
 }
@@ -1279,37 +686,6 @@ static PROVIDER_HOST_ACTOR_REG: (&'static str, _internal::RemoteActorFns) = (
         }) as _internal::RemoteUnlinkFn,
         signal_link_died: (|dead_actor_id, notified_actor_id, stop_reason| {
             Box::pin(_internal::signal_link_died::<ProviderHostActor>(
-                dead_actor_id,
-                notified_actor_id,
-                stop_reason,
-            ))
-        }) as _internal::RemoteSignalLinkDiedFn,
-    },
-);
-
-impl kameo::remote::RemoteActor for StreamReceiverActor {
-    const REMOTE_ID: &'static str = "querymt::StreamReceiverActor";
-}
-
-#[_internal::linkme::distributed_slice(_internal::REMOTE_ACTORS)]
-#[linkme(crate = _internal::linkme)]
-static STREAM_RECEIVER_ACTOR_REG: (&'static str, _internal::RemoteActorFns) = (
-    <StreamReceiverActor as kameo::remote::RemoteActor>::REMOTE_ID,
-    _internal::RemoteActorFns {
-        link: (|actor_id, sibling_id, sibling_remote_id| {
-            Box::pin(_internal::link::<StreamReceiverActor>(
-                actor_id,
-                sibling_id,
-                sibling_remote_id,
-            ))
-        }) as _internal::RemoteLinkFn,
-        unlink: (|actor_id, sibling_id| {
-            Box::pin(_internal::unlink::<StreamReceiverActor>(
-                actor_id, sibling_id,
-            ))
-        }) as _internal::RemoteUnlinkFn,
-        signal_link_died: (|dead_actor_id, notified_actor_id, stop_reason| {
-            Box::pin(_internal::signal_link_died::<StreamReceiverActor>(
                 dead_actor_id,
                 notified_actor_id,
                 stop_reason,
@@ -1365,7 +741,6 @@ macro_rules! remote_provider_msg_impl {
     };
 }
 
-// ProviderHostActor messages
 remote_provider_msg_impl!(
     ProviderHostActor,
     ProviderChatRequest,
@@ -1374,7 +749,7 @@ remote_provider_msg_impl!(
 );
 remote_provider_msg_impl!(
     ProviderHostActor,
-    ProviderStreamRequest,
+    ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderStreamRouterActor>>,
     "querymt::ProviderStreamRequest",
     REG_PROVIDER_STREAM_REQUEST
 );
@@ -1395,12 +770,4 @@ remote_provider_msg_impl!(
     GetProviderStreamStatus,
     "querymt::GetProviderStreamStatus",
     REG_GET_PROVIDER_STREAM_STATUS
-);
-
-// StreamReceiverActor message
-remote_provider_msg_impl!(
-    StreamReceiverActor,
-    StreamChunkRelay,
-    "querymt::StreamChunkRelay",
-    REG_STREAM_CHUNK_RELAY
 );

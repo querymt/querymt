@@ -9,7 +9,10 @@ use tokio::sync::{broadcast, mpsc};
 
 use super::{DialReason, SwarmCommand};
 use super::{MeshEvent, MeshRoute, MeshTransportMode, RouteTable};
-use crate::agent::remote::scope::MeshScopeId;
+use querymt_remote::{
+    InviteError, InviteGrant, InvitePermissions, InviteStore, MeshScopeId, MeshStateStore,
+    NodeId, PeerEntry, SignedInviteGrant, mesh_id_for, scoped_node_manager_for_peer,
+};
 
 /// Type alias for a boxed re-registration closure.
 ///
@@ -46,9 +49,9 @@ pub struct MeshHandle {
     /// `None` when the node is a joiner (not a host). Wrapped in
     /// `Arc<RwLock<..>>` for shared access from the mesh handle and
     /// the admission handler in `RemoteNodeManager`.
-    invite_store: Option<Arc<RwLock<super::super::invite::InviteStore>>>,
+    invite_store: Option<Arc<RwLock<InviteStore>>>,
     /// Unified mesh state store for joined/hosted scopes and reconnect peers.
-    mesh_state_store: Option<Arc<RwLock<super::super::mesh_state::MeshStateStore>>>,
+    mesh_state_store: Option<Arc<RwLock<MeshStateStore>>>,
     /// Active transport mode used by this mesh handle.
     transport_mode: MeshTransportMode,
     /// Channel for sending commands to the swarm event loop.
@@ -86,8 +89,8 @@ impl MeshHandle {
         local_hostname: String,
         re_register_fns: Arc<RwLock<HashMap<String, ReRegisterFn>>>,
         keypair: libp2p::identity::Keypair,
-        invite_store: Option<Arc<RwLock<super::super::invite::InviteStore>>>,
-        mesh_state_store: Option<Arc<RwLock<super::super::mesh_state::MeshStateStore>>>,
+        invite_store: Option<Arc<RwLock<InviteStore>>>,
+        mesh_state_store: Option<Arc<RwLock<MeshStateStore>>>,
         transport_mode: MeshTransportMode,
         swarm_cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
         stream_reconnect_grace: std::time::Duration,
@@ -270,7 +273,7 @@ impl MeshHandle {
     pub async fn resolve_peer_node_id(
         &self,
         peer_name: &str,
-    ) -> Option<crate::agent::remote::NodeId> {
+    ) -> Option<NodeId> {
         use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
 
         let peers: Vec<PeerId> = self.routes.peer_ids();
@@ -279,7 +282,7 @@ impl MeshHandle {
             let mut node_manager = None;
             for scope in self.active_scopes() {
                 let per_peer_name =
-                    crate::agent::remote::scope::scoped_node_manager_for_peer(&scope, &peer_id);
+                    scoped_node_manager_for_peer(&scope, &peer_id);
                 match self.lookup_actor::<RemoteNodeManager>(&per_peer_name).await {
                     Ok(Some(r)) => {
                         node_manager = Some(r);
@@ -432,7 +435,7 @@ impl MeshHandle {
     pub fn leave_iroh_scope(
         &self,
         mesh_id: &str,
-    ) -> Result<bool, super::super::invite::InviteError> {
+    ) -> Result<bool, InviteError> {
         let Some(store) = &self.mesh_state_store else {
             return Ok(false);
         };
@@ -474,15 +477,19 @@ impl MeshHandle {
         self.routes.best_route_for_peer(peer_id)
     }
 
+    pub fn route_peer_ids(&self) -> Vec<PeerId> {
+        self.routes.peer_ids()
+    }
+
     pub fn create_invite(
         &self,
         mesh_name: Option<String>,
         ttl_secs: Option<u64>,
         max_uses: Option<u32>,
         can_invite: bool,
-    ) -> Result<super::super::invite::SignedInviteGrant, super::super::invite::InviteError> {
+    ) -> Result<SignedInviteGrant, InviteError> {
         let max_uses = max_uses.unwrap_or(1);
-        let permissions = super::super::invite::InvitePermissions {
+        let permissions = InvitePermissions {
             can_invite,
             role: "member".to_string(),
         };
@@ -504,7 +511,7 @@ impl MeshHandle {
                 .as_secs();
             let expires_at = ttl_secs.map(|ttl| now + ttl).unwrap_or(0);
 
-            let grant = super::super::invite::InviteGrant {
+            let grant = InviteGrant {
                 version: 3,
                 invite_id: uuid::Uuid::now_v7().to_string(),
                 inviter_peer_id: self.peer_id.to_string(),
@@ -516,7 +523,7 @@ impl MeshHandle {
             grant.sign(&self.keypair)
         }?;
 
-        let mesh_id = super::super::invite::mesh_id_for(
+        let mesh_id = mesh_id_for(
             &self.peer_id.to_string(),
             mesh_name_for_scope.as_deref(),
         );
@@ -541,20 +548,20 @@ impl MeshHandle {
         &self.keypair
     }
 
-    pub fn invite_store(&self) -> Option<&Arc<RwLock<super::super::invite::InviteStore>>> {
+    pub fn invite_store(&self) -> Option<&Arc<RwLock<InviteStore>>> {
         self.invite_store.as_ref()
     }
 
     pub fn mesh_state_store(
         &self,
-    ) -> Option<&Arc<RwLock<super::super::mesh_state::MeshStateStore>>> {
+    ) -> Option<&Arc<RwLock<MeshStateStore>>> {
         self.mesh_state_store.as_ref()
     }
 
     pub fn update_mesh_state_peers(
         &self,
         mesh_id: &str,
-        peers: Vec<super::super::invite::PeerEntry>,
+        peers: Vec<PeerEntry>,
     ) {
         if let Some(ref store) = self.mesh_state_store
             && let Err(e) = store.write().update_known_peers(mesh_id, peers)
@@ -572,6 +579,10 @@ impl MeshHandle {
         note = "use MeshRuntimeHandle::has_transport() or MeshRuntimeHandle::enabled_transports()"
     )]
     pub fn transport_mode(&self) -> MeshTransportMode {
+        self.transport_mode.clone()
+    }
+
+    pub(crate) fn raw_transport_mode(&self) -> MeshTransportMode {
         self.transport_mode.clone()
     }
 

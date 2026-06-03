@@ -6,7 +6,8 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use super::handle::ReRegisterFn;
-use super::{MeshScopeId, MeshTransportKind, PeerEvent, RouteTable};
+use super::{PeerEvent, RouteTable};
+use querymt_remote::{MeshScopeId, MeshStateStore, MeshTransportKind, PeerEntry};
 
 /// Handle a `ConnectionEstablished` swarm event.
 ///
@@ -148,17 +149,17 @@ pub(super) fn connection_route_plan(
 }
 
 pub(super) fn refresh_mesh_state_known_peers(
-    mesh_state_store: &Option<Arc<RwLock<super::super::mesh_state::MeshStateStore>>>,
+    mesh_state_store: &Option<Arc<RwLock<MeshStateStore>>>,
     routes: &RouteTable,
 ) {
     let Some(ms) = mesh_state_store.as_ref() else {
         return;
     };
 
-    let peers: Vec<super::super::invite::PeerEntry> = routes
+    let peers: Vec<PeerEntry> = routes
         .peer_ids()
         .into_iter()
-        .map(|pid| super::super::invite::PeerEntry {
+        .map(|pid| PeerEntry {
             peer_id: pid.to_string(),
             addrs: vec![format!("/p2p/{pid}")],
         })

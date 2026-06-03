@@ -11032,9 +11032,9 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "parking_lot",
- "qrcode",
  "querymt",
  "querymt-provider-common",
+ "querymt-remote",
  "querymt-utils",
  "rapidhash",
  "rayon",
@@ -11158,6 +11158,35 @@ dependencies = [
  "hf-hub 0.5.0",
  "log",
  "tokio",
+]
+
+[[package]]
+name = "querymt-remote"
+version = "0.4.2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "futures-util",
+ "hex",
+ "kameo",
+ "libp2p",
+ "libp2p-iroh",
+ "log",
+ "moka",
+ "parking_lot",
+ "qmt-openai",
+ "qrcode",
+ "querymt",
+ "querymt-utils",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "uuid 1.23.2",
 ]
 
 [[package]]

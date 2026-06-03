@@ -16,9 +16,9 @@ pub(crate) mod fixtures {
     use crate::agent::agent_config::AgentConfig;
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::remote::NodeId;
-    use crate::agent::remote::mesh::{MeshConfig, MeshDiscovery, MeshHandle, bootstrap_mesh};
+    use crate::agent::remote::mesh::MeshHandle;
     use crate::agent::remote::node_manager::RemoteNodeManager;
-    use crate::agent::remote::provider_host::ProviderHostActor;
+    use querymt_remote::ProviderHostActor;
     use crate::agent::session_registry::SessionRegistry;
     use crate::session::backend::StorageBackend as _;
     use crate::session::sqlite_storage::SqliteStorage;
@@ -117,21 +117,26 @@ pub(crate) mod fixtures {
                             .expect("failed to create temp dir for test identity");
                         let identity_path = identity_dir.path().join("test_identity.key");
 
-                        let cfg = MeshConfig {
-                            listen: Some("/ip4/127.0.0.1/tcp/0".to_string()),
-                            discovery: MeshDiscovery::None,
-                            bootstrap_peers: vec![],
-                            directory: crate::agent::remote::mesh::DirectoryMode::default(),
+                        let cfg = querymt_remote::MeshRuntimeConfig {
+                            enabled: true,
+                            lan: Some(querymt_remote::LanMeshConfig {
+                                listen: Some("/ip4/127.0.0.1/tcp/0".to_string()),
+                                discovery: querymt_remote::LanDiscovery::None,
+                                directory: querymt_remote::mesh_runtime_config::DirectoryMode::default(),
+                            }),
+                            iroh_enabled: false,
+                            iroh_scopes: Vec::new(),
+                            identity_file: Some(identity_path),
                             request_timeout: std::time::Duration::from_secs(300),
                             stream_reconnect_grace: std::time::Duration::from_secs(120),
-                            transport: Default::default(),
-                            identity_file: Some(identity_path),
-                            invite: None,
+                            node_name: None,
+                            peers: vec![],
+                            auto_fallback: false,
                         };
                         // Leak the tempdir so it lives for the entire process
                         // (the test mesh is a process-global singleton).
                         std::mem::forget(identity_dir);
-                        bootstrap_mesh(&cfg)
+                        querymt_remote::bootstrap_mesh_handle(&cfg)
                             .await
                             .expect("test mesh bootstrap failed")
                     })
@@ -314,7 +319,7 @@ pub(crate) mod fixtures {
     impl ProviderHostFixture {
         pub async fn new() -> Self {
             let f = AgentConfigFixture::new().await;
-            let actor = ProviderHostActor::new(f.config.clone());
+            let actor = crate::agent::remote::provider_host_backend::provider_host_from_config(f.config.clone());
             let actor_ref = ProviderHostActor::spawn(actor);
             Self {
                 actor_ref,
@@ -509,7 +514,7 @@ pub(crate) mod fixtures {
             // provider routing integration tests that need the mock to fire
             // should use direct `ask(ProviderChatRequest)` with a provider
             // name resolvable from the config.
-            let actor = ProviderHostActor::new(alpha_f.config.clone());
+            let actor = crate::agent::remote::provider_host_backend::provider_host_from_config(alpha_f.config.clone());
             let actor_ref = ProviderHostActor::spawn(actor);
 
             let provider_host_dht = crate::agent::remote::scope::scoped_provider_host(

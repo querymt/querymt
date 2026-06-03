@@ -16,7 +16,7 @@ impl LocalAgentHandle {
         self.mesh.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Activate the mesh by storing the `MeshHandle` returned by `bootstrap_mesh()`.
+    /// Activate the mesh by storing the `MeshHandle` returned by remote mesh bootstrap.
     ///
     /// Also propagates into `config.provider` so that sessions created by a
     /// `RemoteNodeManager` (which holds `Arc<AgentConfig>` with this provider)

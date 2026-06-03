@@ -70,8 +70,8 @@ pub(super) fn finalize_bootstrap(
         listen_label,
     );
 
-    let invite_store = match super::super::invite::default_invite_store_path() {
-        Ok(path) => match super::super::invite::InviteStore::load_or_create(&path) {
+    let invite_store = match querymt_remote::default_invite_store_path() {
+        Ok(path) => match querymt_remote::InviteStore::load_or_create(&path) {
             Ok(store) => Some(Arc::new(RwLock::new(store))),
             Err(e) => {
                 log::warn!("Failed to load invite store: {e}; invites will not be persisted");
@@ -84,8 +84,8 @@ pub(super) fn finalize_bootstrap(
         }
     };
 
-    let mesh_state_store = match super::super::mesh_state::default_mesh_state_path() {
-        Ok(path) => match super::super::mesh_state::MeshStateStore::load_or_create(&path) {
+    let mesh_state_store = match querymt_remote::default_mesh_state_path() {
+        Ok(path) => match querymt_remote::MeshStateStore::load_or_create(&path) {
             Ok(store) => Some(Arc::new(RwLock::new(store))),
             Err(e) => {
                 log::warn!(

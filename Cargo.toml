@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/agent",
     "crates/querymt",
+    "crates/querymt-remote",
     "crates/cli",
     "crates/provider-common",
     "crates/querymt-utils",

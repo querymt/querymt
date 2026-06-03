@@ -6,7 +6,7 @@
 
 use crate::agent::handle::AgentHandle;
 use crate::agent::remote::SessionActorRef;
-use crate::agent::remote::provider_host::{
+use querymt_remote::{
     CancelProviderStreamRequest, GetProviderStreamStatus, ProviderHostActor,
 };
 use crate::delegation::{AgentRegistry, DefaultAgentRegistry};

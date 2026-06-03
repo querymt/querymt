@@ -22,7 +22,7 @@ use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::SessionRuntime;
 use crate::agent::remote::SessionActorRef;
 #[cfg(feature = "remote")]
-use crate::agent::remote::runtime_handle::MeshRuntimeHandle;
+use querymt_remote::MeshRuntimeHandle;
 #[cfg(feature = "remote")]
 use crate::agent::remote::scope::scoped_session;
 use crate::agent::session_actor::SessionActor;

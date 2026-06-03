@@ -189,7 +189,7 @@ pub struct LocalAgentHandle {
     /// `None` = use model heuristic defaults.
     pub default_reasoning_effort: ArcSwap<Option<ReasoningEffort>>,
 
-    /// Handle to the kameo mesh swarm, set after `bootstrap_mesh()` succeeds.
+    /// Handle to the active mesh runtime, set after remote mesh bootstrap succeeds.
     /// `None` in local-only mode. Wrapped in a `Mutex` for interior mutability
     /// so startup code can set it on the shared `Arc<LocalAgentHandle>`.
     #[cfg(feature = "remote")]
