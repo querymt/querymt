@@ -60,7 +60,7 @@ struct PyChatResponse {
     content: Vec<PyContentBlock>,
 }
 
-#[pyclass(name = "Usage")]
+#[pyclass(name = "Usage", skip_from_py_object)]
 #[derive(Clone)]
 struct PyUsage {
     #[pyo3(get)]
@@ -75,7 +75,7 @@ struct PyUsage {
     cache_write: u32,
 }
 
-#[pyclass(name = "ToolCall")]
+#[pyclass(name = "ToolCall", skip_from_py_object)]
 #[derive(Clone)]
 struct PyToolCall {
     #[pyo3(get)]
@@ -88,7 +88,7 @@ struct PyToolCall {
     arguments: String,
 }
 
-#[pyclass(name = "ContentBlock")]
+#[pyclass(name = "ContentBlock", skip_from_py_object)]
 #[derive(Clone)]
 struct PyContentBlock {
     #[pyo3(get)]
@@ -96,7 +96,7 @@ struct PyContentBlock {
     data: Value,
 }
 
-#[pyclass(name = "StreamChunk")]
+#[pyclass(name = "StreamChunk", skip_from_py_object)]
 #[derive(Clone)]
 struct PyStreamChunk {
     #[pyo3(get)]
@@ -110,7 +110,7 @@ impl PyRegistry {
     fn default<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let registry = default_registry().await.map_err(into_py_err)?;
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 Py::new(
                     py,
                     PyRegistry {
@@ -126,7 +126,7 @@ impl PyRegistry {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut registry = PluginRegistry::from_path(&path).map_err(into_py_err)?;
             registry.register_dynamic_loaders();
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 Py::new(
                     py,
                     PyRegistry {
@@ -151,7 +151,7 @@ impl PyRegistry {
         let registry = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             registry.load_all_plugins().await;
-            Python::with_gil(|py| Ok(py.None()))
+            Python::attach(|py| Ok(py.None()))
         })
     }
 
@@ -167,7 +167,7 @@ impl PyRegistry {
         let registry = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let models = registry.list_models(&provider).await.map_err(into_py_err)?;
-            Python::with_gil(|py| Ok(models.into_pyobject(py)?.into_any().unbind()))
+            Python::attach(|py| Ok(models.into_pyobject(py)?.into_any().unbind()))
         })
     }
 
@@ -189,7 +189,7 @@ impl PyRegistry {
                 build_provider(&registry, &provider, &model, params_json, api_key, base_url)
                     .await
                     .map_err(into_py_err)?;
-            Python::with_gil(|py| Py::new(py, PyProvider { inner: provider }))
+            Python::attach(|py| Py::new(py, PyProvider { inner: provider }))
         })
     }
 }
@@ -202,7 +202,7 @@ impl PyProvider {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let response = provider.chat(&messages).await.map_err(into_py_err)?;
             let response = chat_response_to_python(response.as_ref());
-            Python::with_gil(|py| Py::new(py, response))
+            Python::attach(|py| Py::new(py, response))
         })
     }
 
@@ -227,7 +227,7 @@ impl PyProvider {
                 .await
                 .map_err(into_py_err)?;
             let response = chat_response_to_python(response.as_ref());
-            Python::with_gil(|py| Py::new(py, response))
+            Python::attach(|py| Py::new(py, response))
         })
     }
 
@@ -241,7 +241,7 @@ impl PyProvider {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let stream = provider.chat_stream(&messages).await.map_err(into_py_err)?;
             let stream = stream_to_python(stream);
-            Python::with_gil(|py| Py::new(py, stream))
+            Python::attach(|py| Py::new(py, stream))
         })
     }
 
@@ -262,7 +262,7 @@ impl PyProvider {
                 .await
                 .map_err(into_py_err)?;
             let stream = stream_to_python(stream);
-            Python::with_gil(|py| Py::new(py, stream))
+            Python::attach(|py| Py::new(py, stream))
         })
     }
 }
@@ -297,7 +297,7 @@ impl PyMeshRuntime {
             })
             .await
             .map_err(into_py_err)?;
-            Python::with_gil(|py| Py::new(py, PyMeshRuntime { inner: runtime }))
+            Python::attach(|py| Py::new(py, PyMeshRuntime { inner: runtime }))
         })
     }
 
@@ -345,7 +345,7 @@ impl PyMeshRuntime {
             );
             let share = ProviderShare::new(Arc::new(backend), Arc::new(catalog));
             share.register_on_mesh(&runtime).await;
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 Py::new(
                     py,
                     PyProviderShare {
@@ -382,7 +382,7 @@ impl PyMeshRuntime {
                 )
                 .with_params(params_json),
             ) as Arc<dyn LLMProvider>;
-            Python::with_gil(|py| Py::new(py, PyProvider { inner: provider }))
+            Python::attach(|py| Py::new(py, PyProvider { inner: provider }))
         })
     }
 }
@@ -393,7 +393,7 @@ impl PyProviderShare {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             future::pending::<()>().await;
             #[allow(unreachable_code)]
-            Python::with_gil(|py| Ok(py.None()))
+            Python::attach(|py| Ok(py.None()))
         })
     }
 }
@@ -432,7 +432,7 @@ impl PyChatStream {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = rx.lock().await;
             match guard.recv().await {
-                Some(Ok(chunk)) => Python::with_gil(|py| Py::new(py, chunk)),
+                Some(Ok(chunk)) => Python::attach(|py| Py::new(py, chunk)),
                 Some(Err(err)) => Err(PyRuntimeError::new_err(err)),
                 None => Err(PyStopAsyncIteration::new_err("stream ended")),
             }
@@ -665,7 +665,7 @@ fn python_tools_to_rust(tools: Option<&Bound<'_, PyAny>>) -> Result<Option<Vec<T
     };
 
     let seq = tools
-        .downcast::<PySequence>()
+        .cast::<PySequence>()
         .map_err(|_| anyhow!("tools must be a sequence"))?;
     let mut out = Vec::with_capacity(seq.len()?);
     for item in seq.try_iter()? {
@@ -679,13 +679,13 @@ fn python_tools_to_rust(tools: Option<&Bound<'_, PyAny>>) -> Result<Option<Vec<T
 
 fn py_messages_to_rust(messages: &Bound<'_, PyAny>) -> Result<Vec<ChatMessage>> {
     let seq = messages
-        .downcast::<PySequence>()
+        .cast::<PySequence>()
         .map_err(|_| anyhow!("messages must be a sequence"))?;
     let mut out = Vec::with_capacity(seq.len()?);
     for item in seq.try_iter()? {
         let item = item?;
         let dict = item
-            .downcast::<PyDict>()
+            .cast::<PyDict>()
             .map_err(|_| anyhow!("each message must be a dict"))?;
 
         out.push(py_message_to_rust(dict)?);
@@ -720,11 +720,11 @@ fn py_content_to_rust(content: &Bound<'_, PyAny>) -> Result<Vec<Content>> {
         return Ok(vec![Content::text(text)]);
     }
 
-    if let Ok(blocks) = content.downcast::<PyList>() {
+    if let Ok(blocks) = content.cast::<PyList>() {
         let mut out = Vec::with_capacity(blocks.len());
         for item in blocks.iter() {
             let dict = item
-                .downcast::<PyDict>()
+                .cast::<PyDict>()
                 .map_err(|_| anyhow!("each content block must be a dict"))?;
 
             out.push(py_block_to_rust(&dict)?);
@@ -886,14 +886,14 @@ fn python_to_json(value: &Bound<'_, PyAny>) -> Result<Value> {
     if let Ok(v) = value.extract::<String>() {
         return Ok(Value::String(v));
     }
-    if let Ok(list) = value.downcast::<PyList>() {
+    if let Ok(list) = value.cast::<PyList>() {
         let mut out = Vec::with_capacity(list.len());
         for item in list.iter() {
             out.push(python_to_json(&item)?);
         }
         return Ok(Value::Array(out));
     }
-    if let Ok(dict) = value.downcast::<PyDict>() {
+    if let Ok(dict) = value.cast::<PyDict>() {
         let mut out = Map::new();
         for (k, v) in dict.iter() {
             out.insert(k.extract::<String>()?, python_to_json(&v)?);
@@ -1150,10 +1150,17 @@ mod tests {
     use super::*;
     use pyo3::Python;
     use pyo3::types::PyDict;
+    use std::sync::Once;
+
+    fn with_python(f: impl for<'py> FnOnce(Python<'py>)) {
+        static INIT: Once = Once::new();
+        INIT.call_once(Python::initialize);
+        Python::attach(f);
+    }
 
     #[test]
     fn converts_string_content_message() {
-        Python::with_gil(|py| {
+        with_python(|py| {
             let msg = PyDict::new(py);
             msg.set_item("role", "user").unwrap();
             msg.set_item("content", "hello").unwrap();
@@ -1165,7 +1172,7 @@ mod tests {
 
     #[test]
     fn converts_block_content_message() {
-        Python::with_gil(|py| {
+        with_python(|py| {
             let msg = PyDict::new(py);
             let block = PyDict::new(py);
             block.set_item("type", "text").unwrap();
@@ -1181,7 +1188,7 @@ mod tests {
 
     #[test]
     fn converts_tool_result_with_nested_blocks() {
-        Python::with_gil(|py| {
+        with_python(|py| {
             let msg = PyDict::new(py);
             let block = PyDict::new(py);
             let nested = PyDict::new(py);
@@ -1190,7 +1197,7 @@ mod tests {
             block.set_item("type", "tool_result").unwrap();
             block.set_item("id", "call-1").unwrap();
             block.set_item("name", "lookup").unwrap();
-            block.set_item("is_error", True).unwrap();
+            block.set_item("is_error", true).unwrap();
             block
                 .set_item("content", PyList::new(py, [nested]).unwrap())
                 .unwrap();
@@ -1205,7 +1212,7 @@ mod tests {
 
     #[test]
     fn converts_binary_content_from_base64() {
-        Python::with_gil(|py| {
+        with_python(|py| {
             let image = PyDict::new(py);
             image.set_item("type", "image").unwrap();
             image.set_item("mime_type", "image/png").unwrap();
@@ -1236,7 +1243,7 @@ mod tests {
 
     #[test]
     fn converts_python_tools_to_rust() {
-        Python::with_gil(|py| {
+        with_python(|py| {
             let params = PyDict::new(py);
             params.set_item("type", "object").unwrap();
             params.set_item("properties", PyDict::new(py)).unwrap();
