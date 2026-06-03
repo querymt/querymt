@@ -3,7 +3,7 @@ use querymt::error::{LLMError, TransportErrorKind};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct RemoteProviderStreamState {
     disconnected_since: Option<Instant>,
     chunk_index: u64,
@@ -13,12 +13,7 @@ pub struct RemoteProviderStreamState {
 
 impl RemoteProviderStreamState {
     pub fn new() -> Self {
-        Self {
-            disconnected_since: None,
-            chunk_index: 0,
-            pending_chunks: VecDeque::new(),
-            first_chunk_recorded: false,
-        }
+        Self::default()
     }
 
     pub fn take_pending(&mut self, started_at: Instant) -> Option<(StreamChunk, u64, Option<u64>)> {

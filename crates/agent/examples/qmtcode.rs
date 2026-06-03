@@ -335,9 +335,8 @@ async fn register_mesh_actors(
 }
 
 #[cfg(feature = "remote")]
-fn load_stored_iroh_scopes()
--> anyhow::Result<Vec<querymt_agent::agent::remote::mesh_runtime_config::IrohMeshConfig>> {
-    use querymt_agent::agent::remote::mesh_runtime_config::IrohMeshConfig;
+fn load_stored_iroh_scopes() -> anyhow::Result<Vec<querymt_agent::agent::remote::IrohMeshConfig>> {
+    use querymt_agent::agent::remote::IrohMeshConfig;
     use querymt_agent::agent::remote::mesh_state::{MeshStateStore, default_mesh_state_path};
 
     let path = default_mesh_state_path()?;
@@ -512,7 +511,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         && cli.mesh_join.is_none()
     {
         use querymt_agent::agent::remote::bootstrap_mesh_runtime;
-        use querymt_agent::agent::remote::mesh_runtime_config::{
+        use querymt_agent::agent::remote::{
             IrohMeshConfig, LanDiscovery, LanMeshConfig, MeshRuntimeConfig,
         };
 
@@ -545,8 +544,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(LanMeshConfig {
                     listen: Some(mesh_addr.clone()),
                     discovery: LanDiscovery::Mdns,
-                    directory:
-                        querymt_agent::agent::remote::mesh_runtime_config::DirectoryMode::default(),
+                    directory: querymt_agent::agent::remote::DirectoryMode::default(),
                 })
             },
             iroh_enabled: true,

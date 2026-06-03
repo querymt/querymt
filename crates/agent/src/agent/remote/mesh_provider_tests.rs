@@ -231,7 +231,7 @@ mod mesh_provider_tests {
                 },
                 providers: vec![ProviderCatalogEntry {
                     provider: provider_name.to_string(),
-                    model: model_name.to_string(),
+                    model: Some(model_name.to_string()),
                     label: Some(model_name.to_string()),
                     family: Some("mock-family".to_string()),
                     quant: Some("Q4_K_M".to_string()),

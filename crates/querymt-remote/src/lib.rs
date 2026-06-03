@@ -75,8 +75,8 @@ pub use provider_catalog::{
 };
 pub use provider_client::RemoteProviderClientConfig;
 pub use provider_client_runtime::{
-    PeerAliveFuture, RemoteProviderClientCore, RemoteProviderClientTransport, RenewLeaseFuture,
-    StreamPeerAliveFn, StreamRenewFn,
+    PeerAliveFuture, PollStreamContext, RemoteProviderClientCore, RemoteProviderClientTransport,
+    RenewLeaseFuture, StreamPeerAliveFn, StreamRenewFn,
 };
 pub use provider_host_actor::ProviderHostActor;
 pub use provider_host_error::RemoteProviderHostError;

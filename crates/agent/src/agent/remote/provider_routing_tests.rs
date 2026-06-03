@@ -17,17 +17,15 @@
 #[cfg(all(test, feature = "remote"))]
 mod provider_routing_integration_tests {
     use crate::agent::remote::NodeId;
-    use crate::agent::remote::ProviderChatRequest;
     use crate::agent::remote::RemoteNodeManager;
     use crate::agent::remote::node_manager::CreateRemoteSession;
     use crate::agent::remote::test_helpers::fixtures::{
-        AgentConfigFixture, ProviderHostFixture, ProviderRoutingFixture, get_test_mesh,
+        AgentConfigFixture, ProviderRoutingFixture, get_test_mesh,
     };
     use crate::session::provider::ProviderRequest;
-    use querymt::chat::{ChatProvider, FinishReason};
+    use querymt::chat::ChatProvider;
     use querymt::error::LLMError;
     use querymt_remote::MeshChatProvider;
-    use tokio::sync::mpsc;
     use uuid::Uuid;
 
     fn random_node_id() -> String {

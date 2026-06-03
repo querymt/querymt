@@ -117,7 +117,10 @@ pub use node_manager::{ListRemoteSessionsResponse, NodeInfo, RemoteSessionInfo};
 #[cfg(feature = "remote")]
 pub use querymt_remote::MeshChatProvider;
 #[cfg(feature = "remote")]
-pub use querymt_remote::{MeshRuntimeConfig, MeshTransportMode};
+pub use querymt_remote::{
+    DirectoryMode, IrohMeshConfig, LanDiscovery, LanMeshConfig, MeshRuntimeConfig,
+    MeshTransportMode,
+};
 pub use querymt_remote::{ProviderHostActor, StreamReceiverActor};
 
 #[cfg(feature = "remote")]

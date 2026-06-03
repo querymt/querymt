@@ -104,7 +104,7 @@ impl MeshHandle {
         self.stream_reconnect_grace
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "kameo-mesh"))]
     pub fn inject_known_peer_for_test(&self, peer_id: PeerId) {
         self.routes.upsert_addrs(
             peer_id,

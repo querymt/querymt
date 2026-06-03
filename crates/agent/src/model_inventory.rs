@@ -571,7 +571,7 @@ impl ModelInventory {
 
         for scope in &scopes {
             let mut stream =
-                mesh.lookup_all_actors_scoped::<RemoteNodeManager>(&scope, "node_manager");
+                mesh.lookup_all_actors_scoped::<RemoteNodeManager>(scope, "node_manager");
 
             while let Some(result) = stream.next().await {
                 if let Ok(node_ref) = result
@@ -622,9 +622,7 @@ impl ModelInventory {
                         }
                     };
 
-                let Some(peer_id) = node_ref.id().peer_id().copied() else {
-                    return None;
-                };
+                let peer_id = node_ref.id().peer_id().copied()?;
 
                 for scope in &scopes {
                     let catalog_name = scoped_provider_catalog(scope, &peer_id);

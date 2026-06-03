@@ -61,6 +61,18 @@ pub type PeerAliveFuture = Pin<Box<dyn Future<Output = bool> + Send + 'static>>;
 pub type StreamRenewFn = Arc<dyn Fn() -> RenewLeaseFuture + Send + Sync>;
 pub type StreamPeerAliveFn = Arc<dyn Fn() -> PeerAliveFuture + Send + Sync>;
 
+pub struct PollStreamContext<'a> {
+    pub setup_span: tracing::Span,
+    pub stream_start: std::time::Instant,
+    pub session_id: &'a str,
+    pub request_id: &'a str,
+    pub local_peer_id: &'a str,
+    pub target_peer_id: &'a str,
+    pub provider_name: &'a str,
+    pub model: &'a str,
+    pub target_name: &'a str,
+}
+
 #[derive(Clone)]
 pub struct RemoteProviderClientCore<TTransport>
 where
@@ -290,20 +302,22 @@ where
     }
 
     pub fn poll_stream_message(
-        setup_span: tracing::Span,
-        stream_start: std::time::Instant,
-        _reconnect_grace: std::time::Duration,
-        session_id: &str,
-        request_id: &str,
-        local_peer_id: &str,
-        target_peer_id: &str,
-        provider_name: &str,
-        model: &str,
-        target_name: &str,
+        context: PollStreamContext<'_>,
         next: Option<StreamRelayMessage>,
         stream_state: &mut crate::RemoteProviderStreamState,
         peer_alive: bool,
     ) -> Result<Option<querymt::chat::StreamChunk>, LLMError> {
+        let PollStreamContext {
+            setup_span,
+            stream_start,
+            session_id,
+            request_id,
+            local_peer_id,
+            target_peer_id,
+            provider_name,
+            model,
+            target_name,
+        } = context;
         match next {
             Some(StreamRelayMessage::Chunk(chunk)) => {
                 let elapsed_ms = stream_start.elapsed().as_millis();

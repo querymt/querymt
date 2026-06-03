@@ -223,16 +223,17 @@ where
 
                         let peer_alive = peer_alive_fn().await;
                         match RemoteProviderClientCore::<TTransport>::poll_stream_message(
-                            setup_span.clone(),
-                            stream_start,
-                            reconnect_grace,
-                            &session_id_for_stream,
-                            &request_id_for_stream,
-                            &local_peer_id,
-                            &target_peer_id_display,
-                            &provider_for_stream,
-                            &model_for_stream,
-                            &target_for_stream,
+                            crate::PollStreamContext {
+                                setup_span: setup_span.clone(),
+                                stream_start,
+                                session_id: &session_id_for_stream,
+                                request_id: &request_id_for_stream,
+                                local_peer_id: &local_peer_id,
+                                target_peer_id: &target_peer_id_display,
+                                provider_name: &provider_for_stream,
+                                model: &model_for_stream,
+                                target_name: &target_for_stream,
+                            },
                             next,
                             &mut stream_state,
                             peer_alive,
