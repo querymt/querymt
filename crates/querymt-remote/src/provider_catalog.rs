@@ -74,7 +74,9 @@ static PROVIDER_CATALOG_ACTOR_REG: (&'static str, _internal::RemoteActorFns) = (
             ))
         }) as _internal::RemoteLinkFn,
         unlink: (|actor_id, sibling_id| {
-            Box::pin(_internal::unlink::<ProviderCatalogActor>(actor_id, sibling_id))
+            Box::pin(_internal::unlink::<ProviderCatalogActor>(
+                actor_id, sibling_id,
+            ))
         }) as _internal::RemoteUnlinkFn,
         signal_link_died: (|dead_actor_id, notified_actor_id, stop_reason| {
             Box::pin(_internal::signal_link_died::<ProviderCatalogActor>(
@@ -98,7 +100,9 @@ static REG_GET_PROVIDER_CATALOG: (
 ) = (
     _internal::RemoteMessageRegistrationID {
         actor_remote_id: <ProviderCatalogActor as kameo::remote::RemoteActor>::REMOTE_ID,
-        message_remote_id: <ProviderCatalogActor as kameo::remote::RemoteMessage<GetProviderCatalog>>::REMOTE_ID,
+        message_remote_id: <ProviderCatalogActor as kameo::remote::RemoteMessage<
+            GetProviderCatalog,
+        >>::REMOTE_ID,
     },
     _internal::RemoteMessageFns {
         ask: (|actor_id, msg, mailbox_timeout, reply_timeout| {
@@ -110,11 +114,13 @@ static REG_GET_PROVIDER_CATALOG: (
             ))
         }) as _internal::RemoteAskFn,
         try_ask: (|actor_id, msg, reply_timeout| {
-            Box::pin(_internal::try_ask::<ProviderCatalogActor, GetProviderCatalog>(
-                actor_id,
-                msg,
-                reply_timeout,
-            ))
+            Box::pin(
+                _internal::try_ask::<ProviderCatalogActor, GetProviderCatalog>(
+                    actor_id,
+                    msg,
+                    reply_timeout,
+                ),
+            )
         }) as _internal::RemoteTryAskFn,
         tell: (|actor_id, msg, mailbox_timeout| {
             Box::pin(_internal::tell::<ProviderCatalogActor, GetProviderCatalog>(
@@ -124,12 +130,18 @@ static REG_GET_PROVIDER_CATALOG: (
             ))
         }) as _internal::RemoteTellFn,
         try_tell: (|actor_id, msg| {
-            Box::pin(_internal::try_tell::<ProviderCatalogActor, GetProviderCatalog>(actor_id, msg))
+            Box::pin(_internal::try_tell::<
+                ProviderCatalogActor,
+                GetProviderCatalog,
+            >(actor_id, msg))
         }) as _internal::RemoteTryTellFn,
     },
 );
 
-pub fn fallback_provider_host_catalog(scope: &MeshScopeId, peer_id: &(impl std::fmt::Display + ?Sized)) -> String {
+pub fn fallback_provider_host_catalog(
+    scope: &MeshScopeId,
+    peer_id: &(impl std::fmt::Display + ?Sized),
+) -> String {
     scoped_provider_host(scope, peer_id)
 }
 
@@ -196,7 +208,8 @@ mod tests {
     fn snapshot_round_trips_rich_metadata() {
         let snapshot = sample_snapshot();
         let json = serde_json::to_string(&snapshot).expect("serialize snapshot");
-        let decoded: ProviderCatalogSnapshot = serde_json::from_str(&json).expect("deserialize snapshot");
+        let decoded: ProviderCatalogSnapshot =
+            serde_json::from_str(&json).expect("deserialize snapshot");
 
         assert_eq!(decoded, snapshot);
     }

@@ -2,7 +2,10 @@ use crate::mesh_events::MeshEvent;
 use crate::mesh_handle::ReRegisterFn;
 use crate::mesh_routes::RouteTable;
 use crate::mesh_runtime_support::SwarmCommand;
-use crate::{InviteStore, MeshError, MeshHandle, MeshStateStore, MeshTransportMode, default_invite_store_path, default_mesh_state_path};
+use crate::{
+    InviteStore, MeshError, MeshHandle, MeshStateStore, MeshTransportMode,
+    default_invite_store_path, default_mesh_state_path,
+};
 use libp2p::{Multiaddr, PeerId};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};

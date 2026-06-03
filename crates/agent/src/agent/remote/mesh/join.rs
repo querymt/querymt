@@ -1,6 +1,6 @@
 use crate::agent::remote::mesh::{MeshError, MeshHandle, MeshScopeId};
-use querymt_remote::{IrohMeshConfig, MeshRuntimeConfig};
 use libp2p::PeerId;
+use querymt_remote::{IrohMeshConfig, MeshRuntimeConfig};
 
 /// Join an existing mesh using a signed invite grant.
 ///

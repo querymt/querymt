@@ -10,12 +10,12 @@
 #[cfg(test)]
 #[cfg(feature = "remote")]
 mod tests {
-    use querymt_remote::ProviderHostActor;
     use crate::agent::remote::{
         CancelProviderStreamRequest, GetProviderStreamStatus, ProviderChatRequest,
         ProviderStreamRequest, RenewProviderStreamLease,
     };
     use kameo::message::Message;
+    use querymt_remote::ProviderHostActor;
 
     /// Verify that ProviderChatRequest uses DelegatedReply pattern.
     ///

@@ -76,7 +76,10 @@ mod tests {
             _tools: Option<&[Tool]>,
         ) -> Result<
             std::pin::Pin<
-                Box<dyn futures_util::Stream<Item = Result<querymt::chat::StreamChunk, LLMError>> + Send>,
+                Box<
+                    dyn futures_util::Stream<Item = Result<querymt::chat::StreamChunk, LLMError>>
+                        + Send,
+                >,
             >,
             LLMError,
         > {
@@ -126,8 +129,8 @@ mod tests {
 
     #[test]
     fn provider_build_request_attaches_params() {
-        let request = ProviderBuildRequest::new("demo", "m1")
-            .with_params(Some(json!({"temperature": 0.2})));
+        let request =
+            ProviderBuildRequest::new("demo", "m1").with_params(Some(json!({"temperature": 0.2})));
 
         assert_eq!(request.provider_name, "demo");
         assert_eq!(request.model, "m1");

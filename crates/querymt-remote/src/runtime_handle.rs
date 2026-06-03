@@ -1,4 +1,7 @@
-use crate::{MeshHandle, MeshScopeId, MeshTransportKind, enabled_transports_from_mode, mode_has_transport, scoped_actor_name};
+use crate::{
+    MeshHandle, MeshScopeId, MeshTransportKind, enabled_transports_from_mode, mode_has_transport,
+    scoped_actor_name,
+};
 use kameo::actor::{ActorRef, RemoteActorRef};
 use kameo::remote::LookupStream;
 use libp2p::PeerId;
@@ -6,8 +9,8 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-use crate::{InviteError, InviteStore, MeshStateStore, PeerEntry, SignedInviteGrant};
 use crate::mesh_events::PeerEvent;
+use crate::{InviteError, InviteStore, MeshStateStore, PeerEntry, SignedInviteGrant};
 
 #[derive(Clone)]
 pub struct MeshRuntimeHandle {
@@ -116,8 +119,12 @@ impl MeshRuntimeHandle {
         }
     }
 
-    pub async fn register_actor_scoped<A>(&self, actor_ref: ActorRef<A>, scope: &MeshScopeId, name: &str)
-    where
+    pub async fn register_actor_scoped<A>(
+        &self,
+        actor_ref: ActorRef<A>,
+        scope: &MeshScopeId,
+        name: &str,
+    ) where
         A: kameo::Actor + kameo::remote::RemoteActor,
     {
         self.inner
@@ -133,7 +140,9 @@ impl MeshRuntimeHandle {
     where
         A: kameo::Actor + kameo::remote::RemoteActor,
     {
-        self.inner.lookup_actor(scoped_actor_name(scope, name)).await
+        self.inner
+            .lookup_actor(scoped_actor_name(scope, name))
+            .await
     }
 
     pub async fn lookup_actor_scoped_no_retry<A>(
@@ -183,7 +192,8 @@ impl MeshRuntimeHandle {
         max_uses: Option<u32>,
         can_invite: bool,
     ) -> Result<SignedInviteGrant, InviteError> {
-        self.inner.create_invite(mesh_name, ttl_secs, max_uses, can_invite)
+        self.inner
+            .create_invite(mesh_name, ttl_secs, max_uses, can_invite)
     }
 
     pub fn keypair(&self) -> &libp2p::identity::Keypair {
@@ -260,7 +270,9 @@ impl MeshScopeHandle {
     where
         A: kameo::Actor + kameo::remote::RemoteActor,
     {
-        self.runtime.register_actor_scoped(actor_ref, &self.scope, name).await
+        self.runtime
+            .register_actor_scoped(actor_ref, &self.scope, name)
+            .await
     }
 
     pub async fn lookup_actor<A>(
@@ -280,7 +292,9 @@ impl MeshScopeHandle {
     where
         A: kameo::Actor + kameo::remote::RemoteActor,
     {
-        self.runtime.lookup_actor_scoped_no_retry(&self.scope, name).await
+        self.runtime
+            .lookup_actor_scoped_no_retry(&self.scope, name)
+            .await
     }
 
     pub fn lookup_all_actors<A>(&self, name: &str) -> LookupStream<A>

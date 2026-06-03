@@ -6,12 +6,10 @@
 
 use crate::agent::handle::AgentHandle;
 use crate::agent::remote::SessionActorRef;
-use querymt_remote::{
-    CancelProviderStreamRequest, GetProviderStreamStatus, ProviderHostActor,
-};
 use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
 use crate::event_fanout::EventFanout;
 use crate::events::{AgentEventKind, EphemeralEvent, EventEnvelope, EventOrigin};
+use querymt_remote::{CancelProviderStreamRequest, GetProviderStreamStatus, ProviderHostActor};
 
 use agent_client_protocol::schema::{
     CancelNotification, Error, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,

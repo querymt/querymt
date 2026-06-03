@@ -13,7 +13,9 @@ pub fn default_identity_path() -> Result<PathBuf> {
 }
 
 #[cfg(feature = "kameo-mesh")]
-pub fn load_or_generate_keypair(path: Option<&std::path::Path>) -> Result<libp2p::identity::Keypair> {
+pub fn load_or_generate_keypair(
+    path: Option<&std::path::Path>,
+) -> Result<libp2p::identity::Keypair> {
     let path = match path {
         Some(p) => p.to_path_buf(),
         None => default_identity_path()?,

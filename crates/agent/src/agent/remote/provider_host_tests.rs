@@ -9,9 +9,7 @@
 #[cfg(all(test, feature = "remote"))]
 #[allow(clippy::module_inception)]
 mod provider_host_tests {
-    use querymt_remote::{
-        keep_stream_message_buffered, relay_message_is_terminal,
-    };
+    use querymt_remote::{keep_stream_message_buffered, relay_message_is_terminal};
     use tokio::sync::mpsc;
     // ── A.0 — SessionProvider::initial_params() ───────────────────────────────
     //
@@ -94,13 +92,13 @@ mod provider_host_tests {
         // params were silently dropped.
         use crate::agent::agent_config_builder::AgentConfigBuilder;
         use crate::agent::remote::ProviderChatRequest;
-        use querymt_remote::ProviderHostActor;
         use crate::session::backend::StorageBackend as _;
         use crate::session::sqlite_storage::SqliteStorage;
         use kameo::actor::Spawn;
         use kameo::error::SendError;
         use querymt::LLMParams;
         use querymt::plugin::host::PluginRegistry;
+        use querymt_remote::ProviderHostActor;
         use std::sync::Arc;
         use tempfile::TempDir;
 
@@ -169,16 +167,16 @@ mod provider_host_tests {
             Err(e) => panic!("unexpected error variant: {:?}", e),
         }
     }
-    use querymt_remote::StreamReceiverActor;
+    use crate::agent::remote::test_helpers::fixtures::ProviderHostFixture;
     use crate::agent::remote::{
         CancelProviderStreamRequest, GetProviderStreamStatus, ProviderChatRequest,
         ProviderChatResponse, ProviderStreamPhase, ProviderStreamStatus, RenewProviderStreamLease,
         StreamChunkRelay, StreamRelayMessage,
     };
-    use crate::agent::remote::test_helpers::fixtures::ProviderHostFixture;
     use kameo::actor::Spawn;
     use querymt::chat::{ChatResponse, FinishReason, StreamChunk};
     use querymt::{FunctionCall, ToolCall};
+    use querymt_remote::StreamReceiverActor;
 
     // ── A.1 ──────────────────────────────────────────────────────────────────
 
@@ -622,8 +620,8 @@ mod provider_host_tests {
 
     #[test]
     fn test_params_for_remote_provider_includes_system_prompt() {
-        use querymt_remote::params_for_remote_provider;
         use querymt::LLMParams;
+        use querymt_remote::params_for_remote_provider;
 
         let llm = LLMParams::new()
             .provider("llama_cpp")
@@ -661,8 +659,8 @@ mod provider_host_tests {
 
     #[test]
     fn test_params_for_remote_provider_empty_when_no_extra_fields() {
-        use querymt_remote::params_for_remote_provider;
         use querymt::LLMParams;
+        use querymt_remote::params_for_remote_provider;
 
         let llm = LLMParams::new().provider("openai").model("gpt-4");
 
@@ -675,8 +673,8 @@ mod provider_host_tests {
 
     #[test]
     fn test_params_for_remote_provider_strips_api_key() {
-        use querymt_remote::params_for_remote_provider;
         use querymt::LLMParams;
+        use querymt_remote::params_for_remote_provider;
 
         let llm = LLMParams::new()
             .provider("anthropic")
@@ -920,15 +918,33 @@ mod provider_host_tests {
 
         let chunk = StreamRelayMessage::Chunk(StreamChunk::Text("hello".to_string()));
         assert!(
-            !should_ack(&chunk, 0, Duration::from_millis(5), 8, Duration::from_millis(40)),
+            !should_ack(
+                &chunk,
+                0,
+                Duration::from_millis(5),
+                8,
+                Duration::from_millis(40)
+            ),
             "fresh chunk batches inside the window should not force an ack"
         );
         assert!(
-            should_ack(&chunk, 8, Duration::from_millis(5), 8, Duration::from_millis(40)),
+            should_ack(
+                &chunk,
+                8,
+                Duration::from_millis(5),
+                8,
+                Duration::from_millis(40)
+            ),
             "chunk batches should ack once the batch window is reached"
         );
         assert!(
-            should_ack(&chunk, 0, Duration::from_millis(40), 8, Duration::from_millis(40)),
+            should_ack(
+                &chunk,
+                0,
+                Duration::from_millis(40),
+                8,
+                Duration::from_millis(40)
+            ),
             "chunk batches should ack once the time window is reached"
         );
 
@@ -936,7 +952,13 @@ mod provider_host_tests {
             finish_reason: querymt::chat::FinishReason::Stop,
         });
         assert!(
-            should_ack(&done, 0, Duration::from_millis(0), 8, Duration::from_millis(40)),
+            should_ack(
+                &done,
+                0,
+                Duration::from_millis(0),
+                8,
+                Duration::from_millis(40)
+            ),
             "terminal messages must always be acked"
         );
 
@@ -947,7 +969,13 @@ mod provider_host_tests {
             chunk_count: 2,
         };
         assert!(
-            should_ack(&heartbeat, 0, Duration::from_millis(0), 8, Duration::from_millis(40)),
+            should_ack(
+                &heartbeat,
+                0,
+                Duration::from_millis(0),
+                8,
+                Duration::from_millis(40)
+            ),
             "control messages should stay acked for health signaling"
         );
     }

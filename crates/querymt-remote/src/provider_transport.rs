@@ -4,10 +4,12 @@ pub fn remote_send_error_base<E>(error: kameo::error::RemoteSendError<E>) -> Res
     use kameo::error::RemoteSendError;
 
     match error {
-        RemoteSendError::ActorNotRunning | RemoteSendError::ActorStopped => Ok(LLMError::Transport {
-            kind: TransportErrorKind::ConnectionClosed,
-            message: "remote actor not running".to_string(),
-        }),
+        RemoteSendError::ActorNotRunning | RemoteSendError::ActorStopped => {
+            Ok(LLMError::Transport {
+                kind: TransportErrorKind::ConnectionClosed,
+                message: "remote actor not running".to_string(),
+            })
+        }
         RemoteSendError::UnknownActor { .. } | RemoteSendError::UnknownMessage { .. } => {
             Ok(LLMError::Transport {
                 kind: TransportErrorKind::ConnectionClosed,
@@ -21,10 +23,12 @@ pub fn remote_send_error_base<E>(error: kameo::error::RemoteSendError<E>) -> Res
             kind: TransportErrorKind::Other,
             message: "remote mailbox full".to_string(),
         }),
-        RemoteSendError::ReplyTimeout | RemoteSendError::NetworkTimeout => Ok(LLMError::Transport {
-            kind: TransportErrorKind::Timeout,
-            message: "network timeout".to_string(),
-        }),
+        RemoteSendError::ReplyTimeout | RemoteSendError::NetworkTimeout => {
+            Ok(LLMError::Transport {
+                kind: TransportErrorKind::Timeout,
+                message: "network timeout".to_string(),
+            })
+        }
         RemoteSendError::DialFailure => Ok(LLMError::Transport {
             kind: TransportErrorKind::ConnectionRefused,
             message: "dial failure".to_string(),
@@ -33,9 +37,9 @@ pub fn remote_send_error_base<E>(error: kameo::error::RemoteSendError<E>) -> Res
             kind: TransportErrorKind::ConnectionClosed,
             message: "connection closed".to_string(),
         }),
-        RemoteSendError::UnsupportedProtocols => {
-            Ok(LLMError::ProviderError("remote protocol unsupported".to_string()))
-        }
+        RemoteSendError::UnsupportedProtocols => Ok(LLMError::ProviderError(
+            "remote protocol unsupported".to_string(),
+        )),
         RemoteSendError::SerializeMessage(err)
         | RemoteSendError::DeserializeMessage(err)
         | RemoteSendError::SerializeReply(err)

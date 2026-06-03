@@ -144,7 +144,10 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
                         query_interval: std::time::Duration::from_secs(15),
                         ..libp2p::mdns::Config::default()
                     };
-                    Some(libp2p::mdns::tokio::Behaviour::new(mdns_config, local_peer_id)?)
+                    Some(libp2p::mdns::tokio::Behaviour::new(
+                        mdns_config,
+                        local_peer_id,
+                    )?)
                 } else {
                     None
                 };
@@ -182,7 +185,10 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
                         query_interval: std::time::Duration::from_secs(15),
                         ..libp2p::mdns::Config::default()
                     };
-                    Some(libp2p::mdns::tokio::Behaviour::new(mdns_config, local_peer_id)?)
+                    Some(libp2p::mdns::tokio::Behaviour::new(
+                        mdns_config,
+                        local_peer_id,
+                    )?)
                 } else {
                     None
                 };

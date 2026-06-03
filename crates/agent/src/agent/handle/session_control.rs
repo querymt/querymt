@@ -99,7 +99,9 @@ impl LocalAgentHandle {
                                     &bookmark.node_id,
                                 );
                             if let Ok(Some(found)) = mesh
-                                .lookup_actor::<querymt_remote::ProviderHostActor>(&provider_host_name)
+                                .lookup_actor::<querymt_remote::ProviderHostActor>(
+                                    &provider_host_name,
+                                )
                                 .await
                             {
                                 provider_host = Some(found);
@@ -108,12 +110,10 @@ impl LocalAgentHandle {
                         }
                         if let Some(provider_host) = provider_host {
                             let status = provider_host
-                                .ask(
-                                    &crate::agent::remote::GetProviderStreamStatus {
-                                        session_id: session_id.to_string(),
-                                        request_id: None,
-                                    },
-                                )
+                                .ask(&crate::agent::remote::GetProviderStreamStatus {
+                                    session_id: session_id.to_string(),
+                                    request_id: None,
+                                })
                                 .await
                                 .ok()
                                 .flatten();
@@ -144,7 +144,9 @@ impl LocalAgentHandle {
                                     .ask(&crate::agent::remote::CancelProviderStreamRequest {
                                         session_id: session_id.to_string(),
                                         request_id: None,
-                                        reason: Some("session stop requested without status".to_string()),
+                                        reason: Some(
+                                            "session stop requested without status".to_string(),
+                                        ),
                                     })
                                     .await;
                             }

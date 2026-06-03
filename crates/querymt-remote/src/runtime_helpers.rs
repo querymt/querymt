@@ -52,8 +52,17 @@ mod tests {
 
     #[test]
     fn mode_has_transport_checks_membership() {
-        assert!(mode_has_transport(MeshTransportMode::Composite, MeshTransportKind::Lan));
-        assert!(mode_has_transport(MeshTransportMode::Composite, MeshTransportKind::Iroh));
-        assert!(!mode_has_transport(MeshTransportMode::Lan, MeshTransportKind::Iroh));
+        assert!(mode_has_transport(
+            MeshTransportMode::Composite,
+            MeshTransportKind::Lan
+        ));
+        assert!(mode_has_transport(
+            MeshTransportMode::Composite,
+            MeshTransportKind::Iroh
+        ));
+        assert!(!mode_has_transport(
+            MeshTransportMode::Lan,
+            MeshTransportKind::Iroh
+        ));
     }
 }

@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::agent::agent_config::AgentConfig;
+use crate::model_registry::{ModelEntry, enumerate_local_models};
 #[cfg(feature = "remote")]
 use querymt_remote::MeshRuntimeHandle;
-use crate::model_registry::{ModelEntry, enumerate_local_models};
 
 /// Metadata about the current snapshot
 #[derive(Debug, Clone)]
@@ -698,7 +698,11 @@ impl ModelInventory {
                         }
                         Ok(Ok(None)) => {}
                         Ok(Err(e)) => {
-                            tracing::debug!("ProviderCatalog lookup failed for peer {}: {}", peer_id, e);
+                            tracing::debug!(
+                                "ProviderCatalog lookup failed for peer {}: {}",
+                                peer_id,
+                                e
+                            );
                         }
                         Err(_) => {
                             tracing::warn!(

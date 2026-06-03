@@ -68,10 +68,18 @@ pub enum StreamRelayMessage {
         idle_ms: u64,
         chunk_count: u64,
     },
-    ProviderError { error: LLMErrorPayload },
-    TransportDisconnected { reason: String },
-    TransportReconnected { buffered_chunks: usize },
-    TransportFailed { error: LLMErrorPayload },
+    ProviderError {
+        error: LLMErrorPayload,
+    },
+    TransportDisconnected {
+        reason: String,
+    },
+    TransportReconnected {
+        buffered_chunks: usize,
+    },
+    TransportFailed {
+        error: LLMErrorPayload,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

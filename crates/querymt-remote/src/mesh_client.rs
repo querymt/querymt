@@ -20,10 +20,12 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 
-static PROVIDER_HOST_CACHE: OnceLock<RwLock<HashMap<String, kameo::actor::RemoteActorRef<ProviderHostActor>>>> =
-    OnceLock::new();
-static STREAM_ROUTER_CACHE: OnceLock<RwLock<HashMap<String, kameo::actor::ActorRef<ProviderStreamRouterActor>>>> =
-    OnceLock::new();
+static PROVIDER_HOST_CACHE: OnceLock<
+    RwLock<HashMap<String, kameo::actor::RemoteActorRef<ProviderHostActor>>>,
+> = OnceLock::new();
+static STREAM_ROUTER_CACHE: OnceLock<
+    RwLock<HashMap<String, kameo::actor::ActorRef<ProviderStreamRouterActor>>>,
+> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct KameoMeshClientTransport {
@@ -58,7 +60,9 @@ impl KameoMeshClientTransport {
     }
 
     pub fn best_scope_for_peer(&self, peer_id: &PeerId) -> Option<MeshScopeId> {
-        self.mesh.best_route_for_peer(peer_id).map(|route| route.scope)
+        self.mesh
+            .best_route_for_peer(peer_id)
+            .map(|route| route.scope)
     }
 
     async fn invalidate_cached_provider_host(&self, target_locator: &str) {
@@ -176,14 +180,18 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
                 request_id: request_id.to_string(),
             })
             .await
-            .map_err(|e| LLMError::ProviderError(format!("failed to register stream request: {}", e)))?;
+            .map_err(|e| {
+                LLMError::ProviderError(format!("failed to register stream request: {}", e))
+            })?;
         router
             .ask(AttachStreamConsumer {
                 request_id: request_id.to_string(),
                 consumer_tx,
             })
             .await
-            .map_err(|e| LLMError::ProviderError(format!("failed to attach stream consumer: {}", e)))?;
+            .map_err(|e| {
+                LLMError::ProviderError(format!("failed to attach stream consumer: {}", e))
+            })?;
         let remote = router.clone().into_remote_ref().await;
         Ok((router, remote))
     }
@@ -366,8 +374,10 @@ impl ChatProvider for MeshChatProvider {
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
-    ) -> Result<Pin<Box<dyn futures_util::Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
-    {
+    ) -> Result<
+        Pin<Box<dyn futures_util::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
+        LLMError,
+    > {
         self.inner.chat_stream_with_tools(messages, tools).await
     }
 }
@@ -405,7 +415,10 @@ pub async fn find_provider_on_mesh(mesh: &MeshHandle, provider_name: &str) -> Op
         let mut seen_catalog_peers = std::collections::HashSet::new();
         for peer_id in mesh.route_peer_ids() {
             let catalog_name = scoped_provider_catalog(&scope, &peer_id);
-            let Ok(Some(catalog_ref)) = mesh.lookup_actor::<ProviderCatalogActor>(catalog_name).await else {
+            let Ok(Some(catalog_ref)) = mesh
+                .lookup_actor::<ProviderCatalogActor>(catalog_name)
+                .await
+            else {
                 continue;
             };
             if !seen_catalog_peers.insert(peer_id) {
@@ -415,7 +428,10 @@ pub async fn find_provider_on_mesh(mesh: &MeshHandle, provider_name: &str) -> Op
             peers_checked += 1;
             tracing::Span::current().record("peers_checked", peers_checked);
 
-            let snapshot = match catalog_ref.ask::<GetProviderCatalog>(&GetProviderCatalog).await {
+            let snapshot = match catalog_ref
+                .ask::<GetProviderCatalog>(&GetProviderCatalog)
+                .await
+            {
                 Ok(snapshot) => snapshot,
                 Err(e) => {
                     log::debug!("find_provider_on_mesh: GetProviderCatalog failed: {}", e);
@@ -423,7 +439,11 @@ pub async fn find_provider_on_mesh(mesh: &MeshHandle, provider_name: &str) -> Op
                 }
             };
 
-            if !snapshot.providers.iter().any(|entry| entry.provider == provider_name) {
+            if !snapshot
+                .providers
+                .iter()
+                .any(|entry| entry.provider == provider_name)
+            {
                 continue;
             }
 

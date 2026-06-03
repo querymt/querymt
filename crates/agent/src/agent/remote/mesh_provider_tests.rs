@@ -9,22 +9,21 @@
 #[cfg(all(test, feature = "remote"))]
 #[allow(clippy::module_inception)]
 mod mesh_provider_tests {
-    use querymt_remote::{MeshChatProvider, find_provider_on_mesh};
-    use kameo::actor::Spawn;
-    use querymt_remote::should_retry_remote_send;
     use crate::agent::remote::test_helpers::fixtures::{ProviderHostFixture, get_test_mesh};
+    use kameo::actor::Spawn;
     use querymt::chat::ChatProvider;
     use querymt::completion::CompletionProvider;
     use querymt::completion::CompletionRequest;
     use querymt::embedding::EmbeddingProvider;
     use querymt::error::LLMError;
+    use querymt_remote::should_retry_remote_send;
+    use querymt_remote::{MeshChatProvider, find_provider_on_mesh};
     use querymt_remote::{
-        ProviderCatalogActor, ProviderCatalogBackend, ProviderCatalogEntry, ProviderCatalogNodeInfo,
-        ProviderCatalogSnapshot,
+        ProviderCatalogActor, ProviderCatalogBackend, ProviderCatalogEntry,
+        ProviderCatalogNodeInfo, ProviderCatalogSnapshot,
     };
     use std::sync::Arc;
     use uuid::Uuid;
-
 
     // ── B.1 ──────────────────────────────────────────────────────────────────
 
@@ -251,7 +250,8 @@ mod mesh_provider_tests {
         let found_node_id = found.expect("catalog-only discovery should return a node id");
         assert_eq!(found_node_id.to_string(), node_id);
 
-        let provider = MeshChatProvider::new(mesh, &found_node_id.to_string(), provider_name, model_name);
+        let provider =
+            MeshChatProvider::new(mesh, &found_node_id.to_string(), provider_name, model_name);
         let result = provider.chat_with_tools(&[], None).await;
         assert!(
             matches!(result, Err(LLMError::ProviderError(_))),

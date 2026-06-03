@@ -119,8 +119,11 @@ impl MeshHandle {
         self.peer_events_tx.subscribe()
     }
 
-    pub async fn register_actor<A>(&self, actor_ref: kameo::actor::ActorRef<A>, name: impl Into<String>)
-    where
+    pub async fn register_actor<A>(
+        &self,
+        actor_ref: kameo::actor::ActorRef<A>,
+        name: impl Into<String>,
+    ) where
         A: kameo::Actor + kameo::remote::RemoteActor,
     {
         let name = name.into();
@@ -300,7 +303,9 @@ impl MeshHandle {
             .write()
             .retain(|existing| existing != &scope);
 
-        let _ = self.peer_events_tx.send(MeshEvent::ScopeLeft(scope.clone()));
+        let _ = self
+            .peer_events_tx
+            .send(MeshEvent::ScopeLeft(scope.clone()));
         let _ = self.swarm_cmd_tx.send(SwarmCommand::LeaveIrohScope {
             mesh_id: mesh_id.to_string(),
         });
@@ -396,7 +401,10 @@ impl MeshHandle {
     }
 
     pub fn is_iroh_transport_internal(&self) -> bool {
-        matches!(self.transport_mode, MeshTransportMode::Iroh | MeshTransportMode::Composite)
+        matches!(
+            self.transport_mode,
+            MeshTransportMode::Iroh | MeshTransportMode::Composite
+        )
     }
 
     pub fn dial_peer(&self, peer_id: &PeerId) {
@@ -411,7 +419,12 @@ impl MeshHandle {
         self.dial_peer_with_scope(peer_id, Some(scope), DialReason::ExistingMeshPeer);
     }
 
-    fn dial_peer_with_scope(&self, peer_id: &PeerId, scope: Option<MeshScopeId>, reason: DialReason) {
+    fn dial_peer_with_scope(
+        &self,
+        peer_id: &PeerId,
+        scope: Option<MeshScopeId>,
+        reason: DialReason,
+    ) {
         if peer_id == &self.peer_id {
             return;
         }

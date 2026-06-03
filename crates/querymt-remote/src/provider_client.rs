@@ -105,7 +105,9 @@ mod tests {
     #[test]
     fn config_tracks_target_locator_and_session_id() {
         let config = RemoteProviderClientConfig::new("provider_host::peer::abc", "demo", "m1")
-            .with_params(Some(json!({"_remote_session_id": "s-123", "temperature": 0.7})));
+            .with_params(Some(
+                json!({"_remote_session_id": "s-123", "temperature": 0.7}),
+            ));
 
         assert_eq!(config.target_locator(), "provider_host::peer::abc");
         assert_eq!(config.remote_session_id(), Some("s-123"));
@@ -113,11 +115,15 @@ mod tests {
 
     #[test]
     fn stream_controls_are_clamped_and_renew_window_is_derived() {
-        let config = RemoteProviderClientConfig::new("node", "demo", "m1").with_stream_controls(0, 0);
+        let config =
+            RemoteProviderClientConfig::new("node", "demo", "m1").with_stream_controls(0, 0);
 
         assert_eq!(config.heartbeat_interval_secs, 1);
         assert_eq!(config.lease_ttl_secs, 1);
-        assert_eq!(config.lease_renew_every(), std::time::Duration::from_secs(1));
+        assert_eq!(
+            config.lease_renew_every(),
+            std::time::Duration::from_secs(1)
+        );
     }
 
     #[test]

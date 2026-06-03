@@ -1,6 +1,6 @@
 pub fn render_to_terminal(data: &str) -> Option<String> {
-    let code = qrcode::QrCode::with_error_correction_level(data.as_bytes(), qrcode::EcLevel::L)
-        .ok()?;
+    let code =
+        qrcode::QrCode::with_error_correction_level(data.as_bytes(), qrcode::EcLevel::L).ok()?;
     let modules = code.to_colors();
     let width = code.width();
     let total_rows = modules.len() / width;

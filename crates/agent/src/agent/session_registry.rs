@@ -7,8 +7,6 @@ use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, SessionRuntime};
 use crate::agent::remote::SessionActorRef;
 #[cfg(feature = "remote")]
-use querymt_remote::MeshRuntimeHandle;
-#[cfg(feature = "remote")]
 use crate::agent::remote::scope::{MeshScopeId, scoped_event_relay, scoped_session};
 use crate::agent::session_actor::SessionActor;
 use crate::error::AgentError;
@@ -19,6 +17,8 @@ use agent_client_protocol::schema::{
     SessionModeState,
 };
 use kameo::actor::{ActorRef, Spawn};
+#[cfg(feature = "remote")]
+use querymt_remote::MeshRuntimeHandle;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

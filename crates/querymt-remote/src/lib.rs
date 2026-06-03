@@ -4,6 +4,8 @@ pub mod identity;
 pub mod invite;
 #[cfg(feature = "kameo-mesh")]
 pub mod mesh_bootstrap;
+#[cfg(feature = "kameo-mesh")]
+pub mod mesh_client;
 pub mod mesh_config;
 #[cfg(feature = "kameo-mesh")]
 pub mod mesh_events;
@@ -24,27 +26,27 @@ pub mod provider_backend_helpers;
 pub mod provider_catalog;
 pub mod provider_client;
 pub mod provider_client_runtime;
-pub mod provider_protocol;
 pub mod provider_host_actor;
 pub mod provider_host_error;
 pub mod provider_host_support;
-#[cfg(feature = "kameo-mesh")]
-pub mod mesh_client;
-pub mod remote_chat_provider;
-pub mod provider_stream_state;
-pub mod runtime_helpers;
-#[cfg(feature = "kameo-mesh")]
-pub mod runtime_handle;
-pub mod provider_transport;
-pub mod provider_stream_router;
+pub mod provider_protocol;
 pub mod provider_share;
-pub mod scope;
-pub mod stream_router_protocol;
+pub mod provider_stream_router;
+pub mod provider_stream_state;
+pub mod provider_transport;
 #[cfg(feature = "qr")]
 pub mod qr;
+pub mod remote_chat_provider;
+#[cfg(feature = "kameo-mesh")]
+pub mod runtime_handle;
+pub mod runtime_helpers;
+pub mod scope;
+pub mod stream_router_protocol;
 
 pub use identity::*;
 pub use invite::*;
+#[cfg(feature = "kameo-mesh")]
+pub use mesh_client::{KameoMeshClientTransport, MeshChatProvider, find_provider_on_mesh};
 pub use mesh_config::{MeshError, MeshTransportMode};
 #[cfg(feature = "kameo-mesh")]
 pub use mesh_events::{MeshEvent, PeerEvent};
@@ -60,24 +62,22 @@ pub use mesh_runtime_config::{
 pub use mesh_state::{
     MeshLocalRole, MeshState, MeshStateEntry, MeshStateStore, MeshStatus, default_mesh_state_path,
 };
-pub use names::{event_relay, node_manager_for_peer, provider_host, session, NODE_MANAGER};
+pub use names::{NODE_MANAGER, event_relay, node_manager_for_peer, provider_host, session};
 pub use node_id::NodeId;
 pub use provider_backend::{ProviderBuildRequest, RemoteProviderBackend};
 pub use provider_backend_helpers::{
     ClosureProviderBackend, ModelAllowlistBackend, RegistryProviderBackend, StaticCatalogBackend,
     StaticProviderBackend,
 };
+pub use provider_catalog::{
+    GetProviderCatalog, ProviderCatalogActor, ProviderCatalogBackend, ProviderCatalogEntry,
+    ProviderCatalogNodeInfo, ProviderCatalogSnapshot, fallback_provider_host_catalog,
+};
 pub use provider_client::RemoteProviderClientConfig;
 pub use provider_client_runtime::{
     PeerAliveFuture, RemoteProviderClientCore, RemoteProviderClientTransport, RenewLeaseFuture,
     StreamPeerAliveFn, StreamRenewFn,
 };
-pub use provider_catalog::{
-    GetProviderCatalog, ProviderCatalogActor, ProviderCatalogBackend, ProviderCatalogEntry,
-    ProviderCatalogNodeInfo, ProviderCatalogSnapshot, fallback_provider_host_catalog,
-};
-#[cfg(feature = "kameo-mesh")]
-pub use mesh_client::{KameoMeshClientTransport, MeshChatProvider, find_provider_on_mesh};
 pub use provider_host_actor::ProviderHostActor;
 pub use provider_host_error::RemoteProviderHostError;
 pub use provider_host_support::{
@@ -91,20 +91,20 @@ pub use provider_protocol::{
     default_stream_heartbeat_secs, default_stream_lease_ttl_secs, keep_stream_message_buffered,
     relay_message_is_terminal, should_ack_relay_message,
 };
-pub use provider_stream_state::RemoteProviderStreamState;
 pub use provider_share::ProviderShare;
-pub use runtime_helpers::{enabled_transports_from_mode, mode_has_transport, scoped_actor_name};
-#[cfg(feature = "kameo-mesh")]
-pub use runtime_handle::{MeshRuntimeHandle, MeshScopeHandle};
-pub use remote_chat_provider::RemoteChatProvider;
 pub use provider_stream_router::{
     AttachStreamConsumer, DetachStreamConsumer, ProviderStreamRouterActor, RegisterRequest,
     RouterError,
 };
+pub use provider_stream_state::RemoteProviderStreamState;
 pub use provider_transport::{
-    decode_payload_handler_error, remote_send_error_base, remote_send_error_to_llm_error_no_handler,
-    should_retry_remote_send,
+    decode_payload_handler_error, remote_send_error_base,
+    remote_send_error_to_llm_error_no_handler, should_retry_remote_send,
 };
+pub use remote_chat_provider::RemoteChatProvider;
+#[cfg(feature = "kameo-mesh")]
+pub use runtime_handle::{MeshRuntimeHandle, MeshScopeHandle};
+pub use runtime_helpers::{enabled_transports_from_mode, mode_has_transport, scoped_actor_name};
 pub use scope::scoped_provider_catalog;
 pub use scope::{
     MeshScopeId, MeshTransportKind, scoped_event_relay, scoped_node_manager,

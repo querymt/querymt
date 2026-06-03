@@ -1,9 +1,10 @@
 use ::querymt::chat::{ChatMessage, ChatRole, Content, FinishReason, StreamChunk, Tool};
-use base64::Engine;
 use ::querymt::dynamic::PluginRegistryDynamicExt;
 use ::querymt::plugin::host::PluginRegistry;
 use ::querymt::{LLMBuilder, LLMProvider, ToolCall, Usage};
 use anyhow::{Result, anyhow};
+use base64::Engine;
+use futures_util::StreamExt;
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySequence};
@@ -12,7 +13,6 @@ use querymt_remote::{
     ModelAllowlistBackend, ProviderShare, RegistryProviderBackend, StaticCatalogBackend,
     bootstrap_mesh_runtime, find_provider_on_mesh,
 };
-use futures_util::StreamExt;
 use serde_json::{Map, Number, Value};
 use std::future;
 use std::sync::Arc;
@@ -110,7 +110,14 @@ impl PyRegistry {
     fn default<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let registry = default_registry().await.map_err(into_py_err)?;
-            Python::with_gil(|py| Py::new(py, PyRegistry { inner: Arc::new(registry) }))
+            Python::with_gil(|py| {
+                Py::new(
+                    py,
+                    PyRegistry {
+                        inner: Arc::new(registry),
+                    },
+                )
+            })
         })
     }
 
@@ -119,7 +126,14 @@ impl PyRegistry {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut registry = PluginRegistry::from_path(&path).map_err(into_py_err)?;
             registry.register_dynamic_loaders();
-            Python::with_gil(|py| Py::new(py, PyRegistry { inner: Arc::new(registry) }))
+            Python::with_gil(|py| {
+                Py::new(
+                    py,
+                    PyRegistry {
+                        inner: Arc::new(registry),
+                    },
+                )
+            })
         })
     }
 
@@ -168,11 +182,13 @@ impl PyRegistry {
         base_url: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let registry = Arc::clone(&self.inner);
-        let params_json = python_opt_to_json(params.as_ref().map(|value| value.bind(py))).map_err(into_py_err)?;
+        let params_json =
+            python_opt_to_json(params.as_ref().map(|value| value.bind(py))).map_err(into_py_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let provider = build_provider(&registry, &provider, &model, params_json, api_key, base_url)
-                .await
-                .map_err(into_py_err)?;
+            let provider =
+                build_provider(&registry, &provider, &model, params_json, api_key, base_url)
+                    .await
+                    .map_err(into_py_err)?;
             Python::with_gil(|py| Py::new(py, PyProvider { inner: provider }))
         })
     }
@@ -203,7 +219,8 @@ impl PyProvider {
     ) -> PyResult<Bound<'py, PyAny>> {
         let provider = Arc::clone(&self.inner);
         let messages = py_messages_to_rust(messages.bind(py)).map_err(into_py_err)?;
-        let tools = python_tools_to_rust(tools.as_ref().map(|value| value.bind(py))).map_err(into_py_err)?;
+        let tools = python_tools_to_rust(tools.as_ref().map(|value| value.bind(py)))
+            .map_err(into_py_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let response = provider
                 .chat_with_tools(&messages, tools.as_deref())
@@ -214,7 +231,11 @@ impl PyProvider {
         })
     }
 
-    fn chat_stream<'py>(&self, py: Python<'py>, messages: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    fn chat_stream<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Py<PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let provider = Arc::clone(&self.inner);
         let messages = py_messages_to_rust(messages.bind(py)).map_err(into_py_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -233,7 +254,8 @@ impl PyProvider {
     ) -> PyResult<Bound<'py, PyAny>> {
         let provider = Arc::clone(&self.inner);
         let messages = py_messages_to_rust(messages.bind(py)).map_err(into_py_err)?;
-        let tools = python_tools_to_rust(tools.as_ref().map(|value| value.bind(py))).map_err(into_py_err)?;
+        let tools = python_tools_to_rust(tools.as_ref().map(|value| value.bind(py)))
+            .map_err(into_py_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let stream = provider
                 .chat_stream_with_tools(&messages, tools.as_deref())
@@ -312,8 +334,9 @@ impl PyMeshRuntime {
         let runtime = self.inner.clone();
         let registry = Arc::clone(&registry.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let backend = ModelAllowlistBackend::new(RegistryProviderBackend::new(Arc::clone(&registry)))
-                .allow_models(provider.clone(), allowed_models.clone());
+            let backend =
+                ModelAllowlistBackend::new(RegistryProviderBackend::new(Arc::clone(&registry)))
+                    .allow_models(provider.clone(), allowed_models.clone());
             let catalog = StaticCatalogBackend::provider_models(
                 runtime.peer_id().to_string(),
                 label,
@@ -343,15 +366,21 @@ impl PyMeshRuntime {
         params: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let runtime = self.inner.clone();
-        let params_json = python_opt_to_json(params.as_ref().map(|value| value.bind(py))).map_err(into_py_err)?;
+        let params_json =
+            python_opt_to_json(params.as_ref().map(|value| value.bind(py))).map_err(into_py_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let node_id = find_provider_on_mesh(runtime.as_mesh_handle(), &provider)
                 .await
                 .ok_or_else(|| anyhow!("provider '{}' not found on mesh", provider))
                 .map_err(into_py_err)?;
             let provider = Arc::new(
-                MeshChatProvider::from_node_id(runtime.as_mesh_handle(), &node_id, &provider, &model)
-                    .with_params(params_json),
+                MeshChatProvider::from_node_id(
+                    runtime.as_mesh_handle(),
+                    &node_id,
+                    &provider,
+                    &model,
+                )
+                .with_params(params_json),
             ) as Arc<dyn LLMProvider>;
             Python::with_gil(|py| Py::new(py, PyProvider { inner: provider }))
         })
@@ -465,8 +494,8 @@ fn tool_call_to_python(call: ToolCall) -> PyToolCall {
 }
 
 fn content_block_to_python(content: &Content) -> PyContentBlock {
-    let data = serde_json::to_value(content)
-        .unwrap_or_else(|_| Value::String(format!("{content}")));
+    let data =
+        serde_json::to_value(content).unwrap_or_else(|_| Value::String(format!("{content}")));
     let kind = match content {
         Content::Text { .. } => "text",
         Content::Image { .. } => "image",
@@ -485,13 +514,17 @@ fn content_block_to_python(content: &Content) -> PyContentBlock {
 
 fn stream_to_python(
     mut stream: std::pin::Pin<
-        Box<dyn futures_util::Stream<Item = Result<StreamChunk, ::querymt::error::LLMError>> + Send>,
+        Box<
+            dyn futures_util::Stream<Item = Result<StreamChunk, ::querymt::error::LLMError>> + Send,
+        >,
     >,
 ) -> PyChatStream {
     let (tx, rx) = tokio::sync::mpsc::channel(32);
     tokio::spawn(async move {
         while let Some(item) = stream.next().await {
-            let mapped = item.map(stream_chunk_to_python).map_err(|err| err.to_string());
+            let mapped = item
+                .map(stream_chunk_to_python)
+                .map_err(|err| err.to_string());
             if tx.send(mapped).await.is_err() {
                 break;
             }
@@ -514,7 +547,10 @@ fn stream_chunk_to_python(chunk: StreamChunk) -> PyStreamChunk {
             "tool_use_start",
             serde_json::json!({ "index": index, "id": id, "name": name }),
         ),
-        StreamChunk::ToolUseInputDelta { index, partial_json } => (
+        StreamChunk::ToolUseInputDelta {
+            index,
+            partial_json,
+        } => (
             "tool_use_input_delta",
             serde_json::json!({ "index": index, "partial_json": partial_json }),
         ),
@@ -557,7 +593,10 @@ fn stream_chunk_to_python(chunk: StreamChunk) -> PyStreamChunk {
 fn json_to_python<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyAny>> {
     match value {
         Value::Null => Ok(py.None().into_bound(py)),
-        Value::Bool(v) => Ok(<pyo3::Bound<'_, pyo3::types::PyBool> as Clone>::clone(&pyo3::types::PyBool::new(py, *v)).into_any()),
+        Value::Bool(v) => Ok(<pyo3::Bound<'_, pyo3::types::PyBool> as Clone>::clone(
+            &pyo3::types::PyBool::new(py, *v),
+        )
+        .into_any()),
         Value::Number(v) => {
             if let Some(i) = v.as_i64() {
                 Ok(i.into_pyobject(py)?.into_any())
@@ -649,7 +688,6 @@ fn py_messages_to_rust(messages: &Bound<'_, PyAny>) -> Result<Vec<ChatMessage>> 
             .downcast::<PyDict>()
             .map_err(|_| anyhow!("each message must be a dict"))?;
 
-
         out.push(py_message_to_rust(dict)?);
     }
     Ok(out)
@@ -688,7 +726,6 @@ fn py_content_to_rust(content: &Bound<'_, PyAny>) -> Result<Vec<Content>> {
             let dict = item
                 .downcast::<PyDict>()
                 .map_err(|_| anyhow!("each content block must be a dict"))?;
-
 
             out.push(py_block_to_rust(&dict)?);
         }
@@ -796,11 +833,19 @@ fn block_type_name(block: &Bound<'_, PyDict>) -> Result<String> {
 }
 
 fn optional_string(block: &Bound<'_, PyDict>, key: &str) -> Result<Option<String>> {
-    block.get_item(key)?.map(|v| v.extract::<String>()).transpose().map_err(Into::into)
+    block
+        .get_item(key)?
+        .map(|v| v.extract::<String>())
+        .transpose()
+        .map_err(Into::into)
 }
 
 fn optional_bool(block: &Bound<'_, PyDict>, key: &str) -> Result<Option<bool>> {
-    block.get_item(key)?.map(|v| v.extract::<bool>()).transpose().map_err(Into::into)
+    block
+        .get_item(key)?
+        .map(|v| v.extract::<bool>())
+        .transpose()
+        .map_err(Into::into)
 }
 
 fn decode_bytes(block: &Bound<'_, PyDict>, key: &str) -> Result<Vec<u8>> {
@@ -898,7 +943,11 @@ fn thinking_block<'py>(
 
 #[pyfunction]
 #[pyo3(signature = (mime_type, data))]
-fn image_block<'py>(py: Python<'py>, mime_type: String, data: Py<PyAny>) -> PyResult<Bound<'py, PyDict>> {
+fn image_block<'py>(
+    py: Python<'py>,
+    mime_type: String,
+    data: Py<PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
     binary_block(py, "image", mime_type, data.bind(py))
 }
 
@@ -919,7 +968,11 @@ fn pdf_block<'py>(py: Python<'py>, data: Py<PyAny>) -> PyResult<Bound<'py, PyDic
 
 #[pyfunction]
 #[pyo3(signature = (mime_type, data))]
-fn audio_block<'py>(py: Python<'py>, mime_type: String, data: Py<PyAny>) -> PyResult<Bound<'py, PyDict>> {
+fn audio_block<'py>(
+    py: Python<'py>,
+    mime_type: String,
+    data: Py<PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
     binary_block(py, "audio", mime_type, data.bind(py))
 }
 
@@ -1003,7 +1056,11 @@ fn function_tool<'py>(
     Ok(tool)
 }
 
-fn message_dict<'py>(py: Python<'py>, role: &str, content: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyDict>> {
+fn message_dict<'py>(
+    py: Python<'py>,
+    role: &str,
+    content: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
     let msg = PyDict::new(py);
     msg.set_item("role", role)?;
     msg.set_item("content", content)?;
@@ -1134,9 +1191,12 @@ mod tests {
             block.set_item("id", "call-1").unwrap();
             block.set_item("name", "lookup").unwrap();
             block.set_item("is_error", True).unwrap();
-            block.set_item("content", PyList::new(py, [nested]).unwrap()).unwrap();
+            block
+                .set_item("content", PyList::new(py, [nested]).unwrap())
+                .unwrap();
             msg.set_item("role", "tool").unwrap();
-            msg.set_item("content", PyList::new(py, [block]).unwrap()).unwrap();
+            msg.set_item("content", PyList::new(py, [block]).unwrap())
+                .unwrap();
             let out = py_message_to_rust(&msg).unwrap();
             assert_eq!(out.role, ChatRole::Assistant);
             assert!(out.has_tool_result());
@@ -1193,7 +1253,9 @@ mod tests {
             let tools = PyList::empty(py);
             tools.append(tool).unwrap();
 
-            let parsed = python_tools_to_rust(Some(&tools.into_any())).unwrap().unwrap();
+            let parsed = python_tools_to_rust(Some(&tools.into_any()))
+                .unwrap()
+                .unwrap();
             assert_eq!(parsed.len(), 1);
             assert_eq!(parsed[0].function.name, "lookup_weather");
         });

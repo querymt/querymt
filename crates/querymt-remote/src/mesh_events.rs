@@ -7,8 +7,8 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::mesh_handle::ReRegisterFn;
-use crate::mesh_runtime_support::DialReason;
 use crate::mesh_routes::RouteTable;
+use crate::mesh_runtime_support::DialReason;
 
 #[derive(Debug, Clone)]
 pub enum MeshEvent {
@@ -291,19 +291,78 @@ pub(crate) fn seed_scoped_dial_peer(
 
 pub(crate) fn log_kameo_messaging_event(event: &remote::messaging::Event) {
     match event {
-        remote::messaging::Event::AskResult { peer, connection_id, request_id, result } => match result {
-            Ok(_) => tracing::debug!(target: "remote::mesh::messaging", peer = %peer, connection_id = ?connection_id, request_id = %request_id, "kameo ask completed"),
-            Err(error) => tracing::warn!(target: "remote::mesh::messaging", peer = %peer, connection_id = ?connection_id, request_id = %request_id, error = ?error, "kameo ask failed"),
+        remote::messaging::Event::AskResult {
+            peer,
+            connection_id,
+            request_id,
+            result,
+        } => match result {
+            Ok(_) => {
+                tracing::debug!(target: "remote::mesh::messaging", peer = %peer, connection_id = ?connection_id, request_id = %request_id, "kameo ask completed")
+            }
+            Err(error) => {
+                tracing::warn!(target: "remote::mesh::messaging", peer = %peer, connection_id = ?connection_id, request_id = %request_id, error = ?error, "kameo ask failed")
+            }
         },
-        remote::messaging::Event::TellResult { peer, connection_id, request_id, result } => match result {
-            Ok(()) => tracing::debug!(target: "remote::mesh::messaging", peer = %peer, connection_id = ?connection_id, request_id = %request_id, "kameo tell acknowledged"),
-            Err(error) => tracing::warn!(target: "remote::mesh::messaging", peer = %peer, connection_id = ?connection_id, request_id = %request_id, error = %error, "kameo tell failed"),
+        remote::messaging::Event::TellResult {
+            peer,
+            connection_id,
+            request_id,
+            result,
+        } => match result {
+            Ok(()) => {
+                tracing::debug!(target: "remote::mesh::messaging", peer = %peer, connection_id = ?connection_id, request_id = %request_id, "kameo tell acknowledged")
+            }
+            Err(error) => {
+                tracing::warn!(target: "remote::mesh::messaging", peer = %peer, connection_id = ?connection_id, request_id = %request_id, error = %error, "kameo tell failed")
+            }
         },
-        remote::messaging::Event::LinkResult { peer, connection_id, request_id, result } => tracing::debug!(target: "remote::mesh::messaging", peer = %peer, connection_id = ?connection_id, request_id = %request_id, ok = result.is_ok(), "kameo link result"),
-        remote::messaging::Event::UnlinkResult { peer, connection_id, request_id, result } => tracing::debug!(target: "remote::mesh::messaging", peer = %peer, connection_id = ?connection_id, request_id = %request_id, ok = result.is_ok(), "kameo unlink result"),
-        remote::messaging::Event::SignalLinkDiedResult { peer, connection_id, request_id, result } => tracing::debug!(target: "remote::mesh::messaging", peer = %peer, connection_id = ?connection_id, request_id = %request_id, ok = result.is_ok(), "kameo signal_link_died result"),
-        remote::messaging::Event::OutboundFailure { peer, connection_id, request_id, error } => tracing::warn!(target: "remote::mesh::messaging", peer = %peer, connection_id = %connection_id, request_id = %request_id, error = %error, "kameo outbound failure"),
-        remote::messaging::Event::InboundFailure { peer, connection_id, request_id, error } => tracing::warn!(target: "remote::mesh::messaging", peer = %peer, connection_id = %connection_id, request_id = %request_id, error = ?error, "kameo inbound failure"),
-        remote::messaging::Event::ResponseSent { peer, connection_id, request_id } => tracing::trace!(target: "remote::mesh::messaging", peer = %peer, connection_id = %connection_id, request_id = %request_id, "kameo response sent"),
+        remote::messaging::Event::LinkResult {
+            peer,
+            connection_id,
+            request_id,
+            result,
+        } => {
+            tracing::debug!(target: "remote::mesh::messaging", peer = %peer, connection_id = ?connection_id, request_id = %request_id, ok = result.is_ok(), "kameo link result")
+        }
+        remote::messaging::Event::UnlinkResult {
+            peer,
+            connection_id,
+            request_id,
+            result,
+        } => {
+            tracing::debug!(target: "remote::mesh::messaging", peer = %peer, connection_id = ?connection_id, request_id = %request_id, ok = result.is_ok(), "kameo unlink result")
+        }
+        remote::messaging::Event::SignalLinkDiedResult {
+            peer,
+            connection_id,
+            request_id,
+            result,
+        } => {
+            tracing::debug!(target: "remote::mesh::messaging", peer = %peer, connection_id = ?connection_id, request_id = %request_id, ok = result.is_ok(), "kameo signal_link_died result")
+        }
+        remote::messaging::Event::OutboundFailure {
+            peer,
+            connection_id,
+            request_id,
+            error,
+        } => {
+            tracing::warn!(target: "remote::mesh::messaging", peer = %peer, connection_id = %connection_id, request_id = %request_id, error = %error, "kameo outbound failure")
+        }
+        remote::messaging::Event::InboundFailure {
+            peer,
+            connection_id,
+            request_id,
+            error,
+        } => {
+            tracing::warn!(target: "remote::mesh::messaging", peer = %peer, connection_id = %connection_id, request_id = %request_id, error = ?error, "kameo inbound failure")
+        }
+        remote::messaging::Event::ResponseSent {
+            peer,
+            connection_id,
+            request_id,
+        } => {
+            tracing::trace!(target: "remote::mesh::messaging", peer = %peer, connection_id = %connection_id, request_id = %request_id, "kameo response sent")
+        }
     }
 }

@@ -440,8 +440,13 @@ impl SessionProvider {
                 })
                 .or_else(|| Some(serde_json::json!({"_remote_session_id": session_id})));
             return Ok(Arc::new(
-                querymt_remote::MeshChatProvider::from_node_id(mesh, &node_id, provider_name, model)
-                    .with_params(remote_params),
+                querymt_remote::MeshChatProvider::from_node_id(
+                    mesh,
+                    &node_id,
+                    provider_name,
+                    model,
+                )
+                .with_params(remote_params),
             ));
         }
 

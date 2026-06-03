@@ -7,8 +7,8 @@
 mod join;
 
 pub use querymt_remote::{
-    MeshError, MeshEvent, MeshHandle, MeshRoute, MeshRuntimeConfig, MeshRuntimeHandle,
-    MeshScopeId, PeerEvent, RouteTable, bootstrap_mesh_runtime,
+    MeshError, MeshEvent, MeshHandle, MeshRoute, MeshRuntimeConfig, MeshRuntimeHandle, MeshScopeId,
+    PeerEvent, RouteTable, bootstrap_mesh_runtime,
 };
 
 use querymt_remote::SignedInviteGrant;

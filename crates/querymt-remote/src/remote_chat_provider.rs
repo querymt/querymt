@@ -40,7 +40,10 @@ where
         request_id: Option<&str>,
         reason: Option<&str>,
     ) {
-        let _ = self.core.cancel_stream(session_id, request_id, reason).await;
+        let _ = self
+            .core
+            .cancel_stream(session_id, request_id, reason)
+            .await;
     }
 
     pub async fn get_remote_stream_status(
@@ -141,11 +144,9 @@ where
             .target_peer_id_display(self.core.config().target_locator())
             .await;
         let lease_renew_every = self.core.config().lease_renew_every();
-        let renew_lease_factory = self.core.make_renew_lease_fn(
-            host_ref.clone(),
-            session_id.clone(),
-            request_id.clone(),
-        );
+        let renew_lease_factory =
+            self.core
+                .make_renew_lease_fn(host_ref.clone(), session_id.clone(), request_id.clone());
         let peer_alive_fn = self.core.make_target_peer_alive_fn();
         let setup_span = tracing::Span::current();
 
@@ -186,7 +187,9 @@ where
                             tokio::time::sleep_until(renew_due)
                         };
 
-                        let next = if let Some(remaining) = stream_state.reconnect_remaining(reconnect_grace) {
+                        let next = if let Some(remaining) =
+                            stream_state.reconnect_remaining(reconnect_grace)
+                        {
                             if remaining.is_zero() {
                                 return Some((
                                     Err(RemoteProviderClientCore::<TTransport>::reconnect_timeout_error(reconnect_grace)),
@@ -277,8 +280,7 @@ where
     }
 }
 
-impl<TTransport> LLMProvider for RemoteChatProvider<TTransport>
-where
-    TTransport: RemoteProviderClientTransport + 'static,
+impl<TTransport> LLMProvider for RemoteChatProvider<TTransport> where
+    TTransport: RemoteProviderClientTransport + 'static
 {
 }

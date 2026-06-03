@@ -103,21 +103,21 @@ pub use mesh::join_mesh_via_invite;
 #[cfg(feature = "remote")]
 pub use mesh::{MeshError, MeshHandle, PeerEvent, bootstrap_mesh_runtime};
 #[cfg(feature = "remote")]
-pub use querymt_remote::{MeshRuntimeConfig, MeshTransportMode};
-#[cfg(feature = "remote")]
-pub use querymt_remote::MeshChatProvider;
-#[cfg(feature = "remote")]
 pub use mesh_state::{MeshLocalRole, MeshStateEntry, MeshStateStore, MeshStatus};
 pub use node_id::NodeId;
-pub use node_manager::{ListRemoteSessionsResponse, NodeInfo, RemoteSessionInfo};
 #[cfg(feature = "remote")]
 pub use node_manager::{
     CreateRemoteSchedule, CreateRemoteScheduleResponse, CreateRemoteSession,
     CreateRemoteSessionResponse, DeleteRemoteSchedule, ForkRemoteSession,
-    ForkRemoteSessionResponse, GetNodeInfo, ListRemoteSchedules,
-    ListRemoteSchedulesResponse, ListRemoteSessions, PauseRemoteSchedule, RemoteNodeManager,
-    ResumeRemoteSchedule, ResumeRemoteSession, StopRemoteSessionRuntime, TriggerRemoteSchedule,
+    ForkRemoteSessionResponse, GetNodeInfo, ListRemoteSchedules, ListRemoteSchedulesResponse,
+    ListRemoteSessions, PauseRemoteSchedule, RemoteNodeManager, ResumeRemoteSchedule,
+    ResumeRemoteSession, StopRemoteSessionRuntime, TriggerRemoteSchedule,
 };
+pub use node_manager::{ListRemoteSessionsResponse, NodeInfo, RemoteSessionInfo};
+#[cfg(feature = "remote")]
+pub use querymt_remote::MeshChatProvider;
+#[cfg(feature = "remote")]
+pub use querymt_remote::{MeshRuntimeConfig, MeshTransportMode};
 pub use querymt_remote::{ProviderHostActor, StreamReceiverActor};
 
 #[cfg(feature = "remote")]
@@ -126,6 +126,13 @@ pub use querymt_remote::{
     ProviderChatResponse, ProviderStreamPhase, ProviderStreamRequest, ProviderStreamStatus,
     RenewProviderStreamLease, StreamChunkRelay, StreamRelayMessage,
 };
+#[cfg(feature = "remote")]
+pub use querymt_remote::{
+    GetRouterStatus, ProviderStreamRouterActor as SessionStreamRouterActor, RequestPhase,
+    RoutedRequestStatus, RoutedStreamRelayMessage,
+};
+#[cfg(feature = "remote")]
+pub use querymt_remote::{MeshRuntimeHandle, MeshScopeHandle};
 #[cfg(feature = "remote")]
 pub use registry_exchange::{
     GetRegistrations, NotifyRegistration, RegistrationEntry, RegistryExchangeActor,
@@ -142,13 +149,6 @@ pub use routing::{
     RoutingPolicy, RoutingSnapshot, RoutingSnapshotHandle, SetProviderTarget, SetSessionTarget,
     UnresolvePeer, new_routing_snapshot_handle,
 };
-#[cfg(feature = "remote")]
-pub use querymt_remote::{MeshRuntimeHandle, MeshScopeHandle};
 pub use scope::{MeshScopeId, MeshTransportKind};
-#[cfg(feature = "remote")]
-pub use querymt_remote::{
-    GetRouterStatus, ProviderStreamRouterActor as SessionStreamRouterActor, RequestPhase,
-    RoutedRequestStatus, RoutedStreamRelayMessage,
-};
 #[cfg(feature = "remote")]
 pub use transport::{DynMeshTransport, MeshTransport};

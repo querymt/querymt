@@ -129,8 +129,11 @@ impl RoutedRequest {
         }
         self.replay_buffer.push_back(message);
 
-        if relay_message_is_terminal(self.replay_buffer.back().expect("buffer contains pushed message"))
-            && let Some(phase) = terminal_phase
+        if relay_message_is_terminal(
+            self.replay_buffer
+                .back()
+                .expect("buffer contains pushed message"),
+        ) && let Some(phase) = terminal_phase
         {
             self.phase = phase;
         }
@@ -382,7 +385,9 @@ static PROVIDER_STREAM_ROUTER_ACTOR_REG: (&'static str, _internal::RemoteActorFn
             ))
         }) as _internal::RemoteLinkFn,
         unlink: (|actor_id, sibling_id| {
-            Box::pin(_internal::unlink::<ProviderStreamRouterActor>(actor_id, sibling_id))
+            Box::pin(_internal::unlink::<ProviderStreamRouterActor>(
+                actor_id, sibling_id,
+            ))
         }) as _internal::RemoteUnlinkFn,
         signal_link_died: (|dead_actor_id, notified_actor_id, stop_reason| {
             Box::pin(_internal::signal_link_died::<ProviderStreamRouterActor>(
@@ -427,7 +432,11 @@ macro_rules! remote_router_msg_impl {
                     ))
                 }) as _internal::RemoteTryAskFn,
                 tell: (|actor_id, msg, mailbox_timeout| {
-                    Box::pin(_internal::tell::<$actor, $msg_ty>(actor_id, msg, mailbox_timeout))
+                    Box::pin(_internal::tell::<$actor, $msg_ty>(
+                        actor_id,
+                        msg,
+                        mailbox_timeout,
+                    ))
                 }) as _internal::RemoteTellFn,
                 try_tell: (|actor_id, msg| {
                     Box::pin(_internal::try_tell::<$actor, $msg_ty>(actor_id, msg))
@@ -464,7 +473,9 @@ mod tests {
     async fn register_request_creates_entry() {
         let router = create_test_router();
         let request_id = "test-request-1".to_string();
-        router.register_request(request_id.clone()).expect("register request");
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
         let status = router.get_status(Some(&request_id));
         assert_eq!(status.len(), 1);
         assert_eq!(status[0].request_id, request_id);
@@ -492,7 +503,9 @@ mod tests {
     async fn terminal_replay_closes_consumer() {
         let router = create_test_router();
         let request_id = "test-request-2".to_string();
-        router.register_request(request_id.clone()).expect("register request");
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
         router
             .requests
             .lock()
@@ -512,7 +525,10 @@ mod tests {
             .await
             .expect("attach should succeed");
 
-        assert!(matches!(rx.recv().await, Some(StreamRelayMessage::Chunk(StreamChunk::Done { .. }))));
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamRelayMessage::Chunk(StreamChunk::Done { .. }))
+        ));
         assert!(rx.recv().await.is_none());
     }
 
@@ -520,7 +536,9 @@ mod tests {
     async fn buffer_overflow_evicts_oldest_message() {
         let router = ProviderStreamRouterActor::new(Some(3), Some(60));
         let request_id = "test-request-3".to_string();
-        router.register_request(request_id.clone()).expect("register request");
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
 
         for i in 0..4 {
             router
@@ -528,7 +546,9 @@ mod tests {
                 .lock()
                 .get_mut(&request_id)
                 .expect("request exists")
-                .deliver_or_buffer(StreamRelayMessage::Chunk(StreamChunk::Text(format!("msg-{i}"))));
+                .deliver_or_buffer(StreamRelayMessage::Chunk(StreamChunk::Text(format!(
+                    "msg-{i}"
+                ))));
         }
 
         let request = router.requests.lock();
@@ -559,7 +579,12 @@ mod tests {
             .await
             .expect("attach should succeed");
 
-        router_ref.tell(DetachStreamConsumer { request_id: request_id.clone() }).await.expect("detach");
+        router_ref
+            .tell(DetachStreamConsumer {
+                request_id: request_id.clone(),
+            })
+            .await
+            .expect("detach");
 
         let statuses = router_ref
             .ask(GetRouterStatus {
@@ -576,7 +601,9 @@ mod tests {
     async fn cleanup_removes_expired_terminal_requests() {
         let router = ProviderStreamRouterActor::new(Some(10), Some(1));
         let request_id = "test-request-5".to_string();
-        router.register_request(request_id.clone()).expect("register request");
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
         {
             let mut requests = router.requests.lock();
             let request = requests.get_mut(&request_id).expect("request exists");
@@ -592,7 +619,9 @@ mod tests {
     async fn direct_terminal_delivery_closes_consumer_and_marks_completed() {
         let router = create_test_router();
         let request_id = "test-request-6".to_string();
-        router.register_request(request_id.clone()).expect("register request");
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
         let (tx, mut rx) = mpsc::channel(8);
         router
             .requests
@@ -610,7 +639,10 @@ mod tests {
                 finish_reason: querymt::chat::FinishReason::Stop,
             }));
 
-        assert!(matches!(rx.recv().await, Some(StreamRelayMessage::Chunk(StreamChunk::Done { .. }))));
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamRelayMessage::Chunk(StreamChunk::Done { .. }))
+        ));
         assert!(rx.recv().await.is_none());
         let status = router.get_status(Some(&request_id));
         assert_eq!(status[0].phase, RequestPhase::Completed);
@@ -620,8 +652,12 @@ mod tests {
     #[tokio::test]
     async fn get_status_without_request_id_returns_all_requests() {
         let router = create_test_router();
-        router.register_request("req-a".to_string()).expect("register req-a");
-        router.register_request("req-b".to_string()).expect("register req-b");
+        router
+            .register_request("req-a".to_string())
+            .expect("register req-a");
+        router
+            .register_request("req-b".to_string())
+            .expect("register req-b");
 
         let mut ids = router
             .get_status(None)

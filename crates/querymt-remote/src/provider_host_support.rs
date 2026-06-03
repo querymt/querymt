@@ -1,4 +1,7 @@
-use crate::{ProviderBuildRequest, RemoteProviderBackend, StreamChunkRelay, StreamRelayMessage, relay_message_is_terminal};
+use crate::{
+    ProviderBuildRequest, RemoteProviderBackend, StreamChunkRelay, StreamRelayMessage,
+    relay_message_is_terminal,
+};
 use kameo::message::{Context, Message};
 use kameo::remote::_internal;
 use querymt::LLMProvider;
@@ -156,7 +159,9 @@ static STREAM_RECEIVER_ACTOR_REG: (&'static str, _internal::RemoteActorFns) = (
             ))
         }) as _internal::RemoteLinkFn,
         unlink: (|actor_id, sibling_id| {
-            Box::pin(_internal::unlink::<StreamReceiverActor>(actor_id, sibling_id))
+            Box::pin(_internal::unlink::<StreamReceiverActor>(
+                actor_id, sibling_id,
+            ))
         }) as _internal::RemoteUnlinkFn,
         signal_link_died: (|dead_actor_id, notified_actor_id, stop_reason| {
             Box::pin(_internal::signal_link_died::<StreamReceiverActor>(
@@ -180,7 +185,9 @@ static REG_STREAM_CHUNK_RELAY: (
 ) = (
     _internal::RemoteMessageRegistrationID {
         actor_remote_id: <StreamReceiverActor as kameo::remote::RemoteActor>::REMOTE_ID,
-        message_remote_id: <StreamReceiverActor as kameo::remote::RemoteMessage<StreamChunkRelay>>::REMOTE_ID,
+        message_remote_id: <StreamReceiverActor as kameo::remote::RemoteMessage<
+            StreamChunkRelay,
+        >>::REMOTE_ID,
     },
     _internal::RemoteMessageFns {
         ask: (|actor_id, msg, mailbox_timeout, reply_timeout| {

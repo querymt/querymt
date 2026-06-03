@@ -147,7 +147,8 @@ impl ProviderHostActor {
 }
 
 impl Message<ProviderChatRequest> for ProviderHostActor {
-    type Reply = kameo::reply::DelegatedReply<Result<ProviderChatResponse, RemoteProviderHostError>>;
+    type Reply =
+        kameo::reply::DelegatedReply<Result<ProviderChatResponse, RemoteProviderHostError>>;
 
     #[tracing::instrument(
         name = "remote.provider_host.chat",
@@ -185,7 +186,8 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
                 .await
                 .map_err(|e| RemoteProviderHostError::ProviderChat {
                     operation: "chat_with_tools".to_string(),
-                    reason: serde_json::to_string(&e.to_payload()).unwrap_or_else(|_| e.to_string()),
+                    reason: serde_json::to_string(&e.to_payload())
+                        .unwrap_or_else(|_| e.to_string()),
                 })?;
 
             let tool_calls = response.tool_calls().unwrap_or_default();

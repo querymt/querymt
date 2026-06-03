@@ -268,8 +268,11 @@ impl InviteGrant {
                 "token too short for PeerId payload".to_string(),
             ));
         }
-        let peer_id = libp2p::PeerId::from_bytes(&data[peer_id_start..peer_id_start + peer_id_total])
-            .map_err(|e| InviteError::InvalidToken(format!("invalid PeerId in wire bytes: {e}")))?;
+        let peer_id =
+            libp2p::PeerId::from_bytes(&data[peer_id_start..peer_id_start + peer_id_total])
+                .map_err(|e| {
+                    InviteError::InvalidToken(format!("invalid PeerId in wire bytes: {e}"))
+                })?;
         let pos = peer_id_start + peer_id_total;
 
         if data.len() < pos + 14 {
@@ -302,7 +305,9 @@ impl InviteGrant {
         } else {
             Some(
                 std::str::from_utf8(&data[name_start..name_start + name_len])
-                    .map_err(|e| InviteError::InvalidToken(format!("invalid mesh_name UTF-8: {e}")))?
+                    .map_err(|e| {
+                        InviteError::InvalidToken(format!("invalid mesh_name UTF-8: {e}"))
+                    })?
                     .to_string(),
             )
         };
@@ -328,7 +333,10 @@ impl InviteGrant {
     }
 
     #[cfg(feature = "kameo-mesh")]
-    pub fn sign(self, keypair: &libp2p::identity::Keypair) -> Result<SignedInviteGrant, InviteError> {
+    pub fn sign(
+        self,
+        keypair: &libp2p::identity::Keypair,
+    ) -> Result<SignedInviteGrant, InviteError> {
         let wire = self.to_wire_bytes()?;
         let signature_bytes = keypair
             .sign(&wire)

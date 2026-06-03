@@ -1,6 +1,7 @@
 use crate::{
-    CancelProviderStreamRequest, GetProviderStreamStatus, ProviderChatRequest, ProviderChatResponse,
-    ProviderStreamRequest, ProviderStreamStatus, RemoteProviderClientConfig, StreamRelayMessage,
+    CancelProviderStreamRequest, GetProviderStreamStatus, ProviderChatRequest,
+    ProviderChatResponse, ProviderStreamRequest, ProviderStreamStatus, RemoteProviderClientConfig,
+    StreamRelayMessage,
 };
 use async_trait::async_trait;
 use querymt::error::{LLMError, TransportErrorKind};
@@ -86,7 +87,9 @@ where
     }
 
     pub async fn lookup_host(&self) -> Result<TTransport::HostRef, LLMError> {
-        self.transport.lookup_host(self.config.target_locator()).await
+        self.transport
+            .lookup_host(self.config.target_locator())
+            .await
     }
 
     pub async fn invalidate_cached_host(&self) {
@@ -110,7 +113,8 @@ where
         should_retry: impl Fn(&LLMError) -> bool,
     ) -> Result<ProviderChatResponse, LLMError> {
         let request = self.build_chat_request(messages, tools);
-        self.send_chat_request_with_retry(&request, should_retry).await
+        self.send_chat_request_with_retry(&request, should_retry)
+            .await
     }
 
     pub fn build_stream_request(
@@ -216,7 +220,11 @@ where
         request: ProviderStreamRequest<TTransport::RemoteRouterRef>,
         should_retry: impl Fn(&LLMError) -> bool,
     ) -> Result<(), LLMError> {
-        match self.transport.send_stream_request(host, request.clone()).await {
+        match self
+            .transport
+            .send_stream_request(host, request.clone())
+            .await
+        {
             Ok(()) => Ok(()),
             Err(error) if should_retry(&error) => {
                 self.invalidate_cached_host().await;
@@ -422,7 +430,9 @@ where
                 stream_state.note_reconnect();
                 Ok(None)
             }
-            Some(StreamRelayMessage::TransportFailed { error }) => Err(LLMError::from_payload(error)),
+            Some(StreamRelayMessage::TransportFailed { error }) => {
+                Err(LLMError::from_payload(error))
+            }
             None => {
                 if let Some(error) = stream_state.closed_error(peer_alive) {
                     Err(error)

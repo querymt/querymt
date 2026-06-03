@@ -404,11 +404,17 @@ async fn enumerate_remote_models(mesh: &crate::agent::remote::MeshHandle) -> Vec
             }
 
             let catalog_name = scoped_provider_catalog(&scope, &peer_id);
-            let Ok(Some(catalog_ref)) = mesh.lookup_actor::<ProviderCatalogActor>(catalog_name).await else {
+            let Ok(Some(catalog_ref)) = mesh
+                .lookup_actor::<ProviderCatalogActor>(catalog_name)
+                .await
+            else {
                 continue;
             };
 
-            let snapshot = match catalog_ref.ask::<GetProviderCatalog>(&GetProviderCatalog).await {
+            let snapshot = match catalog_ref
+                .ask::<GetProviderCatalog>(&GetProviderCatalog)
+                .await
+            {
                 Ok(snapshot) => snapshot,
                 Err(e) => {
                     log::warn!(

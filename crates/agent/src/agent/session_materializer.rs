@@ -22,8 +22,6 @@ use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::SessionRuntime;
 use crate::agent::remote::SessionActorRef;
 #[cfg(feature = "remote")]
-use querymt_remote::MeshRuntimeHandle;
-#[cfg(feature = "remote")]
 use crate::agent::remote::scope::scoped_session;
 use crate::agent::session_actor::SessionActor;
 use crate::agent::session_mcp::{
@@ -38,6 +36,8 @@ use agent_client_protocol::schema::{
     NewSessionRequest, ResumeSessionRequest,
 };
 use kameo::actor::{ActorRef, Spawn};
+#[cfg(feature = "remote")]
+use querymt_remote::MeshRuntimeHandle;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};

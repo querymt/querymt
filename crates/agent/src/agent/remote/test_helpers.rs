@@ -18,7 +18,6 @@ pub(crate) mod fixtures {
     use crate::agent::remote::NodeId;
     use crate::agent::remote::mesh::MeshHandle;
     use crate::agent::remote::node_manager::RemoteNodeManager;
-    use querymt_remote::ProviderHostActor;
     use crate::agent::session_registry::SessionRegistry;
     use crate::session::backend::StorageBackend as _;
     use crate::session::sqlite_storage::SqliteStorage;
@@ -30,6 +29,7 @@ pub(crate) mod fixtures {
     use querymt::embedding::EmbeddingProvider;
     use querymt::error::LLMError;
     use querymt::plugin::host::PluginRegistry;
+    use querymt_remote::ProviderHostActor;
     use std::path::PathBuf;
     use std::pin::Pin;
     use std::sync::{Arc, OnceLock};
@@ -122,7 +122,8 @@ pub(crate) mod fixtures {
                             lan: Some(querymt_remote::LanMeshConfig {
                                 listen: Some("/ip4/127.0.0.1/tcp/0".to_string()),
                                 discovery: querymt_remote::LanDiscovery::None,
-                                directory: querymt_remote::mesh_runtime_config::DirectoryMode::default(),
+                                directory:
+                                    querymt_remote::mesh_runtime_config::DirectoryMode::default(),
                             }),
                             iroh_enabled: false,
                             iroh_scopes: Vec::new(),
@@ -319,7 +320,9 @@ pub(crate) mod fixtures {
     impl ProviderHostFixture {
         pub async fn new() -> Self {
             let f = AgentConfigFixture::new().await;
-            let actor = crate::agent::remote::provider_host_backend::provider_host_from_config(f.config.clone());
+            let actor = crate::agent::remote::provider_host_backend::provider_host_from_config(
+                f.config.clone(),
+            );
             let actor_ref = ProviderHostActor::spawn(actor);
             Self {
                 actor_ref,
@@ -514,7 +517,9 @@ pub(crate) mod fixtures {
             // provider routing integration tests that need the mock to fire
             // should use direct `ask(ProviderChatRequest)` with a provider
             // name resolvable from the config.
-            let actor = crate::agent::remote::provider_host_backend::provider_host_from_config(alpha_f.config.clone());
+            let actor = crate::agent::remote::provider_host_backend::provider_host_from_config(
+                alpha_f.config.clone(),
+            );
             let actor_ref = ProviderHostActor::spawn(actor);
 
             let provider_host_dht = crate::agent::remote::scope::scoped_provider_host(
