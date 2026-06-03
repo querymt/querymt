@@ -19,11 +19,10 @@ impl LocalAgentHandle {
     ///
     /// ## Fast path
     ///
-    /// Tries a direct DHT lookup under the scoped per-peer node-manager name first.
-    /// This succeeds whenever the remote node registered under the same scope
-    /// (see [`crate::agent::remote::scope::scoped_node_manager_for_peer`]) and is **not** gated on
-    /// `is_peer_alive`, so it works even when mDNS has transiently expired the
-    /// peer (TTL = 30 s) while the TCP connection is still alive.
+    /// If `node_id` parses as a `PeerId`, uses the mesh route table to pick the
+    /// best-known scope for that peer first (LAN beats iroh when both exist),
+    /// then performs a direct per-peer DHT lookup under that scope. This keeps
+    /// routine targeted actions on the same path as current reachability.
     ///
     /// ## Fallback scan
     ///
@@ -61,11 +60,27 @@ impl LocalAgentHandle {
         // is_peer_alive gate that guards the fallback scan, so it works even
         // when mDNS has temporarily expired the peer's heartbeat.
         let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+        let parsed_peer_id = node_id.parse::<libp2p::PeerId>().ok();
+        let mut direct_scopes = Vec::new();
+        if let Some(peer_id) = parsed_peer_id
+            && let Some(best_route) = mesh.best_route_for_peer(&peer_id)
+        {
+            direct_scopes.push(best_route.scope);
+        }
+        if direct_scopes.is_empty() {
+            direct_scopes.push(crate::agent::remote::scope::MeshScopeId::lan_default());
+        }
         for scope in runtime.active_scopes() {
+            if !direct_scopes.contains(&scope) {
+                direct_scopes.push(scope);
+            }
+        }
+
+        for scope in &direct_scopes {
             let direct_dht_name =
-                crate::agent::remote::scope::scoped_node_manager_for_peer(&scope, &node_id);
+                crate::agent::remote::scope::scoped_node_manager_for_peer(scope, &node_id);
             match runtime
-                .lookup_actor::<RemoteNodeManager>(direct_dht_name.clone())
+                .lookup_actor_no_retry::<RemoteNodeManager>(direct_dht_name.clone())
                 .await
             {
                 Ok(Some(node_manager_ref)) => {

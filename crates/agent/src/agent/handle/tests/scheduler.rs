@@ -260,6 +260,21 @@ async fn test_querymt_schedule_ext_methods_local() {
     )
     .await;
     assert_eq!(listed["schedules"][0]["state"], "paused");
+
+    let _ = ext_method_json(
+        &f.handle,
+        "querymt/schedules/delete",
+        serde_json::json!({ "schedulePublicId": schedule_id.clone() }),
+    )
+    .await;
+
+    let listed = ext_method_json(
+        &f.handle,
+        "querymt/schedules/list",
+        serde_json::json!({ "sessionId": session_id }),
+    )
+    .await;
+    assert_eq!(listed["schedules"].as_array().map(Vec::len), Some(0));
 }
 
 #[tokio::test]

@@ -176,6 +176,48 @@ fn find_node_manager_fast_path_dht_name_matches_registration_name() {
 }
 
 #[cfg(feature = "remote")]
+#[test]
+fn find_node_manager_prefers_best_route_scope_for_direct_lookup() {
+    use crate::agent::remote::scope::MeshScopeId;
+
+    let peer_id = libp2p::identity::Keypair::generate_ed25519()
+        .public()
+        .to_peer_id();
+    let routes = crate::agent::remote::mesh::RouteTable::new(std::time::Duration::from_secs(90));
+    let iroh_scope = MeshScopeId::Iroh {
+        mesh_id: "mesh-a".to_string(),
+    };
+
+    routes.upsert_addrs(
+        peer_id,
+        crate::agent::remote::scope::MeshTransportKind::Iroh,
+        iroh_scope.clone(),
+        [format!("/p2p/{peer_id}").parse().unwrap()],
+        70,
+    );
+    routes.upsert_addrs(
+        peer_id,
+        crate::agent::remote::scope::MeshTransportKind::Lan,
+        MeshScopeId::lan_default(),
+        [format!("/ip4/127.0.0.1/tcp/12345/p2p/{peer_id}")
+            .parse()
+            .unwrap()],
+        100,
+    );
+
+    let best = routes
+        .best_route_for_peer(&peer_id)
+        .expect("best route exists");
+    let dht_name = crate::agent::remote::scope::scoped_node_manager_for_peer(&best.scope, &peer_id);
+    assert_eq!(best.scope, MeshScopeId::lan_default());
+    assert_eq!(
+        dht_name,
+        format!("scope::lan::default::node_manager::peer::{}", peer_id),
+        "direct lookup should follow the preferred LAN route"
+    );
+}
+
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn find_node_manager_without_mesh_returns_error() {
     // When no mesh is bootstrapped, find_node_manager must return an error

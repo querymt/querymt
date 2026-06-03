@@ -161,12 +161,12 @@ impl SchedulerHandle {
     /// Remove a schedule.
     pub async fn remove_schedule(&self, schedule_public_id: &str) -> SessionResult<()> {
         self.actor_ref
-            .tell(RemoveSchedule {
+            .ask(RemoveSchedule {
                 schedule_public_id: schedule_public_id.to_string(),
             })
+            .send()
             .await
-            .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
-        Ok(())
+            .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))
     }
 
     /// Pause a schedule.
@@ -392,14 +392,14 @@ impl Message<AddSchedule> for SchedulerActor {
 // ── RemoveSchedule (control) ─────────────────────────────────────────────
 
 impl Message<RemoveSchedule> for SchedulerActor {
-    type Reply = ();
+    type Reply = Result<(), crate::session::error::SessionError>;
 
     async fn handle(
         &mut self,
         msg: RemoveSchedule,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.handle_remove_schedule(&msg.schedule_public_id).await;
+        self.handle_remove_schedule(&msg.schedule_public_id).await
     }
 }
 
@@ -1391,7 +1391,7 @@ impl SchedulerActor {
     }
 
     /// Remove a schedule. If running, defers deletion until after the terminal event.
-    pub async fn handle_remove_schedule(&mut self, schedule_public_id: &str) {
+    pub async fn handle_remove_schedule(&mut self, schedule_public_id: &str) -> SessionResult<()> {
         // Check if currently running
         if self.active_cycles.contains_key(schedule_public_id) {
             info!(
@@ -1400,7 +1400,7 @@ impl SchedulerActor {
             );
             self.pending_deletes.insert(schedule_public_id.to_string());
             self.metrics.pending_deletes = self.pending_deletes.len() as u64;
-            return;
+            return Ok(());
         }
 
         // Remove from in-memory queues
@@ -1410,19 +1410,11 @@ impl SchedulerActor {
         self.metrics.armed_event_schedules = self.event_counters.len() as u64;
         self.reschedule_wake();
 
-        // Delete from store
-        if let Err(e) = self
-            .schedule_store
+        self.schedule_store
             .delete_schedule(schedule_public_id)
-            .await
-        {
-            warn!(
-                "SchedulerActor: failed to delete schedule {}: {}",
-                schedule_public_id, e
-            );
-        } else {
-            info!("SchedulerActor: removed schedule {}", schedule_public_id);
-        }
+            .await?;
+        info!("SchedulerActor: removed schedule {}", schedule_public_id);
+        Ok(())
     }
 
     /// Pause a schedule.
