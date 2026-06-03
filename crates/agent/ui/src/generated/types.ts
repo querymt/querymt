@@ -766,6 +766,7 @@ export interface ScheduleInfo {
 	public_id: string;
 	task_public_id: string;
 	session_public_id: string;
+	node_id?: string;
 	/** Serialized trigger config */
 	trigger: any;
 	/** Current state: armed, running, paused, exhausted, failed */
@@ -1175,6 +1176,8 @@ export type UiClientMessage =
 	/** Create a new schedule (recurring task + schedule trigger) */
 	| { type: "create_schedule", data: {
 	session_id: string;
+	/** Optional remote node that owns the session/schedule. */
+	node_id?: string;
 	/** Prompt text for each cycle (becomes the task's expected_deliverable) */
 	prompt: string;
 	/** Trigger configuration as JSON (ScheduleTrigger) */
@@ -1188,22 +1191,31 @@ export type UiClientMessage =
 	/** List schedules for a session (or all if session_id is None) */
 	| { type: "list_schedules", data: {
 	session_id?: string;
+	node_id?: string;
 }}
 	/** Pause a schedule */
 	| { type: "pause_schedule", data: {
 	schedule_public_id: string;
+	session_id?: string;
+	node_id?: string;
 }}
 	/** Resume a paused schedule */
 	| { type: "resume_schedule", data: {
 	schedule_public_id: string;
+	session_id?: string;
+	node_id?: string;
 }}
 	/** Trigger a schedule to fire immediately */
 	| { type: "trigger_schedule", data: {
 	schedule_public_id: string;
+	session_id?: string;
+	node_id?: string;
 }}
 	/** Delete a schedule */
 	| { type: "delete_schedule", data: {
 	schedule_public_id: string;
+	session_id?: string;
+	node_id?: string;
 }}
 	/** Create a new mesh invite token */
 	| { type: "create_mesh_invite", data: {
@@ -1339,6 +1351,7 @@ export type UiServerMessage =
 	session_id: string;
 	agent_id: string;
 	profile_id?: string;
+	node_id?: string;
 	audit: AuditView;
 	undo_stack: UndoStackFrame[];
 	cursor: StreamCursor;
@@ -1484,11 +1497,14 @@ export type UiServerMessage =
 	/** Schedule list response */
 	| { type: "schedule_list", data: {
 	schedules: ScheduleInfo[];
+	session_id?: string;
+	node_id?: string;
 }}
 	/** Schedule created successfully */
 	| { type: "schedule_created_result", data: {
 	success: boolean;
 	schedule_public_id?: string;
+	node_id?: string;
 	message?: string;
 }}
 	/** Schedule action result (pause/resume/trigger/delete) */
@@ -1496,6 +1512,7 @@ export type UiServerMessage =
 	success: boolean;
 	schedule_public_id: string;
 	action: string;
+	node_id?: string;
 	message?: string;
 }}
 	/** Knowledge query result (entries + consolidations) */

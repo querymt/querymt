@@ -344,7 +344,12 @@ pub(crate) mod fixtures {
         pub async fn new() -> Self {
             let f = AgentConfigFixture::new().await;
             let registry = Arc::new(Mutex::new(SessionRegistry::new(f.config.clone())));
-            let nm = RemoteNodeManager::new(f.config.clone(), registry, None);
+            let nm = RemoteNodeManager::new(
+                f.config.clone(),
+                registry,
+                None,
+                Arc::new(parking_lot::Mutex::new(None)),
+            );
             let actor_ref = RemoteNodeManager::spawn(nm);
             Self {
                 actor_ref,
@@ -358,7 +363,12 @@ pub(crate) mod fixtures {
             let mesh = get_test_mesh().await;
             let f = AgentConfigFixture::new().await;
             let registry = Arc::new(Mutex::new(SessionRegistry::new(f.config.clone())));
-            let nm = RemoteNodeManager::new(f.config.clone(), registry, Some(mesh.clone()));
+            let nm = RemoteNodeManager::new(
+                f.config.clone(),
+                registry,
+                Some(mesh.clone()),
+                Arc::new(parking_lot::Mutex::new(None)),
+            );
             let actor_ref = RemoteNodeManager::spawn(nm);
             Self {
                 actor_ref,
@@ -394,7 +404,12 @@ pub(crate) mod fixtures {
             let mesh = get_test_mesh().await;
             let f = AgentConfigFixture::new().await;
             let registry = Arc::new(Mutex::new(SessionRegistry::new(f.config.clone())));
-            let nm = RemoteNodeManager::new(f.config.clone(), registry, Some(mesh.clone()));
+            let nm = RemoteNodeManager::new(
+                f.config.clone(),
+                registry,
+                Some(mesh.clone()),
+                Arc::new(parking_lot::Mutex::new(None)),
+            );
             let actor_ref = RemoteNodeManager::spawn(nm);
 
             let dht_name = format!("scope::lan::default::node_manager::{}-{}", label, test_id);

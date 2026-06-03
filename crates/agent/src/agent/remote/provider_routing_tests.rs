@@ -1074,7 +1074,12 @@ mod mesh_setup_config_tests {
         use tokio::sync::Mutex;
 
         let registry = Arc::new(Mutex::new(SessionRegistry::new(f.config.clone())));
-        let nm = RemoteNodeManager::new(f.config.clone(), registry, Some(mesh.clone()));
+        let nm = RemoteNodeManager::new(
+            f.config.clone(),
+            registry,
+            Some(mesh.clone()),
+            Arc::new(parking_lot::Mutex::new(None)),
+        );
         let nm_ref = RemoteNodeManager::spawn(nm);
 
         let dht_name = format!("scope::lan::default::node_manager::i6-{}", test_id);
@@ -1249,9 +1254,13 @@ mod peer_delegate_routing_tests {
 
         let alice_f = AgentConfigFixture::new().await;
         let session_registry = Arc::new(Mutex::new(SessionRegistry::new(alice_f.config.clone())));
-        let alice_nm =
-            RemoteNodeManager::new(alice_f.config.clone(), session_registry, Some(mesh.clone()))
-                .with_node_name("alice".to_string());
+        let alice_nm = RemoteNodeManager::new(
+            alice_f.config.clone(),
+            session_registry,
+            Some(mesh.clone()),
+            Arc::new(parking_lot::Mutex::new(None)),
+        )
+        .with_node_name("alice".to_string());
         let alice_nm_ref = RemoteNodeManager::spawn(alice_nm);
 
         // Use a freshly generated keypair to get a unique PeerId for alice.
@@ -1301,8 +1310,13 @@ mod peer_delegate_routing_tests {
         // ── Set up bob's node ────────────────────────────────────────────────
         let bob_f = AgentConfigFixture::new().await;
         let bob_registry = Arc::new(Mutex::new(SessionRegistry::new(bob_f.config.clone())));
-        let bob_nm = RemoteNodeManager::new(bob_f.config.clone(), bob_registry, Some(mesh.clone()))
-            .with_node_name("bob".to_string());
+        let bob_nm = RemoteNodeManager::new(
+            bob_f.config.clone(),
+            bob_registry,
+            Some(mesh.clone()),
+            Arc::new(parking_lot::Mutex::new(None)),
+        )
+        .with_node_name("bob".to_string());
         let bob_nm_ref = RemoteNodeManager::spawn(bob_nm);
 
         let bob_keypair = libp2p::identity::Keypair::generate_ed25519();

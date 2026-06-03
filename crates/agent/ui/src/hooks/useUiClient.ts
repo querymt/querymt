@@ -217,7 +217,19 @@ export function useUiClient() {
   const [pluginUpdateStatus, setPluginUpdateStatus] = useState<Record<string, PluginUpdateStatus>>({});
   const [pluginUpdateResults, setPluginUpdateResults] = useState<PluginUpdateResult[] | null>(null);
   const [isUpdatingPlugins, setIsUpdatingPlugins] = useState(false);
-  const [schedules, setSchedules] = useState<ScheduleInfo[]>([]);
+  const [schedulesByKey, setSchedulesByKey] = useState<Record<string, ScheduleInfo[]>>({});
+  const [loadedSessionNodeIds, setLoadedSessionNodeIds] = useState<Record<string, string | null>>({});
+  const scheduleKeyForSession = useCallback(
+    (targetSessionId?: string | null, explicitNodeId?: string) => {
+      const resolvedNodeId = explicitNodeId ?? (targetSessionId ? loadedSessionNodeIds[targetSessionId] ?? undefined : undefined);
+      return `${targetSessionId ?? ''}::${resolvedNodeId ?? ''}`;
+    },
+    [loadedSessionNodeIds],
+  );
+  const schedules = useMemo(() => {
+    const activeKey = scheduleKeyForSession(sessionId, undefined);
+    return schedulesByKey[activeKey] ?? [];
+  }, [scheduleKeyForSession, schedulesByKey, sessionId]);
   const [knowledgeEntries, setKnowledgeEntries] = useState<KnowledgeEntryInfo[]>([]);
   const [knowledgeConsolidations, setKnowledgeConsolidations] = useState<ConsolidationInfo[]>([]);
   const [knowledgeStats, setKnowledgeStats] = useState<{
@@ -1006,6 +1018,10 @@ export function useUiClient() {
       }
       case 'session_loaded': {
         const d = msg.data;
+        setLoadedSessionNodeIds(prev => ({
+          ...prev,
+          [d.session_id]: d.node_id ?? null,
+        }));
         if (d.profile_id) {
           setSessionProfiles(prev => ({ ...prev, [d.session_id]: d.profile_id! }));
         }
@@ -1336,7 +1352,11 @@ export function useUiClient() {
       }
       case 'schedule_list': {
         const d = msg.data;
-        setSchedules(d.schedules);
+        const scheduleKey = `${d.session_id ?? ''}::${d.node_id ?? ''}`;
+        setSchedulesByKey(prev => ({
+          ...prev,
+          [scheduleKey]: d.schedules,
+        }));
         break;
       }
       case 'schedule_created_result': {
@@ -1924,20 +1944,24 @@ export function useUiClient() {
 
   // ── Schedule management ──────────────────────────────────────────────────
 
-  const listSchedules = useCallback((sessionId?: string) => {
-    sendMessage({ type: 'list_schedules', data: { session_id: sessionId } });
-  }, []);
+  const listSchedules = useCallback((sessionId?: string, nodeId?: string) => {
+    const resolvedNodeId = nodeId ?? (sessionId ? loadedSessionNodeIds[sessionId] ?? undefined : undefined);
+    sendMessage({ type: 'list_schedules', data: { session_id: sessionId, node_id: resolvedNodeId } });
+  }, [loadedSessionNodeIds]);
 
   const createSchedule = useCallback((
     sessionId: string,
     prompt: string,
     trigger: any,
     opts?: { maxSteps?: number; maxCostUsd?: number; maxRuns?: number },
+    nodeId?: string,
   ) => {
+    const resolvedNodeId = nodeId ?? loadedSessionNodeIds[sessionId] ?? undefined;
     sendMessage({
       type: 'create_schedule',
       data: {
         session_id: sessionId,
+        node_id: resolvedNodeId,
         prompt,
         trigger,
         max_steps: opts?.maxSteps,
@@ -1945,22 +1969,22 @@ export function useUiClient() {
         max_runs: opts?.maxRuns,
       },
     });
+  }, [loadedSessionNodeIds]);
+
+  const pauseSchedule = useCallback((schedulePublicId: string, nodeId?: string, sessionId?: string) => {
+    sendMessage({ type: 'pause_schedule', data: { schedule_public_id: schedulePublicId, node_id: nodeId, session_id: sessionId } });
   }, []);
 
-  const pauseSchedule = useCallback((schedulePublicId: string) => {
-    sendMessage({ type: 'pause_schedule', data: { schedule_public_id: schedulePublicId } });
+  const resumeSchedule = useCallback((schedulePublicId: string, nodeId?: string, sessionId?: string) => {
+    sendMessage({ type: 'resume_schedule', data: { schedule_public_id: schedulePublicId, node_id: nodeId, session_id: sessionId } });
   }, []);
 
-  const resumeSchedule = useCallback((schedulePublicId: string) => {
-    sendMessage({ type: 'resume_schedule', data: { schedule_public_id: schedulePublicId } });
+  const triggerScheduleNow = useCallback((schedulePublicId: string, nodeId?: string, sessionId?: string) => {
+    sendMessage({ type: 'trigger_schedule', data: { schedule_public_id: schedulePublicId, node_id: nodeId, session_id: sessionId } });
   }, []);
 
-  const triggerScheduleNow = useCallback((schedulePublicId: string) => {
-    sendMessage({ type: 'trigger_schedule', data: { schedule_public_id: schedulePublicId } });
-  }, []);
-
-  const deleteSchedule = useCallback((schedulePublicId: string) => {
-    sendMessage({ type: 'delete_schedule', data: { schedule_public_id: schedulePublicId } });
+  const deleteSchedule = useCallback((schedulePublicId: string, nodeId?: string, sessionId?: string) => {
+    sendMessage({ type: 'delete_schedule', data: { schedule_public_id: schedulePublicId, node_id: nodeId, session_id: sessionId } });
   }, []);
 
   const queryKnowledge = useCallback((scope: string, question: string, limit?: number) => {
@@ -2083,6 +2107,7 @@ export function useUiClient() {
     isUpdatingPlugins,
     updatePlugins,
     schedules,
+    loadedSessionNodeIds,
     listSchedules,
     createSchedule,
     pauseSchedule,

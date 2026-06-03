@@ -41,6 +41,7 @@ const mocks = vi.hoisted(() => {
       setAuthMethodPref: vi.fn(),
       clearApiTokenResult: vi.fn(),
       setSessionModel: vi.fn(),
+      setActiveProfile: vi.fn(),
       addCustomModelFromHf: vi.fn(),
       addCustomModelFromFile: vi.fn(),
       deleteCustomModel: vi.fn(),
@@ -56,6 +57,7 @@ const mocks = vi.hoisted(() => {
       dismissSessionActionNotice: vi.fn(),
       updatePlugins: vi.fn(),
       createSchedule: vi.fn(),
+      loadSessionChildren: vi.fn(),
     },
   };
 });
@@ -85,9 +87,13 @@ vi.mock('../context/UiClientContext', () => ({
     remoteNodes: [],
     meshInvites: [],
     lastCreatedMeshInvite: null,
+    sessionChildrenLoading: {},
+    loadedSessionNodeIds: {},
   }),
   useUiClientConfig: () => ({
     allModels: [],
+    modelsRefreshing: false,
+    modelsLoadedOnce: true,
     providerCapabilities: {},
     recentModelsByWorkspace: {},
     authProviders: [],

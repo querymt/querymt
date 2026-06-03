@@ -37,7 +37,7 @@ impl LocalAgentHandle {
             model_inventory,
             oauth_service,
             profiles: ArcSwap::from_pointee(None),
-            scheduler_handle: StdMutex::new(None),
+            scheduler_handle: Arc::new(parking_lot::Mutex::new(None)),
             shutdown_done: AtomicBool::new(false),
         }
     }
@@ -191,9 +191,7 @@ impl LocalAgentHandle {
 
         match handle {
             Some(h) => {
-                if let Ok(mut guard) = self.scheduler_handle.lock() {
-                    *guard = Some(h);
-                }
+                *self.scheduler_handle.lock() = Some(h);
                 log::info!("LocalAgentHandle: scheduler started");
                 true
             }
@@ -206,16 +204,11 @@ impl LocalAgentHandle {
 
     /// Get a reference to the scheduler handle, if the scheduler is running.
     pub fn scheduler(&self) -> Option<crate::scheduler::SchedulerHandle> {
-        self.scheduler_handle
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
+        self.scheduler_handle.lock().clone()
     }
 
     pub(super) fn clear_scheduler_handle(&self) {
-        if let Ok(mut guard) = self.scheduler_handle.lock() {
-            *guard = None;
-        }
+        *self.scheduler_handle.lock() = None;
     }
 
     pub(super) fn scheduler_unavailable_error() -> agent_client_protocol::Error {

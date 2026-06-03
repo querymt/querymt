@@ -85,12 +85,12 @@ export interface UiClientActionsContextValue {
   dismissConnectionError: (errorId: number) => void;
   dismissSessionActionNotice: (noticeId: number) => void;
   updatePlugins: () => void;
-  listSchedules: (sessionId?: string) => void;
-  createSchedule: (sessionId: string, prompt: string, trigger: any, opts?: { maxSteps?: number; maxCostUsd?: number; maxRuns?: number }) => void;
-  pauseSchedule: (schedulePublicId: string) => void;
-  resumeSchedule: (schedulePublicId: string) => void;
-  triggerScheduleNow: (schedulePublicId: string) => void;
-  deleteSchedule: (schedulePublicId: string) => void;
+  listSchedules: (sessionId?: string, nodeId?: string) => void;
+  createSchedule: (sessionId: string, prompt: string, trigger: any, opts?: { maxSteps?: number; maxCostUsd?: number; maxRuns?: number }, nodeId?: string) => void;
+  pauseSchedule: (schedulePublicId: string, nodeId?: string, sessionId?: string) => void;
+  resumeSchedule: (schedulePublicId: string, nodeId?: string, sessionId?: string) => void;
+  triggerScheduleNow: (schedulePublicId: string, nodeId?: string, sessionId?: string) => void;
+  deleteSchedule: (schedulePublicId: string, nodeId?: string, sessionId?: string) => void;
   queryKnowledge: (scope: string, question: string, limit?: number) => void;
   listKnowledge: (scope: string, filter?: Record<string, unknown>) => void;
   getKnowledgeStats: (scope: string) => void;
@@ -158,6 +158,7 @@ export interface UiClientSessionContextValue {
   sessionsEverLoaded: boolean;
   lastLoadErrorSessionId: string | null;
   schedules: ScheduleInfo[];
+  loadedSessionNodeIds: Record<string, string | null>;
   knowledgeEntries: KnowledgeEntryInfo[];
   knowledgeConsolidations: ConsolidationInfo[];
   knowledgeStats: {
@@ -336,6 +337,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     lastCreatedMeshInvite: uiClient.lastCreatedMeshInvite,
     lastLoadErrorSessionId: uiClient.lastLoadErrorSessionId,
     schedules: uiClient.schedules,
+    loadedSessionNodeIds: uiClient.loadedSessionNodeIds,
     knowledgeEntries: uiClient.knowledgeEntries,
     knowledgeConsolidations: uiClient.knowledgeConsolidations,
     knowledgeStats: uiClient.knowledgeStats,
@@ -374,6 +376,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     uiClient.lastCreatedMeshInvite,
     uiClient.lastLoadErrorSessionId,
     uiClient.schedules,
+    uiClient.loadedSessionNodeIds,
     uiClient.knowledgeEntries,
     uiClient.knowledgeConsolidations,
     uiClient.knowledgeStats,

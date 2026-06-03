@@ -87,10 +87,10 @@ interface SchedulePanelProps {
   schedules: ScheduleInfo[];
   collapsed: boolean;
   onToggleCollapse: () => void;
-  onPause: (id: string) => void;
-  onResume: (id: string) => void;
-  onTriggerNow: (id: string) => void;
-  onDelete: (id: string) => void;
+  onPause: (id: string, nodeId?: string, sessionId?: string) => void;
+  onResume: (id: string, nodeId?: string, sessionId?: string) => void;
+  onTriggerNow: (id: string, nodeId?: string, sessionId?: string) => void;
+  onDelete: (id: string, nodeId?: string, sessionId?: string) => void;
   onCreateNew: () => void;
 }
 
@@ -215,10 +215,10 @@ export function SchedulePanel({
 
 interface ScheduleRowProps {
   schedule: ScheduleInfo;
-  onPause: (id: string) => void;
-  onResume: (id: string) => void;
-  onTriggerNow: (id: string) => void;
-  onDelete: (id: string) => void;
+  onPause: (id: string, nodeId?: string, sessionId?: string) => void;
+  onResume: (id: string, nodeId?: string, sessionId?: string) => void;
+  onTriggerNow: (id: string, nodeId?: string, sessionId?: string) => void;
+  onDelete: (id: string, nodeId?: string, sessionId?: string) => void;
 }
 
 const ScheduleRow = memo(function ScheduleRow({
@@ -235,13 +235,13 @@ const ScheduleRow = memo(function ScheduleRow({
 
   const handleDelete = useCallback(() => {
     if (confirmDelete) {
-      onDelete(schedule.public_id);
+      onDelete(schedule.public_id, schedule.node_id, schedule.session_public_id);
       setConfirmDelete(false);
     } else {
       setConfirmDelete(true);
       setTimeout(() => setConfirmDelete(false), 3000);
     }
-  }, [confirmDelete, onDelete, schedule.public_id]);
+  }, [confirmDelete, onDelete, schedule.node_id, schedule.public_id, schedule.session_public_id]);
 
   return (
     <div className="relative pl-3 pr-2 py-2 rounded-md bg-surface-elevated/30 border border-transparent hover:bg-surface-elevated/50 transition-all duration-200 group">
@@ -275,14 +275,14 @@ const ScheduleRow = memo(function ScheduleRow({
 
       {/* Session ID (truncated) */}
       <div className="text-[10px] text-ui-muted font-mono truncate mb-1.5">
-        {schedule.session_public_id.substring(0, 16)}...
+        {schedule.node_id ? `${schedule.node_id.substring(0, 8)} / ` : ''}{schedule.session_public_id.substring(0, 16)}...
       </div>
 
       {/* Actions — visible on hover */}
       <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
         {isPaused ? (
           <button
-            onClick={() => onResume(schedule.public_id)}
+            onClick={() => onResume(schedule.public_id, schedule.node_id, schedule.session_public_id)}
             className="p-1 rounded hover:bg-status-success/20 text-status-success transition-colors"
             title="Resume"
           >
@@ -290,7 +290,7 @@ const ScheduleRow = memo(function ScheduleRow({
           </button>
         ) : isActive ? (
           <button
-            onClick={() => onPause(schedule.public_id)}
+            onClick={() => onPause(schedule.public_id, schedule.node_id, schedule.session_public_id)}
             className="p-1 rounded hover:bg-ui-muted/20 text-ui-muted transition-colors"
             title="Pause"
           >
@@ -299,7 +299,7 @@ const ScheduleRow = memo(function ScheduleRow({
         ) : null}
 
         <button
-          onClick={() => onTriggerNow(schedule.public_id)}
+          onClick={() => onTriggerNow(schedule.public_id, schedule.node_id, schedule.session_public_id)}
           className="p-1 rounded hover:bg-accent-primary/20 text-accent-primary transition-colors"
           title="Trigger now"
         >

@@ -142,6 +142,7 @@ async fn test_list_remote_nodes_prefers_per_peer_lookup() {
         remote_cfg.handle.config.clone(),
         remote_cfg.handle.registry.clone(),
         Some(mesh.clone()),
+        remote_cfg.handle.scheduler_handle.clone(),
     )
     .with_node_name("peer-alpha".to_string());
     let node_manager_ref = RemoteNodeManager::spawn(node_manager);

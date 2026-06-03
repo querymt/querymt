@@ -96,6 +96,7 @@ export function ChatView() {
     llmConfigCache,
     undoState,
     schedules,
+    loadedSessionNodeIds,
   } = useUiClientSession();
 
   // UI state from Zustand store
@@ -145,12 +146,21 @@ export function ChatView() {
   // Only pass onSpeakTurn if TTS is available
   const onSpeakTurn = audioCapabilities.tts_models.length > 0 ? handleSpeakTurn : undefined;
 
-  // Fetch schedules when session changes
+  const currentSession = useMemo(
+    () => sessionGroups.flatMap((group) => group.sessions).find((session) => session.session_id === sessionId),
+    [sessionGroups, sessionId],
+  );
+  const currentSessionNodeId = currentSession?.node_id ?? (sessionId ? loadedSessionNodeIds[sessionId] ?? undefined : undefined);
+  const currentSessionIsRemote = Boolean(currentSession?.node || currentSession?.attached !== undefined || currentSession?.runtime_state);
+  const remoteNodeIdPending = currentSessionIsRemote && sessionId && currentSession?.node_id === undefined && !(sessionId in loadedSessionNodeIds);
+
+  // Fetch schedules when session changes, but wait for remote node resolution first.
   useEffect(() => {
-    if (sessionId) {
-      listSchedules(sessionId);
+    if (!sessionId || remoteNodeIdPending) {
+      return;
     }
-  }, [sessionId, listSchedules]);
+    listSchedules(sessionId, currentSessionNodeId);
+  }, [sessionId, currentSessionNodeId, remoteNodeIdPending, listSchedules]);
 
   // Whether to show the schedule panel (has schedules or panel was explicitly opened)
   const showSchedulePanel = schedules.length > 0;

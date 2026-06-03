@@ -734,6 +734,17 @@ pub async fn handle_load_session(
     // 5. Send loaded audit view and persisted undo stack for UI hydration
     let undo_stack = load_undo_stack(state, session_id).await;
     let cursor = snapshot.cursor.clone();
+    #[cfg(feature = "remote")]
+    let loaded_session_node_id = {
+        let registry = state.agent.registry.lock().await;
+        registry
+            .remote_sessions()
+            .into_iter()
+            .find_map(|(remote_session_id, _, remote_node_id)| {
+                (remote_session_id == session_id).then_some(remote_node_id)
+            })
+            .flatten()
+    };
 
     let _ = send_message(
         tx,
@@ -741,6 +752,10 @@ pub async fn handle_load_session(
             session_id: session_id.to_string(),
             agent_id,
             profile_id,
+            #[cfg(feature = "remote")]
+            node_id: loaded_session_node_id,
+            #[cfg(not(feature = "remote"))]
+            node_id: None,
             audit: snapshot.audit,
             undo_stack,
             cursor: cursor.clone(),

@@ -1,15 +1,28 @@
 use super::*;
 
 impl LocalAgentHandle {
+    #[cfg(feature = "remote")]
+    fn map_remote_node_manager_error(
+        error: kameo::error::RemoteSendError<crate::error::AgentError>,
+    ) -> agent_client_protocol::Error {
+        use crate::error::AgentError;
+
+        match error {
+            kameo::error::RemoteSendError::HandlerError(err) => {
+                agent_client_protocol::Error::from(err)
+            }
+            other => agent_client_protocol::Error::from(AgentError::RemoteActor(other.to_string())),
+        }
+    }
+
     /// Find a `RemoteNodeManager` by its stable node id (PeerId string).
     ///
     /// ## Fast path
     ///
-    /// Tries a direct DHT lookup under the scoped per-peer node-manager name first.
-    /// This succeeds whenever the remote node registered under the same scope
-    /// (see [`crate::agent::remote::scope::scoped_node_manager_for_peer`]) and is **not** gated on
-    /// `is_peer_alive`, so it works even when mDNS has transiently expired the
-    /// peer (TTL = 30 s) while the TCP connection is still alive.
+    /// If `node_id` parses as a `PeerId`, uses the mesh route table to pick the
+    /// best-known scope for that peer first (LAN beats iroh when both exist),
+    /// then performs a direct per-peer DHT lookup under that scope. This keeps
+    /// routine targeted actions on the same path as current reachability.
     ///
     /// ## Fallback scan
     ///
@@ -47,11 +60,27 @@ impl LocalAgentHandle {
         // is_peer_alive gate that guards the fallback scan, so it works even
         // when mDNS has temporarily expired the peer's heartbeat.
         let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+        let parsed_peer_id = node_id.parse::<libp2p::PeerId>().ok();
+        let mut direct_scopes = Vec::new();
+        if let Some(peer_id) = parsed_peer_id
+            && let Some(best_route) = mesh.best_route_for_peer(&peer_id)
+        {
+            direct_scopes.push(best_route.scope);
+        }
+        if direct_scopes.is_empty() {
+            direct_scopes.push(crate::agent::remote::scope::MeshScopeId::lan_default());
+        }
         for scope in runtime.active_scopes() {
+            if !direct_scopes.contains(&scope) {
+                direct_scopes.push(scope);
+            }
+        }
+
+        for scope in &direct_scopes {
             let direct_dht_name =
-                crate::agent::remote::scope::scoped_node_manager_for_peer(&scope, &node_id);
+                crate::agent::remote::scope::scoped_node_manager_for_peer(scope, &node_id);
             match runtime
-                .lookup_actor::<RemoteNodeManager>(direct_dht_name.clone())
+                .lookup_actor_no_retry::<RemoteNodeManager>(direct_dht_name.clone())
                 .await
             {
                 Ok(Some(node_manager_ref)) => {
@@ -181,11 +210,10 @@ impl LocalAgentHandle {
         agent_client_protocol::Error,
     > {
         use crate::agent::remote::ListRemoteSessions;
-        use crate::error::AgentError;
         node_manager_ref
             .ask(&ListRemoteSessions { offset, limit })
             .await
-            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+            .map_err(Self::map_remote_node_manager_error)
     }
 
     /// Create a session on a remote node and return the owning node's live session ref.
@@ -200,12 +228,11 @@ impl LocalAgentHandle {
     ) -> Result<crate::agent::remote::CreateRemoteSessionResponse, agent_client_protocol::Error>
     {
         use crate::agent::remote::CreateRemoteSession;
-        use crate::error::AgentError;
 
         node_manager_ref
             .ask(&CreateRemoteSession { cwd })
             .await
-            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+            .map_err(Self::map_remote_node_manager_error)
     }
 
     /// Fork a session on a remote node and return the forked child's live session ref.
@@ -217,7 +244,6 @@ impl LocalAgentHandle {
         message_id: String,
     ) -> Result<crate::agent::remote::ForkRemoteSessionResponse, agent_client_protocol::Error> {
         use crate::agent::remote::ForkRemoteSession;
-        use crate::error::AgentError;
 
         node_manager_ref
             .ask(&ForkRemoteSession {
@@ -225,7 +251,7 @@ impl LocalAgentHandle {
                 message_id,
             })
             .await
-            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+            .map_err(Self::map_remote_node_manager_error)
     }
 
     /// Attach an existing remote session (already has a `RemoteActorRef`) to
@@ -265,11 +291,94 @@ impl LocalAgentHandle {
     ) -> Result<crate::agent::remote::CreateRemoteSessionResponse, agent_client_protocol::Error>
     {
         use crate::agent::remote::ResumeRemoteSession;
-        use crate::error::AgentError;
 
         node_manager_ref
             .ask(&ResumeRemoteSession { session_id })
             .await
-            .map_err(|e| agent_client_protocol::Error::from(AgentError::RemoteActor(e.to_string())))
+            .map_err(Self::map_remote_node_manager_error)
+    }
+
+    #[cfg(feature = "remote")]
+    pub async fn create_remote_schedule(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        request: crate::agent::remote::CreateRemoteSchedule,
+    ) -> Result<crate::agent::remote::CreateRemoteScheduleResponse, agent_client_protocol::Error>
+    {
+        node_manager_ref
+            .ask(&request)
+            .await
+            .map_err(Self::map_remote_node_manager_error)
+    }
+
+    #[cfg(feature = "remote")]
+    pub async fn list_remote_schedules(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        session_id: Option<String>,
+    ) -> Result<crate::agent::remote::ListRemoteSchedulesResponse, agent_client_protocol::Error>
+    {
+        use crate::agent::remote::ListRemoteSchedules;
+
+        node_manager_ref
+            .ask(&ListRemoteSchedules { session_id })
+            .await
+            .map_err(Self::map_remote_node_manager_error)
+    }
+
+    #[cfg(feature = "remote")]
+    pub async fn pause_remote_schedule(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        schedule_public_id: String,
+    ) -> Result<(), agent_client_protocol::Error> {
+        use crate::agent::remote::PauseRemoteSchedule;
+
+        node_manager_ref
+            .ask(&PauseRemoteSchedule { schedule_public_id })
+            .await
+            .map_err(Self::map_remote_node_manager_error)
+    }
+
+    #[cfg(feature = "remote")]
+    pub async fn resume_remote_schedule(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        schedule_public_id: String,
+    ) -> Result<(), agent_client_protocol::Error> {
+        use crate::agent::remote::ResumeRemoteSchedule;
+
+        node_manager_ref
+            .ask(&ResumeRemoteSchedule { schedule_public_id })
+            .await
+            .map_err(Self::map_remote_node_manager_error)
+    }
+
+    #[cfg(feature = "remote")]
+    pub async fn trigger_remote_schedule(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        schedule_public_id: String,
+    ) -> Result<(), agent_client_protocol::Error> {
+        use crate::agent::remote::TriggerRemoteSchedule;
+
+        node_manager_ref
+            .ask(&TriggerRemoteSchedule { schedule_public_id })
+            .await
+            .map_err(Self::map_remote_node_manager_error)
+    }
+
+    #[cfg(feature = "remote")]
+    pub async fn delete_remote_schedule(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        schedule_public_id: String,
+    ) -> Result<(), agent_client_protocol::Error> {
+        use crate::agent::remote::DeleteRemoteSchedule;
+
+        node_manager_ref
+            .ask(&DeleteRemoteSchedule { schedule_public_id })
+            .await
+            .map_err(Self::map_remote_node_manager_error)
     }
 }

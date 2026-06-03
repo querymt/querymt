@@ -437,6 +437,7 @@ pub async fn handle_ui_message(
         }
         UiClientMessage::CreateSchedule {
             session_id,
+            node_id,
             prompt,
             trigger,
             max_steps,
@@ -445,6 +446,7 @@ pub async fn handle_ui_message(
         } => {
             let params = schedules::CreateScheduleParams {
                 session_id: &session_id,
+                node_id: node_id.as_deref(),
                 prompt: &prompt,
                 trigger_json: &trigger,
                 max_steps,
@@ -453,20 +455,67 @@ pub async fn handle_ui_message(
             };
             handle_create_schedule(state, &params, tx).await;
         }
-        UiClientMessage::ListSchedules { session_id } => {
-            handle_list_schedules(state, session_id.as_deref(), tx).await;
+        UiClientMessage::ListSchedules {
+            session_id,
+            node_id,
+        } => {
+            handle_list_schedules(state, session_id.as_deref(), node_id.as_deref(), tx).await;
         }
-        UiClientMessage::PauseSchedule { schedule_public_id } => {
-            handle_pause_schedule(state, &schedule_public_id, tx).await;
+        UiClientMessage::PauseSchedule {
+            schedule_public_id,
+            session_id,
+            node_id,
+        } => {
+            handle_pause_schedule(
+                state,
+                &schedule_public_id,
+                session_id.as_deref(),
+                node_id.as_deref(),
+                tx,
+            )
+            .await;
         }
-        UiClientMessage::ResumeSchedule { schedule_public_id } => {
-            handle_resume_schedule(state, &schedule_public_id, tx).await;
+        UiClientMessage::ResumeSchedule {
+            schedule_public_id,
+            session_id,
+            node_id,
+        } => {
+            handle_resume_schedule(
+                state,
+                &schedule_public_id,
+                session_id.as_deref(),
+                node_id.as_deref(),
+                tx,
+            )
+            .await;
         }
-        UiClientMessage::TriggerSchedule { schedule_public_id } => {
-            handle_trigger_schedule(state, &schedule_public_id, tx).await;
+        UiClientMessage::TriggerSchedule {
+            schedule_public_id,
+            session_id,
+            node_id,
+        } => {
+            handle_trigger_schedule(
+                state,
+                &schedule_public_id,
+                session_id.as_deref(),
+                node_id.as_deref(),
+                tx,
+            )
+            .await;
         }
-        UiClientMessage::DeleteSchedule { schedule_public_id } => {
-            handle_delete_schedule(state, &schedule_public_id, tx).await;
+        UiClientMessage::DeleteSchedule {
+            schedule_public_id,
+            session_id,
+            node_id,
+        } => {
+            handle_delete_schedule(
+                state,
+                &schedule_public_id,
+                session_id.as_deref(),
+                node_id.as_deref(),
+                tx,
+            )
+            .await;
         }
         UiClientMessage::QueryKnowledge {
             scope,

@@ -343,6 +343,7 @@ pub(crate) async fn finalize_remote_session_attach(
             session_id: session_id.to_string(),
             agent_id,
             profile_id: None,
+            node_id: Some(node_id.to_string()),
             audit,
             undo_stack: Vec::new(),
             cursor,

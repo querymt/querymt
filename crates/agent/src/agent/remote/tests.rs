@@ -44,12 +44,15 @@ async fn test_agent_config() -> (Arc<AgentConfig>, TempDir) {
     );
     let llm = LLMParams::new().provider("mock").model("mock");
 
-    let builder = AgentConfigBuilder::new(
+    let mut builder = AgentConfigBuilder::new(
         plugin_registry,
         storage.session_store(),
         storage.event_journal(),
         llm,
     );
+    if let Some(repo) = storage.schedule_repository() {
+        builder = builder.with_schedule_repository(repo);
+    }
     let config = Arc::new(builder.build());
     (config, temp_dir)
 }
@@ -505,9 +508,10 @@ mod node_manager_tests {
     use super::*;
     use crate::agent::messages::GetMode;
     use crate::agent::remote::node_manager::{
-        AdmissionRequest, AdmissionResponse, CreateRemoteSession, ForkRemoteSession, GetNodeInfo,
-        ListRemoteSessions, RemoteNodeManager, ResumeRemoteSession, SessionHandoff,
-        StopRemoteSessionRuntime,
+        AdmissionRequest, AdmissionResponse, CreateRemoteSchedule, CreateRemoteSession,
+        DeleteRemoteSchedule, ForkRemoteSession, GetNodeInfo, ListRemoteSchedules,
+        ListRemoteSessions, PauseRemoteSchedule, RemoteNodeManager, ResumeRemoteSchedule,
+        ResumeRemoteSession, SessionHandoff, StopRemoteSessionRuntime,
     };
     use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
     use crate::model::{AgentMessage, MessagePart};
@@ -523,7 +527,12 @@ mod node_manager_tests {
     -> (ActorRef<RemoteNodeManager>, Arc<AgentConfig>, TempDir) {
         let (config, td) = test_agent_config().await;
         let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
-        let nm = RemoteNodeManager::new(config.clone(), registry, None);
+        let nm = RemoteNodeManager::new(
+            config.clone(),
+            registry,
+            None,
+            Arc::new(parking_lot::Mutex::new(None)),
+        );
         let actor_ref = RemoteNodeManager::spawn(nm);
         (actor_ref, config, td)
     }
@@ -534,7 +543,12 @@ mod node_manager_tests {
         let mesh = get_test_mesh().await;
         let (config, td) = test_agent_config().await;
         let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
-        let nm = RemoteNodeManager::new(config.clone(), registry, Some(mesh.clone()));
+        let nm = RemoteNodeManager::new(
+            config.clone(),
+            registry,
+            Some(mesh.clone()),
+            Arc::new(parking_lot::Mutex::new(None)),
+        );
         let actor_ref = RemoteNodeManager::spawn(nm);
         (actor_ref, config, td)
     }
@@ -544,8 +558,12 @@ mod node_manager_tests {
         let mesh = get_test_mesh().await;
         let (config, _td) = test_agent_config().await;
         let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
-        let nm_ref =
-            RemoteNodeManager::spawn(RemoteNodeManager::new(config, registry, Some(mesh.clone())));
+        let nm_ref = RemoteNodeManager::spawn(RemoteNodeManager::new(
+            config,
+            registry,
+            Some(mesh.clone()),
+            Arc::new(parking_lot::Mutex::new(None)),
+        ));
 
         let invite = mesh
             .create_invite(Some("named-mesh".to_string()), None, Some(1), false)
@@ -714,6 +732,120 @@ mod node_manager_tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, resp.session_id);
         assert!(!sessions[0].peer_label.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_remote_schedule_create_rejects_missing_persisted_session() {
+        let (nm_ref, config, _td) = spawn_test_node_manager_with_mesh().await;
+
+        let session = nm_ref
+            .ask(CreateRemoteSession { cwd: None })
+            .await
+            .expect("create session");
+
+        config
+            .provider
+            .history_store()
+            .delete_session(&session.session_id)
+            .await
+            .expect("delete persisted session row");
+
+        let result = nm_ref
+            .ask(CreateRemoteSchedule {
+                session_id: session.session_id.clone(),
+                prompt: "run every minute".to_string(),
+                trigger: crate::session::domain_schedule::ScheduleTrigger::Interval { seconds: 60 },
+                max_steps: Some(5),
+                max_cost_usd: Some(1.5),
+                max_runs: Some(3),
+            })
+            .await;
+
+        match result {
+            Err(SendError::HandlerError(err)) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains(&session.session_id),
+                    "missing-session error should include session id: {message}"
+                );
+            }
+            Ok(_) => panic!("expected missing persisted session to reject schedule creation"),
+            Err(e) => panic!("unexpected error variant: {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_schedule_lifecycle() {
+        let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
+
+        let session = nm_ref
+            .ask(CreateRemoteSession { cwd: None })
+            .await
+            .expect("create session");
+
+        let created = nm_ref
+            .ask(CreateRemoteSchedule {
+                session_id: session.session_id.clone(),
+                prompt: "run every minute".to_string(),
+                trigger: crate::session::domain_schedule::ScheduleTrigger::Interval { seconds: 60 },
+                max_steps: Some(5),
+                max_cost_usd: Some(1.5),
+                max_runs: Some(3),
+            })
+            .await
+            .expect("create schedule");
+
+        let list = nm_ref
+            .ask(ListRemoteSchedules {
+                session_id: Some(session.session_id.clone()),
+            })
+            .await
+            .expect("list schedules");
+        assert_eq!(list.schedules.len(), 1);
+        assert_eq!(list.schedules[0].public_id, created.schedule_public_id);
+        assert_eq!(list.schedules[0].config.max_runs, Some(3));
+        assert_eq!(
+            list.schedules[0]
+                .config
+                .execution_limits
+                .as_ref()
+                .and_then(|limits| limits.max_steps),
+            Some(5)
+        );
+
+        nm_ref
+            .ask(PauseRemoteSchedule {
+                schedule_public_id: created.schedule_public_id.clone(),
+            })
+            .await
+            .expect("pause schedule");
+        let paused = nm_ref
+            .ask(ListRemoteSchedules {
+                session_id: Some(session.session_id.clone()),
+            })
+            .await
+            .expect("list paused schedules");
+        assert_eq!(paused.schedules[0].state.to_string(), "paused");
+
+        nm_ref
+            .ask(ResumeRemoteSchedule {
+                schedule_public_id: created.schedule_public_id.clone(),
+            })
+            .await
+            .expect("resume schedule");
+        nm_ref
+            .ask(DeleteRemoteSchedule {
+                schedule_public_id: created.schedule_public_id.clone(),
+            })
+            .await
+            .expect("delete schedule");
+        let after_delete = nm_ref
+            .ask(ListRemoteSchedules {
+                session_id: Some(session.session_id),
+            })
+            .await
+            .expect("list after delete");
+        assert!(after_delete.schedules.is_empty());
     }
 
     #[tokio::test]

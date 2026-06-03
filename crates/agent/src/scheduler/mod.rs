@@ -151,7 +151,8 @@ impl SchedulerHandle {
     /// Add a schedule.
     pub async fn add_schedule(&self, schedule: Schedule) -> SessionResult<()> {
         self.actor_ref
-            .tell(AddSchedule { schedule })
+            .ask(AddSchedule { schedule })
+            .send()
             .await
             .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
         Ok(())
@@ -160,12 +161,12 @@ impl SchedulerHandle {
     /// Remove a schedule.
     pub async fn remove_schedule(&self, schedule_public_id: &str) -> SessionResult<()> {
         self.actor_ref
-            .tell(RemoveSchedule {
+            .ask(RemoveSchedule {
                 schedule_public_id: schedule_public_id.to_string(),
             })
+            .send()
             .await
-            .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
-        Ok(())
+            .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))
     }
 
     /// Pause a schedule.
@@ -377,28 +378,28 @@ impl Message<TriggerNow> for SchedulerActor {
 // ── AddSchedule (control) ────────────────────────────────────────────────
 
 impl Message<AddSchedule> for SchedulerActor {
-    type Reply = ();
+    type Reply = Result<(), crate::session::error::SessionError>;
 
     async fn handle(
         &mut self,
         msg: AddSchedule,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.handle_add_schedule(msg.schedule).await;
+        self.handle_add_schedule(msg.schedule).await
     }
 }
 
 // ── RemoveSchedule (control) ─────────────────────────────────────────────
 
 impl Message<RemoveSchedule> for SchedulerActor {
-    type Reply = ();
+    type Reply = Result<(), crate::session::error::SessionError>;
 
     async fn handle(
         &mut self,
         msg: RemoveSchedule,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.handle_remove_schedule(&msg.schedule_public_id).await;
+        self.handle_remove_schedule(&msg.schedule_public_id).await
     }
 }
 
@@ -1365,36 +1366,32 @@ impl SchedulerActor {
     // ── Schedule management ──────────────────────────────────────────────
 
     /// Add a new schedule.
-    pub async fn handle_add_schedule(&mut self, schedule: Schedule) {
+    pub async fn handle_add_schedule(&mut self, schedule: Schedule) -> SessionResult<()> {
         let public_id = schedule.public_id.clone();
         let session_public_id = schedule.session_public_id.clone();
         let task_public_id = schedule.task_public_id.clone();
 
-        match self.schedule_store.create_schedule(schedule).await {
-            Ok(created) => {
-                self.enqueue_schedule(&created);
-                info!(
-                    "SchedulerActor: added schedule {} for task {}",
-                    public_id, task_public_id
-                );
+        let created = self.schedule_store.create_schedule(schedule).await?;
+        self.enqueue_schedule(&created);
+        info!(
+            "SchedulerActor: added schedule {} for task {}",
+            public_id, task_public_id
+        );
 
-                self.config.emit_event(
-                    &session_public_id,
-                    AgentEventKind::ScheduleCreated {
-                        schedule_public_id: created.public_id.clone(),
-                        session_public_id: session_public_id.clone(),
-                        task_public_id,
-                    },
-                );
-            }
-            Err(e) => {
-                warn!("SchedulerActor: failed to create schedule: {}", e);
-            }
-        }
+        self.config.emit_event(
+            &session_public_id,
+            AgentEventKind::ScheduleCreated {
+                schedule_public_id: created.public_id.clone(),
+                session_public_id: session_public_id.clone(),
+                task_public_id,
+            },
+        );
+
+        Ok(())
     }
 
     /// Remove a schedule. If running, defers deletion until after the terminal event.
-    pub async fn handle_remove_schedule(&mut self, schedule_public_id: &str) {
+    pub async fn handle_remove_schedule(&mut self, schedule_public_id: &str) -> SessionResult<()> {
         // Check if currently running
         if self.active_cycles.contains_key(schedule_public_id) {
             info!(
@@ -1403,7 +1400,7 @@ impl SchedulerActor {
             );
             self.pending_deletes.insert(schedule_public_id.to_string());
             self.metrics.pending_deletes = self.pending_deletes.len() as u64;
-            return;
+            return Ok(());
         }
 
         // Remove from in-memory queues
@@ -1413,19 +1410,11 @@ impl SchedulerActor {
         self.metrics.armed_event_schedules = self.event_counters.len() as u64;
         self.reschedule_wake();
 
-        // Delete from store
-        if let Err(e) = self
-            .schedule_store
+        self.schedule_store
             .delete_schedule(schedule_public_id)
-            .await
-        {
-            warn!(
-                "SchedulerActor: failed to delete schedule {}: {}",
-                schedule_public_id, e
-            );
-        } else {
-            info!("SchedulerActor: removed schedule {}", schedule_public_id);
-        }
+            .await?;
+        info!("SchedulerActor: removed schedule {}", schedule_public_id);
+        Ok(())
     }
 
     /// Pause a schedule.
