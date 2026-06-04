@@ -30,9 +30,13 @@ impl AgentProviderCatalogBackend {
 
 impl ProviderCatalogBackend for AgentProviderCatalogBackend {
     fn snapshot(&self) -> ProviderCatalogSnapshot {
-        let providers = self
-            .model_inventory
-            .local_snapshot_entries_blocking()
+        let local_entries = self.model_inventory.local_snapshot_entries_blocking();
+        if local_entries.is_empty() {
+            log::debug!(
+                "provider catalog snapshot has 0 local models; local inventory may still be refreshing"
+            );
+        }
+        let providers = local_entries
             .into_iter()
             .map(|entry| ProviderCatalogEntry {
                 provider: entry.provider,

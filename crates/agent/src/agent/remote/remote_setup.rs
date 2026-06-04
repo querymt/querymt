@@ -88,6 +88,7 @@ pub async fn spawn_and_register_local_mesh_actors_with_name(
     mesh: &crate::agent::remote::MeshHandle,
     node_name: Option<String>,
 ) -> LocalMeshActorRefs {
+    let _ = handle.model_inventory.ensure_local_refresh().await;
     use crate::agent::remote::RemoteNodeManager;
     use kameo::actor::Spawn;
 

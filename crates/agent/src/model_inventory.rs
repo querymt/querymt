@@ -307,6 +307,13 @@ impl ModelInventory {
         });
     }
 
+    fn spawn_local_refresh_task(&self) {
+        let inventory = self.clone();
+        tokio::spawn(async move {
+            inventory.run_local_refresh().await;
+        });
+    }
+
     /// Trigger a background refresh. Returns immediately.
     /// Uses debouncing to avoid triggering too frequently.
     #[tracing::instrument(
@@ -358,6 +365,56 @@ impl ModelInventory {
 
         drop(state); // release lock before spawn
         self.spawn_refresh_task();
+
+        let handle = RefreshHandle::pending(refresh_done_rx, RefreshTriggerDisposition::Started);
+        tracing::Span::current()
+            .record("disposition", handle.disposition().as_str())
+            .record("wait_for_completion", handle.waits_for_completion());
+        handle
+    }
+
+    /// Ensure the local snapshot is refreshed without also querying remote nodes.
+    #[tracing::instrument(
+        name = "model_inventory.ensure_local_refresh",
+        skip(self),
+        fields(disposition = tracing::field::Empty, wait_for_completion = tracing::field::Empty)
+    )]
+    pub async fn ensure_local_refresh(&self) -> RefreshHandle {
+        let mut state = self.inner.refresh_state.lock().await;
+
+        if state.local_refreshing || state.remote_refreshing {
+            let handle = RefreshHandle::pending(
+                state.refresh_done_tx.subscribe(),
+                RefreshTriggerDisposition::AlreadyInProgress,
+            );
+            tracing::Span::current()
+                .record("disposition", handle.disposition().as_str())
+                .record("wait_for_completion", handle.waits_for_completion());
+            return handle;
+        }
+
+        let now = Instant::now();
+        if let Some(last) = state.last_triggered_at
+            && now.duration_since(last) < self.inner.inv_config.refresh_debounce
+            && state.local_updated_at.is_some()
+        {
+            let handle = RefreshHandle::completed(RefreshTriggerDisposition::Debounced);
+            tracing::Span::current()
+                .record("disposition", handle.disposition().as_str())
+                .record("wait_for_completion", handle.waits_for_completion());
+            return handle;
+        }
+
+        state.last_triggered_at = Some(now);
+        state.local_refreshing = true;
+        state.remote_refreshing = false;
+        state.refresh_requested_after_current = false;
+
+        let (refresh_done_tx, refresh_done_rx) = watch::channel(false);
+        state.refresh_done_tx = refresh_done_tx;
+
+        drop(state);
+        self.spawn_local_refresh_task();
 
         let handle = RefreshHandle::pending(refresh_done_rx, RefreshTriggerDisposition::Started);
         tracing::Span::current()
@@ -541,6 +598,41 @@ impl ModelInventory {
     async fn refresh_local(&self) -> Result<Vec<ModelEntry>, ()> {
         let models = enumerate_local_models(&self.inner.config).await;
         Ok(models)
+    }
+
+    #[tracing::instrument(
+        name = "model_inventory.run_local_refresh",
+        skip(self),
+        fields(local_model_count = tracing::field::Empty)
+    )]
+    async fn run_local_refresh(&self) {
+        if let Ok(local_models) = self.refresh_local().await {
+            tracing::Span::current().record("local_model_count", local_models.len());
+            self.inner.local_snapshot.store(Arc::new(local_models));
+
+            let mut state = self.inner.refresh_state.lock().await;
+            state.local_updated_at = Some(Instant::now());
+            state.local_refreshing = false;
+            let rerun = state.refresh_requested_after_current;
+            state.refresh_requested_after_current = false;
+            let _ = state.refresh_done_tx.send(true);
+            let next_version = self
+                .inner
+                .update_version
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let _ = self.inner.update_version_tx.send(next_version);
+            drop(state);
+
+            if rerun {
+                self.spawn_refresh_task();
+            }
+            return;
+        }
+
+        let mut state = self.inner.refresh_state.lock().await;
+        state.local_refreshing = false;
+        let _ = state.refresh_done_tx.send(true);
     }
 
     #[cfg(feature = "remote")]

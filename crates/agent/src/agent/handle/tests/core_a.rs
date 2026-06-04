@@ -21,6 +21,23 @@ async fn test_from_config_creates_empty_registry() {
 }
 
 #[tokio::test]
+async fn test_from_config_does_not_trigger_background_model_refresh() {
+    let f = HandleFixture::new().await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let (_, meta) = f.handle.model_inventory.get_snapshot().await;
+    assert!(
+        meta.local_updated_at.is_none(),
+        "constructing a handle should not eagerly refresh models"
+    );
+    assert!(
+        !meta.refresh_in_progress,
+        "constructing a handle should not start a background refresh"
+    );
+}
+
+#[tokio::test]
 async fn test_initialize_returns_latest_protocol() {
     let f = HandleFixture::new().await;
     let req = InitializeRequest::new(ProtocolVersion::LATEST);

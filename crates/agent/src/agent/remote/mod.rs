@@ -76,6 +76,9 @@ mod mesh_provider_tests;
 mod remote_agent_stub_tests;
 
 #[cfg(all(test, feature = "remote"))]
+mod remote_setup_tests;
+
+#[cfg(all(test, feature = "remote"))]
 mod session_actor_ref_remote_tests;
 
 #[cfg(all(test, feature = "remote"))]
