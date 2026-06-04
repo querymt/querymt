@@ -259,3 +259,198 @@ where
         self.inner.build_provider(request).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use querymt::chat::{ChatMessage, ChatProvider, ChatResponse, Tool};
+    use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
+    use querymt::embedding::EmbeddingProvider;
+    use querymt::error::LLMError;
+    use std::sync::Mutex;
+
+    struct DummyProvider;
+
+    #[async_trait]
+    impl ChatProvider for DummyProvider {
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&[Tool]>,
+        ) -> Result<Box<dyn ChatResponse>, LLMError> {
+            Err(LLMError::NotImplemented("dummy".into()))
+        }
+
+        async fn chat_stream_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&[Tool]>,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures_util::Stream<Item = Result<querymt::chat::StreamChunk, LLMError>>
+                        + Send,
+                >,
+            >,
+            LLMError,
+        > {
+            Err(LLMError::NotImplemented("dummy".into()))
+        }
+    }
+
+    #[async_trait]
+    impl CompletionProvider for DummyProvider {
+        async fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse, LLMError> {
+            Err(LLMError::NotImplemented("dummy".into()))
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for DummyProvider {
+        async fn embed(&self, _input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+            Err(LLMError::NotImplemented("dummy".into()))
+        }
+    }
+
+    impl LLMProvider for DummyProvider {}
+
+    struct RecordingBackend {
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl RecordingBackend {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RemoteProviderBackend for RecordingBackend {
+        type Error = RemoteProviderHostError;
+
+        async fn build_provider(
+            &self,
+            request: ProviderBuildRequest,
+        ) -> Result<Arc<dyn LLMProvider>, Self::Error> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((request.provider_name, request.model));
+            Ok(Arc::new(DummyProvider))
+        }
+    }
+
+    #[test]
+    fn static_catalog_backend_builders_populate_snapshot() {
+        let single = StaticCatalogBackend::provider_model(
+            "node-1",
+            Some("Node One".to_string()),
+            "openai",
+            "gpt-4o",
+        )
+        .snapshot();
+        assert_eq!(single.node.node_id, "node-1");
+        assert_eq!(single.node.node_label.as_deref(), Some("Node One"));
+        assert_eq!(single.providers.len(), 1);
+        assert_eq!(single.providers[0].provider, "openai");
+        assert_eq!(single.providers[0].model.as_deref(), Some("gpt-4o"));
+
+        let multiple = StaticCatalogBackend::providers(
+            "node-2",
+            None,
+            ["openai".to_string(), "anthropic".to_string()],
+        )
+        .snapshot();
+        assert_eq!(multiple.providers.len(), 2);
+        assert!(
+            multiple
+                .providers
+                .iter()
+                .any(|entry| entry.provider == "openai")
+        );
+        assert!(
+            multiple
+                .providers
+                .iter()
+                .any(|entry| entry.provider == "anthropic")
+        );
+    }
+
+    #[tokio::test]
+    async fn static_provider_backend_returns_same_provider_arc() {
+        let provider: Arc<dyn LLMProvider> = Arc::new(DummyProvider);
+        let backend = StaticProviderBackend::new(Arc::clone(&provider));
+        let built = backend
+            .build_provider(ProviderBuildRequest::new("openai", "gpt-4o"))
+            .await
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&provider, &built));
+    }
+
+    #[tokio::test]
+    async fn closure_backend_invokes_builder_with_request() {
+        let backend = ClosureProviderBackend::new(|request: ProviderBuildRequest| async move {
+            assert_eq!(request.provider_name, "openai");
+            assert_eq!(request.model, "gpt-4o");
+            Ok::<Arc<dyn LLMProvider>, RemoteProviderHostError>(Arc::new(DummyProvider))
+        });
+
+        backend
+            .build_provider(ProviderBuildRequest::new("openai", "gpt-4o"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_allowlist_backend_accepts_allowed_models_and_rejects_others() {
+        let inner = RecordingBackend::new();
+        let backend = ModelAllowlistBackend::new(inner)
+            .allow_provider("openai")
+            .allow_models("anthropic", ["claude-3-7".to_string()]);
+
+        backend
+            .build_provider(ProviderBuildRequest::new("openai", "gpt-4o"))
+            .await
+            .unwrap();
+        backend
+            .build_provider(ProviderBuildRequest::new("anthropic", "claude-3-7"))
+            .await
+            .unwrap();
+
+        let err = backend
+            .build_provider(ProviderBuildRequest::new("anthropic", "claude-3-5"))
+            .await
+            .err()
+            .expect("disallowed model should fail");
+        match err {
+            RemoteProviderHostError::Internal(message) => {
+                assert!(message.contains("provider/model not shared"));
+                assert!(message.contains("anthropic"));
+                assert!(message.contains("claude-3-5"));
+            }
+            other => panic!("expected internal allowlist error, got {other:?}"),
+        }
+
+        let err = backend
+            .build_provider(ProviderBuildRequest::new("google", "gemini-1.5"))
+            .await
+            .err()
+            .expect("unknown provider should fail");
+        assert!(matches!(err, RemoteProviderHostError::Internal(_)));
+
+        let calls = backend.inner.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], ("openai".to_string(), "gpt-4o".to_string()));
+        assert_eq!(
+            calls[1],
+            ("anthropic".to_string(), "claude-3-7".to_string())
+        );
+    }
+}

@@ -20,3 +20,23 @@ pub fn session(session_id: &str) -> String {
 pub fn event_relay(session_id: &str, peer_id: &impl fmt::Display) -> String {
     format!("event_relay::{}::{}", session_id, peer_id)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_builders_use_canonical_formats() {
+        assert_eq!(NODE_MANAGER, "node_manager");
+        assert_eq!(
+            node_manager_for_peer(&"peer-1"),
+            "node_manager::peer::peer-1"
+        );
+        assert_eq!(provider_host(&"peer-1"), "provider_host::peer::peer-1");
+        assert_eq!(session("session-1"), "session::session-1");
+        assert_eq!(
+            event_relay("session-1", &"peer-1"),
+            "event_relay::session-1::peer-1"
+        );
+    }
+}

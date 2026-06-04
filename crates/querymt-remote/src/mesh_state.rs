@@ -333,3 +333,249 @@ fn now_secs() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn sample_peer(peer_id: &str, addr: &str) -> PeerEntry {
+        PeerEntry {
+            peer_id: peer_id.to_string(),
+            addrs: vec![addr.to_string()],
+        }
+    }
+
+    fn sample_token(mesh_id: &str, peer_id: &str, invite_id: &str) -> MembershipToken {
+        MembershipToken {
+            version: 1,
+            mesh_id: mesh_id.to_string(),
+            peer_id: peer_id.to_string(),
+            admitted_by: "host-peer".to_string(),
+            invite_id: invite_id.to_string(),
+            permissions: crate::invite::InvitePermissions::default(),
+            issued_at: 1,
+            expires_at: 0,
+            signature: "sig".to_string(),
+        }
+    }
+
+    #[test]
+    fn role_merge_escalates_host_and_member_to_both() {
+        assert_eq!(
+            MeshLocalRole::Host.merge(MeshLocalRole::Member),
+            MeshLocalRole::Both
+        );
+        assert_eq!(
+            MeshLocalRole::Member.merge(MeshLocalRole::Host),
+            MeshLocalRole::Both
+        );
+        assert_eq!(
+            MeshLocalRole::Both.merge(MeshLocalRole::Host),
+            MeshLocalRole::Both
+        );
+    }
+
+    #[test]
+    fn hosted_and_joined_mesh_merge_into_both_role_and_persist() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mesh_state.json");
+        let mesh_id = "host-peer:team-a";
+
+        let mut store = MeshStateStore::load_or_create(&path).unwrap();
+        store
+            .upsert_hosted_mesh(
+                mesh_id.to_string(),
+                Some("Team A".to_string()),
+                Some("invite-1".to_string()),
+            )
+            .unwrap();
+        store
+            .upsert_joined_mesh(
+                sample_token(mesh_id, "member-1", "invite-1"),
+                vec![sample_peer("member-1", "/p2p/member-1")],
+            )
+            .unwrap();
+
+        let reloaded = MeshStateStore::load_or_create(&path).unwrap();
+        let entry = reloaded.get(mesh_id).unwrap();
+        assert_eq!(entry.role, MeshLocalRole::Both);
+        assert_eq!(entry.status, MeshStatus::Active);
+        assert_eq!(entry.name.as_deref(), Some("Team A"));
+        assert_eq!(entry.invite_ids, vec!["invite-1".to_string()]);
+        assert_eq!(entry.membership_token.as_ref().unwrap().peer_id, "member-1");
+        assert!(entry.known_peers.contains_key("member-1"));
+    }
+
+    #[test]
+    fn hosted_mesh_deduplicates_and_sorts_invite_ids() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mesh_state.json");
+        let mesh_id = "host-peer:team-a";
+
+        let mut store = MeshStateStore::load_or_create(&path).unwrap();
+        store
+            .upsert_hosted_mesh(mesh_id.to_string(), None, Some("invite-b".to_string()))
+            .unwrap();
+        store
+            .upsert_hosted_mesh(mesh_id.to_string(), None, Some("invite-a".to_string()))
+            .unwrap();
+        store
+            .upsert_hosted_mesh(mesh_id.to_string(), None, Some("invite-b".to_string()))
+            .unwrap();
+
+        let entry = store.get(mesh_id).unwrap();
+        assert_eq!(
+            entry.invite_ids,
+            vec!["invite-a".to_string(), "invite-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn update_and_remove_known_peers_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mesh_state.json");
+        let mesh_id = "host-peer:team-a";
+
+        let mut store = MeshStateStore::load_or_create(&path).unwrap();
+        store
+            .upsert_hosted_mesh(mesh_id.to_string(), None, None)
+            .unwrap();
+        store
+            .update_known_peers(
+                mesh_id,
+                vec![
+                    sample_peer("peer-a", "/p2p/peer-a"),
+                    sample_peer("peer-b", "/p2p/peer-b"),
+                ],
+            )
+            .unwrap();
+
+        let peers = store.known_peers_for_mesh(mesh_id);
+        assert_eq!(peers.len(), 2);
+        assert!(store.remove_known_peer(mesh_id, "peer-a").unwrap());
+        assert!(!store.remove_known_peer(mesh_id, "missing").unwrap());
+
+        let remaining = store.known_peers_for_mesh(mesh_id);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].peer_id, "peer-b");
+    }
+
+    #[test]
+    fn reconnect_peers_include_known_and_admitted_without_duplicates() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mesh_state.json");
+        let mesh_id = "host-peer:team-a";
+
+        let mut store = MeshStateStore::load_or_create(&path).unwrap();
+        store
+            .upsert_hosted_mesh(mesh_id.to_string(), None, None)
+            .unwrap();
+        store
+            .update_known_peers(
+                mesh_id,
+                vec![sample_peer("peer-a", "/ip4/127.0.0.1/tcp/1/p2p/peer-a")],
+            )
+            .unwrap();
+        store
+            .add_admitted_peer(mesh_id, sample_token(mesh_id, "peer-a", "invite-a"))
+            .unwrap();
+        store
+            .add_admitted_peer(mesh_id, sample_token(mesh_id, "peer-b", "invite-b"))
+            .unwrap();
+
+        let peers = store.reconnect_peers_for_mesh(mesh_id);
+        assert_eq!(peers.len(), 2);
+        assert!(peers.iter().any(|peer| peer.peer_id == "peer-a"
+            && peer.addrs == vec!["/ip4/127.0.0.1/tcp/1/p2p/peer-a".to_string()]));
+        assert!(
+            peers
+                .iter()
+                .any(|peer| peer.peer_id == "peer-b"
+                    && peer.addrs == vec!["/p2p/peer-b".to_string()])
+        );
+    }
+
+    #[test]
+    fn inactive_meshes_are_excluded_from_active_and_reconnect_views() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mesh_state.json");
+        let mesh_id = "host-peer:team-a";
+
+        let mut store = MeshStateStore::load_or_create(&path).unwrap();
+        store
+            .upsert_hosted_mesh(mesh_id.to_string(), None, None)
+            .unwrap();
+        store
+            .add_admitted_peer(mesh_id, sample_token(mesh_id, "peer-a", "invite-a"))
+            .unwrap();
+        assert_eq!(store.active_mesh_ids(), vec![mesh_id.to_string()]);
+
+        assert!(store.mark_left(mesh_id).unwrap());
+        assert!(store.active_mesh_ids().is_empty());
+        assert!(store.reconnect_peers_for_mesh(mesh_id).is_empty());
+        assert!(store.all_reconnect_peers().is_empty());
+    }
+
+    #[test]
+    fn all_reconnect_peers_returns_entries_per_active_mesh() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mesh_state.json");
+        let mesh_a = "host-peer:team-a";
+        let mesh_b = "host-peer:team-b";
+
+        let mut store = MeshStateStore::load_or_create(&path).unwrap();
+        store
+            .upsert_hosted_mesh(mesh_a.to_string(), None, None)
+            .unwrap();
+        store
+            .upsert_hosted_mesh(mesh_b.to_string(), None, None)
+            .unwrap();
+        store
+            .add_admitted_peer(mesh_a, sample_token(mesh_a, "peer-a", "invite-a"))
+            .unwrap();
+        store
+            .add_admitted_peer(mesh_b, sample_token(mesh_b, "peer-a", "invite-b"))
+            .unwrap();
+
+        let peers = store.all_reconnect_peers();
+        assert_eq!(peers.len(), 2);
+        assert!(
+            peers
+                .iter()
+                .any(|(mesh_id, peer)| mesh_id == mesh_a && peer.peer_id == "peer-a")
+        );
+        assert!(
+            peers
+                .iter()
+                .any(|(mesh_id, peer)| mesh_id == mesh_b && peer.peer_id == "peer-a")
+        );
+    }
+
+    #[test]
+    fn mesh_ids_for_host_only_returns_active_hosted_meshes_for_prefix() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mesh_state.json");
+
+        let mut store = MeshStateStore::load_or_create(&path).unwrap();
+        store
+            .upsert_hosted_mesh("host-a:team-a".to_string(), None, None)
+            .unwrap();
+        store
+            .upsert_hosted_mesh("host-a:team-b".to_string(), None, None)
+            .unwrap();
+        store
+            .upsert_hosted_mesh("host-b:team-c".to_string(), None, None)
+            .unwrap();
+        store.mark_left("host-a:team-b").unwrap();
+
+        assert_eq!(
+            store.mesh_ids_for_host("host-a"),
+            vec!["host-a:team-a".to_string()]
+        );
+        assert_eq!(
+            store.mesh_ids_for_host("host-b"),
+            vec!["host-b:team-c".to_string()]
+        );
+    }
+}

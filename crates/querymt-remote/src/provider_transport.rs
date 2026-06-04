@@ -86,3 +86,94 @@ pub fn should_retry_remote_send<E>(error: &kameo::error::RemoteSendError<E>) -> 
             | RemoteSendError::ConnectionClosed
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kameo::error::RemoteSendError;
+    use std::borrow::Cow;
+
+    #[test]
+    fn retry_classifier_only_retries_connection_recovery_cases() {
+        assert!(should_retry_remote_send::<String>(
+            &RemoteSendError::ActorNotRunning
+        ));
+        assert!(should_retry_remote_send::<String>(
+            &RemoteSendError::ActorStopped
+        ));
+        assert!(should_retry_remote_send::<String>(
+            &RemoteSendError::UnknownActor {
+                actor_remote_id: Cow::Borrowed("actor"),
+            }
+        ));
+        assert!(should_retry_remote_send::<String>(
+            &RemoteSendError::UnknownMessage {
+                actor_remote_id: Cow::Borrowed("actor"),
+                message_remote_id: Cow::Borrowed("message"),
+            }
+        ));
+        assert!(should_retry_remote_send::<String>(
+            &RemoteSendError::DialFailure
+        ));
+        assert!(should_retry_remote_send::<String>(
+            &RemoteSendError::ConnectionClosed
+        ));
+        assert!(!should_retry_remote_send::<String>(
+            &RemoteSendError::MailboxFull
+        ));
+        assert!(!should_retry_remote_send::<String>(
+            &RemoteSendError::BadActorType
+        ));
+    }
+
+    #[test]
+    fn remote_send_error_base_maps_transport_and_provider_failures() {
+        let err = remote_send_error_base::<String>(RemoteSendError::ReplyTimeout).unwrap();
+        assert!(matches!(
+            err,
+            LLMError::Transport {
+                kind: TransportErrorKind::Timeout,
+                ..
+            }
+        ));
+
+        let err = remote_send_error_base::<String>(RemoteSendError::BadActorType).unwrap();
+        assert!(matches!(err, LLMError::ProviderError(ref msg) if msg == "bad remote actor type"));
+
+        let err = remote_send_error_base::<String>(RemoteSendError::SerializeReply(
+            "serialize fail".to_string(),
+        ))
+        .unwrap();
+        assert!(matches!(err, LLMError::ProviderError(ref msg) if msg == "serialize fail"));
+    }
+
+    #[test]
+    fn remote_send_error_base_preserves_handler_error() {
+        let err = remote_send_error_base(RemoteSendError::HandlerError("handler boom".to_string()))
+            .expect_err("handler errors should bubble up");
+        assert_eq!(err, "handler boom");
+    }
+
+    #[test]
+    fn decode_payload_handler_error_parses_json_payload_when_available() {
+        let payload = serde_json::to_string(&LLMErrorPayload::Transport {
+            kind: TransportErrorKind::ConnectionClosed,
+            message: "lost link".to_string(),
+        })
+        .unwrap();
+        let err = decode_payload_handler_error(&payload);
+        assert!(matches!(
+            err,
+            LLMError::Transport {
+                kind: TransportErrorKind::ConnectionClosed,
+                ref message,
+            } if message == "lost link"
+        ));
+
+        let fallback = decode_payload_handler_error("plain failure");
+        assert!(matches!(
+            fallback,
+            LLMError::ProviderError(ref message) if message == "plain failure"
+        ));
+    }
+}

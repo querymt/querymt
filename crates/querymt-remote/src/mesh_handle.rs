@@ -476,3 +476,180 @@ impl MeshHandle {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh_events::MeshEvent;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+
+    fn test_mesh_with_stores(
+        mode: MeshTransportMode,
+    ) -> (
+        tempfile::TempDir,
+        MeshHandle,
+        broadcast::Receiver<MeshEvent>,
+        mpsc::UnboundedReceiver<SwarmCommand>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mesh_state_path = dir.path().join("mesh_state.json");
+        let invite_store_path = dir.path().join("invites.json");
+        let mesh_state_store = Arc::new(RwLock::new(
+            MeshStateStore::load_or_create(&mesh_state_path).unwrap(),
+        ));
+        let invite_store = Arc::new(RwLock::new(
+            InviteStore::load_or_create(&invite_store_path).unwrap(),
+        ));
+
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = keypair.public().to_peer_id();
+        let (peer_events_tx, peer_events_rx) = broadcast::channel(16);
+        let routes = Arc::new(RouteTable::new(Duration::from_secs(90)));
+        let re_register_fns = Arc::new(RwLock::new(HashMap::new()));
+        let (swarm_cmd_tx, swarm_cmd_rx) = mpsc::unbounded_channel();
+
+        let mesh = MeshHandle::new(
+            peer_id,
+            peer_events_tx,
+            routes,
+            "test-host".to_string(),
+            re_register_fns,
+            keypair,
+            Some(invite_store),
+            Some(mesh_state_store),
+            mode,
+            swarm_cmd_tx,
+            Duration::from_secs(30),
+        );
+
+        (dir, mesh, peer_events_rx, swarm_cmd_rx)
+    }
+
+    #[test]
+    fn leave_iroh_scope_removes_membership_emits_event_and_notifies_swarm() {
+        let (_dir, mesh, mut events_rx, mut swarm_cmd_rx) =
+            test_mesh_with_stores(MeshTransportMode::Composite);
+        let mesh_id = "inviter:mesh-a";
+
+        mesh.mesh_state_store()
+            .unwrap()
+            .write()
+            .upsert_hosted_mesh(
+                mesh_id.to_string(),
+                Some("mesh-a".to_string()),
+                Some("invite-a".to_string()),
+            )
+            .unwrap();
+        mesh.ensure_scope(MeshScopeId::Iroh {
+            mesh_id: mesh_id.to_string(),
+        });
+        mesh.re_register_fns.write().insert(
+            format!(
+                "scope::iroh::inviter%3Amesh-a::provider_host::peer::{}",
+                mesh.peer_id()
+            ),
+            Arc::new(|| Box::pin(async {})),
+        );
+
+        let removed = mesh.leave_iroh_scope(mesh_id).unwrap();
+        assert!(removed);
+        assert!(mesh.joined_iroh_scopes().is_empty());
+        assert_eq!(mesh.active_scopes(), vec![MeshScopeId::lan_default()]);
+        assert!(mesh.re_register_fns.read().is_empty());
+
+        assert!(matches!(
+            events_rx.try_recv().unwrap(),
+            MeshEvent::ScopeLeft(MeshScopeId::Iroh { mesh_id: left }) if left == mesh_id
+        ));
+        assert!(matches!(
+            swarm_cmd_rx.try_recv().unwrap(),
+            SwarmCommand::LeaveIrohScope { mesh_id: left } if left == mesh_id
+        ));
+    }
+
+    #[test]
+    fn leave_iroh_scope_missing_scope_returns_false_and_emits_nothing() {
+        let (_dir, mesh, mut events_rx, mut swarm_cmd_rx) =
+            test_mesh_with_stores(MeshTransportMode::Composite);
+        mesh.mesh_state_store()
+            .unwrap()
+            .write()
+            .upsert_hosted_mesh(
+                "inviter:mesh-a".to_string(),
+                Some("mesh-a".to_string()),
+                Some("invite-a".to_string()),
+            )
+            .unwrap();
+
+        let removed = mesh.leave_iroh_scope("inviter:mesh-b").unwrap();
+        assert!(!removed);
+        assert_eq!(
+            mesh.joined_iroh_scopes(),
+            vec![MeshScopeId::Iroh {
+                mesh_id: "inviter:mesh-a".to_string()
+            }]
+        );
+        assert!(matches!(
+            events_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(swarm_cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn create_invite_adds_iroh_scope_and_persists_hosted_mesh() {
+        let (_dir, mut mesh, _events_rx, _swarm_cmd_rx) =
+            test_mesh_with_stores(MeshTransportMode::Composite);
+        mesh.set_config_scopes(vec![MeshScopeId::lan_default()]);
+
+        let invite = mesh
+            .create_invite(Some("mesh-a".to_string()), None, Some(1), false)
+            .unwrap();
+        let expected_mesh_id = mesh_id_for(&mesh.peer_id().to_string(), Some("mesh-a"));
+
+        assert_eq!(invite.grant.mesh_name.as_deref(), Some("mesh-a"));
+        assert!(mesh.active_scopes().contains(&MeshScopeId::Iroh {
+            mesh_id: expected_mesh_id.clone()
+        }));
+        let stored = mesh
+            .mesh_state_store()
+            .unwrap()
+            .read()
+            .get(&expected_mesh_id)
+            .unwrap()
+            .clone();
+        assert_eq!(stored.name.as_deref(), Some("mesh-a"));
+        assert_eq!(stored.invite_ids, vec![invite.grant.invite_id.clone()]);
+    }
+
+    #[test]
+    fn active_scopes_does_not_fallback_to_lan_for_iroh_only_mesh() {
+        let (_dir, mesh, _events_rx, _swarm_cmd_rx) =
+            test_mesh_with_stores(MeshTransportMode::Iroh);
+        assert_eq!(mesh.active_scopes(), Vec::<MeshScopeId>::new());
+    }
+
+    #[test]
+    fn deregister_actor_removes_specific_re_register_fn() {
+        let (_dir, mesh, _events_rx, _swarm_cmd_rx) =
+            test_mesh_with_stores(MeshTransportMode::Composite);
+        mesh.re_register_fns.write().insert(
+            "scope::iroh::mesh-a::node_manager".to_string(),
+            Arc::new(|| Box::pin(async {})),
+        );
+        mesh.re_register_fns.write().insert(
+            "scope::iroh::mesh-b::node_manager".to_string(),
+            Arc::new(|| Box::pin(async {})),
+        );
+
+        assert_eq!(mesh.re_register_fns_count(), 2);
+        assert!(mesh.has_re_register_fn("scope::iroh::mesh-a::node_manager"));
+
+        mesh.deregister_actor("scope::iroh::mesh-a::node_manager");
+
+        assert_eq!(mesh.re_register_fns_count(), 1);
+        assert!(!mesh.has_re_register_fn("scope::iroh::mesh-a::node_manager"));
+        assert!(mesh.has_re_register_fn("scope::iroh::mesh-b::node_manager"));
+    }
+}

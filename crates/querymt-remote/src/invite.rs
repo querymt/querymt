@@ -711,3 +711,255 @@ fn push_str(buf: &mut Vec<u8>, s: &str) -> Result<(), InviteError> {
     buf.extend_from_slice(bytes);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn sample_grant(expires_at: u64, max_uses: u32) -> InviteGrant {
+        InviteGrant {
+            version: 3,
+            invite_id: uuid::Uuid::now_v7().to_string(),
+            inviter_peer_id: "12D3KooWJ5Q3u2fY25Lmf4x1F4nQJk4kWjJfJ8W9YJvT9m4KQmY1".to_string(),
+            mesh_name: Some("team-a".to_string()),
+            expires_at,
+            max_uses,
+            permissions: InvitePermissions {
+                can_invite: true,
+                role: "client".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn mesh_id_defaults_to_anon_without_mesh_name() {
+        assert_eq!(mesh_id_for("peer-1", None), "peer-1:anon");
+        assert_eq!(mesh_id_for("peer-1", Some("team")), "peer-1:team");
+    }
+
+    #[test]
+    fn parse_duration_supports_suffixes_and_none() {
+        assert_eq!(parse_duration_secs("15"), Some(15));
+        assert_eq!(parse_duration_secs("2m"), Some(120));
+        assert_eq!(parse_duration_secs("3h"), Some(10_800));
+        assert_eq!(parse_duration_secs("1d"), Some(86_400));
+        assert_eq!(parse_duration_secs("none"), None);
+    }
+
+    #[test]
+    fn format_duration_prefers_largest_exact_unit() {
+        assert_eq!(format_duration_human(90), "90s");
+        assert_eq!(format_duration_human(120), "2m");
+        assert_eq!(format_duration_human(7200), "2h");
+        assert_eq!(format_duration_human(172800), "2d");
+    }
+
+    #[test]
+    fn validate_and_consume_tracks_uses_and_persists_state() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("invites.json");
+        let invite_id = uuid::Uuid::now_v7().to_string();
+        let grant = InviteGrant {
+            version: 3,
+            invite_id: invite_id.clone(),
+            inviter_peer_id: "peer-1".to_string(),
+            mesh_name: Some("team-a".to_string()),
+            expires_at: 0,
+            max_uses: 2,
+            permissions: InvitePermissions::default(),
+        };
+
+        let mut store = InviteStore::load_or_create(&path).unwrap();
+        store.records.insert(
+            invite_id.clone(),
+            InviteRecord {
+                invite_id: invite_id.clone(),
+                grant,
+                created_at: 1,
+                uses_remaining: 2,
+                status: InviteStatus::Pending,
+                used_by: Vec::new(),
+            },
+        );
+        store.save_records().unwrap();
+
+        store.validate_and_consume(&invite_id, "peer-a").unwrap();
+        let reloaded = InviteStore::load_or_create(&path).unwrap();
+        let record = reloaded.records.get(&invite_id).unwrap();
+        assert_eq!(record.uses_remaining, 1);
+        assert_eq!(record.status, InviteStatus::Pending);
+        assert_eq!(record.used_by, vec!["peer-a".to_string()]);
+
+        let mut reloaded = reloaded;
+        reloaded.validate_and_consume(&invite_id, "peer-b").unwrap();
+        let final_store = InviteStore::load_or_create(&path).unwrap();
+        let final_record = final_store.records.get(&invite_id).unwrap();
+        assert_eq!(final_record.uses_remaining, 0);
+        assert_eq!(final_record.status, InviteStatus::Consumed);
+        assert_eq!(
+            final_record.used_by,
+            vec!["peer-a".to_string(), "peer-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn revoke_prevents_future_consumption() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("invites.json");
+        let invite_id = uuid::Uuid::now_v7().to_string();
+
+        let mut store = InviteStore::load_or_create(&path).unwrap();
+        store.records.insert(
+            invite_id.clone(),
+            InviteRecord {
+                invite_id: invite_id.clone(),
+                grant: InviteGrant {
+                    version: 3,
+                    invite_id: invite_id.clone(),
+                    inviter_peer_id: "peer-1".to_string(),
+                    mesh_name: None,
+                    expires_at: 0,
+                    max_uses: 1,
+                    permissions: InvitePermissions::default(),
+                },
+                created_at: 1,
+                uses_remaining: 1,
+                status: InviteStatus::Pending,
+                used_by: Vec::new(),
+            },
+        );
+
+        store.revoke(&invite_id).unwrap();
+        let err = store
+            .validate_and_consume(&invite_id, "peer-a")
+            .expect_err("revoked invite should fail");
+        assert!(matches!(err, InviteError::InviteRevoked));
+    }
+
+    #[test]
+    fn list_pending_omits_consumed_and_revoked_records() {
+        let path = tempdir().unwrap().path().join("invites.json");
+        let mut store = InviteStore::load_or_create(&path).unwrap();
+
+        for (suffix, status) in [
+            ("pending", InviteStatus::Pending),
+            ("consumed", InviteStatus::Consumed),
+            ("revoked", InviteStatus::Revoked),
+        ] {
+            let invite_id = format!("00000000-0000-7000-8000-{suffix:0>12}");
+            store.records.insert(
+                invite_id.clone(),
+                InviteRecord {
+                    invite_id: invite_id.clone(),
+                    grant: InviteGrant {
+                        version: 3,
+                        invite_id,
+                        inviter_peer_id: "peer-1".to_string(),
+                        mesh_name: None,
+                        expires_at: 0,
+                        max_uses: 1,
+                        permissions: InvitePermissions::default(),
+                    },
+                    created_at: 1,
+                    uses_remaining: 1,
+                    status,
+                    used_by: Vec::new(),
+                },
+            );
+        }
+
+        let pending = store.list_pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].status, InviteStatus::Pending);
+    }
+
+    #[cfg(feature = "kameo-mesh")]
+    #[test]
+    fn signed_grant_round_trips_through_wire_and_url_encodings() {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let inviter_peer_id = keypair.public().to_peer_id().to_string();
+        let grant = InviteGrant {
+            inviter_peer_id,
+            ..sample_grant(0, 3)
+        };
+
+        let signed = grant.clone().sign(&keypair).unwrap();
+        signed.verify().unwrap();
+
+        let wire = grant.to_wire_bytes().unwrap();
+        let (decoded, consumed) = InviteGrant::from_wire_bytes(&wire).unwrap();
+        assert_eq!(decoded, grant);
+        assert_eq!(consumed, wire.len());
+
+        let encoded = signed.encode();
+        let decoded_signed = SignedInviteGrant::decode(&encoded).unwrap();
+        assert_eq!(decoded_signed.grant, signed.grant);
+        decoded_signed.verify().unwrap();
+
+        let from_url = SignedInviteGrant::decode(&signed.to_url()).unwrap();
+        assert_eq!(from_url.grant, signed.grant);
+    }
+
+    #[cfg(feature = "kameo-mesh")]
+    #[test]
+    fn membership_token_verification_detects_tampering() {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let expires_at = now_secs() + 60;
+        let mut token = MembershipToken::issue(
+            "mesh-a".to_string(),
+            "peer-b",
+            &keypair,
+            "invite-1".to_string(),
+            InvitePermissions::default(),
+            expires_at,
+        )
+        .unwrap();
+        token.verify().unwrap();
+
+        token.peer_id = "peer-c".to_string();
+        let err = token.verify().expect_err("tampered token should fail");
+        assert!(matches!(err, InviteError::InvalidSignature(_)));
+    }
+
+    #[cfg(feature = "kameo-mesh")]
+    #[test]
+    fn create_invite_and_admit_peer_persist_expected_state() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("invites.json");
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = keypair.public().to_peer_id().to_string();
+
+        let mut store = InviteStore::load_or_create(&path).unwrap();
+        let signed = store
+            .create_invite(
+                &keypair,
+                &peer_id,
+                Some("team-a".to_string()),
+                Some(60),
+                1,
+                InvitePermissions {
+                    can_invite: true,
+                    role: "client".to_string(),
+                },
+            )
+            .unwrap();
+
+        let token = store
+            .admit_peer(
+                &signed.grant.invite_id,
+                "joiner-1",
+                &keypair,
+                Some("team-a"),
+            )
+            .unwrap();
+        token.verify().unwrap();
+        assert_eq!(token.mesh_id, mesh_id_for(&peer_id, Some("team-a")));
+
+        let reloaded = InviteStore::load_or_create(&path).unwrap();
+        let record = reloaded.records.get(&signed.grant.invite_id).unwrap();
+        assert_eq!(record.status, InviteStatus::Consumed);
+        assert_eq!(record.uses_remaining, 0);
+        assert_eq!(record.used_by, vec!["joiner-1".to_string()]);
+    }
+}

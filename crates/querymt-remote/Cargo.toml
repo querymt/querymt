@@ -36,3 +36,4 @@ anyhow = "1.0"
 
 [dev-dependencies]
 qmt-openai = { path = "../providers/openai", default-features = false, features = ["api"] }
+tempfile = "3"

@@ -366,3 +366,132 @@ pub(crate) fn log_kameo_messaging_event(event: &remote::messaging::Event) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn connection_route_plan_composite_with_iroh_peer_includes_lan_and_iroh() {
+        let scope = MeshScopeId::Iroh {
+            mesh_id: "mesh-a".to_string(),
+        };
+        let plan = connection_route_plan(true, true, Some(&scope));
+        assert_eq!(plan.len(), 2);
+        assert_eq!(
+            plan[0],
+            (MeshTransportKind::Lan, MeshScopeId::lan_default(), 100)
+        );
+        assert_eq!(plan[1], (MeshTransportKind::Iroh, scope, 70));
+    }
+
+    #[test]
+    fn connection_route_plan_iroh_only_without_scope_adds_no_lan() {
+        let plan = connection_route_plan(false, true, None);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn peer_id_from_multiaddr_extracts_p2p_component() {
+        let peer_id = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/1/p2p/{peer_id}")
+            .parse()
+            .unwrap();
+        assert_eq!(peer_id_from_multiaddr(&addr), Some(peer_id));
+        assert_eq!(
+            peer_id_from_multiaddr(&"/ip4/127.0.0.1/tcp/1".parse().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_duration_caps_at_thirty_seconds() {
+        assert_eq!(reconnect_backoff_duration(0), Duration::from_secs(1));
+        assert_eq!(reconnect_backoff_duration(1), Duration::from_secs(2));
+        assert_eq!(reconnect_backoff_duration(5), Duration::from_secs(30));
+        assert_eq!(reconnect_backoff_duration(8), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn should_dial_peer_command_requires_iroh_and_scope_for_manual_and_reconnect() {
+        let peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let mut scopes = HashMap::new();
+
+        assert!(!should_dial_peer_command(
+            &peer,
+            DialReason::Manual,
+            &scopes,
+            false
+        ));
+        assert!(should_dial_peer_command(
+            &peer,
+            DialReason::Admission,
+            &scopes,
+            true,
+        ));
+        assert!(should_dial_peer_command(
+            &peer,
+            DialReason::ExistingMeshPeer,
+            &scopes,
+            true,
+        ));
+        assert!(!should_dial_peer_command(
+            &peer,
+            DialReason::Reconnect,
+            &scopes,
+            true,
+        ));
+
+        scopes.insert(
+            peer,
+            MeshScopeId::Iroh {
+                mesh_id: "mesh-a".to_string(),
+            },
+        );
+        assert!(should_dial_peer_command(
+            &peer,
+            DialReason::Reconnect,
+            &scopes,
+            true,
+        ));
+        assert!(should_dial_peer_command(
+            &peer,
+            DialReason::Manual,
+            &scopes,
+            true
+        ));
+    }
+
+    #[test]
+    fn seed_scoped_dial_peer_tracks_iroh_peers_by_scope() {
+        let peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let scope = MeshScopeId::Iroh {
+            mesh_id: "mesh-a".to_string(),
+        };
+        let mut by_scope = HashMap::new();
+        let mut peer_scopes = HashMap::new();
+
+        seed_scoped_dial_peer(peer, Some(scope.clone()), &mut by_scope, &mut peer_scopes);
+        seed_scoped_dial_peer(
+            peer,
+            Some(MeshScopeId::lan_default()),
+            &mut by_scope,
+            &mut peer_scopes,
+        );
+
+        assert_eq!(peer_scopes.get(&peer), Some(&scope));
+        assert!(
+            by_scope
+                .get("mesh-a")
+                .is_some_and(|peers| peers.contains(&peer))
+        );
+        assert_eq!(by_scope.len(), 1);
+    }
+}

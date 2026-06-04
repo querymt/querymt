@@ -137,3 +137,153 @@ impl RouteTable {
             .max_by_key(Self::route_sort_key)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer_id() -> PeerId {
+        libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+    }
+
+    fn addr(value: String) -> Multiaddr {
+        value.parse().unwrap()
+    }
+
+    #[test]
+    fn upsert_merges_addresses_for_same_route_key() {
+        let table = RouteTable::new(Duration::from_secs(60));
+        let peer = peer_id();
+        let scope = MeshScopeId::lan_default();
+
+        table.upsert_addrs(
+            peer,
+            MeshTransportKind::Lan,
+            scope.clone(),
+            [addr(format!("/ip4/127.0.0.1/tcp/1000/p2p/{peer}"))],
+            10,
+        );
+        let route = table.upsert_addrs(
+            peer,
+            MeshTransportKind::Lan,
+            scope,
+            [addr(format!("/ip4/127.0.0.1/tcp/2000/p2p/{peer}"))],
+            20,
+        );
+
+        assert_eq!(route.priority, 20);
+        assert_eq!(route.addrs.len(), 2);
+        assert_eq!(table.routes_for_peer(&peer).len(), 1);
+    }
+
+    #[test]
+    fn remove_addrs_prunes_route_when_last_address_is_removed() {
+        let table = RouteTable::new(Duration::from_secs(60));
+        let peer = peer_id();
+        let scope = MeshScopeId::lan_default();
+        let remove = addr(format!("/ip4/127.0.0.1/tcp/1000/p2p/{peer}"));
+
+        table.upsert_addrs(
+            peer,
+            MeshTransportKind::Lan,
+            scope.clone(),
+            [remove.clone()],
+            10,
+        );
+
+        let expired = HashSet::from([remove]);
+        assert!(
+            table
+                .remove_addrs(peer, MeshTransportKind::Lan, scope, &expired)
+                .is_none()
+        );
+        assert!(!table.is_peer_alive(&peer));
+    }
+
+    #[test]
+    fn remove_peer_clears_all_routes_for_that_peer_only() {
+        let table = RouteTable::new(Duration::from_secs(60));
+        let peer_a = peer_id();
+        let peer_b = peer_id();
+
+        table.upsert_addrs(
+            peer_a,
+            MeshTransportKind::Lan,
+            MeshScopeId::lan_default(),
+            [addr(format!("/ip4/127.0.0.1/tcp/1000/p2p/{peer_a}"))],
+            10,
+        );
+        table.upsert_addrs(
+            peer_b,
+            MeshTransportKind::Iroh,
+            MeshScopeId::Iroh {
+                mesh_id: "mesh-a".to_string(),
+            },
+            [addr(format!("/p2p/{peer_b}"))],
+            20,
+        );
+
+        table.remove_peer(&peer_a);
+
+        assert!(!table.is_peer_alive(&peer_a));
+        assert!(table.is_peer_alive(&peer_b));
+        assert_eq!(table.peer_count(), 1);
+    }
+
+    #[test]
+    fn best_route_prefers_highest_priority() {
+        let table = RouteTable::new(Duration::from_secs(60));
+        let peer = peer_id();
+
+        table.upsert_addrs(
+            peer,
+            MeshTransportKind::Iroh,
+            MeshScopeId::Iroh {
+                mesh_id: "mesh-a".to_string(),
+            },
+            [addr(format!("/p2p/{peer}"))],
+            50,
+        );
+        table.upsert_addrs(
+            peer,
+            MeshTransportKind::Lan,
+            MeshScopeId::lan_default(),
+            [addr(format!("/ip4/127.0.0.1/tcp/1000/p2p/{peer}"))],
+            100,
+        );
+
+        let best = table.best_route_for_peer(&peer).unwrap();
+        assert_eq!(best.transport, MeshTransportKind::Lan);
+        assert_eq!(best.priority, 100);
+    }
+
+    #[test]
+    fn peer_ids_are_unique_across_multiple_routes() {
+        let table = RouteTable::new(Duration::from_secs(60));
+        let peer = peer_id();
+
+        table.upsert_addrs(
+            peer,
+            MeshTransportKind::Lan,
+            MeshScopeId::lan_default(),
+            [addr(format!("/ip4/127.0.0.1/tcp/1000/p2p/{peer}"))],
+            100,
+        );
+        table.upsert_addrs(
+            peer,
+            MeshTransportKind::Iroh,
+            MeshScopeId::Iroh {
+                mesh_id: "mesh-a".to_string(),
+            },
+            [addr(format!("/p2p/{peer}"))],
+            50,
+        );
+
+        let mut peers = table.peer_ids();
+        peers.sort();
+        assert_eq!(peers, vec![peer]);
+        assert_eq!(table.peer_count(), 1);
+    }
+}

@@ -127,3 +127,66 @@ pub fn scoped_event_relay(
         peer_id
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lan_default_uses_expected_display_and_prefix() {
+        let scope = MeshScopeId::lan_default();
+        assert!(scope.is_lan());
+        assert!(!scope.is_iroh());
+        assert_eq!(scope.to_string(), "lan:default");
+        assert_eq!(scope.dht_prefix(), "scope::lan::default::");
+    }
+
+    #[test]
+    fn iroh_scope_encodes_special_characters_in_prefix() {
+        let scope = MeshScopeId::Iroh {
+            mesh_id: "team a/one".to_string(),
+        };
+        assert!(scope.is_iroh());
+        assert_eq!(scope.iroh_mesh_id(), Some("team a/one"));
+        assert_eq!(scope.to_string(), "iroh:team a/one");
+        assert_eq!(scope.dht_prefix(), "scope::iroh::team%20a%2Fone::");
+    }
+
+    #[test]
+    fn scoped_names_use_expected_prefixes() {
+        let scope = MeshScopeId::Iroh {
+            mesh_id: "team-a".to_string(),
+        };
+
+        assert_eq!(
+            scoped_node_manager(&scope),
+            "scope::iroh::team-a::node_manager"
+        );
+        assert_eq!(
+            scoped_node_manager_for_peer(&scope, "peer-1"),
+            "scope::iroh::team-a::node_manager::peer::peer-1"
+        );
+        assert_eq!(
+            scoped_provider_host(&scope, "peer-1"),
+            "scope::iroh::team-a::provider_host::peer::peer-1"
+        );
+        assert_eq!(
+            scoped_provider_catalog(&scope, "peer-1"),
+            "scope::iroh::team-a::provider_catalog::peer::peer-1"
+        );
+        assert_eq!(
+            scoped_session(&scope, "session-1"),
+            "scope::iroh::team-a::session::session-1"
+        );
+        assert_eq!(
+            scoped_event_relay(&scope, "session-1", "peer-1"),
+            "scope::iroh::team-a::event_relay::session-1::peer-1"
+        );
+    }
+
+    #[test]
+    fn transport_kind_display_is_stable() {
+        assert_eq!(MeshTransportKind::Lan.to_string(), "lan");
+        assert_eq!(MeshTransportKind::Iroh.to_string(), "iroh");
+    }
+}

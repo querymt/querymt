@@ -71,3 +71,32 @@ impl<'de> Deserialize<'de> for NodeId {
         Self::parse(&raw).map_err(serde::de::Error::custom)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "kameo-mesh")]
+    #[test]
+    fn parse_display_and_serde_round_trip_peer_id() {
+        let peer_id = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let node_id = NodeId::parse(&peer_id.to_string()).unwrap();
+
+        assert_eq!(node_id.as_peer_id(), &peer_id);
+        assert_eq!(node_id.as_str(), peer_id.to_string());
+        assert_eq!(node_id.to_string(), peer_id.to_string());
+
+        let json = serde_json::to_string(&node_id).unwrap();
+        let decoded: NodeId = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, node_id);
+    }
+
+    #[cfg(feature = "kameo-mesh")]
+    #[test]
+    fn parse_rejects_invalid_peer_id() {
+        let err = NodeId::parse("not-a-peer-id").expect_err("invalid peer id should fail");
+        assert!(err.contains("invalid peer id"));
+    }
+}

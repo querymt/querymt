@@ -667,4 +667,101 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec!["req-a".to_string(), "req-b".to_string()]);
     }
+
+    #[tokio::test]
+    async fn cleanup_preserves_non_terminal_requests() {
+        let router = create_test_router();
+        let request_id = "test-request-7".to_string();
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
+        {
+            let mut requests = router.requests.lock();
+            let request = requests.get_mut(&request_id).expect("request exists");
+            request.last_message_at = Instant::now() - Duration::from_secs(1);
+        }
+
+        router.cleanup_expired_requests();
+
+        let status = router.get_status(Some(&request_id));
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].phase, RequestPhase::AwaitingStream);
+    }
+
+    #[tokio::test]
+    async fn consumer_backpressure_sets_disconnected_and_buffers_message() {
+        let router = create_test_router();
+        let request_id = "test-request-8".to_string();
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
+
+        let (tx, _rx) = mpsc::channel(1);
+        {
+            let mut requests = router.requests.lock();
+            let request = requests.get_mut(&request_id).expect("request exists");
+            request.consumer_tx = Some(tx);
+        }
+
+        router
+            .requests
+            .lock()
+            .get_mut(&request_id)
+            .expect("request exists")
+            .deliver_or_buffer(StreamRelayMessage::Chunk(StreamChunk::Text(
+                "first".to_string(),
+            )));
+        router
+            .requests
+            .lock()
+            .get_mut(&request_id)
+            .expect("request exists")
+            .deliver_or_buffer(StreamRelayMessage::Chunk(StreamChunk::Text(
+                "second".to_string(),
+            )));
+
+        let status = router.get_status(Some(&request_id));
+        assert_eq!(status[0].phase, RequestPhase::ConsumerDisconnected);
+        assert_eq!(status[0].buffered_messages, 1);
+    }
+
+    #[tokio::test]
+    async fn request_phase_transitions_from_awaiting_to_streaming_to_completed() {
+        let router = create_test_router();
+        let request_id = "test-request-9".to_string();
+        router
+            .register_request(request_id.clone())
+            .expect("register request");
+
+        assert_eq!(
+            router.get_status(Some(&request_id))[0].phase,
+            RequestPhase::AwaitingStream
+        );
+
+        router
+            .requests
+            .lock()
+            .get_mut(&request_id)
+            .expect("request exists")
+            .deliver_or_buffer(StreamRelayMessage::Chunk(StreamChunk::Text(
+                "chunk".to_string(),
+            )));
+        assert_eq!(
+            router.get_status(Some(&request_id))[0].phase,
+            RequestPhase::Streaming
+        );
+
+        router
+            .requests
+            .lock()
+            .get_mut(&request_id)
+            .expect("request exists")
+            .deliver_or_buffer(StreamRelayMessage::Chunk(StreamChunk::Done {
+                finish_reason: querymt::chat::FinishReason::Stop,
+            }));
+        assert_eq!(
+            router.get_status(Some(&request_id))[0].phase,
+            RequestPhase::Completed
+        );
+    }
 }

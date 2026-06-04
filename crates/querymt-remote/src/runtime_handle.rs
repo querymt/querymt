@@ -395,3 +395,136 @@ impl MeshScopeHandle {
         self.runtime.dial_peer(peer_id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh_runtime_support::{DialReason, SwarmCommand};
+    use crate::{MeshEvent, MeshTransportMode, RouteTable};
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+
+    fn test_runtime(
+        mode: MeshTransportMode,
+    ) -> (
+        MeshRuntimeHandle,
+        tokio::sync::mpsc::UnboundedReceiver<SwarmCommand>,
+    ) {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = keypair.public().to_peer_id();
+        let (peer_events_tx, _peer_events_rx) = broadcast::channel(8);
+        let routes = Arc::new(RouteTable::new(Duration::from_secs(60)));
+        let re_register_fns = Arc::new(RwLock::new(HashMap::new()));
+        let (swarm_cmd_tx, swarm_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = MeshHandle::new(
+            peer_id,
+            peer_events_tx,
+            routes,
+            "test-host".to_string(),
+            re_register_fns,
+            keypair,
+            None,
+            None,
+            mode,
+            swarm_cmd_tx,
+            Duration::from_secs(30),
+        );
+        (MeshRuntimeHandle::new(handle), swarm_cmd_rx)
+    }
+
+    #[test]
+    fn runtime_handle_exposes_basic_identity_and_transport_state() {
+        let (runtime, _swarm_cmd_rx) = test_runtime(MeshTransportMode::Composite);
+
+        assert_eq!(runtime.local_hostname(), "test-host");
+        assert_eq!(runtime.stream_reconnect_grace(), Duration::from_secs(30));
+        assert_eq!(
+            runtime.enabled_transports(),
+            vec![MeshTransportKind::Lan, MeshTransportKind::Iroh]
+        );
+        assert!(runtime.has_transport(MeshTransportKind::Lan));
+        assert!(runtime.has_transport(MeshTransportKind::Iroh));
+        assert_eq!(
+            MeshRuntimeHandle::from(&runtime).peer_id(),
+            runtime.peer_id()
+        );
+        assert_eq!(runtime.as_ref().peer_id(), runtime.peer_id());
+    }
+
+    #[test]
+    fn runtime_handle_scope_wraps_runtime_and_preserves_scope_metadata() {
+        let (runtime, _swarm_cmd_rx) = test_runtime(MeshTransportMode::Iroh);
+        let scope = MeshScopeId::Iroh {
+            mesh_id: "mesh-a".to_string(),
+        };
+
+        let scoped = runtime.scope(scope.clone());
+        assert_eq!(scoped.scope_id(), &scope);
+        assert_eq!(scoped.runtime().peer_id(), runtime.peer_id());
+        assert_eq!(scoped.peer_id(), runtime.peer_id());
+        assert_eq!(scoped.local_hostname(), runtime.local_hostname());
+    }
+
+    #[test]
+    fn runtime_handle_reports_injected_known_peers() {
+        let (runtime, _swarm_cmd_rx) = test_runtime(MeshTransportMode::Lan);
+        let known_peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+
+        runtime
+            .as_mesh_handle()
+            .inject_known_peer_for_test(known_peer);
+
+        assert!(runtime.is_peer_alive(&known_peer));
+        assert_eq!(runtime.known_peer_ids(), vec![known_peer]);
+    }
+
+    #[test]
+    fn subscribe_peer_events_receives_handle_broadcasts() {
+        let (runtime, _swarm_cmd_rx) = test_runtime(MeshTransportMode::Lan);
+        let mut rx = runtime.subscribe_peer_events();
+        let scope = MeshScopeId::Iroh {
+            mesh_id: "mesh-a".to_string(),
+        };
+
+        runtime.as_mesh_handle().emit_scope_joined(scope.clone());
+
+        assert!(matches!(rx.try_recv().unwrap(), MeshEvent::ScopeJoined(found) if found == scope));
+    }
+
+    #[test]
+    fn dial_peer_delegates_to_mesh_handle_command_channel() {
+        let (runtime, mut swarm_cmd_rx) = test_runtime(MeshTransportMode::Composite);
+        let remote_peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+
+        runtime.dial_peer(&remote_peer);
+
+        match swarm_cmd_rx.try_recv().unwrap() {
+            SwarmCommand::DialPeer {
+                peer_id,
+                scope,
+                reason,
+            } => {
+                assert_eq!(peer_id, remote_peer);
+                assert_eq!(scope, None);
+                assert_eq!(reason, DialReason::Manual);
+            }
+            other => panic!("expected DialPeer command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dial_peer_is_noop_in_lan_only_mode() {
+        let (runtime, mut swarm_cmd_rx) = test_runtime(MeshTransportMode::Lan);
+        let remote_peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+
+        runtime.dial_peer(&remote_peer);
+
+        assert!(swarm_cmd_rx.try_recv().is_err());
+    }
+}
