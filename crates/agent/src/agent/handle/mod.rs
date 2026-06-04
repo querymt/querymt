@@ -50,8 +50,8 @@ use agent_client_protocol::schema::{
     ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
     LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    ResumeSessionRequest, ResumeSessionResponse, SessionConfigOption, SessionInfo,
-    SetSessionModelRequest, SetSessionModelResponse,
+    ResumeSessionRequest, ResumeSessionResponse, SessionConfigOption, SetSessionModelRequest,
+    SetSessionModelResponse,
 };
 use anyhow::Result;
 use arc_swap::ArcSwap;

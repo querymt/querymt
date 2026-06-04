@@ -142,27 +142,7 @@ pub struct AuthProviderEntry {
     pub preferred_method: Option<AuthMethod>,
 }
 
-/// Summary of a session for listing.
-#[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionSummary {
-    pub session_id: String,
-    pub name: Option<String>,
-    pub cwd: Option<String>,
-    pub title: Option<String>,
-    pub created_at: Option<String>,
-    pub updated_at: Option<String>,
-    pub parent_session_id: Option<String>,
-    pub fork_origin: Option<String>,
-    pub session_kind: Option<String>,
-    pub has_children: bool,
-    #[typeshare(serialized_as = "number")]
-    pub fork_count: u64,
-    pub node: Option<String>,
-    pub node_id: Option<String>,
-    pub attached: Option<bool>,
-    pub runtime_state: Option<String>,
-}
+pub use crate::api::{SessionGroup, SessionSummary};
 
 /// Information about a remote node discovered in the kameo mesh.
 #[typeshare]
@@ -176,20 +156,6 @@ pub struct RemoteNodeInfo {
     pub capabilities: Vec<String>,
     /// Number of active sessions on the node
     pub active_sessions: u32,
-}
-
-/// Group of sessions by working directory.
-#[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionGroup {
-    pub cwd: Option<String>,
-    pub sessions: Vec<SessionSummary>,
-    pub latest_activity: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[typeshare(serialized_as = "number")]
-    pub total_count: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
 }
 
 /// Messages from UI client to server.

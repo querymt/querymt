@@ -11167,6 +11167,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "querymt-agent-py"
+version = "0.4.2"
+dependencies = [
+ "anyhow",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "querymt-agent",
+ "tokio",
+]
+
+[[package]]
 name = "querymt-cli"
 version = "0.4.2"
 dependencies = [
@@ -11245,7 +11256,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "querymt-python"
+name = "querymt-py"
 version = "0.4.2"
 dependencies = [
  "anyhow",

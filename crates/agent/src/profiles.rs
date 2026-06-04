@@ -932,6 +932,7 @@ mod tests {
     #[cfg(feature = "remote")]
     use querymt::error::LLMError;
     use std::sync::Arc;
+
     #[cfg(feature = "remote")]
     use std::time::Duration;
 

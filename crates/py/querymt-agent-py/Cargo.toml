@@ -1,12 +1,12 @@
 [package]
-name = "querymt-python"
+name = "querymt-agent-py"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "PyO3 bindings for QueryMT"
+description = "PyO3 bindings for QueryMT Agent"
 
 [lib]
-name = "querymt"
+name = "querymt_agent"
 crate-type = ["cdylib"]
 
 [features]
@@ -15,17 +15,11 @@ extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 anyhow = "1.0"
-base64.workspace = true
 pyo3 = { version = "0.28", features = ["abi3-py310"] }
 pyo3-async-runtimes = { version = "0.28", features = ["attributes", "tokio-runtime"] }
-querymt = { path = "../querymt", default-features = false, features = ["desktop"] }
-querymt-remote = { path = "../querymt-remote", features = ["kameo-mesh"] }
-querymt-utils = { path = "../querymt-utils", features = ["providers"] }
-serde_json.workspace = true
+querymt-agent = { path = "../../agent", default-features = false, features = ["api", "plugin-loaders", "remote"] }
 tokio = { version = "1.0", features = ["rt-multi-thread", "sync"] }
-futures-util = "0.3"
-log.workspace = true
 
 [package.metadata.maturin]
-name = "querymt"
+name = "querymt-agent"
 features = ["extension-module"]

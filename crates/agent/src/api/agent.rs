@@ -5,6 +5,7 @@ use super::callbacks::EventCallbacksState;
 use super::mesh::{AgentMesh, Mesh, MeshSpec};
 use super::quorum::QuorumBuilder;
 use super::session::AgentSession;
+use super::sessions::{AgentSessions, ListSessionsOptions, SessionListPage};
 use super::utils::{default_registry, latest_assistant_message, to_absolute_path};
 use crate::acp::AcpTransport;
 use crate::acp::stdio::serve_stdio;
@@ -22,7 +23,9 @@ use crate::send_agent::SendAgent;
 #[cfg(feature = "api")]
 use crate::server::AgentServer;
 use crate::session::backend::{StorageBackend, resolve_agent_db_path};
+use crate::session::projection::ViewStore;
 use crate::session::sqlite_storage::SqliteStorage;
+use crate::session::store::SessionStore;
 use agent_client_protocol::schema::{ContentBlock, NewSessionRequest, PromptRequest, TextContent};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -645,6 +648,37 @@ impl Agent {
     pub async fn chat_session(&self) -> Result<AgentSession> {
         let session_id = self.create_session().await?;
         Ok(AgentSession::new(self.inner.clone(), session_id))
+    }
+
+    pub fn sessions(&self) -> AgentSessions {
+        self.api_sessions(
+            self.storage
+                .view_store()
+                .expect("ViewStore is required for Agent::sessions()"),
+            self.storage.session_store(),
+            self.cwd.clone(),
+        )
+    }
+
+    pub(crate) fn api_sessions(
+        &self,
+        view_store: Arc<dyn ViewStore>,
+        session_store: Arc<dyn SessionStore>,
+        default_cwd: Option<PathBuf>,
+    ) -> AgentSessions {
+        AgentSessions::new(self.inner.clone(), view_store, session_store, default_cwd)
+    }
+
+    pub async fn list_sessions(&self, options: ListSessionsOptions) -> Result<SessionListPage> {
+        self.sessions().list(options).await
+    }
+
+    pub async fn load_session(&self, session_id: &str) -> Result<AgentSession> {
+        self.sessions().load(session_id).await
+    }
+
+    pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+        self.sessions().delete(session_id).await
     }
 
     pub async fn set_provider(&self, provider: &str, model: &str) -> Result<()> {

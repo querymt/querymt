@@ -18,7 +18,6 @@ impl LocalAgentHandle {
         use crate::agent::messages::SessionRuntimeStatus;
 
         const STOP_ESCALATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-        let remote_request_timeout = Self::remote_request_timeout();
 
         let session_ref = {
             let registry = self.registry.lock().await;
@@ -79,6 +78,7 @@ impl LocalAgentHandle {
         if session_ref.is_remote() {
             #[cfg(feature = "remote")]
             {
+                let remote_request_timeout = Self::remote_request_timeout();
                 let bookmark = self
                     .config
                     .provider

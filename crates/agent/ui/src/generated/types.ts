@@ -786,7 +786,6 @@ export interface ScheduleInfo {
 	updated_at: string;
 }
 
-/** Summary of a session for listing. */
 export interface SessionSummary {
 	session_id: string;
 	name?: string;
@@ -805,7 +804,6 @@ export interface SessionSummary {
 	runtime_state?: string;
 }
 
-/** Group of sessions by working directory. */
 export interface SessionGroup {
 	cwd?: string;
 	sessions: SessionSummary[];

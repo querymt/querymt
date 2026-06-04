@@ -16,6 +16,7 @@ pub mod actor_ref;
 pub(crate) mod admission;
 pub mod dht_name;
 pub mod event_forwarder;
+#[cfg(feature = "remote")]
 pub mod event_relay;
 #[cfg(feature = "remote")]
 pub mod identity;
@@ -100,6 +101,7 @@ pub use actor_ref::SessionActorRef;
 #[cfg(feature = "remote")]
 pub use cached_transport::{CachedDynMeshTransport, CachedMeshTransport};
 pub use event_forwarder::EventForwarder;
+#[cfg(feature = "remote")]
 pub use event_relay::{EventRelayActor, RelayedEvent};
 #[cfg(feature = "remote")]
 pub use mesh::join_mesh_via_invite;

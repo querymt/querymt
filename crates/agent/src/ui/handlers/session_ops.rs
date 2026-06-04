@@ -6,7 +6,9 @@
 
 use super::super::ServerState;
 use super::super::connection::{send_error, send_message, send_state, subscribe_to_file_index};
-use super::super::messages::{SessionGroup, SessionSummary, UiServerMessage};
+#[cfg(all(test, feature = "remote"))]
+use super::super::messages::SessionSummary;
+use super::super::messages::UiServerMessage;
 #[cfg(feature = "remote")]
 use super::remote::finalize_remote_session_attach;
 
@@ -17,6 +19,7 @@ use super::super::session::{
 };
 use crate::agent::LocalAgentHandle;
 use crate::agent::core::AgentMode;
+use crate::api::{AgentSessions, ListSessionsOptions, RemoteSessionMode, SessionListMode};
 use crate::events::EventEnvelope;
 use crate::index::resolve_workspace_root;
 use crate::session::domain::ForkOrigin;
@@ -29,14 +32,9 @@ use querymt::chat::ReasoningEffort;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
-#[cfg(feature = "remote")]
-use tracing::Instrument;
-#[cfg(feature = "remote")]
-use tracing::info_span;
 
-#[cfg(feature = "remote")]
+#[cfg(all(test, feature = "remote"))]
 pub(crate) fn refresh_attached_remote_summary(
     by_node: &mut std::collections::HashMap<String, Vec<SessionSummary>>,
     peer_label: &str,
@@ -62,26 +60,6 @@ pub(crate) fn refresh_attached_remote_summary(
 }
 
 // ── Session list / load ───────────────────────────────────────────────────────
-
-fn to_ui_summary(s: crate::session::projection::SessionListItem) -> SessionSummary {
-    SessionSummary {
-        session_id: s.session_id,
-        name: s.name,
-        cwd: s.cwd,
-        title: s.title,
-        created_at: s.created_at.and_then(|t| t.format(&Rfc3339).ok()),
-        updated_at: s.updated_at.and_then(|t| t.format(&Rfc3339).ok()),
-        parent_session_id: s.parent_session_id,
-        fork_origin: s.fork_origin,
-        session_kind: s.session_kind,
-        has_children: s.has_children,
-        fork_count: s.fork_count as u64,
-        node: None,
-        node_id: None,
-        attached: None,
-        runtime_state: None,
-    }
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct ListSessionsRequest {
@@ -111,305 +89,6 @@ impl ListSessionsRequest {
             ..Self::root_browse()
         }
     }
-}
-
-#[cfg(feature = "remote")]
-async fn merge_remote_bookmarks_for_list(
-    state: &ServerState,
-    groups: &mut Vec<SessionGroup>,
-) -> (usize, usize) {
-    let mut remote_group_count = 0usize;
-    let mut remote_session_count = 0usize;
-
-    let bookmarks = match state.session_store.list_remote_session_bookmarks().await {
-        Ok(bookmarks) => bookmarks,
-        Err(e) => {
-            log::warn!("Failed to load remote session bookmarks: {}", e);
-            Vec::new()
-        }
-    };
-
-    let bookmark_titles: std::collections::HashMap<String, String> = bookmarks
-        .iter()
-        .filter_map(|bookmark| {
-            bookmark
-                .title
-                .clone()
-                .map(|title| (bookmark.session_id.clone(), title))
-        })
-        .collect();
-
-    // Attached remote sessions are already in local state, so they should be
-    // listed immediately without waiting on mesh discovery.
-    let remote = {
-        let registry = state.agent.registry.lock().await;
-        registry.remote_sessions()
-    };
-    if !remote.is_empty() {
-        let cwds = state.session_cwds.lock().await;
-        for (session_id, peer_label, remote_node_id) in remote {
-            let group_cwd = format!("remote::{}", peer_label);
-            let summary = SessionSummary {
-                session_id: session_id.clone(),
-                name: bookmark_titles.get(&session_id).cloned(),
-                cwd: cwds.get(&session_id).map(|p| p.display().to_string()),
-                title: bookmark_titles.get(&session_id).cloned(),
-                created_at: None,
-                updated_at: None,
-                parent_session_id: None,
-                fork_origin: None,
-                session_kind: None,
-                has_children: false,
-                fork_count: 0,
-                node: Some(peer_label.clone()),
-                node_id: remote_node_id,
-                attached: Some(true),
-                runtime_state: None,
-            };
-
-            if let Some(existing) = groups
-                .iter_mut()
-                .find(|g| g.cwd.as_deref() == Some(group_cwd.as_str()))
-            {
-                if !existing
-                    .sessions
-                    .iter()
-                    .any(|s| s.session_id == summary.session_id)
-                {
-                    remote_session_count += 1;
-                    existing.sessions.push(summary);
-                }
-            } else {
-                remote_group_count += 1;
-                remote_session_count += 1;
-                groups.push(SessionGroup {
-                    cwd: Some(group_cwd),
-                    sessions: vec![summary],
-                    latest_activity: None,
-                    total_count: None,
-                    next_cursor: None,
-                });
-            }
-        }
-    }
-
-    // Listing persisted bookmarks is a local, read-only operation; it should
-    // not depend on mesh availability or trigger a remote attach.
-    if !bookmarks.is_empty() {
-        let registry_ids: std::collections::HashSet<String> = {
-            let registry = state.agent.registry.lock().await;
-            registry.session_ids().into_iter().collect()
-        };
-
-        for bookmark in bookmarks {
-            if registry_ids.contains(&bookmark.session_id) {
-                continue;
-            }
-
-            let group_cwd = format!("remote::{}", bookmark.peer_label);
-            let summary = SessionSummary {
-                session_id: bookmark.session_id,
-                name: bookmark.title.clone(),
-                cwd: bookmark.cwd,
-                title: bookmark.title,
-                created_at: None,
-                updated_at: None,
-                parent_session_id: None,
-                fork_origin: None,
-                session_kind: None,
-                has_children: false,
-                fork_count: 0,
-                node: Some(bookmark.peer_label.clone()),
-                node_id: Some(bookmark.node_id),
-                attached: Some(false),
-                runtime_state: Some("stopped".to_string()),
-            };
-
-            if let Some(existing) = groups
-                .iter_mut()
-                .find(|g| g.cwd.as_deref() == Some(group_cwd.as_str()))
-            {
-                if !existing
-                    .sessions
-                    .iter()
-                    .any(|s| s.session_id == summary.session_id)
-                {
-                    remote_session_count += 1;
-                    existing.sessions.push(summary);
-                }
-            } else {
-                remote_group_count += 1;
-                remote_session_count += 1;
-                groups.push(SessionGroup {
-                    cwd: Some(group_cwd),
-                    sessions: vec![summary],
-                    latest_activity: None,
-                    total_count: None,
-                    next_cursor: None,
-                });
-            }
-        }
-    }
-
-    (remote_group_count, remote_session_count)
-}
-
-#[cfg(feature = "remote")]
-async fn merge_remote_sessions_for_list(
-    state: ServerState,
-    groups: &mut Vec<SessionGroup>,
-) -> (usize, usize) {
-    let mut remote_group_count = 0usize;
-    let mut remote_session_count = 0usize;
-
-    // 1. Collect already-attached remote sessions from the registry.
-    let attached_sessions: std::collections::HashSet<String>;
-    let remote = {
-        let registry = state.agent.registry.lock().await;
-        let sessions = registry.remote_sessions();
-        attached_sessions = sessions.iter().map(|(id, _, _)| id.clone()).collect();
-        sessions
-    };
-
-    let mut by_node: std::collections::HashMap<String, Vec<SessionSummary>> =
-        std::collections::HashMap::new();
-    let bookmark_titles: std::collections::HashMap<String, String> = state
-        .session_store
-        .list_remote_session_bookmarks()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|bookmark| bookmark.title.map(|title| (bookmark.session_id, title)))
-        .collect();
-
-    let node_id_by_label: std::collections::HashMap<String, String> =
-        if state.agent.mesh().is_some() {
-            state
-                .get_remote_nodes_cached()
-                .await
-                .into_iter()
-                .map(|n| (n.hostname, n.node_id.to_string()))
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        };
-
-    if !remote.is_empty() {
-        let cwds = state.session_cwds.lock().await;
-
-        for (session_id, peer_label, remote_node_id) in remote {
-            let cwd = cwds.get(&session_id).map(|p| p.display().to_string());
-            let node_id = remote_node_id.or_else(|| node_id_by_label.get(&peer_label).cloned());
-            let title = bookmark_titles.get(&session_id).cloned();
-            by_node
-                .entry(peer_label.clone())
-                .or_default()
-                .push(SessionSummary {
-                    session_id,
-                    name: title.clone(),
-                    cwd: cwd.clone(),
-                    title,
-                    created_at: None,
-                    updated_at: None,
-                    parent_session_id: None,
-                    fork_origin: None,
-                    session_kind: None,
-                    has_children: false,
-                    fork_count: 0,
-                    node: Some(peer_label),
-                    node_id,
-                    attached: Some(true),
-                    runtime_state: None,
-                });
-        }
-    }
-
-    // 2. Query each live peer for their sessions and refresh metadata.
-    let mut confirmed_peer_sessions: std::collections::HashMap<
-        String,
-        std::collections::HashSet<String>,
-    > = std::collections::HashMap::new();
-
-    if state.agent.mesh().is_some() && !node_id_by_label.is_empty() {
-        let peer_futures: Vec<_> = node_id_by_label
-            .iter()
-            .map(|(peer_label, node_id_str)| {
-                let peer_label = peer_label.clone();
-                let node_id_str = node_id_str.clone();
-                let state = state.clone();
-                async move {
-                    let sessions =
-                        match tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                            let nm_ref = state.agent.find_node_manager(&node_id_str).await?;
-                            state.agent.list_remote_sessions(&nm_ref, None, None).await
-                        })
-                        .await
-                        {
-                            Ok(Ok(response)) => response.sessions,
-                            Ok(Err(_)) | Err(_) => return None,
-                        };
-                    Some((peer_label, node_id_str, sessions))
-                }
-            })
-            .collect();
-
-        let peer_results = futures_util::future::join_all(peer_futures).await;
-
-        for result in peer_results.into_iter().flatten() {
-            let (peer_label, node_id_str, sessions) = result;
-
-            let confirmed_ids: std::collections::HashSet<String> =
-                sessions.iter().map(|s| s.session_id.clone()).collect();
-            confirmed_peer_sessions.insert(peer_label.clone(), confirmed_ids);
-
-            for session_info in sessions {
-                if attached_sessions.contains(&session_info.session_id) {
-                    let _ = refresh_attached_remote_summary(
-                        &mut by_node,
-                        &peer_label,
-                        &node_id_str,
-                        &session_info,
-                    );
-                    continue;
-                }
-
-                by_node
-                    .entry(peer_label.clone())
-                    .or_default()
-                    .push(SessionSummary {
-                        session_id: session_info.session_id,
-                        name: session_info.title.clone(),
-                        cwd: session_info.cwd,
-                        title: session_info.title,
-                        created_at: None,
-                        updated_at: None,
-                        parent_session_id: None,
-                        fork_origin: None,
-                        session_kind: None,
-                        has_children: false,
-                        fork_count: 0,
-                        node: Some(peer_label.clone()),
-                        node_id: Some(node_id_str.clone()),
-                        attached: Some(false),
-                        runtime_state: session_info.runtime_state,
-                    });
-            }
-        }
-    }
-
-    for (node_label, sessions) in by_node {
-        remote_group_count += 1;
-        remote_session_count += sessions.len();
-        groups.push(SessionGroup {
-            cwd: Some(format!("remote::{}", node_label)),
-            sessions,
-            latest_activity: None,
-            total_count: None,
-            next_cursor: None,
-        });
-    }
-
-    (remote_group_count, remote_session_count)
 }
 
 /// Handle session listing request.
@@ -444,85 +123,53 @@ pub async fn handle_list_sessions(
         session_scope,
         include_remote,
     } = request;
-    let page_limit = limit.unwrap_or(20).clamp(1, 200) as usize;
-    let mode = mode.unwrap_or_else(|| "browse".to_string());
+    let mode_name = mode.unwrap_or_else(|| "browse".to_string());
     let session_scope = session_scope.unwrap_or_default();
-    let is_browse_first_page = mode == "browse" && cursor.is_none();
+    let is_browse_first_page = mode_name == "browse" && cursor.is_none();
     let should_merge_remote = include_remote
         && is_browse_first_page
         && matches!(session_scope, SessionScope::Root | SessionScope::All);
 
-    let to_ui_group = |g: crate::session::projection::SessionGroup| SessionGroup {
-        cwd: g.cwd,
-        latest_activity: g.latest_activity.and_then(|t| t.format(&Rfc3339).ok()),
-        total_count: Some(g.total_count.unwrap_or(g.sessions.len()) as u64),
-        next_cursor: g.next_cursor,
-        sessions: g.sessions.into_iter().map(to_ui_summary).collect(),
+    let mode = match mode_name.as_str() {
+        "group" => SessionListMode::Group,
+        "search" => SessionListMode::Search,
+        _ => SessionListMode::Browse,
+    };
+    let remote = if should_merge_remote {
+        RemoteSessionMode::Bookmarks
+    } else {
+        RemoteSessionMode::None
     };
 
-    let result = match mode.as_str() {
-        "group" => {
-            let cwd_value = match cwd.as_deref() {
-                Some("__none__") => None,
-                _ => cwd,
-            };
-            state
-                .view_store
-                .list_group_sessions(cwd_value, cursor, page_limit, session_scope)
-                .await
-                .map(|(group, total)| {
-                    let next_cursor = group.next_cursor.clone();
-                    (vec![to_ui_group(group)], next_cursor, total)
-                })
-        }
-        "search" => {
-            let q = query.unwrap_or_default();
-            state
-                .view_store
-                .search_sessions(q, cursor, page_limit, session_scope)
-                .await
-                .map(|(groups, next_cursor, total)| {
-                    (
-                        groups.into_iter().map(to_ui_group).collect(),
-                        next_cursor,
-                        total,
-                    )
-                })
-        }
-        _ => state
-            .view_store
-            .browse_session_groups(cursor, page_limit, 10, session_scope)
-            .await
-            .map(|(groups, next_cursor, total)| {
-                (
-                    groups.into_iter().map(to_ui_group).collect(),
-                    next_cursor,
-                    total,
-                )
-            }),
-    };
-
-    let (mut groups, next_cursor, total_count) = match result {
-        Ok(v) => v,
+    let page = match AgentSessions::new(
+        state.agent.clone(),
+        state.view_store.clone(),
+        state.session_store.clone(),
+        state.default_cwd.clone(),
+    )
+    .list(ListSessionsOptions {
+        mode,
+        cursor,
+        limit,
+        cwd,
+        query,
+        session_scope: Some(session_scope),
+        remote,
+    })
+    .await
+    {
+        Ok(page) => page,
         Err(e) => {
             let _ = send_error(tx, format!("Failed to list sessions: {}", e)).await;
             return;
         }
     };
 
-    #[cfg(feature = "remote")]
-    let mut bookmark_group_count = 0usize;
-    #[cfg(feature = "remote")]
-    let mut bookmark_session_count = 0usize;
-    #[cfg(feature = "remote")]
-    if should_merge_remote {
-        (bookmark_group_count, bookmark_session_count) =
-            merge_remote_bookmarks_for_list(state, &mut groups).await;
-    }
-
+    let groups = page.groups;
+    let next_cursor = page.next_cursor;
+    let total_count = page.total_count;
     let local_group_count = groups.len();
     let local_session_count: usize = groups.iter().map(|g| g.sessions.len()).sum();
-    let total_group_count_after_bookmarks = groups.len();
 
     let span = tracing::Span::current();
     span.record("local_group_count", local_group_count);
@@ -535,7 +182,7 @@ pub async fn handle_list_sessions(
         UiServerMessage::SessionList {
             groups: groups.clone(),
             next_cursor: next_cursor.clone(),
-            total_count: total_count as u64,
+            total_count,
         },
     )
     .await;
@@ -546,9 +193,9 @@ pub async fn handle_list_sessions(
         operation = "ui.list_sessions.first_send",
         local_group_count,
         local_session_count,
-        remote_group_count = bookmark_group_count,
-        remote_session_count = bookmark_session_count,
-        total_group_count = total_group_count_after_bookmarks,
+        remote_group_count = 0usize,
+        remote_session_count = 0usize,
+        total_group_count = local_group_count,
         total_session_count = local_session_count,
         view_fetch_ms = started.elapsed().as_millis() as u64,
         first_send_ms,
@@ -561,23 +208,41 @@ pub async fn handle_list_sessions(
         let state = state.clone();
         let tx = tx.clone();
         let next_cursor = next_cursor.clone();
-        let mut merged_groups = groups;
         tokio::spawn(async move {
             let remote_merge_started = Instant::now();
-            let (live_remote_group_count, live_remote_session_count) =
-                merge_remote_sessions_for_list(state, &mut merged_groups)
-                    .instrument(info_span!("ui.handle_list_sessions.remote_merge"))
-                    .await;
+            let page = match AgentSessions::new(
+                state.agent.clone(),
+                state.view_store.clone(),
+                state.session_store.clone(),
+                state.default_cwd.clone(),
+            )
+            .list(ListSessionsOptions {
+                mode,
+                cursor: None,
+                limit: Some(20),
+                cwd: None,
+                query: None,
+                session_scope: Some(session_scope),
+                remote: RemoteSessionMode::Live,
+            })
+            .await
+            {
+                Ok(page) => page,
+                Err(err) => {
+                    tracing::debug!(target: "querymt_agent::ui::handlers", error = %err, "remote session merge failed");
+                    return;
+                }
+            };
 
-            let total_group_count = merged_groups.len();
-            let total_session_count: usize = merged_groups.iter().map(|g| g.sessions.len()).sum();
+            let total_group_count = page.groups.len();
+            let total_session_count: usize = page.groups.iter().map(|g| g.sessions.len()).sum();
 
             let _ = send_message(
                 &tx,
                 UiServerMessage::SessionList {
-                    groups: merged_groups,
+                    groups: page.groups,
                     next_cursor,
-                    total_count: total_count as u64,
+                    total_count,
                 },
             )
             .await;
@@ -587,8 +252,8 @@ pub async fn handle_list_sessions(
                 operation = "ui.list_sessions.remote_merge",
                 local_group_count,
                 local_session_count,
-                remote_group_count = bookmark_group_count + live_remote_group_count,
-                remote_session_count = bookmark_session_count + live_remote_session_count,
+                remote_group_count = total_group_count.saturating_sub(local_group_count),
+                remote_session_count = total_session_count.saturating_sub(local_session_count),
                 total_group_count,
                 total_session_count,
                 first_send_ms,
@@ -601,9 +266,9 @@ pub async fn handle_list_sessions(
 
     #[cfg(feature = "remote")]
     if should_merge_remote && state.agent.mesh().is_none() {
-        span.record("remote_group_count", bookmark_group_count);
-        span.record("remote_session_count", bookmark_session_count);
-        span.record("total_group_count", total_group_count_after_bookmarks);
+        span.record("remote_group_count", 0usize);
+        span.record("remote_session_count", 0usize);
+        span.record("total_group_count", local_group_count);
         span.record("total_session_count", local_session_count);
         span.record("remote_merge_ms", 0u64);
         span.record("total_ms", started.elapsed().as_millis() as u64);
@@ -613,7 +278,7 @@ pub async fn handle_list_sessions(
     {
         span.record("remote_group_count", 0usize);
         span.record("remote_session_count", 0usize);
-        span.record("total_group_count", total_group_count_after_bookmarks);
+        span.record("total_group_count", local_group_count);
         span.record("total_session_count", local_session_count);
         span.record("remote_merge_ms", 0u64);
         span.record("total_ms", started.elapsed().as_millis() as u64);
@@ -641,14 +306,16 @@ pub async fn handle_list_session_children(
         }
     }
 
-    let page_limit = limit.unwrap_or(20).clamp(1, 200) as usize;
-    let result = state
-        .view_store
-        .list_session_children(parent_session_id.clone(), cursor, page_limit)
-        .await;
-
-    let (group, total_count) = match result {
-        Ok(v) => v,
+    let page = match AgentSessions::new(
+        state.agent.clone(),
+        state.view_store.clone(),
+        state.session_store.clone(),
+        state.default_cwd.clone(),
+    )
+    .children(parent_session_id.clone(), cursor, limit)
+    .await
+    {
+        Ok(page) => page,
         Err(e) => {
             let _ = send_error(tx, format!("Failed to list session children: {}", e)).await;
             return;
@@ -659,9 +326,9 @@ pub async fn handle_list_session_children(
         tx,
         UiServerMessage::SessionChildren {
             parent_session_id,
-            sessions: group.sessions.into_iter().map(to_ui_summary).collect(),
-            next_cursor: group.next_cursor,
-            total_count: total_count as u64,
+            sessions: page.sessions,
+            next_cursor: page.next_cursor,
+            total_count: page.total_count,
         },
     )
     .await;

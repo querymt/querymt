@@ -10,7 +10,7 @@ From the repository root:
 python -m venv .venv
 source .venv/bin/activate
 pip install maturin
-maturin develop --manifest-path crates/querymt-python/Cargo.toml
+maturin develop --manifest-path crates/py/querymt-py/Cargo.toml
 ```
 
 Then verify the module imports:
@@ -40,12 +40,12 @@ asyncio.run(main())
 
 ## Examples
 
-- `crates/querymt-python/examples/chat.py`
-- `crates/querymt-python/examples/stream_chat.py`
-- `crates/querymt-python/examples/tools_chat.py`
-- `crates/querymt-python/examples/tools_stream_chat.py`
-- `crates/querymt-python/examples/share_provider.py`
-- `crates/querymt-python/examples/remote_chat.py`
+- `crates/py/querymt-py/examples/chat.py`
+- `crates/py/querymt-py/examples/stream_chat.py`
+- `crates/py/querymt-py/examples/tools_chat.py`
+- `crates/py/querymt-py/examples/tools_stream_chat.py`
+- `crates/py/querymt-py/examples/share_provider.py`
+- `crates/py/querymt-py/examples/remote_chat.py`
 
 ## Tool Calling
 

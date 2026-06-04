@@ -11,7 +11,8 @@ members = [
     "crates/providers/*",
     "crates/querymt-extism-macros",
     "crates/querymt-mobile-ffi",
-    "crates/querymt-python",
+    "crates/py/querymt-py",
+    "crates/py/querymt-agent-py",
 ]
 
 [workspace.package]

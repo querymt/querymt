@@ -1,6 +1,8 @@
+#[cfg(feature = "kameo-mesh")]
+use crate::{MeshRuntimeHandle, scoped_provider_catalog, scoped_provider_host};
 use crate::{
-    MeshRuntimeHandle, ProviderCatalogActor, ProviderCatalogBackend, ProviderHostActor,
-    RemoteProviderBackend, RemoteProviderHostError, scoped_provider_catalog, scoped_provider_host,
+    ProviderCatalogActor, ProviderCatalogBackend, ProviderHostActor, RemoteProviderBackend,
+    RemoteProviderHostError,
 };
 use kameo::actor::{ActorRef, Spawn};
 use std::sync::Arc;
@@ -32,6 +34,7 @@ impl ProviderShare {
         &self.provider_catalog
     }
 
+    #[cfg(feature = "kameo-mesh")]
     pub async fn register_on_mesh(&self, runtime: &MeshRuntimeHandle) {
         for scope in runtime.active_scopes() {
             runtime

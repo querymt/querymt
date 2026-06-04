@@ -63,6 +63,7 @@ mod config;
 pub mod mesh;
 mod quorum;
 mod session;
+mod sessions;
 mod utils;
 
 // Re-export public API types
@@ -71,6 +72,13 @@ pub use config::{DelegateConfigBuilder, PlannerConfigBuilder};
 pub use mesh::{AgentMesh, Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec};
 pub use quorum::QuorumBuilder;
 pub use session::AgentSession;
+pub use sessions::{
+    AgentLoadedSession, AgentSessions, ListSessionsOptions, RemoteSessionMode, SessionChildrenPage,
+    SessionGroup, SessionListMode, SessionListPage, SessionSummary,
+};
+
+#[cfg(test)]
+mod agent_tests;
 
 // Re-export callback types for public use
 pub use callbacks::{
