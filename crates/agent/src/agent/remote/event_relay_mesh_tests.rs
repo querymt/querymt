@@ -29,7 +29,8 @@ mod event_relay_mesh_tests {
     /// (relay_ref, event_sink, dht_name).
     async fn setup_relay(
         label: &str,
-        test_id: &str,
+        _test_id: &str,
+        session_id: &str,
     ) -> (
         kameo::actor::ActorRef<EventRelayActor>,
         Arc<EventSink>,
@@ -40,12 +41,18 @@ mod event_relay_mesh_tests {
         let journal = storage.event_journal();
         let fanout = Arc::new(EventFanout::new());
         let event_sink = Arc::new(EventSink::new(journal, fanout));
-        let relay = EventRelayActor::new(event_sink.clone(), label.to_string());
+        let relay = EventRelayActor::new(
+            event_sink.clone(),
+            session_id.to_string(),
+            label.to_string(),
+            None,
+            None,
+        );
         let relay_ref = EventRelayActor::spawn(relay);
 
         let dht_name = crate::agent::remote::scope::scoped_event_relay(
             &crate::agent::remote::scope::MeshScopeId::lan_default(),
-            &format!("{}-{}", label, test_id),
+            session_id,
             mesh.peer_id(),
         );
         mesh.register_actor(relay_ref.clone(), dht_name.clone())
@@ -62,7 +69,7 @@ mod event_relay_mesh_tests {
     async fn test_event_forwarder_sends_to_registered_relay() {
         let test_id = Uuid::now_v7().to_string();
         let mesh = get_test_mesh().await;
-        let (relay_ref, event_sink, dht_name) = setup_relay("f1", &test_id).await;
+        let (relay_ref, event_sink, dht_name) = setup_relay("f1", &test_id, "s-f1").await;
         let _ = relay_ref; // keep alive
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -119,7 +126,7 @@ mod event_relay_mesh_tests {
     async fn test_event_forwarding_multiple_events_ordered() {
         let test_id = Uuid::now_v7().to_string();
         let mesh = get_test_mesh().await;
-        let (relay_ref, event_sink, dht_name) = setup_relay("f2", &test_id).await;
+        let (relay_ref, event_sink, dht_name) = setup_relay("f2", &test_id, "s-f2").await;
         let _ = relay_ref;
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -184,7 +191,7 @@ mod event_relay_mesh_tests {
     #[tokio::test]
     async fn test_event_relay_received_counter_increments() {
         let test_id = Uuid::now_v7().to_string();
-        let (_relay_ref, event_sink, _dht_name) = setup_relay("f3", &test_id).await;
+        let (_relay_ref, event_sink, _dht_name) = setup_relay("f3", &test_id, "s-f3").await;
 
         let mut rx = event_sink.fanout().subscribe();
 
@@ -246,7 +253,13 @@ mod event_relay_mesh_tests {
         let journal = storage.event_journal();
         let fanout = Arc::new(EventFanout::new());
         let relay_sink = Arc::new(EventSink::new(journal, fanout));
-        let relay = EventRelayActor::new(relay_sink.clone(), "f4-relay".to_string());
+        let relay = EventRelayActor::new(
+            relay_sink.clone(),
+            session_id.clone(),
+            "f4-relay".to_string(),
+            None,
+            None,
+        );
         let relay_ref = EventRelayActor::spawn(relay);
         mesh.register_actor(relay_ref.clone(), relay_dht_name.clone())
             .await;
@@ -393,7 +406,13 @@ mod event_relay_mesh_tests {
         let journal = storage.event_journal();
         let fanout = Arc::new(EventFanout::new());
         let relay_sink = Arc::new(EventSink::new(journal, fanout));
-        let relay = EventRelayActor::new(relay_sink.clone(), "f5-ready-relay".to_string());
+        let relay = EventRelayActor::new(
+            relay_sink.clone(),
+            session_id.clone(),
+            "f5-ready-relay".to_string(),
+            None,
+            None,
+        );
         let relay_ref = EventRelayActor::spawn(relay);
         mesh.register_actor(relay_ref.clone(), relay_dht_name.clone())
             .await;
@@ -441,7 +460,8 @@ mod event_relay_mesh_tests {
     async fn test_event_forwarder_filters_by_session_id() {
         let test_id = Uuid::now_v7().to_string();
         let mesh = get_test_mesh().await;
-        let (relay_ref, event_sink, dht_name) = setup_relay("f5b", &test_id).await;
+        let (relay_ref, event_sink, dht_name) =
+            setup_relay("f5b", &test_id, "target-session").await;
         let _ = relay_ref; // keep alive
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -515,9 +535,9 @@ mod event_relay_mesh_tests {
         let mesh = get_test_mesh().await;
 
         // Set up 3 relays (simulating 3 attached remote sessions on local side)
-        let (relay_ref_a, sink_a, dht_a) = setup_relay("multi-a", &test_id).await;
-        let (relay_ref_b, sink_b, dht_b) = setup_relay("multi-b", &test_id).await;
-        let (relay_ref_c, sink_c, dht_c) = setup_relay("multi-c", &test_id).await;
+        let (relay_ref_a, sink_a, dht_a) = setup_relay("multi-a", &test_id, "session-a").await;
+        let (relay_ref_b, sink_b, dht_b) = setup_relay("multi-b", &test_id, "session-b").await;
+        let (relay_ref_c, sink_c, dht_c) = setup_relay("multi-c", &test_id, "session-c").await;
         let _ = (relay_ref_a, relay_ref_b, relay_ref_c);
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -625,7 +645,13 @@ mod event_relay_mesh_tests {
         let journal = storage.event_journal();
         let fanout = Arc::new(EventFanout::new());
         let relay_sink = Arc::new(EventSink::new(journal, fanout));
-        let relay = EventRelayActor::new(relay_sink, "f6-relay".to_string());
+        let relay = EventRelayActor::new(
+            relay_sink,
+            session_id.clone(),
+            "f6-relay".to_string(),
+            None,
+            None,
+        );
         let relay_ref = EventRelayActor::spawn(relay);
         mesh.register_actor(relay_ref.clone(), relay_dht_name.clone())
             .await;

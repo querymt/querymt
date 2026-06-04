@@ -179,6 +179,12 @@ pub enum AgentEventKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
     },
+    /// Ephemeral signal emitted when an attached remote session disconnects.
+    RemoteSessionDisconnected {
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        node_id: Option<String>,
+    },
     /// Ephemeral signal emitted when a remote provider host reports liveness while waiting.
     RemoteProviderHeartbeat {
         phase: String,
@@ -679,6 +685,7 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         AgentEventKind::AssistantThinkingDelta { .. } => Durability::Ephemeral,
         AgentEventKind::RemoteStreamDisconnected { .. } => Durability::Ephemeral,
         AgentEventKind::RemoteStreamReconnected { .. } => Durability::Ephemeral,
+        AgentEventKind::RemoteSessionDisconnected { .. } => Durability::Ephemeral,
         AgentEventKind::RemoteProviderHeartbeat { .. } => Durability::Ephemeral,
         AgentEventKind::StreamRecovering { .. } => Durability::Ephemeral,
 
@@ -948,6 +955,15 @@ mod tests {
         let kind = AgentEventKind::AssistantThinkingDelta {
             content: "hmm".into(),
             message_id: "m1".into(),
+        };
+        assert_eq!(classify_durability(&kind), Durability::Ephemeral);
+    }
+
+    #[test]
+    fn classify_remote_session_disconnected_is_ephemeral() {
+        let kind = AgentEventKind::RemoteSessionDisconnected {
+            message: "peer disconnected".into(),
+            node_id: Some("node-1".into()),
         };
         assert_eq!(classify_durability(&kind), Durability::Ephemeral);
     }

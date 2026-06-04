@@ -11,7 +11,8 @@ use super::{DialReason, SwarmCommand};
 use super::{MeshEvent, MeshRoute, MeshTransportMode, RouteTable};
 use querymt_remote::{
     InviteError, InviteGrant, InvitePermissions, InviteStore, MeshScopeId, MeshStateStore,
-    NodeId, PeerEntry, SignedInviteGrant, mesh_id_for, scoped_node_manager_for_peer,
+    NodeId, PeerEntry, SignedInviteGrant, ask_remote_with_timeout, mesh_id_for,
+    scoped_node_manager_for_peer,
 };
 
 /// Type alias for a boxed re-registration closure.
@@ -307,7 +308,13 @@ impl MeshHandle {
                 continue;
             };
 
-            let node_info = match node_manager.ask::<GetNodeInfo>(&GetNodeInfo).await {
+            let node_info = match ask_remote_with_timeout(
+                &node_manager,
+                &GetNodeInfo,
+                std::time::Duration::from_secs(3),
+            )
+            .await
+            {
                 Ok(info) => info,
                 Err(e) => {
                     log::debug!(

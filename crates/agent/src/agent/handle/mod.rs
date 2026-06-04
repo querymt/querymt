@@ -237,10 +237,8 @@ pub(crate) type SchedulerHandleSlot = Arc<ParkingMutex<Option<crate::scheduler::
 // concurrent remote node discovery operations.
 
 #[cfg(feature = "remote")]
-type RemoteNodeInfoResult = Result<
-    Result<crate::agent::remote::NodeInfo, kameo::error::RemoteSendError<crate::error::AgentError>>,
-    tokio::time::error::Elapsed,
->;
+type RemoteNodeInfoResult =
+    Result<crate::agent::remote::NodeInfo, kameo::error::RemoteSendError<crate::error::AgentError>>;
 
 #[cfg(feature = "remote")]
 type RemoteNodeLookupResult = (String, Option<libp2p::PeerId>, RemoteNodeInfoResult);

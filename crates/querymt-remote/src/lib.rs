@@ -38,6 +38,8 @@ pub mod provider_transport;
 pub mod qr;
 pub mod remote_chat_provider;
 #[cfg(feature = "kameo-mesh")]
+pub mod request_timeout;
+#[cfg(feature = "kameo-mesh")]
 pub mod runtime_handle;
 pub mod runtime_helpers;
 pub mod scope;
@@ -51,7 +53,7 @@ pub use mesh_config::{MeshError, MeshTransportMode};
 #[cfg(feature = "kameo-mesh")]
 pub use mesh_events::{MeshEvent, PeerEvent};
 #[cfg(feature = "kameo-mesh")]
-pub use mesh_handle::{MeshHandle, ReRegisterFn};
+pub use mesh_handle::{MeshHandle, ReRegisterFn, RemoteLookupError};
 #[cfg(feature = "kameo-mesh")]
 pub use mesh_routes::{MeshRoute, RouteTable};
 #[cfg(feature = "kameo-mesh")]
@@ -102,6 +104,8 @@ pub use provider_transport::{
     remote_send_error_to_llm_error_no_handler, should_retry_remote_send,
 };
 pub use remote_chat_provider::RemoteChatProvider;
+#[cfg(feature = "kameo-mesh")]
+pub use request_timeout::ask_remote_with_timeout;
 #[cfg(feature = "kameo-mesh")]
 pub use runtime_handle::{MeshRuntimeHandle, MeshScopeHandle};
 pub use runtime_helpers::{enabled_transports_from_mode, mode_has_transport, scoped_actor_name};

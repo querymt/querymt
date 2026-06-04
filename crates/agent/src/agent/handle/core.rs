@@ -7,7 +7,28 @@ impl LocalAgentHandle {
     /// This is the canonical way to create a `LocalAgentHandle` after building
     /// an `AgentConfig` via `AgentConfigBuilder::build()`.
     pub fn from_config(config: Arc<AgentConfig>) -> Self {
-        let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
+        #[cfg(feature = "remote")]
+        let (remote_disconnect_tx, mut remote_disconnect_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+        let mut registry_inner = SessionRegistry::new(config.clone());
+        #[cfg(feature = "remote")]
+        registry_inner.set_remote_disconnect_tx(remote_disconnect_tx);
+        let registry = Arc::new(Mutex::new(registry_inner));
+        #[cfg(feature = "remote")]
+        {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                while let Some(disconnect) = remote_disconnect_rx.recv().await {
+                    let mut registry = registry.lock().await;
+                    let _ = registry
+                        .detach_remote_session_if_relay_matches(
+                            &disconnect.session_id,
+                            disconnect.relay_actor_id,
+                        )
+                        .await;
+                }
+            });
+        }
         let session_materializer = Arc::new(SessionMaterializer::new(config.clone()));
         let model_inventory = crate::model_inventory::ModelInventory::new(config.clone());
         let oauth_service = crate::auth::service::OAuthService::new(

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::mesh_events::MeshEvent;
@@ -16,6 +17,14 @@ use crate::{
 };
 
 pub type ReRegisterFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum RemoteLookupError {
+    #[error("remote actor lookup timed out after {timeout:?}")]
+    Timeout { timeout: Duration },
+    #[error(transparent)]
+    Registry(#[from] kameo::error::RegistryError),
+}
 
 type PeerNodeResolver = Arc<
     dyn Fn(&MeshHandle, &str) -> Pin<Box<dyn Future<Output = Option<NodeId>> + Send>> + Send + Sync,
@@ -184,6 +193,34 @@ impl MeshHandle {
     {
         let name: String = name.into();
         kameo::actor::RemoteActorRef::<A>::lookup(name).await
+    }
+
+    pub async fn lookup_actor_with_timeout<A>(
+        &self,
+        name: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Option<kameo::actor::RemoteActorRef<A>>, RemoteLookupError>
+    where
+        A: kameo::Actor + kameo::remote::RemoteActor,
+    {
+        match tokio::time::timeout(timeout, self.lookup_actor::<A>(name)).await {
+            Ok(result) => result.map_err(RemoteLookupError::from),
+            Err(_) => Err(RemoteLookupError::Timeout { timeout }),
+        }
+    }
+
+    pub async fn lookup_actor_no_retry_with_timeout<A>(
+        &self,
+        name: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Option<kameo::actor::RemoteActorRef<A>>, RemoteLookupError>
+    where
+        A: kameo::Actor + kameo::remote::RemoteActor,
+    {
+        match tokio::time::timeout(timeout, self.lookup_actor_no_retry::<A>(name)).await {
+            Ok(result) => result.map_err(RemoteLookupError::from),
+            Err(_) => Err(RemoteLookupError::Timeout { timeout }),
+        }
     }
 
     pub fn lookup_all_actors<A>(&self, name: impl Into<String>) -> remote::LookupStream<A>

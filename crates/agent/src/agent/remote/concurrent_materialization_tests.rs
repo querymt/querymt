@@ -309,13 +309,15 @@ mod tests {
         // While creations are running, repeatedly assert GetNodeInfo completes
         // within a bounded timeout instead of getting stuck behind mailbox work.
         for _ in 0..5 {
-            let result =
-                tokio::time::timeout(Duration::from_secs(1), actor_ref.ask(GetNodeInfo)).await;
+            let result = actor_ref
+                .ask(GetNodeInfo)
+                .mailbox_timeout(Duration::from_secs(1))
+                .reply_timeout(Duration::from_secs(1))
+                .send()
+                .await;
 
-            match result {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => panic!("GetNodeInfo should succeed under load: {e:?}"),
-                Err(_) => panic!("GetNodeInfo timed out under load"),
+            if let Err(e) = result {
+                panic!("GetNodeInfo should succeed under load: {e:?}");
             }
 
             tokio::time::sleep(Duration::from_millis(20)).await;

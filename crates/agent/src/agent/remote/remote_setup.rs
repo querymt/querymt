@@ -201,6 +201,7 @@ async fn register_remote_agent(
     _peer_addr: &str,
 ) -> Result<(AgentInfo, Option<String>)> {
     use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
+    use querymt_remote::ask_remote_with_timeout;
 
     // Prefer peer-specific DHT names so multi-peer meshes do not bind to the
     // first generic node_manager provider returned by the DHT.
@@ -214,19 +215,17 @@ async fn register_remote_agent(
         target_node_id = Some(resolved_id.clone());
         for scope in runtime.active_scopes() {
             let dht_name = super::scope::scoped_node_manager_for_peer(&scope, &resolved_id);
-            let lookup_result = tokio::time::timeout(
-                lookup_timeout,
-                runtime.lookup_actor::<RemoteNodeManager>(dht_name.clone()),
-            )
-            .await;
-
-            match lookup_result {
-                Ok(Ok(Some(node_manager_ref))) => {
+            match runtime
+                .lookup_actor_with_timeout::<RemoteNodeManager>(dht_name.clone(), lookup_timeout)
+                .await
+            {
+                Ok(Some(node_manager_ref)) => {
                     found_ref = Some(node_manager_ref);
                     break;
                 }
-                Ok(Ok(None)) => {}
-                Ok(Err(e)) => {
+                Ok(None) => {}
+                Err(querymt_remote::RemoteLookupError::Timeout { .. }) => {}
+                Err(e) => {
                     log::debug!(
                         "DHT lookup error for peer '{}' under '{}': {}",
                         remote.peer,
@@ -234,33 +233,34 @@ async fn register_remote_agent(
                         e
                     );
                 }
-                Err(_timeout) => {}
             }
         }
     }
 
     match found_ref {
-        Some(node_manager_ref) => match node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
-            Ok(node_info) => {
-                tracing::Span::current()
-                    .record("reachable", true)
-                    .record("peer_hostname", &node_info.hostname);
-                target_node_id = Some(node_info.node_id.to_string());
-                log::debug!(
-                    "Peer '{}' reachable (hostname='{}')",
-                    remote.peer,
-                    node_info.hostname
-                );
+        Some(node_manager_ref) => {
+            match ask_remote_with_timeout(&node_manager_ref, &GetNodeInfo, lookup_timeout).await {
+                Ok(node_info) => {
+                    tracing::Span::current()
+                        .record("reachable", true)
+                        .record("peer_hostname", &node_info.hostname);
+                    target_node_id = Some(node_info.node_id.to_string());
+                    log::debug!(
+                        "Peer '{}' reachable (hostname='{}')",
+                        remote.peer,
+                        node_info.hostname
+                    );
+                }
+                Err(e) => {
+                    tracing::Span::current().record("reachable", false);
+                    log::debug!(
+                        "GetNodeInfo failed for peer '{}': {} (registering anyway)",
+                        remote.peer,
+                        e
+                    );
+                }
             }
-            Err(e) => {
-                tracing::Span::current().record("reachable", false);
-                log::debug!(
-                    "GetNodeInfo failed for peer '{}': {} (registering anyway)",
-                    remote.peer,
-                    e
-                );
-            }
-        },
+        }
         None => {
             tracing::Span::current().record("reachable", false);
             log::debug!(

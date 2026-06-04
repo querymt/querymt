@@ -187,6 +187,17 @@ impl LocalAgentHandle {
     }
 
     #[cfg(feature = "remote")]
+    pub(super) fn remote_request_timeout() -> std::time::Duration {
+        let default_ms = 10_000_u64;
+        let timeout_ms = std::env::var("QUERYMT_REMOTE_REQUEST_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default_ms);
+        std::time::Duration::from_millis(timeout_ms)
+    }
+
+    #[cfg(feature = "remote")]
     pub(super) fn remote_node_lookup_parallelism() -> usize {
         std::env::var("QUERYMT_REMOTE_NODE_LOOKUP_CONCURRENCY")
             .ok()

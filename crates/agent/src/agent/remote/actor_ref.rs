@@ -445,10 +445,17 @@ impl SessionActorRef {
     /// Shutdown this session actor gracefully (local only for now).
     pub async fn shutdown(&self) -> Result<(), AgentError> {
         match self {
-            Self::Local(actor_ref) => actor_ref
-                .tell(messages::Shutdown)
-                .await
-                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+            Self::Local(actor_ref) => {
+                actor_ref
+                    .tell(messages::Shutdown)
+                    .await
+                    .map_err(|e| AgentError::RemoteActor(e.to_string()))?;
+                actor_ref
+                    .wait_for_shutdown_result()
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| AgentError::RemoteActor(e.to_string()))
+            }
 
             #[cfg(feature = "remote")]
             Self::Remote { .. } => {

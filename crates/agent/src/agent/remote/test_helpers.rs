@@ -371,6 +371,7 @@ pub(crate) mod fixtures {
             let mesh = get_test_mesh().await;
             let f = AgentConfigFixture::new().await;
             let registry = Arc::new(Mutex::new(SessionRegistry::new(f.config.clone())));
+            registry.lock().await.set_mesh(Some(mesh.clone()));
             let nm = RemoteNodeManager::new(
                 f.config.clone(),
                 registry,
@@ -412,6 +413,7 @@ pub(crate) mod fixtures {
             let mesh = get_test_mesh().await;
             let f = AgentConfigFixture::new().await;
             let registry = Arc::new(Mutex::new(SessionRegistry::new(f.config.clone())));
+            registry.lock().await.set_mesh(Some(mesh.clone()));
             let nm = RemoteNodeManager::new(
                 f.config.clone(),
                 registry,
@@ -421,8 +423,31 @@ pub(crate) mod fixtures {
             let actor_ref = RemoteNodeManager::spawn(nm);
 
             let dht_name = format!("scope::lan::default::node_manager::{}-{}", label, test_id);
-            mesh.register_actor(actor_ref.clone(), dht_name.clone())
-                .await;
+            let registration_name = dht_name.clone();
+            let mesh_for_registration = mesh.clone();
+            let actor_ref_for_registration = actor_ref.clone();
+            mesh_runtime()
+                .spawn(async move {
+                    mesh_for_registration
+                        .register_actor(
+                            actor_ref_for_registration.clone(),
+                            registration_name.clone(),
+                        )
+                        .await;
+
+                    let looked_up = mesh_for_registration
+                        .lookup_actor::<RemoteNodeManager>(registration_name.clone())
+                        .await
+                        .expect("node manager self-lookup failed after registration")
+                        .expect("node manager self-lookup returned none after registration");
+                    assert_eq!(
+                        looked_up.id(),
+                        actor_ref_for_registration.id(),
+                        "registered node manager lookup should resolve to the same actor id"
+                    );
+                })
+                .await
+                .expect("node manager registration task panicked");
 
             Self {
                 actor_ref,
@@ -526,8 +551,17 @@ pub(crate) mod fixtures {
                 &crate::agent::remote::scope::MeshScopeId::lan_default(),
                 &format!("alpha-{}", test_id),
             );
-            mesh.register_actor(actor_ref.clone(), provider_host_dht.clone())
-                .await;
+            let mesh_for_registration = mesh.clone();
+            let actor_ref_for_registration = actor_ref.clone();
+            let provider_host_registration = provider_host_dht.clone();
+            mesh_runtime()
+                .spawn(async move {
+                    mesh_for_registration
+                        .register_actor(actor_ref_for_registration, provider_host_registration)
+                        .await;
+                })
+                .await
+                .expect("provider host registration task panicked");
 
             let beta = MeshNodeManagerFixture::new("beta", test_id).await;
 

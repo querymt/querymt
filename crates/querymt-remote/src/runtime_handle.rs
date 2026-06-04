@@ -1,12 +1,13 @@
 use crate::{
-    MeshHandle, MeshScopeId, MeshTransportKind, enabled_transports_from_mode, mode_has_transport,
-    scoped_actor_name,
+    MeshHandle, MeshScopeId, MeshTransportKind, RemoteLookupError, enabled_transports_from_mode,
+    mode_has_transport, scoped_actor_name,
 };
 use kameo::actor::{ActorRef, RemoteActorRef};
 use kameo::remote::LookupStream;
 use libp2p::PeerId;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 
 use crate::mesh_events::PeerEvent;
@@ -93,6 +94,30 @@ impl MeshRuntimeHandle {
         self.inner.lookup_actor_no_retry(name).await
     }
 
+    pub async fn lookup_actor_with_timeout<A>(
+        &self,
+        name: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Option<RemoteActorRef<A>>, RemoteLookupError>
+    where
+        A: kameo::Actor + kameo::remote::RemoteActor,
+    {
+        self.inner.lookup_actor_with_timeout(name, timeout).await
+    }
+
+    pub async fn lookup_actor_no_retry_with_timeout<A>(
+        &self,
+        name: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Option<RemoteActorRef<A>>, RemoteLookupError>
+    where
+        A: kameo::Actor + kameo::remote::RemoteActor,
+    {
+        self.inner
+            .lookup_actor_no_retry_with_timeout(name, timeout)
+            .await
+    }
+
     pub fn lookup_all_actors<A>(&self, name: impl Into<String>) -> LookupStream<A>
     where
         A: kameo::Actor + kameo::remote::RemoteActor,
@@ -155,6 +180,34 @@ impl MeshRuntimeHandle {
     {
         self.inner
             .lookup_actor_no_retry(scoped_actor_name(scope, name))
+            .await
+    }
+
+    pub async fn lookup_actor_scoped_with_timeout<A>(
+        &self,
+        scope: &MeshScopeId,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<Option<RemoteActorRef<A>>, RemoteLookupError>
+    where
+        A: kameo::Actor + kameo::remote::RemoteActor,
+    {
+        self.inner
+            .lookup_actor_with_timeout(scoped_actor_name(scope, name), timeout)
+            .await
+    }
+
+    pub async fn lookup_actor_scoped_no_retry_with_timeout<A>(
+        &self,
+        scope: &MeshScopeId,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<Option<RemoteActorRef<A>>, RemoteLookupError>
+    where
+        A: kameo::Actor + kameo::remote::RemoteActor,
+    {
+        self.inner
+            .lookup_actor_no_retry_with_timeout(scoped_actor_name(scope, name), timeout)
             .await
     }
 
@@ -294,6 +347,32 @@ impl MeshScopeHandle {
     {
         self.runtime
             .lookup_actor_scoped_no_retry(&self.scope, name)
+            .await
+    }
+
+    pub async fn lookup_actor_with_timeout<A>(
+        &self,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<Option<RemoteActorRef<A>>, RemoteLookupError>
+    where
+        A: kameo::Actor + kameo::remote::RemoteActor,
+    {
+        self.runtime
+            .lookup_actor_scoped_with_timeout(&self.scope, name, timeout)
+            .await
+    }
+
+    pub async fn lookup_actor_no_retry_with_timeout<A>(
+        &self,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<Option<RemoteActorRef<A>>, RemoteLookupError>
+    where
+        A: kameo::Actor + kameo::remote::RemoteActor,
+    {
+        self.runtime
+            .lookup_actor_scoped_no_retry_with_timeout(&self.scope, name, timeout)
             .await
     }
 

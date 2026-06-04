@@ -115,34 +115,38 @@ mod node_manager_extended_tests {
         let timeout = std::time::Duration::from_secs(3);
 
         for i in 0..10 {
-            let resp =
-                tokio::time::timeout(timeout, f.actor_ref.ask(CreateRemoteSession { cwd: None }))
-                    .await
-                    .unwrap_or_else(|_| panic!("create timed out at iteration {i}"))
-                    .expect("create");
+            let resp = f
+                .actor_ref
+                .ask(CreateRemoteSession { cwd: None })
+                .mailbox_timeout(timeout)
+                .reply_timeout(timeout)
+                .send()
+                .await
+                .unwrap_or_else(|_| panic!("create timed out at iteration {i}"));
 
-            tokio::time::timeout(
-                timeout,
-                f.actor_ref.ask(StopRemoteSessionRuntime {
+            f.actor_ref
+                .ask(StopRemoteSessionRuntime {
                     session_id: resp.session_id,
-                }),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("stop timed out at iteration {i}"))
-            .expect("stop");
+                })
+                .mailbox_timeout(timeout)
+                .reply_timeout(timeout)
+                .send()
+                .await
+                .unwrap_or_else(|_| panic!("stop timed out at iteration {i}"));
         }
 
-        let sessions = tokio::time::timeout(
-            timeout,
-            f.actor_ref.ask(ListRemoteSessions {
+        let sessions = f
+            .actor_ref
+            .ask(ListRemoteSessions {
                 offset: None,
                 limit: None,
-            }),
-        )
-        .await
-        .expect("list timed out")
-        .expect("list")
-        .sessions;
+            })
+            .mailbox_timeout(timeout)
+            .reply_timeout(timeout)
+            .send()
+            .await
+            .expect("list")
+            .sessions;
 
         // Sessions persist in SQLite but no live actors should remain.
         assert_eq!(
@@ -237,6 +241,25 @@ mod remote_session_lifecycle_integration_tests {
             .unwrap_or_else(|_| panic!("{} timed out after {:?}", label, STEP_TIMEOUT))
     }
 
+    async fn assert_node_manager_lookup(
+        mesh: &crate::agent::remote::mesh::MeshHandle,
+        dht_name: &str,
+        expected_actor_id: kameo::actor::ActorId,
+    ) {
+        let looked_up = within_timeout(
+            "lookup beta node manager",
+            mesh.lookup_actor::<crate::agent::remote::RemoteNodeManager>(dht_name),
+        )
+        .await
+        .expect("lookup failed")
+        .expect("lookup returned none");
+        assert_eq!(
+            looked_up.id(),
+            expected_actor_id,
+            "lookup beta node manager should resolve to fixture actor"
+        );
+    }
+
     // ── G.1 ──────────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -255,7 +278,12 @@ mod remote_session_lifecycle_integration_tests {
         .expect("beta not in DHT");
 
         let resp = within_timeout("CreateRemoteSession on beta", async {
-            beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &CreateRemoteSession { cwd: None },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await
         .expect("CreateRemoteSession on beta");
@@ -285,11 +313,14 @@ mod remote_session_lifecycle_integration_tests {
         );
 
         let _ = within_timeout("destroy created session", async {
-            beta_ref
-                .ask(&StopRemoteSessionRuntime {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &StopRemoteSessionRuntime {
                     session_id: resp.session_id,
-                })
-                .await
+                },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await;
         f.cleanup().await;
@@ -312,7 +343,12 @@ mod remote_session_lifecycle_integration_tests {
         .expect("beta not found");
 
         let resp = within_timeout("create session on beta", async {
-            beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &CreateRemoteSession { cwd: None },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await
         .expect("create");
@@ -338,11 +374,14 @@ mod remote_session_lifecycle_integration_tests {
         );
 
         let _ = within_timeout("destroy created session", async {
-            beta_ref
-                .ask(&StopRemoteSessionRuntime {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &StopRemoteSessionRuntime {
                     session_id: resp.session_id,
-                })
-                .await
+                },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await;
         f.cleanup().await;
@@ -366,24 +405,37 @@ mod remote_session_lifecycle_integration_tests {
 
         // Create two sessions on beta.
         let r1 = within_timeout("create 1", async {
-            beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &CreateRemoteSession { cwd: None },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await
         .expect("create 1");
         let r2 = within_timeout("create 2", async {
-            beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &CreateRemoteSession { cwd: None },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await
         .expect("create 2");
 
         // Alpha lists beta's sessions.
         let sessions: Vec<_> = within_timeout("list", async {
-            beta_ref
-                .ask(&ListRemoteSessions {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &ListRemoteSessions {
                     offset: None,
                     limit: None,
-                })
-                .await
+                },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await
         .expect("list")
@@ -395,19 +447,25 @@ mod remote_session_lifecycle_integration_tests {
         assert!(ids.contains(&r2.session_id.as_str()));
 
         let _ = within_timeout("stop 1", async {
-            beta_ref
-                .ask(&StopRemoteSessionRuntime {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &StopRemoteSessionRuntime {
                     session_id: r1.session_id,
-                })
-                .await
+                },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await;
         let _ = within_timeout("stop 2", async {
-            beta_ref
-                .ask(&StopRemoteSessionRuntime {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &StopRemoteSessionRuntime {
                     session_id: r2.session_id,
-                })
-                .await
+                },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await;
         f.cleanup().await;
@@ -428,7 +486,12 @@ mod remote_session_lifecycle_integration_tests {
         .expect("not found");
 
         let parent = within_timeout("create parent", async {
-            beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &CreateRemoteSession { cwd: None },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await
         .expect("create parent");
@@ -457,12 +520,15 @@ mod remote_session_lifecycle_integration_tests {
             .expect("insert parent message");
 
         let child = within_timeout("fork child", async {
-            beta_ref
-                .ask(&ForkRemoteSession {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &ForkRemoteSession {
                     source_session_id: parent.session_id.clone(),
                     message_id: message_id.clone(),
-                })
-                .await
+                },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await
         .expect("fork child");
@@ -477,19 +543,24 @@ mod remote_session_lifecycle_integration_tests {
                 panic!("expected attachable handoff in integration mesh test")
             }
         };
-        let mode = session_ref
-            .ask(&GetMode)
-            .await
-            .expect("forked child should be directly usable");
+        let mode = within_timeout(
+            "forked child get_mode",
+            querymt_remote::ask_remote_with_timeout(&session_ref, &GetMode, STEP_TIMEOUT),
+        )
+        .await
+        .expect("forked child should be directly usable");
         assert_eq!(mode, AgentMode::Build);
 
         let sessions: Vec<_> = within_timeout("list", async {
-            beta_ref
-                .ask(&ListRemoteSessions {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &ListRemoteSessions {
                     offset: None,
                     limit: None,
-                })
-                .await
+                },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await
         .expect("list")
@@ -497,19 +568,25 @@ mod remote_session_lifecycle_integration_tests {
         assert!(sessions.iter().any(|s| s.session_id == child.session_id));
 
         let _ = within_timeout("stop parent", async {
-            beta_ref
-                .ask(&StopRemoteSessionRuntime {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &StopRemoteSessionRuntime {
                     session_id: parent.session_id,
-                })
-                .await
+                },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await;
         let _ = within_timeout("stop child", async {
-            beta_ref
-                .ask(&StopRemoteSessionRuntime {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &StopRemoteSessionRuntime {
                     session_id: child.session_id,
-                })
-                .await
+                },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await;
         f.cleanup().await;
@@ -532,28 +609,39 @@ mod remote_session_lifecycle_integration_tests {
         .expect("not found");
 
         let resp = within_timeout("create", async {
-            beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &CreateRemoteSession { cwd: None },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await
         .expect("create");
 
         within_timeout("stop", async {
-            beta_ref
-                .ask(&StopRemoteSessionRuntime {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &StopRemoteSessionRuntime {
                     session_id: resp.session_id.clone(),
-                })
-                .await
+                },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await
         .expect("stop");
 
         let sessions = within_timeout("list", async {
-            beta_ref
-                .ask(&ListRemoteSessions {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &ListRemoteSessions {
                     offset: None,
                     limit: None,
-                })
-                .await
+                },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await
         .expect("list")
@@ -573,7 +661,7 @@ mod remote_session_lifecycle_integration_tests {
     // ── G.5 ──────────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_alpha_creates_multiple_sessions_on_beta() {
+    async fn test_lookup_survives_two_stop_cycles() {
         let test_id = Uuid::now_v7().to_string();
         let f = TwoNodeFixture::new(&test_id).await;
         let mesh = get_test_mesh().await;
@@ -586,10 +674,89 @@ mod remote_session_lifecycle_integration_tests {
         .expect("lookup")
         .expect("not found");
 
+        let first = within_timeout("create first", async {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &CreateRemoteSession { cwd: None },
+                STEP_TIMEOUT,
+            )
+            .await
+        })
+        .await
+        .expect("create first");
+
+        let second = within_timeout("create second", async {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &CreateRemoteSession { cwd: None },
+                STEP_TIMEOUT,
+            )
+            .await
+        })
+        .await
+        .expect("create second");
+
+        within_timeout("stop first", async {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &StopRemoteSessionRuntime {
+                    session_id: first.session_id,
+                },
+                STEP_TIMEOUT,
+            )
+            .await
+        })
+        .await
+        .expect("stop first");
+
+        assert_node_manager_lookup(mesh, &f.beta.dht_name, f.beta.actor_ref.id()).await;
+
+        within_timeout("stop second", async {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &StopRemoteSessionRuntime {
+                    session_id: second.session_id,
+                },
+                STEP_TIMEOUT,
+            )
+            .await
+        })
+        .await
+        .expect("stop second");
+
+        assert_node_manager_lookup(mesh, &f.beta.dht_name, f.beta.actor_ref.id()).await;
+
+        f.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn test_alpha_creates_multiple_sessions_on_beta() {
+        let test_id = Uuid::now_v7().to_string();
+        let f = TwoNodeFixture::new(&test_id).await;
+        let mesh = get_test_mesh().await;
+
+        let beta_ref = within_timeout(
+            "lookup beta node manager",
+            mesh.lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name),
+        )
+        .await
+        .expect("lookup")
+        .expect("not found");
+        assert_eq!(
+            beta_ref.id(),
+            f.beta.actor_ref.id(),
+            "lookup beta node manager should resolve to fixture actor"
+        );
+
         let mut ids = Vec::new();
         for i in 0..3 {
             let resp = within_timeout(&format!("create {i}"), async {
-                beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+                querymt_remote::ask_remote_with_timeout(
+                    &beta_ref,
+                    &CreateRemoteSession { cwd: None },
+                    STEP_TIMEOUT,
+                )
+                .await
             })
             .await
             .expect("create");
@@ -603,12 +770,15 @@ mod remote_session_lifecycle_integration_tests {
         assert_eq!(sorted.len(), 3, "all session IDs should be unique");
 
         let sessions = within_timeout("list", async {
-            beta_ref
-                .ask(&ListRemoteSessions {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &ListRemoteSessions {
                     offset: None,
                     limit: None,
-                })
-                .await
+                },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await
         .expect("list")
@@ -616,10 +786,28 @@ mod remote_session_lifecycle_integration_tests {
         assert_eq!(sessions.len(), 3);
 
         for id in ids {
+            let refreshed_beta_ref = within_timeout(
+                "refresh beta node manager",
+                mesh.lookup_actor::<crate::agent::remote::RemoteNodeManager>(&f.beta.dht_name),
+            )
+            .await
+            .expect("refresh lookup")
+            .expect("refreshed beta node manager not found");
+            assert_eq!(
+                refreshed_beta_ref.id(),
+                f.beta.actor_ref.id(),
+                "refreshed lookup beta node manager should resolve to fixture actor"
+            );
+            let stop_id = id.clone();
             let _ = within_timeout("stop created session", async {
-                beta_ref
-                    .ask(&StopRemoteSessionRuntime { session_id: id })
-                    .await
+                querymt_remote::ask_remote_with_timeout(
+                    &refreshed_beta_ref,
+                    &StopRemoteSessionRuntime {
+                        session_id: stop_id,
+                    },
+                    STEP_TIMEOUT,
+                )
+                .await
             })
             .await;
         }
@@ -643,7 +831,12 @@ mod remote_session_lifecycle_integration_tests {
         .expect("not found");
 
         let resp = within_timeout("create remote session", async {
-            beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &CreateRemoteSession { cwd: None },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await
         .expect("create");
@@ -674,11 +867,14 @@ mod remote_session_lifecycle_integration_tests {
 
         // Keep the shared test mesh clean to reduce cross-test interference.
         let _ = within_timeout("stop remote session", async {
-            beta_ref
-                .ask(&StopRemoteSessionRuntime {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &StopRemoteSessionRuntime {
                     session_id: resp.session_id,
-                })
-                .await
+                },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await;
         f.cleanup().await;
@@ -701,7 +897,12 @@ mod remote_session_lifecycle_integration_tests {
         .expect("not found");
 
         let resp = within_timeout("create remote session", async {
-            beta_ref.ask(&CreateRemoteSession { cwd: None }).await
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &CreateRemoteSession { cwd: None },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await
         .expect("create");
@@ -737,11 +938,14 @@ mod remote_session_lifecycle_integration_tests {
         assert_eq!(mode, AgentMode::Plan);
 
         let _ = within_timeout("destroy created session", async {
-            beta_ref
-                .ask(&StopRemoteSessionRuntime {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &StopRemoteSessionRuntime {
                     session_id: resp.session_id,
-                })
-                .await
+                },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await;
         f.cleanup().await;
@@ -775,10 +979,13 @@ mod remote_session_lifecycle_integration_tests {
             .expect("lookup")
             .expect("not found");
 
-        let resp = beta_ref
-            .ask(&CreateRemoteSession { cwd: None })
-            .await
-            .expect("create");
+        let resp = querymt_remote::ask_remote_with_timeout(
+            &beta_ref,
+            &CreateRemoteSession { cwd: None },
+            STEP_TIMEOUT,
+        )
+        .await
+        .expect("create");
 
         // Alpha sets up a relay actor and registers it in the DHT under the
         // name that SubscribeEvents will look for on Beta's session.
@@ -790,7 +997,13 @@ mod remote_session_lifecycle_integration_tests {
         let alpha_journal = alpha_storage.event_journal();
         let alpha_fanout = Arc::new(EventFanout::new());
         let alpha_sink = Arc::new(EventSink::new(alpha_journal, alpha_fanout.clone()));
-        let relay = EventRelayActor::new(alpha_sink.clone(), "alpha-relay-g8".to_string());
+        let relay = EventRelayActor::new(
+            alpha_sink.clone(),
+            resp.session_id.clone(),
+            "alpha-relay-g8".to_string(),
+            None,
+            None,
+        );
         let relay_ref = EventRelayActor::spawn(relay);
 
         let relay_dht_name = crate::agent::remote::scope::scoped_event_relay(
@@ -841,11 +1054,14 @@ mod remote_session_lifecycle_integration_tests {
         let _ = alpha_fanout.subscriber_count(); // just ensure no panic
 
         let _ = within_timeout("destroy created session", async {
-            beta_ref
-                .ask(&StopRemoteSessionRuntime {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &StopRemoteSessionRuntime {
                     session_id: resp.session_id,
-                })
-                .await
+                },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await;
         f.cleanup().await;
@@ -865,10 +1081,13 @@ mod remote_session_lifecycle_integration_tests {
             .expect("lookup")
             .expect("not found");
 
-        let resp = beta_ref
-            .ask(&CreateRemoteSession { cwd: None })
-            .await
-            .expect("create");
+        let resp = querymt_remote::ask_remote_with_timeout(
+            &beta_ref,
+            &CreateRemoteSession { cwd: None },
+            STEP_TIMEOUT,
+        )
+        .await
+        .expect("create");
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -895,11 +1114,14 @@ mod remote_session_lifecycle_integration_tests {
         );
 
         let _ = within_timeout("destroy created session", async {
-            beta_ref
-                .ask(&StopRemoteSessionRuntime {
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &StopRemoteSessionRuntime {
                     session_id: resp.session_id,
-                })
-                .await
+                },
+                STEP_TIMEOUT,
+            )
+            .await
         })
         .await;
         f.cleanup().await;
@@ -919,10 +1141,9 @@ mod remote_session_lifecycle_integration_tests {
             .expect("lookup")
             .expect("not found");
 
-        let info = within_timeout("GetNodeInfo", async { beta_ref.ask(&GetNodeInfo).await })
+        let info = querymt_remote::ask_remote_with_timeout(&beta_ref, &GetNodeInfo, STEP_TIMEOUT)
             .await
             .expect("GetNodeInfo");
-
         assert!(!info.hostname.is_empty(), "hostname should not be empty");
         assert!(
             !info.capabilities.is_empty(),
@@ -948,11 +1169,31 @@ mod remote_session_lifecycle_integration_tests {
         .expect("not found");
 
         let (r1, r2, r3, r4, r5) = tokio::join!(
-            beta_ref.ask(&CreateRemoteSession { cwd: None }),
-            beta_ref.ask(&CreateRemoteSession { cwd: None }),
-            beta_ref.ask(&CreateRemoteSession { cwd: None }),
-            beta_ref.ask(&CreateRemoteSession { cwd: None }),
-            beta_ref.ask(&CreateRemoteSession { cwd: None }),
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &CreateRemoteSession { cwd: None },
+                STEP_TIMEOUT,
+            ),
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &CreateRemoteSession { cwd: None },
+                STEP_TIMEOUT,
+            ),
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &CreateRemoteSession { cwd: None },
+                STEP_TIMEOUT,
+            ),
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &CreateRemoteSession { cwd: None },
+                STEP_TIMEOUT,
+            ),
+            querymt_remote::ask_remote_with_timeout(
+                &beta_ref,
+                &CreateRemoteSession { cwd: None },
+                STEP_TIMEOUT,
+            ),
         );
 
         let mut ids = vec![
@@ -972,9 +1213,12 @@ mod remote_session_lifecycle_integration_tests {
 
         for id in ids {
             let _ = within_timeout("stop created session", async {
-                beta_ref
-                    .ask(&StopRemoteSessionRuntime { session_id: id })
-                    .await
+                querymt_remote::ask_remote_with_timeout(
+                    &beta_ref,
+                    &StopRemoteSessionRuntime { session_id: id },
+                    STEP_TIMEOUT,
+                )
+                .await
             })
             .await;
         }

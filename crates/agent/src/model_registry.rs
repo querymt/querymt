@@ -563,11 +563,18 @@ mod tests {
         assert!(json.get("quant").is_none());
     }
 
-    #[tokio::test]
-    async fn registry_invalidate_clears_caches() {
-        let registry = ModelRegistry::new();
-        // Just verify invalidation doesn't panic on empty caches
-        registry.invalidate_all().await;
+    #[test]
+    fn registry_invalidate_clears_caches() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let registry = ModelRegistry::new();
+            // Just verify invalidation doesn't panic on empty caches.
+            registry.invalidate_all().await;
+            drop(registry);
+        });
     }
 
     /// Verifies that ModelEntry.id can be parsed back into (provider, model) by

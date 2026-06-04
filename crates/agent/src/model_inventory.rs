@@ -556,8 +556,10 @@ impl ModelInventory {
     )]
     async fn refresh_remote(&self) -> Result<(Vec<ModelEntry>, usize, usize), ()> {
         use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
-        use querymt_remote::{GetProviderCatalog, ProviderCatalogActor, scoped_provider_catalog};
-        use tokio::time::timeout;
+        use querymt_remote::{
+            GetProviderCatalog, ProviderCatalogActor, ask_remote_with_timeout,
+            scoped_provider_catalog,
+        };
 
         let start = Instant::now();
         let mesh = match self.mesh() {
@@ -607,18 +609,18 @@ impl ModelInventory {
                 let _permit = semaphore.acquire().await.unwrap();
 
                 let node_info =
-                    match timeout(node_timeout, node_ref.ask::<GetNodeInfo>(&GetNodeInfo)).await {
-                        Ok(Ok(info)) => info,
-                        Ok(Err(e)) => {
-                            tracing::warn!("GetNodeInfo failed: {}", e);
-                            return None;
-                        }
-                        Err(_) => {
+                    match ask_remote_with_timeout(&node_ref, &GetNodeInfo, node_timeout).await {
+                        Ok(info) => info,
+                        Err(kameo::error::RemoteSendError::ReplyTimeout) => {
                             tracing::warn!(
                                 "GetNodeInfo timed out for node (timeout: {:?})",
                                 node_timeout
                             );
                             return Some(Err(()));
+                        }
+                        Err(e) => {
+                            tracing::warn!("GetNodeInfo failed: {}", e);
+                            return None;
                         }
                     };
 
@@ -626,20 +628,22 @@ impl ModelInventory {
 
                 for scope in &scopes {
                     let catalog_name = scoped_provider_catalog(scope, &peer_id);
-                    match timeout(
-                        node_timeout,
-                        mesh.lookup_actor::<ProviderCatalogActor>(catalog_name),
-                    )
-                    .await
+                    match mesh
+                        .lookup_actor_with_timeout::<ProviderCatalogActor>(
+                            catalog_name,
+                            node_timeout,
+                        )
+                        .await
                     {
-                        Ok(Ok(Some(catalog_ref))) => {
-                            match timeout(
+                        Ok(Some(catalog_ref)) => {
+                            match ask_remote_with_timeout(
+                                &catalog_ref,
+                                &GetProviderCatalog,
                                 node_timeout,
-                                catalog_ref.ask::<GetProviderCatalog>(&GetProviderCatalog),
                             )
                             .await
                             {
-                                Ok(Ok(snapshot)) => {
+                                Ok(snapshot) => {
                                     let fallback_node_id = node_info.node_id.to_string();
                                     let resolved_node_id =
                                         crate::agent::remote::NodeId::parse(&snapshot.node.node_id)
@@ -678,36 +682,36 @@ impl ModelInventory {
                                         .collect();
                                     return Some(Ok(entries));
                                 }
-                                Ok(Err(e)) => {
-                                    tracing::debug!(
-                                        "GetProviderCatalog failed for peer {}: {}",
-                                        peer_id,
-                                        e
-                                    );
-                                }
-                                Err(_) => {
+                                Err(kameo::error::RemoteSendError::ReplyTimeout) => {
                                     tracing::warn!(
                                         "GetProviderCatalog timed out for node (timeout: {:?})",
                                         node_timeout
                                     );
                                     return Some(Err(()));
                                 }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        "GetProviderCatalog failed for peer {}: {}",
+                                        peer_id,
+                                        e
+                                    );
+                                }
                             }
                         }
-                        Ok(Ok(None)) => {}
-                        Ok(Err(e)) => {
-                            tracing::debug!(
-                                "ProviderCatalog lookup failed for peer {}: {}",
-                                peer_id,
-                                e
-                            );
-                        }
-                        Err(_) => {
+                        Ok(None) => {}
+                        Err(querymt_remote::RemoteLookupError::Timeout { .. }) => {
                             tracing::warn!(
                                 "ProviderCatalog lookup timed out for node (timeout: {:?})",
                                 node_timeout
                             );
                             return Some(Err(()));
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "ProviderCatalog lookup failed for peer {}: {}",
+                                peer_id,
+                                e
+                            );
                         }
                     }
                 }

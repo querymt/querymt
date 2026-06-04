@@ -285,7 +285,13 @@ mod event_relay_extended {
     #[tokio::test]
     async fn test_relay_multiple_events() {
         let sink = make_sink().await;
-        let relay = EventRelayActor::new(sink.clone(), "multi-test".to_string());
+        let relay = EventRelayActor::new(
+            sink.clone(),
+            "s1".to_string(),
+            "multi-test".to_string(),
+            None,
+            None,
+        );
         let relay_ref = <EventRelayActor as Spawn>::spawn(relay);
 
         let mut rx = sink.fanout().subscribe();
@@ -362,7 +368,13 @@ mod event_relay_extended {
     #[tokio::test]
     async fn test_relay_preserves_session_id() {
         let sink = make_sink().await;
-        let relay = EventRelayActor::new(sink.clone(), "preserve-test".to_string());
+        let relay = EventRelayActor::new(
+            sink.clone(),
+            "unique-session-id-xyz".to_string(),
+            "preserve-test".to_string(),
+            None,
+            None,
+        );
         let relay_ref = <EventRelayActor as Spawn>::spawn(relay);
 
         let mut rx = sink.fanout().subscribe();
@@ -394,7 +406,13 @@ mod event_relay_extended {
     #[tokio::test]
     async fn test_relay_preserves_event_kind() {
         let sink = make_sink().await;
-        let relay = EventRelayActor::new(sink.clone(), "kind-test".to_string());
+        let relay = EventRelayActor::new(
+            sink.clone(),
+            "s1".to_string(),
+            "kind-test".to_string(),
+            None,
+            None,
+        );
         let relay_ref = <EventRelayActor as Spawn>::spawn(relay);
 
         let mut rx = sink.fanout().subscribe();
@@ -431,9 +449,15 @@ mod event_relay_extended {
     }
 
     #[tokio::test]
-    async fn test_relay_different_sessions() {
+    async fn test_relay_ignores_mismatched_session() {
         let sink = make_sink().await;
-        let relay = EventRelayActor::new(sink.clone(), "multi-session".to_string());
+        let relay = EventRelayActor::new(
+            sink.clone(),
+            "session-a".to_string(),
+            "multi-session".to_string(),
+            None,
+            None,
+        );
         let relay_ref = <EventRelayActor as Spawn>::spawn(relay);
 
         let mut rx = sink.fanout().subscribe();
@@ -468,18 +492,14 @@ mod event_relay_extended {
             .await
             .expect("tell b");
 
-        let r1 = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        let received = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
             .await
             .expect("timeout")
             .expect("recv");
-        let r2 = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
-            .await
-            .expect("timeout")
-            .expect("recv");
+        assert_eq!(received.session_id(), "session-a");
 
-        let mut ids = vec![r1.session_id().to_string(), r2.session_id().to_string()];
-        ids.sort();
-        assert_eq!(ids, vec!["session-a", "session-b"]);
+        let extra = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(extra.is_err(), "mismatched session event should be ignored");
     }
 }
 
@@ -517,8 +537,9 @@ mod node_manager_tests {
     use crate::model::{AgentMessage, MessagePart};
     use crate::session::domain::IntentSnapshot;
     use kameo::actor::{ActorRef, Spawn};
-    use kameo::error::SendError;
+    use kameo::error::{RemoteSendError, SendError};
     use querymt::chat::ChatRole;
+    use std::time::Duration;
     use tokio::sync::Mutex;
     use uuid::Uuid;
 
@@ -906,6 +927,7 @@ mod node_manager_tests {
                 .ask(CreateRemoteSession { cwd: None })
                 .await
                 .expect("create");
+
             session_ids.push(resp.session_id);
         }
 
@@ -1160,10 +1182,14 @@ mod node_manager_tests {
     async fn test_resume_session_exposes_persisted_event_stream() {
         let (nm_ref, config, _td) = spawn_test_node_manager_with_mesh().await;
 
+        let control_timeout = Duration::from_secs(5);
         let resp = nm_ref
             .ask(CreateRemoteSession { cwd: None })
+            .mailbox_timeout(control_timeout)
+            .reply_timeout(control_timeout)
+            .send()
             .await
-            .expect("create");
+            .unwrap_or_else(|err| panic!("create timed out after {:?}: {err}", control_timeout));
 
         // Persist a durable event through the agent's event sink.
         config
@@ -1179,16 +1205,22 @@ mod node_manager_tests {
             .ask(StopRemoteSessionRuntime {
                 session_id: resp.session_id.clone(),
             })
+            .mailbox_timeout(control_timeout)
+            .reply_timeout(control_timeout)
+            .send()
             .await
-            .expect("stop");
+            .unwrap_or_else(|err| panic!("stop timed out after {:?}: {err}", control_timeout));
 
         // Resume — materializes a new actor from SQLite.
         let resumed = nm_ref
             .ask(ResumeRemoteSession {
                 session_id: resp.session_id.clone(),
             })
+            .mailbox_timeout(control_timeout)
+            .reply_timeout(control_timeout)
+            .send()
             .await
-            .expect("resume");
+            .unwrap_or_else(|err| panic!("resume timed out after {:?}: {err}", control_timeout));
 
         // Resolve the handoff to get a live actor reference.
         let session_ref = match resumed.handoff {
@@ -1196,11 +1228,21 @@ mod node_manager_tests {
             other => panic!("expected DirectRemote handoff, got {other:?}"),
         };
 
-        // Ask the resumed actor for its full event stream.
-        let events: Vec<crate::events::AgentEvent> = session_ref
-            .ask(&crate::agent::messages::GetEventStream)
-            .await
-            .expect("GetEventStream RPC");
+        // Ask the resumed actor for its full event stream with bounded remote
+        // mailbox/reply timeouts so suite-level mesh issues fail fast.
+        let timeout = Duration::from_secs(5);
+        let events: Vec<crate::events::AgentEvent> = querymt_remote::ask_remote_with_timeout(
+            &session_ref,
+            &crate::agent::messages::GetEventStream,
+            timeout,
+        )
+        .await
+        .unwrap_or_else(|err| match err {
+            RemoteSendError::ReplyTimeout => {
+                panic!("GetEventStream remote reply timed out after {:?}", timeout)
+            }
+            other => panic!("GetEventStream RPC failed after {:?}: {other}", timeout),
+        });
 
         assert!(
             !events.is_empty(),
