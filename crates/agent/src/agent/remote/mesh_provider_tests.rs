@@ -9,15 +9,20 @@
 #[cfg(all(test, feature = "remote"))]
 #[allow(clippy::module_inception)]
 mod mesh_provider_tests {
-    use crate::agent::remote::mesh_provider::{
-        MeshChatProvider, find_provider_on_mesh, should_retry_remote_send,
-    };
     use crate::agent::remote::test_helpers::fixtures::{ProviderHostFixture, get_test_mesh};
+    use kameo::actor::Spawn;
     use querymt::chat::ChatProvider;
     use querymt::completion::CompletionProvider;
     use querymt::completion::CompletionRequest;
     use querymt::embedding::EmbeddingProvider;
     use querymt::error::LLMError;
+    use querymt_remote::should_retry_remote_send;
+    use querymt_remote::{MeshChatProvider, find_provider_on_mesh};
+    use querymt_remote::{
+        ProviderCatalogActor, ProviderCatalogBackend, ProviderCatalogEntry,
+        ProviderCatalogNodeInfo, ProviderCatalogSnapshot,
+    };
+    use std::sync::Arc;
     use uuid::Uuid;
 
     // ── B.1 ──────────────────────────────────────────────────────────────────
@@ -192,6 +197,68 @@ mod mesh_provider_tests {
     }
 
     // ── B.8 ──────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_find_provider_on_mesh_catalog_only_without_node_manager_listing() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+
+        let fake_peer_id = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let node_id = fake_peer_id.to_string();
+        let provider_name = "mock";
+        let model_name = "mock-model";
+
+        mesh.inject_known_peer_for_test(fake_peer_id);
+
+        struct StaticCatalogBackend {
+            snapshot: ProviderCatalogSnapshot,
+        }
+
+        impl ProviderCatalogBackend for StaticCatalogBackend {
+            fn snapshot(&self) -> ProviderCatalogSnapshot {
+                self.snapshot.clone()
+            }
+        }
+
+        let catalog = ProviderCatalogActor::new(Arc::new(StaticCatalogBackend {
+            snapshot: ProviderCatalogSnapshot {
+                node: ProviderCatalogNodeInfo {
+                    node_id: node_id.clone(),
+                    node_label: Some(format!("catalog-only-{}", test_id)),
+                    capabilities: vec!["shell".to_string()],
+                },
+                providers: vec![ProviderCatalogEntry {
+                    provider: provider_name.to_string(),
+                    model: Some(model_name.to_string()),
+                    label: Some(model_name.to_string()),
+                    family: Some("mock-family".to_string()),
+                    quant: Some("Q4_K_M".to_string()),
+                }],
+            },
+        }));
+        let catalog_ref = ProviderCatalogActor::spawn(catalog);
+        let catalog_name = crate::agent::remote::scope::scoped_provider_catalog(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &fake_peer_id,
+        );
+        mesh.register_actor(catalog_ref, catalog_name).await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        let found = find_provider_on_mesh(mesh, provider_name).await;
+        let found_node_id = found.expect("catalog-only discovery should return a node id");
+        assert_eq!(found_node_id.to_string(), node_id);
+
+        let provider =
+            MeshChatProvider::new(mesh, &found_node_id.to_string(), provider_name, model_name);
+        let result = provider.chat_with_tools(&[], None).await;
+        assert!(
+            matches!(result, Err(LLMError::ProviderError(_))),
+            "catalog-only discovery should resolve the node before provider-host lookup fails, got {:?}",
+            result
+        );
+    }
 
     #[tokio::test]
     async fn test_mesh_chat_provider_chat_with_tools_local_host() {

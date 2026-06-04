@@ -16,7 +16,7 @@ impl LocalAgentHandle {
         self.mesh.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Activate the mesh by storing the `MeshHandle` returned by `bootstrap_mesh()`.
+    /// Activate the mesh by storing the `MeshHandle` returned by remote mesh bootstrap.
     ///
     /// Also propagates into `config.provider` so that sessions created by a
     /// `RemoteNodeManager` (which holds `Arc<AgentConfig>` with this provider)
@@ -179,6 +179,17 @@ impl LocalAgentHandle {
     pub(super) fn remote_node_info_timeout() -> std::time::Duration {
         let default_ms = 3_000_u64;
         let timeout_ms = std::env::var("QUERYMT_REMOTE_NODE_INFO_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default_ms);
+        std::time::Duration::from_millis(timeout_ms)
+    }
+
+    #[cfg(feature = "remote")]
+    pub(super) fn remote_request_timeout() -> std::time::Duration {
+        let default_ms = 10_000_u64;
+        let timeout_ms = std::env::var("QUERYMT_REMOTE_REQUEST_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)

@@ -63,18 +63,19 @@ impl LocalAgentHandle {
 
         match config_id {
             "model" => {
+                let model_id = value_id.0.to_string();
+                #[cfg(feature = "remote")]
                 #[derive(serde::Deserialize)]
                 struct QuerymtMeta {
                     #[serde(rename = "modelEntry")]
                     model_entry: crate::model_registry::ModelEntry,
                 }
 
+                #[cfg(feature = "remote")]
                 #[derive(serde::Deserialize)]
                 struct RequestMeta {
                     querymt: QuerymtMeta,
                 }
-
-                let model_id = value_id.0.to_string();
                 #[cfg(feature = "remote")]
                 let provider_node_id = req
                     .meta

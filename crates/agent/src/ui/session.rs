@@ -738,14 +738,13 @@ system = "inline"
             .default_reasoning_effort
             .store(Arc::new(Some(querymt::chat::ReasoningEffort::Low)));
 
-        assert_eq!(
-            default_mode_for_session(&fixture.state, Some("session-1")).await,
-            AgentMode::Plan
-        );
-        assert_eq!(
-            default_reasoning_effort_for_session(&fixture.state, Some("session-1")).await,
-            Some(querymt::chat::ReasoningEffort::Low)
-        );
+        let default_mode = default_mode_for_session(&fixture.state, Some("session-1")).await;
+        let default_reasoning =
+            default_reasoning_effort_for_session(&fixture.state, Some("session-1")).await;
+        profiles.shutdown().await;
+
+        assert_eq!(default_mode, AgentMode::Plan);
+        assert_eq!(default_reasoning, Some(querymt::chat::ReasoningEffort::Low));
     }
 
     #[cfg(feature = "remote")]

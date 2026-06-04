@@ -1,0 +1,92 @@
+name: Test Python Packages
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'crates/py/**'
+      - 'crates/agent/**'
+      - 'crates/querymt/**'
+      - 'crates/querymt-remote/**'
+      - 'crates/querymt-utils/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/test-python-packages.yml'
+  pull_request:
+    paths:
+      - 'crates/py/**'
+      - 'crates/agent/**'
+      - 'crates/querymt/**'
+      - 'crates/querymt-remote/**'
+      - 'crates/querymt-utils/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/test-python-packages.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: target/python-ci
+
+jobs:
+  test-python-packages:
+    name: ${{ matrix.package_name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package_name: querymt
+            cargo_package: querymt-py
+            manifest_path: crates/py/querymt-py/Cargo.toml
+            dependency_manifest_path: ''
+            smoke_command: python -c "import querymt; print(querymt.__all__)"
+          - package_name: querymt-agent
+            cargo_package: querymt-agent-py
+            manifest_path: crates/py/querymt-agent-py/Cargo.toml
+            dependency_manifest_path: crates/py/querymt-py/Cargo.toml
+            smoke_command: python -c "import querymt_agent; print(querymt_agent.Agent)"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          key: python-packages-${{ matrix.cargo_package }}
+
+      - name: Setup Python environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip maturin
+
+      - name: Run Rust tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          cargo test -p ${{ matrix.cargo_package }}
+
+      - name: Run Python smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+
+          if [[ -n "${{ matrix.dependency_manifest_path }}" ]]; then
+            maturin develop --manifest-path "${{ matrix.dependency_manifest_path }}"
+          fi
+
+          maturin develop --manifest-path "${{ matrix.manifest_path }}"
+          ${{ matrix.smoke_command }}

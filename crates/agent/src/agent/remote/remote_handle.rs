@@ -6,12 +6,13 @@
 
 use crate::agent::handle::AgentHandle;
 use crate::agent::remote::SessionActorRef;
-use crate::agent::remote::provider_host::{
-    CancelProviderStreamRequest, GetProviderStreamStatus, ProviderHostActor,
-};
 use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
 use crate::event_fanout::EventFanout;
 use crate::events::{AgentEventKind, EphemeralEvent, EventEnvelope, EventOrigin};
+use querymt_remote::{
+    CancelProviderStreamRequest, GetProviderStreamStatus, ProviderHostActor,
+    ask_remote_with_timeout,
+};
 
 use agent_client_protocol::schema::{
     CancelNotification, Error, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
@@ -74,23 +75,29 @@ impl RemoteAgentHandle {
             return;
         };
 
-        let status = provider_host
-            .ask(&GetProviderStreamStatus {
+        let status = ask_remote_with_timeout(
+            &provider_host,
+            &GetProviderStreamStatus {
                 session_id: session_id.to_string(),
                 request_id: None,
-            })
-            .await
-            .ok()
-            .flatten();
+            },
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .ok()
+        .flatten();
 
         let request_id = status.as_ref().map(|status| status.request_id.clone());
-        let _ = provider_host
-            .ask(&CancelProviderStreamRequest {
+        let _ = ask_remote_with_timeout(
+            &provider_host,
+            &CancelProviderStreamRequest {
                 session_id: session_id.to_string(),
                 request_id,
                 reason: Some("remote prompt request failed".to_string()),
-            })
-            .await;
+            },
+            std::time::Duration::from_secs(3),
+        )
+        .await;
     }
 
     #[cfg(test)]
@@ -130,10 +137,13 @@ impl RemoteAgentHandle {
         span.record("dht_lookup_node_ms", t0.elapsed().as_millis() as u64);
 
         let t1 = std::time::Instant::now();
-        let resp = node_manager
-            .ask(&CreateRemoteSession { cwd })
-            .await
-            .map_err(|e| Error::from(AgentError::RemoteActor(e.to_string())))?;
+        let resp = ask_remote_with_timeout(
+            &node_manager,
+            &CreateRemoteSession { cwd },
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .map_err(|e| Error::from(AgentError::RemoteActor(e.to_string())))?;
         span.record("create_session_ms", t1.elapsed().as_millis() as u64);
 
         let session_id = resp.session_id.clone();
@@ -340,12 +350,15 @@ impl AgentHandle for RemoteAgentHandle {
         }
 
         let node_manager = self.lookup_remote_node_manager().await?;
-        let response = node_manager
-            .ask(&crate::agent::remote::ResumeRemoteSession {
+        let response = ask_remote_with_timeout(
+            &node_manager,
+            &crate::agent::remote::ResumeRemoteSession {
                 session_id: session_id.clone(),
-            })
-            .await
-            .map_err(|e| Error::from(AgentError::RemoteActor(e.to_string())))?;
+            },
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .map_err(|e| Error::from(AgentError::RemoteActor(e.to_string())))?;
 
         let session_ref = self
             .attach_handoff_session(&session_id, response.handoff)

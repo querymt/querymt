@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::agent::agent_config::AgentConfig;
-#[cfg(feature = "remote")]
-use crate::agent::remote::runtime_handle::MeshRuntimeHandle;
 use crate::model_registry::{ModelEntry, enumerate_local_models};
+#[cfg(feature = "remote")]
+use querymt_remote::MeshRuntimeHandle;
 
 /// Metadata about the current snapshot
 #[derive(Debug, Clone)]
@@ -246,6 +246,10 @@ impl ModelInventory {
         *self.inner.mesh.write() = Some(mesh.into());
     }
 
+    pub fn local_snapshot_entries_blocking(&self) -> Vec<ModelEntry> {
+        (*self.inner.local_snapshot.load_full()).clone()
+    }
+
     /// Get current model snapshot immediately (never blocks).
     /// Returns whatever data is available, even if stale.
     #[tracing::instrument(
@@ -303,6 +307,13 @@ impl ModelInventory {
         });
     }
 
+    fn spawn_local_refresh_task(&self) {
+        let inventory = self.clone();
+        tokio::spawn(async move {
+            inventory.run_local_refresh().await;
+        });
+    }
+
     /// Trigger a background refresh. Returns immediately.
     /// Uses debouncing to avoid triggering too frequently.
     #[tracing::instrument(
@@ -354,6 +365,56 @@ impl ModelInventory {
 
         drop(state); // release lock before spawn
         self.spawn_refresh_task();
+
+        let handle = RefreshHandle::pending(refresh_done_rx, RefreshTriggerDisposition::Started);
+        tracing::Span::current()
+            .record("disposition", handle.disposition().as_str())
+            .record("wait_for_completion", handle.waits_for_completion());
+        handle
+    }
+
+    /// Ensure the local snapshot is refreshed without also querying remote nodes.
+    #[tracing::instrument(
+        name = "model_inventory.ensure_local_refresh",
+        skip(self),
+        fields(disposition = tracing::field::Empty, wait_for_completion = tracing::field::Empty)
+    )]
+    pub async fn ensure_local_refresh(&self) -> RefreshHandle {
+        let mut state = self.inner.refresh_state.lock().await;
+
+        if state.local_refreshing || state.remote_refreshing {
+            let handle = RefreshHandle::pending(
+                state.refresh_done_tx.subscribe(),
+                RefreshTriggerDisposition::AlreadyInProgress,
+            );
+            tracing::Span::current()
+                .record("disposition", handle.disposition().as_str())
+                .record("wait_for_completion", handle.waits_for_completion());
+            return handle;
+        }
+
+        let now = Instant::now();
+        if let Some(last) = state.last_triggered_at
+            && now.duration_since(last) < self.inner.inv_config.refresh_debounce
+            && state.local_updated_at.is_some()
+        {
+            let handle = RefreshHandle::completed(RefreshTriggerDisposition::Debounced);
+            tracing::Span::current()
+                .record("disposition", handle.disposition().as_str())
+                .record("wait_for_completion", handle.waits_for_completion());
+            return handle;
+        }
+
+        state.last_triggered_at = Some(now);
+        state.local_refreshing = true;
+        state.remote_refreshing = false;
+        state.refresh_requested_after_current = false;
+
+        let (refresh_done_tx, refresh_done_rx) = watch::channel(false);
+        state.refresh_done_tx = refresh_done_tx;
+
+        drop(state);
+        self.spawn_local_refresh_task();
 
         let handle = RefreshHandle::pending(refresh_done_rx, RefreshTriggerDisposition::Started);
         tracing::Span::current()
@@ -539,6 +600,41 @@ impl ModelInventory {
         Ok(models)
     }
 
+    #[tracing::instrument(
+        name = "model_inventory.run_local_refresh",
+        skip(self),
+        fields(local_model_count = tracing::field::Empty)
+    )]
+    async fn run_local_refresh(&self) {
+        if let Ok(local_models) = self.refresh_local().await {
+            tracing::Span::current().record("local_model_count", local_models.len());
+            self.inner.local_snapshot.store(Arc::new(local_models));
+
+            let mut state = self.inner.refresh_state.lock().await;
+            state.local_updated_at = Some(Instant::now());
+            state.local_refreshing = false;
+            let rerun = state.refresh_requested_after_current;
+            state.refresh_requested_after_current = false;
+            let _ = state.refresh_done_tx.send(true);
+            let next_version = self
+                .inner
+                .update_version
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let _ = self.inner.update_version_tx.send(next_version);
+            drop(state);
+
+            if rerun {
+                self.spawn_refresh_task();
+            }
+            return;
+        }
+
+        let mut state = self.inner.refresh_state.lock().await;
+        state.local_refreshing = false;
+        let _ = state.refresh_done_tx.send(true);
+    }
+
     #[cfg(feature = "remote")]
     #[tracing::instrument(
         name = "model_inventory.refresh_remote",
@@ -551,8 +647,11 @@ impl ModelInventory {
         )
     )]
     async fn refresh_remote(&self) -> Result<(Vec<ModelEntry>, usize, usize), ()> {
-        use crate::agent::remote::{GetNodeInfo, ListAvailableModels, RemoteNodeManager};
-        use tokio::time::timeout;
+        use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
+        use querymt_remote::{
+            GetProviderCatalog, ProviderCatalogActor, ask_remote_with_timeout,
+            scoped_provider_catalog,
+        };
 
         let start = Instant::now();
         let mesh = match self.mesh() {
@@ -564,9 +663,9 @@ impl ModelInventory {
         let scopes = mesh.active_scopes();
         let mut node_refs = Vec::new();
 
-        for scope in scopes {
+        for scope in &scopes {
             let mut stream =
-                mesh.lookup_all_actors_scoped::<RemoteNodeManager>(&scope, "node_manager");
+                mesh.lookup_all_actors_scoped::<RemoteNodeManager>(scope, "node_manager");
 
             while let Some(result) = stream.next().await {
                 if let Ok(node_ref) = result
@@ -595,63 +694,125 @@ impl ModelInventory {
         for node_ref in node_refs {
             let semaphore = semaphore.clone();
             let node_timeout = self.inner.inv_config.remote_node_timeout;
+            let mesh = mesh.clone();
+            let scopes = scopes.clone();
 
             let handle = tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.unwrap();
 
-                // Get node info with timeout
                 let node_info =
-                    match timeout(node_timeout, node_ref.ask::<GetNodeInfo>(&GetNodeInfo)).await {
-                        Ok(Ok(info)) => info,
-                        Ok(Err(e)) => {
-                            tracing::warn!("GetNodeInfo failed: {}", e);
-                            return None;
-                        }
-                        Err(_) => {
+                    match ask_remote_with_timeout(&node_ref, &GetNodeInfo, node_timeout).await {
+                        Ok(info) => info,
+                        Err(kameo::error::RemoteSendError::ReplyTimeout) => {
                             tracing::warn!(
                                 "GetNodeInfo timed out for node (timeout: {:?})",
                                 node_timeout
                             );
-                            return Some(Err(())); // Timeout
+                            return Some(Err(()));
+                        }
+                        Err(e) => {
+                            tracing::warn!("GetNodeInfo failed: {}", e);
+                            return None;
                         }
                     };
 
-                // Get models with timeout
-                match timeout(
-                    node_timeout,
-                    node_ref.ask::<ListAvailableModels>(&ListAvailableModels),
-                )
-                .await
-                {
-                    Ok(Ok(models)) => {
-                        let entries: Vec<ModelEntry> = models
-                            .into_iter()
-                            .map(|m| ModelEntry {
-                                id: format!("{}/{}", m.provider, m.model),
-                                label: m.model.clone(),
-                                source: "catalog".to_string(),
-                                provider: m.provider,
-                                model: m.model,
-                                node_id: Some(node_info.node_id.to_string()),
-                                node_label: Some(node_info.hostname.clone()),
-                                family: None,
-                                quant: None,
-                            })
-                            .collect();
-                        Some(Ok(entries))
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!("ListAvailableModels failed: {}", e);
-                        None
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            "ListAvailableModels timed out for node (timeout: {:?})",
-                            node_timeout
-                        );
-                        Some(Err(())) // Timeout
+                let peer_id = node_ref.id().peer_id().copied()?;
+
+                for scope in &scopes {
+                    let catalog_name = scoped_provider_catalog(scope, &peer_id);
+                    match mesh
+                        .lookup_actor_with_timeout::<ProviderCatalogActor>(
+                            catalog_name,
+                            node_timeout,
+                        )
+                        .await
+                    {
+                        Ok(Some(catalog_ref)) => {
+                            match ask_remote_with_timeout(
+                                &catalog_ref,
+                                &GetProviderCatalog,
+                                node_timeout,
+                            )
+                            .await
+                            {
+                                Ok(snapshot) => {
+                                    let fallback_node_id = node_info.node_id.to_string();
+                                    let resolved_node_id =
+                                        crate::agent::remote::NodeId::parse(&snapshot.node.node_id)
+                                            .ok()
+                                            .map(|id| id.to_string())
+                                            .unwrap_or(fallback_node_id);
+                                    let resolved_label = snapshot
+                                        .node
+                                        .node_label
+                                        .clone()
+                                        .unwrap_or_else(|| node_info.hostname.clone());
+                                    let entries: Vec<ModelEntry> = snapshot
+                                        .providers
+                                        .into_iter()
+                                        .map(|m| {
+                                            let model = m.model.unwrap_or_else(|| "*".to_string());
+                                            let provider = m.provider;
+                                            ModelEntry {
+                                                id: format!("{}/{}", provider, model),
+                                                label: m.label.unwrap_or_else(|| {
+                                                    if model == "*" {
+                                                        format!("{} (all models)", provider)
+                                                    } else {
+                                                        model.clone()
+                                                    }
+                                                }),
+                                                source: "catalog".to_string(),
+                                                provider,
+                                                model,
+                                                node_id: Some(resolved_node_id.clone()),
+                                                node_label: Some(resolved_label.clone()),
+                                                family: m.family,
+                                                quant: m.quant,
+                                            }
+                                        })
+                                        .collect();
+                                    return Some(Ok(entries));
+                                }
+                                Err(kameo::error::RemoteSendError::ReplyTimeout) => {
+                                    tracing::warn!(
+                                        "GetProviderCatalog timed out for node (timeout: {:?})",
+                                        node_timeout
+                                    );
+                                    return Some(Err(()));
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        "GetProviderCatalog failed for peer {}: {}",
+                                        peer_id,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(querymt_remote::RemoteLookupError::Timeout { .. }) => {
+                            tracing::warn!(
+                                "ProviderCatalog lookup timed out for node (timeout: {:?})",
+                                node_timeout
+                            );
+                            return Some(Err(()));
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "ProviderCatalog lookup failed for peer {}: {}",
+                                peer_id,
+                                e
+                            );
+                        }
                     }
                 }
+
+                tracing::debug!(
+                    peer_id = %peer_id,
+                    "remote node has no provider catalog registration; skipping model enumeration"
+                );
+                Some(Ok(Vec::new()))
             });
 
             handles.push(handle);

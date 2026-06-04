@@ -1,7 +1,6 @@
-use crate::agent::remote::mesh::{
-    DirectoryMode, MeshConfig, MeshDiscovery, MeshError, MeshHandle, MeshScopeId, MeshTransportMode,
-};
+use crate::agent::remote::mesh::{MeshError, MeshHandle, MeshScopeId};
 use libp2p::PeerId;
+use querymt_remote::{IrohMeshConfig, MeshRuntimeConfig};
 
 /// Join an existing mesh using a signed invite grant.
 ///
@@ -75,16 +74,21 @@ pub async fn join_mesh_via_invite(
         );
     }
 
-    let config = MeshConfig {
-        listen: None,
-        discovery: MeshDiscovery::None,
-        bootstrap_peers,
-        directory: DirectoryMode::default(),
+    let config = MeshRuntimeConfig {
+        enabled: true,
+        lan: None,
+        iroh_enabled: true,
+        iroh_scopes: vec![IrohMeshConfig {
+            mesh_id: mesh_id.clone(),
+            invite: Some(invite.encode()),
+            name: invite.grant.mesh_name.clone(),
+        }],
+        identity_file,
         request_timeout: std::time::Duration::from_secs(300),
         stream_reconnect_grace: std::time::Duration::from_secs(120),
-        transport: MeshTransportMode::Iroh,
-        identity_file,
-        invite: Some(invite.clone()),
+        node_name: None,
+        peers: bootstrap_peers,
+        auto_fallback: false,
     };
 
     log::info!(
@@ -93,7 +97,7 @@ pub async fn join_mesh_via_invite(
         invite.grant.mesh_name
     );
 
-    let mesh = crate::agent::remote::mesh::bootstrap_mesh(&config).await?;
+    let mesh = querymt_remote::bootstrap_mesh_handle(&config).await?;
     mesh.ensure_scope(MeshScopeId::Iroh {
         mesh_id: mesh_id.clone(),
     });

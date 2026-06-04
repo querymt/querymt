@@ -30,11 +30,12 @@ dbus-secret-service = ["querymt-utils/dbus-secret-service"]
 # Enables kameo remote actor support for cross-machine session management.
 # Adds libp2p-based P2P networking, mDNS peer discovery, and Kademlia DHT
 # for distributed actor registry. SessionActorRef gains a Remote variant.
-remote = ["kameo/remote", "dep:libp2p", "dep:libp2p-iroh", "dep:qrcode"]
+remote = ["kameo/remote", "dep:libp2p", "dep:libp2p-iroh", "querymt-remote/kameo-mesh", "querymt-remote/qr"]
 
 [dependencies]
 typeshare = "1.0"
 querymt = { path = "../querymt", default-features = false, features = ["runtime"] }
+querymt-remote = { path = "../querymt-remote" }
 querymt-provider-common = { path = "../provider-common" }
 querymt-utils = { path = "../querymt-utils", features = ["providers", "serde", "secret-store"] }
 agent-client-protocol = { version = "0.12", features = ["unstable"] }
@@ -42,7 +43,6 @@ agent-client-protocol-schema = { version = "0.13", features = ["unstable"]}
 kameo = "0.20"
 libp2p = { version = "0.56", optional = true, default-features = false }
 libp2p-iroh = { git = "https://github.com/querymt/libp2p-iroh.git", branch = "iroh_098", optional = true }
-qrcode = { version = "0.14", optional = true }
 async-trait.workspace = true
 anyhow = "1.0"
 thiserror = "2.0"

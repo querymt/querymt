@@ -13,7 +13,11 @@ use super::events::{
     should_dial_peer_command,
 };
 use super::{
-    DialReason, MeshError, MeshScopeId, MeshTransportMode, PeerEvent, RouteTable, SwarmCommand,
+    DialReason, MeshError, MeshTransportMode, PeerEvent, RouteTable, SwarmCommand,
+};
+use querymt_remote::{
+    LanDiscovery, MeshRuntimeConfig, MeshScopeId, MeshStateStore, SignedInviteGrant,
+    default_mesh_state_path, load_or_generate_keypair,
 };
 use kameo::remote;
 use libp2p::{Multiaddr, PeerId};
@@ -32,9 +36,8 @@ use libp2p::{Multiaddr, PeerId};
 /// Returns [`MeshError`] if the swarm fails to initialise, the identity
 /// keypair cannot be loaded, or (for Iroh) the iroh transport fails to start.
 pub async fn bootstrap_mesh_runtime(
-    config: &crate::agent::remote::mesh_runtime_config::MeshRuntimeConfig,
-) -> Result<crate::agent::remote::runtime_handle::MeshRuntimeHandle, MeshError> {
-    use crate::agent::remote::mesh_runtime_config::LanDiscovery;
+    config: &MeshRuntimeConfig,
+) -> Result<crate::agent::remote::mesh::MeshRuntimeHandle, MeshError> {
     use futures_util::StreamExt as _;
     use libp2p::swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle};
 
@@ -54,9 +57,8 @@ pub async fn bootstrap_mesh_runtime(
         _ => unreachable!(),
     };
 
-    let keypair =
-        crate::agent::remote::identity::load_or_generate_keypair(config.identity_file.as_deref())
-            .map_err(|e| MeshError::SwarmError(format!("failed to load mesh identity: {e}")))?;
+    let keypair = load_or_generate_keypair(config.identity_file.as_deref())
+        .map_err(|e| MeshError::SwarmError(format!("failed to load mesh identity: {e}")))?;
 
     for peer_addr in &config.peers {
         peer_addr
@@ -90,11 +92,11 @@ pub async fn bootstrap_mesh_runtime(
         .and_then(|l| l.listen.as_deref())
         .unwrap_or("/ip4/0.0.0.0/tcp/0");
 
-    let iroh_invites: Vec<(crate::agent::remote::invite::SignedInviteGrant, String)> = if has_iroh {
+    let iroh_invites: Vec<(SignedInviteGrant, String)> = if has_iroh {
         let mut invites = Vec::new();
         for scope in &config.iroh_scopes {
             if let Some(ref invite_str) = scope.invite {
-                let grant = crate::agent::remote::invite::SignedInviteGrant::decode(invite_str)
+                let grant = SignedInviteGrant::decode(invite_str)
                     .map_err(|e| {
                         MeshError::SwarmError(format!(
                             "invalid invite for scope '{}': {e}",
@@ -109,12 +111,10 @@ pub async fn bootstrap_mesh_runtime(
         Vec::new()
     };
 
-    let mesh_state_store_loop: Option<
-        Arc<RwLock<crate::agent::remote::mesh_state::MeshStateStore>>,
-    > = if has_iroh {
-        crate::agent::remote::mesh_state::default_mesh_state_path()
+    let mesh_state_store_loop: Option<Arc<RwLock<MeshStateStore>>> = if has_iroh {
+        default_mesh_state_path()
             .ok()
-            .and_then(|p| crate::agent::remote::mesh_state::MeshStateStore::load_or_create(&p).ok())
+            .and_then(|p| MeshStateStore::load_or_create(&p).ok())
             .map(|s| Arc::new(RwLock::new(s)))
     } else {
         None
@@ -639,5 +639,5 @@ pub async fn bootstrap_mesh_runtime(
 
     handle.set_config_scopes(config.active_scopes());
 
-    Ok(crate::agent::remote::runtime_handle::MeshRuntimeHandle::new(handle))
+    Ok(crate::agent::remote::mesh::MeshRuntimeHandle::new(handle))
 }

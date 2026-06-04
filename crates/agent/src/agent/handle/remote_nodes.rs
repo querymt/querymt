@@ -5,6 +5,7 @@ impl LocalAgentHandle {
     pub async fn list_remote_nodes(&self) -> Vec<crate::agent::remote::NodeInfo> {
         use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
         use futures_util::{StreamExt, stream::FuturesUnordered};
+        use querymt_remote::ask_remote_with_timeout;
 
         let Some(mesh) = self.mesh() else {
             log::debug!("list_remote_nodes: mesh not bootstrapped");
@@ -85,11 +86,9 @@ impl LocalAgentHandle {
                         let semaphore = Arc::clone(&semaphore);
                         lookups.push(Box::pin(async move {
                             let permit = semaphore.acquire_owned().await.ok();
-                            let res = tokio::time::timeout(
-                                timeout,
-                                node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
-                            )
-                            .await;
+                            let res =
+                                ask_remote_with_timeout(&node_manager_ref, &GetNodeInfo, timeout)
+                                    .await;
                             drop(permit);
                             (cache_key, Some(peer_id), res)
                         }));
@@ -192,11 +191,9 @@ impl LocalAgentHandle {
                         let semaphore = Arc::clone(&semaphore);
                         lookups.push(Box::pin(async move {
                             let permit = semaphore.acquire_owned().await.ok();
-                            let res = tokio::time::timeout(
-                                timeout,
-                                node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo),
-                            )
-                            .await;
+                            let res =
+                                ask_remote_with_timeout(&node_manager_ref, &GetNodeInfo, timeout)
+                                    .await;
                             drop(permit);
                             (cache_key, peer_id, res)
                         }));
@@ -221,11 +218,11 @@ impl LocalAgentHandle {
         let mut fetched_nodes = Vec::new();
         while let Some((cache_key, peer_id, result)) = lookups.next().await {
             match result {
-                Ok(Ok(info)) => {
+                Ok(info) => {
                     self.insert_cached_remote_node(cache_key, info.clone());
                     fetched_nodes.push(info);
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     if let Some(pid) = peer_id {
                         self.mark_cached_remote_node_unreachable(
                             cache_key.clone(),
@@ -236,23 +233,13 @@ impl LocalAgentHandle {
                             Self::stale_lan_probe_ttl(),
                         );
                     }
-                    log::warn!("list_remote_nodes: GetNodeInfo failed: {}", e);
-                }
-                Err(_) => {
-                    if let Some(pid) = peer_id {
-                        self.mark_cached_remote_node_unreachable(
-                            cache_key.clone(),
-                            Self::stale_lan_probe_ttl(),
-                        );
-                        self.mark_cached_remote_node_unreachable(
-                            Self::peer_cache_key(Some(pid), 0),
-                            Self::stale_lan_probe_ttl(),
-                        );
+                    match e {
+                        kameo::error::RemoteSendError::ReplyTimeout => log::warn!(
+                            "list_remote_nodes: GetNodeInfo timed out for peer {:?}",
+                            peer_id
+                        ),
+                        other => log::warn!("list_remote_nodes: GetNodeInfo failed: {}", other),
                     }
-                    log::warn!(
-                        "list_remote_nodes: GetNodeInfo timed out for peer {:?}",
-                        peer_id
-                    );
                 }
             }
         }

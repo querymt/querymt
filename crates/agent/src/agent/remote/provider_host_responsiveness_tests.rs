@@ -10,11 +10,13 @@
 #[cfg(test)]
 #[cfg(feature = "remote")]
 mod tests {
-    use crate::agent::remote::provider_host::{
+    use crate::agent::remote::{
         CancelProviderStreamRequest, GetProviderStreamStatus, ProviderChatRequest,
-        ProviderHostActor, ProviderStreamRequest, RenewProviderStreamLease,
+        ProviderStreamRequest, RenewProviderStreamLease,
     };
+    use kameo::actor::RemoteActorRef;
     use kameo::message::Message;
+    use querymt_remote::{ProviderHostActor, ProviderStreamRouterActor};
 
     /// Verify that ProviderChatRequest uses DelegatedReply pattern.
     ///
@@ -39,7 +41,9 @@ mod tests {
     #[test]
     fn test_provider_stream_request_uses_delegated_reply() {
         // Type-level verification
-        type StreamReply = <ProviderHostActor as Message<ProviderStreamRequest>>::Reply;
+        type StreamReply = <ProviderHostActor as Message<
+            ProviderStreamRequest<RemoteActorRef<ProviderStreamRouterActor>>,
+        >>::Reply;
 
         // Use the type to avoid unused warnings while verifying the type exists
         fn assert_reply_type<T: 'static>() {}

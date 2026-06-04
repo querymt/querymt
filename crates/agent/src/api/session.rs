@@ -19,7 +19,7 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
-    pub(super) fn new(agent: Arc<AgentHandle>, session_id: String) -> Self {
+    pub(crate) fn new(agent: Arc<AgentHandle>, session_id: String) -> Self {
         let callbacks = Arc::new(EventCallbacksState::new(Some(session_id.clone())));
         Self {
             agent,

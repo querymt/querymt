@@ -470,7 +470,7 @@ mod tests {
         assert!(matches!(error, AdmissionError::Rejected { reason } if reason == "nope"));
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn admission_timeout_error_contains_debug_context() {
         let inviter = peer();
         let joiner = peer();

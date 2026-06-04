@@ -27,6 +27,8 @@ use crate::tools::builtins::all_builtin_tools;
 use agent_client_protocol::schema::{ContentBlock, PromptRequest, TextContent};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+#[cfg(feature = "remote")]
+use querymt_remote::ask_remote_with_timeout;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -577,9 +579,12 @@ impl QuorumBuilder {
                                 let Some(node_manager) = node_manager else {
                                     continue;
                                 };
-                                let node_info = match node_manager
-                                    .ask::<GetNodeInfo>(&GetNodeInfo)
-                                    .await
+                                let node_info = match ask_remote_with_timeout(
+                                    &node_manager,
+                                    &GetNodeInfo,
+                                    std::time::Duration::from_secs(3),
+                                )
+                                .await
                                 {
                                     Ok(info) => info,
                                     Err(e) => {

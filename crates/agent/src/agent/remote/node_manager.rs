@@ -61,28 +61,21 @@ pub struct NodeInfo {
     pub active_sessions: usize,
 }
 
-/// A single available model advertised by a mesh node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AvailableModel {
-    pub provider: String,
-    pub model: String,
-}
-
 // ── Remote-only actor and messages ────────────────────────────────────────────
 
 #[cfg(feature = "remote")]
 pub use remote_impl::{
     AdmissionRequest, AdmissionResponse, CreateRemoteSchedule, CreateRemoteScheduleResponse,
     CreateRemoteSession, CreateRemoteSessionResponse, DeleteRemoteSchedule, ForkRemoteSession,
-    ForkRemoteSessionResponse, GetNodeInfo, ListAvailableModels, ListRemoteSchedules,
-    ListRemoteSchedulesResponse, ListRemoteSessions, PauseRemoteSchedule, RemoteNodeManager,
-    RemoteNodeManagerState, ResumeRemoteSchedule, ResumeRemoteSession, SessionHandoff,
-    StopRemoteSessionRuntime, TriggerRemoteSchedule,
+    ForkRemoteSessionResponse, GetNodeInfo, ListRemoteSchedules, ListRemoteSchedulesResponse,
+    ListRemoteSessions, PauseRemoteSchedule, RemoteNodeManager, RemoteNodeManagerState,
+    ResumeRemoteSchedule, ResumeRemoteSession, SessionHandoff, StopRemoteSessionRuntime,
+    TriggerRemoteSchedule,
 };
 
 #[cfg(feature = "remote")]
 mod remote_impl {
-    use super::{AvailableModel, ListRemoteSessionsResponse, NodeInfo, RemoteSessionInfo};
+    use super::{ListRemoteSessionsResponse, NodeInfo, RemoteSessionInfo};
     use crate::agent::agent_config::AgentConfig;
     use crate::agent::remote::NodeId;
     use crate::agent::remote::mesh::MeshHandle;
@@ -179,10 +172,6 @@ mod remote_impl {
         #[serde(default)]
         pub limit: Option<u32>,
     }
-
-    /// List all provider/model pairs this node can serve (has valid credentials for).
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct ListAvailableModels;
 
     /// Create a new schedule owned by this node.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,7 +304,7 @@ mod remote_impl {
 
     /// pattern: heavyweight operations (create/resume/fork) spawn background tasks
     /// that capture cheap clones of this shared state, keeping the actor mailbox
-    /// responsive for lightweight control-plane messages (GetNodeInfo, ListAvailableModels).
+    /// responsive for lightweight control-plane messages (GetNodeInfo and schedule/session RPCs).
     #[derive(Clone)]
     pub struct RemoteNodeManagerState {
         /// Configuration and provider access.
@@ -332,8 +321,6 @@ mod remote_impl {
         /// Per-session async locks preventing concurrent materialization of the
         /// same `session_id`.  Different sessions are independent.
         pub materialization_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-        /// Cached model inventory for fast model listing without blocking the actor mailbox.
-        pub model_inventory: crate::model_inventory::ModelInventory,
         /// Shared scheduler owner borrowed from the local agent handle.
         pub scheduler_handle: crate::agent::handle::SchedulerHandleSlot,
         /// Serializes first-start attempts so concurrent requests converge on one result.
@@ -372,15 +359,12 @@ mod remote_impl {
             mesh: Option<MeshHandle>,
             scheduler_handle: crate::agent::handle::SchedulerHandleSlot,
         ) -> Self {
-            let model_inventory = crate::model_inventory::ModelInventory::new(config.clone());
             let session_materializer = Arc::new(
                 crate::agent::session_materializer::SessionMaterializer::new(config.clone()),
             );
 
-            // Set mesh on model inventory and session materializer if provided
             #[cfg(feature = "remote")]
             if let Some(ref mesh_handle) = mesh {
-                model_inventory.set_mesh(mesh_handle.clone());
                 session_materializer.set_mesh(mesh_handle.clone());
             }
 
@@ -391,17 +375,9 @@ mod remote_impl {
                 session_meta: Arc::new(Mutex::new(HashMap::new())),
                 mesh,
                 materialization_locks: Arc::new(Mutex::new(HashMap::new())),
-                model_inventory,
                 scheduler_handle,
                 scheduler_start_lock: Arc::new(tokio::sync::Mutex::new(())),
             };
-
-            // Prewarm model inventory in the background so first remote model
-            // advertisements are less likely to return an indistinguishable empty snapshot.
-            let inventory = shared_state.model_inventory.clone();
-            tokio::spawn(async move {
-                let _ = inventory.trigger_refresh().await;
-            });
 
             Self {
                 shared_state,
@@ -1248,69 +1224,98 @@ mod remote_impl {
     }
 
     impl Message<StopRemoteSessionRuntime> for RemoteNodeManager {
-        type Reply = Result<(), AgentError>;
+        type Reply = kameo::reply::DelegatedReply<Result<(), AgentError>>;
 
         #[tracing::instrument(
             name = "remote.node_manager.stop_session_runtime",
-            skip(self, _ctx),
+            skip(self, ctx),
             fields(session_id = %msg.session_id, found = tracing::field::Empty)
         )]
         async fn handle(
             &mut self,
             msg: StopRemoteSessionRuntime,
-            _ctx: &mut Context<Self, Self::Reply>,
+            ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
-            let session_ref = {
-                let mut registry = self.shared_state.registry.lock().await;
-                registry.remove(&msg.session_id)
-            };
+            tracing::debug!(
+                session_id = %msg.session_id,
+                "StopRemoteSessionRuntime received"
+            );
+            let shared_state = self.shared_state.clone();
 
-            if let Some(session_ref) = session_ref {
-                tracing::Span::current().record("found", true);
-
-                // Bound shutdown latency so stop requests cannot hang forever
-                // if an actor is unresponsive.
-                let shutdown_timeout = std::time::Duration::from_secs(2);
-                match tokio::time::timeout(shutdown_timeout, session_ref.shutdown()).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        log::warn!(
-                            "RemoteNodeManager: shutdown error for session {}: {}",
-                            msg.session_id,
-                            e
-                        );
-                    }
-                    Err(_) => {
-                        log::warn!(
-                            "RemoteNodeManager: shutdown timed out for session {} after {:?}",
-                            msg.session_id,
-                            shutdown_timeout
-                        );
-                    }
-                }
-
-                // Ensure this session's re-registration closure is removed from the
-                // mesh handle so repeated create/stop cycles don't leak entries.
-                if let Some(ref mesh) = self.shared_state.mesh {
-                    let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
-                    for scope in runtime.active_scopes() {
-                        let dht_name =
-                            crate::agent::remote::scope::scoped_session(&scope, &msg.session_id);
-                        runtime.deregister_actor(&dht_name);
-                    }
-                }
-
-                log::info!(
-                    "RemoteNodeManager: stopped runtime for session {}",
-                    msg.session_id
+            ctx.spawn(async move {
+                tracing::debug!(
+                    session_id = %msg.session_id,
+                    "StopRemoteSessionRuntime spawned task started"
                 );
-                Ok(())
-            } else {
-                tracing::Span::current().record("found", false);
-                Err(AgentError::SessionNotFound {
-                    session_id: msg.session_id.clone(),
-                })
-            }
+                let session_ref = {
+                    let mut registry = shared_state.registry.lock().await;
+                    let removed = registry.remove(&msg.session_id);
+                    tracing::debug!(
+                        session_id = %msg.session_id,
+                        found = removed.is_some(),
+                        "StopRemoteSessionRuntime removed session from registry"
+                    );
+                    removed
+                };
+
+                if let Some(session_ref) = session_ref {
+                    tracing::Span::current().record("found", true);
+
+                    // Bound shutdown latency so stop requests cannot hang forever
+                    // if an actor is unresponsive.
+                    let shutdown_timeout = std::time::Duration::from_secs(2);
+                    tracing::debug!(
+                        session_id = %msg.session_id,
+                        timeout_ms = shutdown_timeout.as_millis(),
+                        "StopRemoteSessionRuntime beginning session shutdown"
+                    );
+                    match tokio::time::timeout(shutdown_timeout, session_ref.shutdown()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            log::warn!(
+                                "RemoteNodeManager: shutdown error for session {}: {}",
+                                msg.session_id,
+                                e
+                            );
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "RemoteNodeManager: shutdown timed out for session {} after {:?}",
+                                msg.session_id,
+                                shutdown_timeout
+                            );
+                        }
+                    }
+
+                    // Ensure this session's re-registration closure is removed from the
+                    // mesh handle so repeated create/stop cycles don't leak entries.
+                    if let Some(ref mesh) = shared_state.mesh {
+                        let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
+                        for scope in runtime.active_scopes() {
+                            let dht_name = crate::agent::remote::scope::scoped_session(
+                                &scope,
+                                &msg.session_id,
+                            );
+                            runtime.deregister_actor(&dht_name);
+                        }
+                    }
+
+                    log::info!(
+                        "RemoteNodeManager: stopped runtime for session {}",
+                        msg.session_id
+                    );
+                    tracing::debug!(
+                        session_id = %msg.session_id,
+                        "StopRemoteSessionRuntime completed successfully"
+                    );
+                    Ok(())
+                } else {
+                    tracing::Span::current().record("found", false);
+                    Err(AgentError::SessionNotFound {
+                        session_id: msg.session_id.clone(),
+                    })
+                }
+            })
         }
     }
 
@@ -1414,47 +1419,6 @@ mod remote_impl {
                 capabilities: vec!["shell".to_string(), "filesystem".to_string()],
                 active_sessions,
             })
-        }
-    }
-
-    impl Message<ListAvailableModels> for RemoteNodeManager {
-        type Reply = Result<Vec<AvailableModel>, AgentError>;
-
-        #[tracing::instrument(
-            name = "remote.node_manager.list_models",
-            skip(self, _ctx),
-            fields(model_count = tracing::field::Empty, cache_hit = tracing::field::Empty)
-        )]
-        async fn handle(
-            &mut self,
-            _msg: ListAvailableModels,
-            _ctx: &mut Context<Self, Self::Reply>,
-        ) -> Self::Reply {
-            // Use the cached model inventory instead of synchronously enumerating models.
-            // This keeps the actor mailbox responsive even when providers are slow.
-            let (local_models, meta) = self.shared_state.model_inventory.get_snapshot().await;
-
-            // Prewarming on actor startup handles the first-query empty snapshot case.
-            // If cache is stale, refresh in the background and return the latest snapshot.
-            if meta.is_stale && !meta.refresh_in_progress {
-                let inventory = self.shared_state.model_inventory.clone();
-                tokio::spawn(async move {
-                    let _ = inventory.trigger_refresh().await;
-                });
-            }
-
-            let local_only: Vec<AvailableModel> = local_models
-                .into_iter()
-                .filter(|entry| entry.node_id.is_none())
-                .map(|entry| AvailableModel {
-                    provider: entry.provider,
-                    model: entry.model,
-                })
-                .collect();
-
-            tracing::Span::current().record("model_count", local_only.len());
-            tracing::Span::current().record("cache_hit", !meta.is_stale);
-            Ok(local_only)
         }
     }
 
@@ -1721,11 +1685,6 @@ mod remote_impl {
         REG_RESUME_REMOTE_SESSION
     );
     remote_node_msg_impl!(GetNodeInfo, "querymt::GetNodeInfo", REG_GET_NODE_INFO);
-    remote_node_msg_impl!(
-        ListAvailableModels,
-        "querymt::ListAvailableModels",
-        REG_LIST_AVAILABLE_MODELS
-    );
     remote_node_msg_impl!(
         CreateRemoteSchedule,
         "querymt::CreateRemoteSchedule",

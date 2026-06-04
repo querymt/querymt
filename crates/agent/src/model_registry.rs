@@ -391,84 +391,76 @@ fn dedupe_models(models: Vec<ModelEntry>) -> Vec<ModelEntry> {
 /// Shared remote enumerator used by UI + ACP.
 #[cfg(feature = "remote")]
 async fn enumerate_remote_models(mesh: &crate::agent::remote::MeshHandle) -> Vec<ModelEntry> {
-    use crate::agent::remote::{GetNodeInfo, ListAvailableModels, NodeId, RemoteNodeManager};
-    use futures_util::StreamExt;
+    use crate::agent::remote::NodeId;
+    use querymt_remote::{GetProviderCatalog, ProviderCatalogActor, scoped_provider_catalog};
 
-    let local_peer_id = *mesh.peer_id();
     let mut all_remote = Vec::new();
     let mut seen_peers = std::collections::HashSet::new();
 
     for scope in mesh.active_scopes() {
-        let mut stream = mesh.lookup_all_actors::<RemoteNodeManager>(
-            crate::agent::remote::scope::scoped_node_manager(&scope),
-        );
+        for peer_id in mesh.route_peer_ids() {
+            if !seen_peers.insert(peer_id) {
+                continue;
+            }
 
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(node_manager_ref) => {
-                    // Skip local node — its models are already fetched via enumerate_local_models.
-                    if node_manager_ref.id().peer_id() == Some(&local_peer_id) {
-                        continue;
-                    }
-                    if let Some(pid) = node_manager_ref.id().peer_id().copied()
-                        && !seen_peers.insert(pid)
-                    {
-                        continue;
-                    }
+            let catalog_name = scoped_provider_catalog(&scope, &peer_id);
+            let Ok(Some(catalog_ref)) = mesh
+                .lookup_actor::<ProviderCatalogActor>(catalog_name)
+                .await
+            else {
+                continue;
+            };
 
-                    // Get the node's identity/label for tagging.
-                    let node_info = match node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
-                        Ok(info) => info,
-                        Err(e) => {
-                            log::warn!("enumerate_remote_models: GetNodeInfo failed: {}", e);
-                            continue;
-                        }
-                    };
-                    if NodeId::parse(&node_info.node_id.to_string()).is_err() {
-                        log::warn!(
-                            "enumerate_remote_models: ignoring node with invalid id '{}'",
-                            node_info.node_id
-                        );
-                        continue;
-                    }
-
-                    // Query available models
-                    match node_manager_ref
-                        .ask::<ListAvailableModels>(&ListAvailableModels)
-                        .await
-                    {
-                        Ok(models) => {
-                            log::debug!(
-                                "enumerate_remote_models: got {} models from node '{}' ({})",
-                                models.len(),
-                                node_info.hostname,
-                                node_info.node_id
-                            );
-                            for m in models {
-                                all_remote.push(ModelEntry {
-                                    id: format!("{}/{}", m.provider, m.model),
-                                    label: m.model.clone(),
-                                    source: "catalog".to_string(),
-                                    provider: m.provider,
-                                    model: m.model,
-                                    node_id: Some(node_info.node_id.to_string()),
-                                    node_label: Some(node_info.hostname.clone()),
-                                    family: None,
-                                    quant: None,
-                                });
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "enumerate_remote_models: ListAvailableModels failed for '{}' ({}): {}",
-                                node_info.hostname,
-                                node_info.node_id,
-                                e
-                            );
-                        }
-                    }
+            let snapshot = match catalog_ref
+                .ask::<GetProviderCatalog>(&GetProviderCatalog)
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    log::warn!(
+                        "enumerate_remote_models: GetProviderCatalog failed for '{}': {}",
+                        peer_id,
+                        e
+                    );
+                    continue;
                 }
-                Err(e) => log::warn!("enumerate_remote_models: lookup error: {}", e),
+            };
+
+            if NodeId::parse(&snapshot.node.node_id).is_err() {
+                log::warn!(
+                    "enumerate_remote_models: ignoring node with invalid id '{}'",
+                    snapshot.node.node_id
+                );
+                continue;
+            }
+
+            log::debug!(
+                "enumerate_remote_models: got {} models from node '{}' ({})",
+                snapshot.providers.len(),
+                snapshot.node.node_label.as_deref().unwrap_or("unknown"),
+                snapshot.node.node_id
+            );
+
+            for m in snapshot.providers {
+                let model = m.model.unwrap_or_else(|| "*".to_string());
+                let provider = m.provider;
+                all_remote.push(ModelEntry {
+                    id: format!("{}/{}", provider, model),
+                    label: m.label.unwrap_or_else(|| {
+                        if model == "*" {
+                            format!("{} (all models)", provider)
+                        } else {
+                            model.clone()
+                        }
+                    }),
+                    source: "catalog".to_string(),
+                    provider,
+                    model,
+                    node_id: Some(snapshot.node.node_id.clone()),
+                    node_label: snapshot.node.node_label.clone(),
+                    family: m.family,
+                    quant: m.quant,
+                });
             }
         }
     }
@@ -571,11 +563,18 @@ mod tests {
         assert!(json.get("quant").is_none());
     }
 
-    #[tokio::test]
-    async fn registry_invalidate_clears_caches() {
-        let registry = ModelRegistry::new();
-        // Just verify invalidation doesn't panic on empty caches
-        registry.invalidate_all().await;
+    #[test]
+    fn registry_invalidate_clears_caches() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let registry = ModelRegistry::new();
+            // Just verify invalidation doesn't panic on empty caches.
+            registry.invalidate_all().await;
+            drop(registry);
+        });
     }
 
     /// Verifies that ModelEntry.id can be parsed back into (provider, model) by

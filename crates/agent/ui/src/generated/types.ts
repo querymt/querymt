@@ -53,6 +53,11 @@ export type AgentEventKind =
 	message: string;
 	message_id?: string;
 }}
+	/** Ephemeral signal emitted when an attached remote session disconnects. */
+	| { type: "remote_session_disconnected", data: {
+	message: string;
+	node_id?: string;
+}}
 	/** Ephemeral signal emitted when a remote provider host reports liveness while waiting. */
 	| { type: "remote_provider_heartbeat", data: {
 	phase: string;
@@ -781,7 +786,6 @@ export interface ScheduleInfo {
 	updated_at: string;
 }
 
-/** Summary of a session for listing. */
 export interface SessionSummary {
 	session_id: string;
 	name?: string;
@@ -800,7 +804,6 @@ export interface SessionSummary {
 	runtime_state?: string;
 }
 
-/** Group of sessions by working directory. */
 export interface SessionGroup {
 	cwd?: string;
 	sessions: SessionSummary[];

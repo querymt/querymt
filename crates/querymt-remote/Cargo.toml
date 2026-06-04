@@ -1,0 +1,39 @@
+[package]
+name = "querymt-remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reusable mesh and remote provider primitives for QueryMT"
+
+[features]
+default = []
+kameo-mesh = ["dep:libp2p", "dep:libp2p-iroh", "dep:moka"]
+qr = ["dep:qrcode"]
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+log.workspace = true
+parking_lot = "0.12"
+serde.workspace = true
+serde_json.workspace = true
+futures-util = "0.3"
+querymt = { path = "../querymt", default-features = false, features = ["runtime"] }
+querymt-utils = { path = "../querymt-utils", features = ["providers"] }
+kameo = { version = "0.20", features = ["remote"] }
+tokio = { version = "1.0", features = ["macros", "rt", "sync", "time"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
+tracing = { version = "0.1", features = ["attributes", "release_max_level_debug"] }
+libp2p = { version = "0.56", optional = true, default-features = false }
+libp2p-iroh = { git = "https://github.com/querymt/libp2p-iroh.git", branch = "iroh_098", optional = true }
+moka = { version = "0.12", features = ["sync"], optional = true }
+qrcode = { version = "0.14", optional = true }
+thiserror = "2.0"
+hex = "0.4"
+uuid = { version = "1.18", features = ["v4", "v7"] }
+anyhow = "1.0"
+
+[dev-dependencies]
+qmt-openai = { path = "../providers/openai", default-features = false, features = ["api"] }
+tempfile = "3"

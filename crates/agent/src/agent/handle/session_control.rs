@@ -78,6 +78,7 @@ impl LocalAgentHandle {
         if session_ref.is_remote() {
             #[cfg(feature = "remote")]
             {
+                let remote_request_timeout = Self::remote_request_timeout();
                 let bookmark = self
                     .config
                     .provider
@@ -99,7 +100,7 @@ impl LocalAgentHandle {
                                     &bookmark.node_id,
                                 );
                             if let Ok(Some(found)) = mesh
-                                .lookup_actor::<crate::agent::remote::provider_host::ProviderHostActor>(
+                                .lookup_actor::<querymt_remote::ProviderHostActor>(
                                     &provider_host_name,
                                 )
                                 .await
@@ -109,16 +110,17 @@ impl LocalAgentHandle {
                             }
                         }
                         if let Some(provider_host) = provider_host {
-                            let status = provider_host
-                                .ask(
-                                    &crate::agent::remote::provider_host::GetProviderStreamStatus {
-                                        session_id: session_id.to_string(),
-                                        request_id: None,
-                                    },
-                                )
-                                .await
-                                .ok()
-                                .flatten();
+                            let status = querymt_remote::ask_remote_with_timeout(
+                                &provider_host,
+                                &crate::agent::remote::GetProviderStreamStatus {
+                                    session_id: session_id.to_string(),
+                                    request_id: None,
+                                },
+                                remote_request_timeout,
+                            )
+                            .await
+                            .ok()
+                            .flatten();
                             if let Some(status) = status {
                                 tracing::warn!(
                                     session_id,
@@ -134,34 +136,45 @@ impl LocalAgentHandle {
                                     last_error = ?status.last_error,
                                     "remote stop found active provider stream; issuing provider-host cancel"
                                 );
-                                let _ = provider_host
-                                    .ask(&crate::agent::remote::provider_host::CancelProviderStreamRequest {
+                                let _ = querymt_remote::ask_remote_with_timeout(
+                                    &provider_host,
+                                    &crate::agent::remote::CancelProviderStreamRequest {
                                         session_id: session_id.to_string(),
                                         request_id: Some(status.request_id.clone()),
                                         reason: Some("session stop requested".to_string()),
-                                    })
-                                    .await;
+                                    },
+                                    remote_request_timeout,
+                                )
+                                .await;
                             } else {
-                                let _ = provider_host
-                                    .ask(&crate::agent::remote::provider_host::CancelProviderStreamRequest {
+                                let _ = querymt_remote::ask_remote_with_timeout(
+                                    &provider_host,
+                                    &crate::agent::remote::CancelProviderStreamRequest {
                                         session_id: session_id.to_string(),
                                         request_id: None,
-                                        reason: Some("session stop requested without status".to_string()),
-                                    })
-                                    .await;
+                                        reason: Some(
+                                            "session stop requested without status".to_string(),
+                                        ),
+                                    },
+                                    remote_request_timeout,
+                                )
+                                .await;
                             }
                         }
                     }
 
                     let nm_ref = self.find_node_manager(&bookmark.node_id).await?;
-                    nm_ref
-                        .ask(&crate::agent::remote::StopRemoteSessionRuntime {
+                    querymt_remote::ask_remote_with_timeout(
+                        &nm_ref,
+                        &crate::agent::remote::StopRemoteSessionRuntime {
                             session_id: session_id.to_string(),
-                        })
-                        .await
-                        .map_err(|e| {
-                            Error::from(crate::error::AgentError::RemoteActor(e.to_string()))
-                        })?;
+                        },
+                        remote_request_timeout,
+                    )
+                    .await
+                    .map_err(|e| {
+                        Error::from(crate::error::AgentError::RemoteActor(e.to_string()))
+                    })?;
                 }
 
                 let mut registry = self.registry.lock().await;

@@ -440,7 +440,7 @@ impl SessionProvider {
                 })
                 .or_else(|| Some(serde_json::json!({"_remote_session_id": session_id})));
             return Ok(Arc::new(
-                crate::agent::remote::mesh_provider::MeshChatProvider::from_node_id(
+                querymt_remote::MeshChatProvider::from_node_id(
                     mesh,
                     &node_id,
                     provider_name,
@@ -476,11 +476,7 @@ impl SessionProvider {
                         provider_name
                     );
                     if let Some(node_id) =
-                        crate::agent::remote::mesh_provider::find_provider_on_mesh(
-                            mesh,
-                            provider_name,
-                        )
-                        .await
+                        querymt_remote::find_provider_on_mesh(mesh, provider_name).await
                     {
                         log::info!(
                             "build_provider: found '{}' on mesh peer '{}', using MeshChatProvider",
@@ -502,7 +498,7 @@ impl SessionProvider {
                                 Some(serde_json::json!({"_remote_session_id": session_id}))
                             });
                         return Ok(Arc::new(
-                            crate::agent::remote::mesh_provider::MeshChatProvider::from_node_id(
+                            querymt_remote::MeshChatProvider::from_node_id(
                                 mesh,
                                 &node_id,
                                 provider_name,
@@ -533,6 +529,7 @@ impl SessionProvider {
         )
         .await?;
 
+        #[cfg(feature = "oauth")]
         let builder_config = resolved_cfg.builder_config;
         let pruned_config_str = resolved_cfg.pruned_config_str;
         let pruned_keys = resolved_cfg.pruned_keys;

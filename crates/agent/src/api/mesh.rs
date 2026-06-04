@@ -4,6 +4,8 @@
 mod invite;
 #[cfg(feature = "remote")]
 mod runtime;
+#[cfg(feature = "remote")]
+mod runtime_config;
 mod types;
 
 #[cfg(feature = "remote")]

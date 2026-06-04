@@ -30,8 +30,8 @@ use super::mesh::{MeshHandle, PeerEvent};
 
 use super::event_relay::EventRelayActor;
 use super::node_manager::RemoteNodeManager;
-use super::provider_host::ProviderHostActor;
 use crate::agent::session_actor::SessionActor;
+use querymt_remote::ProviderHostActor;
 
 // ── MeshTransport trait ───────────────────────────────────────────────────────
 

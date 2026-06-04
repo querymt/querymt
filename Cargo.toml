@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/agent",
     "crates/querymt",
+    "crates/querymt-remote",
     "crates/cli",
     "crates/provider-common",
     "crates/querymt-utils",
@@ -10,10 +11,12 @@ members = [
     "crates/providers/*",
     "crates/querymt-extism-macros",
     "crates/querymt-mobile-ffi",
+    "crates/py/querymt-py",
+    "crates/py/querymt-agent-py",
 ]
 
 [workspace.package]
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
 

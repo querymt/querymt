@@ -6,14 +6,14 @@
 //! All functionality is feature-gated behind `#[cfg(feature = "remote")]`.
 
 use crate::agent::remote::mesh::MeshHandle;
-use crate::agent::remote::provider_host::ProviderHostActor;
-use crate::agent::remote::runtime_handle::MeshRuntimeHandle;
 use crate::agent::remote::scope::{
     scoped_node_manager, scoped_node_manager_for_peer, scoped_provider_host,
 };
 use crate::config::RemoteAgentConfig;
 use crate::delegation::{AgentInfo, DefaultAgentRegistry};
 use anyhow::Result;
+use querymt_remote::scoped_provider_catalog;
+use querymt_remote::{MeshRuntimeHandle, ProviderCatalogActor, ProviderHostActor};
 use std::sync::Arc;
 
 /// Keepalive refs for local mesh actors registered after an agent is built.
@@ -22,6 +22,7 @@ use std::sync::Arc;
 pub struct LocalMeshActorRefs {
     pub node_manager: kameo::actor::ActorRef<crate::agent::remote::RemoteNodeManager>,
     pub provider_host: kameo::actor::ActorRef<ProviderHostActor>,
+    pub provider_catalog: kameo::actor::ActorRef<ProviderCatalogActor>,
 }
 
 #[cfg(feature = "remote")]
@@ -52,6 +53,18 @@ pub async fn register_local_mesh_actor_scope(
         .register_actor(actor_refs.provider_host.clone(), ph_dht_name.clone())
         .await;
     log::info!("ProviderHostActor registered in DHT as '{}'", ph_dht_name);
+
+    let provider_catalog_name = scoped_provider_catalog(scope, mesh.peer_id());
+    runtime
+        .register_actor(
+            actor_refs.provider_catalog.clone(),
+            provider_catalog_name.clone(),
+        )
+        .await;
+    log::info!(
+        "ProviderCatalogActor registered in DHT as '{}'",
+        provider_catalog_name
+    );
 }
 
 /// Spawn and register the local mesh-facing actors for an already-built agent.
@@ -75,6 +88,7 @@ pub async fn spawn_and_register_local_mesh_actors_with_name(
     mesh: &crate::agent::remote::MeshHandle,
     node_name: Option<String>,
 ) -> LocalMeshActorRefs {
+    let _ = handle.model_inventory.ensure_local_refresh().await;
     use crate::agent::remote::RemoteNodeManager;
     use kameo::actor::Spawn;
 
@@ -84,17 +98,29 @@ pub async fn spawn_and_register_local_mesh_actors_with_name(
         Some(mesh.clone()),
         handle.scheduler_handle.clone(),
     );
-    let node_manager = match node_name {
+    let node_manager = match node_name.clone() {
         Some(name) => node_manager.with_node_name(name),
         None => node_manager,
     };
     let node_manager_ref = RemoteNodeManager::spawn(node_manager);
 
-    let provider_host = ProviderHostActor::new(handle.config.clone());
+    let provider_host = crate::agent::remote::provider_host_backend::provider_host_from_config(
+        handle.config.clone(),
+    );
     let provider_host_ref = ProviderHostActor::spawn(provider_host);
+    let provider_catalog = ProviderCatalogActor::new(Arc::new(
+        crate::agent::remote::provider_catalog_backend::AgentProviderCatalogBackend::new(
+            handle.config.clone(),
+            handle.model_inventory.clone(),
+            crate::agent::remote::NodeId::from_peer_id(*mesh.peer_id()).to_string(),
+            node_name.clone(),
+        ),
+    ));
+    let provider_catalog_ref = ProviderCatalogActor::spawn(provider_catalog);
     let actor_refs = LocalMeshActorRefs {
         node_manager: node_manager_ref,
         provider_host: provider_host_ref,
+        provider_catalog: provider_catalog_ref,
     };
 
     let runtime = MeshRuntimeHandle::from(mesh.clone());
@@ -176,11 +202,12 @@ async fn register_remote_agent(
     _peer_addr: &str,
 ) -> Result<(AgentInfo, Option<String>)> {
     use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
+    use querymt_remote::ask_remote_with_timeout;
 
     // Prefer peer-specific DHT names so multi-peer meshes do not bind to the
     // first generic node_manager provider returned by the DHT.
     let lookup_timeout = std::time::Duration::from_secs(5);
-    let runtime = super::runtime_handle::MeshRuntimeHandle::from(mesh.clone());
+    let runtime = MeshRuntimeHandle::from(mesh.clone());
     let mut found_ref = None;
     let mut target_node_id = None;
 
@@ -189,19 +216,17 @@ async fn register_remote_agent(
         target_node_id = Some(resolved_id.clone());
         for scope in runtime.active_scopes() {
             let dht_name = super::scope::scoped_node_manager_for_peer(&scope, &resolved_id);
-            let lookup_result = tokio::time::timeout(
-                lookup_timeout,
-                runtime.lookup_actor::<RemoteNodeManager>(dht_name.clone()),
-            )
-            .await;
-
-            match lookup_result {
-                Ok(Ok(Some(node_manager_ref))) => {
+            match runtime
+                .lookup_actor_with_timeout::<RemoteNodeManager>(dht_name.clone(), lookup_timeout)
+                .await
+            {
+                Ok(Some(node_manager_ref)) => {
                     found_ref = Some(node_manager_ref);
                     break;
                 }
-                Ok(Ok(None)) => {}
-                Ok(Err(e)) => {
+                Ok(None) => {}
+                Err(querymt_remote::RemoteLookupError::Timeout { .. }) => {}
+                Err(e) => {
                     log::debug!(
                         "DHT lookup error for peer '{}' under '{}': {}",
                         remote.peer,
@@ -209,33 +234,34 @@ async fn register_remote_agent(
                         e
                     );
                 }
-                Err(_timeout) => {}
             }
         }
     }
 
     match found_ref {
-        Some(node_manager_ref) => match node_manager_ref.ask::<GetNodeInfo>(&GetNodeInfo).await {
-            Ok(node_info) => {
-                tracing::Span::current()
-                    .record("reachable", true)
-                    .record("peer_hostname", &node_info.hostname);
-                target_node_id = Some(node_info.node_id.to_string());
-                log::debug!(
-                    "Peer '{}' reachable (hostname='{}')",
-                    remote.peer,
-                    node_info.hostname
-                );
+        Some(node_manager_ref) => {
+            match ask_remote_with_timeout(&node_manager_ref, &GetNodeInfo, lookup_timeout).await {
+                Ok(node_info) => {
+                    tracing::Span::current()
+                        .record("reachable", true)
+                        .record("peer_hostname", &node_info.hostname);
+                    target_node_id = Some(node_info.node_id.to_string());
+                    log::debug!(
+                        "Peer '{}' reachable (hostname='{}')",
+                        remote.peer,
+                        node_info.hostname
+                    );
+                }
+                Err(e) => {
+                    tracing::Span::current().record("reachable", false);
+                    log::debug!(
+                        "GetNodeInfo failed for peer '{}': {} (registering anyway)",
+                        remote.peer,
+                        e
+                    );
+                }
             }
-            Err(e) => {
-                tracing::Span::current().record("reachable", false);
-                log::debug!(
-                    "GetNodeInfo failed for peer '{}': {} (registering anyway)",
-                    remote.peer,
-                    e
-                );
-            }
-        },
+        }
         None => {
             tracing::Span::current().record("reachable", false);
             log::debug!(

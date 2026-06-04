@@ -37,6 +37,26 @@ async fn test_authenticate_no_auth_methods_always_succeeds() {
 
 #[cfg(feature = "remote")]
 #[tokio::test]
+async fn test_set_mesh_does_not_trigger_background_model_refresh() {
+    let f = HandleFixture::new().await;
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+
+    f.handle.set_mesh(mesh.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let (_, meta) = f.handle.model_inventory.get_snapshot().await;
+    assert!(
+        meta.local_updated_at.is_none(),
+        "attaching mesh alone should not eagerly refresh local models"
+    );
+    assert!(
+        meta.remote_updated_at.is_none(),
+        "attaching mesh alone should not eagerly refresh remote models"
+    );
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
 async fn test_remote_node_cache_expires_stale_entries() {
     let f = HandleFixture::new().await;
     let cache_key = "peer:test-peer".to_string();

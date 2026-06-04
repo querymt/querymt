@@ -22,6 +22,7 @@ pub(crate) enum ProviderConfigMode<'a> {
 }
 
 pub(crate) struct ResolvedProviderConfig {
+    #[cfg(feature = "oauth")]
     pub builder_config: Value,
     pub pruned_config_str: String,
     pub pruned_keys: Vec<String>,
@@ -194,6 +195,7 @@ pub(crate) async fn resolve_provider_config(
     }
 
     let SharedResolvedProviderConfig {
+        #[cfg(feature = "oauth")]
         full_config,
         pruned_config_str,
         pruned_keys,
@@ -201,6 +203,7 @@ pub(crate) async fn resolve_provider_config(
     } = builder.prune_for_factory(factory.as_ref())?;
 
     Ok(ResolvedProviderConfig {
+        #[cfg(feature = "oauth")]
         builder_config: full_config,
         pruned_config_str,
         pruned_keys,
@@ -346,11 +349,14 @@ mod tests {
         .await
         .expect("resolved config");
 
-        assert_eq!(
-            resolved.builder_config["base_url"],
-            "https://example.invalid/v1"
-        );
-        assert_eq!(resolved.builder_config["api_key"], "bogus");
+        #[cfg(feature = "oauth")]
+        {
+            assert_eq!(
+                resolved.builder_config["base_url"],
+                "https://example.invalid/v1"
+            );
+            assert_eq!(resolved.builder_config["api_key"], "bogus");
+        }
         assert_eq!(resolved.pruned_keys, Vec::<String>::new());
     }
 
@@ -367,20 +373,36 @@ mod tests {
             r#"{"properties":{"base_url":{},"api_key":{}}}"#,
         );
 
-        let resolved = resolve_provider_config(
-            &registry,
-            &initial,
-            &factory,
-            "xiaomi",
-            ProviderConfigMode::CatalogListing,
-        )
-        .await
-        .expect("resolved config");
+        #[cfg(feature = "oauth")]
+        {
+            let resolved = resolve_provider_config(
+                &registry,
+                &initial,
+                &factory,
+                "xiaomi",
+                ProviderConfigMode::CatalogListing,
+            )
+            .await
+            .expect("resolved config");
 
-        assert_eq!(
-            resolved.builder_config["base_url"],
-            "https://override.invalid/v1"
-        );
+            assert_eq!(
+                resolved.builder_config["base_url"],
+                "https://override.invalid/v1"
+            );
+        }
+
+        #[cfg(not(feature = "oauth"))]
+        {
+            let _ = resolve_provider_config(
+                &registry,
+                &initial,
+                &factory,
+                "xiaomi",
+                ProviderConfigMode::CatalogListing,
+            )
+            .await
+            .expect("resolved config");
+        }
     }
 
     #[tokio::test]
@@ -409,8 +431,11 @@ mod tests {
         .await
         .expect("resolved config");
 
-        assert_eq!(resolved.builder_config["api_key"], "override-key");
-        assert_eq!(resolved.builder_config["model"], "gpt-4o-mini");
+        #[cfg(feature = "oauth")]
+        {
+            assert_eq!(resolved.builder_config["api_key"], "override-key");
+            assert_eq!(resolved.builder_config["model"], "gpt-4o-mini");
+        }
         assert!(!resolved.use_oauth_resolver);
     }
 }

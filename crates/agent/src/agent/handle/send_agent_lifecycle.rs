@@ -81,56 +81,9 @@ impl LocalAgentHandle {
         &self,
         req: ListSessionsRequest,
     ) -> Result<ListSessionsResponse, Error> {
-        // Use the history store directly without holding the registry lock.
-        // The registry lock is only needed for in-memory mutations; listing
-        // sessions is a pure DB read that shouldn't be serialized on the lock.
-        let store = self.config.provider.history_store();
-        let sessions = store
-            .list_sessions()
+        crate::api::AgentSessions::list_acp_from_store(self.config.provider.history_store(), req)
             .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?;
-
-        let requested_cwd = req.cwd.as_ref().map(std::path::PathBuf::from);
-        let filtered_infos: Vec<SessionInfo> = sessions
-            .into_iter()
-            .filter(|s| match requested_cwd.as_ref() {
-                Some(cwd) => s.cwd.as_ref() == Some(cwd),
-                None => true,
-            })
-            .map(|s| {
-                let mut info = SessionInfo::new(
-                    agent_client_protocol::schema::SessionId::from(s.public_id),
-                    s.cwd.unwrap_or_default(),
-                );
-                if let Some(name) = s.name {
-                    info.title = Some(name);
-                }
-                if let Some(updated_at) = s.updated_at {
-                    info.updated_at = Some(
-                        updated_at
-                            .format(&time::format_description::well_known::Rfc3339)
-                            .unwrap_or_default(),
-                    );
-                }
-                info
-            })
-            .collect();
-
-        let start_idx = req
-            .cursor
-            .as_ref()
-            .and_then(|c| c.parse::<usize>().ok())
-            .unwrap_or(0);
-        let limit = 100;
-        let end_idx = (start_idx + limit).min(filtered_infos.len());
-        let paginated = filtered_infos[start_idx..end_idx].to_vec();
-        let next_cursor = if end_idx < filtered_infos.len() {
-            Some(end_idx.to_string())
-        } else {
-            None
-        };
-
-        Ok(ListSessionsResponse::new(paginated).next_cursor(next_cursor))
+            .map_err(|e| Error::internal_error().data(e.to_string()))
     }
 
     pub(super) async fn handle_fork_session(

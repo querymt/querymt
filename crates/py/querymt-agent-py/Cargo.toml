@@ -1,0 +1,25 @@
+[package]
+name = "querymt-agent-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PyO3 bindings for QueryMT Agent"
+
+[lib]
+name = "querymt_agent"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+anyhow = "1.0"
+pyo3 = { version = "0.28", features = ["abi3-py310"] }
+pyo3-async-runtimes = { version = "0.28", features = ["attributes", "tokio-runtime"] }
+querymt-agent = { path = "../../agent", default-features = false, features = ["api", "plugin-loaders", "remote"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "sync"] }
+
+[package.metadata.maturin]
+name = "querymt-agent"
+features = ["extension-module"]

@@ -670,10 +670,6 @@ where
         // in case another task won the race.
         let document = self.catalog.load_profile(profile_id).await?;
         let runtime = Arc::new(build_profile_runtime(document, self.shared_infra.clone()).await?);
-        #[cfg(feature = "remote")]
-        if let Some(mesh) = self.mesh_handle() {
-            runtime.agent().handle().set_mesh(mesh);
-        }
 
         let mut runtimes = self.runtimes.lock().await;
         if let Some(existing) = runtimes.get(profile_id) {
@@ -936,6 +932,7 @@ mod tests {
     #[cfg(feature = "remote")]
     use querymt::error::LLMError;
     use std::sync::Arc;
+
     #[cfg(feature = "remote")]
     use std::time::Duration;
 

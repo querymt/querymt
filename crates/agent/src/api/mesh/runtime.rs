@@ -1,10 +1,10 @@
-//! Shared mesh runtime bootstrap and compatibility checks.
+//! Shared remote mesh runtime bootstrap and compatibility checks.
 
 use anyhow::{Result, anyhow};
 use std::sync::OnceLock;
 use tokio::sync::OnceCell;
 
-use crate::agent::remote::mesh_runtime_config::MeshRuntimeConfig;
+use super::runtime_config::{MeshRuntimeConfig, from_toml_config};
 use crate::agent::remote::{MeshRuntimeHandle, bootstrap_mesh_runtime};
 use crate::config::MeshTomlConfig;
 
@@ -19,7 +19,7 @@ struct SharedMeshState {
 static SHARED_MESH: OnceLock<OnceCell<SharedMeshState>> = OnceLock::new();
 
 pub(crate) async fn start_shared_runtime(spec: MeshSpec) -> Result<MeshRuntime> {
-    // The public API exposes a singleton shared runtime, so repeat starts must
+    // The public API exposes a singleton shared remote runtime, so repeat starts must
     // either reuse an equivalent config or fail with a clear mismatch error.
     if matches!(spec, MeshSpec::Disabled) {
         return Err(anyhow!(
@@ -98,7 +98,7 @@ fn runtime_config_label(config: &MeshRuntimeConfig) -> String {
 
 fn runtime_config_from_spec(spec: MeshSpec) -> Result<MeshRuntimeConfig> {
     let cfg: MeshTomlConfig = spec.into_toml();
-    MeshRuntimeConfig::from_toml_config(
+    from_toml_config(
         cfg.enabled,
         cfg.transport,
         cfg.discovery,

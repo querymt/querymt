@@ -50,8 +50,8 @@ use agent_client_protocol::schema::{
     ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
     LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    ResumeSessionRequest, ResumeSessionResponse, SessionConfigOption, SessionInfo,
-    SetSessionModelRequest, SetSessionModelResponse,
+    ResumeSessionRequest, ResumeSessionResponse, SessionConfigOption, SetSessionModelRequest,
+    SetSessionModelResponse,
 };
 use anyhow::Result;
 use arc_swap::ArcSwap;
@@ -189,7 +189,7 @@ pub struct LocalAgentHandle {
     /// `None` = use model heuristic defaults.
     pub default_reasoning_effort: ArcSwap<Option<ReasoningEffort>>,
 
-    /// Handle to the kameo mesh swarm, set after `bootstrap_mesh()` succeeds.
+    /// Handle to the active mesh runtime, set after remote mesh bootstrap succeeds.
     /// `None` in local-only mode. Wrapped in a `Mutex` for interior mutability
     /// so startup code can set it on the shared `Arc<LocalAgentHandle>`.
     #[cfg(feature = "remote")]
@@ -237,10 +237,8 @@ pub(crate) type SchedulerHandleSlot = Arc<ParkingMutex<Option<crate::scheduler::
 // concurrent remote node discovery operations.
 
 #[cfg(feature = "remote")]
-type RemoteNodeInfoResult = Result<
-    Result<crate::agent::remote::NodeInfo, kameo::error::RemoteSendError<crate::error::AgentError>>,
-    tokio::time::error::Elapsed,
->;
+type RemoteNodeInfoResult =
+    Result<crate::agent::remote::NodeInfo, kameo::error::RemoteSendError<crate::error::AgentError>>;
 
 #[cfg(feature = "remote")]
 type RemoteNodeLookupResult = (String, Option<libp2p::PeerId>, RemoteNodeInfoResult);
