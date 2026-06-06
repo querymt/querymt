@@ -186,6 +186,10 @@ pub struct AgentSettings {
     /// Slash commands system configuration.
     #[serde(default)]
     pub slash_commands: SlashCommandsConfig,
+
+    /// Hook command system configuration.
+    #[serde(default)]
+    pub hooks: HooksConfig,
 }
 
 #[allow(dead_code)]

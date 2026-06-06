@@ -741,6 +741,7 @@ impl super::agent::Agent {
 
         planner_config.middleware = config.planner.middleware;
         planner_config.execution = config.planner.execution;
+        planner_config.hooks = crate::config::HooksConfig::default();
 
         builder.planner_config = Some(planner_config);
 
@@ -791,6 +792,7 @@ impl super::agent::Agent {
             delegate_config.execution = delegate.execution;
             delegate_config.assume_mutating = Some(delegate.assume_mutating);
             delegate_config.mutating_tools = Some(delegate.mutating_tools);
+            delegate_config.hooks = crate::config::HooksConfig::default();
 
             // Register peer delegate for mesh routing resolution in build()
             #[cfg(feature = "remote")]

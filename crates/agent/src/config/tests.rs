@@ -954,6 +954,30 @@ fn test_schema_single_agent_config_has_example() {
     );
 }
 
+#[test]
+fn test_hooks_config_unknown_event_rejected() {
+    let err = toml::from_str::<SingleAgentConfig>(
+        r#"
+[agent]
+provider = "anthropic"
+model = "claude-sonnet-4-5-sonnet"
+
+[agent.hooks]
+enabled = true
+UnknownEvent = []
+"#,
+    )
+    .expect("config should deserialize with flattened hook extra");
+
+    let validation = err.agent.hooks.validate();
+    assert!(validation.is_err());
+    let msg = validation.unwrap_err().to_string();
+    assert!(
+        msg.contains("unsupported hook event"),
+        "unexpected error: {msg}"
+    );
+}
+
 // ── Multi-transport mesh config TOML parsing ────────────────────────────
 
 #[test]

@@ -15,7 +15,7 @@ use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::{SnapshotPolicy, ToolPolicy};
 use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{
-    ExecutionPolicy, McpServerConfig, MiddlewareEntry, SingleAgentConfig, SkillsConfig,
+    ExecutionPolicy, HooksConfig, McpServerConfig, MiddlewareEntry, SingleAgentConfig, SkillsConfig,
 };
 use crate::middleware::{MIDDLEWARE_REGISTRY, MiddlewareDriver};
 use crate::runner::{ChatRunner, ChatSession};
@@ -104,6 +104,7 @@ pub struct AgentBuilder {
     middleware_entries: Vec<MiddlewareEntry>,
     execution: Option<ExecutionPolicy>,
     skills_config: Option<SkillsConfig>,
+    hooks_config: Option<HooksConfig>,
     /// MCP servers from TOML `[[mcp]]` config, attached to every new session.
     mcp_servers: Vec<McpServerConfig>,
     /// Runtime MCP attachment source (e.g., mobile in-process MCP peers).
@@ -142,6 +143,7 @@ impl AgentBuilder {
             middleware_entries: Vec::new(),
             execution: None,
             skills_config: None,
+            hooks_config: None,
             mcp_servers: Vec::new(),
             session_mcp_attachment_source: None,
             agent_registry: None,
@@ -255,6 +257,12 @@ impl AgentBuilder {
     /// Configure skills.
     pub fn skills(mut self, config: SkillsConfig) -> Self {
         self.skills_config = Some(config);
+        self
+    }
+
+    /// Configure hooks.
+    pub fn hooks(mut self, config: HooksConfig) -> Self {
+        self.hooks_config = Some(config);
         self
     }
 
@@ -509,6 +517,11 @@ impl AgentBuilder {
 
         if let Some(ref exec) = self.execution {
             builder = builder.with_snapshot_from_execution(exec);
+        }
+
+        if let Some(hooks_config) = self.hooks_config.take() {
+            let hooks = crate::hooks::Hooks::new(hooks_config)?;
+            builder = builder.with_hooks(hooks);
         }
 
         // Build initial config for middleware factories (temporary handle)
@@ -995,6 +1008,7 @@ impl Agent {
         // Thread through config fields that were previously silently dropped
         builder.execution = Some(config.agent.execution);
         builder.skills_config = Some(config.agent.skills);
+        builder.hooks_config = Some(config.agent.hooks);
 
         // Wire MCP servers from TOML `[[mcp]]` config.
         if !config.mcp.is_empty() {

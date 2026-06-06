@@ -264,6 +264,7 @@ async fn test_registry_overwrite() {
 //  EventRelayActor — extended tests
 // ═══════════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "remote")]
 mod event_relay_extended {
     use super::*;
     use crate::agent::remote::event_relay::{EventRelayActor, RelayedEvent};

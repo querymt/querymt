@@ -14,6 +14,7 @@ use crate::agent::utils::{format_prompt_user_text_only, render_prompt_for_displa
 use crate::elicitation::ElicitationAction;
 use crate::error::AgentError;
 use crate::events::{AgentEventKind, SessionLimits};
+use crate::hooks::HookNotice;
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::LLMConfig;
@@ -48,6 +49,19 @@ const ATTACHMENTS_PLACEHOLDER: &str = "(attachments included)";
 // TODO: use it once figured out intent updates
 #[allow(dead_code)]
 const INTENT_CONFIRMATION_TIMEOUT_SECS: u64 = 45;
+
+fn emit_hook_notices(config: &AgentConfig, session_id: &str, notices: Vec<HookNotice>) {
+    for notice in notices {
+        config.emit_event(
+            session_id,
+            AgentEventKind::HookNotice {
+                event_name: notice.event_name,
+                message: notice.message,
+                is_error: notice.is_error,
+            },
+        );
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IntentUpdateDecision {
@@ -1699,6 +1713,7 @@ async fn execute_prompt_detached(
     // Create execution context — attach the cancellation token so it propagates
     // into individual tool calls for cooperative cancellation.
     // The knowledge store is propagated so knowledge tools can access it.
+    let turn_id = Uuid::new_v4().to_string();
     let mut exec_ctx = ExecutionContext::new(
         session_id.clone(),
         runtime.clone(),
@@ -1710,7 +1725,9 @@ async fn execute_prompt_detached(
     .with_execution_origin(execution_origin)
     .with_knowledge_store(config.knowledge_store())
     .with_event_sink(config.event_sink.clone())
-    .with_workspace_query_bridge(bridge.clone());
+    .with_workspace_query_bridge(bridge.clone())
+    .with_turn_id(turn_id.clone())
+    .with_turn_mode(mode);
 
     // 4. Slash command expansion (before storing user messages)
     let mut req = req;
@@ -1738,6 +1755,42 @@ async fn execute_prompt_detached(
     let user_text = format_prompt_user_text_only(&req.prompt);
 
     let message_id = Uuid::new_v4().to_string();
+
+    let hook_result = config
+        .hooks
+        .run_user_prompt_submit(crate::hooks::UserPromptSubmitRequest {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            cwd: exec_ctx.cwd().map(|p| p.to_path_buf()),
+            model: exec_ctx
+                .llm_config()
+                .map(|cfg| cfg.model.clone())
+                .unwrap_or_default(),
+            permission_mode: exec_ctx.permission_mode().to_string(),
+            prompt: user_text.clone(),
+        })
+        .await
+        .map_err(|e| AgentError::Internal(e.to_string()))?;
+    emit_hook_notices(&config, &session_id, hook_result.notices.clone());
+    if hook_result.should_block {
+        let reason = hook_result
+            .block_reason
+            .unwrap_or_else(|| "prompt blocked by hook".to_string());
+        config.emit_event(
+            &session_id,
+            AgentEventKind::Error {
+                message: reason.clone(),
+            },
+        );
+        return Err(AgentError::Internal(reason));
+    }
+    if !hook_result.additional_contexts.is_empty() {
+        log::debug!(
+            "Session {}: ignoring {} hook additional_context item(s) for MVP",
+            session_id,
+            hook_result.additional_contexts.len()
+        );
+    }
 
     config.emit_event(
         &session_id,

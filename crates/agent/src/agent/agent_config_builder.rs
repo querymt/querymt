@@ -17,6 +17,7 @@ use crate::config::{
 use crate::delegation::{AgentRegistry, DefaultAgentRegistry};
 use crate::event_fanout::EventFanout;
 use crate::event_sink::EventSink;
+use crate::hooks::Hooks;
 use crate::index::{WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig};
 use crate::middleware::{
     AgentModeMiddleware, ContextConfig, ContextMiddleware, DelegationConfig, DelegationMiddleware,
@@ -72,6 +73,7 @@ pub struct AgentConfigBuilder {
     schedule_repository: Option<Arc<dyn crate::session::repo_schedule::ScheduleRepository>>,
     knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
     slash_command_registry: crate::slash_commands::SlashCommandRegistry,
+    hooks: Hooks,
 }
 
 impl AgentConfigBuilder {
@@ -128,6 +130,7 @@ impl AgentConfigBuilder {
             schedule_repository: None,
             knowledge_store: None,
             slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
+            hooks: Hooks::disabled(),
         }
     }
 
@@ -177,6 +180,7 @@ impl AgentConfigBuilder {
             schedule_repository: None,
             knowledge_store: None,
             slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
+            hooks: Hooks::disabled(),
         }
     }
 
@@ -217,6 +221,7 @@ impl AgentConfigBuilder {
             schedule_repository: self.schedule_repository,
             knowledge_store: self.knowledge_store,
             slash_command_registry: self.slash_command_registry,
+            hooks: self.hooks,
         }
     }
 
@@ -464,6 +469,12 @@ impl AgentConfigBuilder {
         registry: crate::slash_commands::SlashCommandRegistry,
     ) -> Self {
         self.slash_command_registry = registry;
+        self
+    }
+
+    /// Set the hooks runtime.
+    pub fn with_hooks(mut self, hooks: Hooks) -> Self {
+        self.hooks = hooks;
         self
     }
 

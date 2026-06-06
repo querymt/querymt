@@ -599,6 +599,59 @@ impl SessionMaterializer {
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
+        if let Ok(Some(llm_config)) = self
+            .config
+            .provider
+            .history_store()
+            .get_session_llm_config(&prepared.session_id)
+            .await
+        {
+            let permission_mode = {
+                let mode = *self
+                    .config
+                    .default_mode
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                crate::hooks::permission_mode_label(mode).to_string()
+            };
+            let hook_result = self
+                .config
+                .hooks
+                .run_session_start(crate::hooks::SessionStartRequest {
+                    session_id: prepared.session_id.clone(),
+                    cwd: prepared.cwd.clone(),
+                    model: llm_config.model.clone(),
+                    permission_mode,
+                    source: "new_session".to_string(),
+                })
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))?;
+            for notice in hook_result.notices {
+                self.config.emit_event(
+                    &prepared.session_id,
+                    crate::events::AgentEventKind::HookNotice {
+                        event_name: notice.event_name,
+                        message: notice.message,
+                        is_error: notice.is_error,
+                    },
+                );
+            }
+            if !hook_result.additional_contexts.is_empty() {
+                log::debug!(
+                    "Session {}: ignoring {} session-start hook additional_context item(s) for MVP",
+                    prepared.session_id,
+                    hook_result.additional_contexts.len()
+                );
+            }
+            if let Some(stop_reason) = hook_result.stop_reason {
+                log::warn!(
+                    "Session {}: session-start hook requested stop: {}",
+                    prepared.session_id,
+                    stop_reason
+                );
+            }
+        }
+
         // Emit initial provider configuration
         if let Ok(Some(llm_config)) = self
             .config

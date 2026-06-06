@@ -145,6 +145,13 @@ QueryMT implements a 3-layer context management system:
 - **Argument substitution**: Dynamic prompts with `$1`, `$2`, `$ARGUMENTS`
 - **Team sharing**: Share commands via `.qmt/commands/`
 
+### Hooks
+
+- **Profile-level automation**: Enable lifecycle policies per config or profile
+- **Command-based checks**: Run local commands before prompts, tools, approvals, or turn completion
+- **Schema-backed contract**: Validate hook stdin/stdout against generated JSON schemas
+- **Stop-time continuation**: Request one extra LLM step before a turn fully completes
+
 ### Code Intelligence Tools
 
 - **AST-aware analysis**: `index`, `get_symbol`, `get_function`
@@ -198,6 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - **Overview** (this document): Architecture and concepts
 - **[Configuration Guide](configuration.md)**: TOML configuration reference
+- **[Hooks Guide](hooks.md)**: Config-level lifecycle hooks and command schemas
 - **[Mesh Networking Guide](mesh.md)**: Cross-machine collaboration and internet mesh
 - **[Profiles Guide](profiles.md)**: Save and switch between configurations
 - **[Slash Commands Guide](slash-commands.md)**: Custom commands and workflows

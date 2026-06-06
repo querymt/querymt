@@ -1,0 +1,56 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "NullableString": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "properties": {
+    "cwd": {
+      "type": "string"
+    },
+    "hook_event_name": {
+      "const": "user_prompt_submit",
+      "type": "string"
+    },
+    "model": {
+      "type": "string"
+    },
+    "permission_mode": {
+      "enum": [
+        "default",
+        "plan",
+        "accept_edits"
+      ],
+      "type": "string"
+    },
+    "prompt": {
+      "type": "string"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "transcript_path": {
+      "$ref": "#/definitions/NullableString"
+    },
+    "turn_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "turn_id",
+    "transcript_path",
+    "cwd",
+    "hook_event_name",
+    "model",
+    "permission_mode",
+    "prompt"
+  ],
+  "title": "user-prompt-submit.command.input",
+  "type": "object"
+}

@@ -254,6 +254,11 @@ pub enum AgentEventKind {
         is_error: bool,
         result: String,
     },
+    HookNotice {
+        event_name: String,
+        message: String,
+        is_error: bool,
+    },
     SnapshotStart {
         policy: String,
     },
@@ -1023,6 +1028,16 @@ mod tests {
             tool_call_id: "tc1".into(),
             tool_name: "shell".into(),
             arguments: "{}".into(),
+        };
+        assert_eq!(classify_durability(&kind), Durability::Durable);
+    }
+
+    #[test]
+    fn classify_hook_notice_is_durable() {
+        let kind = AgentEventKind::HookNotice {
+            event_name: "post_tool_use".into(),
+            message: "invalid hook output".into(),
+            is_error: true,
         };
         assert_eq!(classify_durability(&kind), Durability::Durable);
     }

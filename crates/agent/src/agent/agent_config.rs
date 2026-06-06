@@ -12,6 +12,7 @@ use crate::config::{DelegationWaitPolicy, McpServerConfig, RuntimeExecutionPolic
 use crate::delegation::AgentRegistry;
 use crate::event_sink::EventSink;
 use crate::events::{AgentEventKind, DurableEvent};
+use crate::hooks::Hooks;
 use crate::index::WorkspaceIndexManagerActor;
 use crate::middleware::{CompositeDriver, MiddlewareDriver};
 use crate::session::compaction::SessionCompaction;
@@ -89,6 +90,8 @@ pub struct AgentConfig {
     pub knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
     /// Slash command registry for prompt expansion and ACP advertising.
     pub slash_command_registry: crate::slash_commands::SlashCommandRegistry,
+    /// Hook command registry for lifecycle policy checks.
+    pub hooks: Hooks,
 }
 
 impl AgentConfig {

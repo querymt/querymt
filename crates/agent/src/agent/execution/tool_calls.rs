@@ -9,6 +9,7 @@ use crate::agent::core::SnapshotPolicy;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::snapshots::{SnapshotState, snapshot_metadata};
 use crate::events::AgentEventKind;
+use crate::hooks::{PermissionRequestDecision, PostToolUseRequest, PreToolUseRequest};
 use crate::middleware::ToolCall as MiddlewareToolCall;
 use crate::middleware::{ExecutionState, ToolResult, WaitCondition};
 use crate::model::{AgentMessage, MessagePart};
@@ -53,12 +54,66 @@ pub(super) async fn execute_tool_call(
         exec_ctx.session_id, call.function.name
     );
 
+    let mut args: serde_json::Value =
+        serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| serde_json::json!({}));
+    let hook_result = config
+        .hooks
+        .run_pre_tool_use(PreToolUseRequest {
+            session_id: exec_ctx.session_id.clone(),
+            turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+            cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
+            model: exec_ctx
+                .llm_config()
+                .map(|cfg| cfg.model.clone())
+                .unwrap_or_default(),
+            permission_mode: exec_ctx.permission_mode().to_string(),
+            tool_name: call.function.name.clone(),
+            tool_input: args.clone(),
+            tool_use_id: call.id.clone(),
+        })
+        .await?;
+    for notice in hook_result.notices {
+        config.emit_event(
+            &exec_ctx.session_id,
+            AgentEventKind::HookNotice {
+                event_name: notice.event_name,
+                message: notice.message,
+                is_error: notice.is_error,
+            },
+        );
+    }
+    if let Some(updated_input) = hook_result.updated_input {
+        args = updated_input;
+    }
+    if !hook_result.additional_contexts.is_empty() {
+        log::debug!(
+            "Session {}: ignoring {} pre-tool-use hook additional_context item(s) for MVP",
+            exec_ctx.session_id,
+            hook_result.additional_contexts.len()
+        );
+    }
+    if hook_result.should_block {
+        let reason = hook_result
+            .block_reason
+            .unwrap_or_else(|| "tool blocked by hook".to_string());
+        return Ok(ToolResult::new(
+            call.id.clone(),
+            vec![Content::text(format!("Error: {}", reason))],
+            true,
+            Some(call.function.name.clone()),
+            Some(serde_json::to_string(&args).unwrap_or_else(|_| call.function.arguments.clone())),
+        ));
+    }
+
+    let arguments_json =
+        serde_json::to_string(&args).unwrap_or_else(|_| call.function.arguments.clone());
+
     config.emit_event(
         &exec_ctx.session_id,
         AgentEventKind::ToolCallStart {
             tool_call_id: call.id.clone(),
             tool_name: call.function.name.clone(),
-            arguments: call.function.arguments.clone(),
+            arguments: arguments_json.clone(),
         },
     );
 
@@ -102,7 +157,7 @@ pub(super) async fn execute_tool_call(
         .record_progress(
             crate::session::domain::ProgressKind::ToolCall,
             format!("Calling tool: {}", call.function.name),
-            Some(serde_json::from_str(&call.function.arguments).unwrap_or_default()),
+            Some(args.clone()),
         )
         .await
     {
@@ -121,9 +176,6 @@ pub(super) async fn execute_tool_call(
             );
         }
     }
-
-    let args: serde_json::Value =
-        serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| serde_json::json!({}));
 
     // Set up elicitation channel for this tool call
     let (elicitation_tx, mut elicitation_rx) =
@@ -231,6 +283,7 @@ pub(super) async fn execute_tool_call(
             &call.function.name,
             &args,
             bridge,
+            exec_ctx.turn_id().unwrap_or_default(),
         )
         .instrument(info_span!(
             "agent.tool.permission_wait",
@@ -329,6 +382,58 @@ pub(super) async fn execute_tool_call(
         raw_result_blocks
     };
 
+    let mut result_blocks = result_blocks;
+    let mut is_error = is_error;
+    let post_hook = config
+        .hooks
+        .run_post_tool_use(PostToolUseRequest {
+            session_id: exec_ctx.session_id.clone(),
+            turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+            cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
+            model: exec_ctx
+                .llm_config()
+                .map(|cfg| cfg.model.clone())
+                .unwrap_or_default(),
+            permission_mode: exec_ctx.permission_mode().to_string(),
+            tool_name: call.function.name.clone(),
+            tool_input: args.clone(),
+            tool_response: serde_json::Value::String(
+                result_blocks
+                    .iter()
+                    .filter_map(|b| b.as_text())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            tool_use_id: call.id.clone(),
+        })
+        .await?;
+    for notice in post_hook.notices {
+        config.emit_event(
+            &exec_ctx.session_id,
+            AgentEventKind::HookNotice {
+                event_name: notice.event_name,
+                message: notice.message,
+                is_error: notice.is_error,
+            },
+        );
+    }
+    if !post_hook.additional_contexts.is_empty() {
+        log::debug!(
+            "Session {}: ignoring {} post-tool-use hook additional_context item(s) for MVP",
+            exec_ctx.session_id,
+            post_hook.additional_contexts.len()
+        );
+    }
+    if post_hook.should_block {
+        is_error = true;
+        result_blocks = vec![Content::text(format!(
+            "Error: {}",
+            post_hook
+                .block_reason
+                .unwrap_or_else(|| "tool result blocked by hook".to_string())
+        ))];
+    }
+
     // Extract text summary for event (display purposes)
     let result_text: String = result_blocks
         .iter()
@@ -395,7 +500,7 @@ pub(super) async fn execute_tool_call(
         result_blocks,
         is_error,
         Some(call.function.name.clone()),
-        Some(call.function.arguments.clone()),
+        Some(arguments_json.clone()),
     );
     if let Some(part) = snapshot_part {
         tool_result = tool_result.with_snapshot(part);
@@ -428,6 +533,7 @@ pub(super) async fn ensure_tool_permission(
     tool_name: &str,
     args: &serde_json::Value,
     bridge: Option<&ClientBridgeSender>,
+    turn_id: &str,
 ) -> Result<bool, agent_client_protocol::Error> {
     use crate::agent::utils::{extract_locations, tool_kind_for_tool};
     use agent_client_protocol::schema::{
@@ -458,6 +564,50 @@ pub(super) async fn ensure_tool_permission(
         }
     }
     Span::current().record("cache_hit", false);
+
+    let hook_decision = config
+        .hooks
+        .run_permission_request(crate::hooks::PermissionRequestRequest {
+            session_id: exec_ctx.session_id.clone(),
+            turn_id: turn_id.to_string(),
+            cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
+            model: exec_ctx
+                .llm_config()
+                .map(|cfg| cfg.model.clone())
+                .unwrap_or_default(),
+            permission_mode: exec_ctx.permission_mode().to_string(),
+            tool_name: tool_name.to_string(),
+            tool_input: args.clone(),
+        })
+        .await
+        .map_err(|e| agent_client_protocol::Error::internal_error().data(e.to_string()))?;
+    for notice in hook_decision.notices {
+        config.emit_event(
+            &exec_ctx.session_id,
+            AgentEventKind::HookNotice {
+                event_name: notice.event_name,
+                message: notice.message,
+                is_error: notice.is_error,
+            },
+        );
+    }
+    match hook_decision.decision {
+        Some(PermissionRequestDecision::Allow) => {
+            Span::current().record("granted", true);
+            return Ok(true);
+        }
+        Some(PermissionRequestDecision::Deny { message }) => {
+            log::debug!(
+                "Session {}: permission hook denied {}: {}",
+                exec_ctx.session_id,
+                tool_name,
+                message
+            );
+            Span::current().record("granted", false);
+            return Ok(false);
+        }
+        None => {}
+    }
 
     let permission_id = Uuid::new_v4().to_string();
     config.emit_event(

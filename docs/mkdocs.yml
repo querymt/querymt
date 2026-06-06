@@ -84,6 +84,7 @@ nav:
   - Agent:
     - Overview: agent/index.md
     - Configuration: agent/configuration.md
+    - Hooks: agent/hooks.md
     - Agent Modes: agent/agent_modes.md
     - Middleware: agent/middleware.md
     - Delegation: agent/delegation.md

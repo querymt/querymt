@@ -429,6 +429,10 @@ threshold = 0.85
 min_lines = 10
 ```
 
+### `hook_guarded_coder.toml` — Single coder with lifecycle hooks
+
+Use this profile when you want config-level hook commands to inspect shell calls, automate approval decisions, or request one extra step at turn completion.
+
 ### `multi_agent.toml` — Planner + delegates
 
 ```toml
@@ -1053,6 +1057,7 @@ For complete agent configurations designed for scheduled use, see:
 - `examples/confs/standup_bot.toml` - Daily standup reporter
 - `examples/confs/research_journal.toml` - Research journal with event-driven consolidation
 - `examples/confs/learning_pair.toml` - Learning pair with scheduled consolidation
+- `examples/confs/hook_guarded_coder.toml` - Single coder with config-level lifecycle hooks
 
 ---
 

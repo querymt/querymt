@@ -1,0 +1,102 @@
+# Hook-Guarded Coder Profile
+#
+# Demonstrates QueryMT's config-level hooks using snake_case event names.
+# This profile is useful as a starting point for review-heavy or policy-heavy
+# workflows where local commands should inspect prompts, tool calls, or stop-time
+# behavior before the turn fully completes.
+#
+# The hook commands below point at committed example scripts under
+# `examples/hooks/`. Copy and adapt them for your own local policies.
+
+[profile]
+id = "hook-guarded-coder"
+name = "Hook Guarded Coder"
+description = "Single coder profile with config-level lifecycle hooks"
+tags = ["coding", "hooks", "policy"]
+
+[agent]
+provider = "anthropic"
+model = "claude-sonnet-4-5-20250929"
+assume_mutating = false
+mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
+tools = [
+  "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
+  "glob", "search_text", "ls", "index", "get_symbol", "get_function", "skill",
+  "shell",
+  "create_task", "todowrite", "todoread",
+  "question",
+  "browse",
+]
+system = [
+  { file = "../prompts/default_system.txt" },
+  { file = "../prompts/code_meta.jinja2" }
+]
+
+[agent.execution.snapshot]
+backend = "git"
+
+[agent.execution.tool_output]
+max_lines = 2000
+max_bytes = 51200
+
+[agent.execution.pruning]
+protect_tokens = 40000
+
+[agent.execution.compaction]
+auto = true
+
+[agent.hooks]
+enabled = true
+
+[[agent.hooks.pre_tool_use]]
+matcher = "^shell$"
+
+[[agent.hooks.pre_tool_use.hooks]]
+type = "command"
+command = "sh ../hooks/check-shell.sh"
+timeout_sec = 5
+status_message = "Checking shell command"
+
+[[agent.hooks.permission_request]]
+matcher = "^shell$"
+
+[[agent.hooks.permission_request.hooks]]
+type = "command"
+command = "sh ../hooks/approve-safe-shell.sh"
+timeout_sec = 5
+status_message = "Evaluating permission request"
+
+[[agent.hooks.stop]]
+
+[[agent.hooks.stop.hooks]]
+type = "command"
+command = "sh ../hooks/stop-verify.sh"
+timeout_sec = 5
+status_message = "Checking whether another step is needed"
+
+[[middleware]]
+type = "agent_mode"
+default = "build"
+reminder = """<system-reminder>
+# Plan Mode
+
+You are in **plan mode**. You may only observe, analyze, and plan.
+Do not edit files or run mutating commands.
+</system-reminder>"""
+review_reminder = """<system-reminder>
+# Review Mode
+
+You are in **review mode**. Provide review findings only.
+Do not edit files or run mutating commands.
+</system-reminder>"""
+
+[[middleware]]
+type = "limits"
+max_steps = 200
+max_turns = 50
+
+[[middleware]]
+type = "context"
+warn_at_percent = 80
+compact_at_percent = 90
+fallback_max_tokens = 150000
