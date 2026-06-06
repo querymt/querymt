@@ -19,6 +19,7 @@ use agent_client_protocol::schema::{
 };
 use kameo::actor::ActorRef;
 use querymt::chat::ReasoningEffort;
+use std::time::Duration;
 
 /// Location-transparent reference to a `SessionActor`.
 ///
@@ -104,6 +105,50 @@ impl SessionActorRef {
 // mapped to `AgentError::RemoteActor` for a uniform API.
 
 impl SessionActorRef {
+    const REMOTE_CONTROL_MAILBOX_TIMEOUT: Duration = Duration::from_secs(10);
+    const REMOTE_CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+    const REMOTE_PROMPT_MAILBOX_TIMEOUT: Duration = Duration::from_secs(10);
+    const REMOTE_PROMPT_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
+    const REMOTE_MODEL_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+    const REMOTE_UNDO_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+    const REMOTE_HISTORY_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+    const REMOTE_IO_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+    fn map_infallible_remote_send_error(
+        error: kameo::error::RemoteSendError<kameo::error::Infallible>,
+    ) -> AgentError {
+        match error {
+            kameo::error::RemoteSendError::HandlerError(err) => match err {},
+            other => AgentError::RemoteActor(other.to_string()),
+        }
+    }
+
+    fn map_agent_timeout_remote_send_error(
+        error: kameo::error::RemoteSendError<AgentError>,
+        timeout_message: impl Into<String>,
+    ) -> AgentError {
+        match error {
+            kameo::error::RemoteSendError::HandlerError(err) => err,
+            kameo::error::RemoteSendError::ReplyTimeout => AgentError::SessionTimeout {
+                details: timeout_message.into(),
+            },
+            other => AgentError::RemoteActor(other.to_string()),
+        }
+    }
+
+    fn map_infallible_timeout_remote_send_error(
+        error: kameo::error::RemoteSendError<kameo::error::Infallible>,
+        timeout_message: impl Into<String>,
+    ) -> AgentError {
+        match error {
+            kameo::error::RemoteSendError::HandlerError(err) => match err {},
+            kameo::error::RemoteSendError::ReplyTimeout => AgentError::SessionTimeout {
+                details: timeout_message.into(),
+            },
+            other => AgentError::RemoteActor(other.to_string()),
+        }
+    }
+
     /// Send a prompt to the session and wait for completion.
     #[tracing::instrument(
         name = "remote.session_ref.prompt",
@@ -122,29 +167,29 @@ impl SessionActorRef {
                 .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => {
-                // Use a generous timeout (10 min) to prevent indefinite hangs
-                // when the remote node is unreachable or the prompt execution stalls.
-                const REMOTE_PROMPT_TIMEOUT: std::time::Duration =
-                    std::time::Duration::from_secs(600);
-                match tokio::time::timeout(
-                    REMOTE_PROMPT_TIMEOUT,
-                    actor_ref.ask(&messages::Prompt { req }),
-                )
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&messages::Prompt { req })
+                .mailbox_timeout(Self::REMOTE_PROMPT_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_PROMPT_REPLY_TIMEOUT)
+                .send()
                 .await
-                {
-                    Ok(result) => {
-                        tracing::Span::current().record("timed_out", false);
-                        result.map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string())))
-                    }
-                    Err(_elapsed) => {
-                        tracing::Span::current().record("timed_out", true);
-                        Err(AcpError::from(AgentError::SessionTimeout {
-                            details: "Remote prompt timed out (exceeded 600s)".to_string(),
-                        }))
-                    }
-                }
-            }
+                .map_err(|e| {
+                    tracing::Span::current().record(
+                        "timed_out",
+                        matches!(e, kameo::error::RemoteSendError::ReplyTimeout),
+                    );
+                    AcpError::from(match e {
+                        kameo::error::RemoteSendError::HandlerError(err) => err,
+                        kameo::error::RemoteSendError::ReplyTimeout => AgentError::SessionTimeout {
+                            details: format!(
+                                "Remote prompt timed out (mailbox={}s, reply={}s)",
+                                Self::REMOTE_PROMPT_MAILBOX_TIMEOUT.as_secs(),
+                                Self::REMOTE_PROMPT_REPLY_TIMEOUT.as_secs()
+                            ),
+                        },
+                        other => AgentError::RemoteActor(other.to_string()),
+                    })
+                }),
         }
     }
 
@@ -191,8 +236,16 @@ impl SessionActorRef {
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
                 .ask(&messages::GetMode)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
+                .send()
                 .await
-                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+                .map_err(|e| {
+                    Self::map_infallible_timeout_remote_send_error(
+                        e,
+                        "GetMode timed out on remote session",
+                    )
+                }),
         }
     }
 
@@ -211,8 +264,16 @@ impl SessionActorRef {
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
                 .ask(&messages::SetReasoningEffort { effort })
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
+                .send()
                 .await
-                .map_err(|e| AgentError::RemoteActor(e.to_string()))?,
+                .map_err(|e| {
+                    Self::map_agent_timeout_remote_send_error(
+                        e,
+                        "SetReasoningEffort timed out on remote session",
+                    )
+                })?,
         }
         Ok(())
     }
@@ -228,8 +289,16 @@ impl SessionActorRef {
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
                 .ask(&messages::GetReasoningEffort)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
+                .send()
                 .await
-                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+                .map_err(|e| {
+                    Self::map_infallible_timeout_remote_send_error(
+                        e,
+                        "GetReasoningEffort timed out on remote session",
+                    )
+                }),
         }
     }
 
@@ -248,8 +317,17 @@ impl SessionActorRef {
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
                 .ask(&messages::Undo { message_id })
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_UNDO_REPLY_TIMEOUT)
+                .send()
                 .await
-                .map_err(|e| UndoError::ActorSend(e.to_string())),
+                .map_err(|e| match e {
+                    kameo::error::RemoteSendError::HandlerError(err) => err,
+                    kameo::error::RemoteSendError::ReplyTimeout => {
+                        UndoError::ActorSend("Undo timed out on remote session".to_string())
+                    }
+                    other => UndoError::ActorSend(other.to_string()),
+                }),
         }
     }
 
@@ -268,8 +346,17 @@ impl SessionActorRef {
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
                 .ask(&messages::Redo)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_UNDO_REPLY_TIMEOUT)
+                .send()
                 .await
-                .map_err(|e| UndoError::ActorSend(e.to_string())),
+                .map_err(|e| match e {
+                    kameo::error::RemoteSendError::HandlerError(err) => err,
+                    kameo::error::RemoteSendError::ReplyTimeout => {
+                        UndoError::ActorSend("Redo timed out on remote session".to_string())
+                    }
+                    other => UndoError::ActorSend(other.to_string()),
+                }),
         }
     }
 
@@ -320,8 +407,19 @@ impl SessionActorRef {
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
                 .ask(&msg)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_MODEL_REPLY_TIMEOUT)
+                .send()
                 .await
-                .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
+                .map_err(|e| {
+                    AcpError::from(match e {
+                        kameo::error::RemoteSendError::HandlerError(err) => err,
+                        kameo::error::RemoteSendError::ReplyTimeout => AgentError::SessionTimeout {
+                            details: "SetSessionModel timed out on remote session".to_string(),
+                        },
+                        other => AgentError::RemoteActor(other.to_string()),
+                    })
+                }),
         }
     }
 
@@ -341,8 +439,16 @@ impl SessionActorRef {
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
                 .ask(&messages::GetHistory)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_HISTORY_REPLY_TIMEOUT)
+                .send()
                 .await
-                .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
+                .map_err(|e| {
+                    AcpError::from(Self::map_agent_timeout_remote_send_error(
+                        e,
+                        "GetHistory timed out on remote session",
+                    ))
+                }),
         }
     }
 
@@ -365,8 +471,16 @@ impl SessionActorRef {
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
                 .ask(&messages::GetEventStream)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_HISTORY_REPLY_TIMEOUT)
+                .send()
                 .await
-                .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
+                .map_err(|e| {
+                    AcpError::from(Self::map_agent_timeout_remote_send_error(
+                        e,
+                        "GetEventStream timed out on remote session",
+                    ))
+                }),
         }
     }
 
@@ -381,8 +495,16 @@ impl SessionActorRef {
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
                 .ask(&messages::GetLlmConfig)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
+                .send()
                 .await
-                .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
+                .map_err(|e| {
+                    AcpError::from(Self::map_agent_timeout_remote_send_error(
+                        e,
+                        "GetLlmConfig timed out on remote session",
+                    ))
+                }),
         }
     }
 
@@ -397,8 +519,16 @@ impl SessionActorRef {
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
                 .ask(&messages::GetSessionLimits)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
+                .send()
                 .await
-                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+                .map_err(|e| {
+                    Self::map_infallible_timeout_remote_send_error(
+                        e,
+                        "GetSessionLimits timed out on remote session",
+                    )
+                }),
         }
     }
 
@@ -414,7 +544,52 @@ impl SessionActorRef {
             Self::Remote { actor_ref, .. } => actor_ref
                 .ask(&messages::GetRuntimeStatus)
                 .await
-                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+                .map_err(Self::map_infallible_remote_send_error),
+        }
+    }
+
+    /// Query current runtime status with bounded mailbox and reply timeouts.
+    pub async fn get_runtime_status_with_timeout(
+        &self,
+        mailbox_timeout: Duration,
+        reply_timeout: Duration,
+    ) -> Result<messages::SessionRuntimeStatus, AgentError> {
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(messages::GetRuntimeStatus)
+                .mailbox_timeout(mailbox_timeout)
+                .reply_timeout(reply_timeout)
+                .send()
+                .await
+                .map_err(|e| match e {
+                    kameo::error::SendError::HandlerError(err) => match err {},
+                    kameo::error::SendError::Timeout(_) => AgentError::SessionTimeout {
+                        details: format!(
+                            "GetRuntimeStatus timed out (mailbox={}ms, reply={}ms)",
+                            mailbox_timeout.as_millis(),
+                            reply_timeout.as_millis()
+                        ),
+                    },
+                    other => AgentError::RemoteActor(other.to_string()),
+                }),
+
+            #[cfg(feature = "remote")]
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&messages::GetRuntimeStatus)
+                .mailbox_timeout(mailbox_timeout)
+                .reply_timeout(reply_timeout)
+                .send()
+                .await
+                .map_err(|e| {
+                    Self::map_infallible_timeout_remote_send_error(
+                        e,
+                        format!(
+                            "GetRuntimeStatus timed out (mailbox={}ms, reply={}ms)",
+                            mailbox_timeout.as_millis(),
+                            reply_timeout.as_millis()
+                        ),
+                    )
+                }),
         }
     }
 
@@ -465,6 +640,42 @@ impl SessionActorRef {
         }
     }
 
+    /// Shutdown this session actor gracefully with a bounded wait for local shutdown.
+    pub async fn shutdown_with_timeout(
+        &self,
+        mailbox_timeout: Duration,
+        reply_timeout: Duration,
+    ) -> Result<(), AgentError> {
+        match self {
+            Self::Local(actor_ref) => {
+                actor_ref
+                    .tell(messages::Shutdown)
+                    .mailbox_timeout(mailbox_timeout)
+                    .send()
+                    .await
+                    .map_err(|e| AgentError::RemoteActor(e.to_string()))?;
+                tokio::time::timeout(reply_timeout, actor_ref.wait_for_shutdown_result())
+                    .await
+                    .map_err(|_| AgentError::SessionTimeout {
+                        details: format!(
+                            "Shutdown timed out waiting for actor stop (reply={}ms)",
+                            reply_timeout.as_millis()
+                        ),
+                    })?
+                    .map(|_| ())
+                    .map_err(|e| AgentError::RemoteActor(e.to_string()))
+            }
+
+            #[cfg(feature = "remote")]
+            Self::Remote { .. } => {
+                log::warn!(
+                    "shutdown_with_timeout called on remote SessionActorRef — not yet supported"
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// Subscribe to events from this session (for remote event relay).
     ///
     /// Registers an event forwarder on the session that sends events to the
@@ -503,8 +714,16 @@ impl SessionActorRef {
                     relay_actor_id,
                     relay_dht_name,
                 })
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
+                .send()
                 .await
-                .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
+                .map_err(|e| {
+                    AcpError::from(Self::map_agent_timeout_remote_send_error(
+                        e,
+                        "SubscribeEvents timed out on remote session",
+                    ))
+                }),
         }
     }
 
@@ -523,8 +742,16 @@ impl SessionActorRef {
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
                 .ask(&messages::SetPlanningContext { summary })
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
+                .send()
                 .await
-                .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string())))?,
+                .map_err(|e| {
+                    AcpError::from(Self::map_agent_timeout_remote_send_error(
+                        e,
+                        "SetPlanningContext timed out on remote session",
+                    ))
+                })?,
         }
         Ok(())
     }
@@ -550,8 +777,16 @@ impl SessionActorRef {
                     relay_actor_id,
                     relay_dht_name,
                 })
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
+                .send()
                 .await
-                .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
+                .map_err(|e| {
+                    AcpError::from(Self::map_agent_timeout_remote_send_error(
+                        e,
+                        "UnsubscribeEvents timed out on remote session",
+                    ))
+                }),
         }
     }
 
@@ -574,8 +809,17 @@ impl SessionActorRef {
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
                 .ask(&messages::GetFileIndex)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_IO_REPLY_TIMEOUT)
+                .send()
                 .await
-                .map_err(|e| FileProxyError::ActorSend(e.to_string())),
+                .map_err(|e| match e {
+                    kameo::error::RemoteSendError::HandlerError(err) => err,
+                    kameo::error::RemoteSendError::ReplyTimeout => FileProxyError::ActorSend(
+                        "GetFileIndex timed out on remote session".to_string(),
+                    ),
+                    other => FileProxyError::ActorSend(other.to_string()),
+                }),
         }
     }
 
@@ -617,8 +861,17 @@ impl SessionActorRef {
                     offset,
                     limit,
                 })
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_IO_REPLY_TIMEOUT)
+                .send()
                 .await
-                .map_err(|e| FileProxyError::ActorSend(e.to_string())),
+                .map_err(|e| match e {
+                    kameo::error::RemoteSendError::HandlerError(err) => err,
+                    kameo::error::RemoteSendError::ReplyTimeout => FileProxyError::ActorSend(
+                        "ReadRemoteFile timed out on remote session".to_string(),
+                    ),
+                    other => FileProxyError::ActorSend(other.to_string()),
+                }),
         }
     }
 

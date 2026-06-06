@@ -29,6 +29,7 @@ use log::{debug, info, warn};
 use messages::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -114,6 +115,8 @@ pub struct SchedulerHandle {
 }
 
 impl SchedulerHandle {
+    const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+
     /// Create a new handle wrapping a kameo actor ref.
     pub fn new(actor_ref: ActorRef<SchedulerActor>) -> Self {
         Self { actor_ref }
@@ -201,6 +204,9 @@ impl SchedulerHandle {
             .ask(ListSchedules {
                 session_public_id: session_public_id.map(|s| s.to_string()),
             })
+            .mailbox_timeout(Self::CONTROL_TIMEOUT)
+            .reply_timeout(Self::CONTROL_TIMEOUT)
+            .send()
             .await
             .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
         Ok(schedules)
@@ -213,6 +219,9 @@ impl SchedulerHandle {
             .ask(GetSchedule {
                 schedule_public_id: schedule_public_id.to_string(),
             })
+            .mailbox_timeout(Self::CONTROL_TIMEOUT)
+            .reply_timeout(Self::CONTROL_TIMEOUT)
+            .send()
             .await
             .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
         Ok(schedule)
@@ -220,7 +229,13 @@ impl SchedulerHandle {
 
     /// Get a snapshot of the current scheduler metrics.
     pub async fn metrics(&self) -> SchedulerMetrics {
-        self.actor_ref.ask(GetMetrics).await.unwrap_or_default()
+        self.actor_ref
+            .ask(GetMetrics)
+            .mailbox_timeout(Self::CONTROL_TIMEOUT)
+            .reply_timeout(Self::CONTROL_TIMEOUT)
+            .send()
+            .await
+            .unwrap_or_default()
     }
 
     /// Shutdown the scheduler and its background tasks.

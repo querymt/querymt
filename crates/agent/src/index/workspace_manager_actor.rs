@@ -8,6 +8,7 @@ use super::function_index::FunctionIndexConfig;
 use super::workspace_actor::{WorkspaceHandle, WorkspaceIndexActor};
 use kameo::Actor;
 use kameo::actor::{ActorRef, Spawn};
+use kameo::error::SendError;
 use kameo::message::{Context, Message};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -81,10 +82,27 @@ impl Actor for WorkspaceIndexManagerActor {
 }
 
 impl WorkspaceIndexManagerActor {
+    /// Shared timeout policy for workspace index lookup/creation.
+    pub const GET_OR_CREATE_MAILBOX_TIMEOUT: Duration = Duration::from_secs(10);
+    pub const GET_OR_CREATE_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
     /// Spawn a new manager actor with the given config.
     pub fn new(config: WorkspaceIndexManagerConfig) -> ActorRef<Self> {
         WorkspaceIndexManagerActor::spawn(WorkspaceIndexManagerActorArgs { config })
     }
+}
+
+/// Ask the workspace manager for a handle using the standard timeout policy.
+pub async fn get_or_create_workspace_with_timeout(
+    manager: &ActorRef<WorkspaceIndexManagerActor>,
+    root: PathBuf,
+) -> Result<WorkspaceHandle, SendError<GetOrCreate, String>> {
+    manager
+        .ask(GetOrCreate { root })
+        .mailbox_timeout(WorkspaceIndexManagerActor::GET_OR_CREATE_MAILBOX_TIMEOUT)
+        .reply_timeout(WorkspaceIndexManagerActor::GET_OR_CREATE_REPLY_TIMEOUT)
+        .send()
+        .await
 }
 
 // ---------------------------------------------------------------------------

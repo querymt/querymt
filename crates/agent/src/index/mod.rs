@@ -23,5 +23,6 @@ pub use workspace_actor::{
 };
 pub use workspace_manager_actor::{
     GetOrCreate, WorkspaceIndexManagerActor, WorkspaceIndexManagerConfig,
+    get_or_create_workspace_with_timeout,
 };
 pub use workspace_root::{normalize_cwd, resolve_workspace_root};

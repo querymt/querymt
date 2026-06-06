@@ -116,6 +116,9 @@ impl LocalAgentHandle {
             // Registry lock is now dropped, safe to make async actor call
             let current_mode = existing_ref
                 .ask(crate::agent::messages::GetMode)
+                .mailbox_timeout(std::time::Duration::from_secs(10))
+                .reply_timeout(std::time::Duration::from_secs(10))
+                .send()
                 .await
                 .map_err(|e| Error::internal_error().data(e.to_string()))?;
 

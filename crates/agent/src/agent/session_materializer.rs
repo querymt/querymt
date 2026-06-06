@@ -683,7 +683,9 @@ impl SessionMaterializer {
                 let cwd_owned = cwd_path.clone();
                 tokio::spawn(async move {
                     let root = crate::index::resolve_workspace_root(&cwd_owned);
-                    match manager_actor.ask(crate::index::GetOrCreate { root }).await {
+                    match crate::index::get_or_create_workspace_with_timeout(&manager_actor, root)
+                        .await
+                    {
                         Ok(handle) => {
                             let _ = runtime_clone.workspace_handle.set(handle);
                         }

@@ -1048,18 +1048,19 @@ mod remote_impl {
                                 #[cfg(feature = "remote")]
                                 crate::agent::remote::SessionActorRef::Remote { .. } => 0,
                             };
-                            let state = match tokio::time::timeout(
-                                std::time::Duration::from_millis(200),
-                                session_ref.get_runtime_status(),
-                            )
-                            .await
+                            let state = match session_ref
+                                .get_runtime_status_with_timeout(
+                                    std::time::Duration::from_millis(200),
+                                    std::time::Duration::from_millis(200),
+                                )
+                                .await
                             {
-                                Ok(Ok(SessionRuntimeStatus::Idle)) => "idle".to_string(),
-                                Ok(Ok(
+                                Ok(SessionRuntimeStatus::Idle) => "idle".to_string(),
+                                Ok(
                                     SessionRuntimeStatus::Running
                                     | SessionRuntimeStatus::CancelRequested,
-                                )) => "busy".to_string(),
-                                Ok(Err(_)) | Err(_) => "active".to_string(),
+                                ) => "busy".to_string(),
+                                Err(_) => "active".to_string(),
                             };
                             (aid, Some(state))
                         }
@@ -1269,20 +1270,23 @@ mod remote_impl {
                         timeout_ms = shutdown_timeout.as_millis(),
                         "StopRemoteSessionRuntime beginning session shutdown"
                     );
-                    match tokio::time::timeout(shutdown_timeout, session_ref.shutdown()).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            log::warn!(
-                                "RemoteNodeManager: shutdown error for session {}: {}",
-                                msg.session_id,
-                                e
-                            );
-                        }
-                        Err(_) => {
+                    match session_ref
+                        .shutdown_with_timeout(shutdown_timeout, shutdown_timeout)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(AgentError::SessionTimeout { .. }) => {
                             log::warn!(
                                 "RemoteNodeManager: shutdown timed out for session {} after {:?}",
                                 msg.session_id,
                                 shutdown_timeout
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "RemoteNodeManager: shutdown error for session {}: {}",
+                                msg.session_id,
+                                e
                             );
                         }
                     }
