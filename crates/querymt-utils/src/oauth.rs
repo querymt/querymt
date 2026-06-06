@@ -201,6 +201,18 @@ fn convert_openai_tokens(tokens: openai_auth::TokenSet) -> TokenSet {
     }
 }
 
+async fn timeout_callback_result<T, E, F>(timeout: Duration, future: F) -> Result<T>
+where
+    E: std::fmt::Display,
+    F: std::future::Future<Output = std::result::Result<T, E>>,
+{
+    match tokio::time::timeout(timeout, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(anyhow!("Callback server error: {}", err)),
+        Err(_) => Err(anyhow!("Timeout waiting for OAuth callback")),
+    }
+}
+
 /// Codex OAuth provider implementation
 ///
 /// This is intentionally separate from OpenAI so tokens are stored and looked up
@@ -945,26 +957,21 @@ pub async fn openai_callback_server(
         .build();
     let client = openai_auth::OAuthClient::new(config)?;
 
-    // Start callback server with timeout
-    let tokens_future = run_callback_server(port, state, &client, verifier);
+    let tokens =
+        timeout_callback_result(timeout, run_callback_server(port, state, &client, verifier))
+            .await?;
 
-    match tokio::time::timeout(timeout, tokens_future).await {
-        Ok(Ok(tokens)) => {
-            // Extract API key if present
-            let api_key = tokens.api_key.clone();
+    // Extract API key if present
+    let api_key = tokens.api_key.clone();
 
-            // Convert openai_auth::TokenSet to anthropic_auth::TokenSet
-            let token_set = TokenSet {
-                access_token: tokens.access_token,
-                refresh_token: tokens.refresh_token,
-                expires_at: tokens.expires_at,
-            };
+    // Convert openai_auth::TokenSet to anthropic_auth::TokenSet
+    let token_set = TokenSet {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        expires_at: tokens.expires_at,
+    };
 
-            Ok((token_set, api_key))
-        }
-        Ok(Err(e)) => Err(anyhow!("Callback server error: {}", e)),
-        Err(_) => Err(anyhow!("Timeout waiting for OAuth callback")),
-    }
+    Ok((token_set, api_key))
 }
 
 /// Run an Anthropic OAuth callback server on localhost.
@@ -992,14 +999,7 @@ pub async fn anthropic_callback_server(
 ) -> Result<(TokenSet, Option<String>)> {
     use anthropic_auth::run_callback_server;
 
-    // Start callback server with timeout
-    let callback_future = run_callback_server(port, state);
-
-    let callback = match tokio::time::timeout(timeout, callback_future).await {
-        Ok(Ok(callback)) => callback,
-        Ok(Err(e)) => return Err(anyhow!("Callback server error: {}", e)),
-        Err(_) => return Err(anyhow!("Timeout waiting for OAuth callback")),
-    };
+    let callback = timeout_callback_result(timeout, run_callback_server(port, state)).await?;
 
     let client = AnthropicOAuthClient::new(OAuthConfig::default())?;
     let code_with_state = format!("{}#{}", callback.code, callback.state);

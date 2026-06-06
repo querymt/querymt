@@ -33,6 +33,10 @@ pub struct KameoMeshClientTransport {
 }
 
 impl KameoMeshClientTransport {
+    const STREAM_ROUTER_TIMEOUT: Duration = Duration::from_secs(10);
+    const PROVIDER_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+    const PROVIDER_CHAT_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
+
     pub fn new(mesh: MeshHandle) -> Self {
         Self { mesh }
     }
@@ -179,6 +183,9 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
             .ask(RegisterRequest {
                 request_id: request_id.to_string(),
             })
+            .mailbox_timeout(Self::STREAM_ROUTER_TIMEOUT)
+            .reply_timeout(Self::STREAM_ROUTER_TIMEOUT)
+            .send()
             .await
             .map_err(|e| {
                 LLMError::ProviderError(format!("failed to register stream request: {}", e))
@@ -188,6 +195,9 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
                 request_id: request_id.to_string(),
                 consumer_tx,
             })
+            .mailbox_timeout(Self::STREAM_ROUTER_TIMEOUT)
+            .reply_timeout(Self::STREAM_ROUTER_TIMEOUT)
+            .send()
             .await
             .map_err(|e| {
                 LLMError::ProviderError(format!("failed to attach stream consumer: {}", e))
@@ -202,6 +212,9 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         request: &crate::ProviderChatRequest,
     ) -> Result<crate::ProviderChatResponse, LLMError> {
         host.ask(request)
+            .mailbox_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
+            .reply_timeout(Self::PROVIDER_CHAT_REPLY_TIMEOUT)
+            .send()
             .await
             .map_err(|e| match crate::remote_send_error_base(e) {
                 Ok(err) => err,
@@ -229,6 +242,9 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         request: CancelProviderStreamRequest,
     ) -> Result<(), LLMError> {
         host.ask(&request)
+            .mailbox_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
+            .reply_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
+            .send()
             .await
             .map(|_| ())
             .map_err(remote_send_error_to_llm_error_no_handler)
@@ -246,6 +262,9 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
             request_id: request_id.to_string(),
             lease_ttl_secs,
         })
+        .mailbox_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
+        .reply_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
+        .send()
         .await
         .map_err(remote_send_error_to_llm_error_no_handler)
     }
@@ -256,6 +275,9 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         request: GetProviderStreamStatus,
     ) -> Result<Option<ProviderStreamStatus>, LLMError> {
         host.ask(&request)
+            .mailbox_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
+            .reply_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
+            .send()
             .await
             .map_err(remote_send_error_to_llm_error_no_handler)
     }

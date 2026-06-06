@@ -50,8 +50,9 @@ pub type AutoCompleteNotifier = Arc<dyn Fn(CompleteFlowResult) + Send + Sync>;
 
 /// Result sent from the HTTP callback handler back to the listener task.
 #[cfg(feature = "oauth")]
-type CallbackResultSender =
-    Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<(String, String), String>>>>>;
+type CallbackResult = Result<(String, String), String>;
+#[cfg(feature = "oauth")]
+type CallbackResultSender = Arc<Mutex<Option<tokio::sync::oneshot::Sender<CallbackResult>>>>;
 
 /// Identifies a specific OAuth flow (used internally by listener lifecycle).
 #[cfg(feature = "oauth")]
@@ -712,6 +713,32 @@ fn oauth_mode_for_provider(provider: &str) -> Option<&'static str> {
 // ── Callback listener task (free fn for 'static tokio::spawn) ─────────────────
 
 #[cfg(feature = "oauth")]
+enum WaitResult {
+    Stopped,
+    Timeout,
+    Callback(CallbackResult),
+}
+
+#[cfg(feature = "oauth")]
+async fn wait_for_oauth_callback(
+    stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
+    callback_rx: tokio::sync::oneshot::Receiver<CallbackResult>,
+) -> WaitResult {
+    use std::time::Duration;
+
+    tokio::select! {
+        _ = &mut *stop_rx => WaitResult::Stopped,
+        result = tokio::time::timeout(Duration::from_secs(OAUTH_CALLBACK_TIMEOUT_SECS), callback_rx) => {
+            match result {
+                Ok(Ok(cb)) => WaitResult::Callback(cb),
+                Ok(Err(_)) => WaitResult::Callback(Err("Callback listener closed unexpectedly".to_string())),
+                Err(_) => WaitResult::Timeout,
+            }
+        }
+    }
+}
+
+#[cfg(feature = "oauth")]
 async fn run_callback_listener_task(
     svc: OAuthService,
     identity: FlowIdentity,
@@ -724,7 +751,6 @@ async fn run_callback_listener_task(
         response::Html,
         routing::get,
     };
-    use std::time::Duration;
 
     let FlowIdentity {
         flow_id,
@@ -839,22 +865,7 @@ async fn run_callback_listener_task(
             .await;
     });
 
-    enum WaitResult {
-        Stopped,
-        Timeout,
-        Callback(Result<(String, String), String>),
-    }
-
-    let wait = tokio::select! {
-        _ = &mut stop_rx => WaitResult::Stopped,
-        result = tokio::time::timeout(Duration::from_secs(OAUTH_CALLBACK_TIMEOUT_SECS), callback_rx) => {
-            match result {
-                Ok(Ok(cb)) => WaitResult::Callback(cb),
-                Ok(Err(_)) => WaitResult::Callback(Err("Callback listener closed unexpectedly".to_string())),
-                Err(_) => WaitResult::Timeout,
-            }
-        }
-    };
+    let wait = wait_for_oauth_callback(&mut stop_rx, callback_rx).await;
 
     let _ = shutdown_tx.send(());
     let _ = server_task.await;

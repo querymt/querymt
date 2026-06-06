@@ -7,7 +7,8 @@
 use super::messages::UiPromptBlock;
 use crate::agent::file_proxy::ReadRemoteFileResponse;
 use crate::index::{
-    FileIndex, FileIndexEntry, GetOrCreate, WorkspaceIndexManagerActor, resolve_workspace_root,
+    FileIndex, FileIndexEntry, WorkspaceIndexManagerActor, get_or_create_workspace_with_timeout,
+    resolve_workspace_root,
 };
 use crate::tools::builtins::read_shared::{DEFAULT_READ_LIMIT, render_read_output};
 use agent_client_protocol::schema::{ContentBlock, ImageContent, TextContent};
@@ -144,10 +145,7 @@ async fn build_file_index_lookup(
     cwd: &Path,
     root: &Path,
 ) -> Option<HashMap<String, bool>> {
-    let handle = workspace_manager
-        .ask(GetOrCreate {
-            root: root.to_path_buf(),
-        })
+    let handle = get_or_create_workspace_with_timeout(workspace_manager, root.to_path_buf())
         .await
         .ok()?;
     let index = handle.file_index()?;

@@ -489,6 +489,19 @@ impl AgentSessions {
         }
     }
 
+    #[cfg(feature = "remote")]
+    async fn list_remote_sessions_for_node(
+        agent: Arc<LocalAgentHandle>,
+        node_id: String,
+    ) -> Option<Vec<crate::agent::remote::RemoteSessionInfo>> {
+        let nm_ref = agent.find_node_manager(&node_id).await.ok()?;
+        agent
+            .list_remote_sessions(&nm_ref, None, None)
+            .await
+            .ok()
+            .map(|response| response.sessions)
+    }
+
     async fn merge_remote_live(&self, groups: &mut Vec<SessionGroup>) {
         #[cfg(not(feature = "remote"))]
         {
@@ -528,15 +541,7 @@ impl AgentSessions {
                     let agent = self.agent.clone();
                     async move {
                         let sessions =
-                            match tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                                let nm_ref = agent.find_node_manager(&node_id_str).await?;
-                                agent.list_remote_sessions(&nm_ref, None, None).await
-                            })
-                            .await
-                            {
-                                Ok(Ok(response)) => response.sessions,
-                                Ok(Err(_)) | Err(_) => return None,
-                            };
+                            Self::list_remote_sessions_for_node(agent, node_id_str.clone()).await?;
                         Some((peer_label, node_id_str, sessions))
                     }
                 })

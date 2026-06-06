@@ -223,6 +223,17 @@ pub struct FileIndexWatcher {
     _rebuild_handle: tokio::task::JoinHandle<()>,
 }
 
+async fn build_file_index_blocking(
+    root: PathBuf,
+    config: FileIndexConfig,
+    overrides: Override,
+    context: &'static str,
+) -> Result<FileIndex, FileIndexError> {
+    tokio::task::spawn_blocking(move || build_file_index(&root, &config, &overrides))
+        .await
+        .map_err(|e| FileIndexError::WalkError(format!("{}: {}", context, e)))?
+}
+
 impl FileIndexWatcher {
     /// Create a new file index watcher with default configuration.
     pub async fn new(root: PathBuf) -> Result<Self, FileIndexError> {
@@ -265,13 +276,13 @@ impl FileIndexWatcher {
         let config_clone = config.clone();
         let overrides_clone = overrides.clone();
         let gitignore_clone_init = gitignore.clone();
-        let initial_index = tokio::task::spawn_blocking(move || {
-            build_file_index(&root_clone, &config_clone, &overrides_clone)
-        })
-        .await
-        .map_err(|e| {
-            FileIndexError::WalkError(format!("Failed to build initial index: {}", e))
-        })??;
+        let initial_index = build_file_index_blocking(
+            root_clone,
+            config_clone,
+            overrides_clone,
+            "Failed to build initial index",
+        )
+        .await?;
 
         index.store(Arc::new(Some(initial_index.clone())));
         let _ = index_tx.send(initial_index);
@@ -302,11 +313,21 @@ impl FileIndexWatcher {
                         let config = config_clone.clone();
                         let overrides = overrides_clone.clone();
 
-                        if let Ok(Ok(new_index)) = tokio::task::spawn_blocking(move || {
-                            build_file_index(&root, &config, &overrides)
-                        }).await {
-                            index_clone.store(Arc::new(Some(new_index.clone())));
-                            let _ = index_tx_clone.send(new_index);
+                        match build_file_index_blocking(
+                            root,
+                            config,
+                            overrides,
+                            "Failed full rebuild on timer",
+                        )
+                        .await
+                        {
+                            Ok(new_index) => {
+                                index_clone.store(Arc::new(Some(new_index.clone())));
+                                let _ = index_tx_clone.send(new_index);
+                            }
+                            Err(err) => {
+                                log::warn!("FileIndexWatcher: {}", err);
+                            }
                         }
                     }
                     result = event_rx.recv() => {
@@ -405,16 +426,26 @@ impl FileIndexWatcher {
                                 let config = config_clone.clone();
                                 let overrides = overrides_clone.clone();
 
-                                if let Ok(Ok(new_index)) = tokio::task::spawn_blocking(move || {
-                                    build_file_index(&root, &config, &overrides)
-                                }).await {
-                                    index_clone.store(Arc::new(Some(new_index.clone())));
-                                    log::debug!(
-                                        "FileIndexWatcher: Broadcasting rebuilt index with {} files ({})",
-                                        new_index.files.len(),
-                                        reason
-                                    );
-                                    let _ = index_tx_clone.send(new_index);
+                                match build_file_index_blocking(
+                                    root,
+                                    config,
+                                    overrides,
+                                    "Failed full rebuild after branch or .gitignore change",
+                                )
+                                .await
+                                {
+                                    Ok(new_index) => {
+                                        index_clone.store(Arc::new(Some(new_index.clone())));
+                                        log::debug!(
+                                            "FileIndexWatcher: Broadcasting rebuilt index with {} files ({})",
+                                            new_index.files.len(),
+                                            reason
+                                        );
+                                        let _ = index_tx_clone.send(new_index);
+                                    }
+                                    Err(err) => {
+                                        log::warn!("FileIndexWatcher: {}", err);
+                                    }
                                 }
 
                                 last_rebuild = std::time::Instant::now();
@@ -446,15 +477,25 @@ impl FileIndexWatcher {
                                     let config = config_clone.clone();
                                     let overrides = overrides_clone.clone();
 
-                                    if let Ok(Ok(new_index)) = tokio::task::spawn_blocking(move || {
-                                        build_file_index(&root, &config, &overrides)
-                                    }).await {
-                                        index_clone.store(Arc::new(Some(new_index.clone())));
-                                        log::debug!(
-                                            "FileIndexWatcher: Broadcasting rebuilt index with {} files",
-                                            new_index.files.len()
-                                        );
-                                        let _ = index_tx_clone.send(new_index);
+                                    match build_file_index_blocking(
+                                        root,
+                                        config,
+                                        overrides,
+                                        "Failed full rebuild without current index",
+                                    )
+                                    .await
+                                    {
+                                        Ok(new_index) => {
+                                            index_clone.store(Arc::new(Some(new_index.clone())));
+                                            log::debug!(
+                                                "FileIndexWatcher: Broadcasting rebuilt index with {} files",
+                                                new_index.files.len()
+                                            );
+                                            let _ = index_tx_clone.send(new_index);
+                                        }
+                                        Err(err) => {
+                                            log::warn!("FileIndexWatcher: {}", err);
+                                        }
                                     }
                                 }
 
@@ -501,11 +542,7 @@ impl FileIndexWatcher {
         let config = self.config.clone();
 
         let new_index =
-            tokio::task::spawn_blocking(move || build_file_index(&root, &config, &overrides))
-                .await
-                .map_err(|e| {
-                    FileIndexError::WalkError(format!("Failed to refresh index: {}", e))
-                })??;
+            build_file_index_blocking(root, config, overrides, "Failed to refresh index").await?;
 
         self.index.store(Arc::new(Some(new_index.clone())));
         let _ = self.index_tx.send(new_index.clone());

@@ -871,22 +871,20 @@ pub async fn subscribe_to_file_index(
     workspace_root: std::path::PathBuf,
 ) {
     // Get the workspace and subscribe to its file index updates
-    let handle = match state
-        .workspace_manager
-        .ask(crate::index::GetOrCreate {
-            root: workspace_root.clone(),
-        })
-        .await
-    {
-        Ok(handle) => handle,
-        Err(err) => {
-            log::error!(
-                "Failed to get workspace for file index subscription: {}",
-                err
-            );
-            return;
-        }
-    };
+    let manager = &state.workspace_manager;
+    let handle =
+        match crate::index::get_or_create_workspace_with_timeout(manager, workspace_root.clone())
+            .await
+        {
+            Ok(handle) => handle,
+            Err(err) => {
+                log::error!(
+                    "Failed to get workspace for file index subscription: {}",
+                    err
+                );
+                return;
+            }
+        };
 
     // Ensure each connection has at most one active forwarder task.
     let existing_forwarder = {

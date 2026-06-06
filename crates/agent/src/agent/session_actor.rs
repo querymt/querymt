@@ -28,7 +28,7 @@ use log::{debug, info, warn};
 use querymt::chat::{ChatRole, ReasoningEffort};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::oneshot;
+use tokio::sync::{OwnedSemaphorePermit, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span, instrument};
 use uuid::Uuid;
@@ -1597,6 +1597,28 @@ struct DetachedPromptExecution {
     execution_origin: crate::agent::execution_context::ExecutionOrigin,
 }
 
+enum PermitWaitOutcome {
+    Acquired(OwnedSemaphorePermit),
+    TimedOut,
+    Cancelled,
+}
+
+async fn acquire_execution_permit_with_timeout(
+    permit: &Arc<tokio::sync::Semaphore>,
+    cancel_token: &CancellationToken,
+    timeout: std::time::Duration,
+) -> Result<PermitWaitOutcome, AgentError> {
+    tokio::select! {
+        permit = tokio::time::timeout(timeout, permit.clone().acquire_owned()) => match permit {
+            Ok(result) => result
+                .map(PermitWaitOutcome::Acquired)
+                .map_err(|_| AgentError::SessionSemaphoreClosed),
+            Err(_) => Ok(PermitWaitOutcome::TimedOut),
+        },
+        _ = cancel_token.cancelled() => Ok(PermitWaitOutcome::Cancelled),
+    }
+}
+
 #[instrument(
     name = "agent.prompt.execute",
     skip(exec),
@@ -1635,18 +1657,18 @@ async fn execute_prompt_detached(
     );
 
     // Acquire execution permit (blocking with timeout)
-    let _permit = match tokio::select! {
-        permit = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            runtime.execution_permit.acquire(),
-        ) => permit,
-        _ = cancel_token.cancelled() => {
+    let _permit = match acquire_execution_permit_with_timeout(
+        &runtime.execution_permit,
+        &cancel_token,
+        std::time::Duration::from_millis(100),
+    )
+    .await?
+    {
+        PermitWaitOutcome::Acquired(permit) => permit,
+        PermitWaitOutcome::Cancelled => {
             return Ok(PromptResponse::new(StopReason::Cancelled));
         }
-    } {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(_)) => return Err(AgentError::SessionSemaphoreClosed),
-        Err(_) => {
+        PermitWaitOutcome::TimedOut => {
             debug!(
                 "Session {} is busy, waiting for previous operation to complete...",
                 session_id
@@ -1658,16 +1680,18 @@ async fn execute_prompt_detached(
                 },
             );
             let timeout_duration = std::time::Duration::from_secs(config.execution_timeout_secs);
-            match tokio::select! {
-                permit = tokio::time::timeout(timeout_duration, runtime.execution_permit.acquire()) => permit,
-                _ = cancel_token.cancelled() => {
+            match acquire_execution_permit_with_timeout(
+                &runtime.execution_permit,
+                &cancel_token,
+                timeout_duration,
+            )
+            .await?
+            {
+                PermitWaitOutcome::Acquired(permit) => permit,
+                PermitWaitOutcome::Cancelled => {
                     return Ok(PromptResponse::new(StopReason::Cancelled));
                 }
-            } {
-                Ok(Ok(permit)) => permit,
-                Ok(Err(_)) => return Err(AgentError::SessionSemaphoreClosed),
-                Err(_) => {
-                    // TODO(agent-error): structured .data() payload lost — restore when AgentError supports structured data
+                PermitWaitOutcome::TimedOut => {
                     return Err(AgentError::SessionTimeout {
                         details: format!(
                             "session_id={}, timeout={}s",

@@ -21,7 +21,7 @@ use crate::agent::LocalAgentHandle;
 use crate::agent::core::AgentMode;
 use crate::api::{AgentSessions, ListSessionsOptions, RemoteSessionMode, SessionListMode};
 use crate::events::EventEnvelope;
-use crate::index::resolve_workspace_root;
+use crate::index::{get_or_create_workspace_with_timeout, resolve_workspace_root};
 use crate::session::domain::ForkOrigin;
 use crate::session::load_session_snapshot;
 use crate::session::projection::SessionScope;
@@ -1503,17 +1503,14 @@ pub async fn handle_get_file_index(state: &ServerState, conn_id: &str, tx: &mpsc
 
     let root = resolve_workspace_root(&cwd);
 
-    let workspace = match state
-        .workspace_manager
-        .ask(crate::index::GetOrCreate { root: root.clone() })
-        .await
-    {
-        Ok(handle) => handle,
-        Err(err) => {
-            let _ = send_error(tx, format!("Workspace index error: {}", err)).await;
-            return;
-        }
-    };
+    let workspace =
+        match get_or_create_workspace_with_timeout(&state.workspace_manager, root.clone()).await {
+            Ok(handle) => handle,
+            Err(err) => {
+                let _ = send_error(tx, format!("Workspace index error: {}", err)).await;
+                return;
+            }
+        };
 
     let Some(index) = workspace.file_index() else {
         let _ = send_error(tx, "File index not ready".to_string()).await;
