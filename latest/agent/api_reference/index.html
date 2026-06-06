@@ -1269,6 +1269,33 @@
   
   
     <li class="md-nav__item">
+      <a href="../hooks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Hooks
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../agent_modes/" class="md-nav__link">
         
   
@@ -2530,64 +2557,19 @@
 <a id="__codelineno-15-5" name="__codelineno-15-5"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="agenteventkind">AgentEventKind</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-16-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-16-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-16-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-16-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-16-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-16-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-16-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-16-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-16-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-16-10">10</a></span>
-<span class="normal"><a href="#__codelineno-16-11">11</a></span>
-<span class="normal"><a href="#__codelineno-16-12">12</a></span>
-<span class="normal"><a href="#__codelineno-16-13">13</a></span>
-<span class="normal"><a href="#__codelineno-16-14">14</a></span>
-<span class="normal"><a href="#__codelineno-16-15">15</a></span>
-<span class="normal"><a href="#__codelineno-16-16">16</a></span>
-<span class="normal"><a href="#__codelineno-16-17">17</a></span>
-<span class="normal"><a href="#__codelineno-16-18">18</a></span>
-<span class="normal"><a href="#__codelineno-16-19">19</a></span>
-<span class="normal"><a href="#__codelineno-16-20">20</a></span>
-<span class="normal"><a href="#__codelineno-16-21">21</a></span>
-<span class="normal"><a href="#__codelineno-16-22">22</a></span>
-<span class="normal"><a href="#__codelineno-16-23">23</a></span>
-<span class="normal"><a href="#__codelineno-16-24">24</a></span>
-<span class="normal"><a href="#__codelineno-16-25">25</a></span>
-<span class="normal"><a href="#__codelineno-16-26">26</a></span>
-<span class="normal"><a href="#__codelineno-16-27">27</a></span>
-<span class="normal"><a href="#__codelineno-16-28">28</a></span>
-<span class="normal"><a href="#__codelineno-16-29">29</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">enum</span><span class="w"> </span><span class="nc">AgentEventKind</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-16-2" name="__codelineno-16-2"></a><span class="w">    </span><span class="c1">// Session events</span>
-<a id="__codelineno-16-3" name="__codelineno-16-3"></a><span class="w">    </span><span class="n">SessionCreated</span><span class="p">,</span>
-<a id="__codelineno-16-4" name="__codelineno-16-4"></a><span class="w">    </span><span class="n">SessionStarted</span><span class="p">,</span>
-<a id="__codelineno-16-5" name="__codelineno-16-5"></a><span class="w">    </span><span class="n">SessionCancelled</span><span class="p">,</span>
-<a id="__codelineno-16-6" name="__codelineno-16-6"></a><span class="w">    </span><span class="n">SessionClosed</span><span class="p">,</span>
-<a id="__codelineno-16-7" name="__codelineno-16-7"></a>
-<a id="__codelineno-16-8" name="__codelineno-16-8"></a><span class="w">    </span><span class="c1">// Message events</span>
-<a id="__codelineno-16-9" name="__codelineno-16-9"></a><span class="w">    </span><span class="n">UserMessage</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">message</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-16-10" name="__codelineno-16-10"></a><span class="w">    </span><span class="n">AssistantMessage</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">content</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-16-11" name="__codelineno-16-11"></a>
-<a id="__codelineno-16-12" name="__codelineno-16-12"></a><span class="w">    </span><span class="c1">// Tool events</span>
-<a id="__codelineno-16-13" name="__codelineno-16-13"></a><span class="w">    </span><span class="n">ToolCall</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">tool_name</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w"> </span><span class="n">arguments</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-16-14" name="__codelineno-16-14"></a><span class="w">    </span><span class="n">ToolResult</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">tool_name</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w"> </span><span class="n">result</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-16-15" name="__codelineno-16-15"></a>
-<a id="__codelineno-16-16" name="__codelineno-16-16"></a><span class="w">    </span><span class="c1">// Delegation events</span>
-<a id="__codelineno-16-17" name="__codelineno-16-17"></a><span class="w">    </span><span class="n">DelegationRequested</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">delegation</span><span class="p">:</span><span class="w"> </span><span class="nc">Delegation</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-16-18" name="__codelineno-16-18"></a><span class="w">    </span><span class="n">DelegationCompleted</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">delegation_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w"> </span><span class="n">result</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-16-19" name="__codelineno-16-19"></a><span class="w">    </span><span class="n">DelegationFailed</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">delegation_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w"> </span><span class="n">error</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-16-20" name="__codelineno-16-20"></a>
-<a id="__codelineno-16-21" name="__codelineno-16-21"></a><span class="w">    </span><span class="c1">// Mode events</span>
-<a id="__codelineno-16-22" name="__codelineno-16-22"></a><span class="w">    </span><span class="n">AgentModeChanged</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">mode</span><span class="p">:</span><span class="w"> </span><span class="nc">AgentMode</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-16-23" name="__codelineno-16-23"></a>
-<a id="__codelineno-16-24" name="__codelineno-16-24"></a><span class="w">    </span><span class="c1">// System events</span>
-<a id="__codelineno-16-25" name="__codelineno-16-25"></a><span class="w">    </span><span class="n">CompactionStarted</span><span class="p">,</span>
-<a id="__codelineno-16-26" name="__codelineno-16-26"></a><span class="w">    </span><span class="n">CompactionCompleted</span><span class="p">,</span>
-<a id="__codelineno-16-27" name="__codelineno-16-27"></a><span class="w">    </span><span class="n">PruningStarted</span><span class="p">,</span>
-<a id="__codelineno-16-28" name="__codelineno-16-28"></a><span class="w">    </span><span class="n">PruningCompleted</span><span class="p">,</span>
-<a id="__codelineno-16-29" name="__codelineno-16-29"></a><span class="p">}</span>
+<p>The concrete event enum evolves over time; consult <code>crates/agent/src/events.rs</code> for the canonical Rust definition. Common event families include session lifecycle, prompts/messages, tool execution, permissions, compaction, delegation, and hook diagnostics.</p>
+<p>Hook-related diagnostics are surfaced as:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-16-1">1</a></span>
+<span class="normal"><a href="#__codelineno-16-2">2</a></span>
+<span class="normal"><a href="#__codelineno-16-3">3</a></span>
+<span class="normal"><a href="#__codelineno-16-4">4</a></span>
+<span class="normal"><a href="#__codelineno-16-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1"></a><span class="n">HookNotice</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-16-2" name="__codelineno-16-2"></a><span class="w">    </span><span class="n">event_name</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<a id="__codelineno-16-3" name="__codelineno-16-3"></a><span class="w">    </span><span class="n">message</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<a id="__codelineno-16-4" name="__codelineno-16-4"></a><span class="w">    </span><span class="n">is_error</span><span class="p">:</span><span class="w"> </span><span class="kt">bool</span><span class="p">,</span>
+<a id="__codelineno-16-5" name="__codelineno-16-5"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
+<p><code>hook_notice</code> is emitted when a hook exits successfully but returns invalid output that QueryMT ignores for control-flow purposes.</p>
 <h2 id="delegation">Delegation</h2>
 <h3 id="delegation_1">Delegation</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-17-1"> 1</a></span>

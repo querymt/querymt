@@ -1269,6 +1269,33 @@
   
   
     <li class="md-nav__item">
+      <a href="../hooks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Hooks
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../agent_modes/" class="md-nav__link">
         
   
@@ -1660,6 +1687,17 @@
     <span class="md-ellipsis">
       <span class="md-typeset">
         <code>single_coder.toml</code> — Full-featured single coder
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#hook_guarded_codertoml-single-coder-with-lifecycle-hooks" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        <code>hook_guarded_coder.toml</code> — Single coder with lifecycle hooks
       </span>
     </span>
   </a>
@@ -2768,6 +2806,8 @@
 <a id="__codelineno-18-47" name="__codelineno-18-47"></a><span class="n">threshold</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.85</span>
 <a id="__codelineno-18-48" name="__codelineno-18-48"></a><span class="n">min_lines</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span>
 </code></pre></div></td></tr></table></div>
+<h3 id="hook_guarded_codertoml-single-coder-with-lifecycle-hooks"><code>hook_guarded_coder.toml</code> — Single coder with lifecycle hooks</h3>
+<p>Use this profile when you want config-level hook commands to inspect shell calls, automate approval decisions, or request one extra step at turn completion.</p>
 <h3 id="multi_agenttoml-planner-delegates"><code>multi_agent.toml</code> — Planner + delegates</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-19-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-19-2"> 2</a></span>
@@ -3643,7 +3683,8 @@
 - <code>examples/confs/watchdog.toml</code> - Scheduled codebase health monitor
 - <code>examples/confs/standup_bot.toml</code> - Daily standup reporter
 - <code>examples/confs/research_journal.toml</code> - Research journal with event-driven consolidation
-- <code>examples/confs/learning_pair.toml</code> - Learning pair with scheduled consolidation</p>
+- <code>examples/confs/learning_pair.toml</code> - Learning pair with scheduled consolidation
+- <code>examples/confs/hook_guarded_coder.toml</code> - Single coder with config-level lifecycle hooks</p>
 <hr />
 <h2 id="running-all-examples_1">Running All Examples</h2>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-54-1"> 1</a></span>

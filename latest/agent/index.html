@@ -1463,6 +1463,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#hooks" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Hooks
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#code-intelligence-tools" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -1574,6 +1585,33 @@
     
   
   Configuration
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="./hooks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Hooks
 
     
   </span>
@@ -1993,6 +2031,13 @@
 <li><strong>Argument substitution</strong>: Dynamic prompts with <code>$1</code>, <code>$2</code>, <code>$ARGUMENTS</code></li>
 <li><strong>Team sharing</strong>: Share commands via <code>.qmt/commands/</code></li>
 </ul>
+<h3 id="hooks">Hooks</h3>
+<ul>
+<li><strong>Profile-level automation</strong>: Enable lifecycle policies per config or profile</li>
+<li><strong>Command-based checks</strong>: Run local commands before prompts, tools, approvals, or turn completion</li>
+<li><strong>Schema-backed contract</strong>: Validate hook stdin/stdout against generated JSON schemas</li>
+<li><strong>Stop-time continuation</strong>: Request one extra LLM step before a turn fully completes</li>
+</ul>
 <h3 id="code-intelligence-tools">Code Intelligence Tools</h3>
 <ul>
 <li><strong>AST-aware analysis</strong>: <code>index</code>, <code>get_symbol</code>, <code>get_function</code></li>
@@ -2061,6 +2106,7 @@
 <ul>
 <li><strong>Overview</strong> (this document): Architecture and concepts</li>
 <li><strong><a href="configuration/">Configuration Guide</a></strong>: TOML configuration reference</li>
+<li><strong><a href="hooks/">Hooks Guide</a></strong>: Config-level lifecycle hooks and command schemas</li>
 <li><strong><a href="mesh/">Mesh Networking Guide</a></strong>: Cross-machine collaboration and internet mesh</li>
 <li><strong><a href="profiles/">Profiles Guide</a></strong>: Save and switch between configurations</li>
 <li><strong><a href="slash-commands/">Slash Commands Guide</a></strong>: Custom commands and workflows</li>

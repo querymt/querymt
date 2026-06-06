@@ -1269,6 +1269,33 @@
   
   
     <li class="md-nav__item">
+      <a href="../hooks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Hooks
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../agent_modes/" class="md-nav__link">
         
   
@@ -1359,6 +1386,17 @@
     <span class="md-ellipsis">
       <span class="md-typeset">
         Architecture
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#hooks-vs-middleware" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Hooks vs Middleware
       </span>
     </span>
   </a>
@@ -1936,6 +1974,10 @@
     B([Agent Processing])
 
     A --&gt; CD --&gt; B</code></pre>
+<h2 id="hooks-vs-middleware">Hooks vs Middleware</h2>
+<p>Middleware is compiled Rust code that participates directly in the agent execution pipeline. Hooks are profile/config-level external commands with JSON stdin/stdout schemas.</p>
+<p>If you need local scripts, policy checks, approval automation, or profile-level lifecycle command hooks, use hooks. If you need typed in-process behavior or deep runtime integration, use middleware.</p>
+<p>See the <a href="../hooks/">Hooks Guide</a> for config-level lifecycle command hooks.</p>
 <h2 id="middleware-driver-trait">Middleware Driver Trait</h2>
 <p>All middleware must implement the <code>MiddlewareDriver</code> trait:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-1"> 1</a></span>
