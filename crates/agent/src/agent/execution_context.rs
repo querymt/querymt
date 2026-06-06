@@ -1,7 +1,7 @@
 //! Execution context bundling all per-run state for agent execution
 
 use crate::acp::client_bridge::ClientBridgeSender;
-use crate::agent::core::{SessionRuntime, ToolConfig};
+use crate::agent::core::{AgentMode, SessionRuntime, ToolConfig};
 use crate::knowledge::KnowledgeStore;
 use crate::model::AgentMessage;
 use crate::session::error::SessionResult;
@@ -88,6 +88,14 @@ pub(crate) struct ExecutionContext {
     /// definitions, symbols, hover docs, and type definitions through the
     /// editor's language server.
     pub workspace_query_bridge: Option<ClientBridgeSender>,
+    /// Stable turn id used by hook payloads and turn-scoped metadata.
+    pub turn_id: Option<String>,
+    /// Agent mode captured at turn start for this execution.
+    ///
+    /// This is intentionally a per-turn snapshot rather than a live view of the
+    /// mutable session actor mode. If the user changes mode while a prompt is
+    /// running, the new mode applies to the next turn.
+    pub turn_mode: AgentMode,
 }
 
 impl ExecutionContext {
@@ -110,6 +118,8 @@ impl ExecutionContext {
             knowledge_store: None,
             event_sink: None,
             workspace_query_bridge: None,
+            turn_id: None,
+            turn_mode: AgentMode::Build,
         }
     }
 
@@ -146,7 +156,16 @@ impl ExecutionContext {
         self
     }
 
-    /// Get the current working directory, if set
+    pub fn with_turn_id(mut self, turn_id: impl Into<String>) -> Self {
+        self.turn_id = Some(turn_id.into());
+        self
+    }
+
+    pub fn with_turn_mode(mut self, mode: AgentMode) -> Self {
+        self.turn_mode = mode;
+        self
+    }
+
     pub fn cwd(&self) -> Option<&Path> {
         self.runtime.cwd.as_deref()
     }
@@ -166,12 +185,14 @@ impl ExecutionContext {
         self.session_handle.execution_config()
     }
 
-    /// Create a tool execution context from this execution context
-    ///
-    /// This centralizes the construction of `AgentToolContext` from the execution state,
-    /// extracting the necessary fields (session_id, cwd, agent_registry) in one place.
-    /// The cancellation token and knowledge store are propagated so tools can abort
-    /// long-running work and access the knowledge layer.
+    pub fn turn_id(&self) -> Option<&str> {
+        self.turn_id.as_deref()
+    }
+
+    pub fn permission_mode(&self) -> &'static str {
+        crate::hooks::permission_mode_label(self.turn_mode)
+    }
+
     pub fn tool_context(
         &self,
         agent_registry: Arc<dyn crate::delegation::AgentRegistry>,

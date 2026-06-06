@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 mod execution;
 mod extensions;
+mod hooks;
 mod loader;
 mod mcp;
 mod mesh;
@@ -26,6 +27,7 @@ mod tools;
 
 pub use execution::*;
 pub use extensions::*;
+pub use hooks::*;
 pub use loader::{ConfigSource, interpolate_env_vars, load_config};
 pub use mcp::*;
 pub use mesh::*;

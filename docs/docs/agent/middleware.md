@@ -17,6 +17,14 @@ flowchart LR
     A --> CD --> B
 ```
 
+## Hooks vs Middleware
+
+Middleware is compiled Rust code that participates directly in the agent execution pipeline. Hooks are profile/config-level external commands with JSON stdin/stdout schemas.
+
+If you need local scripts, policy checks, approval automation, or profile-level lifecycle command hooks, use hooks. If you need typed in-process behavior or deep runtime integration, use middleware.
+
+See the [Hooks Guide](hooks.md) for config-level lifecycle command hooks.
+
 ## Middleware Driver Trait
 
 All middleware must implement the `MiddlewareDriver` trait:

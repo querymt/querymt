@@ -227,37 +227,19 @@ pub struct EventEnvelope {
 
 ### AgentEventKind
 
+The concrete event enum evolves over time; consult `crates/agent/src/events.rs` for the canonical Rust definition. Common event families include session lifecycle, prompts/messages, tool execution, permissions, compaction, delegation, and hook diagnostics.
+
+Hook-related diagnostics are surfaced as:
+
 ```rust
-pub enum AgentEventKind {
-    // Session events
-    SessionCreated,
-    SessionStarted,
-    SessionCancelled,
-    SessionClosed,
-    
-    // Message events
-    UserMessage { message: String },
-    AssistantMessage { content: String },
-    
-    // Tool events
-    ToolCall { tool_name: String, arguments: String },
-    ToolResult { tool_name: String, result: String },
-    
-    // Delegation events
-    DelegationRequested { delegation: Delegation },
-    DelegationCompleted { delegation_id: String, result: Option<String> },
-    DelegationFailed { delegation_id: String, error: String },
-    
-    // Mode events
-    AgentModeChanged { mode: AgentMode },
-    
-    // System events
-    CompactionStarted,
-    CompactionCompleted,
-    PruningStarted,
-    PruningCompleted,
+HookNotice {
+    event_name: String,
+    message: String,
+    is_error: bool,
 }
 ```
+
+`hook_notice` is emitted when a hook exits successfully but returns invalid output that QueryMT ignores for control-flow purposes.
 
 ## Delegation
 

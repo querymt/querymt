@@ -117,6 +117,11 @@ export type AgentEventKind =
 	is_error: boolean;
 	result: string;
 }}
+	| { type: "hook_notice", data: {
+	event_name: string;
+	message: string;
+	is_error: boolean;
+}}
 	| { type: "snapshot_start", data: {
 	policy: string;
 }}

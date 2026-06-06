@@ -25,6 +25,7 @@ pub mod event_sink;
 pub mod events;
 pub mod export;
 pub mod hash;
+pub mod hooks;
 pub mod index;
 pub mod knowledge;
 pub mod middleware;

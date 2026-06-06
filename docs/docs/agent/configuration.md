@@ -163,6 +163,33 @@ urls = []                 # Remote skill URLs (future)
 agent_id = "querymt"      # Agent identifier for skills
 ```
 
+### Hooks Configuration
+
+Hooks run configured local commands at specific agent lifecycle points. They are configured directly in `[agent.hooks]`, which makes them a natural fit for profiles.
+
+```toml
+[agent.hooks]
+enabled = true
+
+[[agent.hooks.pre_tool_use]]
+matcher = "^shell$"
+
+[[agent.hooks.pre_tool_use.hooks]]
+type = "command"
+command = "sh ./hooks/check-shell.sh"
+timeout_sec = 5
+status_message = "Checking shell command"
+
+[[agent.hooks.stop]]
+
+[[agent.hooks.stop.hooks]]
+type = "command"
+command = "sh ./hooks/stop-verify.sh"
+timeout_sec = 5
+```
+
+Hook commands receive JSON on stdin and return JSON on stdout. See the [Hooks Guide](hooks.md) for supported events, schema files, and `stop` continuation behavior.
+
 ## MCP Servers
 
 MCP (Model Context Protocol) servers extend agent capabilities:

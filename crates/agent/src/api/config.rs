@@ -1,7 +1,7 @@
 //! Agent configuration types for the simple builder API
 
 use super::utils::infer_required_capabilities;
-use crate::config::{ExecutionPolicy, MiddlewareEntry};
+use crate::config::{ExecutionPolicy, HooksConfig, MiddlewareEntry};
 use crate::tools::CapabilityRequirement;
 use querymt::{LLMParams, chat::ReasoningEffort};
 use serde_json::Value;
@@ -19,6 +19,7 @@ pub(super) struct AgentConfig {
     pub execution: ExecutionPolicy,
     pub assume_mutating: Option<bool>,
     pub mutating_tools: Option<Vec<String>>,
+    pub hooks: HooksConfig,
 }
 
 impl AgentConfig {
@@ -34,6 +35,7 @@ impl AgentConfig {
             execution: ExecutionPolicy::default(),
             assume_mutating: None,
             mutating_tools: None,
+            hooks: HooksConfig::default(),
         }
     }
 }
