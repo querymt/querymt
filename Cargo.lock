@@ -11067,7 +11067,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid 1.23.2",
- "which 8.0.2",
+ "which 8.0.3",
 ]
 
 [[package]]
@@ -13163,7 +13163,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sigstore-protobuf-specs-derive",
- "which 8.0.2",
+ "which 8.0.3",
 ]
 
 [[package]]
@@ -16253,9 +16253,9 @@ dependencies = [
 
 [[package]]
 name = "which"
-version = "8.0.2"
+version = "8.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81995fafaaaf6ae47a7d0cc83c67caf92aeb7e5331650ae6ff856f7c0c60c459"
+checksum = "c789537cf2f7f55be8e6192f92e464174ee55f91af622777f7f1ceb0dbccd03e"
 dependencies = [
  "libc",
 ]
