@@ -847,7 +847,7 @@ async fn build_profile_runtime(
     let metadata = document.metadata;
     let agent = match document.config {
         Config::Single(config) => {
-            Agent::from_single_config_with_infra(config, shared_infra).await?
+            Agent::from_single_config_with_infra(*config, shared_infra).await?
         }
         Config::Multi(config) => {
             #[cfg(feature = "remote")]
@@ -855,7 +855,7 @@ async fn build_profile_runtime(
             #[cfg(not(feature = "remote"))]
             let infra = shared_infra;
 
-            Agent::from_quorum_config_with_infra(config, infra).await?
+            Agent::from_quorum_config_with_infra(*config, infra).await?
         }
     };
 

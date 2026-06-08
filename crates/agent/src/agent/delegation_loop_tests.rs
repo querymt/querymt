@@ -229,6 +229,7 @@ impl TestHarness {
             store.clone(),
             agent_registry.clone(),
             config.tool_registry_arc(),
+            config.hooks.clone(),
             None,
         ));
         let _orchestrator_handle = orchestrator.start_listening(config.event_sink.fanout());

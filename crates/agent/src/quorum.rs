@@ -322,12 +322,19 @@ impl AgentQuorumBuilder {
                 self.event_fanout.clone(),
             ));
 
+            let planner_hooks = planner
+                .as_any()
+                .downcast_ref::<crate::agent::LocalAgentHandle>()
+                .map(|handle| handle.config.hooks.clone())
+                .unwrap_or_else(crate::hooks::Hooks::disabled);
+
             let mut orch = DelegationOrchestrator::new(
                 planner.clone(),
                 delegation_sink,
                 self.storage.session_store().clone(),
                 registry.clone(),
                 tool_registry,
+                planner_hooks,
                 self.cwd.clone(),
             )
             .with_verification(self.verification_enabled)

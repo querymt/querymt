@@ -1,0 +1,80 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "NullableString": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "properties": {
+    "child_session_id": {
+      "type": "string"
+    },
+    "cwd": {
+      "type": "string"
+    },
+    "delegation_id": {
+      "type": "string"
+    },
+    "hook_event_name": {
+      "const": "post_delegation",
+      "type": "string"
+    },
+    "model": {
+      "type": "string"
+    },
+    "objective": {
+      "type": "string"
+    },
+    "permission_mode": {
+      "enum": [
+        "default",
+        "plan",
+        "accept_edits"
+      ],
+      "type": "string"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "target_agent_id": {
+      "type": "string"
+    },
+    "transcript_path": {
+      "$ref": "#/definitions/NullableString"
+    },
+    "turn_id": {
+      "type": "string"
+    },
+    "verification_passed": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "session_id",
+    "turn_id",
+    "transcript_path",
+    "cwd",
+    "hook_event_name",
+    "model",
+    "permission_mode",
+    "delegation_id",
+    "target_agent_id",
+    "child_session_id",
+    "objective",
+    "status",
+    "summary",
+    "verification_passed"
+  ],
+  "title": "post-delegation.command.input",
+  "type": "object"
+}

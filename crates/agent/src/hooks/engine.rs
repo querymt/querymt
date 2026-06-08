@@ -1,12 +1,17 @@
 use crate::hooks::config::{HookCommandConfig, HookEventConfig, HookHandlerConfig, HooksConfig};
 use crate::hooks::output_parser::{
-    ParsedDecision, ParsedPermissionDecision, parse_permission_request, parse_post_tool_use,
-    parse_pre_tool_use, parse_session_start, parse_stop, parse_user_prompt_submit,
+    ParsedDecision, ParsedPermissionDecision, parse_delegation_failure, parse_delegation_start,
+    parse_permission_request, parse_post_compaction, parse_post_delegation, parse_post_tool_use,
+    parse_pre_compaction, parse_pre_delegation, parse_pre_tool_use, parse_session_start,
+    parse_stop, parse_user_prompt_submit,
 };
 use crate::hooks::runner::{CommandHookSpec, run_command_hook};
 use crate::hooks::schema::{
-    PermissionRequestCommandInput, PostToolUseCommandInput, PreToolUseCommandInput,
-    SessionStartCommandInput, StopCommandInput, UserPromptSubmitCommandInput,
+    DelegationFailureCommandInput, DelegationStartCommandInput, NullableString,
+    PermissionRequestCommandInput, PostCompactionCommandInput, PostDelegationCommandInput,
+    PostToolUseCommandInput, PreCompactionCommandInput, PreDelegationCommandInput,
+    PreToolUseCommandInput, SessionStartCommandInput, StopCommandInput,
+    UserPromptSubmitCommandInput,
 };
 use log::warn;
 use serde::Serialize;
@@ -30,6 +35,15 @@ pub struct HookNotice {
 pub enum PermissionRequestDecision {
     Allow,
     Deny { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpdatedDelegation {
+    pub target_agent_id: Option<String>,
+    pub objective: Option<String>,
+    pub context: Option<String>,
+    pub constraints: Option<String>,
+    pub expected_output: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +159,135 @@ pub struct StopResult {
     pub notices: Vec<HookNotice>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreCompactionRequest {
+    pub session_id: String,
+    pub turn_id: String,
+    pub cwd: Option<PathBuf>,
+    pub model: String,
+    pub permission_mode: String,
+    pub trigger: String,
+    pub token_estimate: u32,
+    pub message_count: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PreCompactionResult {
+    pub should_block: bool,
+    pub block_reason: Option<String>,
+    pub additional_contexts: Vec<String>,
+    pub notices: Vec<HookNotice>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PostCompactionRequest {
+    pub session_id: String,
+    pub turn_id: String,
+    pub cwd: Option<PathBuf>,
+    pub model: String,
+    pub permission_mode: String,
+    pub trigger: String,
+    pub summary: String,
+    pub original_token_count: u32,
+    pub summary_token_count: u32,
+    pub message_count: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PostCompactionResult {
+    pub additional_contexts: Vec<String>,
+    pub notices: Vec<HookNotice>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreDelegationRequest {
+    pub session_id: String,
+    pub turn_id: String,
+    pub cwd: Option<PathBuf>,
+    pub model: String,
+    pub permission_mode: String,
+    pub tool_use_id: String,
+    pub target_agent_id: String,
+    pub objective: String,
+    pub context: Option<String>,
+    pub constraints: Option<String>,
+    pub expected_output: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PreDelegationResult {
+    pub should_block: bool,
+    pub block_reason: Option<String>,
+    pub updated_delegation: Option<UpdatedDelegation>,
+    pub additional_contexts: Vec<String>,
+    pub notices: Vec<HookNotice>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DelegationStartRequest {
+    pub session_id: String,
+    pub turn_id: String,
+    pub cwd: Option<PathBuf>,
+    pub model: String,
+    pub permission_mode: String,
+    pub delegation_id: String,
+    pub target_agent_id: String,
+    pub objective: String,
+    pub context: Option<String>,
+    pub constraints: Option<String>,
+    pub expected_output: Option<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DelegationStartResult {
+    pub additional_contexts: Vec<String>,
+    pub notices: Vec<HookNotice>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PostDelegationRequest {
+    pub session_id: String,
+    pub turn_id: String,
+    pub cwd: Option<PathBuf>,
+    pub model: String,
+    pub permission_mode: String,
+    pub delegation_id: String,
+    pub target_agent_id: String,
+    pub child_session_id: String,
+    pub objective: String,
+    pub status: String,
+    pub summary: String,
+    pub verification_passed: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PostDelegationResult {
+    pub additional_contexts: Vec<String>,
+    pub notices: Vec<HookNotice>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DelegationFailureRequest {
+    pub session_id: String,
+    pub turn_id: String,
+    pub cwd: Option<PathBuf>,
+    pub model: String,
+    pub permission_mode: String,
+    pub delegation_id: String,
+    pub target_agent_id: String,
+    pub objective: String,
+    pub status: String,
+    pub error: String,
+    pub error_type: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DelegationFailureResult {
+    pub additional_contexts: Vec<String>,
+    pub notices: Vec<HookNotice>,
+}
+
 impl Hooks {
     pub fn new(config: HooksConfig) -> anyhow::Result<Self> {
         config.validate()?;
@@ -168,7 +311,7 @@ impl Hooks {
         }
         let input = SessionStartCommandInput {
             session_id: request.session_id,
-            transcript_path: crate::hooks::schema::NullableString::from_string(None),
+            transcript_path: NullableString::from_string(None),
             cwd: cwd_string(request.cwd.as_deref()),
             hook_event_name: HookEventConfig::SessionStart.label().to_string(),
             model: request.model,
@@ -181,7 +324,7 @@ impl Hooks {
             .run_event(
                 HookEventConfig::SessionStart,
                 None,
-                input,
+                input.clone(),
                 request.cwd.as_deref(),
             )
             .await?
@@ -198,19 +341,9 @@ impl Hooks {
                     }
                 }
                 Ok(None) => {}
-                Err(err) => {
-                    let message = format!(
-                        "Ignoring invalid {} hook output: {}",
-                        HookEventConfig::SessionStart.label(),
-                        err
-                    );
-                    warn!("{}", message);
-                    result.notices.push(HookNotice {
-                        event_name: HookEventConfig::SessionStart.label().to_string(),
-                        message,
-                        is_error: true,
-                    });
-                }
+                Err(err) => result
+                    .notices
+                    .push(invalid_notice(HookEventConfig::SessionStart, err)),
             }
         }
         Ok(result)
@@ -226,7 +359,7 @@ impl Hooks {
         let input = UserPromptSubmitCommandInput {
             session_id: request.session_id,
             turn_id: request.turn_id,
-            transcript_path: crate::hooks::schema::NullableString::from_string(None),
+            transcript_path: NullableString::from_string(None),
             cwd: cwd_string(request.cwd.as_deref()),
             hook_event_name: HookEventConfig::UserPromptSubmit.label().to_string(),
             model: request.model,
@@ -239,7 +372,7 @@ impl Hooks {
             .run_event(
                 HookEventConfig::UserPromptSubmit,
                 None,
-                input,
+                input.clone(),
                 request.cwd.as_deref(),
             )
             .await?
@@ -260,17 +393,9 @@ impl Hooks {
                 }
                 Ok(None) => {}
                 Err(err) => {
-                    let message = format!(
-                        "Ignoring invalid {} hook output: {}",
-                        HookEventConfig::UserPromptSubmit.label(),
-                        err
-                    );
-                    warn!("{}", message);
-                    result.notices.push(HookNotice {
-                        event_name: HookEventConfig::UserPromptSubmit.label().to_string(),
-                        message,
-                        is_error: true,
-                    });
+                    result
+                        .notices
+                        .push(invalid_notice(HookEventConfig::UserPromptSubmit, err));
                 }
             }
         }
@@ -287,7 +412,7 @@ impl Hooks {
         let input = PreToolUseCommandInput {
             session_id: request.session_id,
             turn_id: request.turn_id,
-            transcript_path: crate::hooks::schema::NullableString::from_string(None),
+            transcript_path: NullableString::from_string(None),
             cwd: cwd_string(request.cwd.as_deref()),
             hook_event_name: HookEventConfig::PreToolUse.label().to_string(),
             model: request.model,
@@ -302,7 +427,7 @@ impl Hooks {
             .run_event(
                 HookEventConfig::PreToolUse,
                 Some(&request.tool_name),
-                input,
+                input.clone(),
                 request.cwd.as_deref(),
             )
             .await?
@@ -334,19 +459,9 @@ impl Hooks {
                     }
                 }
                 Ok(None) => {}
-                Err(err) => {
-                    let message = format!(
-                        "Ignoring invalid {} hook output: {}",
-                        HookEventConfig::PreToolUse.label(),
-                        err
-                    );
-                    warn!("{}", message);
-                    result.notices.push(HookNotice {
-                        event_name: HookEventConfig::PreToolUse.label().to_string(),
-                        message,
-                        is_error: true,
-                    });
-                }
+                Err(err) => result
+                    .notices
+                    .push(invalid_notice(HookEventConfig::PreToolUse, err)),
             }
         }
         Ok(result)
@@ -362,7 +477,7 @@ impl Hooks {
         let input = PermissionRequestCommandInput {
             session_id: request.session_id,
             turn_id: request.turn_id,
-            transcript_path: crate::hooks::schema::NullableString::from_string(None),
+            transcript_path: NullableString::from_string(None),
             cwd: cwd_string(request.cwd.as_deref()),
             hook_event_name: HookEventConfig::PermissionRequest.label().to_string(),
             model: request.model,
@@ -376,7 +491,7 @@ impl Hooks {
             .run_event(
                 HookEventConfig::PermissionRequest,
                 Some(&request.tool_name),
-                input,
+                input.clone(),
                 request.cwd.as_deref(),
             )
             .await?
@@ -394,17 +509,9 @@ impl Hooks {
                 },
                 Ok(None) => {}
                 Err(err) => {
-                    let message = format!(
-                        "Ignoring invalid {} hook output: {}",
-                        HookEventConfig::PermissionRequest.label(),
-                        err
-                    );
-                    warn!("{}", message);
-                    result.notices.push(HookNotice {
-                        event_name: HookEventConfig::PermissionRequest.label().to_string(),
-                        message,
-                        is_error: true,
-                    });
+                    result
+                        .notices
+                        .push(invalid_notice(HookEventConfig::PermissionRequest, err));
                 }
             }
         }
@@ -421,7 +528,7 @@ impl Hooks {
         let input = PostToolUseCommandInput {
             session_id: request.session_id,
             turn_id: request.turn_id,
-            transcript_path: crate::hooks::schema::NullableString::from_string(None),
+            transcript_path: NullableString::from_string(None),
             cwd: cwd_string(request.cwd.as_deref()),
             hook_event_name: HookEventConfig::PostToolUse.label().to_string(),
             model: request.model,
@@ -437,7 +544,7 @@ impl Hooks {
             .run_event(
                 HookEventConfig::PostToolUse,
                 Some(&request.tool_name),
-                input,
+                input.clone(),
                 request.cwd.as_deref(),
             )
             .await?
@@ -462,17 +569,9 @@ impl Hooks {
                 }
                 Ok(None) => {}
                 Err(err) => {
-                    let message = format!(
-                        "Ignoring invalid {} hook output: {}",
-                        HookEventConfig::PostToolUse.label(),
-                        err
-                    );
-                    warn!("{}", message);
-                    result.notices.push(HookNotice {
-                        event_name: HookEventConfig::PostToolUse.label().to_string(),
-                        message,
-                        is_error: true,
-                    });
+                    result
+                        .notices
+                        .push(invalid_notice(HookEventConfig::PostToolUse, err));
                 }
             }
         }
@@ -486,7 +585,7 @@ impl Hooks {
         let input = StopCommandInput {
             session_id: request.session_id,
             turn_id: request.turn_id,
-            transcript_path: crate::hooks::schema::NullableString::from_string(None),
+            transcript_path: NullableString::from_string(None),
             cwd: cwd_string(request.cwd.as_deref()),
             hook_event_name: HookEventConfig::Stop.label().to_string(),
             model: request.model,
@@ -496,7 +595,12 @@ impl Hooks {
 
         let mut result = StopResult::default();
         for stdout in self
-            .run_event(HookEventConfig::Stop, None, input, request.cwd.as_deref())
+            .run_event(
+                HookEventConfig::Stop,
+                None,
+                input.clone(),
+                request.cwd.as_deref(),
+            )
             .await?
         {
             match parse_stop(&stdout) {
@@ -521,19 +625,326 @@ impl Hooks {
                     }
                 }
                 Ok(None) => {}
-                Err(err) => {
-                    let message = format!(
-                        "Ignoring invalid {} hook output: {}",
-                        HookEventConfig::Stop.label(),
-                        err
-                    );
-                    warn!("{}", message);
-                    result.notices.push(HookNotice {
-                        event_name: HookEventConfig::Stop.label().to_string(),
-                        message,
-                        is_error: true,
-                    });
+                Err(err) => result
+                    .notices
+                    .push(invalid_notice(HookEventConfig::Stop, err)),
+            }
+        }
+        Ok(result)
+    }
+
+    pub async fn run_pre_compaction(
+        &self,
+        request: PreCompactionRequest,
+    ) -> anyhow::Result<PreCompactionResult> {
+        if !self.is_enabled() {
+            return Ok(PreCompactionResult::default());
+        }
+        let input = PreCompactionCommandInput {
+            session_id: request.session_id,
+            turn_id: request.turn_id,
+            transcript_path: NullableString::from_string(None),
+            cwd: cwd_string(request.cwd.as_deref()),
+            hook_event_name: HookEventConfig::PreCompaction.label().to_string(),
+            model: request.model,
+            permission_mode: request.permission_mode,
+            trigger: request.trigger,
+            token_estimate: request.token_estimate,
+            message_count: request.message_count,
+        };
+
+        let mut result = PreCompactionResult::default();
+        for stdout in self
+            .run_event(
+                HookEventConfig::PreCompaction,
+                None,
+                input.clone(),
+                request.cwd.as_deref(),
+            )
+            .await?
+        {
+            match parse_pre_compaction(&stdout) {
+                Ok(Some(parsed)) => {
+                    if let Some(context) = parsed.additional_context {
+                        result.additional_contexts.push(context);
+                    }
+                    if matches!(parsed.decision, Some(ParsedDecision::Block)) {
+                        result.should_block = true;
+                        if result.block_reason.is_none() {
+                            result.block_reason = parsed
+                                .reason
+                                .or_else(|| Some("compaction blocked by hook".to_string()));
+                        }
+                    }
                 }
+                Ok(None) => {}
+                Err(err) => {
+                    result
+                        .notices
+                        .push(invalid_notice(HookEventConfig::PreCompaction, err));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    pub async fn run_post_compaction(
+        &self,
+        request: PostCompactionRequest,
+    ) -> anyhow::Result<PostCompactionResult> {
+        if !self.is_enabled() {
+            return Ok(PostCompactionResult::default());
+        }
+        let input = PostCompactionCommandInput {
+            session_id: request.session_id,
+            turn_id: request.turn_id,
+            transcript_path: NullableString::from_string(None),
+            cwd: cwd_string(request.cwd.as_deref()),
+            hook_event_name: HookEventConfig::PostCompaction.label().to_string(),
+            model: request.model,
+            permission_mode: request.permission_mode,
+            trigger: request.trigger,
+            summary: request.summary,
+            original_token_count: request.original_token_count,
+            summary_token_count: request.summary_token_count,
+            message_count: request.message_count,
+        };
+
+        let mut result = PostCompactionResult::default();
+        for stdout in self
+            .run_event(
+                HookEventConfig::PostCompaction,
+                None,
+                input.clone(),
+                request.cwd.as_deref(),
+            )
+            .await?
+        {
+            match parse_post_compaction(&stdout) {
+                Ok(Some(parsed)) => {
+                    if let Some(context) = parsed.additional_context {
+                        result.additional_contexts.push(context);
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    result
+                        .notices
+                        .push(invalid_notice(HookEventConfig::PostCompaction, err));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    pub async fn run_pre_delegation(
+        &self,
+        request: PreDelegationRequest,
+    ) -> anyhow::Result<PreDelegationResult> {
+        if !self.is_enabled() {
+            return Ok(PreDelegationResult::default());
+        }
+        let input = PreDelegationCommandInput {
+            session_id: request.session_id,
+            turn_id: request.turn_id,
+            transcript_path: NullableString::from_string(None),
+            cwd: cwd_string(request.cwd.as_deref()),
+            hook_event_name: HookEventConfig::PreDelegation.label().to_string(),
+            model: request.model,
+            permission_mode: request.permission_mode,
+            tool_use_id: request.tool_use_id,
+            target_agent_id: request.target_agent_id.clone(),
+            objective: request.objective,
+            context: NullableString::from_string(request.context),
+            constraints: NullableString::from_string(request.constraints),
+            expected_output: NullableString::from_string(request.expected_output),
+        };
+
+        let mut result = PreDelegationResult::default();
+        for stdout in self
+            .run_event(
+                HookEventConfig::PreDelegation,
+                Some(&request.target_agent_id),
+                input.clone(),
+                request.cwd.as_deref(),
+            )
+            .await?
+        {
+            match parse_pre_delegation(&stdout) {
+                Ok(Some(parsed)) => {
+                    if let Some(context) = parsed.additional_context {
+                        result.additional_contexts.push(context);
+                    }
+                    if let Some(updated) = parsed.updated_delegation {
+                        result.updated_delegation = Some(UpdatedDelegation {
+                            target_agent_id: updated.target_agent_id,
+                            objective: updated.objective,
+                            context: updated.context,
+                            constraints: updated.constraints,
+                            expected_output: updated.expected_output,
+                        });
+                    }
+                    if matches!(parsed.decision, Some(ParsedDecision::Block)) {
+                        result.should_block = true;
+                        if result.block_reason.is_none() {
+                            result.block_reason = parsed
+                                .reason
+                                .or_else(|| Some("delegation blocked by hook".to_string()));
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    result
+                        .notices
+                        .push(invalid_notice(HookEventConfig::PreDelegation, err));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    pub async fn run_delegation_start(
+        &self,
+        request: DelegationStartRequest,
+    ) -> anyhow::Result<DelegationStartResult> {
+        if !self.is_enabled() {
+            return Ok(DelegationStartResult::default());
+        }
+        let input = DelegationStartCommandInput {
+            session_id: request.session_id,
+            turn_id: request.turn_id,
+            transcript_path: NullableString::from_string(None),
+            cwd: cwd_string(request.cwd.as_deref()),
+            hook_event_name: HookEventConfig::DelegationStart.label().to_string(),
+            model: request.model,
+            permission_mode: request.permission_mode,
+            delegation_id: request.delegation_id,
+            target_agent_id: request.target_agent_id.clone(),
+            objective: request.objective,
+            context: NullableString::from_string(request.context),
+            constraints: NullableString::from_string(request.constraints),
+            expected_output: NullableString::from_string(request.expected_output),
+            status: request.status,
+        };
+        self.run_observing_delegation_event(
+            HookEventConfig::DelegationStart,
+            &request.target_agent_id,
+            input,
+            request.cwd.as_deref(),
+            parse_delegation_start,
+        )
+        .await
+        .map(|out| DelegationStartResult {
+            additional_contexts: out.additional_contexts,
+            notices: out.notices,
+        })
+    }
+
+    pub async fn run_post_delegation(
+        &self,
+        request: PostDelegationRequest,
+    ) -> anyhow::Result<PostDelegationResult> {
+        if !self.is_enabled() {
+            return Ok(PostDelegationResult::default());
+        }
+        let input = PostDelegationCommandInput {
+            session_id: request.session_id,
+            turn_id: request.turn_id,
+            transcript_path: NullableString::from_string(None),
+            cwd: cwd_string(request.cwd.as_deref()),
+            hook_event_name: HookEventConfig::PostDelegation.label().to_string(),
+            model: request.model,
+            permission_mode: request.permission_mode,
+            delegation_id: request.delegation_id,
+            target_agent_id: request.target_agent_id.clone(),
+            child_session_id: request.child_session_id,
+            objective: request.objective,
+            status: request.status,
+            summary: request.summary,
+            verification_passed: request.verification_passed,
+        };
+        self.run_observing_delegation_event(
+            HookEventConfig::PostDelegation,
+            &request.target_agent_id,
+            input,
+            request.cwd.as_deref(),
+            parse_post_delegation,
+        )
+        .await
+        .map(|out| PostDelegationResult {
+            additional_contexts: out.additional_contexts,
+            notices: out.notices,
+        })
+    }
+
+    pub async fn run_delegation_failure(
+        &self,
+        request: DelegationFailureRequest,
+    ) -> anyhow::Result<DelegationFailureResult> {
+        if !self.is_enabled() {
+            return Ok(DelegationFailureResult::default());
+        }
+        let input = DelegationFailureCommandInput {
+            session_id: request.session_id,
+            turn_id: request.turn_id,
+            transcript_path: NullableString::from_string(None),
+            cwd: cwd_string(request.cwd.as_deref()),
+            hook_event_name: HookEventConfig::DelegationFailure.label().to_string(),
+            model: request.model,
+            permission_mode: request.permission_mode,
+            delegation_id: request.delegation_id,
+            target_agent_id: request.target_agent_id.clone(),
+            objective: request.objective,
+            status: request.status,
+            error: request.error,
+            error_type: request.error_type,
+        };
+        self.run_observing_delegation_event(
+            HookEventConfig::DelegationFailure,
+            &request.target_agent_id,
+            input,
+            request.cwd.as_deref(),
+            parse_delegation_failure,
+        )
+        .await
+        .map(|out| DelegationFailureResult {
+            additional_contexts: out.additional_contexts,
+            notices: out.notices,
+        })
+    }
+
+    async fn run_observing_delegation_event<T, F>(
+        &self,
+        event: HookEventConfig,
+        target_agent_id: &str,
+        input: T,
+        cwd: Option<&Path>,
+        parser: F,
+    ) -> anyhow::Result<ObservingHookResult>
+    where
+        T: Serialize + Clone,
+        F: Fn(
+            &str,
+        )
+            -> anyhow::Result<Option<crate::hooks::output_parser::ParsedDelegationLifecycle>>,
+    {
+        let mut result = ObservingHookResult::default();
+        for stdout in self
+            .run_event(event, Some(target_agent_id), input, cwd)
+            .await?
+        {
+            match parser(&stdout) {
+                Ok(Some(parsed)) => {
+                    if let Some(context) = parsed.additional_context {
+                        result.additional_contexts.push(context);
+                    }
+                    if !parsed.continue_processing || parsed.stop_reason.is_some() {
+                        result.notices.push(ignored_control_notice(event));
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => result.notices.push(invalid_notice(event, err)),
             }
         }
         Ok(result)
@@ -578,6 +989,12 @@ impl Hooks {
     }
 }
 
+#[derive(Default)]
+struct ObservingHookResult {
+    additional_contexts: Vec<String>,
+    notices: Vec<HookNotice>,
+}
+
 fn spec_from_command(command: &HookCommandConfig) -> CommandHookSpec {
     CommandHookSpec {
         command: command.command.clone(),
@@ -601,4 +1018,25 @@ fn matches_group(matcher: Option<&str>, value: Option<&str>) -> bool {
 fn cwd_string(cwd: Option<&Path>) -> String {
     cwd.map(|p| p.display().to_string())
         .unwrap_or_else(|| ".".to_string())
+}
+
+fn invalid_notice(event: HookEventConfig, err: anyhow::Error) -> HookNotice {
+    let message = format!("Ignoring invalid {} hook output: {}", event.label(), err);
+    warn!("{}", message);
+    HookNotice {
+        event_name: event.label().to_string(),
+        message,
+        is_error: true,
+    }
+}
+
+fn ignored_control_notice(event: HookEventConfig) -> HookNotice {
+    HookNotice {
+        event_name: event.label().to_string(),
+        message: format!(
+            "Ignoring control fields from {} hook output; this hook is observe-only",
+            event.label()
+        ),
+        is_error: false,
+    }
 }

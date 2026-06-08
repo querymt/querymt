@@ -1,0 +1,80 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "NullableString": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "properties": {
+    "constraints": {
+      "$ref": "#/definitions/NullableString"
+    },
+    "context": {
+      "$ref": "#/definitions/NullableString"
+    },
+    "cwd": {
+      "type": "string"
+    },
+    "delegation_id": {
+      "type": "string"
+    },
+    "expected_output": {
+      "$ref": "#/definitions/NullableString"
+    },
+    "hook_event_name": {
+      "const": "delegation_start",
+      "type": "string"
+    },
+    "model": {
+      "type": "string"
+    },
+    "objective": {
+      "type": "string"
+    },
+    "permission_mode": {
+      "enum": [
+        "default",
+        "plan",
+        "accept_edits"
+      ],
+      "type": "string"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "target_agent_id": {
+      "type": "string"
+    },
+    "transcript_path": {
+      "$ref": "#/definitions/NullableString"
+    },
+    "turn_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "turn_id",
+    "transcript_path",
+    "cwd",
+    "hook_event_name",
+    "model",
+    "permission_mode",
+    "delegation_id",
+    "target_agent_id",
+    "objective",
+    "context",
+    "constraints",
+    "expected_output",
+    "status"
+  ],
+  "title": "delegation-start.command.input",
+  "type": "object"
+}

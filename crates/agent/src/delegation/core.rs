@@ -1,6 +1,9 @@
 use crate::event_fanout::EventFanout;
 use crate::event_sink::EventSink;
 use crate::events::{AgentEventKind, EventEnvelope};
+use crate::hooks::{
+    DelegationFailureRequest, DelegationStartRequest, HookNotice, Hooks, PostDelegationRequest,
+};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::{Delegation, DelegationStatus, ForkOrigin, ForkPointType};
 use crate::session::store::SessionStore;
@@ -98,6 +101,7 @@ pub struct DelegationOrchestrator {
     store: Arc<dyn SessionStore>,
     agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
     tool_registry: Arc<ToolRegistry>,
+    hooks: Hooks,
     config: DelegationOrchestratorConfig,
     max_parallel: Arc<tokio::sync::Semaphore>,
     /// Maps delegation_id -> (parent_session_id, cancellation_token, join_handle)
@@ -115,6 +119,7 @@ impl DelegationOrchestrator {
         store: Arc<dyn SessionStore>,
         agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
         tool_registry: Arc<ToolRegistry>,
+        hooks: Hooks,
         cwd: Option<PathBuf>,
     ) -> Self {
         Self {
@@ -123,6 +128,7 @@ impl DelegationOrchestrator {
             store,
             agent_registry,
             tool_registry,
+            hooks,
             config: DelegationOrchestratorConfig::new(cwd),
             max_parallel: Arc::new(tokio::sync::Semaphore::new(5)),
             active_delegations: Arc::new(Mutex::new(HashMap::new())),
@@ -234,6 +240,7 @@ impl DelegationOrchestrator {
                 let cancel_token = CancellationToken::new();
                 let active_delegations = self.active_delegations.clone();
                 let active_delegations_for_spawn = active_delegations.clone();
+                let hooks = self.hooks.clone();
 
                 // Store the cancellation token and join handle
                 let delegation_id = delegation.public_id.clone();
@@ -249,12 +256,17 @@ impl DelegationOrchestrator {
                         Ok(permit) => permit,
                         Err(_) => {
                             fail_delegation(
-                                &event_sink,
-                                &delegator,
-                                &store,
-                                &config,
-                                &parent_session_id,
-                                &delegation.public_id,
+                                DelegationFailureContext {
+                                    event_sink: &event_sink,
+                                    delegator: &delegator,
+                                    store: &store,
+                                    hooks: Some(&hooks),
+                                    config: &config,
+                                    parent_session_id: &parent_session_id,
+                                    delegation_id: &delegation.public_id,
+                                    target_agent_id: Some(&delegation.target_agent_id),
+                                    objective: Some(&delegation.objective),
+                                },
                                 "Delegation queue closed before execution could start",
                             )
                             .await;
@@ -268,6 +280,7 @@ impl DelegationOrchestrator {
                         store,
                         tool_registry,
                         config,
+                        hooks,
                         active_delegations: active_delegations_for_spawn,
                         delegation_summarizer,
                         routing_snapshot,
@@ -291,12 +304,17 @@ impl DelegationOrchestrator {
                                 delegation.target_agent_id
                             );
                             fail_delegation(
-                                &ctx.event_sink,
-                                &ctx.delegator,
-                                &ctx.store,
-                                &ctx.config,
-                                &parent_session_id,
-                                &delegation.public_id,
+                                DelegationFailureContext {
+                                    event_sink: &ctx.event_sink,
+                                    delegator: &ctx.delegator,
+                                    store: &ctx.store,
+                                    hooks: Some(&ctx.hooks),
+                                    config: &ctx.config,
+                                    parent_session_id: &parent_session_id,
+                                    delegation_id: &delegation.public_id,
+                                    target_agent_id: Some(&delegation.target_agent_id),
+                                    objective: Some(&delegation.objective),
+                                },
                                 &error_message,
                             )
                             .await;
@@ -378,10 +396,23 @@ struct DelegationContext {
     event_sink: Arc<EventSink>,
     store: Arc<dyn SessionStore>,
     tool_registry: Arc<ToolRegistry>,
+    hooks: Hooks,
     config: DelegationOrchestratorConfig,
     active_delegations: ActiveDelegations,
     delegation_summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
     routing_snapshot: Option<crate::agent::remote::RoutingSnapshotHandle>,
+}
+
+struct DelegationFailureContext<'a> {
+    event_sink: &'a Arc<EventSink>,
+    delegator: &'a Arc<dyn crate::agent::handle::AgentHandle>,
+    store: &'a Arc<dyn SessionStore>,
+    hooks: Option<&'a Hooks>,
+    config: &'a DelegationOrchestratorConfig,
+    parent_session_id: &'a str,
+    delegation_id: &'a str,
+    target_agent_id: Option<&'a str>,
+    objective: Option<&'a str>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -414,6 +445,37 @@ async fn execute_delegation(
     cancel_token: CancellationToken,
 ) {
     let delegation_id = delegation.public_id.clone();
+    let mut planning_context_additions = String::new();
+
+    let start_hook = ctx
+        .hooks
+        .run_delegation_start(DelegationStartRequest {
+            session_id: parent_session_id.clone(),
+            turn_id: String::new(),
+            cwd: ctx.config.cwd.clone(),
+            model: String::new(),
+            permission_mode: "default".to_string(),
+            delegation_id: delegation.public_id.clone(),
+            target_agent_id: delegation.target_agent_id.clone(),
+            objective: delegation.objective.clone(),
+            context: delegation.context.clone(),
+            constraints: delegation.constraints.clone(),
+            expected_output: delegation.expected_output.clone(),
+            status: "requested".to_string(),
+        })
+        .await;
+    match start_hook {
+        Ok(result) => {
+            emit_hook_notices(&ctx.delegator, &parent_session_id, result.notices);
+            if !result.additional_contexts.is_empty() {
+                planning_context_additions = format!(
+                    "\n\n<hook-added-context>\n{}\n</hook-added-context>",
+                    result.additional_contexts.join("\n\n")
+                );
+            }
+        }
+        Err(err) => warn!("Delegation start hook failed: {}", err),
+    }
 
     if let Err(e) = ctx
         .store
@@ -450,12 +512,17 @@ async fn execute_delegation(
         Err(e) => {
             let error_message = format!("Failed to create session via kameo: {}", e);
             fail_delegation(
-                &ctx.event_sink,
-                &ctx.delegator,
-                &ctx.store,
-                &ctx.config,
-                &parent_session_id,
-                &delegation.public_id,
+                DelegationFailureContext {
+                    event_sink: &ctx.event_sink,
+                    delegator: &ctx.delegator,
+                    store: &ctx.store,
+                    hooks: Some(&ctx.hooks),
+                    config: &ctx.config,
+                    parent_session_id: &parent_session_id,
+                    delegation_id: &delegation.public_id,
+                    target_agent_id: Some(&delegation.target_agent_id),
+                    objective: Some(&delegation.objective),
+                },
                 &error_message,
             )
             .await;
@@ -575,8 +642,10 @@ async fn execute_delegation(
                 }
 
                 // Inject via SetPlanningContext kameo message
-                let formatted_summary =
-                    format!("\n\n<planning-context>\n{}\n</planning-context>", summary);
+                let formatted_summary = format!(
+                    "\n\n<planning-context>\n{}{}\n</planning-context>",
+                    summary, planning_context_additions
+                );
                 let summary_bytes = formatted_summary.len();
                 async {
                     if let Err(e) = session_ref.set_planning_context(formatted_summary).await {
@@ -647,12 +716,17 @@ async fn execute_delegation(
                 delegation_id, delegation.target_agent_id, response.stop_reason,
             );
             fail_delegation(
-                &ctx.event_sink,
-                &ctx.delegator,
-                &ctx.store,
-                &ctx.config,
-                &parent_session_id,
-                &delegation.public_id,
+                DelegationFailureContext {
+                    event_sink: &ctx.event_sink,
+                    delegator: &ctx.delegator,
+                    store: &ctx.store,
+                    hooks: Some(&ctx.hooks),
+                    config: &ctx.config,
+                    parent_session_id: &parent_session_id,
+                    delegation_id: &delegation_id,
+                    target_agent_id: Some(&delegation.target_agent_id),
+                    objective: Some(&delegation.objective),
+                },
                 &error_message,
             )
             .await;
@@ -713,12 +787,17 @@ async fn execute_delegation(
                     "Verification failed: The changes did not pass the specified verification checks."
                         .to_string();
                 fail_delegation(
-                    &ctx.event_sink,
-                    &ctx.delegator,
-                    &ctx.store,
-                    &ctx.config,
-                    &parent_session_id,
-                    &delegation.public_id,
+                    DelegationFailureContext {
+                        event_sink: &ctx.event_sink,
+                        delegator: &ctx.delegator,
+                        store: &ctx.store,
+                        hooks: Some(&ctx.hooks),
+                        config: &ctx.config,
+                        parent_session_id: &parent_session_id,
+                        delegation_id: &delegation.public_id,
+                        target_agent_id: Some(&delegation.target_agent_id),
+                        objective: Some(&delegation.objective),
+                    },
                     &error_message,
                 )
                 .await;
@@ -726,7 +805,7 @@ async fn execute_delegation(
             }
 
             // 5. Get history for summary via kameo (works for local and remote)
-            let summary = async {
+            let mut summary = async {
                 let s = match session_ref.get_history().await {
                     Ok(history) => extract_session_summary_from_history(&history),
                     Err(err) => {
@@ -742,6 +821,34 @@ async fn execute_delegation(
                 summary_bytes = tracing::field::Empty,
             ))
             .await;
+
+            match ctx
+                .hooks
+                .run_post_delegation(PostDelegationRequest {
+                    session_id: parent_session_id.clone(),
+                    turn_id: String::new(),
+                    cwd: ctx.config.cwd.clone(),
+                    model: String::new(),
+                    permission_mode: "default".to_string(),
+                    delegation_id: delegation.public_id.clone(),
+                    target_agent_id: delegation.target_agent_id.clone(),
+                    child_session_id: child_session_id.clone(),
+                    objective: delegation.objective.clone(),
+                    status: "complete".to_string(),
+                    summary: summary.clone(),
+                    verification_passed,
+                })
+                .await
+            {
+                Ok(result) => {
+                    emit_hook_notices(&ctx.delegator, &parent_session_id, result.notices);
+                    if !result.additional_contexts.is_empty() {
+                        summary =
+                            format!("{}\n\n{}", summary, result.additional_contexts.join("\n\n"));
+                    }
+                }
+                Err(err) => warn!("Post-delegation hook failed: {}", err),
+            }
 
             if let Err(e) = ctx
                 .store
@@ -777,12 +884,17 @@ async fn execute_delegation(
         Some(Err(e)) => {
             let error_message = format!("Delegation failed: {}", e);
             fail_delegation(
-                &ctx.event_sink,
-                &ctx.delegator,
-                &ctx.store,
-                &ctx.config,
-                &parent_session_id,
-                &delegation_id,
+                DelegationFailureContext {
+                    event_sink: &ctx.event_sink,
+                    delegator: &ctx.delegator,
+                    store: &ctx.store,
+                    hooks: Some(&ctx.hooks),
+                    config: &ctx.config,
+                    parent_session_id: &parent_session_id,
+                    delegation_id: &delegation_id,
+                    target_agent_id: Some(&delegation.target_agent_id),
+                    objective: Some(&delegation.objective),
+                },
                 &error_message,
             )
             .await;
@@ -798,38 +910,72 @@ async fn execute_delegation(
 
 #[instrument(
     name = "delegation.fail",
-    skip(event_sink, delegator, store, config),
-    fields(delegation_id = %delegation_id, parent_session_id = %parent_session_id)
+    skip(ctx),
+    fields(
+        delegation_id = %ctx.delegation_id,
+        parent_session_id = %ctx.parent_session_id,
+    )
 )]
-async fn fail_delegation(
-    event_sink: &Arc<EventSink>,
-    delegator: &Arc<dyn crate::agent::handle::AgentHandle>,
-    store: &Arc<dyn SessionStore>,
-    config: &DelegationOrchestratorConfig,
-    parent_session_id: &str,
-    delegation_id: &str,
-    error_message: &str,
-) {
+async fn fail_delegation(ctx: DelegationFailureContext<'_>, error_message: &str) {
     error!("{}", error_message);
-    if let Err(e) = store
-        .update_delegation_status(delegation_id, DelegationStatus::Failed)
+    if let Err(e) = ctx
+        .store
+        .update_delegation_status(ctx.delegation_id, DelegationStatus::Failed)
         .await
     {
         warn!("Failed to persist delegation failure: {}", e);
     }
 
+    let mut failure_message = error_message.to_string();
+    if let Some(hooks) = ctx.hooks {
+        match hooks
+            .run_delegation_failure(DelegationFailureRequest {
+                session_id: ctx.parent_session_id.to_string(),
+                turn_id: String::new(),
+                cwd: ctx.config.cwd.clone(),
+                model: String::new(),
+                permission_mode: "default".to_string(),
+                delegation_id: ctx.delegation_id.to_string(),
+                target_agent_id: ctx.target_agent_id.unwrap_or_default().to_string(),
+                objective: ctx.objective.unwrap_or_default().to_string(),
+                status: "failed".to_string(),
+                error: error_message.to_string(),
+                error_type: classify_delegation_error(error_message).0.to_string(),
+            })
+            .await
+        {
+            Ok(result) => {
+                emit_hook_notices(ctx.delegator, ctx.parent_session_id, result.notices);
+                if !result.additional_contexts.is_empty() {
+                    failure_message = format!(
+                        "{}\n\n{}",
+                        failure_message,
+                        result.additional_contexts.join("\n\n")
+                    );
+                }
+            }
+            Err(err) => warn!("Delegation failure hook failed: {}", err),
+        }
+    }
+
     emit_delegation_event(
-        delegator,
-        event_sink,
-        parent_session_id,
+        ctx.delegator,
+        ctx.event_sink,
+        ctx.parent_session_id,
         AgentEventKind::DelegationFailed {
-            delegation_id: delegation_id.to_string(),
-            error: error_message.to_string(),
+            delegation_id: ctx.delegation_id.to_string(),
+            error: failure_message.clone(),
         },
     );
 
-    if config.inject_results {
-        inject_failure(delegator, parent_session_id, delegation_id, error_message).await;
+    if ctx.config.inject_results {
+        inject_failure(
+            ctx.delegator,
+            ctx.parent_session_id,
+            ctx.delegation_id,
+            &failure_message,
+        )
+        .await;
     }
 }
 
@@ -841,6 +987,23 @@ fn emit_delegation_event(
 ) {
     // emit_event is now on the AgentHandle trait — no downcast needed.
     delegator.emit_event(session_id, kind);
+}
+
+fn emit_hook_notices(
+    delegator: &Arc<dyn crate::agent::handle::AgentHandle>,
+    session_id: &str,
+    notices: Vec<HookNotice>,
+) {
+    for notice in notices {
+        delegator.emit_event(
+            session_id,
+            AgentEventKind::HookNotice {
+                event_name: notice.event_name,
+                message: notice.message,
+                is_error: notice.is_error,
+            },
+        );
+    }
 }
 
 fn build_delegation_prompt(delegation: &Delegation) -> String {

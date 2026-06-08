@@ -99,7 +99,7 @@ async fn build_config_from_toml_value(
             }
         }
 
-        Config::Single(config)
+        Config::Single(Box::new(config))
     } else if value.get("quorum").is_some() || value.get("planner").is_some() {
         // Multi-agent config
         let mut config: QuorumConfig = value
@@ -135,7 +135,7 @@ async fn build_config_from_toml_value(
             }
         }
 
-        Config::Multi(config)
+        Config::Multi(Box::new(config))
     } else {
         return Err(anyhow!(
             "Invalid config file: must contain [agent] for single agent or [quorum]/[planner] for multi-agent"

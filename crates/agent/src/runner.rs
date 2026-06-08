@@ -324,6 +324,7 @@ async fn build_runner_from_config(
 ) -> Result<AgentRunner> {
     match config {
         Config::Single(single_config) => {
+            let single_config = *single_config;
             let agent = match infra {
                 Some(infra) => Agent::from_single_config_with_infra(single_config, infra).await?,
                 None => Agent::from_single_config(single_config).await?,
@@ -331,6 +332,7 @@ async fn build_runner_from_config(
             Ok(AgentRunner::new(agent))
         }
         Config::Multi(quorum_config) => {
+            let quorum_config = *quorum_config;
             let agent = match infra {
                 Some(infra) => Agent::from_quorum_config_with_infra(quorum_config, infra).await?,
                 None => Agent::from_quorum_config(quorum_config).await?,

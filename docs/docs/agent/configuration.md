@@ -180,6 +180,21 @@ command = "sh ./hooks/check-shell.sh"
 timeout_sec = 5
 status_message = "Checking shell command"
 
+[[agent.hooks.pre_compaction]]
+
+[[agent.hooks.pre_compaction.hooks]]
+type = "command"
+command = "sh ./hooks/check-compaction.sh"
+timeout_sec = 5
+
+[[agent.hooks.pre_delegation]]
+matcher = "^coder$"
+
+[[agent.hooks.pre_delegation.hooks]]
+type = "command"
+command = "sh ./hooks/check-delegation.sh"
+timeout_sec = 5
+
 [[agent.hooks.stop]]
 
 [[agent.hooks.stop.hooks]]
@@ -188,7 +203,7 @@ command = "sh ./hooks/stop-verify.sh"
 timeout_sec = 5
 ```
 
-Hook commands receive JSON on stdin and return JSON on stdout. See the [Hooks Guide](hooks.md) for supported events, schema files, and `stop` continuation behavior.
+Hook commands receive JSON on stdin and return JSON on stdout. Supported events now include compaction hooks and delegation hooks in addition to tool, prompt, session, permission, and stop hooks. See the [Hooks Guide](hooks.md) for the full event list, schema files, and `stop` continuation behavior.
 
 ## MCP Servers
 

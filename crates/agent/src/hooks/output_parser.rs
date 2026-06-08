@@ -1,8 +1,10 @@
 use crate::hooks::schema::{
-    BlockDecisionWire, PermissionRequestBehaviorWire, PermissionRequestCommandOutputWire,
-    PostToolUseCommandOutputWire, PreToolUseCommandOutputWire, PreToolUseDecisionWire,
-    PreToolUsePermissionDecisionWire, SessionStartCommandOutputWire, StopCommandOutputWire,
-    UserPromptSubmitCommandOutputWire,
+    BlockDecisionWire, DelegationFailureCommandOutputWire, DelegationStartCommandOutputWire,
+    PermissionRequestBehaviorWire, PermissionRequestCommandOutputWire,
+    PostCompactionCommandOutputWire, PostDelegationCommandOutputWire, PostToolUseCommandOutputWire,
+    PreCompactionCommandOutputWire, PreDelegationCommandOutputWire, PreToolUseCommandOutputWire,
+    PreToolUseDecisionWire, PreToolUsePermissionDecisionWire, SessionStartCommandOutputWire,
+    StopCommandOutputWire, UpdatedDelegationWire, UserPromptSubmitCommandOutputWire,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -16,6 +18,15 @@ pub enum ParsedDecision {
 pub enum ParsedPermissionDecision {
     Allow,
     Deny { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ParsedUpdatedDelegation {
+    pub target_agent_id: Option<String>,
+    pub objective: Option<String>,
+    pub context: Option<String>,
+    pub constraints: Option<String>,
+    pub expected_output: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,6 +70,33 @@ pub struct ParsedSessionStart {
 pub struct ParsedStop {
     pub decision: Option<ParsedDecision>,
     pub reason: Option<String>,
+    pub continue_processing: bool,
+    pub stop_reason: Option<String>,
+    pub additional_context: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedPreCompaction {
+    pub decision: Option<ParsedDecision>,
+    pub reason: Option<String>,
+    pub additional_context: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedPostCompaction {
+    pub additional_context: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedPreDelegation {
+    pub decision: Option<ParsedDecision>,
+    pub reason: Option<String>,
+    pub updated_delegation: Option<ParsedUpdatedDelegation>,
+    pub additional_context: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedDelegationLifecycle {
     pub continue_processing: bool,
     pub stop_reason: Option<String>,
     pub additional_context: Option<String>,
@@ -192,6 +230,142 @@ pub fn parse_stop(stdout: &str) -> anyhow::Result<Option<ParsedStop>> {
     }))
 }
 
+pub fn parse_pre_compaction(stdout: &str) -> anyhow::Result<Option<ParsedPreCompaction>> {
+    let Some(output) = parse_json::<PreCompactionCommandOutputWire>(stdout)? else {
+        return Ok(None);
+    };
+    Ok(Some(ParsedPreCompaction {
+        decision: output
+            .decision
+            .map(|BlockDecisionWire::Block| ParsedDecision::Block),
+        reason: output.reason,
+        additional_context: output
+            .hook_specific_output
+            .and_then(|hook| hook.additional_context),
+    }))
+}
+
+pub fn parse_post_compaction(stdout: &str) -> anyhow::Result<Option<ParsedPostCompaction>> {
+    let Some(output) = parse_json::<PostCompactionCommandOutputWire>(stdout)? else {
+        return Ok(None);
+    };
+    Ok(Some(ParsedPostCompaction {
+        additional_context: output
+            .hook_specific_output
+            .and_then(|hook| hook.additional_context),
+    }))
+}
+
+pub fn parse_pre_delegation(stdout: &str) -> anyhow::Result<Option<ParsedPreDelegation>> {
+    let Some(output) = parse_json::<PreDelegationCommandOutputWire>(stdout)? else {
+        return Ok(None);
+    };
+    Ok(Some(ParsedPreDelegation {
+        decision: output
+            .decision
+            .map(|BlockDecisionWire::Block| ParsedDecision::Block),
+        reason: output.reason,
+        updated_delegation: output
+            .hook_specific_output
+            .as_ref()
+            .and_then(|hook| hook.updated_delegation.as_ref())
+            .map(parsed_updated_delegation),
+        additional_context: output
+            .hook_specific_output
+            .and_then(|hook| hook.additional_context),
+    }))
+}
+
+pub fn parse_delegation_start(stdout: &str) -> anyhow::Result<Option<ParsedDelegationLifecycle>> {
+    parse_delegation_lifecycle::<DelegationStartCommandOutputWire>(stdout)
+}
+
+pub fn parse_post_delegation(stdout: &str) -> anyhow::Result<Option<ParsedDelegationLifecycle>> {
+    parse_delegation_lifecycle::<PostDelegationCommandOutputWire>(stdout)
+}
+
+pub fn parse_delegation_failure(stdout: &str) -> anyhow::Result<Option<ParsedDelegationLifecycle>> {
+    parse_delegation_lifecycle::<DelegationFailureCommandOutputWire>(stdout)
+}
+
+fn parse_delegation_lifecycle<T>(stdout: &str) -> anyhow::Result<Option<ParsedDelegationLifecycle>>
+where
+    T: DeserializeOwned + DelegationLifecycleOutput,
+{
+    let Some(output) = parse_json::<T>(stdout)? else {
+        return Ok(None);
+    };
+    Ok(Some(ParsedDelegationLifecycle {
+        continue_processing: output.universal_continue(),
+        stop_reason: output.universal_stop_reason(),
+        additional_context: output.additional_context(),
+    }))
+}
+
+trait DelegationLifecycleOutput {
+    fn universal_continue(&self) -> bool;
+    fn universal_stop_reason(&self) -> Option<String>;
+    fn additional_context(&self) -> Option<String>;
+}
+
+impl DelegationLifecycleOutput for DelegationStartCommandOutputWire {
+    fn universal_continue(&self) -> bool {
+        self.universal.r#continue
+    }
+
+    fn universal_stop_reason(&self) -> Option<String> {
+        self.universal.stop_reason.clone()
+    }
+
+    fn additional_context(&self) -> Option<String> {
+        self.hook_specific_output
+            .as_ref()
+            .and_then(|hook| hook.additional_context.clone())
+    }
+}
+
+impl DelegationLifecycleOutput for PostDelegationCommandOutputWire {
+    fn universal_continue(&self) -> bool {
+        self.universal.r#continue
+    }
+
+    fn universal_stop_reason(&self) -> Option<String> {
+        self.universal.stop_reason.clone()
+    }
+
+    fn additional_context(&self) -> Option<String> {
+        self.hook_specific_output
+            .as_ref()
+            .and_then(|hook| hook.additional_context.clone())
+    }
+}
+
+impl DelegationLifecycleOutput for DelegationFailureCommandOutputWire {
+    fn universal_continue(&self) -> bool {
+        self.universal.r#continue
+    }
+
+    fn universal_stop_reason(&self) -> Option<String> {
+        self.universal.stop_reason.clone()
+    }
+
+    fn additional_context(&self) -> Option<String> {
+        self.hook_specific_output
+            .as_ref()
+            .and_then(|hook| hook.additional_context.clone())
+    }
+}
+
+fn parsed_updated_delegation(wire: &UpdatedDelegationWire) -> ParsedUpdatedDelegation {
+    ParsedUpdatedDelegation {
+        target_agent_id: wire.target_agent_id.clone(),
+        objective: wire.objective.clone(),
+        context: wire.context.clone(),
+        constraints: wire.constraints.clone(),
+        expected_output: wire.expected_output.clone(),
+    }
+}
+
 fn parse_json<T: DeserializeOwned>(stdout: &str) -> anyhow::Result<Option<T>> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -251,6 +425,66 @@ mod tests {
     }
 
     #[test]
+    fn parse_pre_delegation_supports_rewrite() {
+        let parsed = parse_pre_delegation(
+            &json!({
+                "continue": true,
+                "decision": "block",
+                "reason": "route elsewhere",
+                "hook_specific_output": {
+                    "hook_event_name": "pre_delegation",
+                    "updated_delegation": {
+                        "target_agent_id": "coder",
+                        "objective": "refined objective"
+                    },
+                    "additional_context": "remember tests"
+                }
+            })
+            .to_string(),
+        )
+        .expect("parse")
+        .expect("value");
+
+        assert_eq!(parsed.decision, Some(ParsedDecision::Block));
+        assert_eq!(
+            parsed.updated_delegation,
+            Some(ParsedUpdatedDelegation {
+                target_agent_id: Some("coder".to_string()),
+                objective: Some("refined objective".to_string()),
+                context: None,
+                constraints: None,
+                expected_output: None,
+            })
+        );
+        assert_eq!(parsed.additional_context.as_deref(), Some("remember tests"));
+    }
+
+    #[test]
+    fn parse_pre_compaction_supports_block() {
+        let parsed = parse_pre_compaction(
+            &json!({
+                "continue": true,
+                "decision": "block",
+                "reason": "too risky",
+                "hook_specific_output": {
+                    "hook_event_name": "pre_compaction",
+                    "additional_context": "wait for confirmation"
+                }
+            })
+            .to_string(),
+        )
+        .expect("parse")
+        .expect("value");
+
+        assert_eq!(parsed.decision, Some(ParsedDecision::Block));
+        assert_eq!(parsed.reason.as_deref(), Some("too risky"));
+        assert_eq!(
+            parsed.additional_context.as_deref(),
+            Some("wait for confirmation")
+        );
+    }
+
+    #[test]
     fn parse_permission_request_supports_allow_and_deny() {
         let allow = parse_permission_request(
             &json!({
@@ -305,6 +539,28 @@ mod tests {
         assert!(!parsed.continue_processing);
         assert_eq!(parsed.reason.as_deref(), Some("keep going"));
         assert_eq!(parsed.additional_context.as_deref(), Some("follow-up"));
+    }
+
+    #[test]
+    fn parse_post_delegation_supports_additional_context() {
+        let parsed = parse_post_delegation(
+            &json!({
+                "continue": true,
+                "hook_specific_output": {
+                    "hook_event_name": "post_delegation",
+                    "additional_context": "Include follow-up checks"
+                }
+            })
+            .to_string(),
+        )
+        .expect("parse post delegation")
+        .expect("value");
+
+        assert!(parsed.continue_processing);
+        assert_eq!(
+            parsed.additional_context.as_deref(),
+            Some("Include follow-up checks")
+        );
     }
 
     #[test]

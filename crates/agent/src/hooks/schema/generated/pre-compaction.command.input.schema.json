@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "NullableString": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "properties": {
+    "cwd": {
+      "type": "string"
+    },
+    "hook_event_name": {
+      "const": "pre_compaction",
+      "type": "string"
+    },
+    "message_count": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "model": {
+      "type": "string"
+    },
+    "permission_mode": {
+      "enum": [
+        "default",
+        "plan",
+        "accept_edits"
+      ],
+      "type": "string"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "token_estimate": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "transcript_path": {
+      "$ref": "#/definitions/NullableString"
+    },
+    "trigger": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "turn_id",
+    "transcript_path",
+    "cwd",
+    "hook_event_name",
+    "model",
+    "permission_mode",
+    "trigger",
+    "token_estimate",
+    "message_count"
+  ],
+  "title": "pre-compaction.command.input",
+  "type": "object"
+}

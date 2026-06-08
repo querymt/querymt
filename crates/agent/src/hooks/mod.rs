@@ -11,10 +11,13 @@ pub use config::{
     HookCommandConfig, HookEventConfig, HookHandlerConfig, HooksConfig, MatcherGroupConfig,
 };
 pub use engine::{
-    HookNotice, Hooks, PermissionRequestDecision, PermissionRequestRequest,
-    PermissionRequestResult, PostToolUseRequest, PostToolUseResult, PreToolUseRequest,
+    DelegationFailureRequest, DelegationFailureResult, DelegationStartRequest,
+    DelegationStartResult, HookNotice, Hooks, PermissionRequestDecision, PermissionRequestRequest,
+    PermissionRequestResult, PostCompactionRequest, PostCompactionResult, PostDelegationRequest,
+    PostDelegationResult, PostToolUseRequest, PostToolUseResult, PreCompactionRequest,
+    PreCompactionResult, PreDelegationRequest, PreDelegationResult, PreToolUseRequest,
     PreToolUseResult, SessionStartRequest, SessionStartResult, StopRequest, StopResult,
-    UserPromptSubmitRequest, UserPromptSubmitResult,
+    UpdatedDelegation, UserPromptSubmitRequest, UserPromptSubmitResult,
 };
 
 pub fn permission_mode_label(mode: crate::agent::core::AgentMode) -> &'static str {

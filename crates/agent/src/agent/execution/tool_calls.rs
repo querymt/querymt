@@ -9,7 +9,10 @@ use crate::agent::core::SnapshotPolicy;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::snapshots::{SnapshotState, snapshot_metadata};
 use crate::events::AgentEventKind;
-use crate::hooks::{PermissionRequestDecision, PostToolUseRequest, PreToolUseRequest};
+use crate::hooks::{
+    PermissionRequestDecision, PostToolUseRequest, PreDelegationRequest, PreToolUseRequest,
+    UpdatedDelegation,
+};
 use crate::middleware::ToolCall as MiddlewareToolCall;
 use crate::middleware::{ExecutionState, ToolResult, WaitCondition};
 use crate::model::{AgentMessage, MessagePart};
@@ -726,14 +729,16 @@ pub(super) async fn ensure_tool_permission(
 )]
 pub(super) async fn record_tool_side_effects(
     config: &AgentConfig,
-    result: &ToolResult,
+    result: &mut ToolResult,
     exec_ctx: &ExecutionContext,
-) -> Option<WaitCondition> {
+) -> Result<Option<WaitCondition>, anyhow::Error> {
     if result.is_error {
-        return None;
+        return Ok(None);
     }
 
-    let tool_name = result.tool_name.as_ref()?;
+    let Some(tool_name) = result.tool_name.as_ref() else {
+        return Ok(None);
+    };
 
     if tool_name == "write_file" || tool_name == "apply_patch" {
         let args: serde_json::Value =
@@ -788,6 +793,82 @@ pub(super) async fn record_tool_side_effects(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        let pre_hook = config
+            .hooks
+            .run_pre_delegation(PreDelegationRequest {
+                session_id: exec_ctx.session_id.clone(),
+                turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+                cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
+                model: exec_ctx
+                    .llm_config()
+                    .map(|cfg| cfg.model.clone())
+                    .unwrap_or_default(),
+                permission_mode: exec_ctx.permission_mode().to_string(),
+                tool_use_id: result.call_id.clone(),
+                target_agent_id: target_agent_id.clone(),
+                objective: objective.clone(),
+                context: context_val.clone(),
+                constraints: constraints.clone(),
+                expected_output: expected_output.clone(),
+            })
+            .await?;
+        for notice in pre_hook.notices {
+            config.emit_event(
+                &exec_ctx.session_id,
+                AgentEventKind::HookNotice {
+                    event_name: notice.event_name,
+                    message: notice.message,
+                    is_error: notice.is_error,
+                },
+            );
+        }
+
+        let UpdatedDelegation {
+            target_agent_id: updated_target_agent_id,
+            objective: updated_objective,
+            context: updated_context,
+            constraints: updated_constraints,
+            expected_output: updated_expected_output,
+        } = pre_hook.updated_delegation.unwrap_or_default();
+
+        let target_agent_id = updated_target_agent_id.unwrap_or(target_agent_id);
+        let objective = updated_objective.unwrap_or(objective);
+        let mut context_val = updated_context.or(context_val);
+        let constraints = updated_constraints.or(constraints);
+        let expected_output = updated_expected_output.or(expected_output);
+
+        if !pre_hook.additional_contexts.is_empty() {
+            let extra_context = pre_hook.additional_contexts.join("\n\n");
+            context_val = Some(match context_val {
+                Some(existing) if !existing.is_empty() => {
+                    format!("{}\n\n{}", existing, extra_context)
+                }
+                _ => extra_context,
+            });
+        }
+
+        if pre_hook.should_block {
+            let reason = pre_hook
+                .block_reason
+                .unwrap_or_else(|| "delegation blocked by hook".to_string());
+            result.content = vec![Content::text(format!(
+                "Delegation blocked by hook: {}",
+                reason
+            ))];
+            result.is_error = false;
+            return Ok(None);
+        }
+
+        if let Ok(serialized_args) = serde_json::to_string(&serde_json::json!({
+            "target_agent_id": target_agent_id,
+            "objective": objective,
+            "context": context_val,
+            "constraints": constraints,
+            "expected_output": expected_output,
+        })) {
+            result.tool_arguments = Some(serialized_args);
+        }
+
         if let Ok(delegation) = exec_ctx
             .state
             .record_delegation(
@@ -805,11 +886,13 @@ pub(super) async fn record_tool_side_effects(
                     delegation: delegation.clone(),
                 },
             );
-            return Some(WaitCondition::delegation(delegation.public_id.clone()));
+            return Ok(Some(WaitCondition::delegation(
+                delegation.public_id.clone(),
+            )));
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// Store all completed tool results back into conversation history.
@@ -840,34 +923,45 @@ pub(super) async fn store_all_tool_results(
     let mut messages = (*context.messages).to_vec();
     let mut wait_conditions = Vec::new();
 
+    // Record per-result side effects (delegations, artifacts, etc.) before
+    // persisting the combined tool_result message so hook-driven rewrites are
+    // visible to the model in the stored transcript.
+    let mut adjusted_results = Vec::with_capacity(results.len());
+    for mut result in results.iter().cloned() {
+        if let Some(wait_condition) =
+            record_tool_side_effects(config, &mut result, exec_ctx).await?
+        {
+            wait_conditions.push(wait_condition);
+        }
+        adjusted_results.push(result);
+    }
+
     // Collect all tool results into a single User message so that the LLM API
     // sees every tool_result block immediately after the assistant's tool_use
-    // blocks.  Splitting them across multiple consecutive User messages violates
+    // blocks. Splitting them across multiple consecutive User messages violates
     // the Anthropic API contract (and potentially other providers').
-    let mut all_parts = Vec::with_capacity(results.len() * 2);
-    let mut snapshot_parts = Vec::new();
-    for result in results.iter() {
-        all_parts.push(MessagePart::ToolResult {
+    let mut result_parts: Vec<_> = adjusted_results
+        .iter()
+        .map(|result| MessagePart::ToolResult {
             call_id: result.call_id.clone(),
             content: result.content.clone(),
             is_error: result.is_error,
             tool_name: result.tool_name.clone(),
             tool_arguments: result.tool_arguments.clone(),
             compacted_at: None,
-        });
-        if let Some(ref snapshot) = result.snapshot_part {
-            snapshot_parts.push(snapshot.clone());
-        }
-    }
-    // Snapshots after all ToolResult parts — interleaving them causes the
-    // Anthropic API to miss subsequent tool_result content blocks.
-    all_parts.extend(snapshot_parts);
+        })
+        .collect();
+    let snapshot_parts: Vec<_> = adjusted_results
+        .iter()
+        .filter_map(|result| result.snapshot_part.clone())
+        .collect();
+    result_parts.extend(snapshot_parts);
 
     let result_msg = AgentMessage {
         id: Uuid::new_v4().to_string(),
         session_id: exec_ctx.session_id.clone(),
         role: ChatRole::User,
-        parts: all_parts,
+        parts: result_parts,
         created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
         parent_message_id: None,
         source_provider: None,
@@ -880,14 +974,6 @@ pub(super) async fn store_all_tool_results(
         .map_err(|e| anyhow::anyhow!("Failed to store tool results: {}", e))?;
 
     messages.push(result_msg.to_chat_message());
-
-    // Record per-result side effects (delegations, artifacts, etc.) after
-    // the combined message has been persisted.
-    for result in results.iter() {
-        if let Some(wait_condition) = record_tool_side_effects(config, result, exec_ctx).await {
-            wait_conditions.push(wait_condition);
-        }
-    }
 
     let new_context = Arc::new(
         crate::middleware::ConversationContext::new(

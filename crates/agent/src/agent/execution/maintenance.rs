@@ -6,7 +6,8 @@
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::utils::u32_from_usize;
-use crate::events::AgentEventKind;
+use crate::events::{AgentEventKind, StopType};
+use crate::hooks::{PostCompactionRequest, PreCompactionRequest};
 use crate::middleware::ExecutionState;
 use crate::model::MessagePart;
 use crate::session::compaction::SessionCompaction;
@@ -109,10 +110,59 @@ pub(super) async fn run_ai_compaction(
         })
         .sum();
 
+    let turn_id = exec_ctx.turn_id().unwrap_or_default().to_string();
+    let model_name = exec_ctx
+        .llm_config()
+        .map(|cfg| cfg.model.clone())
+        .unwrap_or_default();
+    let token_estimate_u32 = u32_from_usize(token_estimate, "token_estimate", Some(session_id));
+    let message_count = u32_from_usize(messages.len(), "messages.len", Some(session_id));
+
+    let pre_hook = config
+        .hooks
+        .run_pre_compaction(PreCompactionRequest {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
+            model: model_name.clone(),
+            permission_mode: exec_ctx.permission_mode().to_string(),
+            trigger: "context_threshold".to_string(),
+            token_estimate: token_estimate_u32,
+            message_count,
+        })
+        .await?;
+    for notice in pre_hook.notices {
+        config.emit_event(
+            session_id,
+            AgentEventKind::HookNotice {
+                event_name: notice.event_name,
+                message: notice.message,
+                is_error: notice.is_error,
+            },
+        );
+    }
+    if pre_hook.should_block {
+        let mut reason = pre_hook
+            .block_reason
+            .unwrap_or_else(|| "compaction blocked by hook".to_string());
+        if !pre_hook.additional_contexts.is_empty() {
+            reason = format!(
+                "{}\n\n{}",
+                reason,
+                pre_hook.additional_contexts.join("\n\n")
+            );
+        }
+        return Ok(ExecutionState::Stopped {
+            message: reason.into(),
+            stop_type: StopType::ContextThreshold,
+            context: current_state.context().cloned(),
+        });
+    }
+
     config.emit_event(
         session_id,
         AgentEventKind::CompactionStart {
-            token_estimate: u32_from_usize(token_estimate, "token_estimate", Some(session_id)),
+            token_estimate: token_estimate_u32,
         },
     );
 
@@ -139,7 +189,7 @@ pub(super) async fn run_ai_compaction(
         backoff_multiplier: config.execution_policy.compaction.retry.backoff_multiplier,
     };
 
-    let result = config
+    let mut result = config
         .compaction
         .process(
             &messages,
@@ -152,6 +202,47 @@ pub(super) async fn run_ai_compaction(
         )
         .await
         .map_err(|e| anyhow::anyhow!("Compaction failed: {}", e))?;
+
+    let post_hook = config
+        .hooks
+        .run_post_compaction(PostCompactionRequest {
+            session_id: session_id.clone(),
+            turn_id,
+            cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
+            model: model_name,
+            permission_mode: exec_ctx.permission_mode().to_string(),
+            trigger: "context_threshold".to_string(),
+            summary: result.summary.clone(),
+            original_token_count: u32_from_usize(
+                result.original_token_count,
+                "result.original_token_count",
+                Some(session_id),
+            ),
+            summary_token_count: u32_from_usize(
+                result.summary_token_count,
+                "result.summary_token_count",
+                Some(session_id),
+            ),
+            message_count,
+        })
+        .await?;
+    for notice in post_hook.notices {
+        config.emit_event(
+            session_id,
+            AgentEventKind::HookNotice {
+                event_name: notice.event_name,
+                message: notice.message,
+                is_error: notice.is_error,
+            },
+        );
+    }
+    if !post_hook.additional_contexts.is_empty() {
+        result.summary = format!(
+            "{}\n\n{}",
+            result.summary,
+            post_hook.additional_contexts.join("\n\n")
+        );
+    }
 
     info!(
         "Compaction generated summary: {} tokens -> {} tokens",

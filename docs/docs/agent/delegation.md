@@ -74,7 +74,13 @@ system = """You are a planner agent. Your role is to:
 
 ### 1. Delegation Request
 
-The planner decides to delegate and creates a delegation request:
+The planner decides to delegate and creates a delegation request.
+
+If hooks are enabled, `pre_delegation` runs before the delegation is recorded. It can block the delegation entirely or rewrite fields such as `target_agent_id`, `objective`, `context`, `constraints`, and `expected_output`.
+
+The planner-side tool result is updated when a delegation is blocked, so the model sees `Delegation blocked by hook: ...` instead of a misleading queued message.
+
+The delegation request shape is:
 
 ```rust
 pub struct Delegation {
@@ -102,6 +108,10 @@ let (session_id, session_ref) = target_agent
 ```
 
 ### 3. Context Injection
+
+The planner's context is injected into the delegate session.
+
+If hooks are enabled, `delegation_start` runs just before the delegate begins work. This hook is observe-only: it cannot block execution, but its `additional_context` is appended to the child session planning context.
 
 The planner's context is injected into the delegate session:
 
@@ -132,6 +142,10 @@ Delegate:
 
 ### 5. Result Collection
 
+The delegate's work is collected.
+
+If hooks are enabled, `post_delegation` runs after the delegate summary is extracted. This hook is observe-only and can append context to the summary that gets injected back into the planner session.
+
 The delegate's work is collected:
 
 ```rust
@@ -161,6 +175,10 @@ if let Some(verification_spec) = &delegation.verification_spec {
 
 ### 7. Result Injection
 
+The result is injected back into the planner session.
+
+If a delegation fails, `delegation_failure` runs before the failure message is injected back into the planner. This hook is also observe-only and can append remediation context to the planner-visible failure message.
+
 The result is injected back into the planner session:
 
 ```rust
@@ -171,6 +189,17 @@ let message = format_delegation_completion_message(
 
 planner_session.prompt(message).await?;
 ```
+
+## Delegation Hooks Summary
+
+| Hook | Matcher | Behavior |
+|---|---|---|
+| `pre_delegation` | target agent regex | Block or rewrite the delegation before it is recorded |
+| `delegation_start` | target agent regex | Observe start and append planning context for the child session |
+| `post_delegation` | target agent regex | Observe completion and append context to the injected summary |
+| `delegation_failure` | target agent regex | Observe failure and append context to the injected failure message |
+
+See the [Hooks Guide](hooks.md) for JSON payloads, schemas, and output examples.
 
 ## Delegation Status
 

@@ -2,7 +2,8 @@ use super::engine::{Hooks, PostToolUseRequest, PreToolUseRequest, StopRequest};
 use super::schema;
 use crate::hooks::config::{HookHandlerConfig, HooksConfig, MatcherGroupConfig};
 use crate::hooks::schema::{
-    PermissionRequestCommandOutputWire, PreToolUseCommandInput, StopCommandOutputWire,
+    PermissionRequestCommandOutputWire, PreCompactionCommandOutputWire,
+    PreDelegationCommandOutputWire, PreToolUseCommandInput, StopCommandOutputWire,
 };
 use crate::hooks::{HookCommandConfig, HookEventConfig};
 use schemars::JsonSchema;
@@ -32,6 +33,18 @@ fn generated_hook_schemas_match_expected_fixtures() {
         schema::SESSION_START_OUTPUT_FIXTURE,
         schema::STOP_INPUT_FIXTURE,
         schema::STOP_OUTPUT_FIXTURE,
+        schema::PRE_COMPACTION_INPUT_FIXTURE,
+        schema::PRE_COMPACTION_OUTPUT_FIXTURE,
+        schema::POST_COMPACTION_INPUT_FIXTURE,
+        schema::POST_COMPACTION_OUTPUT_FIXTURE,
+        schema::PRE_DELEGATION_INPUT_FIXTURE,
+        schema::PRE_DELEGATION_OUTPUT_FIXTURE,
+        schema::DELEGATION_START_INPUT_FIXTURE,
+        schema::DELEGATION_START_OUTPUT_FIXTURE,
+        schema::POST_DELEGATION_INPUT_FIXTURE,
+        schema::POST_DELEGATION_OUTPUT_FIXTURE,
+        schema::DELEGATION_FAILURE_INPUT_FIXTURE,
+        schema::DELEGATION_FAILURE_OUTPUT_FIXTURE,
     ] {
         let generated = std::fs::read(generated_dir.join(file_name)).expect("generated fixture");
         let expected = std::fs::read(expected_dir.join(file_name)).expect("expected fixture");
@@ -84,6 +97,29 @@ fn schema_examples_validate_against_generated_json_schemas() {
         }
     });
     assert_matches_schema::<StopCommandOutputWire>(&stop_output);
+
+    let pre_compaction_output = json!({
+        "continue": true,
+        "decision": "block",
+        "reason": "preserve raw context",
+        "hook_specific_output": {
+            "hook_event_name": "pre_compaction",
+            "additional_context": "wait for explicit confirmation"
+        }
+    });
+    assert_matches_schema::<PreCompactionCommandOutputWire>(&pre_compaction_output);
+
+    let pre_delegation_output = json!({
+        "continue": true,
+        "hook_specific_output": {
+            "hook_event_name": "pre_delegation",
+            "updated_delegation": {
+                "target_agent_id": "coder",
+                "objective": "narrow task"
+            }
+        }
+    });
+    assert_matches_schema::<PreDelegationCommandOutputWire>(&pre_delegation_output);
 
     let invalid = json!({
         "continue": true,
@@ -143,6 +179,15 @@ fn hook_event_labels_are_stable() {
     );
     assert_eq!(HookEventConfig::PostToolUse.label(), "post_tool_use");
     assert_eq!(HookEventConfig::Stop.label(), "stop");
+    assert_eq!(HookEventConfig::PreCompaction.label(), "pre_compaction");
+    assert_eq!(HookEventConfig::PostCompaction.label(), "post_compaction");
+    assert_eq!(HookEventConfig::PreDelegation.label(), "pre_delegation");
+    assert_eq!(HookEventConfig::DelegationStart.label(), "delegation_start");
+    assert_eq!(HookEventConfig::PostDelegation.label(), "post_delegation");
+    assert_eq!(
+        HookEventConfig::DelegationFailure.label(),
+        "delegation_failure"
+    );
 }
 
 #[tokio::test]

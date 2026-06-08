@@ -13,6 +13,12 @@ pub struct HooksConfig {
     pub permission_request: Vec<MatcherGroupConfig>,
     pub post_tool_use: Vec<MatcherGroupConfig>,
     pub stop: Vec<MatcherGroupConfig>,
+    pub pre_compaction: Vec<MatcherGroupConfig>,
+    pub post_compaction: Vec<MatcherGroupConfig>,
+    pub pre_delegation: Vec<MatcherGroupConfig>,
+    pub delegation_start: Vec<MatcherGroupConfig>,
+    pub post_delegation: Vec<MatcherGroupConfig>,
+    pub delegation_failure: Vec<MatcherGroupConfig>,
     #[schemars(skip)]
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
@@ -48,6 +54,12 @@ pub enum HookEventConfig {
     PermissionRequest,
     PostToolUse,
     Stop,
+    PreCompaction,
+    PostCompaction,
+    PreDelegation,
+    DelegationStart,
+    PostDelegation,
+    DelegationFailure,
 }
 
 impl HookEventConfig {
@@ -59,6 +71,12 @@ impl HookEventConfig {
             Self::PermissionRequest => "permission_request",
             Self::PostToolUse => "post_tool_use",
             Self::Stop => "stop",
+            Self::PreCompaction => "pre_compaction",
+            Self::PostCompaction => "post_compaction",
+            Self::PreDelegation => "pre_delegation",
+            Self::DelegationStart => "delegation_start",
+            Self::PostDelegation => "post_delegation",
+            Self::DelegationFailure => "delegation_failure",
         }
     }
 }
@@ -72,6 +90,12 @@ impl HooksConfig {
             HookEventConfig::PermissionRequest => &self.permission_request,
             HookEventConfig::PostToolUse => &self.post_tool_use,
             HookEventConfig::Stop => &self.stop,
+            HookEventConfig::PreCompaction => &self.pre_compaction,
+            HookEventConfig::PostCompaction => &self.post_compaction,
+            HookEventConfig::PreDelegation => &self.pre_delegation,
+            HookEventConfig::DelegationStart => &self.delegation_start,
+            HookEventConfig::PostDelegation => &self.post_delegation,
+            HookEventConfig::DelegationFailure => &self.delegation_failure,
         }
     }
 
@@ -89,6 +113,12 @@ impl HooksConfig {
             HookEventConfig::PermissionRequest,
             HookEventConfig::PostToolUse,
             HookEventConfig::Stop,
+            HookEventConfig::PreCompaction,
+            HookEventConfig::PostCompaction,
+            HookEventConfig::PreDelegation,
+            HookEventConfig::DelegationStart,
+            HookEventConfig::PostDelegation,
+            HookEventConfig::DelegationFailure,
         ] {
             for (group_idx, group) in self.groups_for(event).iter().enumerate() {
                 if group.hooks.is_empty() {

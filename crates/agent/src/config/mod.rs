@@ -41,8 +41,8 @@ pub use tools::*;
 /// Top-level config discriminator
 #[derive(Debug)]
 pub enum Config {
-    Single(SingleAgentConfig),
-    Multi(QuorumConfig),
+    Single(Box<SingleAgentConfig>),
+    Multi(Box<QuorumConfig>),
 }
 
 fn default_true() -> bool {

@@ -1,6 +1,6 @@
 # QueryMT Agent - Hooks
 
-Hooks let you run configured local commands at specific points in the agent lifecycle. They are useful for policy checks, audit logging, approval automation, tool input rewriting, and stop-time validation.
+Hooks let you run configured local commands at specific points in the agent lifecycle. They are useful for policy checks, audit logging, approval automation, tool input rewriting, compaction control, delegation control, and stop-time validation.
 
 ## Overview
 
@@ -45,6 +45,21 @@ type = "command"
 command = "sh ./hooks/check-shell.sh"
 timeout_sec = 5
 status_message = "Checking shell command"
+
+[[agent.hooks.pre_compaction]]
+
+[[agent.hooks.pre_compaction.hooks]]
+type = "command"
+command = "sh ./hooks/check-compaction.sh"
+timeout_sec = 5
+
+[[agent.hooks.pre_delegation]]
+matcher = "^coder$"
+
+[[agent.hooks.pre_delegation.hooks]]
+type = "command"
+command = "sh ./hooks/check-delegation.sh"
+timeout_sec = 5
 
 [[agent.hooks.stop]]
 
@@ -98,6 +113,12 @@ QueryMT currently supports these hook events:
 | `pre_tool_use` | tool name regex | Block or rewrite tool input |
 | `permission_request` | tool name regex | Allow or deny permission prompts |
 | `post_tool_use` | tool name regex | Mark a tool result as blocked/error |
+| `pre_compaction` | none | Block compaction and replace the final stop reason shown to the user |
+| `post_compaction` | none | Append context to the stored compaction summary |
+| `pre_delegation` | target agent regex | Block or rewrite a delegation request before it is recorded |
+| `delegation_start` | target agent regex | Observe delegation start and append planning context for the child session |
+| `post_delegation` | target agent regex | Append context to the delegate summary injected back into the planner |
+| `delegation_failure` | target agent regex | Append context to the failure message injected back into the planner |
 | `stop` | none | Request one extra LLM step |
 
 ## Examples
@@ -173,6 +194,53 @@ Expected hook output:
 }
 ```
 
+### pre_compaction block
+
+```json
+{
+  "decision": "block",
+  "reason": "Compaction requires manual review before context is collapsed.",
+  "hook_specific_output": {
+    "hook_event_name": "pre_compaction",
+    "additional_context": "Tell the user which transcript region needs review."
+  }
+}
+```
+
+When `pre_compaction` blocks, QueryMT does not start compaction. The hook reason becomes the final stop message shown to the user for that context-threshold stop.
+
+### pre_delegation rewrite and block
+
+```json
+{
+  "decision": "block",
+  "reason": "This task must stay in the planner session.",
+  "hook_specific_output": {
+    "hook_event_name": "pre_delegation",
+    "updated_delegation": {
+      "target_agent_id": "coder",
+      "objective": "Narrow the task to implementation only"
+    },
+    "additional_context": "Keep verification requirements explicit."
+  }
+}
+```
+
+`pre_delegation` is the only delegation hook that can change behavior. If it blocks, QueryMT rewrites the delegate tool result so the model sees `Delegation blocked by hook: ...` instead of the original queued message.
+
+### delegation_start planning context
+
+```json
+{
+  "hook_specific_output": {
+    "hook_event_name": "delegation_start",
+    "additional_context": "Focus the delegate on minimal diffs and call out validation gaps."
+  }
+}
+```
+
+`delegation_start` is observe-only. Its `additional_context` is appended to the child session planning context, not used as a control signal.
+
 ### stop continuation
 
 Example script for `crates/agent/examples/hooks/stop-verify.sh`:
@@ -222,6 +290,18 @@ Relevant files include:
 - `crates/agent/src/hooks/schema/generated/pre-tool-use.command.output.schema.json`
 - `crates/agent/src/hooks/schema/generated/permission-request.command.input.schema.json`
 - `crates/agent/src/hooks/schema/generated/permission-request.command.output.schema.json`
+- `crates/agent/src/hooks/schema/generated/pre-compaction.command.input.schema.json`
+- `crates/agent/src/hooks/schema/generated/pre-compaction.command.output.schema.json`
+- `crates/agent/src/hooks/schema/generated/post-compaction.command.input.schema.json`
+- `crates/agent/src/hooks/schema/generated/post-compaction.command.output.schema.json`
+- `crates/agent/src/hooks/schema/generated/pre-delegation.command.input.schema.json`
+- `crates/agent/src/hooks/schema/generated/pre-delegation.command.output.schema.json`
+- `crates/agent/src/hooks/schema/generated/delegation-start.command.input.schema.json`
+- `crates/agent/src/hooks/schema/generated/delegation-start.command.output.schema.json`
+- `crates/agent/src/hooks/schema/generated/post-delegation.command.input.schema.json`
+- `crates/agent/src/hooks/schema/generated/post-delegation.command.output.schema.json`
+- `crates/agent/src/hooks/schema/generated/delegation-failure.command.input.schema.json`
+- `crates/agent/src/hooks/schema/generated/delegation-failure.command.output.schema.json`
 - `crates/agent/src/hooks/schema/generated/stop.command.input.schema.json`
 - `crates/agent/src/hooks/schema/generated/stop.command.output.schema.json`
 
@@ -249,5 +329,5 @@ This lets dashboards, session timelines, and event subscribers surface hook prob
 
 - Hooks are configured through agent configs and profiles only.
 - Automatic global or project hook discovery is not implemented yet.
-- `additional_context` is currently used for `stop` continuation messages, but other hook events do not yet inject it back into the model context.
+- `additional_context` is injected only for selected events today: `stop`, `post_compaction`, `delegation_start`, `post_delegation`, and `delegation_failure`.
 - Hook input JSON is produced from typed Rust structs and not runtime-validated against JSON Schema; the generated schemas serve as the documented/tested contract.
