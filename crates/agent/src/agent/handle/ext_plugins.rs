@@ -1,3 +1,4 @@
+#[cfg(feature = "plugin-loaders")]
 use super::utils::ext_json_response;
 use super::*;
 

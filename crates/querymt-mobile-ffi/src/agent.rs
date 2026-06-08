@@ -131,7 +131,7 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
 
     let agent = match config {
         Config::Single(single) => {
-            querymt_agent::api::Agent::from_single_config_with_infra(single, infra)
+            querymt_agent::api::Agent::from_single_config_with_infra(*single, infra)
                 .await
                 .map_err(|e| {
                     set_last_error(
@@ -143,7 +143,7 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
         }
         Config::Multi(quorum) => {
             log::info!("Initializing multi-agent/quorum config");
-            querymt_agent::api::Agent::from_quorum_config_with_infra(quorum, infra)
+            querymt_agent::api::Agent::from_quorum_config_with_infra(*quorum, infra)
                 .await
                 .map_err(|e| {
                     set_last_error(
