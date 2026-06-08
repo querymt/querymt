@@ -2491,7 +2491,22 @@
 <span class="normal"><a href="#__codelineno-7-15">15</a></span>
 <span class="normal"><a href="#__codelineno-7-16">16</a></span>
 <span class="normal"><a href="#__codelineno-7-17">17</a></span>
-<span class="normal"><a href="#__codelineno-7-18">18</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="k">[agent.hooks]</span>
+<span class="normal"><a href="#__codelineno-7-18">18</a></span>
+<span class="normal"><a href="#__codelineno-7-19">19</a></span>
+<span class="normal"><a href="#__codelineno-7-20">20</a></span>
+<span class="normal"><a href="#__codelineno-7-21">21</a></span>
+<span class="normal"><a href="#__codelineno-7-22">22</a></span>
+<span class="normal"><a href="#__codelineno-7-23">23</a></span>
+<span class="normal"><a href="#__codelineno-7-24">24</a></span>
+<span class="normal"><a href="#__codelineno-7-25">25</a></span>
+<span class="normal"><a href="#__codelineno-7-26">26</a></span>
+<span class="normal"><a href="#__codelineno-7-27">27</a></span>
+<span class="normal"><a href="#__codelineno-7-28">28</a></span>
+<span class="normal"><a href="#__codelineno-7-29">29</a></span>
+<span class="normal"><a href="#__codelineno-7-30">30</a></span>
+<span class="normal"><a href="#__codelineno-7-31">31</a></span>
+<span class="normal"><a href="#__codelineno-7-32">32</a></span>
+<span class="normal"><a href="#__codelineno-7-33">33</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="k">[agent.hooks]</span>
 <a id="__codelineno-7-2" name="__codelineno-7-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
 <a id="__codelineno-7-3" name="__codelineno-7-3"></a>
 <a id="__codelineno-7-4" name="__codelineno-7-4"></a><span class="k">[[agent.hooks.pre_tool_use]]</span>
@@ -2503,14 +2518,29 @@
 <a id="__codelineno-7-10" name="__codelineno-7-10"></a><span class="n">timeout_sec</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span>
 <a id="__codelineno-7-11" name="__codelineno-7-11"></a><span class="n">status_message</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Checking shell command&quot;</span>
 <a id="__codelineno-7-12" name="__codelineno-7-12"></a>
-<a id="__codelineno-7-13" name="__codelineno-7-13"></a><span class="k">[[agent.hooks.stop]]</span>
+<a id="__codelineno-7-13" name="__codelineno-7-13"></a><span class="k">[[agent.hooks.pre_compaction]]</span>
 <a id="__codelineno-7-14" name="__codelineno-7-14"></a>
-<a id="__codelineno-7-15" name="__codelineno-7-15"></a><span class="k">[[agent.hooks.stop.hooks]]</span>
+<a id="__codelineno-7-15" name="__codelineno-7-15"></a><span class="k">[[agent.hooks.pre_compaction.hooks]]</span>
 <a id="__codelineno-7-16" name="__codelineno-7-16"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;command&quot;</span>
-<a id="__codelineno-7-17" name="__codelineno-7-17"></a><span class="n">command</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;sh ./hooks/stop-verify.sh&quot;</span>
+<a id="__codelineno-7-17" name="__codelineno-7-17"></a><span class="n">command</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;sh ./hooks/check-compaction.sh&quot;</span>
 <a id="__codelineno-7-18" name="__codelineno-7-18"></a><span class="n">timeout_sec</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span>
+<a id="__codelineno-7-19" name="__codelineno-7-19"></a>
+<a id="__codelineno-7-20" name="__codelineno-7-20"></a><span class="k">[[agent.hooks.pre_delegation]]</span>
+<a id="__codelineno-7-21" name="__codelineno-7-21"></a><span class="n">matcher</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;^coder$&quot;</span>
+<a id="__codelineno-7-22" name="__codelineno-7-22"></a>
+<a id="__codelineno-7-23" name="__codelineno-7-23"></a><span class="k">[[agent.hooks.pre_delegation.hooks]]</span>
+<a id="__codelineno-7-24" name="__codelineno-7-24"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;command&quot;</span>
+<a id="__codelineno-7-25" name="__codelineno-7-25"></a><span class="n">command</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;sh ./hooks/check-delegation.sh&quot;</span>
+<a id="__codelineno-7-26" name="__codelineno-7-26"></a><span class="n">timeout_sec</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span>
+<a id="__codelineno-7-27" name="__codelineno-7-27"></a>
+<a id="__codelineno-7-28" name="__codelineno-7-28"></a><span class="k">[[agent.hooks.stop]]</span>
+<a id="__codelineno-7-29" name="__codelineno-7-29"></a>
+<a id="__codelineno-7-30" name="__codelineno-7-30"></a><span class="k">[[agent.hooks.stop.hooks]]</span>
+<a id="__codelineno-7-31" name="__codelineno-7-31"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;command&quot;</span>
+<a id="__codelineno-7-32" name="__codelineno-7-32"></a><span class="n">command</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;sh ./hooks/stop-verify.sh&quot;</span>
+<a id="__codelineno-7-33" name="__codelineno-7-33"></a><span class="n">timeout_sec</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span>
 </code></pre></div></td></tr></table></div>
-<p>Hook commands receive JSON on stdin and return JSON on stdout. See the <a href="../hooks/">Hooks Guide</a> for supported events, schema files, and <code>stop</code> continuation behavior.</p>
+<p>Hook commands receive JSON on stdin and return JSON on stdout. Supported events now include compaction hooks and delegation hooks in addition to tool, prompt, session, permission, and stop hooks. See the <a href="../hooks/">Hooks Guide</a> for the full event list, schema files, and <code>stop</code> continuation behavior.</p>
 <h2 id="mcp-servers">MCP Servers</h2>
 <p>MCP (Model Context Protocol) servers extend agent capabilities:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-8-1"> 1</a></span>

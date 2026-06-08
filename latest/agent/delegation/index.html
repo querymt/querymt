@@ -1575,6 +1575,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#delegation-hooks-summary" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Delegation Hooks Summary
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#delegation-status" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -2208,7 +2219,10 @@
 </code></pre></div></td></tr></table></div>
 <h2 id="delegation-lifecycle">Delegation Lifecycle</h2>
 <h3 id="1-delegation-request">1. Delegation Request</h3>
-<p>The planner decides to delegate and creates a delegation request:</p>
+<p>The planner decides to delegate and creates a delegation request.</p>
+<p>If hooks are enabled, <code>pre_delegation</code> runs before the delegation is recorded. It can block the delegation entirely or rewrite fields such as <code>target_agent_id</code>, <code>objective</code>, <code>context</code>, <code>constraints</code>, and <code>expected_output</code>.</p>
+<p>The planner-side tool result is updated when a delegation is blocked, so the model sees <code>Delegation blocked by hook: ...</code> instead of a misleading queued message.</p>
+<p>The delegation request shape is:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-3-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-3-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-3-3"> 3</a></span>
@@ -2242,6 +2256,8 @@
 <a id="__codelineno-4-4" name="__codelineno-4-4"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="3-context-injection">3. Context Injection</h3>
+<p>The planner's context is injected into the delegate session.</p>
+<p>If hooks are enabled, <code>delegation_start</code> runs just before the delegate begins work. This hook is observe-only: it cannot block execution, but its <code>additional_context</code> is appended to the child session planning context.</p>
 <p>The planner's context is injected into the delegate session:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-5-1">1</a></span>
 <span class="normal"><a href="#__codelineno-5-2">2</a></span>
@@ -2276,6 +2292,8 @@
 <a id="__codelineno-6-11" name="__codelineno-6-11"></a>  - Writes tests
 </code></pre></div></td></tr></table></div>
 <h3 id="5-result-collection">5. Result Collection</h3>
+<p>The delegate's work is collected.</p>
+<p>If hooks are enabled, <code>post_delegation</code> runs after the delegate summary is extracted. This hook is observe-only and can append context to the summary that gets injected back into the planner session.</p>
 <p>The delegate's work is collected:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-7-1">1</a></span>
 <span class="normal"><a href="#__codelineno-7-2">2</a></span>
@@ -2310,6 +2328,8 @@
 <a id="__codelineno-8-10" name="__codelineno-8-10"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="7-result-injection">7. Result Injection</h3>
+<p>The result is injected back into the planner session.</p>
+<p>If a delegation fails, <code>delegation_failure</code> runs before the failure message is injected back into the planner. This hook is also observe-only and can append remediation context to the planner-visible failure message.</p>
 <p>The result is injected back into the planner session:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1">1</a></span>
 <span class="normal"><a href="#__codelineno-9-2">2</a></span>
@@ -2323,6 +2343,39 @@
 <a id="__codelineno-9-5" name="__codelineno-9-5"></a>
 <a id="__codelineno-9-6" name="__codelineno-9-6"></a><span class="n">planner_session</span><span class="p">.</span><span class="n">prompt</span><span class="p">(</span><span class="n">message</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
+<h2 id="delegation-hooks-summary">Delegation Hooks Summary</h2>
+<table>
+<thead>
+<tr>
+<th>Hook</th>
+<th>Matcher</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>pre_delegation</code></td>
+<td>target agent regex</td>
+<td>Block or rewrite the delegation before it is recorded</td>
+</tr>
+<tr>
+<td><code>delegation_start</code></td>
+<td>target agent regex</td>
+<td>Observe start and append planning context for the child session</td>
+</tr>
+<tr>
+<td><code>post_delegation</code></td>
+<td>target agent regex</td>
+<td>Observe completion and append context to the injected summary</td>
+</tr>
+<tr>
+<td><code>delegation_failure</code></td>
+<td>target agent regex</td>
+<td>Observe failure and append context to the injected failure message</td>
+</tr>
+</tbody>
+</table>
+<p>See the <a href="../hooks/">Hooks Guide</a> for JSON payloads, schemas, and output examples.</p>
 <h2 id="delegation-status">Delegation Status</h2>
 <table>
 <thead>
