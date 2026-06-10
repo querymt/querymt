@@ -36,6 +36,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use url::Url;
 
+const XAI_ADDITIONAL_LIST_MODELS: &[&str] = &["grok-composer-2.5-fast"];
+
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Xai {
@@ -818,11 +820,18 @@ impl HTTPLLMProviderFactory for XaiFactory {
     }
 
     fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
-        let models = openai_parse_list_models(&resp)?;
-        Ok(models
+        let mut models: Vec<String> = openai_parse_list_models(&resp)?
             .into_iter()
             .filter(|model| is_supported_xai_list_model(model))
-            .collect())
+            .collect();
+
+        for model in XAI_ADDITIONAL_LIST_MODELS {
+            if !models.iter().any(|listed| listed == model) {
+                models.push((*model).to_string());
+            }
+        }
+
+        Ok(models)
     }
 
     fn config_schema(&self) -> String {
@@ -920,11 +929,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_list_models_filters_grok_imagine_models() {
+    fn parse_list_models_filters_grok_imagine_models_and_appends_additional_models() {
         let response = Response::builder()
             .status(200)
             .body(
-                br#"{"data":[{"id":"grok-4"},{"id":"grok-imagine"},{"id":"grok-imagine-latest"},{"id":"grok-3-mini"}]}"#
+                br#"{"data":[{"id":"grok-4"},{"id":"grok-imagine"},{"id":"grok-imagine-latest"},{"id":"grok-3"}]}"#
                     .to_vec(),
             )
             .expect("response should build");
@@ -933,7 +942,38 @@ mod tests {
             .parse_list_models(response)
             .expect("model parsing should succeed");
 
-        assert_eq!(models, vec!["grok-4", "grok-3-mini"]);
+        assert_eq!(models, vec!["grok-4", "grok-3", "grok-composer-2.5-fast"]);
+    }
+
+    #[test]
+    fn parse_list_models_does_not_duplicate_additional_models() {
+        let response = Response::builder()
+            .status(200)
+            .body(br#"{"data":[{"id":"grok-4"},{"id":"grok-composer-2.5-fast"}]}"#.to_vec())
+            .expect("response should build");
+
+        let models = XaiFactory
+            .parse_list_models(response)
+            .expect("model parsing should succeed");
+
+        assert_eq!(models, vec!["grok-4", "grok-composer-2.5-fast"]);
+    }
+
+    #[test]
+    fn parse_list_models_keeps_prefixed_upstream_model_and_appends_bare_additional_model() {
+        let response = Response::builder()
+            .status(200)
+            .body(br#"{"data":[{"id":"x-ai/grok-composer-2.5-fast"}]}"#.to_vec())
+            .expect("response should build");
+
+        let models = XaiFactory
+            .parse_list_models(response)
+            .expect("model parsing should succeed");
+
+        assert_eq!(
+            models,
+            vec!["x-ai/grok-composer-2.5-fast", "grok-composer-2.5-fast"]
+        );
     }
 
     #[test]
