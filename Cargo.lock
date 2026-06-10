@@ -90,7 +90,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "uuid 1.23.2",
+ "uuid 1.23.3",
 ]
 
 [[package]]
@@ -1579,7 +1579,7 @@ checksum = "d38f2da7a0a2c4ccf0065be06397cc26a81f4e528be095826eee9d4adbb8c60f"
 dependencies = [
  "byteorder",
  "fnv",
- "uuid 1.23.2",
+ "uuid 1.23.3",
 ]
 
 [[package]]
@@ -2787,7 +2787,7 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bef552e6f588e446098f6ba40d89ac146c8c7b64aade83c051ee00bb5d2bc18d"
 dependencies = [
- "uuid 1.23.2",
+ "uuid 1.23.3",
 ]
 
 [[package]]
@@ -3507,7 +3507,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq 3.3.0",
  "url",
- "uuid 1.23.2",
+ "uuid 1.23.3",
  "wasi-common",
  "wasmtime",
  "wiggle",
@@ -6699,7 +6699,7 @@ dependencies = [
  "tokio-stream",
  "toml 0.8.23",
  "tracing",
- "uuid 1.23.2",
+ "uuid 1.23.3",
  "zip",
 ]
 
@@ -6970,7 +6970,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "url",
- "uuid 1.23.2",
+ "uuid 1.23.3",
 ]
 
 [[package]]
@@ -8212,7 +8212,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "urlencoding",
- "uuid 1.23.2",
+ "uuid 1.23.3",
  "variantly",
  "vob",
 ]
@@ -8247,7 +8247,7 @@ dependencies = [
  "tokio-tungstenite 0.28.0",
  "tracing",
  "utoipa",
- "uuid 1.23.2",
+ "uuid 1.23.3",
 ]
 
 [[package]]
@@ -8353,7 +8353,7 @@ dependencies = [
  "portable-atomic",
  "smallvec 1.15.1",
  "tagptr",
- "uuid 1.23.2",
+ "uuid 1.23.3",
 ]
 
 [[package]]
@@ -9224,7 +9224,7 @@ dependencies = [
  "toml 0.8.23",
  "ureq 2.12.1",
  "url",
- "uuid 1.23.2",
+ "uuid 1.23.3",
  "walkdir",
 ]
 
@@ -11066,7 +11066,7 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "url",
- "uuid 1.23.2",
+ "uuid 1.23.3",
  "which 8.0.3",
 ]
 
@@ -11163,7 +11163,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "typeshare",
- "uuid 1.23.2",
+ "uuid 1.23.3",
  "whatlang",
 ]
 
@@ -11300,7 +11300,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
- "uuid 1.23.2",
+ "uuid 1.23.3",
 ]
 
 [[package]]
@@ -12163,7 +12163,7 @@ dependencies = [
  "smallvec 1.15.1",
  "sqlite-wasm-rs",
  "time",
- "uuid 1.23.2",
+ "uuid 1.23.3",
 ]
 
 [[package]]
@@ -14101,7 +14101,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.52.0",
@@ -15466,9 +15466,9 @@ dependencies = [
 
 [[package]]
 name = "uuid"
-version = "1.23.2"
+version = "1.23.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d258b83ceec21034727ecee8c382cfa6c3e133699b0742c64571814fb420c9f7"
+checksum = "144d6b123cef80b301b8f72a9e2ca4370ddec21950d0a103dd22c437006d2db7"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
