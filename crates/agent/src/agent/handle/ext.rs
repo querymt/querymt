@@ -1,6 +1,10 @@
 use super::*;
 
 impl LocalAgentHandle {
+    pub(super) async fn handle_ext_capabilities(&self) -> Result<ExtResponse, Error> {
+        super::utils::ext_json_response(&crate::control::capabilities::get_capabilities(self))
+    }
+
     pub(super) async fn handle_ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
         match req.method.as_ref() {
             "querymt/models" => self.handle_ext_models().await,
@@ -15,6 +19,7 @@ impl LocalAgentHandle {
             "querymt/auth/start" => self.handle_ext_auth_start(req).await,
             "querymt/auth/complete" => self.handle_ext_auth_complete(req).await,
             "querymt/auth/logout" => self.handle_ext_auth_logout(req).await,
+            "querymt/capabilities" => self.handle_ext_capabilities().await,
             "querymt/mesh/status" => self.handle_ext_mesh_status().await,
             "querymt/mesh/join" => self.handle_ext_mesh_join(req).await,
             "querymt/mesh/nodes" => self.handle_ext_mesh_nodes().await,
@@ -27,6 +32,7 @@ impl LocalAgentHandle {
             "querymt/remote/dismissSession" => self.handle_ext_remote_dismiss_session(req).await,
             "querymt/schedules/create" => self.handle_ext_schedule_create(req).await,
             "querymt/schedules/list" => self.handle_ext_schedule_list(req).await,
+            "querymt/schedules/get" => self.handle_ext_schedule_get(req).await,
             "querymt/schedules/pause" => self.handle_ext_schedule_pause(req).await,
             "querymt/schedules/resume" => self.handle_ext_schedule_resume(req).await,
             "querymt/schedules/trigger" => self.handle_ext_schedule_trigger(req).await,

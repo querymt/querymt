@@ -39,7 +39,7 @@ pub(crate) fn refresh_attached_remote_summary(
     by_node: &mut std::collections::HashMap<String, Vec<SessionSummary>>,
     peer_label: &str,
     node_id: &str,
-    session_info: &crate::agent::remote::RemoteSessionInfo,
+    session_info: &crate::agent::remote::RemoteSessionSnapshot,
 ) -> bool {
     let Some(existing) = by_node.get_mut(peer_label).and_then(|sessions| {
         sessions

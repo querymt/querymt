@@ -5,26 +5,22 @@
 //! node. The local dashboard sends these messages to nodes it has discovered.
 //!
 //! The actor and its messages are only available with the `remote` feature.
-//! The `RemoteSessionInfo` and `NodeInfo` data types are always available
-//! (needed for UI serialization regardless of feature).
+//! The `RemoteSessionSnapshot` and `NodeInfo` data types are always available
+//! for mesh/node-manager serialization, but ACP/UI should prefer shared control DTOs.
 
 use crate::agent::remote::NodeId;
 use serde::{Deserialize, Serialize};
-use typeshare::typeshare;
 
-/// Metadata about a session available on a remote node.
-#[typeshare]
+/// Internal snapshot of a session available on a remote node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemoteSessionInfo {
+pub struct RemoteSessionSnapshot {
     /// Session public ID (same format as local sessions)
     pub session_id: String,
     /// kameo ActorId of the SessionActor on the remote node (raw u64)
-    #[typeshare(serialized_as = "number")]
     pub actor_id: u64,
     /// Working directory on the remote machine (if set)
     pub cwd: Option<String>,
     /// Unix timestamp when the session was created
-    #[typeshare(serialized_as = "number")]
     pub created_at: i64,
     /// Session title/name, if set
     pub title: Option<String>,
@@ -35,16 +31,14 @@ pub struct RemoteSessionInfo {
 }
 
 /// Paginated response for listing sessions on a remote node.
-#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListRemoteSessionsResponse {
     /// Sessions in the requested page.
-    pub sessions: Vec<RemoteSessionInfo>,
+    pub sessions: Vec<RemoteSessionSnapshot>,
     /// Offset for the next page; `None` when there are no more pages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_offset: Option<u32>,
     /// Total sessions across all pages.
-    #[typeshare(serialized_as = "number")]
     pub total_count: u32,
 }
 
@@ -75,7 +69,7 @@ pub use remote_impl::{
 
 #[cfg(feature = "remote")]
 mod remote_impl {
-    use super::{ListRemoteSessionsResponse, NodeInfo, RemoteSessionInfo};
+    use super::{ListRemoteSessionsResponse, NodeInfo, RemoteSessionSnapshot};
     use crate::agent::agent_config::AgentConfig;
     use crate::agent::remote::NodeId;
     use crate::agent::remote::mesh::MeshHandle;
@@ -1067,7 +1061,7 @@ mod remote_impl {
                         None => (0, Some("persisted".to_string())),
                     };
 
-                    infos.push(RemoteSessionInfo {
+                    infos.push(RemoteSessionSnapshot {
                         session_id: session.public_id.clone(),
                         actor_id,
                         cwd: session.cwd.as_ref().map(|p| p.display().to_string()),

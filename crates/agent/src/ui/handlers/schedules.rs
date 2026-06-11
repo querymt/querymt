@@ -1,7 +1,6 @@
 use super::super::ServerState;
 use super::super::connection::{send_error, send_message};
-use super::super::messages::{ScheduleInfo, UiServerMessage};
-use crate::session::domain_schedule::Schedule;
+use super::super::messages::UiServerMessage;
 use tokio::sync::mpsc;
 
 /// Parameters for creating a new schedule, bundled to stay within clippy's
@@ -16,27 +15,6 @@ pub struct CreateScheduleParams<'a> {
     pub max_runs: Option<u32>,
 }
 
-/// Convert a domain `Schedule` to a UI `ScheduleInfo` DTO.
-fn schedule_to_info(s: &Schedule, node_id: Option<&str>) -> ScheduleInfo {
-    let fmt = &time::format_description::well_known::Rfc3339;
-    ScheduleInfo {
-        public_id: s.public_id.clone(),
-        task_public_id: s.task_public_id.clone(),
-        session_public_id: s.session_public_id.clone(),
-        node_id: node_id.map(ToOwned::to_owned),
-        trigger: serde_json::to_value(&s.trigger).unwrap_or_default(),
-        state: s.state.to_string(),
-        last_run_at: s.last_run_at.and_then(|t| t.format(fmt).ok()),
-        next_run_at: s.next_run_at.and_then(|t| t.format(fmt).ok()),
-        run_count: s.run_count,
-        consecutive_failures: s.consecutive_failures,
-        max_runs: s.config.max_runs,
-        max_runtime_seconds: s.config.max_runtime_seconds,
-        created_at: s.created_at.format(fmt).unwrap_or_default(),
-        updated_at: s.updated_at.format(fmt).unwrap_or_default(),
-    }
-}
-
 /// Resolve the `session_public_id` that owns a local schedule.
 async fn resolve_session_id(state: &ServerState, schedule_public_id: &str) -> Option<String> {
     state
@@ -48,18 +26,6 @@ async fn resolve_session_id(state: &ServerState, schedule_public_id: &str) -> Op
         .map(|s| s.session_public_id)
 }
 
-#[cfg(feature = "remote")]
-async fn find_node_manager(
-    state: &ServerState,
-    node_id: &str,
-) -> Result<kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>, String> {
-    state
-        .agent
-        .find_node_manager(node_id)
-        .await
-        .map_err(|e| e.to_string())
-}
-
 /// Handle `ListSchedules` — list schedules for a session or all.
 pub async fn handle_list_schedules(
     state: &ServerState,
@@ -67,55 +33,18 @@ pub async fn handle_list_schedules(
     node_id: Option<&str>,
     tx: &mpsc::Sender<String>,
 ) {
-    #[cfg(feature = "remote")]
-    if let Some(node_id) = node_id {
-        let result = match find_node_manager(state, node_id).await {
-            Ok(node_manager) => state
-                .agent
-                .list_remote_schedules(&node_manager, session_id.map(ToOwned::to_owned))
-                .await
-                .map(|r| r.schedules),
-            Err(e) => {
-                let _ = send_error(tx, format!("Failed to find remote node: {e}")).await;
-                return;
-            }
-        };
-
-        match result {
-            Ok(schedules) => {
-                let infos: Vec<ScheduleInfo> = schedules
-                    .iter()
-                    .map(|schedule| schedule_to_info(schedule, Some(node_id)))
-                    .collect();
-                let _ = send_message(
-                    tx,
-                    UiServerMessage::ScheduleList {
-                        schedules: infos,
-                        session_id: session_id.map(ToOwned::to_owned),
-                        node_id: Some(node_id.to_string()),
-                    },
-                )
-                .await;
-            }
-            Err(e) => {
-                let _ = send_error(tx, format!("Failed to list remote schedules: {e}")).await;
-            }
-        }
-        return;
-    }
-
-    match state.agent.list_schedules(session_id).await {
-        Ok(schedules) => {
-            let infos: Vec<ScheduleInfo> = schedules
-                .iter()
-                .map(|schedule| schedule_to_info(schedule, None))
-                .collect();
+    let request = crate::control::schedules::ListSchedulesControlRequest {
+        node_id: node_id.map(ToOwned::to_owned),
+        session_id: session_id.map(ToOwned::to_owned),
+    };
+    match crate::control::schedules::list_schedules(&state.agent, request).await {
+        Ok(response) => {
             let _ = send_message(
                 tx,
                 UiServerMessage::ScheduleList {
-                    schedules: infos,
-                    session_id: session_id.map(ToOwned::to_owned),
-                    node_id: None,
+                    schedules: response.schedules,
+                    session_id: response.session_id,
+                    node_id: response.node_id,
                 },
             )
             .await;
@@ -151,74 +80,23 @@ pub async fn handle_create_schedule(
         }
     };
 
-    #[cfg(feature = "remote")]
-    let result = if let Some(node_id) = params.node_id {
-        match find_node_manager(state, node_id).await {
-            Ok(node_manager) => state
-                .agent
-                .create_remote_schedule(
-                    &node_manager,
-                    crate::agent::remote::CreateRemoteSchedule {
-                        session_id: params.session_id.to_string(),
-                        prompt: params.prompt.to_string(),
-                        trigger,
-                        max_steps: params.max_steps,
-                        max_cost_usd: params.max_cost_usd,
-                        max_runs: params.max_runs,
-                    },
-                )
-                .await
-                .map(|r| r.schedule_public_id),
-            Err(e) => Err(agent_client_protocol::Error::internal_error().data(e)),
-        }
-    } else {
-        match state
-            .agent
-            .config
-            .provider
-            .history_store()
-            .get_session_provider_node_id(params.session_id)
-            .await
-        {
-            Ok(Some(_)) => Err(agent_client_protocol::Error::invalid_params()
-                .data("Remote sessions require node_id for schedule creation".to_string())),
-            Ok(None) => {
-                state
-                    .agent
-                    .create_scheduled_task(
-                        params.session_id,
-                        params.prompt,
-                        trigger,
-                        params.max_steps,
-                        params.max_cost_usd,
-                        params.max_runs,
-                    )
-                    .await
-            }
-            Err(e) => Err(agent_client_protocol::Error::internal_error().data(e.to_string())),
-        }
+    let request = crate::control::schedules::CreateScheduleControlRequest {
+        node_id: params.node_id.map(ToOwned::to_owned),
+        session_id: params.session_id.to_string(),
+        prompt: params.prompt.to_string(),
+        trigger,
+        max_steps: params.max_steps,
+        max_cost_usd: params.max_cost_usd,
+        max_runs: params.max_runs,
     };
 
-    #[cfg(not(feature = "remote"))]
-    let result = state
-        .agent
-        .create_scheduled_task(
-            params.session_id,
-            params.prompt,
-            trigger,
-            params.max_steps,
-            params.max_cost_usd,
-            params.max_runs,
-        )
-        .await;
-
-    match result {
-        Ok(schedule_public_id) => {
+    match crate::control::schedules::create_schedule(&state.agent, request).await {
+        Ok(schedule) => {
             let _ = send_message(
                 tx,
                 UiServerMessage::ScheduleCreatedResult {
                     success: true,
-                    schedule_public_id: Some(schedule_public_id),
+                    schedule_public_id: Some(schedule.public_id),
                     node_id: params.node_id.map(ToOwned::to_owned),
                     message: None,
                 },
@@ -321,49 +199,16 @@ async fn handle_schedule_action(
         resolve_session_id(state, schedule_public_id).await
     };
 
-    #[cfg(feature = "remote")]
-    let result = if let Some(node_id) = node_id {
-        match find_node_manager(state, node_id).await {
-            Ok(node_manager) => match action {
-                "pause" => {
-                    state
-                        .agent
-                        .pause_remote_schedule(&node_manager, schedule_public_id.to_string())
-                        .await
-                }
-                "resume" => {
-                    state
-                        .agent
-                        .resume_remote_schedule(&node_manager, schedule_public_id.to_string())
-                        .await
-                }
-                "trigger" => {
-                    state
-                        .agent
-                        .trigger_remote_schedule(&node_manager, schedule_public_id.to_string())
-                        .await
-                }
-                "delete" => {
-                    state
-                        .agent
-                        .delete_remote_schedule(&node_manager, schedule_public_id.to_string())
-                        .await
-                }
-                _ => Ok(()),
-            },
-            Err(e) => Err(agent_client_protocol::Error::internal_error().data(e)),
-        }
-    } else {
-        run_local_action(state, schedule_public_id, action).await
+    let request = crate::control::schedules::ScheduleActionControlRequest {
+        node_id: node_id.map(ToOwned::to_owned),
+        schedule_public_id: schedule_public_id.to_string(),
     };
 
-    #[cfg(not(feature = "remote"))]
-    let result = run_local_action(state, schedule_public_id, action).await;
-
-    let (success, message) = match result {
-        Ok(()) => (true, None),
-        Err(e) => (false, Some(e.to_string())),
-    };
+    let (success, message) =
+        match crate::control::schedules::schedule_action(&state.agent, request, action).await {
+            Ok(_) => (true, None),
+            Err(e) => (false, Some(e.to_string())),
+        };
 
     let _ = send_message(
         tx,
@@ -379,19 +224,5 @@ async fn handle_schedule_action(
 
     if success {
         handle_list_schedules(state, refresh_session_id.as_deref(), node_id, tx).await;
-    }
-}
-
-async fn run_local_action(
-    state: &ServerState,
-    schedule_public_id: &str,
-    action: &str,
-) -> Result<(), agent_client_protocol::Error> {
-    match action {
-        "pause" => state.agent.pause_schedule(schedule_public_id).await,
-        "resume" => state.agent.resume_schedule(schedule_public_id).await,
-        "trigger" => state.agent.trigger_schedule_now(schedule_public_id).await,
-        "delete" => state.agent.delete_schedule(schedule_public_id).await,
-        _ => Ok(()),
     }
 }

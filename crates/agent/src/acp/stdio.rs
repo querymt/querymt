@@ -90,6 +90,15 @@ async fn run_bridge_task(
                     log::error!("Bridge: session_notification failed: {:?}", e);
                 }
             }
+            ClientBridgeMessage::ExtNotification(notif) => {
+                let _span = info_span!("acp.ext_notification").entered();
+                log::debug!("Bridge: forwarding ext notification");
+                if let Err(e) =
+                    connection.send_notification(acp::ClientNotification::ExtNotification(notif))
+                {
+                    log::error!("Bridge: ext_notification failed: {:?}", e);
+                }
+            }
             ClientBridgeMessage::RequestPermission {
                 request,
                 response_tx,

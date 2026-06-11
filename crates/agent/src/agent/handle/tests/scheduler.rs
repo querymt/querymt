@@ -79,11 +79,11 @@ async fn test_querymt_schedule_ext_create_remote_missing_session_surfaces_error(
         std::sync::Arc::from(
             serde_json::value::RawValue::from_string(
                 serde_json::json!({
-                    "nodeId": node_id,
-                    "sessionId": session.session_id,
+                    "node_id": node_id,
+                    "session_id": session.session_id,
                     "prompt": "daily summary",
                     "trigger": { "type": "interval", "seconds": 300 },
-                    "maxRuns": 2,
+                    "max_runs": 2,
                 })
                 .to_string(),
             )
@@ -148,8 +148,8 @@ async fn test_querymt_remote_attach_session_missing_persisted_session_surfaces_e
         std::sync::Arc::from(
             serde_json::value::RawValue::from_string(
                 serde_json::json!({
-                    "nodeId": node_id,
-                    "sessionId": missing_session_id,
+                    "node_id": node_id,
+                    "session_id": missing_session_id,
                 })
                 .to_string(),
             )
@@ -191,14 +191,14 @@ async fn test_querymt_schedule_ext_methods_local() {
         &f.handle,
         "querymt/schedules/create",
         serde_json::json!({
-            "sessionId": session_id,
+            "session_id": session_id,
             "prompt": "daily summary",
             "trigger": { "type": "interval", "seconds": 300 },
-            "maxRuns": 2,
+            "max_runs": 2,
         }),
     )
     .await;
-    let schedule_id = created["schedulePublicId"]
+    let schedule_id = created["schedule"]["public_id"]
         .as_str()
         .expect("schedule id")
         .to_string();
@@ -221,17 +221,27 @@ async fn test_querymt_schedule_ext_methods_local() {
     let listed = ext_method_json(
         &f.handle,
         "querymt/schedules/list",
-        serde_json::json!({ "sessionId": session_id }),
+        serde_json::json!({ "session_id": session_id }),
     )
     .await;
     assert_eq!(listed["schedules"].as_array().map(Vec::len), Some(1));
+    assert_eq!(listed["schedules"][0]["public_id"], schedule_id);
 
-    let _ = ext_method_json(
+    let fetched = ext_method_json(
         &f.handle,
-        "querymt/schedules/pause",
-        serde_json::json!({ "schedulePublicId": schedule_id.clone() }),
+        "querymt/schedules/get",
+        serde_json::json!({ "schedule_public_id": schedule_id.clone() }),
     )
     .await;
+    assert_eq!(fetched["schedule"]["public_id"], schedule_id);
+
+    let paused = ext_method_json(
+        &f.handle,
+        "querymt/schedules/pause",
+        serde_json::json!({ "schedule_public_id": schedule_id.clone() }),
+    )
+    .await;
+    assert_eq!(paused["action"], "pause");
 
     wait_for_condition(|| {
         let storage = f.storage.clone();
@@ -256,22 +266,23 @@ async fn test_querymt_schedule_ext_methods_local() {
     let listed = ext_method_json(
         &f.handle,
         "querymt/schedules/list",
-        serde_json::json!({ "sessionId": session_id }),
+        serde_json::json!({ "session_id": session_id }),
     )
     .await;
     assert_eq!(listed["schedules"][0]["state"], "paused");
 
-    let _ = ext_method_json(
+    let deleted = ext_method_json(
         &f.handle,
         "querymt/schedules/delete",
-        serde_json::json!({ "schedulePublicId": schedule_id.clone() }),
+        serde_json::json!({ "schedule_public_id": schedule_id.clone() }),
     )
     .await;
+    assert_eq!(deleted["action"], "delete");
 
     let listed = ext_method_json(
         &f.handle,
         "querymt/schedules/list",
-        serde_json::json!({ "sessionId": session_id }),
+        serde_json::json!({ "session_id": session_id }),
     )
     .await;
     assert_eq!(listed["schedules"].as_array().map(Vec::len), Some(0));
@@ -288,6 +299,30 @@ async fn test_list_schedules_returns_empty_when_scheduler_actor_stops() {
 
     let schedules = f.handle.list_schedules(None).await.expect("list_schedules");
     assert!(schedules.is_empty());
+}
+
+#[tokio::test]
+async fn test_querymt_schedule_get_missing_returns_not_found() {
+    let f = RealStorageHandleFixture::new().await;
+
+    let req = agent_client_protocol::schema::ExtRequest::new(
+        "querymt/schedules/get",
+        std::sync::Arc::from(
+            serde_json::value::RawValue::from_string(
+                serde_json::json!({ "schedule_public_id": "missing-schedule" }).to_string(),
+            )
+            .unwrap(),
+        ),
+    );
+
+    let err = f
+        .handle
+        .ext_method(req)
+        .await
+        .expect_err("missing schedule should reject get");
+
+    assert_eq!(err.code, agent_client_protocol::ErrorCode::ResourceNotFound);
+    assert!(err.message.contains("missing-schedule"));
 }
 
 #[tokio::test]

@@ -145,18 +145,8 @@ pub struct AuthProviderEntry {
 pub use crate::api::{SessionGroup, SessionSummary};
 
 /// Information about a remote node discovered in the kameo mesh.
-#[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemoteNodeInfo {
-    /// Stable mesh node id (PeerId string).
-    pub id: String,
-    /// Human-readable label / hostname
-    pub label: String,
-    /// Node capabilities
-    pub capabilities: Vec<String>,
-    /// Number of active sessions on the node
-    pub active_sessions: u32,
-}
+#[typeshare(serialized_as = "RemoteNodeInfo")]
+pub use crate::control::remote::RemoteNodeInfo;
 
 /// Messages from UI client to server.
 /// Typeshare-annotated: generated for TypeScript and Swift.
@@ -546,30 +536,8 @@ pub struct PluginUpdateResult {
     pub message: Option<String>,
 }
 
-/// Schedule information DTO for the UI.
-#[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScheduleInfo {
-    pub public_id: String,
-    pub task_public_id: String,
-    pub session_public_id: String,
-    #[serde(default)]
-    pub node_id: Option<String>,
-    /// Serialized trigger config
-    #[typeshare(serialized_as = "any")]
-    pub trigger: serde_json::Value,
-    /// Current state: armed, running, paused, exhausted, failed
-    pub state: String,
-    pub last_run_at: Option<String>,
-    pub next_run_at: Option<String>,
-    pub run_count: u32,
-    pub consecutive_failures: u32,
-    pub max_runs: Option<u32>,
-    #[typeshare(serialized_as = "number")]
-    pub max_runtime_seconds: u64,
-    pub created_at: String,
-    pub updated_at: String,
-}
+#[typeshare(serialized_as = "ScheduleInfo")]
+pub use crate::control::schedules::ScheduleInfo;
 
 /// Knowledge entry DTO for the UI (read-only).
 #[typeshare]
@@ -600,23 +568,8 @@ pub struct ConsolidationInfo {
 }
 
 /// Mesh invite DTO for the UI.
-#[typeshare]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MeshInviteInfo {
-    pub invite_id: String,
-    pub mesh_name: Option<String>,
-    #[typeshare(serialized_as = "number")]
-    pub expires_at: u64,
-    #[typeshare(serialized_as = "number")]
-    pub max_uses: u32,
-    #[typeshare(serialized_as = "number")]
-    pub uses_remaining: u32,
-    /// pending | consumed | revoked
-    pub status: String,
-    pub used_by: Vec<String>,
-    #[typeshare(serialized_as = "number")]
-    pub created_at: u64,
-}
+#[typeshare(serialized_as = "MeshInviteInfo")]
+pub use crate::control::mesh::MeshInviteInfo;
 
 // ============================================================================
 // Typeshare mirror types for upstream crate types
@@ -921,7 +874,7 @@ pub enum UiServerMessage {
         /// Stable node id (PeerId string)
         node_id: String,
         /// Sessions on that node
-        sessions: Vec<crate::agent::remote::RemoteSessionInfo>,
+        sessions: Vec<crate::control::remote::RemoteSessionInfo>,
         /// Offset for the next page; omitted when there are no more pages
         #[serde(skip_serializing_if = "Option::is_none")]
         next_offset: Option<u32>,
