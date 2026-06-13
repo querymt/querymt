@@ -2,150 +2,45 @@
 use super::utils::ext_json_response;
 use super::*;
 
-fn default_attach() -> bool {
-    true
-}
-
 impl LocalAgentHandle {
     pub(super) async fn handle_ext_remote_sessions(
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        #[cfg_attr(not(feature = "remote"), allow(dead_code))]
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct RemoteSessionsReq {
-            node_id: String,
-            #[serde(default)]
-            offset: Option<u32>,
-            #[serde(default)]
-            limit: Option<u32>,
-        }
-
-        let parsed: RemoteSessionsReq = serde_json::from_str(req.params.get()).map_err(|e| {
-            Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
-        })?;
-
-        #[cfg(feature = "remote")]
-        {
-            let nm_ref = self.find_node_manager(&parsed.node_id).await?;
-            let response = self
-                .list_remote_sessions(&nm_ref, parsed.offset, parsed.limit)
-                .await?;
-            ext_json_response(&serde_json::json!({
-                "nodeId": parsed.node_id,
-                "sessions": response.sessions,
-                "nextOffset": response.next_offset,
-                "totalCount": response.total_count,
-            }))
-        }
-
-        #[cfg(not(feature = "remote"))]
-        {
-            let _ = parsed;
-            Err(Error::method_not_found())
-        }
+        let parsed: crate::control::remote::RemoteSessionsRequest =
+            serde_json::from_str(req.params.get()).map_err(|e| {
+                Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+            })?;
+        let response = crate::control::remote::list_remote_sessions(self, parsed).await?;
+        ext_json_response(&response)
     }
 
     pub(super) async fn handle_ext_remote_create_session(
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        #[cfg_attr(not(feature = "remote"), allow(dead_code))]
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct CreateReq {
-            node_id: String,
-            #[serde(default)]
-            cwd: Option<String>,
-            #[serde(default = "default_attach")]
-            attach: bool,
-        }
-
-        let parsed: CreateReq = serde_json::from_str(req.params.get()).map_err(|e| {
-            Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
-        })?;
-
-        #[cfg(feature = "remote")]
-        {
-            let nm_ref = self.find_node_manager(&parsed.node_id).await?;
-            let resp = self
-                .create_remote_session(&nm_ref, parsed.cwd.clone())
-                .await?;
-
-            if !parsed.attach {
-                return ext_json_response(&serde_json::json!({
-                    "sessionId": resp.session_id,
-                    "nodeId": parsed.node_id,
-                    "attached": false,
-                    "configOptions": [],
-                }));
-            }
-
-            let snapshot = self
-                .attach_remote_session_for_ext(
-                    &parsed.node_id,
-                    &resp.session_id,
-                    Some(resp.handoff),
-                )
-                .await?;
-
-            ext_json_response(&serde_json::json!({
-                "sessionId": resp.session_id,
-                "nodeId": parsed.node_id,
-                "attached": true,
-                "configOptions": [],
-                "snapshot": snapshot,
-            }))
-        }
-
-        #[cfg(not(feature = "remote"))]
-        {
-            let _ = parsed;
-            Err(Error::method_not_found())
-        }
+        let parsed: crate::control::remote::CreateRemoteSessionRequest =
+            serde_json::from_str(req.params.get()).map_err(|e| {
+                Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+            })?;
+        let response = crate::control::remote::create_remote_session(self, parsed).await?;
+        ext_json_response(&response)
     }
 
     pub(super) async fn handle_ext_remote_attach_session(
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        #[cfg_attr(not(feature = "remote"), allow(dead_code))]
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct AttachReq {
-            node_id: String,
-            session_id: String,
-        }
-
-        let parsed: AttachReq = serde_json::from_str(req.params.get()).map_err(|e| {
-            Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
-        })?;
-
-        #[cfg(feature = "remote")]
-        {
-            let snapshot = self
-                .attach_remote_session_for_ext(&parsed.node_id, &parsed.session_id, None)
-                .await?;
-
-            ext_json_response(&serde_json::json!({
-                "sessionId": parsed.session_id,
-                "nodeId": parsed.node_id,
-                "attached": true,
-                "configOptions": [],
-                "snapshot": snapshot,
-            }))
-        }
-
-        #[cfg(not(feature = "remote"))]
-        {
-            let _ = parsed;
-            Err(Error::method_not_found())
-        }
+        let parsed: crate::control::remote::AttachRemoteSessionRequest =
+            serde_json::from_str(req.params.get()).map_err(|e| {
+                Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+            })?;
+        let response = crate::control::remote::attach_remote_session(self, parsed).await?;
+        ext_json_response(&response)
     }
 
     #[cfg(feature = "remote")]
-    async fn attach_remote_session_for_ext(
+    pub(crate) async fn attach_remote_session_for_ext(
         &self,
         node_id: &str,
         session_id: &str,
@@ -242,40 +137,11 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        #[cfg_attr(not(feature = "remote"), allow(dead_code))]
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct DismissReq {
-            session_id: String,
-        }
-
-        let parsed: DismissReq = serde_json::from_str(req.params.get()).map_err(|e| {
-            Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
-        })?;
-
-        #[cfg(feature = "remote")]
-        {
-            {
-                let mut registry = self.registry.lock().await;
-                registry.detach_remote_session(&parsed.session_id).await;
-            }
-
-            self.config
-                .provider
-                .history_store()
-                .remove_remote_session_bookmark(&parsed.session_id)
-                .await
-                .map_err(|e| {
-                    Error::internal_error().data(serde_json::json!({"error": e.to_string()}))
-                })?;
-
-            ext_json_response(&serde_json::json!({ "success": true }))
-        }
-
-        #[cfg(not(feature = "remote"))]
-        {
-            let _ = parsed;
-            Err(Error::method_not_found())
-        }
+        let parsed: crate::control::remote::DismissRemoteSessionRequest =
+            serde_json::from_str(req.params.get()).map_err(|e| {
+                Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+            })?;
+        let response = crate::control::remote::dismiss_remote_session(self, parsed).await?;
+        ext_json_response(&response)
     }
 }

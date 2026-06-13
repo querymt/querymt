@@ -397,6 +397,11 @@ export interface Artifact {
 	created_at: string;
 }
 
+export interface AttachRemoteSessionRequest {
+	node_id: string;
+	session_id: string;
+}
+
 /** An audio-capable model entry returned in [`UiServerMessage::AudioCapabilities`]. */
 export interface AudioModelInfo {
 	/** Provider name (e.g. "izwi") */
@@ -557,6 +562,41 @@ export interface AuthProviderEntry {
 	preferred_method?: AuthMethod;
 }
 
+export interface ControlAgentInfo {
+	id: string;
+	display_name: string;
+	kind: string;
+	version?: string;
+}
+
+export interface ControlTransportInfo {
+	acp: boolean;
+	stdio: boolean;
+	websocket: boolean;
+	mesh: boolean;
+	mesh_transport: string;
+}
+
+export interface ControlFeatureInfo {
+	mesh: boolean;
+	mesh_invites: boolean;
+	remote_sessions: boolean;
+	schedules: boolean;
+	remote_schedules: boolean;
+	profiles: boolean;
+	auth: boolean;
+	models: boolean;
+}
+
+export interface CapabilitiesInfo {
+	querymt_control_version: number;
+	agent: ControlAgentInfo;
+	transport: ControlTransportInfo;
+	features: ControlFeatureInfo;
+	methods: string[];
+	notifications: string[];
+}
+
 /** Knowledge consolidation DTO for the UI (read-only). */
 export interface ConsolidationInfo {
 	public_id: string;
@@ -565,6 +605,32 @@ export interface ConsolidationInfo {
 	insight: string;
 	source_count: number;
 	created_at: string;
+}
+
+export interface CreateMeshInviteRequest {
+	mesh_name?: string;
+	ttl?: string;
+	max_uses?: number;
+}
+
+export interface CreateRemoteSessionRequest {
+	node_id: string;
+	cwd?: string;
+	attach: boolean;
+}
+
+export interface CreateScheduleControlRequest {
+	node_id?: string;
+	session_id: string;
+	prompt: string;
+	trigger: any;
+	max_steps?: number;
+	max_cost_usd?: number;
+	max_runs?: number;
+}
+
+export interface DismissRemoteSessionRequest {
+	session_id: string;
 }
 
 /** Location of a function in source code */
@@ -651,6 +717,11 @@ export interface FunctionToolInfo {
 	parameters: any;
 }
 
+export interface GetScheduleControlRequest {
+	node_id?: string;
+	schedule_public_id: string;
+}
+
 /** Knowledge entry DTO for the UI (read-only). */
 export interface KnowledgeEntryInfo {
 	public_id: string;
@@ -664,32 +735,9 @@ export interface KnowledgeEntryInfo {
 	created_at: string;
 }
 
-/** Metadata about a session available on a remote node. */
-export interface RemoteSessionInfo {
-	/** Session public ID (same format as local sessions) */
-	session_id: string;
-	/** kameo ActorId of the SessionActor on the remote node (raw u64) */
-	actor_id: number;
-	/** Working directory on the remote machine (if set) */
-	cwd?: string;
-	/** Unix timestamp when the session was created */
-	created_at: number;
-	/** Session title/name, if set */
-	title?: string;
-	/** Human-readable label of the peer that owns this session */
-	peer_label: string;
-	/** High-level runtime lifecycle state for UI summaries. */
-	runtime_state?: string;
-}
-
-/** Paginated response for listing sessions on a remote node. */
-export interface ListRemoteSessionsResponse {
-	/** Sessions in the requested page. */
-	sessions: RemoteSessionInfo[];
-	/** Offset for the next page; `None` when there are no more pages. */
-	next_offset?: number;
-	/** Total sessions across all pages. */
-	total_count: number;
+export interface ListSchedulesControlRequest {
+	node_id?: string;
+	session_id?: string;
 }
 
 /**
@@ -704,17 +752,89 @@ export interface McpServerInfo {
 	endpoint: string;
 }
 
-/** Mesh invite DTO for the UI. */
+export interface MeshInviteCreatedInfo {
+	invite_id: string;
+	url: string;
+	qr_code?: string;
+	expires_at: number;
+	max_uses: number;
+	mesh_name?: string;
+}
+
 export interface MeshInviteInfo {
 	invite_id: string;
 	mesh_name?: string;
 	expires_at: number;
 	max_uses: number;
 	uses_remaining: number;
-	/** pending | consumed | revoked */
 	status: string;
 	used_by: string[];
 	created_at: number;
+}
+
+export interface MeshInviteListInfo {
+	invites: MeshInviteInfo[];
+}
+
+export interface MeshInviteRevokedInfo {
+	success: boolean;
+	invite_id: string;
+	message?: string;
+}
+
+export interface MeshJoinInfo {
+	joined: boolean;
+	peer_id: string;
+	mesh_id: string;
+	mesh_name?: string;
+	inviter_peer_id: string;
+	already_joined: boolean;
+}
+
+export interface MeshJoinRequest {
+	invite: string;
+}
+
+export interface MeshJoinedNotification {
+	peer_id: string;
+	transport: string;
+}
+
+export interface MeshNodesChangedNotification {
+	peer_id: string;
+	change: string;
+}
+
+export interface RemoteNodeInfo {
+	id: string;
+	label: string;
+	capabilities: string[];
+	active_sessions: number;
+	transport: string;
+	last_seen_at?: string;
+}
+
+export interface MeshNodesInfo {
+	nodes: RemoteNodeInfo[];
+}
+
+export interface MeshPeerExpiredNotification {
+	peer_id: string;
+}
+
+export interface MeshScopeInfo {
+	kind: string;
+	id: string;
+}
+
+export interface MeshStatusInfo {
+	enabled: boolean;
+	peer_id?: string;
+	transport?: string;
+	known_peer_count: number;
+	has_invite_store: boolean;
+	has_mesh_state_store: boolean;
+	scopes: MeshScopeInfo[];
 }
 
 /** Cached model list entry with canonical identity. */
@@ -739,6 +859,10 @@ export interface ModelEntry {
 	quant?: string;
 }
 
+export interface ModelsChangedNotification {
+	reason: string;
+}
+
 /** Result of updating a single OCI plugin, reported in `PluginUpdateComplete`. */
 export interface PluginUpdateResult {
 	plugin_name: string;
@@ -759,27 +883,65 @@ export interface RecentModelEntry {
 	use_count: number;
 }
 
-/** Information about a remote node discovered in the kameo mesh. */
-export interface RemoteNodeInfo {
-	/** Stable mesh node id (PeerId string). */
-	id: string;
-	/** Human-readable label / hostname */
-	label: string;
-	/** Node capabilities */
-	capabilities: string[];
-	/** Number of active sessions on the node */
-	active_sessions: number;
+export interface RemoteSessionAttachInfo {
+	session_id: string;
+	node_id: string;
+	attached: boolean;
+	config_options: Array<any>;
+	snapshot: any;
 }
 
-/** Schedule information DTO for the UI. */
+export interface RemoteSessionDismissInfo {
+	success: boolean;
+	session_id: string;
+}
+
+export interface RemoteSessionInfo {
+	id: string;
+	node_id: string;
+	node_label?: string;
+	title?: string;
+	cwd?: string;
+	updated_at?: string;
+	profile_id?: string;
+	model_id?: string;
+}
+
+export interface RemoteSessionListInfo {
+	node_id: string;
+	sessions: RemoteSessionInfo[];
+	next_offset?: number;
+	total_count: number;
+}
+
+export interface RemoteSessionsRequest {
+	node_id: string;
+	offset?: number;
+	limit?: number;
+}
+
+export interface RevokeMeshInviteRequest {
+	invite_id: string;
+}
+
+export interface ScheduleActionControlRequest {
+	node_id?: string;
+	schedule_public_id: string;
+}
+
+export interface ScheduleActionResult {
+	success: boolean;
+	node_id?: string;
+	schedule_public_id: string;
+	action: string;
+}
+
 export interface ScheduleInfo {
 	public_id: string;
 	task_public_id: string;
 	session_public_id: string;
 	node_id?: string;
-	/** Serialized trigger config */
 	trigger: any;
-	/** Current state: armed, running, paused, exhausted, failed */
 	state: string;
 	last_run_at?: string;
 	next_run_at?: string;
@@ -789,6 +951,20 @@ export interface ScheduleInfo {
 	max_runtime_seconds: number;
 	created_at: string;
 	updated_at: string;
+}
+
+export interface ScheduleListInfo {
+	node_id?: string;
+	session_id?: string;
+	schedules: ScheduleInfo[];
+}
+
+export interface SchedulesChangedNotification {
+	node_id?: string;
+	session_id?: string;
+	schedule_public_id: string;
+	change: string;
+	schedule?: ScheduleInfo;
 }
 
 export interface SessionSummary {

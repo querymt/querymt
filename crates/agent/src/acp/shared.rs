@@ -86,6 +86,7 @@ pub const QMT_NOTIFICATION_MESH_NODES_CHANGED: &str = "querymt/mesh/nodesChanged
 pub const QMT_NOTIFICATION_MESH_JOINED: &str = "querymt/mesh/joined";
 pub const QMT_NOTIFICATION_MESH_PEER_EXPIRED: &str = "querymt/mesh/peerExpired";
 pub const QMT_NOTIFICATION_MODELS_CHANGED: &str = "querymt/models/changed";
+pub const QMT_NOTIFICATION_SCHEDULES_CHANGED: &str = "querymt/schedules/changed";
 
 fn ext_notification(method: &str, params: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
@@ -98,38 +99,53 @@ fn ext_notification(method: &str, params: serde_json::Value) -> serde_json::Valu
 pub fn mesh_nodes_changed_notification(peer_id: &str, change: &str) -> serde_json::Value {
     ext_notification(
         QMT_NOTIFICATION_MESH_NODES_CHANGED,
-        serde_json::json!({
-            "peerId": peer_id,
-            "change": change,
-        }),
+        serde_json::to_value(
+            crate::control::notifications::MeshNodesChangedNotification {
+                peer_id: peer_id.to_string(),
+                change: change.to_string(),
+            },
+        )
+        .expect("serialize mesh nodes changed notification"),
     )
 }
 
 pub fn mesh_joined_notification(peer_id: &str, transport: &str) -> serde_json::Value {
     ext_notification(
         QMT_NOTIFICATION_MESH_JOINED,
-        serde_json::json!({
-            "peerId": peer_id,
-            "transport": transport,
-        }),
+        serde_json::to_value(crate::control::notifications::MeshJoinedNotification {
+            peer_id: peer_id.to_string(),
+            transport: transport.to_string(),
+        })
+        .expect("serialize mesh joined notification"),
     )
 }
 
 pub fn mesh_peer_expired_notification(peer_id: &str) -> serde_json::Value {
     ext_notification(
         QMT_NOTIFICATION_MESH_PEER_EXPIRED,
-        serde_json::json!({
-            "peerId": peer_id,
-        }),
+        serde_json::to_value(crate::control::notifications::MeshPeerExpiredNotification {
+            peer_id: peer_id.to_string(),
+        })
+        .expect("serialize mesh peer expired notification"),
     )
 }
 
 pub fn models_changed_notification(reason: &str) -> serde_json::Value {
     ext_notification(
         QMT_NOTIFICATION_MODELS_CHANGED,
-        serde_json::json!({
-            "reason": reason,
-        }),
+        serde_json::to_value(crate::control::notifications::ModelsChangedNotification {
+            reason: reason.to_string(),
+        })
+        .expect("serialize models changed notification"),
+    )
+}
+
+pub fn schedules_changed_notification(
+    payload: crate::control::notifications::SchedulesChangedNotification,
+) -> serde_json::Value {
+    ext_notification(
+        QMT_NOTIFICATION_SCHEDULES_CHANGED,
+        serde_json::to_value(payload).expect("serialize schedules changed notification"),
     )
 }
 
@@ -1085,7 +1101,7 @@ mod tests {
             serde_json::json!(QMT_NOTIFICATION_MESH_NODES_CHANGED)
         );
         assert_eq!(
-            nodes_changed["params"]["peerId"],
+            nodes_changed["params"]["peer_id"],
             serde_json::json!("peer-1")
         );
         assert_eq!(
@@ -1099,7 +1115,7 @@ mod tests {
             serde_json::json!(QMT_NOTIFICATION_MESH_PEER_EXPIRED)
         );
         assert_eq!(
-            peer_expired["params"]["peerId"],
+            peer_expired["params"]["peer_id"],
             serde_json::json!("peer-2")
         );
 
@@ -1111,6 +1127,28 @@ mod tests {
         assert_eq!(
             models_changed["params"]["reason"],
             serde_json::json!("manual_refresh")
+        );
+
+        let schedules_changed = schedules_changed_notification(
+            crate::control::notifications::SchedulesChangedNotification {
+                node_id: Some("node-a".to_string()),
+                session_id: Some("session-a".to_string()),
+                schedule_public_id: "sched-1".to_string(),
+                change: "created".to_string(),
+                schedule: None,
+            },
+        );
+        assert_eq!(
+            schedules_changed["method"],
+            serde_json::json!(QMT_NOTIFICATION_SCHEDULES_CHANGED)
+        );
+        assert_eq!(
+            schedules_changed["params"]["schedule_public_id"],
+            serde_json::json!("sched-1")
+        );
+        assert_eq!(
+            schedules_changed["params"]["change"],
+            serde_json::json!("created")
         );
     }
 

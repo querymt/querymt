@@ -7,6 +7,7 @@ pub mod prelude;
 pub use api as simple;
 
 pub mod config;
+pub mod control;
 pub mod runner;
 pub mod template;
 

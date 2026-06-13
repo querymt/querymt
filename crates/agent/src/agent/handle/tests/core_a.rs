@@ -169,8 +169,8 @@ async fn test_list_remote_nodes_prefers_per_peer_lookup() {
     mesh.inject_known_peer_for_test(peer_id);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let nodes = f.handle.list_remote_nodes().await;
-    let labels: HashSet<_> = nodes.into_iter().map(|node| node.hostname).collect();
+    let nodes = crate::control::remote::list_remote_nodes(&f.handle).await;
+    let labels: HashSet<_> = nodes.into_iter().map(|node| node.label).collect();
 
     assert!(
         labels.contains("peer-alpha"),

@@ -305,7 +305,12 @@ impl LocalAgentHandle {
 
 // ── Tests ─────────────────────────────────────────────────────────────────
 
+mod capabilities;
 mod core_a;
 mod core_b;
+mod mesh;
 mod remote;
+mod remote_ext;
+mod schedule_get_remote;
+mod schedule_notifications;
 mod scheduler;

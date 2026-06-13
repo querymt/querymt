@@ -1,6 +1,6 @@
 #![cfg(all(test, feature = "api", feature = "remote"))]
 
-use crate::agent::remote::RemoteSessionInfo;
+use crate::agent::remote::RemoteSessionSnapshot;
 use crate::ui::handlers::refresh_attached_remote_summary;
 use crate::ui::messages::SessionSummary;
 use std::collections::HashMap;
@@ -33,7 +33,7 @@ fn refresh_attached_remote_summary_updates_title_for_attached_session() {
         &mut by_node,
         "peer-a",
         "node-123",
-        &RemoteSessionInfo {
+        &RemoteSessionSnapshot {
             session_id: "sess-1".to_string(),
             actor_id: 42,
             cwd: Some("/tmp".to_string()),
@@ -79,7 +79,7 @@ fn refresh_attached_remote_summary_does_not_clear_existing_title_on_none() {
         &mut by_node,
         "peer-a",
         "node-123",
-        &RemoteSessionInfo {
+        &RemoteSessionSnapshot {
             session_id: "sess-1".to_string(),
             actor_id: 42,
             cwd: Some("/tmp".to_string()),

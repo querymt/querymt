@@ -11,14 +11,12 @@
 
 use super::super::ServerState;
 use super::super::connection::{send_error, send_message};
-use super::super::messages::{MeshInviteInfo, UiServerMessage};
+use super::super::messages::UiServerMessage;
 use super::session_ops::{ListSessionsRequest, handle_list_sessions};
 #[cfg(feature = "remote")]
 use crate::agent::remote::node_manager::SessionHandoff;
 #[cfg(feature = "remote")]
 use crate::agent::remote::scope::MeshScopeId;
-#[cfg(feature = "remote")]
-use crate::agent::utils::u32_from_usize;
 #[cfg(feature = "remote")]
 use kameo::actor::RemoteActorRef;
 #[cfg(feature = "remote")]
@@ -27,29 +25,8 @@ use tokio::sync::mpsc;
 
 /// List remote nodes discovered in the kameo mesh.
 pub async fn handle_list_remote_nodes(state: &ServerState, tx: &mpsc::Sender<String>) {
-    #[cfg(feature = "remote")]
-    {
-        let nodes = state.get_remote_nodes_cached().await;
-        let _ = send_message(
-            tx,
-            UiServerMessage::RemoteNodes {
-                nodes: nodes
-                    .into_iter()
-                    .map(|n| super::super::messages::RemoteNodeInfo {
-                        id: n.node_id.to_string(),
-                        label: n.hostname,
-                        capabilities: n.capabilities,
-                        active_sessions: u32_from_usize(n.active_sessions, "active_sessions", None),
-                    })
-                    .collect(),
-            },
-        )
-        .await;
-    }
-    #[cfg(not(feature = "remote"))]
-    {
-        let _ = send_message(tx, UiServerMessage::RemoteNodes { nodes: Vec::new() }).await;
-    }
+    let nodes = crate::control::remote::list_remote_nodes(&state.agent).await;
+    let _ = send_message(tx, UiServerMessage::RemoteNodes { nodes }).await;
 }
 
 /// List sessions on a specific remote node.
@@ -60,62 +37,27 @@ pub async fn handle_list_remote_sessions(
     limit: Option<u32>,
     tx: &mpsc::Sender<String>,
 ) {
-    #[cfg(feature = "remote")]
-    {
-        let node_manager_ref = match state.agent.find_node_manager(node_id).await {
-            Ok(r) => r,
-            Err(e) => {
-                log::warn!("handle_list_remote_sessions: {}", e.message);
-                let _ = send_message(
-                    tx,
-                    UiServerMessage::RemoteSessions {
-                        node_id: node_id.to_string(),
-                        sessions: Vec::new(),
-                        next_offset: None,
-                        total_count: Some(0),
-                    },
-                )
-                .await;
-                return;
-            }
-        };
-
-        match state
-            .agent
-            .list_remote_sessions(&node_manager_ref, offset, limit)
-            .await
-        {
-            Ok(response) => {
-                let _ = send_message(
-                    tx,
-                    UiServerMessage::RemoteSessions {
-                        node_id: node_id.to_string(),
-                        sessions: response.sessions,
-                        next_offset: response.next_offset,
-                        total_count: Some(response.total_count),
-                    },
-                )
-                .await;
-            }
-            Err(e) => {
-                log::warn!("handle_list_remote_sessions: {}", e.message);
-                let _ =
-                    send_error(tx, format!("Failed to list remote sessions: {}", e.message)).await;
-            }
+    let request = crate::control::remote::RemoteSessionsRequest {
+        node_id: node_id.to_string(),
+        offset,
+        limit,
+    };
+    match crate::control::remote::list_remote_sessions(&state.agent, request).await {
+        Ok(response) => {
+            let _ = send_message(
+                tx,
+                UiServerMessage::RemoteSessions {
+                    node_id: response.node_id,
+                    sessions: response.sessions,
+                    next_offset: response.next_offset,
+                    total_count: Some(response.total_count),
+                },
+            )
+            .await;
         }
-    }
-    #[cfg(not(feature = "remote"))]
-    {
-        let _ = send_message(
-            tx,
-            UiServerMessage::RemoteSessions {
-                node_id: node_id.to_string(),
-                sessions: Vec::new(),
-                next_offset: None,
-                total_count: Some(0),
-            },
-        )
-        .await;
+        Err(e) => {
+            let _ = send_error(tx, format!("Failed to list remote sessions: {e}")).await;
+        }
     }
 }
 
@@ -580,59 +522,22 @@ pub async fn handle_create_mesh_invite(
 ) {
     #[cfg(feature = "remote")]
     {
-        let Some(mesh) = state.agent.mesh() else {
-            let _ = send_error(tx, "mesh not bootstrapped — start with --mesh".to_string()).await;
-            return;
+        let request = crate::control::mesh::CreateMeshInviteRequest {
+            mesh_name,
+            ttl,
+            max_uses,
         };
-
-        if !mesh.is_iroh_transport_internal() {
-            let _ = send_error(
-                tx,
-                "Mesh invites require iroh transport. Restart host with --mesh --mesh-invite (or set transport=iroh).".to_string(),
-            )
-            .await;
-            return;
-        }
-
-        let ttl_secs = ttl
-            .as_deref()
-            .and_then(crate::agent::remote::invite::parse_duration_secs)
-            .or(Some(24 * 3600));
-
-        match mesh.create_invite(mesh_name.clone(), ttl_secs, max_uses, false) {
+        match crate::control::mesh::create_invite(&state.agent, request).await {
             Ok(invite) => {
-                let scope = crate::agent::remote::scope::MeshScopeId::Iroh {
-                    mesh_id: crate::agent::remote::invite::mesh_id_for(
-                        &invite.grant.inviter_peer_id,
-                        invite.grant.mesh_name.as_deref(),
-                    ),
-                };
-                if let Err(e) = state
-                    .agent
-                    .publish_mesh_scope(
-                        &crate::agent::remote::MeshRuntimeHandle::from(mesh.clone()),
-                        &scope,
-                    )
-                    .await
-                {
-                    log::warn!(
-                        "handle_create_mesh_invite: failed to publish local actors for scope {}: {}",
-                        scope,
-                        e
-                    );
-                }
-
-                let url = invite.to_url();
-                let qr_code = crate::agent::remote::qr::render_to_terminal(&url);
                 let _ = send_message(
                     tx,
                     UiServerMessage::MeshInviteCreated {
-                        invite_id: invite.grant.invite_id,
-                        url,
-                        qr_code,
-                        expires_at: invite.grant.expires_at,
-                        max_uses: invite.grant.max_uses,
-                        mesh_name,
+                        invite_id: invite.invite_id,
+                        url: invite.url,
+                        qr_code: invite.qr_code,
+                        expires_at: invite.expires_at,
+                        max_uses: invite.max_uses,
+                        mesh_name: invite.mesh_name,
                     },
                 )
                 .await;
@@ -656,45 +561,12 @@ pub async fn handle_create_mesh_invite(
 pub async fn handle_list_mesh_invites(state: &ServerState, tx: &mpsc::Sender<String>) {
     #[cfg(feature = "remote")]
     {
-        let Some(mesh) = state.agent.mesh() else {
-            let _ = send_message(
-                tx,
-                UiServerMessage::MeshInviteList {
-                    invites: Vec::new(),
-                },
-            )
-            .await;
-            return;
-        };
-
-        let invites = if let Some(store) = mesh.invite_store() {
-            let store = store.read();
-            store
-                .list_pending()
-                .into_iter()
-                .map(|r| MeshInviteInfo {
-                    invite_id: r.invite_id.clone(),
-                    mesh_name: r.grant.mesh_name.clone(),
-                    expires_at: r.grant.expires_at,
-                    max_uses: r.grant.max_uses,
-                    uses_remaining: r.uses_remaining,
-                    status: match r.status {
-                        crate::agent::remote::invite::InviteStatus::Pending => {
-                            "pending".to_string()
-                        }
-                        crate::agent::remote::invite::InviteStatus::Consumed => {
-                            "consumed".to_string()
-                        }
-                        crate::agent::remote::invite::InviteStatus::Revoked => {
-                            "revoked".to_string()
-                        }
-                    },
-                    used_by: r.used_by.clone(),
-                    created_at: r.created_at,
-                })
-                .collect()
-        } else {
-            Vec::new()
+        let invites = match crate::control::mesh::list_invites(&state.agent).await {
+            Ok(response) => response.invites,
+            Err(e) => {
+                let _ = send_error(tx, format!("Failed to list mesh invites: {e}")).await;
+                return;
+            }
         };
 
         let _ = send_message(tx, UiServerMessage::MeshInviteList { invites }).await;
@@ -719,35 +591,17 @@ pub async fn handle_revoke_mesh_invite(
 ) {
     #[cfg(feature = "remote")]
     {
-        let Some(mesh) = state.agent.mesh() else {
-            let _ = send_message(
-                tx,
-                UiServerMessage::MeshInviteRevoked {
-                    invite_id: invite_id.to_string(),
-                    success: false,
-                    message: Some("mesh not bootstrapped — start with --mesh".to_string()),
-                },
-            )
-            .await;
-            return;
+        let request = crate::control::mesh::RevokeMeshInviteRequest {
+            invite_id: invite_id.to_string(),
         };
-
-        let result = if let Some(store) = mesh.invite_store() {
-            store.write().revoke(invite_id)
-        } else {
-            Err(crate::agent::remote::invite::InviteError::StoreError(
-                "invite store not available".to_string(),
-            ))
-        };
-
-        match result {
-            Ok(()) => {
+        match crate::control::mesh::revoke_invite(&state.agent, request).await {
+            Ok(result) => {
                 let _ = send_message(
                     tx,
                     UiServerMessage::MeshInviteRevoked {
-                        invite_id: invite_id.to_string(),
-                        success: true,
-                        message: None,
+                        invite_id: result.invite_id,
+                        success: result.success,
+                        message: result.message,
                     },
                 )
                 .await;
