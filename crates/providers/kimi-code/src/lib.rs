@@ -346,6 +346,7 @@ impl HTTPLLMProviderFactory for KimiCodeFactory {
             "kimi-k2-turbo-preview".to_string(),
             "kimi-k2.5".to_string(),
             "kimi-k2.6".to_string(),
+            "kimi-k2.7".to_string(),
         ])
     }
 
