@@ -15,9 +15,6 @@
 //!
 //! All other messages use JSON text frames as before.
 
-#[cfg(feature = "remote")]
-use crate::agent::utils::u32_from_usize;
-
 use super::messages::{RoutingMode, UiClientMessage, UiServerMessage};
 use super::session::{
     PRIMARY_AGENT_ID, active_profile_id, build_agent_list, list_profiles, mode_for_session,
@@ -608,7 +605,6 @@ async fn update_live_cursor(
 /// pushing the fresh node list to the client.
 #[cfg(feature = "remote")]
 pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
-    use super::messages::RemoteNodeInfo;
     use crate::agent::remote::PeerEvent;
 
     let Some(mesh) = state.agent.mesh() else {
@@ -682,19 +678,8 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                             let nodes = state.get_remote_nodes_cached().await;
 
                             let msg = UiServerMessage::RemoteNodes {
-                                nodes: nodes
-                                    .iter()
-                                    .map(|n| RemoteNodeInfo {
-                                        id: n.node_id.to_string(),
-                                        label: n.hostname.clone(),
-                                        capabilities: n.capabilities.clone(),
-                                        active_sessions: u32_from_usize(
-                                            n.active_sessions,
-                                            "active_sessions",
-                                            None,
-                                        ),
-                                    })
-                                    .collect(),
+                                nodes: crate::control::remote::list_remote_nodes(&state.agent)
+                                    .await,
                             };
 
                             if send_message(&tx, msg).await.is_err() {
@@ -777,19 +762,7 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                         }
 
                         let msg = UiServerMessage::RemoteNodes {
-                            nodes: nodes
-                                .into_iter()
-                                .map(|n| RemoteNodeInfo {
-                                    id: n.node_id.to_string(),
-                                    label: n.hostname,
-                                    capabilities: n.capabilities,
-                                    active_sessions: u32_from_usize(
-                                        n.active_sessions,
-                                        "active_sessions",
-                                        None,
-                                    ),
-                                })
-                                .collect(),
+                            nodes: crate::control::remote::list_remote_nodes(&state.agent).await,
                         };
 
                         if send_message(&tx, msg).await.is_err() {
@@ -806,21 +779,12 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                             if tx_delayed.is_closed() {
                                 return;
                             }
-                            let nodes = state_delayed.get_remote_nodes_cached().await;
+                            let _nodes = state_delayed.get_remote_nodes_cached().await;
                             let msg = UiServerMessage::RemoteNodes {
-                                nodes: nodes
-                                    .into_iter()
-                                    .map(|n| RemoteNodeInfo {
-                                        id: n.node_id.to_string(),
-                                        label: n.hostname,
-                                        capabilities: n.capabilities,
-                                        active_sessions: u32_from_usize(
-                                            n.active_sessions,
-                                            "active_sessions",
-                                            None,
-                                        ),
-                                    })
-                                    .collect(),
+                                nodes: crate::control::remote::list_remote_nodes(
+                                    &state_delayed.agent,
+                                )
+                                .await,
                             };
                             let _ = send_message(&tx_delayed, msg).await;
                         });
@@ -831,21 +795,9 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
                     log::warn!("spawn_peer_event_watcher: lagged by {n} events, re-querying");
                     state.invalidate_remote_node_cache().await;
                     state.agent.model_inventory.invalidate_remote().await;
-                    let nodes = state.get_remote_nodes_cached().await;
+                    let _nodes = state.get_remote_nodes_cached().await;
                     let msg = UiServerMessage::RemoteNodes {
-                        nodes: nodes
-                            .into_iter()
-                            .map(|n| RemoteNodeInfo {
-                                id: n.node_id.to_string(),
-                                label: n.hostname,
-                                capabilities: n.capabilities,
-                                active_sessions: u32_from_usize(
-                                    n.active_sessions,
-                                    "active_sessions",
-                                    None,
-                                ),
-                            })
-                            .collect(),
+                        nodes: crate::control::remote::list_remote_nodes(&state.agent).await,
                     };
                     if send_message(&tx, msg).await.is_err() {
                         break;

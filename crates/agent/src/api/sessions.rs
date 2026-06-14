@@ -493,7 +493,7 @@ impl AgentSessions {
     async fn list_remote_sessions_for_node(
         agent: Arc<LocalAgentHandle>,
         node_id: String,
-    ) -> Option<Vec<crate::agent::remote::RemoteSessionInfo>> {
+    ) -> Option<Vec<crate::agent::remote::RemoteSessionSnapshot>> {
         let nm_ref = agent.find_node_manager(&node_id).await.ok()?;
         agent
             .list_remote_sessions(&nm_ref, None, None)

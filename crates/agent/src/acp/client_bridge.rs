@@ -44,7 +44,8 @@
 //! ```
 
 use agent_client_protocol::schema::{
-    Error, RequestPermissionRequest, RequestPermissionResponse, SessionNotification,
+    Error, ExtNotification, RequestPermissionRequest, RequestPermissionResponse,
+    SessionNotification,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -53,12 +54,16 @@ use tokio::sync::{mpsc, oneshot};
 /// These messages cross the `Send`/`!Send` boundary via an mpsc channel.
 /// The bridge task running in a `LocalSet` receives these messages and
 /// forwards them to the `!Send` client connection.
+#[derive(Debug)]
 pub enum ClientBridgeMessage {
     /// Fire-and-forget session notification.
     ///
     /// The bridge task will call `connection.session_notification(...)`.
     /// No response is expected.
     Notification(SessionNotification),
+
+    /// Fire-and-forget ACP extension notification payload.
+    ExtNotification(ExtNotification),
 
     /// Request-response permission request.
     ///
@@ -135,6 +140,13 @@ impl ClientBridgeSender {
     pub async fn notify(&self, notification: SessionNotification) -> Result<(), Error> {
         self.tx
             .send(ClientBridgeMessage::Notification(notification))
+            .await
+            .map_err(|_| Error::from(crate::error::AgentError::ClientBridgeClosed))
+    }
+
+    pub async fn notify_ext(&self, notification: ExtNotification) -> Result<(), Error> {
+        self.tx
+            .send(ClientBridgeMessage::ExtNotification(notification))
             .await
             .map_err(|_| Error::from(crate::error::AgentError::ClientBridgeClosed))
     }

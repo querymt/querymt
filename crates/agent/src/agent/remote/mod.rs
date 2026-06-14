@@ -118,7 +118,7 @@ pub use node_manager::{
     ListRemoteSessions, PauseRemoteSchedule, RemoteNodeManager, ResumeRemoteSchedule,
     ResumeRemoteSession, StopRemoteSessionRuntime, TriggerRemoteSchedule,
 };
-pub use node_manager::{ListRemoteSessionsResponse, NodeInfo, RemoteSessionInfo};
+pub use node_manager::{ListRemoteSessionsResponse, NodeInfo, RemoteSessionSnapshot};
 #[cfg(feature = "remote")]
 pub use querymt_remote::MeshChatProvider;
 #[cfg(feature = "remote")]

@@ -38,6 +38,9 @@ pub enum AgentError {
     #[error("session execution timeout: {details}")]
     SessionTimeout { details: String },
 
+    #[error("schedule not found: {schedule_public_id}")]
+    ScheduleNotFound { schedule_public_id: String },
+
     // --- MCP / Protocol ---
     #[error("MCP {transport} server failed: {reason}")]
     McpServerFailed { transport: String, reason: String },
@@ -92,14 +95,16 @@ pub enum AgentError {
 /// | Code    | ACP meaning        | Used for                                          |
 /// |---------|--------------------|---------------------------------------------------|
 /// | -32601  | MethodNotFound     | `MethodNotImplemented`                            |
-/// | -32002  | ResourceNotFound   | `SessionNotFound`, `RemoteSessionNotFound`        |
+/// | -32002  | ResourceNotFound   | `SessionNotFound`, `RemoteSessionNotFound`, `ScheduleNotFound` |
 /// | -32603  | InternalError      | everything else (replaces the old -32000 catch-all) |
 impl From<AgentError> for AcpError {
     fn from(e: AgentError) -> Self {
         let code: i32 = match &e {
             AgentError::MethodNotImplemented { .. } => -32601, // MethodNotFound
-            AgentError::SessionNotFound { .. } | AgentError::RemoteSessionNotFound { .. } => -32002, // ResourceNotFound
-            _ => -32603, // InternalError
+            AgentError::SessionNotFound { .. }
+            | AgentError::RemoteSessionNotFound { .. }
+            | AgentError::ScheduleNotFound { .. } => -32002, // ResourceNotFound
+            _ => -32603,                                       // InternalError
         };
         AcpError::new(code, e.to_string())
     }
