@@ -2,7 +2,7 @@ use super::session::AgentSession;
 use crate::agent::LocalAgentHandle;
 use crate::session::load_snapshot::{SessionLoadSnapshot, load_session_snapshot};
 use crate::session::projection::{SessionListItem, SessionScope, ViewStore};
-use crate::session::store::{Session, SessionStore};
+use crate::session::store::SessionStore;
 use agent_client_protocol::schema::{
     ListSessionsRequest as AcpListSessionsRequest, ListSessionsResponse as AcpListSessionsResponse,
     LoadSessionRequest, NewSessionRequest, SessionId, SessionInfo,
@@ -203,14 +203,7 @@ impl AgentSessions {
         &self,
         request: AcpListSessionsRequest,
     ) -> Result<AcpListSessionsResponse> {
-        Self::list_acp_from_store(self.session_store(), request).await
-    }
-
-    pub async fn list_acp_from_store(
-        session_store: Arc<dyn SessionStore>,
-        request: AcpListSessionsRequest,
-    ) -> Result<AcpListSessionsResponse> {
-        let page = Self::list_for_acp_from_store(session_store, request).await?;
+        let page = self.list_for_acp(request).await?;
         Ok(AcpListSessionsResponse::new(page.sessions).next_cursor(page.next_cursor))
     }
 
@@ -218,44 +211,27 @@ impl AgentSessions {
         &self,
         request: AcpListSessionsRequest,
     ) -> Result<AcpSessionListPage> {
-        Self::list_for_acp_from_store(self.session_store(), request).await
+        Self::list_for_acp_from_view_store(self.view_store()?, request).await
     }
 
-    pub(crate) async fn list_for_acp_from_store(
-        session_store: Arc<dyn SessionStore>,
+    pub(crate) async fn list_for_acp_from_view_store(
+        view_store: Arc<dyn ViewStore>,
         request: AcpListSessionsRequest,
     ) -> Result<AcpSessionListPage> {
-        let sessions = session_store.list_sessions().await?;
-        let requested_cwd = request.cwd;
-        let mut filtered_infos: Vec<SessionInfo> = sessions
-            .into_iter()
-            .filter(|session| match requested_cwd.as_ref() {
-                Some(cwd) => session.cwd.as_ref() == Some(cwd),
-                None => true,
-            })
-            .map(session_to_acp_info)
-            .collect();
-
-        filtered_infos.sort_by(|a, b| {
-            b.updated_at
-                .cmp(&a.updated_at)
-                .then_with(|| a.session_id.to_string().cmp(&b.session_id.to_string()))
-        });
-
-        let start_idx = request
-            .cursor
-            .as_ref()
-            .and_then(|cursor| cursor.parse::<usize>().ok())
-            .unwrap_or(0);
+        let requested_cwd = request.cwd.map(|cwd| cwd.display().to_string());
         let limit = 100usize;
-        let end_idx = (start_idx + limit).min(filtered_infos.len());
-        let paginated = filtered_infos[start_idx..end_idx].to_vec();
-        let next_cursor = (end_idx < filtered_infos.len()).then(|| end_idx.to_string());
+
+        let (sessions, next_cursor, total_count) = view_store
+            .list_session_items(requested_cwd, request.cursor, limit, SessionScope::All)
+            .await?;
 
         Ok(AcpSessionListPage {
-            sessions: paginated,
+            sessions: sessions
+                .into_iter()
+                .map(session_list_item_to_acp_info)
+                .collect(),
             next_cursor,
-            total_count: filtered_infos.len() as u64,
+            total_count: total_count as u64,
         })
     }
 
@@ -590,13 +566,13 @@ impl From<crate::session::projection::SessionGroup> for SessionGroup {
     }
 }
 
-fn session_to_acp_info(session: Session) -> SessionInfo {
+fn session_list_item_to_acp_info(item: SessionListItem) -> SessionInfo {
     let mut info = SessionInfo::new(
-        SessionId::from(session.public_id),
-        session.cwd.unwrap_or_default(),
+        SessionId::from(item.session_id),
+        item.cwd.map(PathBuf::from).unwrap_or_default(),
     );
-    info.title = session.name;
-    info.updated_at = session
+    info.title = item.name.or(item.title);
+    info.updated_at = item
         .updated_at
         .and_then(|updated_at| updated_at.format(&Rfc3339).ok());
     info

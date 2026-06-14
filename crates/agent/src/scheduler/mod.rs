@@ -1818,7 +1818,6 @@ mod unit_tests {
     /// of lingering until their next failed `tell()` attempt.
     #[tokio::test]
     async fn shutdown_token_is_cancelled_on_abort() {
-        use crate::session::backend::StorageBackend;
         use crate::session::repo_schedule::SqliteScheduleRepository;
         use crate::session::schema;
         use crate::test_utils::{
@@ -1857,8 +1856,7 @@ mod unit_tests {
         let config = Arc::new(
             crate::agent::agent_config_builder::AgentConfigBuilder::new(
                 Arc::new(plugin_registry),
-                session_store.clone(),
-                storage.event_journal(),
+                storage.clone(),
                 LLMParams::new().provider("mock").model("mock-model"),
             )
             .build(),

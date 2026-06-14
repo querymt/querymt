@@ -44,12 +44,7 @@ async fn test_agent_config() -> (Arc<AgentConfig>, TempDir) {
     );
     let llm = LLMParams::new().provider("mock").model("mock");
 
-    let mut builder = AgentConfigBuilder::new(
-        plugin_registry,
-        storage.session_store(),
-        storage.event_journal(),
-        llm,
-    );
+    let mut builder = AgentConfigBuilder::new(plugin_registry, storage.clone(), llm);
     if let Some(repo) = storage.schedule_repository() {
         builder = builder.with_schedule_repository(repo);
     }

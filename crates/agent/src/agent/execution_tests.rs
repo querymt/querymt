@@ -162,6 +162,7 @@ impl TestHarness {
 
         let config = Arc::new(
             crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+                event_journal_storage.clone(),
                 provider_context,
                 event_journal_storage.event_journal(),
             )
@@ -498,6 +499,7 @@ async fn test_middleware_stops_execution() {
     // Rebuild config with the StopOnBeforeLlmCall middleware
     harness.config = Arc::new(
         crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+            harness.config.storage.clone(),
             harness.config.provider.clone(),
             harness.config.event_sink.journal().clone(),
         )

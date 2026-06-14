@@ -15,6 +15,7 @@ use crate::events::{AgentEventKind, DurableEvent};
 use crate::hooks::Hooks;
 use crate::index::WorkspaceIndexManagerActor;
 use crate::middleware::{CompositeDriver, MiddlewareDriver};
+use crate::session::backend::StorageBackend;
 use crate::session::compaction::SessionCompaction;
 
 use crate::session::provider::SessionProvider;
@@ -38,6 +39,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 pub struct AgentConfig {
     // ── Infrastructure (Arc, thread-safe) ────────────────────────
     pub provider: Arc<SessionProvider>,
+    pub storage: Arc<dyn StorageBackend>,
     pub event_sink: Arc<EventSink>,
     pub agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
     pub workspace_manager_actor: ActorRef<WorkspaceIndexManagerActor>,
@@ -404,26 +406,17 @@ mod tests {
     use super::*;
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
-    use crate::session::backend::StorageBackend;
     use crate::session::sqlite_storage::SqliteStorage;
     use crate::test_utils::helpers::empty_plugin_registry;
     use querymt::LLMParams;
     use std::sync::Arc;
 
     async fn make_config() -> (Arc<AgentConfig>, tempfile::TempDir) {
-        use crate::session::backend::StorageBackend;
         let (registry, temp_dir) = empty_plugin_registry().unwrap();
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm = LLMParams::new().provider("mock").model("mock-model");
-        let config = Arc::new(
-            AgentConfigBuilder::new(
-                Arc::new(registry),
-                storage.session_store(),
-                storage.event_journal(),
-                llm,
-            )
-            .build(),
-        );
+        let config =
+            Arc::new(AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm).build());
         (config, temp_dir)
     }
 
@@ -441,14 +434,9 @@ mod tests {
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm = LLMParams::new().provider("mock").model("mock");
         let config = Arc::new(
-            AgentConfigBuilder::new(
-                Arc::new(registry),
-                storage.session_store(),
-                storage.event_journal(),
-                llm,
-            )
-            .with_denied_tools(["shell".to_string()])
-            .build(),
+            AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm)
+                .with_denied_tools(["shell".to_string()])
+                .build(),
         );
         assert!(!config.is_tool_allowed("shell"));
         assert!(config.is_tool_allowed("read_tool"));
@@ -460,14 +448,9 @@ mod tests {
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm = LLMParams::new().provider("mock").model("mock");
         let config = Arc::new(
-            AgentConfigBuilder::new(
-                Arc::new(registry),
-                storage.session_store(),
-                storage.event_journal(),
-                llm,
-            )
-            .with_allowed_tools(["read_tool", "shell"])
-            .build(),
+            AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm)
+                .with_allowed_tools(["read_tool", "shell"])
+                .build(),
         );
         assert!(config.is_tool_allowed("read_tool"));
         assert!(config.is_tool_allowed("shell"));
@@ -552,14 +535,9 @@ mod tests {
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm = LLMParams::new().provider("mock").model("mock");
         let config = Arc::new(
-            AgentConfigBuilder::new(
-                Arc::new(registry),
-                storage.session_store(),
-                storage.event_journal(),
-                llm,
-            )
-            .with_max_steps(100)
-            .build(),
+            AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm)
+                .with_max_steps(100)
+                .build(),
         );
         let _driver = config.create_driver();
         let limits = config.get_session_limits();

@@ -289,16 +289,12 @@ impl QuorumBuilder {
             let delegation_wait_policy_for_delegate = self.delegation_wait_policy.clone();
             let delegation_wait_timeout_for_delegate = self.delegation_wait_timeout_secs;
             let delegation_cancel_grace_for_delegate = self.delegation_cancel_grace_secs;
-            builder = builder.add_delegate_agent(agent_info, move |store, event_journal| {
-                let mut b = AgentConfigBuilder::new(
-                    registry.clone(),
-                    store.clone(),
-                    event_journal.clone(),
-                    llm_config.clone(),
-                )
-                .with_agent_id(delegate_agent_id.clone())
-                .with_tool_policy(ToolPolicy::BuiltInOnly)
-                .with_snapshot_policy(snapshot_policy_for_delegate);
+            builder = builder.add_delegate_agent(agent_info, move |storage| {
+                let mut b =
+                    AgentConfigBuilder::new(registry.clone(), storage.clone(), llm_config.clone())
+                        .with_agent_id(delegate_agent_id.clone())
+                        .with_tool_policy(ToolPolicy::BuiltInOnly)
+                        .with_snapshot_policy(snapshot_policy_for_delegate);
 
                 if snapshot_policy_for_delegate != SnapshotPolicy::None {
                     b = b.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
@@ -413,11 +409,10 @@ impl QuorumBuilder {
         let delegation_wait_policy_for_planner = self.delegation_wait_policy.clone();
         let delegation_wait_timeout_for_planner = self.delegation_wait_timeout_secs;
         let delegation_cancel_grace_for_planner = self.delegation_cancel_grace_secs;
-        builder = builder.with_planner(move |store, event_journal, agent_registry| {
+        builder = builder.with_planner(move |storage, agent_registry| {
             let mut b = AgentConfigBuilder::new(
                 registry_for_planner.clone(),
-                store.clone(),
-                event_journal.clone(),
+                storage.clone(),
                 planner_llm.clone(),
             )
             .with_agent_id("planner")
@@ -935,10 +930,14 @@ fn apply_middleware_from_config(
     };
 
     let factory_config = Arc::new(
-        AgentConfigBuilder::from_provider(builder.provider().clone(), builder.event_journal())
-            .with_agent_registry(builder.agent_registry())
-            .with_execution_policy(ephemeral_policy)
-            .build(),
+        AgentConfigBuilder::from_provider(
+            builder.storage().clone(),
+            builder.provider().clone(),
+            builder.event_journal(),
+        )
+        .with_agent_registry(builder.agent_registry())
+        .with_execution_policy(ephemeral_policy)
+        .build(),
     );
 
     for entry in entries {

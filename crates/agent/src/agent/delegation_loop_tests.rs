@@ -161,10 +161,12 @@ impl TestHarness {
         let registry = Arc::new(registry);
 
         // Use a single shared in-memory SQLite store for orchestrator and delegates.
-        let shared_storage = SqliteStorage::connect(":memory:".into())
-            .await
-            .expect("shared sqlite storage");
-        let store: Arc<dyn SessionStore> = Arc::new(shared_storage.clone());
+        let shared_storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("shared sqlite storage"),
+        );
+        let store: Arc<dyn SessionStore> = shared_storage.clone();
 
         let provider_context = crate::session::provider::SessionProvider::new(
             registry,
@@ -211,6 +213,7 @@ impl TestHarness {
 
         let config = Arc::new(
             crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+                shared_storage.clone(),
                 provider_context,
                 shared_storage.event_journal(),
             )
@@ -379,6 +382,7 @@ async fn build_delegate_handle(
     );
 
     let mut builder = crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+        delegate_event_storage.clone(),
         delegate_session_provider,
         delegate_event_storage.event_journal(),
     )

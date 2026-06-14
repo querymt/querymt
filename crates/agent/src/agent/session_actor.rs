@@ -2119,9 +2119,10 @@ mod tests {
                 .expect_get_session_llm_config()
                 .returning(move |_| Ok(Some(llm_for_mock.clone())))
                 .times(0..);
+            let llm_config_for_mock = llm_config.clone();
             store
                 .expect_get_llm_config()
-                .returning(move |_| Ok(Some(llm_config.clone())))
+                .returning(move |_| Ok(Some(llm_config_for_mock.clone())))
                 .times(0..);
             store
                 .expect_create_or_get_llm_config()
@@ -2144,19 +2145,22 @@ mod tests {
                 .returning(|| Ok(vec![]))
                 .times(0..);
 
-            let store: Arc<dyn SessionStore> = Arc::new(store);
-            let storage = Arc::new(
+            let mock_storage = Arc::new(
                 crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
                     .await
                     .expect("create event store"),
             );
-
+            let store: Arc<dyn SessionStore> = Arc::new(store);
+            let provider = Arc::new(crate::session::provider::SessionProvider::new(
+                Arc::new(plugin_registry),
+                store,
+                LLMParams::new().provider("mock").model("mock-model"),
+            ));
             let config = Arc::new(
-                AgentConfigBuilder::new(
-                    Arc::new(plugin_registry),
-                    store.clone(),
-                    storage.event_journal(),
-                    LLMParams::new().provider("mock").model("mock-model"),
+                AgentConfigBuilder::from_provider(
+                    mock_storage.clone(),
+                    provider,
+                    mock_storage.event_journal(),
                 )
                 .with_tool_policy(ToolPolicy::ProviderOnly)
                 .build(),
@@ -2472,22 +2476,22 @@ mod tests {
             .returning(|| Ok(vec![]))
             .times(0..);
 
-        let store: Arc<dyn SessionStore> = Arc::new(store);
         let storage = Arc::new(
             crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
                 .await
                 .expect("create event store"),
         );
 
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        let provider = Arc::new(crate::session::provider::SessionProvider::new(
+            Arc::new(plugin_registry),
+            store,
+            LLMParams::new().provider("mock").model("mock-model"),
+        ));
         let config = Arc::new(
-            AgentConfigBuilder::new(
-                Arc::new(plugin_registry),
-                store,
-                storage.event_journal(),
-                LLMParams::new().provider("mock").model("mock-model"),
-            )
-            .with_tool_policy(ToolPolicy::ProviderOnly)
-            .build(),
+            AgentConfigBuilder::from_provider(storage.clone(), provider, storage.event_journal())
+                .with_tool_policy(ToolPolicy::ProviderOnly)
+                .build(),
         );
 
         let runtime = crate::agent::core::SessionRuntime::new(

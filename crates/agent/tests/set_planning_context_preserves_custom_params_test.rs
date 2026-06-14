@@ -68,8 +68,7 @@ async fn set_planning_context_preserves_custom_params() {
     let agent_config = Arc::new(
         AgentConfigBuilder::new(
             registry,
-            storage.session_store(),
-            storage.event_journal(),
+            storage.clone(),
             LLMParams::new().provider("llama_cpp").model("test-model"),
         )
         .build(),

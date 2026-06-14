@@ -66,8 +66,7 @@ impl TestAgent {
         );
         let builder = AgentConfigBuilder::new(
             Arc::new(registry),
-            storage.session_store(),
-            storage.event_journal(),
+            storage.clone(),
             LLMParams::new().provider("mock").model("mock"),
         );
         let config = Arc::new(builder.build());
@@ -92,8 +91,7 @@ impl TestAgent {
         );
         let builder = AgentConfigBuilder::new(
             Arc::new(registry),
-            storage.session_store(),
-            storage.event_journal(),
+            storage.clone(),
             LLMParams::new().provider("mock").model("mock"),
         );
         let config = Arc::new(builder.build());

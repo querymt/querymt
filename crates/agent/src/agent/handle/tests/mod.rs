@@ -87,9 +87,10 @@ impl HandleFixture {
             .expect_get_llm_config()
             .returning(move |_| Ok(Some(llm_config.clone())))
             .times(0..);
+        let listed_sessions_for_mock = listed_sessions.clone();
         store
             .expect_list_sessions()
-            .returning(move || Ok(listed_sessions.clone()))
+            .returning(move || Ok(listed_sessions_for_mock.clone()))
             .times(0..);
         store
             .expect_create_or_get_llm_config()
@@ -114,17 +115,26 @@ impl HandleFixture {
             })
             .times(0..);
 
-        let store: Arc<dyn SessionStore> = Arc::new(store);
         let storage = Arc::new(
             crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
                 .await
                 .expect("create event store"),
         );
+        for listed_session in &listed_sessions {
+            storage
+                .create_session(
+                    listed_session.name.clone(),
+                    listed_session.cwd.clone(),
+                    None,
+                    listed_session.fork_origin.clone(),
+                )
+                .await
+                .expect("seed listed session");
+        }
 
         let mut builder = AgentConfigBuilder::new(
             Arc::new(plugin_registry),
-            store.clone(),
-            storage.event_journal(),
+            storage.clone(),
             LLMParams::new().provider("mock").model("mock-model"),
         )
         .with_tool_policy(ToolPolicy::ProviderOnly);
@@ -276,8 +286,7 @@ impl RealStorageHandleFixture {
 
         let mut builder = AgentConfigBuilder::new(
             Arc::new(plugin_registry),
-            storage.session_store(),
-            storage.event_journal(),
+            storage.clone(),
             LLMParams::new().provider("mock").model("mock-model"),
         )
         .with_tool_policy(ToolPolicy::ProviderOnly);

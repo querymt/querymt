@@ -81,8 +81,7 @@ async fn test_undo_handler_single_agent() -> Result<()> {
 
     let builder = AgentConfigBuilder::new(
         Arc::new(registry),
-        storage.session_store(),
-        storage.event_journal(),
+        storage.clone(),
         LLMParams::new().provider("mock").model("mock"),
     )
     .with_snapshot_policy(SnapshotPolicy::Diff)
@@ -309,8 +308,7 @@ async fn test_undo_handler_cross_session() -> Result<()> {
 
     let builder = AgentConfigBuilder::new(
         Arc::new(registry),
-        storage.session_store(),
-        storage.event_journal(),
+        storage.clone(),
         LLMParams::new().provider("mock").model("mock"),
     )
     .with_snapshot_policy(SnapshotPolicy::Diff)

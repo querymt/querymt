@@ -17,7 +17,6 @@ mod tests {
     use crate::agent::session_materializer::{PreparedSessionResult, SessionMaterializer};
     use crate::agent::session_registry::SessionRegistry;
     use crate::send_agent::SendAgent;
-    use crate::session::backend::StorageBackend;
     use crate::test_utils::{
         MockLlmProvider, SharedLlmProvider, TestProviderFactory, mock_plugin_registry,
     };
@@ -58,8 +57,7 @@ mod tests {
         let config = Arc::new(
             AgentConfigBuilder::new(
                 Arc::new(plugin_registry),
-                storage.session_store(),
-                storage.event_journal(),
+                storage.clone(),
                 LLMParams::new().provider("mock").model("mock-model"),
             )
             .with_tool_policy(ToolPolicy::ProviderOnly)

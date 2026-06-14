@@ -365,14 +365,9 @@ impl AgentBuilder {
             }
         };
 
-        let mut builder = AgentConfigBuilder::new(
-            plugin_registry,
-            backend.session_store(),
-            backend.event_journal(),
-            llm_config,
-        )
-        .with_agent_id("agent")
-        .with_snapshot_policy(snapshot_policy);
+        let mut builder = AgentConfigBuilder::new(plugin_registry, backend.clone(), llm_config)
+            .with_agent_id("agent")
+            .with_snapshot_policy(snapshot_policy);
 
         // Phase 7: inject pre-populated agent registry (remote agents from config).
         #[cfg(feature = "remote")]

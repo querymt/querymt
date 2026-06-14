@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::backend::StorageBackend;
 
 async fn ext_method_json(
     handle: &LocalAgentHandle,

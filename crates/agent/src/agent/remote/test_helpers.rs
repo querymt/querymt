@@ -19,7 +19,6 @@ pub(crate) mod fixtures {
     use crate::agent::remote::mesh::MeshHandle;
     use crate::agent::remote::node_manager::RemoteNodeManager;
     use crate::agent::session_registry::SessionRegistry;
-    use crate::session::backend::StorageBackend as _;
     use crate::session::sqlite_storage::SqliteStorage;
     use kameo::actor::{ActorRef, Spawn};
     use querymt::LLMParams;
@@ -179,12 +178,7 @@ pub(crate) mod fixtures {
             );
             let llm = LLMParams::new().provider("mock").model("mock");
 
-            let builder = AgentConfigBuilder::new(
-                plugin_registry,
-                storage.session_store(),
-                storage.event_journal(),
-                llm,
-            );
+            let builder = AgentConfigBuilder::new(plugin_registry, storage.clone(), llm);
             let config = Arc::new(builder.build());
 
             Self {

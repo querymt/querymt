@@ -1004,7 +1004,6 @@ mod tests {
                 .returning(|| Ok(vec![]))
                 .times(0..);
 
-            let store: Arc<dyn SessionStore> = Arc::new(store);
             let storage = Arc::new(
                 crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
                     .await
@@ -1014,8 +1013,7 @@ mod tests {
             let config = Arc::new(
                 AgentConfigBuilder::new(
                     Arc::new(plugin_registry),
-                    store.clone(),
-                    storage.event_journal(),
+                    storage.clone(),
                     LLMParams::new().provider("mock").model("mock-model"),
                 )
                 .with_tool_policy(ToolPolicy::ProviderOnly)
@@ -1195,7 +1193,6 @@ mod tests {
             .returning(|| Ok(vec![]))
             .times(0..);
 
-        let store2: Arc<dyn SessionStore> = Arc::new(store2);
         let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
         let shared = SharedLlmProvider {
             inner: provider,
@@ -1208,15 +1205,17 @@ mod tests {
                 .await
                 .expect("create event store"),
         );
+        let store: Arc<dyn SessionStore> = Arc::new(store2);
+        let provider = Arc::new(crate::session::provider::SessionProvider::new(
+            Arc::new(plugin_registry),
+            store,
+            LLMParams::new().provider("mock").model("mock-model"),
+        ));
         let config = Arc::new(
-            AgentConfigBuilder::new(
-                Arc::new(plugin_registry),
-                store2.clone(),
-                storage.event_journal(),
-                LLMParams::new().provider("mock").model("mock-model"),
-            )
-            .build(),
+            AgentConfigBuilder::from_provider(storage.clone(), provider, storage.event_journal())
+                .build(),
         );
+
         let registry = SessionRegistry::new(config);
 
         let req = agent_client_protocol::schema::ForkSessionRequest::new(

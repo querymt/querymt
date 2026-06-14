@@ -196,14 +196,9 @@ impl UndoTestFixture {
         let backend = GitSnapshotBackend::with_snapshot_base(snapshot_base_path.clone());
         let backend_arc = Arc::new(backend);
 
-        let builder = AgentConfigBuilder::new(
-            registry,
-            storage.session_store(),
-            storage.event_journal(),
-            llm,
-        )
-        .with_snapshot_policy(SnapshotPolicy::Diff)
-        .with_snapshot_backend(backend_arc.clone());
+        let builder = AgentConfigBuilder::new(registry, storage.clone(), llm)
+            .with_snapshot_policy(SnapshotPolicy::Diff)
+            .with_snapshot_backend(backend_arc.clone());
 
         let config = Arc::new(builder.build());
         let handle = AgentHandle::from_config(config);
@@ -455,8 +450,7 @@ impl DelegateTestFixture {
         let delegate_storage = Arc::new(SqliteStorage::connect(":memory:".into()).await?);
         let delegate_builder = AgentConfigBuilder::new(
             Arc::new(delegate_registry),
-            delegate_storage.session_store(),
-            delegate_storage.event_journal(),
+            delegate_storage.clone(),
             LLMParams::new().provider("mock").model("mock-model"),
         );
         let delegate_config = Arc::new(delegate_builder.build());
@@ -480,8 +474,7 @@ impl DelegateTestFixture {
 
         let builder = AgentConfigBuilder::new(
             Arc::new(planner_registry),
-            planner_storage.session_store(),
-            planner_storage.event_journal(),
+            planner_storage.clone(),
             LLMParams::new().provider("mock").model("mock-model"),
         )
         .with_agent_registry(Arc::new(registry));

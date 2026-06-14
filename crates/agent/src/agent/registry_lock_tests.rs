@@ -12,8 +12,6 @@ mod tests {
     use crate::agent::core::ToolPolicy;
     use crate::agent::session_actor::SessionActor;
     use crate::agent::session_registry::SessionRegistry;
-    use crate::session::backend::StorageBackend;
-    use crate::session::store::SessionStore;
     use crate::test_utils::{
         MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory,
         mock_plugin_registry,
@@ -34,8 +32,7 @@ mod tests {
         let factory = Arc::new(TestProviderFactory { provider: shared });
         let (plugin_registry, temp_dir) = mock_plugin_registry(factory).expect("plugin registry");
 
-        let store = MockSessionStore::new();
-        let store: Arc<dyn SessionStore> = Arc::new(store);
+        let _store = MockSessionStore::new();
         let storage = Arc::new(
             crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
                 .await
@@ -45,8 +42,7 @@ mod tests {
         let config = Arc::new(
             AgentConfigBuilder::new(
                 Arc::new(plugin_registry),
-                store.clone(),
-                storage.event_journal(),
+                storage.clone(),
                 LLMParams::new().provider("mock").model("mock-model"),
             )
             .with_tool_policy(ToolPolicy::ProviderOnly)

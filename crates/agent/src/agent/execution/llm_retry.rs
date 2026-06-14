@@ -300,8 +300,6 @@ mod tests {
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
     use crate::config::RuntimeExecutionPolicy;
-    use crate::session::backend::StorageBackend;
-    use crate::session::store::SessionStore;
     use crate::test_utils::{
         MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
         mock_plugin_registry, mock_session,
@@ -337,7 +335,6 @@ mod tests {
             .returning(move |_| Ok(Some(llm_config.clone())))
             .times(0..);
 
-        let store: Arc<dyn SessionStore> = Arc::new(store);
         let storage = Arc::new(
             crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
                 .await
@@ -352,8 +349,7 @@ mod tests {
         let config = Arc::new(
             AgentConfigBuilder::new(
                 Arc::new(plugin_registry),
-                store.clone(),
-                storage.event_journal(),
+                storage.clone(),
                 LLMParams::new().provider("mock").model("mock-model"),
             )
             .with_tool_policy(ToolPolicy::ProviderOnly)

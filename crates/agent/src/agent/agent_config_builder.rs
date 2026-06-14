@@ -23,10 +23,10 @@ use crate::middleware::{
     AgentModeMiddleware, ContextConfig, ContextMiddleware, DelegationConfig, DelegationMiddleware,
     LimitsConfig, LimitsMiddleware, MiddlewareDriver,
 };
+use crate::session::backend::StorageBackend;
 use crate::session::compaction::SessionCompaction;
 use crate::session::projection::EventJournal;
 use crate::session::provider::SessionProvider;
-use crate::session::store::SessionStore;
 use crate::tools::ToolRegistry;
 use agent_client_protocol::schema::AuthMethod;
 use arc_swap::ArcSwap;
@@ -43,6 +43,7 @@ use tokio::sync::Mutex;
 /// `AgentConfig`, callers use this builder and call `build()` to get the
 /// config directly.
 pub struct AgentConfigBuilder {
+    storage: Arc<dyn StorageBackend>,
     provider: Arc<SessionProvider>,
     event_journal: Arc<dyn EventJournal>,
     event_fanout: Arc<EventFanout>,
@@ -82,19 +83,20 @@ impl AgentConfigBuilder {
     /// Registers all built-in tools in the default tool registry.
     pub fn new(
         plugin_registry: Arc<PluginRegistry>,
-        store: Arc<dyn SessionStore>,
-        event_journal: Arc<dyn EventJournal>,
+        storage: Arc<dyn StorageBackend>,
         initial_config: LLMParams,
     ) -> Self {
         let provider = Arc::new(SessionProvider::new(
             Arc::clone(&plugin_registry),
-            store,
+            storage.session_store(),
             initial_config,
         ));
+        let event_journal = storage.event_journal();
         let mut tool_registry = ToolRegistry::new();
         tool_registry.extend(crate::tools::builtins::all_builtin_tools());
 
         Self {
+            storage: storage.clone(),
             provider,
             event_journal,
             event_fanout: Arc::new(EventFanout::new()),
@@ -127,8 +129,8 @@ impl AgentConfigBuilder {
             pending_elicitations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             mcp_servers: Vec::new(),
             session_mcp_attachment_source: Arc::new(NoopSessionMcpAttachmentSource),
-            schedule_repository: None,
-            knowledge_store: None,
+            schedule_repository: storage.schedule_repository(),
+            knowledge_store: storage.knowledge_store(),
             slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
             hooks: Hooks::disabled(),
         }
@@ -141,10 +143,12 @@ impl AgentConfigBuilder {
     /// everything else.  Does **not** register built-in tools — call
     /// [`with_tool_registry`] if you need them.
     pub fn from_provider(
+        storage: Arc<dyn StorageBackend>,
         provider: Arc<SessionProvider>,
         event_journal: Arc<dyn EventJournal>,
     ) -> Self {
         Self {
+            storage: storage.clone(),
             provider,
             event_journal,
             event_fanout: Arc::new(EventFanout::new()),
@@ -177,8 +181,8 @@ impl AgentConfigBuilder {
             pending_elicitations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             mcp_servers: Vec::new(),
             session_mcp_attachment_source: Arc::new(NoopSessionMcpAttachmentSource),
-            schedule_repository: None,
-            knowledge_store: None,
+            schedule_repository: storage.schedule_repository(),
+            knowledge_store: storage.knowledge_store(),
             slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
             hooks: Hooks::disabled(),
         }
@@ -192,6 +196,7 @@ impl AgentConfigBuilder {
         ));
         AgentConfig {
             provider: self.provider,
+            storage: self.storage,
             event_sink,
             agent_registry: self.agent_registry,
             workspace_manager_actor: self.workspace_manager_actor,
@@ -635,6 +640,11 @@ impl AgentConfigBuilder {
         &self.provider
     }
 
+    /// Borrow the `StorageBackend` used to build this config.
+    pub fn storage(&self) -> &Arc<dyn StorageBackend> {
+        &self.storage
+    }
+
     /// Borrow the `agent_registry` (used by `DelegationMiddleware` constructor in quorum).
     pub fn agent_registry(&self) -> Arc<dyn AgentRegistry + Send + Sync> {
         self.agent_registry.clone()
@@ -670,7 +680,6 @@ mod tests {
     use super::*;
     use crate::agent::core::{AgentMode, SnapshotPolicy, ToolPolicy};
     use crate::config::PruningConfig;
-    use crate::session::backend::StorageBackend;
     use crate::session::sqlite_storage::SqliteStorage;
     use crate::test_utils::helpers::empty_plugin_registry;
     use querymt::LLMParams;
@@ -680,12 +689,7 @@ mod tests {
         let (registry, temp_dir) = empty_plugin_registry().unwrap();
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm = LLMParams::new().provider("mock").model("mock-model");
-        let builder = AgentConfigBuilder::new(
-            Arc::new(registry),
-            storage.session_store(),
-            storage.event_journal(),
-            llm,
-        );
+        let builder = AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm);
         (builder, temp_dir)
     }
 

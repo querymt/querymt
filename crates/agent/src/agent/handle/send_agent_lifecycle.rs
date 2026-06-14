@@ -81,9 +81,15 @@ impl LocalAgentHandle {
         &self,
         req: ListSessionsRequest,
     ) -> Result<ListSessionsResponse, Error> {
-        crate::api::AgentSessions::list_acp_from_store(self.config.provider.history_store(), req)
+        let view_store = self
+            .config
+            .storage
+            .view_store()
+            .ok_or_else(|| Error::internal_error().data("view store unavailable"))?;
+        let page = crate::api::AgentSessions::list_for_acp_from_view_store(view_store, req)
             .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+        Ok(ListSessionsResponse::new(page.sessions).next_cursor(page.next_cursor))
     }
 
     pub(super) async fn handle_fork_session(
@@ -200,6 +206,18 @@ impl LocalAgentHandle {
         if is_loaded {
             // Closing is best-effort: deleting persisted history is the primary intent.
             let _ = self.stop_session(&session_id).await;
+        }
+
+        let exists = self
+            .config
+            .provider
+            .history_store()
+            .get_session(&session_id)
+            .await
+            .map_err(|e| Error::internal_error().data(serde_json::json!({"error": e.to_string()})))?
+            .is_some();
+        if !exists {
+            return Ok(DeleteSessionResponse::new());
         }
 
         self.config

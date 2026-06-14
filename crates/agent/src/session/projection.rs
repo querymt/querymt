@@ -193,6 +193,16 @@ pub trait ViewStore: Send + Sync {
         session_scope: SessionScope,
     ) -> SessionResult<(SessionGroup, usize)>;
 
+    /// Page flat session metadata rows using the same title and hierarchy projection logic
+    /// as the UI session list.
+    async fn list_session_items(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+    ) -> SessionResult<(Vec<SessionListItem>, Option<String>, usize)>;
+
     /// Search all sessions via FTS5 (DB-wide, not limited to loaded pages).
     async fn search_sessions(
         &self,

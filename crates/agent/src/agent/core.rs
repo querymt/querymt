@@ -269,23 +269,18 @@ mod tests {
         let all_tools = crate::tools::builtins::all_builtin_tools();
 
         use crate::agent::agent_config_builder::AgentConfigBuilder;
-        use crate::session::backend::StorageBackend;
         use crate::session::sqlite_storage::SqliteStorage;
         use crate::test_utils::empty_plugin_registry;
         use std::sync::Arc;
 
         let (plugin_registry, _temp_dir) = empty_plugin_registry().unwrap();
-        let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm_config = querymt::LLMParams::new()
             .provider("test")
             .model("test-model");
 
-        let builder = AgentConfigBuilder::new(
-            Arc::new(plugin_registry),
-            storage.session_store(),
-            storage.event_journal(),
-            llm_config,
-        );
+        let builder =
+            AgentConfigBuilder::new(Arc::new(plugin_registry), storage.clone(), llm_config);
         let config = builder.build();
 
         // Check that all tools are present

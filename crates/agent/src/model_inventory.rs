@@ -882,7 +882,6 @@ impl ModelInventory {
 mod tests {
     use super::*;
     use crate::agent::agent_config_builder::AgentConfigBuilder;
-    use crate::session::backend::StorageBackend;
     use crate::session::sqlite_storage::SqliteStorage;
     use crate::test_utils::helpers::empty_plugin_registry;
     use futures_util::future::join_all;
@@ -892,12 +891,7 @@ mod tests {
         let (registry, _temp_dir) = empty_plugin_registry().unwrap();
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let llm = LLMParams::new().provider("mock").model("mock-model");
-        let builder = AgentConfigBuilder::new(
-            Arc::new(registry),
-            storage.session_store(),
-            storage.event_journal(),
-            llm,
-        );
+        let builder = AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm);
         Arc::new(builder.build())
     }
 

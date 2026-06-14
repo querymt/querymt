@@ -5,7 +5,7 @@ use crate::events::EventEnvelope;
 
 use crate::session::backend::{StorageBackend, default_agent_db_path};
 use crate::session::error::SessionError;
-use crate::session::projection::{EventJournal, ViewStore};
+use crate::session::projection::ViewStore;
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::session::store::SessionStore;
 use crate::tools::CapabilityRequirement;
@@ -13,13 +13,11 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-type DelegateFactory =
-    Box<dyn FnOnce(Arc<dyn SessionStore>, Arc<dyn EventJournal>) -> Arc<dyn AgentHandle> + Send>;
+type DelegateFactory = Box<dyn FnOnce(Arc<dyn StorageBackend>) -> Arc<dyn AgentHandle> + Send>;
 
 type PlannerFactory = Box<
     dyn FnOnce(
-            Arc<dyn SessionStore>,
-            Arc<dyn EventJournal>,
+            Arc<dyn StorageBackend>,
             Arc<dyn AgentRegistry + Send + Sync>,
         ) -> Arc<dyn AgentHandle>
         + Send,
@@ -186,9 +184,7 @@ impl AgentQuorumBuilder {
 
     pub fn add_delegate_agent<F>(mut self, info: AgentInfo, factory: F) -> Self
     where
-        F: FnOnce(Arc<dyn SessionStore>, Arc<dyn EventJournal>) -> Arc<dyn AgentHandle>
-            + Send
-            + 'static,
+        F: FnOnce(Arc<dyn StorageBackend>) -> Arc<dyn AgentHandle> + Send + 'static,
     {
         self.delegate_factories.push((info, Box::new(factory)));
         self
@@ -197,8 +193,7 @@ impl AgentQuorumBuilder {
     pub fn with_planner<F>(mut self, factory: F) -> Self
     where
         F: FnOnce(
-                Arc<dyn SessionStore>,
-                Arc<dyn EventJournal>,
+                Arc<dyn StorageBackend>,
                 Arc<dyn AgentRegistry + Send + Sync>,
             ) -> Arc<dyn AgentHandle>
             + Send
@@ -289,10 +284,7 @@ impl AgentQuorumBuilder {
         }
 
         for (info, factory) in self.delegate_factories {
-            let agent = factory(
-                self.storage.session_store().clone(),
-                self.storage.event_journal().clone(),
-            );
+            let agent = factory(self.storage.clone());
 
             registry.register_handle(info.clone(), agent.clone());
             delegates.push(DelegateAgent { info, agent });
@@ -303,11 +295,7 @@ impl AgentQuorumBuilder {
         let planner_factory = self
             .planner_factory
             .ok_or(AgentQuorumError::MissingPlanner)?;
-        let planner = planner_factory(
-            self.storage.session_store().clone(),
-            self.storage.event_journal().clone(),
-            registry.clone(),
-        );
+        let planner = planner_factory(self.storage.clone(), registry.clone());
 
         let orchestrator = if self.delegation_enabled {
             // We need to get the tool_registry. For now, we'll use a default/empty one
@@ -391,12 +379,11 @@ mod tests {
         let (plugin_registry, _temp_dir) = empty_plugin_registry().unwrap();
         let plugin_registry = Arc::new(plugin_registry);
 
-        builder = builder.with_planner(move |store, event_journal, agent_registry| {
+        builder = builder.with_planner(move |storage, agent_registry| {
             let config = Arc::new(
                 AgentConfigBuilder::new(
                     plugin_registry.clone(),
-                    store,
-                    event_journal,
+                    storage.clone(),
                     LLMParams::new().provider("mock").model("mock-model"),
                 )
                 .with_agent_registry(agent_registry)

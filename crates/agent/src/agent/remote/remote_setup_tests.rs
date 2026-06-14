@@ -4,7 +4,6 @@ use super::remote_setup::spawn_and_register_local_mesh_actors_with_name;
 use crate::agent::LocalAgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::remote::test_helpers::fixtures::get_test_mesh;
-use crate::session::backend::StorageBackend;
 use crate::test_utils::{SharedLlmProvider, TestProviderFactory, mock_plugin_registry};
 use querymt::LLMParams;
 use std::sync::Arc;
@@ -27,8 +26,7 @@ async fn mesh_publication_triggers_local_only_model_refresh() {
     let config = Arc::new(
         AgentConfigBuilder::new(
             Arc::new(plugin_registry),
-            storage.session_store(),
-            storage.event_journal(),
+            storage.clone(),
             LLMParams::new().provider("mock").model("mock-model"),
         )
         .build(),

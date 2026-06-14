@@ -1,4 +1,3 @@
-#[cfg(feature = "remote")]
 use super::utils::ext_json_response;
 use super::*;
 

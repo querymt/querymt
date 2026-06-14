@@ -94,8 +94,10 @@ async fn acp_list_sessions_orders_by_updated_at_and_paginates() -> Result<()> {
         )
         .await?;
 
-    let all = AgentSessions::list_for_acp_from_store(
-        session_store.clone(),
+    let view_store = agent.storage_backend().view_store().expect("view store");
+
+    let all = AgentSessions::list_for_acp_from_view_store(
+        view_store.clone(),
         AcpListSessionsRequest::new(),
     )
     .await?;
@@ -106,16 +108,16 @@ async fn acp_list_sessions_orders_by_updated_at_and_paginates() -> Result<()> {
     assert_eq!(all.sessions[1].session_id.to_string(), first.public_id);
     assert!(all.next_cursor.is_none());
 
-    let filtered = AgentSessions::list_for_acp_from_store(
-        session_store.clone(),
+    let filtered = AgentSessions::list_for_acp_from_view_store(
+        view_store.clone(),
         AcpListSessionsRequest::new().cwd(PathBuf::from("/tmp/a")),
     )
     .await?;
     assert_eq!(filtered.total_count, 1);
     assert_eq!(filtered.sessions[0].session_id.to_string(), first.public_id);
 
-    let cursor_page = AgentSessions::list_for_acp_from_store(
-        session_store.clone(),
+    let cursor_page = AgentSessions::list_for_acp_from_view_store(
+        view_store.clone(),
         AcpListSessionsRequest::new().cursor("1"),
     )
     .await?;
@@ -127,8 +129,8 @@ async fn acp_list_sessions_orders_by_updated_at_and_paginates() -> Result<()> {
     );
     assert!(cursor_page.next_cursor.is_none());
 
-    let invalid_cursor_page = AgentSessions::list_for_acp_from_store(
-        session_store.clone(),
+    let invalid_cursor_page = AgentSessions::list_for_acp_from_view_store(
+        view_store.clone(),
         AcpListSessionsRequest::new().cursor("not-a-number"),
     )
     .await?;
@@ -143,7 +145,7 @@ async fn acp_list_sessions_orders_by_updated_at_and_paginates() -> Result<()> {
         .create_session(None, Some("/tmp/c".into()), None, None)
         .await?;
     let with_untitled =
-        AgentSessions::list_for_acp_from_store(session_store, AcpListSessionsRequest::new())
+        AgentSessions::list_for_acp_from_view_store(view_store, AcpListSessionsRequest::new())
             .await?;
     let untitled_info = with_untitled
         .sessions
@@ -152,6 +154,39 @@ async fn acp_list_sessions_orders_by_updated_at_and_paginates() -> Result<()> {
         .expect("untitled session should be present");
     assert!(untitled_info.title.is_none());
     assert_eq!(untitled_info.cwd, PathBuf::from("/tmp/c"));
+
+    let intent_only = session_store
+        .create_session(None, Some("/tmp/d".into()), None, None)
+        .await?;
+    let intent_session = session_store
+        .get_session(&intent_only.public_id)
+        .await?
+        .expect("session exists");
+    session_store
+        .create_intent_snapshot(crate::session::domain::IntentSnapshot {
+            id: 0,
+            session_id: intent_session.id,
+            task_id: None,
+            summary: "This title comes from the initial intent snapshot and should be truncated if it gets too long for the ACP session list".to_string(),
+            constraints: None,
+            next_step_hint: None,
+            created_at: time::OffsetDateTime::now_utc(),
+        })
+        .await?;
+    let with_intent_title = AgentSessions::list_for_acp_from_view_store(
+        agent.storage_backend().view_store().expect("view store"),
+        AcpListSessionsRequest::new(),
+    )
+    .await?;
+    let intent_info = with_intent_title
+        .sessions
+        .iter()
+        .find(|info| info.session_id.to_string() == intent_only.public_id)
+        .expect("intent-titled session should be present");
+    assert_eq!(
+        intent_info.title.as_deref(),
+        Some("This title comes from the initial intent snapshot and should be truncated if ...")
+    );
     Ok(())
 }
 

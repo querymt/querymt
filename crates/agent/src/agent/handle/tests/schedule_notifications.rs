@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::backend::StorageBackend;
 
 #[tokio::test]
 async fn test_schedule_create_and_action_emit_ext_notifications_when_bridge_present() {

@@ -28,7 +28,6 @@ mod provider_host_tests {
     #[tokio::test]
     async fn test_session_provider_initial_params_exposed() {
         use crate::agent::agent_config_builder::AgentConfigBuilder;
-        use crate::session::backend::StorageBackend as _;
         use crate::session::sqlite_storage::SqliteStorage;
         use querymt::LLMParams;
         use querymt::plugin::host::PluginRegistry;
@@ -53,15 +52,7 @@ mod provider_host_tests {
             .parameter("model", "hf:owner/repo:model.gguf")
             .parameter("n_ctx", 32768_u64);
 
-        let config = Arc::new(
-            AgentConfigBuilder::new(
-                registry,
-                storage.session_store(),
-                storage.event_journal(),
-                llm,
-            )
-            .build(),
-        );
+        let config = Arc::new(AgentConfigBuilder::new(registry, storage.clone(), llm).build());
 
         let params = config.provider.initial_params();
         assert_eq!(params.provider.as_deref(), Some("llama_cpp"));
@@ -92,7 +83,6 @@ mod provider_host_tests {
         // params were silently dropped.
         use crate::agent::agent_config_builder::AgentConfigBuilder;
         use crate::agent::remote::ProviderChatRequest;
-        use crate::session::backend::StorageBackend as _;
         use crate::session::sqlite_storage::SqliteStorage;
         use kameo::actor::Spawn;
         use kameo::error::SendError;
@@ -119,15 +109,7 @@ mod provider_host_tests {
             .parameter("model", "hf:owner/repo:model.gguf")
             .parameter("n_ctx", 32768_u64);
 
-        let config = Arc::new(
-            AgentConfigBuilder::new(
-                registry,
-                storage.session_store(),
-                storage.event_journal(),
-                llm,
-            )
-            .build(),
-        );
+        let config = Arc::new(AgentConfigBuilder::new(registry, storage.clone(), llm).build());
 
         let actor = crate::agent::remote::provider_host_backend::provider_host_from_config(config);
         let actor_ref = ProviderHostActor::spawn(actor);

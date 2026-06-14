@@ -46,17 +46,20 @@ pub struct CapabilitiesInfo {
 }
 
 pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
+    #[cfg(feature = "remote")]
     let mesh = agent.mesh();
+    #[cfg(not(feature = "remote"))]
+    let mesh: Option<()> = None;
     let mesh_enabled = mesh.is_some();
+    #[cfg(feature = "remote")]
     let mesh_transport = match mesh.as_ref().map(|mesh| mesh.transport_mode()) {
-        #[cfg(feature = "remote")]
         Some(crate::agent::remote::MeshTransportMode::Lan) => "lan".to_string(),
-        #[cfg(feature = "remote")]
         Some(crate::agent::remote::MeshTransportMode::Iroh) => "iroh".to_string(),
-        #[cfg(feature = "remote")]
         Some(crate::agent::remote::MeshTransportMode::Composite) => "multi".to_string(),
         None => "none".to_string(),
     };
+    #[cfg(not(feature = "remote"))]
+    let mesh_transport = "none".to_string();
     let mesh_invites = {
         #[cfg(feature = "remote")]
         {
