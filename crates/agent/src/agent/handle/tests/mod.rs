@@ -197,6 +197,34 @@ async fn bind_test_profile(f: &HandleFixture, session_id: &str, profile_id: &str
         .await;
 }
 
+async fn register_bound_test_session(f: &HandleFixture, session_id: &str, profile_id: &str) {
+    bind_test_profile(f, session_id, profile_id).await;
+
+    let runtime = f
+        .handle
+        .profiles()
+        .unwrap()
+        .runtime_for_profile(profile_id)
+        .await
+        .expect("bound profile runtime should load");
+    let profile_handle = runtime.agent().handle();
+    let actor = SessionActor::new(
+        profile_handle.config.clone(),
+        session_id.to_string(),
+        crate::agent::core::SessionRuntime::new(
+            None,
+            std::collections::HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        ),
+    );
+    let actor_ref = SessionActor::spawn(actor);
+    profile_handle
+        .registry
+        .lock()
+        .await
+        .insert(session_id.to_string(), actor_ref);
+}
+
 async fn register_test_session(f: &HandleFixture, session_id: &str) {
     let actor = SessionActor::new(
         f.handle.config.clone(),

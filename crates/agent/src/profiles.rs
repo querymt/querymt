@@ -7,13 +7,18 @@ use crate::api::{Agent, AgentInfra};
 use crate::config::{Config, load_config};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
+#[cfg(feature = "remote")]
+use std::sync::Mutex as StdMutex;
+use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 /// Embedded profile key used for the qmtcode default single-agent profile.
 pub const DEFAULT_EMBEDDED_PROFILE_KEY: &str = "default";
@@ -154,6 +159,10 @@ impl ProfileSource {
 pub trait ProfileCatalog: Send + Sync {
     async fn list_profiles(&self) -> Result<Vec<ProfileMetadata>>;
     async fn load_profile(&self, id: &str) -> Result<ProfileDocument>;
+
+    fn watch_roots(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
 }
 
 #[async_trait]
@@ -167,6 +176,10 @@ where
 
     async fn load_profile(&self, id: &str) -> Result<ProfileDocument> {
         (**self).load_profile(id).await
+    }
+
+    fn watch_roots(&self) -> Vec<PathBuf> {
+        (**self).watch_roots()
     }
 }
 
@@ -526,6 +539,20 @@ impl ProfileCatalog for LocalProfileCatalog {
         Ok(profiles)
     }
 
+    fn watch_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        if self.include_default_user_dir
+            && let Some(dir) = self
+                .default_user_dir_override
+                .clone()
+                .or_else(default_user_profiles_dir)
+        {
+            roots.push(dir);
+        }
+        roots.extend(self.local_dirs.iter().cloned());
+        roots
+    }
+
     async fn load_profile(&self, id: &str) -> Result<ProfileDocument> {
         let matches: Vec<_> = self
             .list_profiles()
@@ -604,6 +631,7 @@ pub struct ProfileRuntimeManager<C = Arc<dyn ProfileCatalog>> {
     // profile resolution for new sessions; existing session bindings should remain authoritative.
     active_profile_id: Mutex<String>,
     runtimes: Mutex<HashMap<String, Arc<ProfileRuntime>>>,
+    runtime_fingerprints: Mutex<HashMap<String, Option<String>>>,
     session_bindings: Mutex<HashMap<String, SessionProfileBinding>>,
     #[cfg(feature = "remote")]
     mesh: StdMutex<Option<crate::agent::remote::MeshHandle>>,
@@ -611,7 +639,7 @@ pub struct ProfileRuntimeManager<C = Arc<dyn ProfileCatalog>> {
 
 impl<C> ProfileRuntimeManager<C>
 where
-    C: ProfileCatalog,
+    C: ProfileCatalog + 'static,
 {
     pub async fn with_default_infra(
         catalog: C,
@@ -634,6 +662,7 @@ where
             shared_infra,
             active_profile_id: Mutex::new(active_profile_id.into()),
             runtimes: Mutex::new(HashMap::new()),
+            runtime_fingerprints: Mutex::new(HashMap::new()),
             session_bindings: Mutex::new(HashMap::new()),
             #[cfg(feature = "remote")]
             mesh: StdMutex::new(None),
@@ -642,6 +671,45 @@ where
 
     pub async fn list_profiles(&self) -> Result<Vec<ProfileMetadata>> {
         self.catalog.list_profiles().await
+    }
+
+    pub async fn reload_profiles(&self) -> Result<Vec<ProfileMetadata>> {
+        let profiles = self.catalog.list_profiles().await?;
+        let profile_fingerprints = profiles
+            .iter()
+            .map(|profile| (profile.id.clone(), profile.fingerprint.clone()))
+            .collect::<HashMap<_, _>>();
+        if !profile_fingerprints.contains_key(self.active_profile_id.lock().await.as_str()) {
+            let fallback = profiles
+                .first()
+                .map(|profile| profile.id.clone())
+                .unwrap_or_else(|| DEFAULT_EMBEDDED_PROFILE_KEY.to_string());
+            *self.active_profile_id.lock().await = fallback;
+        }
+
+        let mut runtime_fingerprints = self.runtime_fingerprints.lock().await;
+        let mut runtimes = self.runtimes.lock().await;
+        runtimes.retain(|profile_id, _| {
+            let Some(current_fingerprint) = profile_fingerprints.get(profile_id) else {
+                runtime_fingerprints.remove(profile_id);
+                return false;
+            };
+            if runtime_fingerprints.get(profile_id) != Some(current_fingerprint) {
+                runtime_fingerprints.remove(profile_id);
+                return false;
+            }
+            true
+        });
+        Ok(profiles)
+    }
+
+    pub async fn reload_profiles_logged(&self) {
+        match self.reload_profiles().await {
+            Ok(profiles) => info!(profile_count = profiles.len(), "profile catalog reloaded"),
+            Err(err) => {
+                warn!(error = %err, "failed to reload profile catalog; keeping cached runtimes")
+            }
+        }
     }
 
     pub async fn active_profile_id(&self) -> String {
@@ -679,6 +747,10 @@ where
         if let Some(mesh) = self.mesh_handle() {
             runtime.agent().handle().set_mesh(mesh);
         }
+        self.runtime_fingerprints
+            .lock()
+            .await
+            .insert(profile_id.to_string(), runtime.metadata.fingerprint.clone());
         runtimes.insert(profile_id.to_string(), runtime.clone());
         Ok(runtime)
     }
@@ -764,6 +836,59 @@ where
         self.runtimes.lock().await.values().cloned().collect()
     }
 
+    pub fn start_profile_watcher(self: &Arc<Self>) -> Option<RecommendedWatcher> {
+        let roots = self.catalog.watch_roots();
+        if roots.is_empty() {
+            return None;
+        }
+
+        let manager = self.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<notify::Result<notify::Event>>();
+        let mut watcher = match notify::recommended_watcher(move |event| {
+            let _ = tx.send(event);
+        }) {
+            Ok(watcher) => watcher,
+            Err(err) => {
+                warn!(error = %err, "failed to create profile watcher");
+                return None;
+            }
+        };
+
+        let mut watched_roots = 0usize;
+        for root in roots {
+            if let Err(err) = std::fs::create_dir_all(&root) {
+                warn!(path = %root.display(), error = %err, "failed to create profile watch root");
+                continue;
+            }
+            if let Err(err) = watcher.watch(&root, RecursiveMode::NonRecursive) {
+                warn!(path = %root.display(), error = %err, "failed to watch profile directory");
+                continue;
+            }
+            watched_roots += 1;
+        }
+
+        if watched_roots == 0 {
+            return None;
+        }
+
+        tokio::spawn(async move {
+            let debounce = Duration::from_millis(350);
+            while let Some(event) = rx.recv().await {
+                match event {
+                    Ok(event) if event.paths.iter().any(|path| is_profile_toml_path(path)) => {
+                        debug!(?event.kind, "profile file change detected");
+                        while tokio::time::timeout(debounce, rx.recv()).await.is_ok() {}
+                        manager.reload_profiles_logged().await;
+                    }
+                    Ok(_) => {}
+                    Err(err) => warn!(error = %err, "profile watcher error"),
+                }
+            }
+        });
+
+        Some(watcher)
+    }
+
     #[cfg(feature = "remote")]
     pub fn set_mesh_handle(&self, mesh: crate::agent::remote::MeshHandle) {
         *self.mesh.lock().expect("profile mesh mutex poisoned") = Some(mesh);
@@ -833,6 +958,7 @@ impl ProfileRuntimeManager<Arc<dyn ProfileCatalog>> {
             shared_infra,
             active_profile_id: Mutex::new(active_profile_id.into()),
             runtimes: Mutex::new(HashMap::new()),
+            runtime_fingerprints: Mutex::new(HashMap::new()),
             session_bindings: Mutex::new(HashMap::new()),
             #[cfg(feature = "remote")]
             mesh: StdMutex::new(None),
@@ -862,6 +988,10 @@ async fn build_profile_runtime(
     Ok(ProfileRuntime { metadata, agent })
 }
 
+fn is_profile_toml_path(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("toml")
+}
+
 fn list_local_profiles(dir: &Path) -> Result<Vec<ProfileMetadata>> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -884,6 +1014,7 @@ fn list_local_profiles(dir: &Path) -> Result<Vec<ProfileMetadata>> {
         };
 
         let content = std::fs::read_to_string(&path)?;
+        let fingerprint = profile_file_fingerprint(&path, &content);
         let file_meta = parse_profile_file_metadata(&content)?.unwrap_or_default();
         let id = file_meta.id.unwrap_or_else(|| stem.to_string());
         let name = file_meta.name.unwrap_or_else(|| id.clone());
@@ -894,12 +1025,26 @@ fn list_local_profiles(dir: &Path) -> Result<Vec<ProfileMetadata>> {
             tags: file_meta.tags,
             source: ProfileSource::LocalPath { path: path.clone() },
             config_kind: infer_config_kind_from_toml(&content).ok().flatten(),
-            fingerprint: None,
+            fingerprint: Some(fingerprint),
         };
         profiles.insert(path, metadata);
     }
 
     Ok(profiles.into_values().collect())
+}
+
+fn profile_file_fingerprint(path: &Path, content: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    if let Ok(metadata) = std::fs::metadata(path) {
+        metadata.len().hash(&mut hasher);
+        if let Ok(modified) = metadata.modified()
+            && let Ok(duration) = modified.duration_since(UNIX_EPOCH)
+        {
+            duration.as_nanos().hash(&mut hasher);
+        }
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 fn parse_profile_file_metadata(content: &str) -> Result<Option<ProfileFileMetadata>> {

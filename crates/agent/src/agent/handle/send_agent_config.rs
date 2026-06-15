@@ -7,15 +7,7 @@ impl LocalAgentHandle {
         req: SetSessionModelRequest,
     ) -> Result<SetSessionModelResponse, Error> {
         let session_id = req.session_id.to_string();
-        let session_ref = {
-            let registry = self.registry.lock().await;
-            registry.get(&session_id).cloned().ok_or_else(|| {
-                Error::invalid_params().data(serde_json::json!({
-                    "message": "unknown session",
-                    "sessionId": session_id,
-                }))
-            })?
-        };
+        let session_ref = self.session_ref_for_agent_session(&session_id).await?;
 
         session_ref.set_session_model(req).await
     }
@@ -31,15 +23,7 @@ impl LocalAgentHandle {
             .map_err(|e| Error::invalid_params().data(serde_json::json!({ "error": e })))?;
         let session_id = req.session_id.to_string();
 
-        let session_ref = {
-            let registry = self.registry.lock().await;
-            registry.get(&session_id).cloned().ok_or_else(|| {
-                Error::invalid_params().data(serde_json::json!({
-                    "message": "unknown session",
-                    "sessionId": session_id,
-                }))
-            })?
-        };
+        let session_ref = self.session_ref_for_agent_session(&session_id).await?;
 
         session_ref.set_mode(mode).await.map_err(Error::from)?;
         Ok(agent_client_protocol::schema::SetSessionModeResponse::new())
@@ -94,15 +78,7 @@ impl LocalAgentHandle {
                     })
                     .transpose()?;
 
-                let session_ref = {
-                    let registry = self.registry.lock().await;
-                    registry.get(&session_id).cloned().ok_or_else(|| {
-                        Error::invalid_params().data(serde_json::json!({
-                            "message": "unknown session",
-                            "sessionId": session_id,
-                        }))
-                    })?
-                };
+                let session_ref = self.session_ref_for_agent_session(&session_id).await?;
 
                 #[cfg(feature = "remote")]
                 let msg = crate::agent::messages::SetSessionModel {
@@ -166,15 +142,7 @@ impl LocalAgentHandle {
                     })));
                 }
 
-                let session_ref = {
-                    let registry = self.registry.lock().await;
-                    registry.get(&session_id).cloned().ok_or_else(|| {
-                        Error::invalid_params().data(serde_json::json!({
-                            "message": "unknown session",
-                            "sessionId": session_id,
-                        }))
-                    })?
-                };
+                let session_ref = self.session_ref_for_agent_session(&session_id).await?;
                 let mode = session_ref.get_mode().await.unwrap_or(AgentMode::Build);
                 let effort = session_ref.get_reasoning_effort().await.ok().flatten();
                 let config_options = self
@@ -192,15 +160,7 @@ impl LocalAgentHandle {
                     .parse::<AgentMode>()
                     .map_err(|e| Error::invalid_params().data(serde_json::json!({ "error": e })))?;
 
-                let session_ref = {
-                    let registry = self.registry.lock().await;
-                    registry.get(&session_id).cloned().ok_or_else(|| {
-                        Error::invalid_params().data(serde_json::json!({
-                            "message": "unknown session",
-                            "sessionId": session_id,
-                        }))
-                    })?
-                };
+                let session_ref = self.session_ref_for_agent_session(&session_id).await?;
                 session_ref.set_mode(mode).await.map_err(Error::from)?;
 
                 let effort = session_ref.get_reasoning_effort().await.ok().flatten();
@@ -230,15 +190,7 @@ impl LocalAgentHandle {
                     )
                 };
 
-                let session_ref = {
-                    let registry = self.registry.lock().await;
-                    registry.get(&session_id).cloned().ok_or_else(|| {
-                        Error::invalid_params().data(serde_json::json!({
-                            "message": "unknown session",
-                            "sessionId": session_id,
-                        }))
-                    })?
-                };
+                let session_ref = self.session_ref_for_agent_session(&session_id).await?;
 
                 session_ref
                     .set_reasoning_effort(effort)

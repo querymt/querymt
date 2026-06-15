@@ -280,6 +280,77 @@ impl LocalAgentHandle {
             }
         }
 
+        if let Some(profiles) = self.profiles() {
+            let profile_id = match requested_profile_id_from_meta(req.meta.as_ref()) {
+                Some(profile_id) => profile_id.to_string(),
+                None => profiles.active_profile_id().await,
+            };
+            let runtime = profiles.runtime_for_profile(&profile_id).await.map_err(|err| {
+                Error::invalid_params().data(serde_json::json!({
+                    "message": format_prefixed_error_chain(&format!("Failed to load profile '{profile_id}'"), &err),
+                    "profileId": profile_id,
+                }))
+            })?;
+            let profile_handle = runtime.agent().handle();
+            let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
+            if let Some(bridge) = bridge {
+                profile_handle.set_bridge(bridge).await;
+            }
+            let prepared = profile_handle
+                .session_materializer
+                .prepare_new_session(req)
+                .await?;
+            let session_id = prepared.session_id.clone();
+            let session_ref = {
+                let mut registry = profile_handle.registry_lock().await;
+                registry.register_prepared_session(&prepared).await
+            };
+            let bridge = profile_handle
+                .bridge
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone());
+            profile_handle
+                .session_materializer
+                .finalize_session(&prepared, bridge)
+                .await?;
+            profiles
+                .bind_session_to_runtime(session_id.clone(), &runtime)
+                .await
+                .map_err(|err| {
+                    Error::internal_error().data(serde_json::json!({
+                        "message": format_prefixed_error_chain("Failed to bind session to profile", &err),
+                        "profileId": profile_id,
+                        "sessionId": session_id,
+                    }))
+                })?;
+
+            let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+            let profile_list = profiles.list_profiles().await.map_err(|err| {
+                Error::internal_error().data(serde_json::json!({
+                    "message": format_prefixed_error_chain("Failed to list profiles", &err),
+                }))
+            })?;
+            let config_options = crate::agent::session_registry::config_options_with_profiles(
+                current_mode,
+                **profile_handle.config.default_reasoning_effort.load(),
+                Some(profile_id.as_str()),
+                &profile_list,
+            );
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                "querymt".to_string(),
+                serde_json::json!({
+                    "profile_id": profile_id,
+                    "profile_source": "querymt_profile_manager",
+                }),
+            );
+            return Ok(NewSessionResponse::new(session_id)
+                .modes(crate::agent::session_registry::mode_state(current_mode))
+                .config_options(config_options)
+                .meta(meta));
+        }
+
         // Phase 1: Prepare session (heavy work, NO registry lock held)
         let prepared = self.session_materializer.prepare_new_session(req).await?;
 
@@ -327,6 +398,76 @@ impl LocalAgentHandle {
         req: agent_client_protocol::schema::LoadSessionRequest,
     ) -> std::result::Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
         let session_id = req.session_id.to_string();
+
+        if let Some(profiles) = self.profiles()
+            && let Some(binding) = profiles.session_binding(&session_id).await
+        {
+            let runtime = profiles
+                .runtime_for_profile(&binding.profile_id)
+                .await
+                .map_err(|err| {
+                    Error::internal_error().data(serde_json::json!({
+                        "message": format_prefixed_error_chain(
+                            &format!("Failed to load profile '{}'", binding.profile_id),
+                            &err,
+                        ),
+                        "profileId": binding.profile_id,
+                        "sessionId": session_id,
+                    }))
+                })?;
+            let profile_handle = runtime.agent().handle();
+            let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
+            if let Some(bridge) = bridge {
+                profile_handle.set_bridge(bridge).await;
+            }
+
+            let existing_session_ref = {
+                let registry = profile_handle.registry_lock().await;
+                registry.get(&session_id).cloned()
+            };
+            let session_ref = if let Some(session_ref) = existing_session_ref {
+                session_ref
+            } else {
+                match profile_handle
+                    .session_materializer
+                    .prepare_load_session(req, Some(&profile_handle.registry))
+                    .await?
+                {
+                    PreparedSessionResult::Prepared(prepared) => {
+                        let session_ref = {
+                            let mut registry = profile_handle.registry_lock().await;
+                            registry.register_prepared_session(&prepared).await
+                        };
+                        let bridge = profile_handle
+                            .bridge
+                            .lock()
+                            .ok()
+                            .and_then(|guard| guard.clone());
+                        profile_handle
+                            .session_materializer
+                            .finalize_session(&prepared, bridge)
+                            .await?;
+                        session_ref
+                    }
+                    PreparedSessionResult::AlreadyRegistered(session_ref) => session_ref,
+                }
+            };
+            let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+            let profile_list = profiles.list_profiles().await.map_err(|err| {
+                Error::internal_error().data(serde_json::json!({
+                    "message": format_prefixed_error_chain("Failed to list profiles", &err),
+                }))
+            })?;
+            let config_options = crate::agent::session_registry::config_options_with_profiles(
+                current_mode,
+                **profile_handle.config.default_reasoning_effort.load(),
+                Some(binding.profile_id.as_str()),
+                &profile_list,
+            );
+            return Ok(LoadSessionResponse::new()
+                .modes(crate::agent::session_registry::mode_state(current_mode))
+                .config_options(config_options));
+        }
 
         // Single-flight check: Check if session is already materialized
         // Clone the session_ref out of the registry to avoid holding the lock
@@ -417,4 +558,11 @@ impl LocalAgentHandle {
 
         log::info!("LocalAgentHandle: Shutdown complete");
     }
+}
+
+fn requested_profile_id_from_meta(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<&str> {
+    let profile_id = meta?.get("querymt")?.get("profile_id")?.as_str()?.trim();
+    (!profile_id.is_empty() && profile_id != "default").then_some(profile_id)
 }

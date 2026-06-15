@@ -1,3 +1,4 @@
+use super::utils::format_prefixed_error_chain;
 use super::*;
 
 impl LocalAgentHandle {
@@ -5,6 +6,33 @@ impl LocalAgentHandle {
         &self,
         session_id: &str,
     ) -> Result<SessionActorRef, Error> {
+        if let Some(profiles) = self.profiles()
+            && let Some(binding) = profiles.session_binding(session_id).await
+        {
+            let runtime = profiles
+                .runtime_for_profile(&binding.profile_id)
+                .await
+                .map_err(|err| {
+                    Error::internal_error().data(serde_json::json!({
+                        "message": format_prefixed_error_chain(
+                            &format!("Failed to load profile '{}'", binding.profile_id),
+                            &err,
+                        ),
+                        "profileId": binding.profile_id,
+                        "sessionId": session_id,
+                    }))
+                })?;
+            let profile_handle = runtime.agent().handle();
+            let registry = profile_handle.registry.lock().await;
+            return registry.get(session_id).cloned().ok_or_else(|| {
+                Error::invalid_params().data(serde_json::json!({
+                    "message": "unknown session for bound profile",
+                    "sessionId": session_id,
+                    "profileId": binding.profile_id,
+                }))
+            });
+        }
+
         let registry = self.registry.lock().await;
         registry.get(session_id).cloned().ok_or_else(|| {
             Error::invalid_params().data(serde_json::json!({

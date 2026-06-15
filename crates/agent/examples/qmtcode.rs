@@ -644,7 +644,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let _profile_watcher = profile_manager
+        .as_ref()
+        .and_then(ProfileRuntimeManager::start_profile_watcher);
+
     if is_acp {
+        if let Some(manager) = profile_manager.clone() {
+            runner.handle().set_profiles(manager);
+        }
         eprintln!("Starting ACP stdio server...");
         runner.acp("stdio").await?;
     } else if is_api {
