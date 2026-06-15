@@ -1052,6 +1052,13 @@ pub unsafe extern "C" fn qmt_ffi_free_string(ptr: *mut std::ffi::c_char) {
 // ============================================================================
 
 #[cfg(target_os = "android")]
+static ANDROID_CONTEXT_INIT: std::sync::Once = std::sync::Once::new();
+#[cfg(target_os = "android")]
+static ANDROID_CONTEXT_GLOBAL: once_cell::sync::OnceCell<
+    jni::objects::Global<jni::objects::JObject<'static>>,
+> = once_cell::sync::OnceCell::new();
+
+#[cfg(target_os = "android")]
 unsafe fn android_init_impl(env: *mut std::ffi::c_void, context: *mut std::ffi::c_void) -> i32 {
     if env.is_null() || context.is_null() {
         set_last_error(
@@ -1063,9 +1070,21 @@ unsafe fn android_init_impl(env: *mut std::ffi::c_void, context: *mut std::ffi::
 
     let mut env = unsafe { jni::EnvUnowned::from_raw(env.cast::<jni::sys::JNIEnv>()) };
     let context = context.cast::<jni::sys::_jobject>();
+
     match env
         .with_env_no_catch(|env| {
             let context = unsafe { jni::objects::JObject::from_raw(env, context) };
+            let java_vm = env.get_java_vm()?;
+            let global_context =
+                ANDROID_CONTEXT_GLOBAL.get_or_try_init(|| env.new_global_ref(&context))?;
+
+            ANDROID_CONTEXT_INIT.call_once(|| unsafe {
+                ndk_context::initialize_android_context(
+                    java_vm.get_raw().cast(),
+                    global_context.as_obj().as_raw().cast(),
+                );
+            });
+
             rustls_platform_verifier::android::init_with_env(env, context)
         })
         .into_outcome()
