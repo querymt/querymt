@@ -547,12 +547,37 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                                 ACK_WINDOW_BATCHES,
                                 ACK_WINDOW_INTERVAL,
                             );
+                            if is_terminal {
+                                tracing::info!(
+                                    target: "querymt_remote::provider::relay",
+                                    session_id = %session_id,
+                                    request_id = %request_id,
+                                    provider = %provider_name,
+                                    model = %model,
+                                    should_ack,
+                                    buffered_messages = buffered.len(),
+                                    unacked_batches,
+                                    "relaying terminal provider stream message"
+                                );
+                            }
                             let relay_result = if should_ack {
                                 stream_router_ref.tell(&relay).send_ack().await.map_err(|e| e.to_string())
                             } else {
                                 stream_router_ref.tell(&relay).send().map_err(|e| e.to_string())
                             };
                             if let Err(e) = relay_result {
+                                if is_terminal {
+                                    tracing::warn!(
+                                        target: "querymt_remote::provider::relay",
+                                        session_id = %session_id,
+                                        request_id = %request_id,
+                                        provider = %provider_name,
+                                        model = %model,
+                                        should_ack,
+                                        error = %e,
+                                        "failed to relay terminal provider stream message"
+                                    );
+                                }
                                 if disconnected_since.is_none() {
                                     disconnected_since = Some(tokio::time::Instant::now());
                                     let _ = stream_router_ref.tell(&RoutedStreamRelayMessage {
@@ -569,6 +594,19 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                                 }
                                 tokio::time::sleep(Duration::from_millis(250)).await;
                                 continue;
+                            }
+
+                            if is_terminal {
+                                tracing::info!(
+                                    target: "querymt_remote::provider::relay",
+                                    session_id = %session_id,
+                                    request_id = %request_id,
+                                    provider = %provider_name,
+                                    model = %model,
+                                    should_ack,
+                                    relay_elapsed_ms = relay_start.elapsed().as_millis(),
+                                    "terminal provider stream message relayed successfully"
+                                );
                             }
 
                             if is_chunk_batch {

@@ -206,6 +206,10 @@ pub fn should_ack_relay_message(
     ack_window_batches: u32,
     ack_window_interval: std::time::Duration,
 ) -> bool {
+    if relay_message_is_terminal(message) {
+        return true;
+    }
+
     match message {
         StreamRelayMessage::Chunk(_) | StreamRelayMessage::ChunkBatch(_) => {
             unacked_batches >= ack_window_batches || last_ack_at >= ack_window_interval

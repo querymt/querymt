@@ -94,18 +94,69 @@ where
         Pin<Box<dyn futures_util::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
         LLMError,
     > {
-        let host_ref = self.core.lookup_host().await?;
         let request_id = Uuid::now_v7().to_string();
         let session_id = self
             .remote_session_id()
             .unwrap_or("unknown-session")
             .to_string();
+        let provider_name = self.core.config().provider_name.clone();
+        let model_name = self.core.config().model.clone();
+        let target_locator = self.core.config().target_locator.clone();
+        let setup_span = tracing::info_span!(
+            "remote.provider_client.stream.setup",
+            session_id = %session_id,
+            request_id = %request_id,
+            provider = %provider_name,
+            model = %model_name,
+            target_locator = %target_locator,
+            message_count = messages.len(),
+            tool_count = tools.map(|t| t.len()).unwrap_or(0),
+            first_chunk_ms = tracing::field::Empty,
+        );
+        let _setup_guard = setup_span.enter();
+
+        tracing::info!(
+            target: "querymt_remote::provider::stream",
+            session_id = %session_id,
+            request_id = %request_id,
+            provider = %provider_name,
+            model = %model_name,
+            target_locator = %target_locator,
+            "starting remote provider stream setup"
+        );
+
+        tracing::debug!(
+            target: "querymt_remote::provider::stream",
+            session_id = %session_id,
+            request_id = %request_id,
+            "looking up remote provider host"
+        );
+        let host_ref = self.core.lookup_host().await?;
+        tracing::debug!(
+            target: "querymt_remote::provider::stream",
+            session_id = %session_id,
+            request_id = %request_id,
+            "remote provider host lookup completed"
+        );
 
         let (tx, rx) = mpsc::channel::<crate::StreamRelayMessage>(64);
+        tracing::debug!(
+            target: "querymt_remote::provider::stream",
+            session_id = %session_id,
+            request_id = %request_id,
+            channel_capacity = 64,
+            "registering and attaching stream router consumer"
+        );
         let (_router_ref, remote_router_ref) = self
             .core
             .prepare_stream_router(&session_id, &request_id, tx)
             .await?;
+        tracing::debug!(
+            target: "querymt_remote::provider::stream",
+            session_id = %session_id,
+            request_id = %request_id,
+            "stream router consumer attached"
+        );
 
         let stream_request = self.core.build_stream_request(
             messages,
@@ -116,6 +167,12 @@ where
             self.core.transport().stream_reconnect_grace().as_secs(),
         );
 
+        tracing::debug!(
+            target: "querymt_remote::provider::stream",
+            session_id = %session_id,
+            request_id = %request_id,
+            "sending remote provider stream request"
+        );
         self.core
             .send_stream_request_with_retry(&host_ref, stream_request, |error| {
                 matches!(
@@ -128,13 +185,22 @@ where
                 )
             })
             .await?;
+        tracing::info!(
+            target: "querymt_remote::provider::stream",
+            session_id = %session_id,
+            request_id = %request_id,
+            provider = %provider_name,
+            model = %model_name,
+            target_locator = %target_locator,
+            "remote provider stream request acknowledged"
+        );
 
         let raw_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         let session_id_for_stream = session_id.clone();
         let request_id_for_stream = request_id.clone();
-        let provider_for_stream = self.core.config().provider_name.clone();
-        let model_for_stream = self.core.config().model.clone();
-        let target_for_stream = self.core.config().target_locator.clone();
+        let provider_for_stream = provider_name.clone();
+        let model_for_stream = model_name.clone();
+        let target_for_stream = target_locator.clone();
         let reconnect_grace = self.core.transport().stream_reconnect_grace();
         let stream_start = Instant::now();
         let local_peer_id = self.core.transport().local_peer_id_display().await;
@@ -148,7 +214,17 @@ where
             self.core
                 .make_renew_lease_fn(host_ref.clone(), session_id.clone(), request_id.clone());
         let peer_alive_fn = self.core.make_target_peer_alive_fn();
-        let setup_span = tracing::Span::current();
+        let setup_span = setup_span.clone();
+        tracing::info!(
+            target: "querymt_remote::provider::stream",
+            session_id = %session_id,
+            request_id = %request_id,
+            local_peer_id = %local_peer_id,
+            target_peer_id = %target_peer_id_display,
+            lease_renew_every_ms = lease_renew_every.as_millis(),
+            reconnect_grace_ms = reconnect_grace.as_millis(),
+            "remote provider stream consumer ready"
+        );
 
         let stream = futures_util::stream::unfold(
             (
@@ -168,11 +244,39 @@ where
                 let renew_lease = renew_lease_factory.clone();
                 let peer_alive_fn = peer_alive_fn.clone();
                 async move {
-                    if let Some((chunk, _chunk_index, first_chunk_ms)) =
+                    if stream_state.is_finished() {
+                        tracing::debug!(
+                            target: "querymt_remote::provider::stream",
+                            session_id = %session_id_for_stream,
+                            request_id = %request_id_for_stream,
+                            chunk_index = stream_state.chunk_index(),
+                            "remote provider stream finished after terminal chunk"
+                        );
+                        return None;
+                    }
+
+                    if let Some((chunk, chunk_index, first_chunk_ms)) =
                         stream_state.take_pending(stream_start)
                     {
                         if let Some(first_chunk_ms) = first_chunk_ms {
                             setup_span.record("first_chunk_ms", first_chunk_ms);
+                        }
+                        if let StreamChunk::Done { finish_reason } = &chunk {
+                            tracing::info!(
+                                target: "querymt_remote::provider::stream",
+                                session_id = %session_id_for_stream,
+                                request_id = %request_id_for_stream,
+                                local_peer_id = %local_peer_id,
+                                target_peer_id = %target_peer_id_display,
+                                provider = %provider_for_stream,
+                                model = %model_for_stream,
+                                target_node = %target_for_stream,
+                                chunk_index,
+                                elapsed_ms = stream_start.elapsed().as_millis(),
+                                finish_reason = ?finish_reason,
+                                pending_chunks = stream_state.pending_chunks_len(),
+                                "stream done received from remote provider pending batch"
+                            );
                         }
                         return Some((Ok(chunk), (raw_stream, stream_state, renew_due)));
                     }

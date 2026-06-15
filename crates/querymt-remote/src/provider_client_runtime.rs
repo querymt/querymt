@@ -321,12 +321,13 @@ where
         match next {
             Some(StreamRelayMessage::Chunk(chunk)) => {
                 let elapsed_ms = stream_start.elapsed().as_millis();
-                let (chunk_index, first_chunk_ms) = stream_state.note_chunk(stream_start);
+                let (chunk_index, first_chunk_ms) =
+                    stream_state.note_chunk_received(&chunk, stream_start);
                 if let Some(first_chunk_ms) = first_chunk_ms {
                     setup_span.record("first_chunk_ms", first_chunk_ms);
                 }
                 if let querymt::chat::StreamChunk::Done { finish_reason } = &chunk {
-                    tracing::debug!(
+                    tracing::info!(
                         target: "querymt_remote::provider::stream",
                         session_id = %session_id,
                         request_id = %request_id,
@@ -338,6 +339,7 @@ where
                         chunk_index,
                         elapsed_ms,
                         finish_reason = ?finish_reason,
+                        pending_chunks = stream_state.pending_chunks_len(),
                         "stream done received from remote provider"
                     );
                 } else {
@@ -370,7 +372,7 @@ where
                     );
                     return Ok(None);
                 };
-                tracing::trace!(
+                tracing::debug!(
                     target: "remote::mesh_provider::stream",
                     session_id = %session_id,
                     request_id = %request_id,
@@ -381,6 +383,7 @@ where
                     target_node = %target_name,
                     batch_len,
                     elapsed_ms,
+                    pending_chunks = stream_state.pending_chunks_len(),
                     "stream batch received"
                 );
                 if let Some(first_chunk_ms) = first_chunk_ms {
@@ -448,11 +451,24 @@ where
                 Err(LLMError::from_payload(error))
             }
             None => {
-                if let Some(error) = stream_state.closed_error(peer_alive) {
-                    Err(error)
-                } else {
-                    Ok(None)
-                }
+                tracing::warn!(
+                    target: "querymt_remote::provider::stream",
+                    session_id = %session_id,
+                    request_id = %request_id,
+                    local_peer_id = %local_peer_id,
+                    target_peer_id = %target_peer_id,
+                    provider = %provider_name,
+                    model = %model,
+                    target_node = %target_name,
+                    peer_alive,
+                    disconnected = stream_state.is_disconnected(),
+                    pending_chunks = stream_state.pending_chunks_len(),
+                    chunk_index = stream_state.chunk_index(),
+                    elapsed_ms = stream_start.elapsed().as_millis(),
+                    terminal_seen = stream_state.terminal_seen(),
+                    "remote provider stream channel closed before terminal"
+                );
+                Err(stream_state.closed_error(peer_alive))
             }
         }
     }

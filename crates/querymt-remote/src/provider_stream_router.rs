@@ -83,6 +83,15 @@ impl RoutedRequest {
     fn deliver_or_buffer(&mut self, message: StreamRelayMessage) {
         self.last_message_at = Instant::now();
 
+        let message_type = match &message {
+            StreamRelayMessage::Chunk(_) => "chunk",
+            StreamRelayMessage::ChunkBatch(_) => "chunk_batch",
+            StreamRelayMessage::Heartbeat { .. } => "heartbeat",
+            StreamRelayMessage::ProviderError { .. } => "provider_error",
+            StreamRelayMessage::TransportDisconnected { .. } => "transport_disconnected",
+            StreamRelayMessage::TransportReconnected { .. } => "transport_reconnected",
+            StreamRelayMessage::TransportFailed { .. } => "transport_failed",
+        };
         let is_terminal = relay_message_is_terminal(&message);
         let terminal_phase = terminal_request_phase(&message);
 
@@ -102,25 +111,68 @@ impl RoutedRequest {
         let message = if let Some(tx) = &self.consumer_tx {
             match tx.try_send(message) {
                 Ok(()) => {
+                    tracing::debug!(
+                        target: "querymt_remote::provider::router",
+                        request_id = %self.request_id,
+                        message_type,
+                        is_terminal,
+                        phase = %self.phase,
+                        buffered = self.replay_buffer.len(),
+                        "router delivered message to stream consumer"
+                    );
                     if is_terminal {
                         if let Some(phase) = terminal_phase {
                             self.phase = phase;
                         }
+                        tracing::info!(
+                            target: "querymt_remote::provider::router",
+                            request_id = %self.request_id,
+                            message_type,
+                            phase = %self.phase,
+                            "router delivered terminal message to stream consumer"
+                        );
                         self.consumer_tx = None;
                     }
                     return;
                 }
                 Err(mpsc::error::TrySendError::Full(msg)) => {
+                    tracing::warn!(
+                        target: "querymt_remote::provider::router",
+                        request_id = %self.request_id,
+                        message_type,
+                        is_terminal,
+                        phase = %self.phase,
+                        buffered = self.replay_buffer.len(),
+                        "router consumer channel full; buffering message"
+                    );
                     self.phase = RequestPhase::ConsumerDisconnected;
                     msg
                 }
                 Err(mpsc::error::TrySendError::Closed(msg)) => {
+                    tracing::warn!(
+                        target: "querymt_remote::provider::router",
+                        request_id = %self.request_id,
+                        message_type,
+                        is_terminal,
+                        phase = %self.phase,
+                        buffered = self.replay_buffer.len(),
+                        "router consumer channel closed; buffering message"
+                    );
                     self.consumer_tx = None;
                     self.phase = RequestPhase::ConsumerDisconnected;
                     msg
                 }
             }
         } else {
+            tracing::debug!(
+                target: "querymt_remote::provider::router",
+                request_id = %self.request_id,
+                message_type,
+                is_terminal,
+                phase = %self.phase,
+                buffered = self.replay_buffer.len(),
+                "router has no active consumer; buffering message"
+            );
             message
         };
 
@@ -136,6 +188,14 @@ impl RoutedRequest {
         ) && let Some(phase) = terminal_phase
         {
             self.phase = phase;
+            tracing::info!(
+                target: "querymt_remote::provider::router",
+                request_id = %self.request_id,
+                message_type,
+                phase = %self.phase,
+                buffered = self.replay_buffer.len(),
+                "router buffered terminal message"
+            );
         }
     }
 

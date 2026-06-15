@@ -9,6 +9,7 @@ pub struct RemoteProviderStreamState {
     chunk_index: u64,
     pending_chunks: VecDeque<StreamChunk>,
     first_chunk_recorded: bool,
+    terminal_seen: bool,
 }
 
 impl RemoteProviderStreamState {
@@ -18,9 +19,8 @@ impl RemoteProviderStreamState {
 
     pub fn take_pending(&mut self, started_at: Instant) -> Option<(StreamChunk, u64, Option<u64>)> {
         let chunk = self.pending_chunks.pop_front()?;
-        self.chunk_index += 1;
-        let first_chunk_ms = self.record_first_chunk(started_at);
-        Some((chunk, self.chunk_index, first_chunk_ms))
+        let (chunk_index, first_chunk_ms) = self.note_chunk_received(&chunk, started_at);
+        Some((chunk, chunk_index, first_chunk_ms))
     }
 
     pub fn push_batch_and_take_first(
@@ -39,8 +39,13 @@ impl RemoteProviderStreamState {
         Some((chunk, chunk_index, first_chunk_ms, batch_len))
     }
 
-    pub fn note_chunk(&mut self, started_at: Instant) -> (u64, Option<u64>) {
+    pub fn note_chunk_received(
+        &mut self,
+        chunk: &StreamChunk,
+        started_at: Instant,
+    ) -> (u64, Option<u64>) {
         self.chunk_index += 1;
+        self.note_terminal_if_done(chunk);
         let first_chunk_ms = self.record_first_chunk(started_at);
         (self.chunk_index, first_chunk_ms)
     }
@@ -62,14 +67,36 @@ impl RemoteProviderStreamState {
         self.disconnected_since.is_some()
     }
 
-    pub fn closed_error(&self, peer_alive: bool) -> Option<LLMError> {
-        if self.is_disconnected() || !peer_alive {
-            Some(LLMError::Transport {
-                kind: TransportErrorKind::ConnectionClosed,
-                message: format!("stream receiver closed (peer_alive={})", peer_alive),
-            })
-        } else {
-            None
+    pub fn pending_chunks_len(&self) -> usize {
+        self.pending_chunks.len()
+    }
+
+    pub fn chunk_index(&self) -> u64 {
+        self.chunk_index
+    }
+
+    pub fn terminal_seen(&self) -> bool {
+        self.terminal_seen
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.terminal_seen && self.pending_chunks.is_empty()
+    }
+
+    pub fn closed_error(&self, peer_alive: bool) -> LLMError {
+        LLMError::Transport {
+            kind: TransportErrorKind::ConnectionClosed,
+            message: format!(
+                "stream receiver closed before terminal chunk (peer_alive={}, disconnected={})",
+                peer_alive,
+                self.is_disconnected()
+            ),
+        }
+    }
+
+    fn note_terminal_if_done(&mut self, chunk: &StreamChunk) {
+        if matches!(chunk, StreamChunk::Done { .. }) {
+            self.terminal_seen = true;
         }
     }
 
@@ -89,17 +116,21 @@ mod tests {
     use querymt::chat::{FinishReason, StreamChunk};
 
     #[test]
-    fn note_chunk_only_reports_first_chunk_latency_once() {
+    fn note_chunk_received_only_reports_first_chunk_latency_once() {
         let mut state = RemoteProviderStreamState::new();
         let started_at = Instant::now() - Duration::from_millis(25);
 
-        let (first_index, first_latency) = state.note_chunk(started_at);
-        let (second_index, second_latency) = state.note_chunk(started_at);
+        let (first_index, first_latency) =
+            state.note_chunk_received(&StreamChunk::Text("one".to_string()), started_at);
+        let (second_index, second_latency) =
+            state.note_chunk_received(&StreamChunk::Text("two".to_string()), started_at);
 
         assert_eq!(first_index, 1);
         assert!(first_latency.is_some());
         assert_eq!(second_index, 2);
         assert_eq!(second_latency, None);
+        assert!(!state.terminal_seen());
+        assert!(!state.is_finished());
     }
 
     #[test]
@@ -134,8 +165,61 @@ mod tests {
         assert!(matches!(third.0, StreamChunk::Done { .. }));
         assert_eq!(third.1, 3);
         assert_eq!(third.2, None);
+        assert!(state.terminal_seen());
+        assert!(state.is_finished());
 
         assert!(state.take_pending(started_at).is_none());
+    }
+
+    #[test]
+    fn terminal_batch_drains_trailing_usage_before_finished() {
+        let mut state = RemoteProviderStreamState::new();
+        let started_at = Instant::now() - Duration::from_millis(10);
+
+        let first = state
+            .push_batch_and_take_first(
+                started_at,
+                vec![
+                    StreamChunk::Text("one".to_string()),
+                    StreamChunk::Done {
+                        finish_reason: FinishReason::Stop,
+                    },
+                    StreamChunk::Usage(Default::default()),
+                ],
+            )
+            .unwrap();
+
+        assert!(matches!(first.0, StreamChunk::Text(ref text) if text == "one"));
+        assert!(!state.terminal_seen());
+        assert!(!state.is_finished());
+
+        let second = state.take_pending(started_at).unwrap();
+        assert!(matches!(second.0, StreamChunk::Done { .. }));
+        assert!(state.terminal_seen());
+        assert!(!state.is_finished());
+
+        let third = state.take_pending(started_at).unwrap();
+        assert!(matches!(third.0, StreamChunk::Usage(_)));
+        assert!(state.terminal_seen());
+        assert!(state.is_finished());
+    }
+
+    #[test]
+    fn single_done_marks_stream_finished() {
+        let mut state = RemoteProviderStreamState::new();
+        let started_at = Instant::now() - Duration::from_millis(10);
+
+        let (index, first_latency) = state.note_chunk_received(
+            &StreamChunk::Done {
+                finish_reason: FinishReason::Stop,
+            },
+            started_at,
+        );
+
+        assert_eq!(index, 1);
+        assert!(first_latency.is_some());
+        assert!(state.terminal_seen());
+        assert!(state.is_finished());
     }
 
     #[test]
@@ -165,13 +249,10 @@ mod tests {
     }
 
     #[test]
-    fn closed_error_depends_on_disconnect_or_peer_liveness() {
+    fn closed_error_reports_pre_terminal_close() {
         let mut state = RemoteProviderStreamState::new();
-        assert!(state.closed_error(true).is_none());
 
-        let err = state
-            .closed_error(false)
-            .expect("dead peer should produce error");
+        let err = state.closed_error(true);
         assert!(matches!(
             err,
             LLMError::Transport {
@@ -179,11 +260,10 @@ mod tests {
                 ..
             }
         ));
+        assert!(err.to_string().contains("before terminal chunk"));
 
         state.note_disconnect();
-        let err = state
-            .closed_error(true)
-            .expect("disconnected stream should produce error");
+        let err = state.closed_error(true);
         assert!(matches!(
             err,
             LLMError::Transport {
