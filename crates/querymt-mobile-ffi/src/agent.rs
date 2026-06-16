@@ -113,6 +113,7 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
         plugin_registry: plugin_registry.clone(),
         storage: Some(storage.clone()),
         session_mcp_attachment_source: Some(session_mcp_source),
+        event_fanout: Some(Arc::new(querymt_agent::event_fanout::EventFanout::new())),
     };
 
     let profile_catalog =

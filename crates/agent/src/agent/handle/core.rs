@@ -464,9 +464,13 @@ impl LocalAgentHandle {
                 Some(binding.profile_id.as_str()),
                 &profile_list,
             );
-            return Ok(LoadSessionResponse::new()
+            let mut response = LoadSessionResponse::new()
                 .modes(crate::agent::session_registry::mode_state(current_mode))
-                .config_options(config_options));
+                .config_options(config_options);
+            if let Some(meta) = profile_handle.session_load_snapshot_meta(&session_id).await {
+                response = response.meta(meta);
+            }
+            return Ok(response);
         }
 
         // Single-flight check: Check if session is already materialized
@@ -487,9 +491,13 @@ impl LocalAgentHandle {
                     **self.config.default_reasoning_effort.load(),
                 )
                 .await?;
-            return Ok(LoadSessionResponse::new()
+            let mut response = LoadSessionResponse::new()
                 .modes(crate::agent::session_registry::mode_state(current_mode))
-                .config_options(config_options));
+                .config_options(config_options);
+            if let Some(meta) = self.session_load_snapshot_meta(&session_id).await {
+                response = response.meta(meta);
+            }
+            return Ok(response);
         }
 
         // Phase 1: Prepare session (heavy work, NO registry lock held)
@@ -531,9 +539,30 @@ impl LocalAgentHandle {
             )
             .await?;
 
-        Ok(LoadSessionResponse::new()
+        let mut response = LoadSessionResponse::new()
             .modes(crate::agent::session_registry::mode_state(current_mode))
-            .config_options(config_options))
+            .config_options(config_options);
+        if let Some(meta) = self.session_load_snapshot_meta(&session_id).await {
+            response = response.meta(meta);
+        }
+
+        Ok(response)
+    }
+
+    async fn session_load_snapshot_meta(
+        &self,
+        session_id: &str,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let view_store = self.config.storage.view_store()?;
+        let snapshot = crate::session::load_session_snapshot(self, view_store, session_id)
+            .await
+            .ok()?;
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "querymt/sessionLoadSnapshot.v1".to_string(),
+            serde_json::to_value(snapshot).ok()?,
+        );
+        Some(meta)
     }
 
     /// Gracefully shutdown the agent and all background tasks.

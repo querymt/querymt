@@ -1,6 +1,7 @@
 //! Tests for replay/live session stream cursor semantics.
 
 use crate::api::{AgentInfra, ProfileRuntimeHandle};
+use crate::event_fanout::EventFanout;
 use crate::events::{AgentEventKind, EventOrigin};
 use crate::profiles::{LocalProfileCatalog, ProfileRuntimeManager};
 use crate::session::backend::StorageBackend;
@@ -35,17 +36,17 @@ system = "inline"
     .expect("failed to write profile");
 }
 
-async fn test_profile_manager(dir: &Path) -> ProfileRuntimeHandle {
+async fn test_profile_manager_with_infra(
+    dir: &Path,
+    storage: Arc<SqliteStorage>,
+    event_fanout: Arc<EventFanout>,
+) -> ProfileRuntimeHandle {
     let (registry, _registry_dir) = empty_plugin_registry().expect("empty plugin registry");
-    let storage = Arc::new(
-        SqliteStorage::connect(":memory:".into())
-            .await
-            .expect("in-memory storage"),
-    );
     let infra = AgentInfra {
         plugin_registry: Arc::new(registry),
         storage: Some(storage),
         session_mcp_attachment_source: None,
+        event_fanout: Some(event_fanout),
     };
     let catalog: Arc<dyn crate::profiles::ProfileCatalog> = Arc::new(
         LocalProfileCatalog::builder()
@@ -283,11 +284,16 @@ async fn forwarder_drops_event_when_seq_is_at_or_below_cursor() -> Result<()> {
 }
 
 #[tokio::test]
-async fn forwarder_picks_up_lazily_materialized_profile_runtime_events() -> Result<()> {
+async fn forwarder_uses_shared_profile_runtime_fanout_without_polling() -> Result<()> {
     let agent = TestAgent::new().await;
     let dir = tempfile::TempDir::new().expect("create temp profile dir");
     write_profile(dir.path(), "alpha.toml");
-    let profiles = test_profile_manager(dir.path()).await;
+    let profiles = test_profile_manager_with_infra(
+        dir.path(),
+        agent.storage.clone(),
+        agent.handle.config.event_sink.fanout().clone(),
+    )
+    .await;
 
     let session_id = "s-profile-live".to_string();
     let conn_id = "conn-profile-live".to_string();
@@ -301,7 +307,7 @@ async fn forwarder_picks_up_lazily_materialized_profile_runtime_events() -> Resu
         view_store: agent.storage.view_store().expect("view store"),
         session_store: agent.storage.session_store(),
         default_cwd: None,
-        event_sources: vec![],
+        event_sources: vec![agent.handle.config.event_sink.fanout().clone()],
         profiles: Some(profiles.clone()),
         connections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         connection_senders: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -346,8 +352,13 @@ async fn forwarder_picks_up_lazily_materialized_profile_runtime_events() -> Resu
         .await
         .expect("session binds to profile runtime");
 
-    // Give the polling forwarder one interval to discover the newly materialized runtime.
-    sleep(Duration::from_millis(150)).await;
+    assert!(
+        Arc::ptr_eq(
+            state.agent.config.event_sink.fanout(),
+            runtime.agent().handle().config.event_sink.fanout()
+        ),
+        "profile runtimes should share the root live event fanout"
+    );
 
     runtime.agent().handle().config.event_sink.fanout().publish(
         crate::events::EventEnvelope::Durable(crate::events::DurableEvent {

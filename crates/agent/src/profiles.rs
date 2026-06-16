@@ -1106,6 +1106,7 @@ mod tests {
                 plugin_registry: Arc::new(registry),
                 storage: Some(storage),
                 session_mcp_attachment_source: None,
+                event_fanout: None,
             },
             temp_dir,
         )
