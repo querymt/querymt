@@ -33,10 +33,10 @@ mod session_stream_tests;
 #[cfg(test)]
 mod undo_handler_tests;
 
+use crate::api::ProfileRuntimeHandle;
 use crate::auth::service::OAuthService;
 use crate::event_fanout::EventFanout;
 use crate::index::WorkspaceIndexManagerActor;
-use crate::profiles::{ProfileCatalog, ProfileRuntimeManager};
 use crate::session::projection::ViewStore;
 use crate::session::store::SessionStore;
 use crate::ui::messages::UiServerMessage;
@@ -63,7 +63,7 @@ pub struct UiServer {
     session_store: Arc<dyn SessionStore>,
     default_cwd: Option<PathBuf>,
     event_sources: Vec<Arc<EventFanout>>,
-    profiles: Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>>,
+    profiles: Option<ProfileRuntimeHandle>,
     connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
     connection_senders: Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>,
     session_agents: Arc<Mutex<HashMap<String, String>>>,
@@ -131,7 +131,7 @@ pub(crate) struct ServerState {
     pub session_store: Arc<dyn SessionStore>,
     pub default_cwd: Option<PathBuf>,
     pub event_sources: Vec<Arc<EventFanout>>,
-    pub profiles: Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>>,
+    pub profiles: Option<ProfileRuntimeHandle>,
     pub connections: Arc<Mutex<HashMap<String, ConnectionState>>>,
     /// Registered senders for broadcasting generic UI server messages to all
     /// connected clients. Inserted on WebSocket connect, removed on disconnect.
@@ -257,7 +257,7 @@ impl UiServer {
         view_store: Arc<dyn ViewStore>,
         session_store: Arc<dyn SessionStore>,
         default_cwd: Option<PathBuf>,
-        profiles: Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>,
+        profiles: ProfileRuntimeHandle,
     ) -> Self {
         Self::build(
             agent,
@@ -273,7 +273,7 @@ impl UiServer {
         view_store: Arc<dyn ViewStore>,
         session_store: Arc<dyn SessionStore>,
         default_cwd: Option<PathBuf>,
-        profiles: Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>>,
+        profiles: Option<ProfileRuntimeHandle>,
     ) -> Self {
         let event_sources = collect_event_sources(&agent);
 

@@ -608,7 +608,7 @@ mod tests {
         session_ref_for_session,
     };
     use crate::agent::core::AgentMode;
-    use crate::api::AgentInfra;
+    use crate::api::{AgentInfra, ProfileRuntimeHandle};
     use crate::profiles::{LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager};
     use crate::test_utils::{TestServerState, empty_plugin_registry};
     use crate::ui::messages::UiPromptBlock;
@@ -652,11 +652,7 @@ system = "inline"
         assert!(msg.ends_with(raw));
     }
 
-    async fn profile_fixture() -> (
-        TestServerState,
-        Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>,
-        tempfile::TempDir,
-    ) {
+    async fn profile_fixture() -> (TestServerState, ProfileRuntimeHandle, tempfile::TempDir) {
         let mut fixture = TestServerState::new().await;
         let dir = tempfile::TempDir::new().expect("temp profile dir");
         write_profile(dir.path(), "alpha.toml");
@@ -673,7 +669,7 @@ system = "inline"
             storage: Some(fixture.agent.storage.clone()),
             session_mcp_attachment_source: None,
         };
-        let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+        let profiles: ProfileRuntimeHandle = Arc::new(ProfileRuntimeManager::with_infra_boxed(
             catalog, "alpha", infra,
         ));
         fixture.state.profiles = Some(profiles.clone());

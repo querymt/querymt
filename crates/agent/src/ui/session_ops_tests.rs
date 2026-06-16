@@ -2,7 +2,7 @@
 
 use crate::agent::messages::SessionRuntimeStatus;
 use crate::agent::{SessionActor, core::SessionRuntime};
-use crate::api::AgentInfra;
+use crate::api::{AgentInfra, ProfileRuntimeHandle};
 use crate::model::{AgentMessage, MessagePart};
 use crate::profiles::{LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager};
 use crate::session::backend::StorageBackend;
@@ -142,7 +142,7 @@ async fn attach_profiles(
     fixture: &mut crate::test_utils::TestServerState,
     active_profile_id: &str,
     profile_dir: &Path,
-) -> Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>> {
+) -> ProfileRuntimeHandle {
     let (registry, _config_dir) = empty_plugin_registry().expect("empty plugin registry");
     let infra = AgentInfra {
         plugin_registry: Arc::new(registry),
@@ -155,7 +155,7 @@ async fn attach_profiles(
             .local_dir(profile_dir)
             .build(),
     );
-    let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+    let profiles: ProfileRuntimeHandle = Arc::new(ProfileRuntimeManager::with_infra_boxed(
         catalog,
         active_profile_id,
         infra,

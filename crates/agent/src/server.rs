@@ -1,4 +1,4 @@
-use crate::profiles::{ProfileCatalog, ProfileRuntimeManager};
+use crate::api::ProfileRuntimeHandle;
 use crate::ui::UiServer;
 use crate::{acp::AcpServer, session::StorageBackend};
 use axum::Router;
@@ -22,7 +22,7 @@ pub struct AgentServer {
     agent: Arc<crate::agent::LocalAgentHandle>,
     storage: Arc<dyn StorageBackend>,
     default_cwd: Option<PathBuf>,
-    profiles: Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>>,
+    profiles: Option<ProfileRuntimeHandle>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,10 +46,7 @@ impl AgentServer {
         }
     }
 
-    pub fn with_profiles(
-        mut self,
-        profiles: Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>,
-    ) -> Self {
+    pub fn with_profiles(mut self, profiles: ProfileRuntimeHandle) -> Self {
         #[cfg(feature = "remote")]
         if let Some(mesh) = self.agent.mesh() {
             profiles.set_mesh_handle(mesh);
@@ -59,8 +56,8 @@ impl AgentServer {
         self
     }
 
-    #[cfg(all(test, feature = "remote"))]
-    pub(crate) fn profiles(&self) -> Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>> {
+    #[cfg(test)]
+    pub(crate) fn profiles(&self) -> Option<ProfileRuntimeHandle> {
         self.profiles.clone()
     }
 
@@ -312,8 +309,8 @@ async fn handle_sft_export(
 #[cfg(all(test, feature = "remote"))]
 mod tests {
     use super::*;
-    use crate::api::AgentInfra;
-    use crate::profiles::LocalProfileCatalog;
+    use crate::api::{AgentInfra, ProfileRuntimeHandle};
+    use crate::profiles::{LocalProfileCatalog, ProfileRuntimeManager};
     use crate::session::sqlite_storage::SqliteStorage;
     use crate::test_utils::empty_plugin_registry;
 
@@ -358,7 +355,7 @@ system = "inline"
             .include_embedded_default(false)
             .local_dir(dir.path())
             .build();
-        let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+        let profiles: ProfileRuntimeHandle = Arc::new(ProfileRuntimeManager::with_infra_boxed(
             Arc::new(catalog),
             "alpha",
             AgentInfra {
