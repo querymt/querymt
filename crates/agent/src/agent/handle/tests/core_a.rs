@@ -289,8 +289,7 @@ system = "beta"
         .await
         .with_profiles("alpha", profile_dir.path())
         .await;
-    register_test_session(&f, "session-1").await;
-    bind_test_profile(&f, "session-1", "alpha").await;
+    register_bound_test_session(&f, "session-1", "alpha").await;
 
     let options = profile_config_options(&f, Some("session-1")).await;
 
@@ -343,10 +342,44 @@ fn test_config_options_with_profiles_uses_profile_metadata() {
 }
 
 #[tokio::test]
+async fn test_new_session_binds_requested_profile_from_querymt_meta() {
+    let (f, _profile_dir) = profile_fixture_with_files(&[
+        ("alpha.toml", ALPHA_PROFILE_TOML),
+        ("beta.toml", BETA_PROFILE_TOML),
+    ])
+    .await;
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "querymt".to_string(),
+        serde_json::json!({ "profile_id": "beta" }),
+    );
+    let req =
+        agent_client_protocol::schema::NewSessionRequest::new(std::path::PathBuf::new()).meta(meta);
+
+    let response = f.handle.new_session(req).await.expect("new session");
+    let session_id = response.session_id.to_string();
+    let binding = f
+        .handle
+        .profiles()
+        .expect("profiles configured")
+        .session_binding(&session_id)
+        .await
+        .expect("session binding");
+
+    assert_eq!(binding.profile_id, "beta");
+    assert_eq!(
+        response.config_options.expect("config options")[0]
+            .id
+            .0
+            .as_ref(),
+        "profile"
+    );
+}
+
+#[tokio::test]
 async fn test_set_profile_config_option_rejects_unknown_profile() {
     let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
-    register_test_session(&f, "session-1").await;
-    bind_test_profile(&f, "session-1", "alpha").await;
+    register_bound_test_session(&f, "session-1", "alpha").await;
 
     let req = agent_client_protocol::schema::SetSessionConfigOptionRequest::new(
         "session-1",
@@ -369,8 +402,7 @@ async fn test_set_profile_config_option_rejects_different_bound_profile() {
         ("beta.toml", BETA_PROFILE_TOML),
     ])
     .await;
-    register_test_session(&f, "session-1").await;
-    bind_test_profile(&f, "session-1", "alpha").await;
+    register_bound_test_session(&f, "session-1", "alpha").await;
 
     let req = agent_client_protocol::schema::SetSessionConfigOptionRequest::new(
         "session-1",
@@ -389,8 +421,7 @@ async fn test_set_profile_config_option_rejects_different_bound_profile() {
 #[tokio::test]
 async fn test_set_profile_config_option_accepts_same_bound_profile() {
     let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
-    register_test_session(&f, "session-1").await;
-    bind_test_profile(&f, "session-1", "alpha").await;
+    register_bound_test_session(&f, "session-1", "alpha").await;
     let req = agent_client_protocol::schema::SetSessionConfigOptionRequest::new(
         "session-1",
         "profile",
