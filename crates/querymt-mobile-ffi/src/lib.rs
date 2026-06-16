@@ -118,13 +118,11 @@ impl querymt_agent::agent::session_mcp::SessionMcpAttachmentSource
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct RegisterInprocMcpPipeParams {
     server_name: String,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct UnregisterInprocMcpParams {
     server_name: String,
 }
@@ -678,7 +676,7 @@ pub unsafe extern "C" fn qmt_ffi_acp_send(
                         Ok(()) => querymt_agent::acp::shared::RpcResponse {
                             jsonrpc: "2.0".to_string(),
                             result: Some(
-                                serde_json::json!({ "readFd": read_fd, "writeFd": write_fd }),
+                                serde_json::json!({ "read_fd": read_fd, "write_fd": write_fd }),
                             ),
                             error: None,
                             id: req.id,
@@ -1282,7 +1280,7 @@ mod tests {
             json["method"],
             serde_json::json!("querymt/mesh/nodesChanged")
         );
-        assert_eq!(json["params"]["peerId"], serde_json::json!("peer-123"));
+        assert_eq!(json["params"]["peer_id"], serde_json::json!("peer-123"));
         assert_eq!(json["params"]["change"], serde_json::json!("discovered"));
     }
 
@@ -1294,10 +1292,10 @@ mod tests {
     #[test]
     fn remote_attach_snapshot_preserves_existing() {
         let mut result_obj = serde_json::json!({
-            "sessionId": "s-remote-1",
-            "nodeId": "n-1",
+            "session_id": "s-remote-1",
+            "node_id": "n-1",
             "attached": true,
-            "configOptions": [],
+            "config_options": [],
             "snapshot": {
                 "audit": {
                     "session_id": "s-remote-1",
@@ -1343,10 +1341,10 @@ mod tests {
     #[test]
     fn remote_attach_snapshot_allows_fallback_when_missing() {
         let mut result_obj = serde_json::json!({
-            "sessionId": "s-remote-2",
-            "nodeId": "n-1",
+            "session_id": "s-remote-2",
+            "node_id": "n-1",
             "attached": true,
-            "configOptions": []
+            "config_options": []
         })
         .as_object()
         .unwrap()

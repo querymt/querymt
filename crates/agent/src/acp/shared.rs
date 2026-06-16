@@ -5,6 +5,7 @@
 //! RPC message handling.
 
 use crate::agent::LocalAgentHandle as AgentHandle;
+use crate::control::remote::{AttachRemoteSessionRequest, RemoteSessionAttachInfo};
 use crate::event_fanout::EventFanout;
 use crate::events::{AgentEvent, AgentEventKind, EventEnvelope};
 use crate::send_agent::SendAgent;
@@ -147,6 +148,28 @@ pub fn schedules_changed_notification(
         QMT_NOTIFICATION_SCHEDULES_CHANGED,
         serde_json::to_value(payload).expect("serialize schedules changed notification"),
     )
+}
+
+fn querymt_session_id_from_request(method: &str, params: &serde_json::Value) -> Option<String> {
+    match method {
+        "querymt/remote/attachSession" => {
+            serde_json::from_value::<AttachRemoteSessionRequest>(params.clone())
+                .ok()
+                .map(|req| req.session_id)
+        }
+        _ => None,
+    }
+}
+
+fn querymt_session_id_from_response(method: &str, value: &serde_json::Value) -> Option<String> {
+    match method {
+        "querymt/remote/createSession" => {
+            serde_json::from_value::<RemoteSessionAttachInfo>(value.clone())
+                .ok()
+                .map(|resp| resp.session_id)
+        }
+        _ => None,
+    }
 }
 
 pub fn event_envelopes_to_notifications<I>(events: I) -> Vec<serde_json::Value>
@@ -661,6 +684,10 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                         let response = agent.load_session(params).await;
                         match response {
                             Ok(r) => {
+                                let mut owners = session_owners.lock().await;
+                                owners.insert(session_id.clone(), conn_id.to_string());
+                                drop(owners);
+
                                 let mut value = serde_json::to_value(r).unwrap();
                                 if let (Some(hooks), Some(local_agent)) = (
                                     context.session_hooks.as_ref(),
@@ -837,11 +864,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
 
             // Forward _querymt/* extension methods to the agent's ext_method handler.
             m if m.starts_with("_querymt/") || m.starts_with("querymt/") => {
-                let session_id_for_owner = req
-                    .params
-                    .get("sessionId")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+                let session_id_for_owner = querymt_session_id_from_request(m, &req.params);
                 let raw_params = serde_json::value::RawValue::from_string(
                     serde_json::to_string(&req.params).unwrap_or_else(|_| "null".to_string()),
                 )
@@ -858,15 +881,8 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                     .map(|r| serde_json::from_str(r.0.get()).unwrap_or(serde_json::Value::Null));
                 match response {
                     Ok(mut value) => {
-                        // For remote/createSession the sessionId is not in
-                        // request params but in the response body.
-                        let session_id = if m == "querymt/remote/createSession" {
-                            value.get("sessionId").and_then(|v| v.as_str()).map(|s| s.to_string())
-                        } else if m == "querymt/remote/attachSession" {
-                            session_id_for_owner
-                        } else {
-                            None
-                        };
+                        let session_id = session_id_for_owner
+                            .or_else(|| querymt_session_id_from_response(m, &value));
                         if let Some(session_id) = session_id {
                             let mut owners = session_owners.lock().await;
                             owners.insert(session_id.clone(), conn_id.to_string());
@@ -1581,7 +1597,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_attach_extension_records_session_owner_without_ffi_branch() {
+    async fn remote_attach_extension_records_session_owner_with_snake_case_payload() {
         let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
@@ -1694,7 +1710,7 @@ mod tests {
             RpcRequest {
                 jsonrpc: "2.0".to_string(),
                 method: "querymt/remote/attachSession".to_string(),
-                params: serde_json::json!({"sessionId": "s-remote", "nodeId": "n-1"}),
+                params: serde_json::json!({"session_id": "s-remote", "node_id": "n-1"}),
                 id: serde_json::json!(1),
             },
             RpcDispatchContext::default(),
@@ -1709,7 +1725,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_create_session_records_session_owner() {
+    async fn remote_create_session_records_session_owner_from_snake_case_response() {
         let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
@@ -1795,7 +1811,7 @@ mod tests {
                 _: agent_client_protocol::schema::ExtRequest,
             ) -> Result<agent_client_protocol::schema::ExtResponse, Error> {
                 let raw = serde_json::value::RawValue::from_string(
-                    serde_json::json!({"sessionId": "s-cr","attached":false}).to_string(),
+                    serde_json::json!({"session_id": "s-cr","node_id": "n-1","attached":false,"config_options":[]}).to_string(),
                 )
                 .unwrap();
                 Ok(agent_client_protocol::schema::ExtResponse::new(Arc::from(
@@ -1822,7 +1838,7 @@ mod tests {
             RpcRequest {
                 jsonrpc: "2.0".to_string(),
                 method: "querymt/remote/createSession".to_string(),
-                params: serde_json::json!({"nodeId": "n-1"}),
+                params: serde_json::json!({"node_id": "n-1"}),
                 id: serde_json::json!(1),
             },
             RpcDispatchContext::default(),
@@ -1833,6 +1849,132 @@ mod tests {
         assert_eq!(
             session_owners.lock().await.get("s-cr").cloned(),
             Some("conn-9".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn session_load_records_session_owner_for_live_updates() {
+        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+
+        struct Dummy;
+
+        #[async_trait::async_trait]
+        impl SendAgent for Dummy {
+            async fn initialize(
+                &self,
+                _: agent_client_protocol::schema::InitializeRequest,
+            ) -> Result<agent_client_protocol::schema::InitializeResponse, Error> {
+                unreachable!()
+            }
+            async fn authenticate(
+                &self,
+                _: agent_client_protocol::schema::AuthenticateRequest,
+            ) -> Result<agent_client_protocol::schema::AuthenticateResponse, Error> {
+                unreachable!()
+            }
+            async fn new_session(
+                &self,
+                _: agent_client_protocol::schema::NewSessionRequest,
+            ) -> Result<agent_client_protocol::schema::NewSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn prompt(
+                &self,
+                _: agent_client_protocol::schema::PromptRequest,
+            ) -> Result<agent_client_protocol::schema::PromptResponse, Error> {
+                unreachable!()
+            }
+            async fn cancel(
+                &self,
+                _: agent_client_protocol::schema::CancelNotification,
+            ) -> Result<(), Error> {
+                unreachable!()
+            }
+            async fn load_session(
+                &self,
+                _: agent_client_protocol::schema::LoadSessionRequest,
+            ) -> Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
+                Ok(agent_client_protocol::schema::LoadSessionResponse::new())
+            }
+            async fn list_sessions(
+                &self,
+                _: agent_client_protocol::schema::ListSessionsRequest,
+            ) -> Result<agent_client_protocol::schema::ListSessionsResponse, Error> {
+                unreachable!()
+            }
+            async fn fork_session(
+                &self,
+                _: agent_client_protocol::schema::ForkSessionRequest,
+            ) -> Result<agent_client_protocol::schema::ForkSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn resume_session(
+                &self,
+                _: agent_client_protocol::schema::ResumeSessionRequest,
+            ) -> Result<agent_client_protocol::schema::ResumeSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn close_session(
+                &self,
+                _: agent_client_protocol::schema::CloseSessionRequest,
+            ) -> Result<agent_client_protocol::schema::CloseSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn delete_session(
+                &self,
+                _: agent_client_protocol::schema::DeleteSessionRequest,
+            ) -> Result<agent_client_protocol::schema::DeleteSessionResponse, Error> {
+                unreachable!()
+            }
+            async fn set_session_model(
+                &self,
+                _: agent_client_protocol::schema::SetSessionModelRequest,
+            ) -> Result<agent_client_protocol::schema::SetSessionModelResponse, Error> {
+                unreachable!()
+            }
+            async fn ext_method(
+                &self,
+                _: agent_client_protocol::schema::ExtRequest,
+            ) -> Result<agent_client_protocol::schema::ExtResponse, Error> {
+                unreachable!()
+            }
+            async fn ext_notification(
+                &self,
+                _: agent_client_protocol::schema::ExtNotification,
+            ) -> Result<(), Error> {
+                unreachable!()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let output = handle_rpc_message_with_context(
+            &Dummy,
+            &session_owners,
+            &pending_permissions,
+            &pending_elicitations,
+            "conn-load",
+            RpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: AGENT_METHOD_NAMES.session_load.to_string(),
+                params: serde_json::json!({
+                    "sessionId": "s-load",
+                    "cwd": "/tmp",
+                    "mcpServers": []
+                }),
+                id: serde_json::json!(1),
+            },
+            RpcDispatchContext::default(),
+        )
+        .await;
+
+        assert!(output.response.error.is_none());
+        assert_eq!(
+            session_owners.lock().await.get("s-load").cloned(),
+            Some("conn-load".to_string())
         );
     }
 
