@@ -646,6 +646,7 @@ impl QuorumBuilder {
             default_session_id: Arc::new(Mutex::new(None)),
             cwd,
             callbacks: Arc::new(EventCallbacksState::new(None)),
+            profiles: None,
             quorum: Some(quorum),
         })
     }

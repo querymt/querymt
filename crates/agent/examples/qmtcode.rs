@@ -44,7 +44,7 @@ use clap::Parser;
 use querymt_agent::prelude::*;
 use querymt_agent::profiles::{
     DEFAULT_EMBEDDED_PROFILE_KEY, LocalProfileCatalog, ProfileCatalog, ProfileConfigKind,
-    ProfileMetadata, ProfileRuntimeManager, ProfileSource, ensure_unique_profile_ids,
+    ProfileMetadata, ProfileSource, ensure_unique_profile_ids,
     standard_embedded_profile_catalog_builder,
 };
 #[cfg(any(feature = "api", feature = "dashboard"))]
@@ -425,8 +425,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let shared_infra = AgentInfra::shared_with_db_path(cli.db.clone()).await?;
 
-    #[allow(unused_variables, unused_assignments)]
-    let mut profile_manager: Option<Arc<ProfileRuntimeManager<Arc<dyn ProfileCatalog>>>> = None;
     let runner = if let Some(config_path) = &cli.config_file {
         eprintln!("Loading agent from: {}", config_path.display());
         from_config_with_infra(config_path, shared_infra.clone()).await?
@@ -436,15 +434,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let document = profile_catalog.load_profile(&selected_profile).await?;
         let runner = from_config_value_with_infra(document.config, shared_infra.clone()).await?;
         let catalog: Arc<dyn ProfileCatalog> = Arc::new(profile_catalog);
-        #[allow(unused_assignments)]
-        {
-            profile_manager = Some(Arc::new(ProfileRuntimeManager::with_infra_boxed(
-                catalog,
-                selected_profile.clone(),
-                shared_infra.clone(),
-            )));
-        }
-        runner
+        runner.with_profiles(AgentProfiles::new(
+            catalog,
+            selected_profile,
+            shared_infra.clone(),
+        ))
     };
 
     eprintln!("Agent loaded successfully!\n");
@@ -486,7 +480,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Joined mesh: peer_id={}", mesh.peer_id());
                 register_mesh_actors(&runner, &mesh).await;
                 runner.handle().set_mesh(mesh.clone());
-                if let Some(manager) = &profile_manager {
+                if let Some(manager) = runner.profiles() {
                     manager.set_mesh(mesh).await;
                 }
             }
@@ -633,7 +627,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 register_mesh_actors(&runner, &mesh).await;
                 runner.handle().set_mesh(mesh.clone());
-                if let Some(manager) = &profile_manager {
+                if let Some(manager) = runner.profiles() {
                     manager.set_mesh(mesh).await;
                 }
             }
@@ -644,14 +638,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let _profile_watcher = profile_manager
-        .as_ref()
-        .and_then(ProfileRuntimeManager::start_profile_watcher);
-
     if is_acp {
-        if let Some(manager) = profile_manager.clone() {
-            runner.handle().set_profiles(manager);
-        }
         eprintln!("Starting ACP stdio server...");
         runner.acp("stdio").await?;
     } else if is_api {
@@ -659,13 +646,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let addr = cli.api.as_deref().unwrap_or(DEFAULT_SERVER_ADDR);
             eprintln!("Starting API server at http://{}", addr);
-            let server = runner.server();
-            let server = if let Some(manager) = profile_manager.clone() {
-                server.with_profiles(manager)
-            } else {
-                server
-            };
-            server.run(addr, ServerMode::Api).await?;
+            runner.server().run(addr, ServerMode::Api).await?;
         }
         #[cfg(not(feature = "api"))]
         {
@@ -676,13 +657,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let addr = cli.dashboard.as_deref().unwrap_or(DEFAULT_SERVER_ADDR);
             eprintln!("Starting dashboard at http://{}", addr);
-            let server = runner.server();
-            let server = if let Some(manager) = profile_manager.clone() {
-                server.with_profiles(manager)
-            } else {
-                server
-            };
-            server.run(addr, ServerMode::Dashboard).await?;
+            runner.server().run(addr, ServerMode::Dashboard).await?;
         }
         #[cfg(not(feature = "dashboard"))]
         {

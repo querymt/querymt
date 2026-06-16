@@ -61,6 +61,7 @@ mod agent;
 mod callbacks;
 mod config;
 pub mod mesh;
+mod profiles;
 mod quorum;
 mod session;
 mod sessions;
@@ -70,6 +71,7 @@ mod utils;
 pub use agent::{Agent, AgentBuilder, AgentInfra};
 pub use config::{DelegateConfigBuilder, PlannerConfigBuilder};
 pub use mesh::{AgentMesh, Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec};
+pub use profiles::{AgentProfiles, ProfileRuntimeHandle};
 pub use quorum::QuorumBuilder;
 pub use session::AgentSession;
 pub use sessions::{

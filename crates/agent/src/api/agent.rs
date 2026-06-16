@@ -3,6 +3,7 @@
 use super::callbacks::EventCallbacksState;
 #[cfg(feature = "remote")]
 use super::mesh::{AgentMesh, Mesh, MeshSpec};
+use super::profiles::{AgentProfiles, ProfileRuntimeHandle};
 use super::quorum::QuorumBuilder;
 use super::session::AgentSession;
 use super::sessions::{AgentSessions, ListSessionsOptions, SessionListPage};
@@ -591,6 +592,7 @@ impl AgentBuilder {
             default_session_id: Arc::new(Mutex::new(None)),
             cwd,
             callbacks: Arc::new(EventCallbacksState::new(None)),
+            profiles: None,
             quorum: None,
         };
 
@@ -610,6 +612,7 @@ pub struct Agent {
     pub(super) default_session_id: Arc<Mutex<Option<String>>>,
     pub(super) cwd: Option<PathBuf>,
     pub(super) callbacks: Arc<EventCallbacksState>,
+    pub(super) profiles: Option<AgentProfiles>,
     /// Present when this agent was built with `Agent::multi()`.
     /// Holds the quorum orchestrator for delegate access.
     pub(super) quorum: Option<crate::quorum::AgentQuorum>,
@@ -760,9 +763,29 @@ impl Agent {
         self
     }
 
+    pub fn with_profiles(mut self, profiles: AgentProfiles) -> Self {
+        let manager = profiles.manager();
+        #[cfg(feature = "remote")]
+        if let Some(mesh) = self.inner.mesh() {
+            manager.set_mesh_handle(mesh);
+        }
+        self.inner.set_profiles(manager);
+        self.profiles = Some(profiles);
+        self
+    }
+
+    pub fn profiles(&self) -> Option<ProfileRuntimeHandle> {
+        self.profiles.as_ref().map(AgentProfiles::manager)
+    }
+
     #[cfg(feature = "api")]
     pub fn server(&self) -> AgentServer {
-        AgentServer::new(self.inner.clone(), self.storage.clone(), self.cwd.clone())
+        let server = AgentServer::new(self.inner.clone(), self.storage.clone(), self.cwd.clone());
+        if let Some(profiles) = self.profiles() {
+            server.with_profiles(profiles)
+        } else {
+            server
+        }
     }
 
     /// Start an ACP server with the specified transport.

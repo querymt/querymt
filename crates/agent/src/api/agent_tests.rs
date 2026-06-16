@@ -1,6 +1,9 @@
 use super::{
-    Agent, AgentInfra, AgentSessions, ListSessionsOptions, RemoteSessionMode, SessionListMode,
+    Agent, AgentInfra, AgentProfiles, AgentSessions, ListSessionsOptions, RemoteSessionMode,
+    SessionListMode,
 };
+use crate::profiles::{LocalProfileCatalog, ProfileCatalog};
+#[cfg(feature = "remote")]
 use crate::session::store::RemoteSessionBookmark;
 use crate::test_utils::helpers::empty_plugin_registry;
 use agent_client_protocol::schema::ListSessionsRequest as AcpListSessionsRequest;
@@ -9,9 +12,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 async fn test_agent() -> Result<Agent> {
+    test_agent_with_storage(None).await
+}
+
+async fn test_agent_with_storage(
+    storage: Option<Arc<crate::session::sqlite_storage::SqliteStorage>>,
+) -> Result<Agent> {
     let (registry, _temp_dir) = empty_plugin_registry()?;
-    let storage =
-        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let storage = match storage {
+        Some(storage) => storage,
+        None => Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
+        ),
+    };
     Agent::single()
         .provider("openai", "gpt-4o-mini")
         .infra(AgentInfra {
@@ -21,6 +34,71 @@ async fn test_agent() -> Result<Agent> {
         })
         .build()
         .await
+}
+
+async fn attach_test_profiles(
+    agent: Agent,
+    storage: Arc<crate::session::sqlite_storage::SqliteStorage>,
+    profile_dir: &std::path::Path,
+) -> Result<Agent> {
+    let (registry, _temp_dir) = empty_plugin_registry()?;
+    let catalog: Arc<dyn ProfileCatalog> = Arc::new(
+        LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(profile_dir)
+            .build(),
+    );
+    Ok(agent.with_profiles(AgentProfiles::new(
+        catalog,
+        "alpha",
+        AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+        },
+    )))
+}
+
+#[tokio::test]
+async fn with_profiles_keeps_watcher_alive() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    std::fs::write(
+        dir.path().join("alpha.toml"),
+        "[agent]\nprovider = \"test\"\nmodel = \"test-model\"\nsystem = \"inline\"\n",
+    )?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = test_agent_with_storage(Some(storage.clone())).await?;
+    let agent = attach_test_profiles(agent, storage, dir.path()).await?;
+
+    assert!(agent.profiles().is_some());
+    assert!(
+        agent
+            .profiles
+            .as_ref()
+            .expect("profiles attached")
+            .has_watcher()
+    );
+    assert!(agent.handle().profiles().is_some());
+    Ok(())
+}
+
+#[cfg(feature = "api")]
+#[tokio::test]
+async fn server_inherits_attached_profiles() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    std::fs::write(
+        dir.path().join("alpha.toml"),
+        "[agent]\nprovider = \"test\"\nmodel = \"test-model\"\nsystem = \"inline\"\n",
+    )?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = test_agent_with_storage(Some(storage.clone())).await?;
+    let agent = attach_test_profiles(agent, storage, dir.path()).await?;
+
+    let server = agent.server();
+    assert!(server.profiles().is_some());
+    Ok(())
 }
 
 #[tokio::test]

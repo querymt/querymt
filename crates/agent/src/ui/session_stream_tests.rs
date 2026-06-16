@@ -1,6 +1,6 @@
 //! Tests for replay/live session stream cursor semantics.
 
-use crate::api::AgentInfra;
+use crate::api::{AgentInfra, ProfileRuntimeHandle};
 use crate::events::{AgentEventKind, EventOrigin};
 use crate::profiles::{LocalProfileCatalog, ProfileRuntimeManager};
 use crate::session::backend::StorageBackend;
@@ -35,9 +35,7 @@ system = "inline"
     .expect("failed to write profile");
 }
 
-async fn test_profile_manager(
-    dir: &Path,
-) -> Arc<ProfileRuntimeManager<Arc<dyn crate::profiles::ProfileCatalog>>> {
+async fn test_profile_manager(dir: &Path) -> ProfileRuntimeHandle {
     let (registry, _registry_dir) = empty_plugin_registry().expect("empty plugin registry");
     let storage = Arc::new(
         SqliteStorage::connect(":memory:".into())
@@ -55,9 +53,10 @@ async fn test_profile_manager(
             .local_dir(dir)
             .build(),
     );
-    Arc::new(ProfileRuntimeManager::with_infra_boxed(
+    let profiles: ProfileRuntimeHandle = Arc::new(ProfileRuntimeManager::with_infra_boxed(
         catalog, "alpha", infra,
-    ))
+    ));
+    profiles
 }
 
 #[tokio::test]

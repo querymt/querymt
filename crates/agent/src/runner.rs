@@ -2,7 +2,7 @@
 //!
 //! Provides a common trait for both single agents and multi-agent quorums.
 
-use crate::api::{Agent, AgentInfra};
+use crate::api::{Agent, AgentInfra, AgentProfiles, ProfileRuntimeHandle};
 use crate::config::{Config, ConfigSource, load_config};
 use crate::events::EventEnvelope;
 #[cfg(feature = "api")]
@@ -207,6 +207,15 @@ impl AgentRunner {
     pub fn on_error(&self, callback: impl Fn(String) + Send + Sync + 'static) -> &Self {
         self.0.on_error(callback);
         self
+    }
+
+    pub fn with_profiles(mut self, profiles: AgentProfiles) -> Self {
+        self.0 = self.0.with_profiles(profiles);
+        self
+    }
+
+    pub fn profiles(&self) -> Option<ProfileRuntimeHandle> {
+        self.0.profiles()
     }
 
     /// Access the underlying `AgentHandle` for advanced use cases.

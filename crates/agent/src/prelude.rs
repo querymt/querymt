@@ -26,8 +26,9 @@ pub use crate::error::AgentError;
 
 // High-level APIs
 pub use crate::api::{
-    Agent, AgentBuilder, AgentInfra, AgentMesh, AgentSession, DelegateConfigBuilder, Mesh,
-    MeshJoinOutcome, MeshRuntime, MeshSpec, PlannerConfigBuilder, QuorumBuilder,
+    Agent, AgentBuilder, AgentInfra, AgentMesh, AgentProfiles, AgentSession, DelegateConfigBuilder,
+    Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec, PlannerConfigBuilder, ProfileRuntimeHandle,
+    QuorumBuilder,
 };
 // Config and runner APIs
 pub use crate::config::{
