@@ -328,6 +328,7 @@ mod tests {
                 plugin_registry: Arc::new(registry),
                 storage: Some(storage.clone()),
                 session_mcp_attachment_source: None,
+                event_fanout: None,
             })
             .build()
             .await
@@ -362,6 +363,7 @@ system = "inline"
                 plugin_registry: root.handle().config.provider.plugin_registry(),
                 storage: Some(storage.clone()),
                 session_mcp_attachment_source: None,
+                event_fanout: None,
             },
         ));
 

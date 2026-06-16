@@ -26,7 +26,6 @@ use futures_util::{sink::SinkExt, stream::StreamExt as FuturesStreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
 // ── Binary frame helpers ───────────────────────────────────────────────────────
@@ -317,46 +316,15 @@ pub async fn send_binary(
 pub fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sender<String>) {
     let mut seen_sources = HashSet::new();
     for event_source in &state.event_sources {
-        spawn_event_source_forwarder(
-            state.clone(),
-            conn_id.clone(),
-            tx.clone(),
-            event_source.clone(),
-        );
-        seen_sources.insert(Arc::as_ptr(event_source) as usize);
+        if seen_sources.insert(Arc::as_ptr(event_source) as usize) {
+            spawn_event_source_forwarder(
+                state.clone(),
+                conn_id.clone(),
+                tx.clone(),
+                event_source.clone(),
+            );
+        }
     }
-
-    if let Some(profiles) = state.profiles.clone() {
-        tokio::spawn(async move {
-            loop {
-                if !connection_is_open(&state, &conn_id, &tx).await {
-                    break;
-                }
-
-                let runtimes = profiles.materialized_runtimes().await;
-                for runtime in runtimes {
-                    for event_source in
-                        super::session::collect_event_sources(&runtime.agent().handle())
-                    {
-                        if seen_sources.insert(Arc::as_ptr(&event_source) as usize) {
-                            spawn_event_source_forwarder(
-                                state.clone(),
-                                conn_id.clone(),
-                                tx.clone(),
-                                event_source,
-                            );
-                        }
-                    }
-                }
-
-                sleep(Duration::from_millis(100)).await;
-            }
-        });
-    }
-}
-
-async fn connection_is_open(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<String>) -> bool {
-    !tx.is_closed() && state.connections.lock().await.contains_key(conn_id)
 }
 
 fn spawn_event_source_forwarder(
@@ -1172,6 +1140,7 @@ system = "explore"
             plugin_registry: Arc::new(registry),
             storage: Some(fixture.agent.storage.clone()),
             session_mcp_attachment_source: None,
+            event_fanout: None,
         };
         fixture.state.profiles = Some(Arc::new(ProfileRuntimeManager::with_infra_boxed(
             catalog,

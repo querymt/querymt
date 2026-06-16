@@ -668,6 +668,7 @@ system = "inline"
             plugin_registry: Arc::new(registry),
             storage: Some(fixture.agent.storage.clone()),
             session_mcp_attachment_source: None,
+            event_fanout: None,
         };
         let profiles: ProfileRuntimeHandle = Arc::new(ProfileRuntimeManager::with_infra_boxed(
             catalog, "alpha", infra,

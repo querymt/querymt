@@ -31,6 +31,7 @@ async fn test_agent_with_storage(
             plugin_registry: Arc::new(registry),
             storage: Some(storage),
             session_mcp_attachment_source: None,
+            event_fanout: None,
         })
         .build()
         .await
@@ -55,6 +56,7 @@ async fn attach_test_profiles(
             plugin_registry: Arc::new(registry),
             storage: Some(storage),
             session_mcp_attachment_source: None,
+            event_fanout: None,
         },
     )))
 }

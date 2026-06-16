@@ -18,6 +18,7 @@ use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{
     ExecutionPolicy, HooksConfig, McpServerConfig, MiddlewareEntry, SingleAgentConfig, SkillsConfig,
 };
+use crate::event_fanout::EventFanout;
 use crate::middleware::{MIDDLEWARE_REGISTRY, MiddlewareDriver};
 use crate::runner::{ChatRunner, ChatSession};
 use crate::send_agent::SendAgent;
@@ -54,6 +55,7 @@ use std::sync::{Arc, Mutex};
 ///         plugin_registry: Arc::new(registry),
 ///         storage: Some(storage),
 ///         session_mcp_attachment_source: None,
+///         event_fanout: None,
 ///     })
 ///     .build()
 ///     .await
@@ -70,6 +72,8 @@ pub struct AgentInfra {
     pub storage: Option<Arc<dyn StorageBackend>>,
     /// Optional runtime MCP attachment source (e.g., for mobile in-process MCP peers).
     pub session_mcp_attachment_source: Option<Arc<dyn SessionMcpAttachmentSource>>,
+    /// Shared live event bus for runtimes that should stream through one UI/ACP connection.
+    pub event_fanout: Option<Arc<EventFanout>>,
 }
 
 impl AgentInfra {
@@ -86,6 +90,7 @@ impl AgentInfra {
             plugin_registry: registry,
             storage: Some(storage),
             session_mcp_attachment_source: None,
+            event_fanout: Some(Arc::new(EventFanout::new())),
         })
     }
 }
@@ -344,9 +349,10 @@ impl AgentBuilder {
             .llm_config
             .ok_or_else(|| anyhow!("LLM configuration is required (call .provider() first)"))?;
 
-        let (plugin_registry, backend): (
+        let (plugin_registry, backend, event_fanout): (
             Arc<querymt::plugin::host::PluginRegistry>,
             Arc<dyn StorageBackend>,
+            Option<Arc<EventFanout>>,
         ) = match self.infra {
             Some(infra) => {
                 let storage = match infra.storage {
@@ -356,19 +362,22 @@ impl AgentBuilder {
                         Arc::new(SqliteStorage::connect(db_path).await?)
                     }
                 };
-                (infra.plugin_registry, storage)
+                (infra.plugin_registry, storage, infra.event_fanout)
             }
             None => {
                 let registry = Arc::new(default_registry().await?);
                 let db_path = resolve_agent_db_path(self.db_path)?;
                 let storage = Arc::new(SqliteStorage::connect(db_path).await?);
-                (registry, storage)
+                (registry, storage, None)
             }
         };
 
         let mut builder = AgentConfigBuilder::new(plugin_registry, backend.clone(), llm_config)
             .with_agent_id("agent")
             .with_snapshot_policy(snapshot_policy);
+        if let Some(event_fanout) = event_fanout {
+            builder = builder.with_event_fanout(event_fanout);
+        }
 
         // Phase 7: inject pre-populated agent registry (remote agents from config).
         #[cfg(feature = "remote")]
@@ -917,6 +926,7 @@ impl Agent {
     ///     plugin_registry: Arc::new(registry),
     ///     storage: Some(storage),
     ///     session_mcp_attachment_source: None,
+    ///     event_fanout: None,
     /// }).await.unwrap();
     /// agent.chat("hello").await.unwrap();
     /// # }

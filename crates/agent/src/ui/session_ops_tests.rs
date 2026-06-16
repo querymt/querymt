@@ -148,6 +148,7 @@ async fn attach_profiles(
         plugin_registry: Arc::new(registry),
         storage: Some(fixture.agent.storage.clone()),
         session_mcp_attachment_source: None,
+        event_fanout: None,
     };
     let catalog: Arc<dyn ProfileCatalog> = Arc::new(
         LocalProfileCatalog::builder()

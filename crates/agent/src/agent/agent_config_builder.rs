@@ -232,6 +232,12 @@ impl AgentConfigBuilder {
 
     // ── Template context ──────────────────────────────────────────────────
 
+    /// Use a caller-provided live event bus instead of creating an isolated fanout.
+    pub fn with_event_fanout(mut self, event_fanout: Arc<EventFanout>) -> Self {
+        self.event_fanout = event_fanout;
+        self
+    }
+
     /// Set the agent ID used for `{{ agent_id }}` template resolution in
     /// system prompts.  Must be called before `build()` and before the
     /// `Arc<SessionProvider>` is shared (i.e. while refcount is 1).

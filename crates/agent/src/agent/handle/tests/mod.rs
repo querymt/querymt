@@ -55,6 +55,7 @@ impl HandleFixture {
                 plugin_registry: Arc::new(plugin_registry),
                 storage: None,
                 session_mcp_attachment_source: None,
+                event_fanout: None,
             },
         ));
         self.handle.set_profiles(profiles);
