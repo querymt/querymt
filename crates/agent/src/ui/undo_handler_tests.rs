@@ -681,12 +681,13 @@ async fn test_elicitation_response_routes_to_delegate_pending_map() -> Result<()
 
     let elicitation_id = "delegate-elicitation-42".to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    fixture
-        .delegate
-        .pending_elicitations()
-        .lock()
-        .await
-        .insert(elicitation_id.clone(), tx);
+    fixture.delegate.pending_elicitations().lock().await.insert(
+        elicitation_id.clone(),
+        crate::elicitation::PendingElicitation {
+            session_id: "delegate-session".to_string(),
+            sender: tx,
+        },
+    );
 
     handle_elicitation_response(
         &state,
@@ -755,11 +756,13 @@ system = "inline"
 
     let elicitation_id = "profile-runtime-elicitation-1".to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    profile_agent
-        .pending_elicitations()
-        .lock()
-        .await
-        .insert(elicitation_id.clone(), tx);
+    profile_agent.pending_elicitations().lock().await.insert(
+        elicitation_id.clone(),
+        crate::elicitation::PendingElicitation {
+            session_id: session_id.clone(),
+            sender: tx,
+        },
+    );
 
     handle_elicitation_response(
         &f.state,

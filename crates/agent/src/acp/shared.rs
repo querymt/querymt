@@ -830,7 +830,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
 
                                 let mut tx = {
                                     let mut pending = pending_elicitations.lock().await;
-                                    pending.remove(&params.elicitation_id)
+                                    pending.remove(&params.elicitation_id).map(|entry| entry.sender)
                                 };
 
                                 if tx.is_none()
@@ -2238,12 +2238,13 @@ mod tests {
 
         let elicitation_id = "delegate-elicitation-rpc".to_string();
         let (tx, rx) = oneshot::channel();
-        fixture
-            .delegate
-            .pending_elicitations()
-            .lock()
-            .await
-            .insert(elicitation_id.clone(), tx);
+        fixture.delegate.pending_elicitations().lock().await.insert(
+            elicitation_id.clone(),
+            crate::elicitation::PendingElicitation {
+                session_id: "delegate-session".to_string(),
+                sender: tx,
+            },
+        );
 
         let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));

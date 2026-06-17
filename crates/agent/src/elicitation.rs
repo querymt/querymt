@@ -54,8 +54,14 @@ pub struct ElicitationResponse {
     pub content: Option<serde_json::Value>,
 }
 
-/// Type alias for the pending elicitation map (elicitation_id -> response sender)
-pub type PendingElicitationMap = Arc<Mutex<HashMap<String, oneshot::Sender<ElicitationResponse>>>>;
+#[derive(Debug)]
+pub struct PendingElicitation {
+    pub session_id: String,
+    pub sender: oneshot::Sender<ElicitationResponse>,
+}
+
+/// Type alias for the pending elicitation map (elicitation_id -> session-aware response sender)
+pub type PendingElicitationMap = Arc<Mutex<HashMap<String, PendingElicitation>>>;
 
 /// Removes and returns a pending elicitation sender by ID.
 ///
@@ -101,12 +107,30 @@ pub async fn take_pending_elicitation_sender(
     None
 }
 
+pub async fn insert_pending_elicitation(
+    pending_map: &PendingElicitationMap,
+    elicitation_id: String,
+    session_id: String,
+    sender: oneshot::Sender<ElicitationResponse>,
+) {
+    let mut pending = pending_map.lock().await;
+    pending.insert(elicitation_id, PendingElicitation { session_id, sender });
+}
+
+pub async fn has_pending_elicitation_for_session(
+    pending_map: &PendingElicitationMap,
+    session_id: &str,
+) -> bool {
+    let pending = pending_map.lock().await;
+    pending.values().any(|entry| entry.session_id == session_id)
+}
+
 async fn take_from_pending_map(
     pending_map: &PendingElicitationMap,
     elicitation_id: &str,
 ) -> Option<oneshot::Sender<ElicitationResponse>> {
     let mut pending = pending_map.lock().await;
-    pending.remove(elicitation_id)
+    pending.remove(elicitation_id).map(|entry| entry.sender)
 }
 
 /// MCP client handler — the single `ClientHandler` impl used for all MCP server
@@ -160,10 +184,13 @@ impl ClientHandler for McpClientHandler {
             let (tx, rx) = oneshot::channel();
 
             // Store the response channel
-            {
-                let mut pending = self.pending.lock().await;
-                pending.insert(elicitation_id.clone(), tx);
-            }
+            insert_pending_elicitation(
+                &self.pending,
+                elicitation_id.clone(),
+                self.session_id.clone(),
+                tx,
+            )
+            .await;
 
             // Extract message and schema from the enum variant
             let (message, schema_json) = match &request {
@@ -430,10 +457,7 @@ mod tests {
         let map: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, _rx) = oneshot::channel();
 
-        {
-            let mut pending = map.lock().await;
-            pending.insert("elicit-1".to_string(), tx);
-        }
+        insert_pending_elicitation(&map, "elicit-1".to_string(), "s1".to_string(), tx).await;
 
         let has_entry = {
             let pending = map.lock().await;
@@ -448,15 +472,12 @@ mod tests {
         let map: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, rx) = oneshot::channel();
 
-        {
-            let mut pending = map.lock().await;
-            pending.insert("elicit-2".to_string(), tx);
-        }
+        insert_pending_elicitation(&map, "elicit-2".to_string(), "s1".to_string(), tx).await;
 
         // Simulate response
         let tx = {
             let mut pending = map.lock().await;
-            pending.remove("elicit-2")
+            pending.remove("elicit-2").map(|entry| entry.sender)
         };
 
         assert!(tx.is_some());
@@ -473,17 +494,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_elicitation_map_tracks_session_membership() {
+        let map: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = oneshot::channel();
+
+        insert_pending_elicitation(&map, "elicit-3".to_string(), "s-track".to_string(), tx).await;
+
+        assert!(has_pending_elicitation_for_session(&map, "s-track").await);
+        assert!(!has_pending_elicitation_for_session(&map, "other-session").await);
+    }
+
+    #[tokio::test]
     async fn take_sender_resolves_delegate_pending_elicitation() {
         let fixture = DelegateTestFixture::new().await.unwrap();
 
         let elicitation_id = "delegate-elicitation-1".to_string();
         let (tx, rx) = oneshot::channel();
-        fixture
-            .delegate
-            .pending_elicitations()
-            .lock()
-            .await
-            .insert(elicitation_id.clone(), tx);
+        fixture.delegate.pending_elicitations().lock().await.insert(
+            elicitation_id.clone(),
+            PendingElicitation {
+                session_id: "delegate-session".to_string(),
+                sender: tx,
+            },
+        );
 
         let sender = take_pending_elicitation_sender(fixture.planner.as_ref(), &elicitation_id)
             .await

@@ -1016,18 +1016,19 @@ export interface SessionLoadSnapshot {
 	cursor: StreamCursor;
 }
 
-export enum SessionStatus {
+/** High-level runtime state for stop/resume orchestration. */
+export enum SessionRuntimeStatus {
 	Idle = "idle",
-	Busy = "busy",
-	Error = "error",
-	Cancelling = "cancelling",
+	Running = "running",
+	Waiting = "waiting",
+	CancelRequested = "cancel_requested",
 }
 
 export interface SessionMeta {
 	messageCount: number;
 	userMessageCount: number;
 	hasErrors: boolean;
-	status: SessionStatus;
+	runtimeStatus: SessionRuntimeStatus;
 }
 
 /**

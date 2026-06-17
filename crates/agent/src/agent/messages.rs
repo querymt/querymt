@@ -19,6 +19,7 @@ use agent_client_protocol::schema::{
 use querymt::LLMParams;
 use querymt::chat::ReasoningEffort;
 use serde::{Deserialize, Serialize};
+use typeshare::typeshare;
 
 // ══════════════════════════════════════════════════════════════════════════
 //  Execution
@@ -38,10 +39,13 @@ pub struct Prompt {
 pub struct Cancel;
 
 /// High-level runtime state for stop/resume orchestration.
+#[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionRuntimeStatus {
     Idle,
     Running,
+    Waiting,
     CancelRequested,
 }
 

@@ -190,10 +190,13 @@ pub(super) async fn execute_tool_call(
     tokio::spawn(async move {
         while let Some(request) = elicitation_rx.recv().await {
             let elicitation_id = request.elicitation_id.clone();
-            {
-                let mut pending = pending_elicitations.lock().await;
-                pending.insert(elicitation_id.clone(), request.response_tx);
-            }
+            crate::elicitation::insert_pending_elicitation(
+                &pending_elicitations,
+                elicitation_id.clone(),
+                session_id_clone.clone(),
+                request.response_tx,
+            )
+            .await;
             // Durable: elicitation must be visible in UI replay.
             if let Err(err) = event_sink
                 .emit_durable(

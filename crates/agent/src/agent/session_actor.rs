@@ -181,10 +181,13 @@ async fn request_intent_update_confirmation(
     let elicitation_id = Uuid::new_v4().to_string();
     let (response_tx, response_rx) = oneshot::channel();
 
-    {
-        let mut pending = config.pending_elicitations.lock().await;
-        pending.insert(elicitation_id.clone(), response_tx);
-    }
+    crate::elicitation::insert_pending_elicitation(
+        &config.pending_elicitations,
+        elicitation_id.clone(),
+        session_id.to_string(),
+        response_tx,
+    )
+    .await;
 
     let requested_schema = serde_json::json!({
         "type": "object",
@@ -830,6 +833,13 @@ impl Message<GetRuntimeStatus> for SessionActor {
             SessionRuntimeStatus::Idle
         } else if self.turn_state.token.is_cancelled() {
             SessionRuntimeStatus::CancelRequested
+        } else if crate::elicitation::has_pending_elicitation_for_session(
+            &self.config.pending_elicitations,
+            &self.session_id,
+        )
+        .await
+        {
+            SessionRuntimeStatus::Waiting
         } else {
             SessionRuntimeStatus::Running
         };

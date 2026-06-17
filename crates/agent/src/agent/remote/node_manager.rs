@@ -1050,10 +1050,11 @@ mod remote_impl {
                                 .await
                             {
                                 Ok(SessionRuntimeStatus::Idle) => "idle".to_string(),
-                                Ok(
-                                    SessionRuntimeStatus::Running
-                                    | SessionRuntimeStatus::CancelRequested,
-                                ) => "busy".to_string(),
+                                Ok(SessionRuntimeStatus::Waiting) => "waiting".to_string(),
+                                Ok(SessionRuntimeStatus::Running) => "running".to_string(),
+                                Ok(SessionRuntimeStatus::CancelRequested) => {
+                                    "cancel_requested".to_string()
+                                }
                                 Err(_) => "active".to_string(),
                             };
                             (aid, Some(state))

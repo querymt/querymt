@@ -334,28 +334,8 @@ async fn acp_session_list_includes_meta_from_stats_and_finish_reason() -> Result
     assert_eq!(meta.get("messageCount"), Some(&serde_json::json!(2)));
     assert_eq!(meta.get("userMessageCount"), Some(&serde_json::json!(1)));
     assert_eq!(meta.get("hasErrors"), Some(&serde_json::json!(true)));
-    assert_eq!(meta.get("status"), Some(&serde_json::json!("error")));
+    assert_eq!(meta.get("runtimeStatus"), Some(&serde_json::json!("idle")));
     Ok(())
-}
-
-#[test]
-fn acp_session_status_mapping_keeps_cancel_separate_from_error() {
-    use super::SessionStatus;
-    use super::sessions::derive_session_status;
-    use crate::agent::messages::SessionRuntimeStatus;
-
-    assert_eq!(
-        derive_session_status(SessionRuntimeStatus::CancelRequested, false),
-        SessionStatus::Cancelling
-    );
-    assert_eq!(
-        derive_session_status(SessionRuntimeStatus::CancelRequested, true),
-        SessionStatus::Error
-    );
-    assert_eq!(
-        derive_session_status(SessionRuntimeStatus::Running, false),
-        SessionStatus::Busy
-    );
 }
 
 #[cfg(feature = "remote")]

@@ -102,16 +102,6 @@ pub struct AcpSessionListPage {
 }
 
 #[typeshare]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionStatus {
-    Idle,
-    Busy,
-    Error,
-    Cancelling,
-}
-
-#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
     #[typeshare(serialized_as = "number")]
@@ -122,7 +112,8 @@ pub struct SessionMeta {
     pub user_message_count: u32,
     #[serde(rename = "hasErrors")]
     pub has_errors: bool,
-    pub status: SessionStatus,
+    #[serde(rename = "runtimeStatus")]
+    pub runtime_status: SessionRuntimeStatus,
 }
 
 impl SessionMeta {
@@ -131,21 +122,6 @@ impl SessionMeta {
             .ok()
             .and_then(|value| value.as_object().cloned())
             .unwrap_or_default()
-    }
-}
-
-pub(crate) fn derive_session_status(
-    runtime_status: SessionRuntimeStatus,
-    has_errors: bool,
-) -> SessionStatus {
-    if has_errors {
-        return SessionStatus::Error;
-    }
-
-    match runtime_status {
-        SessionRuntimeStatus::Idle => SessionStatus::Idle,
-        SessionRuntimeStatus::Running => SessionStatus::Busy,
-        SessionRuntimeStatus::CancelRequested => SessionStatus::Cancelling,
     }
 }
 
@@ -342,7 +318,7 @@ impl AgentSessions {
                 message_count: stats.message_count,
                 user_message_count: stats.user_message_count,
                 has_errors,
-                status: derive_session_status(runtime_status, has_errors),
+                runtime_status,
             };
             info.meta = Some(meta.to_acp_meta());
         }
