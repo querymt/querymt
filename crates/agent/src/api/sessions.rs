@@ -1,14 +1,17 @@
 use super::session::AgentSession;
 use crate::agent::LocalAgentHandle;
+use crate::agent::messages::SessionRuntimeStatus;
 use crate::session::load_snapshot::{SessionLoadSnapshot, load_session_snapshot};
 use crate::session::projection::{SessionListItem, SessionScope, ViewStore};
 use crate::session::store::SessionStore;
 use agent_client_protocol::schema::{
     ListSessionsRequest as AcpListSessionsRequest, ListSessionsResponse as AcpListSessionsResponse,
-    LoadSessionRequest, NewSessionRequest, SessionId, SessionInfo,
+    LoadSessionRequest, Meta, NewSessionRequest, SessionId, SessionInfo,
 };
 use anyhow::{Result, anyhow};
+use querymt::chat::FinishReason;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use time::format_description::well_known::Rfc3339;
@@ -96,6 +99,54 @@ pub struct AcpSessionListPage {
     pub sessions: Vec<SessionInfo>,
     pub next_cursor: Option<String>,
     pub total_count: u64,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    Idle,
+    Busy,
+    Error,
+    Cancelling,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMeta {
+    #[typeshare(serialized_as = "number")]
+    #[serde(rename = "messageCount")]
+    pub message_count: u32,
+    #[typeshare(serialized_as = "number")]
+    #[serde(rename = "userMessageCount")]
+    pub user_message_count: u32,
+    #[serde(rename = "hasErrors")]
+    pub has_errors: bool,
+    pub status: SessionStatus,
+}
+
+impl SessionMeta {
+    fn to_acp_meta(&self) -> Meta {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default()
+    }
+}
+
+pub(crate) fn derive_session_status(
+    runtime_status: SessionRuntimeStatus,
+    has_errors: bool,
+) -> SessionStatus {
+    if has_errors {
+        return SessionStatus::Error;
+    }
+
+    match runtime_status {
+        SessionRuntimeStatus::Idle => SessionStatus::Idle,
+        SessionRuntimeStatus::Running => SessionStatus::Busy,
+        SessionRuntimeStatus::CancelRequested => SessionStatus::Cancelling,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,7 +262,17 @@ impl AgentSessions {
         &self,
         request: AcpListSessionsRequest,
     ) -> Result<AcpSessionListPage> {
-        Self::list_for_acp_from_view_store(self.view_store()?, request).await
+        Self::list_for_acp_with_runtime(&self.agent, self.view_store()?, request).await
+    }
+
+    pub(crate) async fn list_for_acp_with_runtime(
+        agent: &LocalAgentHandle,
+        view_store: Arc<dyn ViewStore>,
+        request: AcpListSessionsRequest,
+    ) -> Result<AcpSessionListPage> {
+        let mut page = Self::list_for_acp_from_view_store(view_store.clone(), request).await?;
+        Self::hydrate_acp_session_meta(agent, view_store, &mut page.sessions).await?;
+        Ok(page)
     }
 
     pub(crate) async fn list_for_acp_from_view_store(
@@ -233,6 +294,60 @@ impl AgentSessions {
             next_cursor,
             total_count: total_count as u64,
         })
+    }
+
+    async fn hydrate_acp_session_meta(
+        agent: &LocalAgentHandle,
+        view_store: Arc<dyn ViewStore>,
+        sessions: &mut [SessionInfo],
+    ) -> Result<()> {
+        let session_ids: Vec<String> = sessions
+            .iter()
+            .map(|info| info.session_id.to_string())
+            .collect();
+        if session_ids.is_empty() {
+            return Ok(());
+        }
+
+        let persisted_stats = view_store.get_session_list_meta_stats(&session_ids).await?;
+        let actor_refs = {
+            let registry = agent.registry.lock().await;
+            registry.get_many(session_ids.iter().map(String::as_str))
+        };
+        let runtime_statuses = futures_util::future::join_all(actor_refs.into_iter().map(
+            |(session_id, actor_ref)| async move {
+                let status = actor_ref
+                    .get_runtime_status()
+                    .await
+                    .unwrap_or(SessionRuntimeStatus::Idle);
+                (session_id, status)
+            },
+        ))
+        .await
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        for info in sessions {
+            let session_id = info.session_id.to_string();
+            let stats = persisted_stats
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_default();
+            let runtime_status = runtime_statuses
+                .get(&session_id)
+                .copied()
+                .unwrap_or(SessionRuntimeStatus::Idle);
+            let has_errors = stats.last_finish_reason == Some(FinishReason::Error);
+            let meta = SessionMeta {
+                message_count: stats.message_count,
+                user_message_count: stats.user_message_count,
+                has_errors,
+                status: derive_session_status(runtime_status, has_errors),
+            };
+            info.meta = Some(meta.to_acp_meta());
+        }
+
+        Ok(())
     }
 
     pub async fn browse(&self, options: ListSessionsOptions) -> Result<SessionListPage> {

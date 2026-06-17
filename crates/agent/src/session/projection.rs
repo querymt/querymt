@@ -8,7 +8,9 @@
 use crate::events::{AgentEvent, AgentEventKind, DurableEvent, EventOrigin};
 use crate::session::error::SessionResult;
 use async_trait::async_trait;
+use querymt::chat::FinishReason;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use time::OffsetDateTime;
 use typeshare::typeshare;
 
@@ -78,6 +80,13 @@ pub struct SummaryView {
     pub last_activity: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub generated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionListMetaStats {
+    pub message_count: u32,
+    pub user_message_count: u32,
+    pub last_finish_reason: Option<FinishReason>,
 }
 
 /// Redaction policy for controlling what information is shown
@@ -202,6 +211,12 @@ pub trait ViewStore: Send + Sync {
         limit: usize,
         session_scope: SessionScope,
     ) -> SessionResult<(Vec<SessionListItem>, Option<String>, usize)>;
+
+    /// Batch lightweight stats needed by ACP session metadata for a paginated list.
+    async fn get_session_list_meta_stats(
+        &self,
+        session_ids: &[String],
+    ) -> SessionResult<HashMap<String, SessionListMetaStats>>;
 
     /// Search all sessions via FTS5 (DB-wide, not limited to loaded pages).
     async fn search_sessions(

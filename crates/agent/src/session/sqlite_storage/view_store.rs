@@ -7,8 +7,8 @@ use crate::session::error::SessionResult;
 use crate::session::projection::{
     AuditView, DefaultRedactor, EventJournal, FilterExpr, PredicateOp, RecentModelEntry,
     RecentModelsView, RedactedArtifact, RedactedProgress, RedactedTask, RedactedView,
-    RedactionPolicy, Redactor, SessionGroup, SessionListFilter, SessionListItem, SessionListView,
-    SessionScope, SummaryView, ViewStore,
+    RedactionPolicy, Redactor, SessionGroup, SessionListFilter, SessionListItem,
+    SessionListMetaStats, SessionListView, SessionScope, SummaryView, ViewStore,
 };
 use crate::session::repo_artifact::SqliteArtifactRepository;
 use crate::session::repo_decision::SqliteDecisionRepository;
@@ -22,7 +22,9 @@ use crate::session::repository::{
     ProgressRepository, SessionRepository, TaskRepository,
 };
 use crate::session::store::Session;
-use rusqlite::{OptionalExtension, params};
+use querymt::chat::FinishReason;
+use rusqlite::{OptionalExtension, params, params_from_iter};
+use std::collections::HashMap;
 
 use super::SqliteStorage;
 
@@ -52,6 +54,19 @@ fn map_session_list_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sessio
         has_children: fork_count > 0,
         fork_count,
     })
+}
+
+fn parse_finish_reason(value: &str) -> Option<FinishReason> {
+    match value {
+        "Stop" | "stop" => Some(FinishReason::Stop),
+        "Length" | "length" => Some(FinishReason::Length),
+        "ContentFilter" | "content_filter" => Some(FinishReason::ContentFilter),
+        "ToolCalls" | "tool_calls" => Some(FinishReason::ToolCalls),
+        "Error" | "error" => Some(FinishReason::Error),
+        "Other" | "other" => Some(FinishReason::Other),
+        "Unknown" | "unknown" => Some(FinishReason::Unknown),
+        _ => None,
+    }
 }
 
 fn session_scope_where(scope: SessionScope, alias: &str) -> String {
@@ -1077,6 +1092,82 @@ impl ViewStore for SqliteStorage {
             };
 
             Ok((sessions, next_cursor, total_count))
+        })
+        .await
+    }
+
+    async fn get_session_list_meta_stats(
+        &self,
+        session_ids: &[String],
+    ) -> SessionResult<HashMap<String, SessionListMetaStats>> {
+        if session_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let session_ids = session_ids.to_vec();
+        self.run_blocking(move |conn| {
+            let mut stats: HashMap<String, SessionListMetaStats> = session_ids
+                .iter()
+                .map(|id| (id.clone(), SessionListMetaStats::default()))
+                .collect();
+            let placeholders = std::iter::repeat_n("?", session_ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let mut stmt = conn.prepare(&format!(
+                r#"
+                SELECT
+                    s.public_id,
+                    COUNT(m.id) AS message_count,
+                    COALESCE(SUM(CASE WHEN m.role = 'User' THEN 1 ELSE 0 END), 0) AS user_message_count
+                FROM sessions s
+                LEFT JOIN messages m ON m.session_id = s.id
+                WHERE s.public_id IN ({})
+                GROUP BY s.public_id
+                "#,
+                placeholders
+            ))?;
+            let rows = stmt.query_map(params_from_iter(session_ids.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (session_id, message_count, user_message_count) = row?;
+                if let Some(entry) = stats.get_mut(&session_id) {
+                    entry.message_count = message_count.max(0) as u32;
+                    entry.user_message_count = user_message_count.max(0) as u32;
+                }
+            }
+
+            let mut stmt = conn.prepare(&format!(
+                r#"
+                SELECT
+                    session_id,
+                    json_extract(payload_json, '$.data.finish_reason') AS finish_reason
+                FROM event_journal
+                WHERE kind = 'llm_request_end'
+                  AND session_id IN ({})
+                ORDER BY stream_seq DESC
+                "#,
+                placeholders
+            ))?;
+            let rows = stmt.query_map(params_from_iter(session_ids.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows {
+                let (session_id, finish_reason) = row?;
+                let Some(entry) = stats.get_mut(&session_id) else {
+                    continue;
+                };
+                if entry.last_finish_reason.is_none() {
+                    entry.last_finish_reason = finish_reason.as_deref().and_then(parse_finish_reason);
+                }
+            }
+
+            Ok(stats)
         })
         .await
     }
