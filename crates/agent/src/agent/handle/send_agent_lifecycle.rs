@@ -86,7 +86,7 @@ impl LocalAgentHandle {
             .storage
             .view_store()
             .ok_or_else(|| Error::internal_error().data("view store unavailable"))?;
-        let page = crate::api::AgentSessions::list_for_acp_from_view_store(view_store, req)
+        let page = crate::api::AgentSessions::list_for_acp_with_runtime(self, view_store, req)
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
         Ok(ListSessionsResponse::new(page.sessions).next_cursor(page.next_cursor))

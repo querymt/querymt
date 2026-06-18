@@ -76,7 +76,7 @@ pub use quorum::QuorumBuilder;
 pub use session::AgentSession;
 pub use sessions::{
     AgentLoadedSession, AgentSessions, ListSessionsOptions, RemoteSessionMode, SessionChildrenPage,
-    SessionGroup, SessionListMode, SessionListPage, SessionSummary,
+    SessionGroup, SessionListMode, SessionListPage, SessionMeta, SessionStatus, SessionSummary,
 };
 
 #[cfg(test)]

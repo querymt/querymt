@@ -1,13 +1,19 @@
+#[cfg(feature = "remote")]
+use super::RemoteSessionMode;
 use super::{
-    Agent, AgentInfra, AgentProfiles, AgentSessions, ListSessionsOptions, RemoteSessionMode,
-    SessionListMode,
+    Agent, AgentInfra, AgentProfiles, AgentSessions, ListSessionsOptions, SessionListMode,
 };
+use crate::events::{AgentEventKind, EventOrigin, ExecutionMetrics};
+use crate::model::AgentMessage;
 use crate::profiles::{LocalProfileCatalog, ProfileCatalog};
+use crate::session::backend::StorageBackend;
+use crate::session::projection::{EventJournal, NewDurableEvent};
 #[cfg(feature = "remote")]
 use crate::session::store::RemoteSessionBookmark;
 use crate::test_utils::helpers::empty_plugin_registry;
 use agent_client_protocol::schema::ListSessionsRequest as AcpListSessionsRequest;
 use anyhow::Result;
+use querymt::chat::{ChatRole, FinishReason};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -268,6 +274,88 @@ async fn acp_list_sessions_orders_by_updated_at_and_paginates() -> Result<()> {
         Some("This title comes from the initial intent snapshot and should be truncated if ...")
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn acp_session_list_includes_meta_from_stats_and_finish_reason() -> Result<()> {
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = test_agent_with_storage(Some(storage.clone())).await?;
+    let session_store = storage.session_store();
+    let session = session_store
+        .create_session(
+            Some("Meta Session".to_string()),
+            Some("/tmp/meta".into()),
+            None,
+            None,
+        )
+        .await?;
+
+    session_store
+        .add_message(
+            &session.public_id,
+            AgentMessage::new(session.public_id.clone(), ChatRole::User),
+        )
+        .await?;
+    session_store
+        .add_message(
+            &session.public_id,
+            AgentMessage::new(session.public_id.clone(), ChatRole::Assistant),
+        )
+        .await?;
+    storage
+        .append_durable(&NewDurableEvent {
+            session_id: session.public_id.clone(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::LlmRequestEnd {
+                usage: None,
+                tool_calls: 0,
+                finish_reason: Some(FinishReason::Error),
+                cost_usd: None,
+                cumulative_cost_usd: None,
+                context_tokens: 0,
+                metrics: ExecutionMetrics::default(),
+            },
+        })
+        .await?;
+
+    let page = agent
+        .sessions()
+        .list_for_acp(AcpListSessionsRequest::new())
+        .await?;
+    let info = page
+        .sessions
+        .iter()
+        .find(|info| info.session_id.to_string() == session.public_id)
+        .expect("session should be listed");
+    let meta = info.meta.as_ref().expect("ACP session meta should be set");
+
+    assert_eq!(meta.get("messageCount"), Some(&serde_json::json!(2)));
+    assert_eq!(meta.get("userMessageCount"), Some(&serde_json::json!(1)));
+    assert_eq!(meta.get("hasErrors"), Some(&serde_json::json!(true)));
+    assert_eq!(meta.get("status"), Some(&serde_json::json!("error")));
+    Ok(())
+}
+
+#[test]
+fn acp_session_status_mapping_keeps_cancel_separate_from_error() {
+    use super::SessionStatus;
+    use super::sessions::derive_session_status;
+    use crate::agent::messages::SessionRuntimeStatus;
+
+    assert_eq!(
+        derive_session_status(SessionRuntimeStatus::CancelRequested, false),
+        SessionStatus::Cancelling
+    );
+    assert_eq!(
+        derive_session_status(SessionRuntimeStatus::CancelRequested, true),
+        SessionStatus::Error
+    );
+    assert_eq!(
+        derive_session_status(SessionRuntimeStatus::Running, false),
+        SessionStatus::Busy
+    );
 }
 
 #[cfg(feature = "remote")]

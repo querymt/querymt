@@ -274,6 +274,22 @@ impl SessionRegistry {
         self.sessions.get(session_id)
     }
 
+    /// Clone actor refs for loaded sessions without awaiting while the registry is locked.
+    pub(crate) fn get_many<'a>(
+        &self,
+        session_ids: impl IntoIterator<Item = &'a str>,
+    ) -> HashMap<String, SessionActorRef> {
+        session_ids
+            .into_iter()
+            .filter_map(|id| {
+                self.sessions
+                    .get(id)
+                    .cloned()
+                    .map(|actor| (id.to_string(), actor))
+            })
+            .collect()
+    }
+
     /// Insert a pre-spawned session actor into the registry.
     ///
     /// Accepts anything that converts into a `SessionActorRef`, including

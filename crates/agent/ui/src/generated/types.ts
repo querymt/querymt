@@ -1016,6 +1016,20 @@ export interface SessionLoadSnapshot {
 	cursor: StreamCursor;
 }
 
+export enum SessionStatus {
+	Idle = "idle",
+	Busy = "busy",
+	Error = "error",
+	Cancelling = "cancelling",
+}
+
+export interface SessionMeta {
+	messageCount: number;
+	userMessageCount: number;
+	hasErrors: boolean;
+	status: SessionStatus;
+}
+
 /**
  * Mirror of `querymt::chat::Tool` for typeshare generation.
  * Note: kept for typeshare output; may be unused in Rust code paths.
