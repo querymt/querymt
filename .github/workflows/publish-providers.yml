@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Check out full history
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -108,7 +108,7 @@ jobs:
 
     steps:
       - name: Check out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Generate providers JSON
         shell: bash
@@ -172,7 +172,7 @@ jobs:
           echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
 
       - name: Check out provider index branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: provider-index
           path: provider-index
@@ -211,7 +211,7 @@ jobs:
 
       - name: Check out code
         if: matrix.crate != 'noop'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Read crate version
         if: matrix.crate != 'noop'
