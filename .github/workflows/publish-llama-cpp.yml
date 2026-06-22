@@ -120,7 +120,13 @@ jobs:
           - os: windows
             arch: amd64
             target: x86_64-pc-windows-msvc
-            runner: windows-latest
+            # windows-latest now ships VS 2026 (v18), whose Visual Studio
+            # Integration CUDA 12.8 does not declare, causing CMake's
+            # enable_language(CUDA) under the VS generator to fail with
+            # "No CUDA toolset found". Pin windows-2022 (VS 17) for the CUDA
+            # build; the default (non-CUDA) Windows build stays on
+            # windows-latest.
+            runner: windows-2022
             features: cuda
             feature_tag: cuda12.8
             needs_cuda: "true"
@@ -166,7 +172,14 @@ jobs:
         if: runner.os == 'Linux' && contains(matrix.features, 'vulkan')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libvulkan-dev glslc
+          sudo apt-get install -y libvulkan-dev glslc glslang-tools
+          # The bundled llama.cpp now calls find_package(SPIRV-Headers).
+          # Ubuntu's spirv-headers apt package ships no CMake config file, so
+          # install SPIRV-Headers from source into /usr/local (a CMake default
+          # search path) so find_package(SPIRV-Headers) resolves.
+          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-headers
+          cmake -S /tmp/spirv-headers -B /tmp/spirv-headers/build
+          sudo cmake --install /tmp/spirv-headers/build
 
       - name: Install Vulkan SDK (Windows)
         if: runner.os == 'Windows' && contains(matrix.features, 'vulkan')
