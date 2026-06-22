@@ -38,7 +38,7 @@ querymt = { path = "../querymt", default-features = false, features = ["runtime"
 querymt-remote = { path = "../querymt-remote" }
 querymt-provider-common = { path = "../provider-common" }
 querymt-utils = { path = "../querymt-utils", features = ["providers", "serde", "secret-store"] }
-agent-client-protocol = { version = "0.12", features = ["unstable"] }
+agent-client-protocol = { version = "0.15", features = ["unstable"] }
 agent-client-protocol-schema = { version = "0.13", features = ["unstable"]}
 kameo = "0.21"
 libp2p = { version = "0.56", optional = true, default-features = false }
