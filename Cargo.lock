@@ -75,7 +75,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4361ba6627e51de955b10f3c77fb9eb959c85191a236c1c2c84e32f4ff240faf"
 dependencies = [
  "agent-client-protocol-derive",
- "agent-client-protocol-schema",
+ "agent-client-protocol-schema 0.13.2",
  "async-process",
  "blocking",
  "futures",
@@ -117,6 +117,21 @@ dependencies = [
  "serde_with",
  "strum 0.28.0",
  "tracing",
+]
+
+[[package]]
+name = "agent-client-protocol-schema"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4e7eb6f1e554741f621ae4abb046d4fbb3cb88541bc599693ae7f9aa30b72eb"
+dependencies = [
+ "anyhow",
+ "derive_more",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "strum 0.28.0",
 ]
 
 [[package]]
@@ -11074,7 +11089,7 @@ name = "querymt-agent"
 version = "0.5.0"
 dependencies = [
  "agent-client-protocol",
- "agent-client-protocol-schema",
+ "agent-client-protocol-schema 0.14.0",
  "anyhow",
  "arc-swap",
  "async-trait",
