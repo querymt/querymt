@@ -2,8 +2,7 @@ use crate::backend::{install_abort_callback, llama_backend};
 use crate::config::{DEFAULT_MAX_TOKENS, LlamaCppConfig, LlamaCppLogMode};
 use crate::context::estimate_context_memory;
 use crate::generation::{
-    build_prompt, build_prompt_candidates, build_prompt_with, build_raw_prompt, generate,
-    generate_streaming, generate_streaming_with_thinking,
+    build_prompt, build_prompt_with, build_raw_prompt, generate, generate_streaming_with_thinking,
 };
 use crate::memory::MemoryEstimate;
 use crate::multimodal::MultimodalContext;
@@ -515,84 +514,36 @@ impl ChatProvider for LlamaCppProvider {
             }
         }
 
-        // No-tool streaming: try the OAI-compat path first so that
-        // `reasoning_content` deltas from thinking models are routed to
-        // `StreamChunk::Thinking` rather than being emitted raw as Text.
-        // Fall back to the plain `generate_streaming` path if the template
-        // call fails (e.g. model does not support the oaicompat API).
-        //
-        // Pass `media_marker` so that image placeholder tokens are injected
-        // into the prompt before the OAI-compat template is applied.
+        // No-tool streaming uses the same Rust-side template path as tool
+        // streaming so thinking markers are routed to StreamChunk::Thinking.
+        // Template failures are surfaced instead of silently degrading to raw
+        // streaming, which would leak <think> tags to the UI.
         let thinking_template =
-            apply_template_for_thinking(&self.model, &self.cfg, messages, media_marker).ok();
-        let prompts = if thinking_template.is_none() {
-            build_prompt_candidates(&self.model, &self.cfg, messages, media_marker)?
-        } else {
-            vec![]
-        };
+            apply_template_for_thinking(&self.model, &self.cfg, messages, media_marker)?;
         let cfg = self.cfg.clone();
         let model = Arc::clone(&self.model);
         let multimodal = self.multimodal.clone();
 
         thread::spawn(move || {
-            // OAI-compat thinking path — now supports multimodal input.
-            if let Some(template_result) = thinking_template {
-                match generate_streaming_with_thinking(
-                    &model,
-                    &cfg,
-                    &template_result,
-                    max_tokens,
-                    None,
-                    &tx,
-                    multimodal.as_deref(),
-                    &bitmaps,
-                ) {
-                    Ok(usage) => {
-                        let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Usage(usage)));
-                        let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Done {
-                            finish_reason: FinishReason::Stop,
-                        }));
-                    }
-                    Err(err) => {
-                        let _ = tx.unbounded_send(Err(err));
-                    }
+            match generate_streaming_with_thinking(
+                &model,
+                &cfg,
+                &thinking_template,
+                max_tokens,
+                None,
+                &tx,
+                multimodal.as_deref(),
+                &bitmaps,
+            ) {
+                Ok(usage) => {
+                    let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Usage(usage)));
+                    let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Done {
+                        finish_reason: FinishReason::Stop,
+                    }));
                 }
-                return;
-            }
-
-            // Standard streaming (with or without images)
-            let mut final_usage = None;
-            for (idx, prompt) in prompts.iter().enumerate() {
-                match generate_streaming(
-                    &model,
-                    &cfg,
-                    prompt,
-                    max_tokens,
-                    None,
-                    &tx,
-                    multimodal.as_deref(),
-                    &bitmaps,
-                ) {
-                    Ok(usage) => {
-                        let should_fallback = usage.output_tokens == 0 && idx + 1 < prompts.len();
-                        if should_fallback {
-                            continue;
-                        }
-                        final_usage = Some(usage);
-                        break;
-                    }
-                    Err(err) => {
-                        let _ = tx.unbounded_send(Err(err));
-                        return;
-                    }
+                Err(err) => {
+                    let _ = tx.unbounded_send(Err(err));
                 }
-            }
-
-            if let Some(usage) = final_usage {
-                let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Usage(usage)));
-                let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Done {
-                    finish_reason: FinishReason::Stop,
-                }));
             }
         });
 

@@ -10,11 +10,12 @@ type = "native"
 [features]
 default = ["native"]
 api = ["querymt", "querymt/tracing"]
-native = ["api", "llama-cpp-2/openmp"]
-cuda = ["llama-cpp-2/cuda"]
-metal = ["llama-cpp-2/metal"]
+native = ["api", "common", "openmp"]
+common = ["llama-cpp-2/common", "llama-cpp-2/mtmd"]
+cuda = ["api", "common", "llama-cpp-2/cuda"]
+metal = ["api", "common", "llama-cpp-2/metal"]
 openmp = ["llama-cpp-2/openmp"]
-vulkan = ["llama-cpp-2/vulkan"]
+vulkan = ["api", "common", "llama-cpp-2/vulkan"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -24,10 +25,14 @@ async-trait.workspace = true
 encoding_rs = "0.8"
 futures.workspace = true
 infer = { version = "0.19", default-features = false }
-llama-cpp-2 = { version = "0.1", default-features = false, features = ["mtmd"]}
+llama-cpp-2 = { version = "0.1", default-features = false }
 querymt-provider-common = { path = "../../provider-common" }
 log.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+minijinja = { version = "2", default-features = false, features = ["builtins", "json", "loop_controls", "macros", "serde"] }
+minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
 querymt = { path = "../../querymt", default-features = false, optional = true }
+regex = "1"
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1,14 +1,15 @@
+use crate::chat_format::parse_assistant_format_with_state;
+use crate::common_chat::ChatTemplateResult;
 use crate::config::LlamaCppConfig;
 use crate::multimodal::MultimodalContext;
 use crate::response::GeneratedText;
 use crate::tools::prefill::prefill_for_tool_generation;
 use crate::tools::sampler::{SamplingParams, build_tool_sampler};
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::{AddBos, ChatTemplateResult, LlamaModel};
+use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::mtmd::MtmdBitmap;
 use querymt::Usage;
 use querymt::error::LLMError;
-use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -58,14 +59,24 @@ pub(crate) fn generate_with_tools(
     }
 
     let params = SamplingParams::from_config(cfg, temperature);
-    let mut sampler = build_tool_sampler(model, result, &params);
+    let mut sampler = build_tool_sampler(model, result, &params)?;
     let mut output_tokens = 0u32;
     let mut output = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let mut first_token_logged = false;
+    let mut eog_hit = false;
+
+    log::debug!(
+        "generate_with_tools: sampler built, has_grammar={}, input_tokens={}, max_tokens={}",
+        result.grammar.is_some(),
+        state.input_tokens,
+        max_tokens
+    );
 
     while state.n_cur < state.n_len_total {
         let token = sampler.sample(&state.ctx, batch.n_tokens() - 1);
         if model.is_eog_token(token) {
+            eog_hit = true;
             break;
         }
 
@@ -77,6 +88,17 @@ pub(crate) fn generate_with_tools(
             Ok(piece) => piece,
             Err(_) => String::from_utf8_lossy(&bytes).to_string(),
         };
+
+        if !first_token_logged {
+            first_token_logged = true;
+            log::debug!(
+                "generate_with_tools: first token id={}, piece=<<<{}>>>, special={}",
+                token,
+                chunk,
+                special
+            );
+        }
+
         output.push_str(&chunk);
 
         // Check additional stop sequences
@@ -110,6 +132,23 @@ pub(crate) fn generate_with_tools(
         }
     }
 
+    let head_len = 400.min(output.len());
+    let tail_len = 400.min(output.len());
+    let head = &output[..head_len];
+    let tail = if output.len() > 400 {
+        &output[output.len() - tail_len..]
+    } else {
+        ""
+    };
+    log::debug!(
+        "generate_with_tools: done output_tokens={}, eog_hit={}, output_len={}, head=<<<{}>>>, tail=<<<{}>>>",
+        output_tokens,
+        eog_hit,
+        output.len(),
+        head,
+        tail
+    );
+
     Ok(GeneratedText {
         text: output,
         usage: Usage {
@@ -140,21 +179,7 @@ pub(crate) fn parse_tool_response(
     log::debug!("Parsing tool response: text_len={}", text.len());
     log::debug!("Raw generated text: {}", text);
 
-    let parsed_json = result.parse_response_oaicompat(text, false).map_err(|e| {
-        log::debug!(
-            "Failed to parse response with parse_response_oaicompat: {}",
-            e
-        );
-        LLMError::ProviderError(format!("Failed to parse response: {}", e))
-    })?;
-
-    log::debug!("Parsed JSON: {}", parsed_json);
-
-    let parsed: Value = serde_json::from_str(&parsed_json).map_err(|e| {
-        LLMError::ProviderError(format!("Failed to deserialize parsed response: {}", e))
-    })?;
-
-    extract_parsed_response(&parsed)
+    extract_parsed_response(text, result.starts_in_thinking)
 }
 
 /// Extract content, thinking, tool calls and finish reason from a parsed
@@ -163,7 +188,8 @@ pub(crate) fn parse_tool_response(
 /// Separated from [`parse_tool_response`] so the JSON-processing logic can be
 /// unit-tested without requiring a live `ChatTemplateResult` / FFI context.
 fn extract_parsed_response(
-    parsed: &Value,
+    text: &str,
+    starts_in_thinking: bool,
 ) -> Result<
     (
         String,
@@ -173,66 +199,8 @@ fn extract_parsed_response(
     ),
     LLMError,
 > {
-    let raw_content = parsed
-        .get("content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    // The C++ parser may have already extracted reasoning_content.
-    // If so, use it directly. Otherwise, use extract_thinking as fallback.
-    let reasoning_content = parsed
-        .get("reasoning_content")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty());
-
-    let (thinking, content) = if reasoning_content.is_some() {
-        (reasoning_content, raw_content)
-    } else {
-        querymt::chat::extract_thinking(&raw_content)
-    };
-
-    // The llama.cpp C++ parser (chat.cpp) returns `arguments` as a parsed JSON
-    // object (via `json::parse()`), but `querymt::FunctionCall::arguments` is a
-    // `String`.  A plain `serde_json::from_value` would silently fail on the
-    // type mismatch.  Instead we manually extract each field and stringify
-    // `arguments` when it is not already a string — matching what every other
-    // provider (anthropic, openai, google, ollama, …) does.
-    let tool_calls: Option<Vec<querymt::ToolCall>> = parsed
-        .get("tool_calls")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| {
-            if arr.is_empty() {
-                return None;
-            }
-            let calls: Vec<querymt::ToolCall> = arr
-                .iter()
-                .filter_map(|tc| {
-                    let id = tc.get("id")?.as_str()?.to_string();
-                    let call_type = tc
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("function")
-                        .to_string();
-                    let func = tc.get("function")?;
-                    let name = func.get("name")?.as_str()?.to_string();
-                    let arguments = match func.get("arguments") {
-                        Some(Value::String(s)) => s.clone(),
-                        Some(v) => serde_json::to_string(v).unwrap_or_default(),
-                        None => String::new(),
-                    };
-                    Some(querymt::ToolCall {
-                        id,
-                        call_type,
-                        function: querymt::FunctionCall { name, arguments },
-                    })
-                })
-                .collect();
-            if calls.is_empty() { None } else { Some(calls) }
-        });
-
-    let finish_reason = if tool_calls.is_some() {
+    let parsed = parse_assistant_format_with_state(text, starts_in_thinking);
+    let finish_reason = if parsed.tool_calls.is_some() {
         querymt::chat::FinishReason::ToolCalls
     } else {
         querymt::chat::FinishReason::Stop
@@ -240,223 +208,78 @@ fn extract_parsed_response(
 
     log::debug!(
         "Parsed response: content_len={}, thinking={}, tool_calls={}, finish_reason={:?}",
-        content.len(),
-        thinking.as_ref().map(|t| t.len()).unwrap_or(0),
-        tool_calls
+        parsed.content.len(),
+        parsed.thinking.as_ref().map(|t| t.len()).unwrap_or(0),
+        parsed
+            .tool_calls
             .as_ref()
             .map(|tc: &Vec<querymt::ToolCall>| tc.len())
             .unwrap_or(0),
         finish_reason
     );
 
-    Ok((content, thinking, tool_calls, finish_reason))
+    Ok((
+        parsed.content,
+        parsed.thinking,
+        parsed.tool_calls,
+        finish_reason,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use querymt::chat::FinishReason;
-    use serde_json::json;
 
-    /// Regression test: llama.cpp's C++ parser returns `arguments` as a JSON
-    /// object (via `json::parse()`).  Before the fix, `serde_json::from_value`
-    /// silently failed because `FunctionCall::arguments` is a `String`, and
-    /// `.ok()` swallowed the error — dropping tool calls entirely.
     #[test]
-    fn tool_calls_with_object_arguments() {
-        let parsed = json!({
-            "role": "assistant",
-            "content": "Let me search for files.",
-            "tool_calls": [{
-                "type": "function",
-                "function": {
-                    "name": "glob",
-                    "arguments": {
-                        "pattern": "**/*delegat*",
-                        "path": "/some/path"
-                    }
-                },
-                "id": "call_abc123"
-            }]
-        });
-
+    fn parses_plain_text_response() {
         let (content, thinking, tool_calls, finish_reason) =
-            extract_parsed_response(&parsed).unwrap();
-
-        assert_eq!(content, "Let me search for files.");
-        assert!(thinking.is_none());
-        assert_eq!(finish_reason, FinishReason::ToolCalls);
-
-        let calls = tool_calls.expect("tool_calls should be Some");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id, "call_abc123");
-        assert_eq!(calls[0].call_type, "function");
-        assert_eq!(calls[0].function.name, "glob");
-
-        // Arguments should be a JSON string representation of the object
-        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
-        assert_eq!(args["pattern"], "**/*delegat*");
-        assert_eq!(args["path"], "/some/path");
-    }
-
-    /// When `arguments` is already a JSON string (e.g. from providers that
-    /// conform to the OpenAI convention), it must be preserved as-is.
-    #[test]
-    fn tool_calls_with_string_arguments() {
-        let parsed = json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "type": "function",
-                "function": {
-                    "name": "read_file",
-                    "arguments": "{\"path\":\"/tmp/test.txt\"}"
-                },
-                "id": "call_def456"
-            }]
-        });
-
-        let (_, _, tool_calls, finish_reason) = extract_parsed_response(&parsed).unwrap();
-
-        assert_eq!(finish_reason, FinishReason::ToolCalls);
-        let calls = tool_calls.expect("tool_calls should be Some");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].function.name, "read_file");
-        assert_eq!(calls[0].function.arguments, "{\"path\":\"/tmp/test.txt\"}");
-    }
-
-    /// Tool call with empty/missing arguments (e.g. a no-argument tool).
-    #[test]
-    fn tool_calls_with_empty_object_arguments() {
-        let parsed = json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "type": "function",
-                "function": {
-                    "name": "get_time",
-                    "arguments": {}
-                },
-                "id": "call_empty"
-            }]
-        });
-
-        let (_, _, tool_calls, finish_reason) = extract_parsed_response(&parsed).unwrap();
-
-        assert_eq!(finish_reason, FinishReason::ToolCalls);
-        let calls = tool_calls.expect("tool_calls should be Some");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].function.name, "get_time");
-        assert_eq!(calls[0].function.arguments, "{}");
-    }
-
-    /// Tool call with no `arguments` key at all.
-    #[test]
-    fn tool_calls_with_missing_arguments() {
-        let parsed = json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "type": "function",
-                "function": {
-                    "name": "get_time"
-                },
-                "id": "call_noargs"
-            }]
-        });
-
-        let (_, _, tool_calls, finish_reason) = extract_parsed_response(&parsed).unwrap();
-
-        assert_eq!(finish_reason, FinishReason::ToolCalls);
-        let calls = tool_calls.expect("tool_calls should be Some");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].function.arguments, "");
-    }
-
-    /// Multiple tool calls in a single response.
-    #[test]
-    fn multiple_tool_calls() {
-        let parsed = json!({
-            "role": "assistant",
-            "content": "I'll search in parallel.",
-            "tool_calls": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "glob",
-                        "arguments": {"pattern": "**/*.rs"}
-                    },
-                    "id": "call_1"
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "search_text",
-                        "arguments": {"pattern": "TODO", "path": "/src"}
-                    },
-                    "id": "call_2"
-                }
-            ]
-        });
-
-        let (content, _, tool_calls, finish_reason) = extract_parsed_response(&parsed).unwrap();
-
-        assert_eq!(content, "I'll search in parallel.");
-        assert_eq!(finish_reason, FinishReason::ToolCalls);
-        let calls = tool_calls.expect("tool_calls should be Some");
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].function.name, "glob");
-        assert_eq!(calls[1].function.name, "search_text");
-    }
-
-    /// No tool calls → finish_reason should be Stop.
-    #[test]
-    fn no_tool_calls() {
-        let parsed = json!({
-            "role": "assistant",
-            "content": "Here is my answer."
-        });
-
-        let (content, _, tool_calls, finish_reason) = extract_parsed_response(&parsed).unwrap();
+            extract_parsed_response("Here is my answer.", false).unwrap();
 
         assert_eq!(content, "Here is my answer.");
+        assert!(thinking.is_none());
         assert!(tool_calls.is_none());
         assert_eq!(finish_reason, FinishReason::Stop);
     }
 
-    /// Empty tool_calls array → treated as no tool calls.
     #[test]
-    fn empty_tool_calls_array() {
-        let parsed = json!({
-            "role": "assistant",
-            "content": "Done.",
-            "tool_calls": []
-        });
-
-        let (_, _, tool_calls, finish_reason) = extract_parsed_response(&parsed).unwrap();
-
-        assert!(tool_calls.is_none());
-        assert_eq!(finish_reason, FinishReason::Stop);
-    }
-
-    /// reasoning_content is used when present.
-    #[test]
-    fn reasoning_content_extracted() {
-        let parsed = json!({
-            "role": "assistant",
-            "content": "The answer is 42.",
-            "reasoning_content": "Let me think about this step by step..."
-        });
-
+    fn parses_thinking_and_qwen_tool_call() {
+        let input = r#"<think>Need a file search.</think>
+<tool_call>{"name":"glob","arguments":{"pattern":"**/*.rs"}}</tool_call>"#;
         let (content, thinking, tool_calls, finish_reason) =
-            extract_parsed_response(&parsed).unwrap();
+            extract_parsed_response(input, false).unwrap();
 
-        assert_eq!(content, "The answer is 42.");
-        assert_eq!(
-            thinking.as_deref(),
-            Some("Let me think about this step by step...")
-        );
-        assert!(tool_calls.is_none());
-        assert_eq!(finish_reason, FinishReason::Stop);
+        assert!(content.is_empty());
+        assert_eq!(thinking.as_deref(), Some("Need a file search."));
+        assert_eq!(finish_reason, FinishReason::ToolCalls);
+        let calls = tool_calls.expect("tool_calls should be Some");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "glob");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["pattern"], "**/*.rs");
+    }
+
+    #[test]
+    fn parses_qwen_function_tool_call() {
+        let input = "<tool_call>\n<function=get_weather>\n<parameter=city>\nCopenhagen\n</parameter>\n</function>\n</tool_call>";
+        let (_, _, tool_calls, finish_reason) = extract_parsed_response(input, false).unwrap();
+
+        assert_eq!(finish_reason, FinishReason::ToolCalls);
+        let calls = tool_calls.expect("tool_calls should be Some");
+        assert_eq!(calls[0].function.name, "get_weather");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["city"], "Copenhagen");
+    }
+
+    #[test]
+    fn parses_open_prompt_thinking_then_tool_call() {
+        let input = "Thinking Process:\n1. analyze\n</think><tool_call>{\"name\":\"glob\",\"arguments\":{\"pattern\":\"**/*.rs\"}}</tool_call>";
+        let (content, thinking, tool_calls, finish_reason) =
+            extract_parsed_response(input, true).unwrap();
+
+        assert!(content.is_empty());
+        assert_eq!(thinking.as_deref(), Some("Thinking Process:\n1. analyze"));
+        assert_eq!(finish_reason, FinishReason::ToolCalls);
+        assert_eq!(tool_calls.unwrap()[0].function.name, "glob");
     }
 }

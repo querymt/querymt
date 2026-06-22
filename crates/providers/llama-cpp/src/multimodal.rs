@@ -175,6 +175,8 @@ impl MultimodalContext {
             print_timings: false,
             n_threads: cfg.mmproj_threads.unwrap_or(cfg.n_threads.unwrap_or(4)),
             media_marker: media_marker_cstr,
+            image_min_tokens: -1,
+            image_max_tokens: -1,
         };
 
         log::info!(
@@ -272,7 +274,7 @@ impl MediaAttachment {
         self.validate_mime()?;
 
         // Create bitmap from image buffer
-        MtmdBitmap::from_buffer(ctx, &self.data)
+        MtmdBitmap::from_buffer(ctx, &self.data, false)
             .map_err(|e| LLMError::ProviderError(format!("Failed to create image bitmap: {}", e)))
     }
 }

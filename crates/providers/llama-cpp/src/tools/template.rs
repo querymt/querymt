@@ -1,7 +1,8 @@
+use crate::common_chat::ChatTemplateResult;
 use crate::config::LlamaCppConfig;
 use crate::messages;
-use llama_cpp_2::model::{ChatTemplateResult, LlamaChatTemplate, LlamaModel};
-use llama_cpp_2::openai::OpenAIChatTemplateParams;
+use llama_cpp_2::common_chat::{CommonChatParams, CommonReasoningFormat};
+use llama_cpp_2::model::{LlamaChatTemplate, LlamaModel};
 use querymt::chat::{ChatMessage, Tool};
 use querymt::error::LLMError;
 use std::sync::Arc;
@@ -97,30 +98,19 @@ pub(crate) fn apply_template_for_thinking(
         .or_else(|_| LlamaChatTemplate::new("chatml"))
         .map_err(|e| LLMError::ProviderError(format!("Failed to get chat template: {}", e)))?;
 
-    let params = OpenAIChatTemplateParams {
-        messages_json: &messages_json,
-        tools_json: None,
-        tool_choice: None,
-        json_schema: json_schema_str.as_deref(),
-        grammar: None,
-        reasoning_format: None,
-        chat_template_kwargs: None,
-        add_generation_prompt: true,
-        use_jinja: true,
-        parallel_tool_calls: false,
-        enable_thinking: if has_schema {
-            false
-        } else {
-            cfg.enable_thinking.unwrap_or(true)
-        },
-        add_bos: false,
-        add_eos: false,
-        parse_tool_calls: false,
+    let mut params = CommonChatParams::new(&messages_json);
+    params.json_schema = json_schema_str.as_deref();
+    params.reasoning_format = CommonReasoningFormat::Auto;
+    params.enable_thinking = if has_schema {
+        false
+    } else {
+        cfg.enable_thinking.unwrap_or(true)
     };
 
-    let result = model
-        .apply_chat_template_oaicompat(&template, &params)
-        .map_err(|e| LLMError::ProviderError(format!("Failed to apply chat template: {}", e)))?;
+    let result: ChatTemplateResult = model
+        .apply_common_chat_template(Some(&template), &params)
+        .map_err(|e| LLMError::ProviderError(format!("Failed to apply chat template: {}", e)))?
+        .into();
 
     log::debug!(
         "Template applied (thinking): prompt_len={}",
@@ -161,33 +151,20 @@ pub(crate) fn apply_template_with_tools(
         .or_else(|_| LlamaChatTemplate::new("chatml"))
         .map_err(|e| LLMError::ProviderError(format!("Failed to get chat template: {}", e)))?;
 
-    let params = OpenAIChatTemplateParams {
-        messages_json: &messages_json,
-        tools_json: Some(&tools_json),
-        tool_choice: None,
-        json_schema: json_schema_str.as_deref(),
-        grammar: None,
-        reasoning_format: None,
-        chat_template_kwargs: None,
-        add_generation_prompt: true,
-        use_jinja: true,
-        parallel_tool_calls: false,
-        enable_thinking: if has_schema {
-            false
-        } else {
-            cfg.enable_thinking.unwrap_or(true)
-        },
-        // BOS is handled by the tokenizer in generate_with_tools(),
-        // not by the template engine, to avoid double-BOS.
-        // See self.cfg.add_bos.
-        add_bos: false,
-        add_eos: false,
-        parse_tool_calls: true,
+    let mut params = CommonChatParams::new(&messages_json);
+    params.tools_json = Some(&tools_json);
+    params.json_schema = json_schema_str.as_deref();
+    params.reasoning_format = CommonReasoningFormat::Auto;
+    params.enable_thinking = if has_schema {
+        false
+    } else {
+        cfg.enable_thinking.unwrap_or(true)
     };
 
-    let result = model
-        .apply_chat_template_oaicompat(&template, &params)
-        .map_err(|e| LLMError::ProviderError(format!("Failed to apply chat template: {}", e)))?;
+    let result: ChatTemplateResult = model
+        .apply_common_chat_template(Some(&template), &params)
+        .map_err(|e| LLMError::ProviderError(format!("Failed to apply chat template: {}", e)))?
+        .into();
 
     log::debug!(
         "Template applied: prompt_len={}, has_grammar={}, triggers={}, stops={}, parse_tool_calls={}",
@@ -195,7 +172,7 @@ pub(crate) fn apply_template_with_tools(
         result.grammar.is_some(),
         result.grammar_triggers.len(),
         result.additional_stops.len(),
-        result.parse_tool_calls
+        !tools.is_empty()
     );
 
     Ok(result)

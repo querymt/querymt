@@ -1,7 +1,8 @@
+use crate::common_chat::ChatTemplateResult;
 use crate::config::LlamaCppConfig;
-use crate::tools::template::{anchor_pattern, regex_escape};
-use llama_cpp_2::model::{AddBos, ChatTemplateResult, GrammarTriggerType, LlamaModel};
+use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use querymt::error::LLMError;
 use std::sync::Arc;
 
 /// Resolved sampling parameters for a single generation call.
@@ -56,70 +57,113 @@ impl SamplingParams {
     }
 }
 
-/// Build a grammar-constrained sampler from a ChatTemplateResult.
-///
-/// When a grammar is present, we use only `[grammar, greedy]` to match
-/// the reference llama.cpp examples. Mixing temperature / top-p / top-k
-/// with grammar sampling can corrupt the grammar state and trigger
-/// assertion failures in llama-grammar.cpp.
+/// Build the sampler used for tool-capable generation.
 pub(crate) fn build_tool_sampler(
     model: &Arc<LlamaModel>,
     result: &ChatTemplateResult,
     params: &SamplingParams,
-) -> LlamaSampler {
-    if let Some(ref grammar) = result.grammar {
-        let grammar_sampler = if result.grammar_lazy {
-            // Build lazy grammar sampler with triggers
+) -> Result<LlamaSampler, LLMError> {
+    #[cfg(feature = "common")]
+    if let Some(tool_grammar) = &result.grammar {
+        log::debug!(
+            "build_tool_sampler: grammar lazy={}, root={}, triggers={:?}, grammar_len={}",
+            tool_grammar.lazy,
+            tool_grammar.root,
+            tool_grammar
+                .triggers
+                .iter()
+                .map(|t| &t.value)
+                .collect::<Vec<_>>(),
+            tool_grammar.grammar.len()
+        );
+        let grammar_sampler = if tool_grammar.lazy {
             let mut trigger_patterns = Vec::new();
             let mut trigger_tokens = Vec::new();
 
-            for trigger in &result.grammar_triggers {
-                match trigger.trigger_type {
-                    GrammarTriggerType::Token => {
-                        if let Some(token) = trigger.token {
-                            trigger_tokens.push(token);
-                        }
+            for trigger in &tool_grammar.triggers {
+                match model.str_to_token(&trigger.value, AddBos::Never) {
+                    Ok(tokens) if tokens.len() == 1 => {
+                        log::debug!(
+                            "build_tool_sampler: trigger '{}' tokenized to single token {}",
+                            trigger.value,
+                            tokens[0]
+                        );
+                        trigger_tokens.push(tokens[0]);
                     }
-                    GrammarTriggerType::Word => {
-                        match model.str_to_token(&trigger.value, AddBos::Never) {
-                            Ok(tokens) if tokens.len() == 1 => {
-                                trigger_tokens.push(tokens[0]);
-                            }
-                            _ => {
-                                trigger_patterns.push(regex_escape(&trigger.value));
-                            }
-                        }
+                    Ok(tokens) => {
+                        log::debug!(
+                            "build_tool_sampler: trigger '{}' tokenized to {} tokens, using regex pattern instead",
+                            trigger.value,
+                            tokens.len()
+                        );
+                        trigger_patterns.push(regex_escape(&trigger.value));
                     }
-                    GrammarTriggerType::Pattern => {
-                        trigger_patterns.push(trigger.value.clone());
-                    }
-                    GrammarTriggerType::PatternFull => {
-                        trigger_patterns.push(anchor_pattern(&trigger.value));
+                    Err(e) => {
+                        log::debug!(
+                            "build_tool_sampler: trigger '{}' failed to tokenize ({}), using regex pattern",
+                            trigger.value,
+                            e
+                        );
+                        trigger_patterns.push(regex_escape(&trigger.value));
                     }
                 }
             }
 
+            log::debug!(
+                "build_tool_sampler: building lazy grammar with {} trigger_tokens, {} trigger_patterns",
+                trigger_tokens.len(),
+                trigger_patterns.len()
+            );
+
             LlamaSampler::grammar_lazy_patterns(
                 model,
-                grammar,
-                "root",
+                &tool_grammar.grammar,
+                tool_grammar.root,
                 &trigger_patterns,
                 &trigger_tokens,
             )
-            .ok()
         } else {
-            // Build strict grammar sampler
-            LlamaSampler::grammar(model, grammar, "root").ok()
-        };
-
-        if let Some(g) = grammar_sampler {
-            // Grammar + greedy only — no temp/top_p/top_k/min_p/penalties
-            return LlamaSampler::chain_simple([g, LlamaSampler::greedy()]);
+            log::debug!("build_tool_sampler: building strict (non-lazy) grammar");
+            LlamaSampler::grammar(model, &tool_grammar.grammar, tool_grammar.root)
         }
+        .map_err(|e| {
+            LLMError::ProviderError(format!(
+                "Failed to build tool grammar sampler: {e}. Grammar:\n{}",
+                tool_grammar.grammar
+            ))
+        })?;
+
+        log::debug!("build_tool_sampler: grammar sampler constructed successfully");
+
+        return Ok(LlamaSampler::chain_simple([
+            grammar_sampler,
+            build_standard_sampler(params),
+        ]));
     }
 
-    // No grammar or grammar creation failed — fall back to standard sampler
-    build_standard_sampler(params)
+    #[cfg(feature = "common")]
+    log::warn!(
+        "build_tool_sampler: no tool grammar present in ChatTemplateResult — sampling unconstrained"
+    );
+
+    #[cfg(not(feature = "common"))]
+    let _ = (model, result);
+
+    Ok(build_standard_sampler(params))
+}
+
+fn regex_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '.' | '^' | '$' | '|' | '(' | ')' | '*' | '+' | '?' | '[' | ']' | '{' | '}' | '\\' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 /// Build a standard sampler without grammar constraints.
@@ -139,11 +183,6 @@ pub(crate) fn build_standard_sampler(params: &SamplingParams) -> LlamaSampler {
         ));
     }
 
-    if let Some(temp) = params.temperature {
-        if temp > 0.0 {
-            samplers.push(LlamaSampler::temp(temp));
-        }
-    }
     if let Some(top_k) = params.top_k {
         samplers.push(LlamaSampler::top_k(top_k as i32));
     }
@@ -154,20 +193,24 @@ pub(crate) fn build_standard_sampler(params: &SamplingParams) -> LlamaSampler {
         samplers.push(LlamaSampler::min_p(min_p, 1));
     }
 
-    samplers.push(LlamaSampler::dist(params.seed));
-    if !params.is_explicit() {
-        // Pure-default path: nudge toward greedy for deterministic output.
-        samplers.push(LlamaSampler::greedy());
+    match params.temperature {
+        Some(t) if t > 0.0 => {
+            samplers.push(LlamaSampler::temp(t));
+            samplers.push(LlamaSampler::dist(params.seed));
+        }
+        _ => samplers.push(LlamaSampler::greedy()),
     }
 
     LlamaSampler::chain_simple(samplers)
 }
 
-/// Build a fallback sampler with default parameters.
+/// Conservative fallback used only when a model immediately emits EOG with the
+/// configured sampler and no explicit sampling options were set.
 pub(crate) fn build_fallback_sampler(seed: u32) -> LlamaSampler {
     LlamaSampler::chain_simple([
-        LlamaSampler::temp(0.7),
-        LlamaSampler::top_p(0.9, 1),
+        LlamaSampler::top_k(40),
+        LlamaSampler::top_p(0.95, 1),
+        LlamaSampler::temp(0.8),
         LlamaSampler::dist(seed),
     ])
 }
