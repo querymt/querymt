@@ -1,4 +1,6 @@
 mod backend;
+mod chat_format;
+mod common_chat;
 mod config;
 mod context;
 mod generation;
@@ -7,6 +9,7 @@ mod messages;
 mod multimodal;
 mod provider;
 mod response;
+mod template;
 mod tools;
 
 pub use config::LlamaCppConfig;

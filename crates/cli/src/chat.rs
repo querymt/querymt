@@ -154,8 +154,16 @@ pub async fn handle_any_response(
                                         entry.2.push_str(&partial_json);
                                     }
                                 }
-                                StreamChunk::ToolUseComplete { .. } => {
-                                    log::debug!("Received tool use complete");
+                                StreamChunk::ToolUseComplete { index, tool_call } => {
+                                    log::debug!(
+                                        "Received tool use complete: {} (idx {})",
+                                        tool_call.function.name, index
+                                    );
+                                    tool_calls_map.insert(index, (
+                                        tool_call.id,
+                                        tool_call.function.name,
+                                        tool_call.function.arguments,
+                                    ));
                                 }
                                 StreamChunk::Usage(usage) => {
                                     log::debug!(
