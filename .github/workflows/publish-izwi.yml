@@ -140,7 +140,11 @@ jobs:
           - os: windows
             arch: amd64
             target: x86_64-pc-windows-msvc
-            runner: windows-latest
+            # windows-latest now ships VS 2026 (v18), which CUDA 12.8
+            # rejects during NVCC host compiler checks. Pin windows-2022
+            # (VS 17) for the CUDA build; the default Windows build stays
+            # on windows-latest.
+            runner: windows-2022
             features: "cuda flash-attn"
             feature_tag: cuda12.8-sm80
             needs_cuda: "true"
