@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "querymt"
-version = "0.4.2"
+dynamic = ["version"]
 description = "Python bindings for QueryMT"
 readme = "README.md"
 requires-python = ">=3.10"
