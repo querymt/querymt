@@ -30,59 +30,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import os
-          import pathlib
-          import tomllib
-
-          root = pathlib.Path.cwd()
-          tag = os.environ["GITHUB_REF_NAME"]
-          if not tag.startswith("v"):
-              raise SystemExit(f"Release tag must start with 'v', got: {tag}")
-
-          version = tag[1:]
-
-          cargo = tomllib.loads((root / "Cargo.toml").read_text())
-          workspace_version = cargo["workspace"]["package"]["version"]
-
-          querymt_py = tomllib.loads((root / "crates/py/querymt-py/pyproject.toml").read_text())
-          querymt_agent_py = tomllib.loads((root / "crates/py/querymt-agent-py/pyproject.toml").read_text())
-
-          checks = {
-              "tag": version,
-              "workspace": workspace_version,
-              "querymt": querymt_py["project"]["version"],
-              "querymt[agent] optional dependency": querymt_py["project"]["optional-dependencies"]["agent"][0],
-              "querymt-agent": querymt_agent_py["project"]["version"],
-              "querymt-agent dependency": querymt_agent_py["project"]["dependencies"][0],
-          }
-
-          expected_querymt_dependency = f"querymt=={version}"
-          expected_agent_dependency = f"querymt-agent=={version}"
-          errors = []
-          if workspace_version != version:
-              errors.append(f"workspace version {workspace_version} does not match tag {version}")
-          if querymt_py["project"]["version"] != version:
-              errors.append(f"querymt pyproject version {querymt_py['project']['version']} does not match tag {version}")
-          if querymt_agent_py["project"]["version"] != version:
-              errors.append(f"querymt-agent pyproject version {querymt_agent_py['project']['version']} does not match tag {version}")
-          if querymt_py["project"]["optional-dependencies"].get("agent") != [expected_agent_dependency]:
-              errors.append(
-                  "querymt optional dependency list for 'agent' "
-                  f"{querymt_py['project']['optional-dependencies'].get('agent')} does not match [{expected_agent_dependency!r}]"
-              )
-          if querymt_agent_py["project"]["dependencies"] != [expected_querymt_dependency]:
-              errors.append(
-                  "querymt-agent dependency list "
-                  f"{querymt_agent_py['project']['dependencies']} does not match [{expected_querymt_dependency!r}]"
-              )
-
-          for label, value in checks.items():
-              print(f"{label}: {value}")
-
-          if errors:
-              raise SystemExit("\n".join(errors))
-          PY
+          python scripts/sync_python_package_versions.py --check --tag "$GITHUB_REF_NAME"
 
   build-querymt:
     name: Build querymt wheels
