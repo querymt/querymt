@@ -324,8 +324,13 @@ impl ChatProvider for LlamaCppProvider {
             vec![]
         };
 
-        // Get media marker (if multimodal)
-        let media_marker = self.multimodal.as_ref().map(|m| m.marker());
+        // Only route through MTMD when the prompt actually contains media.
+        let active_multimodal = if bitmaps.is_empty() {
+            None
+        } else {
+            self.multimodal.as_deref()
+        };
+        let media_marker = active_multimodal.map(|m| m.marker());
 
         // If tools are provided and not empty, use tool-aware generation
         if let Some(tools) = tools {
@@ -343,7 +348,7 @@ impl ChatProvider for LlamaCppProvider {
                     &template_result,
                     max_tokens,
                     None,
-                    self.multimodal.as_deref(),
+                    active_multimodal,
                     &bitmaps,
                 )?;
                 let (content, thinking, tool_calls, finish_reason) =
@@ -370,7 +375,7 @@ impl ChatProvider for LlamaCppProvider {
                 &template_result,
                 max_tokens,
                 None,
-                self.multimodal.as_deref(),
+                active_multimodal,
                 &bitmaps,
             )?;
             let (content, thinking, _tool_calls, finish_reason) =
@@ -395,7 +400,7 @@ impl ChatProvider for LlamaCppProvider {
             &prompt,
             max_tokens,
             None,
-            self.multimodal.as_deref(),
+            active_multimodal,
             &bitmaps,
         )?;
         // Fallback handling (existing logic)
@@ -409,7 +414,7 @@ impl ChatProvider for LlamaCppProvider {
                     &fallback_prompt,
                     max_tokens,
                     None,
-                    self.multimodal.as_deref(),
+                    active_multimodal,
                     &bitmaps,
                 )?;
             }
@@ -422,11 +427,18 @@ impl ChatProvider for LlamaCppProvider {
                 &raw_prompt,
                 max_tokens,
                 None,
-                self.multimodal.as_deref(),
+                active_multimodal,
                 &bitmaps,
             )?;
         }
-        let (thinking, clean_text) = querymt::chat::extract_thinking(&generated.text);
+        let reasoning_format = crate::common_chat::ReasoningFormat::detect(&prompt);
+        let parsed = crate::chat_format::parse_assistant_format_with_state(
+            &generated.text,
+            reasoning_format,
+            false,
+        );
+        let clean_text = parsed.content;
+        let thinking = parsed.thinking;
         Ok(Box::new(LlamaCppChatResponse {
             text: clean_text,
             thinking,
@@ -467,7 +479,12 @@ impl ChatProvider for LlamaCppProvider {
             vec![]
         };
 
-        let media_marker = self.multimodal.as_ref().map(|m| m.marker());
+        let active_multimodal = if bitmaps.is_empty() {
+            None
+        } else {
+            self.multimodal.as_deref()
+        };
+        let media_marker = active_multimodal.map(|m| m.marker());
 
         // If tools are provided and not empty, use tool-aware streaming
         if let Some(tools) = tools {
@@ -481,7 +498,11 @@ impl ChatProvider for LlamaCppProvider {
                 )?;
                 let cfg = self.cfg.clone();
                 let model = Arc::clone(&self.model);
-                let multimodal = self.multimodal.clone();
+                let multimodal = if bitmaps.is_empty() {
+                    None
+                } else {
+                    self.multimodal.clone()
+                };
 
                 thread::spawn(move || {
                     match generate_streaming_with_tools(
@@ -522,7 +543,11 @@ impl ChatProvider for LlamaCppProvider {
             apply_template_for_thinking(&self.model, &self.cfg, messages, media_marker)?;
         let cfg = self.cfg.clone();
         let model = Arc::clone(&self.model);
-        let multimodal = self.multimodal.clone();
+        let multimodal = if bitmaps.is_empty() {
+            None
+        } else {
+            self.multimodal.clone()
+        };
 
         thread::spawn(move || {
             match generate_streaming_with_thinking(

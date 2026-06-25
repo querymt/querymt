@@ -1,5 +1,5 @@
 use crate::chat_format::ToolFormat;
-use crate::common_chat::{ChatTemplateResult, prompt_starts_in_thinking};
+use crate::common_chat::{ChatTemplateResult, ReasoningFormat, prompt_starts_in_thinking};
 use crate::config::LlamaCppConfig;
 use crate::messages;
 use llama_cpp_2::model::LlamaModel;
@@ -122,7 +122,8 @@ fn render_template(
         })
         .map_err(|e| LLMError::ProviderError(format!("Failed to render chat template: {e}")))?;
 
-    let starts_in_thinking = prompt_starts_in_thinking(&prompt);
+    let reasoning_format = ReasoningFormat::detect(&prompt);
+    let starts_in_thinking = prompt_starts_in_thinking(&prompt, reasoning_format);
 
     let prompt_tail_len = 1200.min(prompt.len());
     let prompt_tail = if prompt_tail_len > 0 {
@@ -132,9 +133,10 @@ fn render_template(
     };
     let tools_in_prompt = tools.is_some() && prompt.contains("tools");
     log::debug!(
-        "render_template: prompt_len={}, starts_in_thinking={}, tools_section_in_prompt={}, prompt_tail=<<<{}>>>",
+        "render_template: prompt_len={}, starts_in_thinking={}, reasoning_format={:?}, tools_section_in_prompt={}, prompt_tail=<<<{}>>>",
         prompt.len(),
         starts_in_thinking,
+        reasoning_format,
         tools_in_prompt,
         prompt_tail
     );
@@ -145,6 +147,7 @@ fn render_template(
         preserved_tokens: known_preserved_tokens(),
         additional_stops: known_stop_sequences(),
         starts_in_thinking,
+        reasoning_format,
     })
 }
 
@@ -239,6 +242,10 @@ fn known_preserved_tokens() -> Vec<String> {
         "<end_function_call>",
         "<think>",
         "</think>",
+        "<|channel>",
+        "<channel|>",
+        "<|think|>",
+        "<|\"|>",
     ]
     .into_iter()
     .map(str::to_string)

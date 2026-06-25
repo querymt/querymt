@@ -18,6 +18,7 @@ use llama_cpp_2::mtmd::{MtmdBitmap, MtmdInputChunkType, MtmdInputText};
 use querymt::Usage;
 use querymt::chat::ChatMessage;
 use querymt::error::LLMError;
+use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -98,6 +99,39 @@ pub(crate) fn build_raw_prompt(
 /// * `temperature` - Sampling temperature (None for greedy)
 /// * `mm_ctx` - Optional multimodal context (for vision/audio models)
 /// * `bitmaps` - Image/audio bitmaps (must match marker count in prompt)
+pub(crate) fn decode_token_piece(
+    model: &Arc<LlamaModel>,
+    decoder: &mut encoding_rs::Decoder,
+    preserved: &HashSet<llama_cpp_2::token::LlamaToken>,
+    token: llama_cpp_2::token::LlamaToken,
+) -> Result<String, LLMError> {
+    let special = preserved.contains(&token);
+    let bytes = model
+        .token_to_piece_bytes(token, 128, special, None)
+        .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+    match model.token_to_piece(token, decoder, special, None) {
+        Ok(piece) => Ok(piece),
+        Err(_) => Ok(String::from_utf8_lossy(&bytes).to_string()),
+    }
+}
+
+fn preserved_token_set(
+    model: &Arc<LlamaModel>,
+    result: Option<&ChatTemplateResult>,
+) -> HashSet<llama_cpp_2::token::LlamaToken> {
+    let mut preserved = HashSet::new();
+    if let Some(result) = result {
+        for token_str in &result.preserved_tokens {
+            if let Ok(tokens) = model.str_to_token(token_str, AddBos::Never) {
+                if tokens.len() == 1 {
+                    preserved.insert(tokens[0]);
+                }
+            }
+        }
+    }
+    preserved
+}
+
 pub(crate) fn generate(
     model: &Arc<LlamaModel>,
     cfg: &LlamaCppConfig,
@@ -162,7 +196,7 @@ pub(crate) fn generate(
     let n_batch = resolve_n_batch(cfg, n_ctx_total as u32);
 
     // UNIFIED TOKENIZATION AND EVALUATION
-    let (n_past, input_tokens) = if let Some(mm_ctx) = mm_ctx {
+    let (n_past, input_tokens) = if let Some(mm_ctx) = mm_ctx.filter(|_| !bitmaps.is_empty()) {
         // Multimodal path: use MTMD tokenization
         let input_text = MtmdInputText {
             text: prompt.to_string(),
@@ -317,6 +351,7 @@ pub(crate) fn generate(
     let mut output_tokens = 0u32;
     let mut output = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let preserved = preserved_token_set(model, None);
     while n_cur < n_len_total {
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         if model.is_eog_token(token) {
@@ -328,13 +363,7 @@ pub(crate) fn generate(
             break;
         }
 
-        let bytes = model
-            .token_to_piece_bytes(token, 128, true, None)
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-        let chunk = match model.token_to_piece(token, &mut decoder, true, None) {
-            Ok(piece) => piece,
-            Err(_) => String::from_utf8_lossy(&bytes).to_string(),
-        };
+        let chunk = decode_token_piece(model, &mut decoder, &preserved, token)?;
         output.push_str(&chunk);
 
         batch.clear();
@@ -436,7 +465,7 @@ pub(crate) fn generate_streaming_with_thinking(
     let mut batch = LlamaBatch::new(n_batch, 1);
 
     // TOKENIZATION AND EVALUATION — dual path: multimodal vs text-only
-    let (n_past, input_tokens) = if let Some(mm_ctx) = mm_ctx {
+    let (n_past, input_tokens) = if let Some(mm_ctx) = mm_ctx.filter(|_| !bitmaps.is_empty()) {
         // Multimodal path: use MTMD tokenization so image embeddings are encoded.
         let input_text = MtmdInputText {
             text: result.prompt.clone(),
@@ -574,6 +603,7 @@ pub(crate) fn generate_streaming_with_thinking(
     let n_len_total = n_past + max_tokens as i32;
     let mut output_tokens = 0u32;
     let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let preserved = preserved_token_set(model, Some(result));
 
     while n_cur < n_len_total {
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
@@ -586,13 +616,7 @@ pub(crate) fn generate_streaming_with_thinking(
             break;
         }
 
-        let bytes = model
-            .token_to_piece_bytes(token, 128, true, None)
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-        let chunk = match model.token_to_piece(token, &mut decoder, true, None) {
-            Ok(piece) => piece,
-            Err(_) => String::from_utf8_lossy(&bytes).to_string(),
-        };
+        let chunk = decode_token_piece(model, &mut decoder, &preserved, token)?;
 
         for delta in stream_state.update(&chunk, true) {
             let stream_chunk = match delta {
