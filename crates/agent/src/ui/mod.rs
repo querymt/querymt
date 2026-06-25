@@ -55,6 +55,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// UI WebSocket server.
 pub struct UiServer {
@@ -70,6 +71,7 @@ pub struct UiServer {
     session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
     workspace_manager: ActorRef<WorkspaceIndexManagerActor>,
     oauth_service: OAuthService,
+    shutdown_token: CancellationToken,
 }
 
 /// Cached result of a remote-node DHT discovery query.
@@ -140,6 +142,7 @@ pub(crate) struct ServerState {
     pub session_cwds: Arc<Mutex<HashMap<String, PathBuf>>>,
     pub workspace_manager: ActorRef<WorkspaceIndexManagerActor>,
     pub oauth_service: OAuthService,
+    pub shutdown_token: CancellationToken,
     /// Cache for remote node DHT discovery results with a short TTL.
     #[cfg(feature = "remote")]
     pub remote_node_cache: Arc<Mutex<Option<RemoteNodeCache>>>,
@@ -247,8 +250,16 @@ impl UiServer {
         view_store: Arc<dyn ViewStore>,
         session_store: Arc<dyn SessionStore>,
         default_cwd: Option<PathBuf>,
+        shutdown_token: CancellationToken,
     ) -> Self {
-        Self::build(agent, view_store, session_store, default_cwd, None)
+        Self::build(
+            agent,
+            view_store,
+            session_store,
+            default_cwd,
+            None,
+            shutdown_token,
+        )
     }
 
     /// Create a UI server backed by a profile runtime manager.
@@ -258,6 +269,7 @@ impl UiServer {
         session_store: Arc<dyn SessionStore>,
         default_cwd: Option<PathBuf>,
         profiles: ProfileRuntimeHandle,
+        shutdown_token: CancellationToken,
     ) -> Self {
         Self::build(
             agent,
@@ -265,6 +277,7 @@ impl UiServer {
             session_store,
             default_cwd,
             Some(profiles),
+            shutdown_token,
         )
     }
 
@@ -274,6 +287,7 @@ impl UiServer {
         session_store: Arc<dyn SessionStore>,
         default_cwd: Option<PathBuf>,
         profiles: Option<ProfileRuntimeHandle>,
+        shutdown_token: CancellationToken,
     ) -> Self {
         let event_sources = collect_event_sources(&agent);
 
@@ -290,6 +304,7 @@ impl UiServer {
             session_cwds: Arc::new(Mutex::new(HashMap::new())),
             workspace_manager: agent.workspace_manager_actor(),
             oauth_service: agent.oauth_service.clone(),
+            shutdown_token,
         }
     }
 
@@ -308,6 +323,7 @@ impl UiServer {
             session_cwds: self.session_cwds,
             workspace_manager: self.workspace_manager,
             oauth_service: self.oauth_service,
+            shutdown_token: self.shutdown_token,
             #[cfg(feature = "remote")]
             remote_node_cache: Arc::new(Mutex::new(None)),
         };
@@ -324,14 +340,17 @@ impl UiServer {
             // Drop the pending initial value so we only react to future refreshes.
             let _ = rx.try_recv();
             loop {
-                match rx.recv().await {
-                    Ok(_version) => {
-                        broadcast_state.broadcast_model_snapshot().await;
+                tokio::select! {
+                    _ = broadcast_state.shutdown_token.cancelled() => break,
+                    result = rx.recv() => match result {
+                        Ok(_version) => {
+                            broadcast_state.broadcast_model_snapshot().await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            broadcast_state.broadcast_model_snapshot().await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        broadcast_state.broadcast_model_snapshot().await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });

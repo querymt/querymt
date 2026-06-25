@@ -147,6 +147,11 @@ impl SessionMaterializer {
         *self.mesh.write() = Some(mesh);
     }
 
+    #[cfg(feature = "remote")]
+    pub fn clear_mesh(&self) {
+        *self.mesh.write() = None;
+    }
+
     /// Get the current mesh handle (if any).
     #[cfg(feature = "remote")]
     pub fn mesh(&self) -> Option<crate::agent::remote::MeshHandle> {

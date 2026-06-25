@@ -1,6 +1,6 @@
-use crate::agent::remote::mesh::{MeshError, MeshHandle, MeshScopeId};
+use crate::agent::remote::mesh::{MeshError, MeshScopeId};
 use libp2p::PeerId;
-use querymt_remote::{IrohMeshConfig, MeshRuntimeConfig};
+use querymt_remote::{IrohMeshConfig, MeshRuntimeConfig, MeshRuntimeHandle};
 
 /// Join an existing mesh using a signed invite grant.
 ///
@@ -24,7 +24,7 @@ use querymt_remote::{IrohMeshConfig, MeshRuntimeConfig};
 pub async fn join_mesh_via_invite(
     invite: &crate::agent::remote::invite::SignedInviteGrant,
     identity_file: Option<std::path::PathBuf>,
-) -> Result<MeshHandle, MeshError> {
+) -> Result<MeshRuntimeHandle, MeshError> {
     use crate::agent::remote::invite::{PeerEntry, mesh_id_for};
     use crate::agent::remote::node_manager::{AdmissionRequest, AdmissionResponse};
 
@@ -97,7 +97,8 @@ pub async fn join_mesh_via_invite(
         invite.grant.mesh_name
     );
 
-    let mesh = querymt_remote::bootstrap_mesh_handle(&config).await?;
+    let runtime = querymt_remote::bootstrap_mesh_runtime(&config).await?;
+    let mesh = runtime.as_mesh_handle();
     mesh.ensure_scope(MeshScopeId::Iroh {
         mesh_id: mesh_id.clone(),
     });
@@ -224,7 +225,7 @@ pub async fn join_mesh_via_invite(
         *store_arc.write() = fresh;
     }
 
-    Ok(mesh)
+    Ok(runtime)
 }
 
 /// Find a reachable `RemoteNodeManager` for the admission handshake.

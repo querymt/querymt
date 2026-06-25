@@ -79,7 +79,7 @@ toml.workspace = true
 minijinja = { version = "2", default-features = false, features = ["serde"] }
 iana-time-zone = "0.1"
 regex.workspace = true
-tokio-util = { version = "0.7", features = ["compat"] }
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
 base64.workspace = true
 hex = "0.4"
 infer = "0.19"

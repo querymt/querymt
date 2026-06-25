@@ -40,6 +40,17 @@ impl LocalAgentHandle {
         self.model_inventory.set_mesh(mesh);
     }
 
+    #[cfg(feature = "remote")]
+    pub fn clear_mesh(&self) {
+        *self.mesh.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.config.provider.set_mesh(None);
+        if let Ok(mut registry) = self.registry.try_lock() {
+            registry.set_mesh(None);
+        }
+        self.session_materializer.clear_mesh();
+        self.model_inventory.clear_mesh();
+    }
+
     /// Enable/disable automatic mesh fallback for unpinned provider resolution.
     #[cfg(feature = "remote")]
     pub fn set_mesh_fallback(&self, enabled: bool) {

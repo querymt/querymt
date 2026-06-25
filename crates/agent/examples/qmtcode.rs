@@ -443,6 +443,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("Agent loaded successfully!\n");
 
+    #[cfg(feature = "remote")]
+    let mut mesh_runtime: Option<querymt_agent::agent::remote::MeshRuntimeHandle> = None;
+
     // ── Phase 6: Mesh Bootstrap ───────────────────────────────────────────────
     //
     // Simplified mesh modes:
@@ -476,13 +479,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         match join_mesh_via_invite(&invite, None).await {
-            Ok(mesh) => {
+            Ok(runtime) => {
+                let mesh = runtime.as_mesh_handle().clone();
                 eprintln!("Joined mesh: peer_id={}", mesh.peer_id());
                 register_mesh_actors(&runner, &mesh).await;
                 runner.handle().set_mesh(mesh.clone());
                 if let Some(manager) = runner.profiles() {
                     manager.set_mesh(mesh).await;
                 }
+                mesh_runtime = Some(runtime);
             }
             Err(e) => {
                 eprintln!("Warning: mesh join failed: {}", e);
@@ -630,6 +635,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(manager) = runner.profiles() {
                     manager.set_mesh(mesh).await;
                 }
+                mesh_runtime = Some(runtime);
             }
             Err(e) => {
                 eprintln!("Warning: mesh bootstrap failed: {}", e);
@@ -669,9 +675,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Received Ctrl+C, shutting down mesh node...");
     }
 
-    // Graceful shutdown: release scheduler lease, stop background tasks.
-    // Idempotent — safe to call even if the dashboard server already ran shutdown.
+    // Request shutdown without blocking on background drains; telemetry is finalized last.
     runner.handle().shutdown().await;
+    #[cfg(feature = "remote")]
+    if let Some(runtime) = mesh_runtime.take() {
+        runtime.request_shutdown();
+    }
+    querymt_utils::telemetry::flush_telemetry();
 
     Ok(())
 }

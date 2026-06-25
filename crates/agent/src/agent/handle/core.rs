@@ -566,26 +566,24 @@ impl LocalAgentHandle {
     }
 
     /// Gracefully shutdown the agent and all background tasks.
+    /// Request agent shutdown without waiting for background work to drain.
     pub async fn shutdown(&self) {
         if self.shutdown_done.swap(true, Ordering::SeqCst) {
             return;
         }
-        log::info!("LocalAgentHandle: Starting graceful shutdown");
+        log::info!("LocalAgentHandle: Requesting shutdown");
 
-        // Shutdown the scheduler first
         if let Some(scheduler) = self.scheduler() {
-            scheduler.shutdown().await;
+            scheduler.request_shutdown();
         }
+        self.clear_scheduler_handle();
+
+        #[cfg(feature = "remote")]
+        self.clear_mesh();
 
         self.config.shutdown().await;
 
-        // Wait briefly for in-flight work to settle, then flush any
-        // buffered OTLP spans/logs before the process exits.
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        querymt_utils::telemetry::flush_telemetry();
-
-        log::info!("LocalAgentHandle: Shutdown complete");
+        log::info!("LocalAgentHandle: Shutdown requested");
     }
 }
 

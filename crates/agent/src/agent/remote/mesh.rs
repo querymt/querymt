@@ -16,6 +16,6 @@ use querymt_remote::SignedInviteGrant;
 pub async fn join_mesh_via_invite(
     invite: &SignedInviteGrant,
     identity_file: Option<std::path::PathBuf>,
-) -> Result<MeshHandle, MeshError> {
+) -> Result<MeshRuntimeHandle, MeshError> {
     join::join_mesh_via_invite(invite, identity_file).await
 }
