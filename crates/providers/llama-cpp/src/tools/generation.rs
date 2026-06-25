@@ -179,7 +179,7 @@ pub(crate) fn parse_tool_response(
     log::debug!("Parsing tool response: text_len={}", text.len());
     log::debug!("Raw generated text: {}", text);
 
-    extract_parsed_response(text, result.starts_in_thinking)
+    extract_parsed_response(text, result.reasoning_format, result.starts_in_thinking)
 }
 
 /// Extract content, thinking, tool calls and finish reason from a parsed
@@ -189,6 +189,7 @@ pub(crate) fn parse_tool_response(
 /// unit-tested without requiring a live `ChatTemplateResult` / FFI context.
 fn extract_parsed_response(
     text: &str,
+    reasoning_format: crate::common_chat::ReasoningFormat,
     starts_in_thinking: bool,
 ) -> Result<
     (
@@ -199,7 +200,7 @@ fn extract_parsed_response(
     ),
     LLMError,
 > {
-    let parsed = parse_assistant_format_with_state(text, starts_in_thinking);
+    let parsed = parse_assistant_format_with_state(text, reasoning_format, starts_in_thinking);
     let finish_reason = if parsed.tool_calls.is_some() {
         querymt::chat::FinishReason::ToolCalls
     } else {
@@ -233,8 +234,12 @@ mod tests {
 
     #[test]
     fn parses_plain_text_response() {
-        let (content, thinking, tool_calls, finish_reason) =
-            extract_parsed_response("Here is my answer.", false).unwrap();
+        let (content, thinking, tool_calls, finish_reason) = extract_parsed_response(
+            "Here is my answer.",
+            crate::common_chat::ReasoningFormat::ThinkTags,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(content, "Here is my answer.");
         assert!(thinking.is_none());
@@ -247,7 +252,8 @@ mod tests {
         let input = r#"<think>Need a file search.</think>
 <tool_call>{"name":"glob","arguments":{"pattern":"**/*.rs"}}</tool_call>"#;
         let (content, thinking, tool_calls, finish_reason) =
-            extract_parsed_response(input, false).unwrap();
+            extract_parsed_response(input, crate::common_chat::ReasoningFormat::ThinkTags, false)
+                .unwrap();
 
         assert!(content.is_empty());
         assert_eq!(thinking.as_deref(), Some("Need a file search."));
@@ -262,7 +268,9 @@ mod tests {
     #[test]
     fn parses_qwen_function_tool_call() {
         let input = "<tool_call>\n<function=get_weather>\n<parameter=city>\nCopenhagen\n</parameter>\n</function>\n</tool_call>";
-        let (_, _, tool_calls, finish_reason) = extract_parsed_response(input, false).unwrap();
+        let (_, _, tool_calls, finish_reason) =
+            extract_parsed_response(input, crate::common_chat::ReasoningFormat::ThinkTags, false)
+                .unwrap();
 
         assert_eq!(finish_reason, FinishReason::ToolCalls);
         let calls = tool_calls.expect("tool_calls should be Some");
@@ -275,10 +283,29 @@ mod tests {
     fn parses_open_prompt_thinking_then_tool_call() {
         let input = "Thinking Process:\n1. analyze\n</think><tool_call>{\"name\":\"glob\",\"arguments\":{\"pattern\":\"**/*.rs\"}}</tool_call>";
         let (content, thinking, tool_calls, finish_reason) =
-            extract_parsed_response(input, true).unwrap();
+            extract_parsed_response(input, crate::common_chat::ReasoningFormat::ThinkTags, true)
+                .unwrap();
 
         assert!(content.is_empty());
         assert_eq!(thinking.as_deref(), Some("Thinking Process:\n1. analyze"));
+        assert_eq!(finish_reason, FinishReason::ToolCalls);
+        assert_eq!(tool_calls.unwrap()[0].function.name, "glob");
+    }
+
+    #[test]
+    fn parses_gemma_channel_tool_response() {
+        let input = "<|channel>thought\nReview tool usage<channel|><|tool_call>call:glob{pattern:<|\"|>**/*.rs<|\"|>}<tool_call|>";
+        let (content, thinking, tool_calls, finish_reason) = extract_parsed_response(
+            input,
+            crate::common_chat::ReasoningFormat::GemmaChannel {
+                implicit_leading_reasoning_prefix: false,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert!(content.is_empty());
+        assert_eq!(thinking.as_deref(), Some("Review tool usage"));
         assert_eq!(finish_reason, FinishReason::ToolCalls);
         assert_eq!(tool_calls.unwrap()[0].function.name, "glob");
     }

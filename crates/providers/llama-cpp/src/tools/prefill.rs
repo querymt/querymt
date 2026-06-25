@@ -43,7 +43,7 @@ pub(crate) fn prefill_for_tool_generation<'a>(
 
     let backend = llama_backend()?;
 
-    if let Some(mm_ctx) = mm_ctx {
+    if let Some(mm_ctx) = mm_ctx.filter(|_| !bitmaps.is_empty()) {
         // Multimodal path: tokenize first so n_ctx autosizing is based on true input size.
         let input_text = MtmdInputText {
             text: prompt.to_string(),

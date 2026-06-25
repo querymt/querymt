@@ -1,4 +1,4 @@
-use crate::common_chat::{GrammarTrigger, ToolGrammar};
+use crate::common_chat::{GrammarTrigger, ReasoningFormat, ToolGrammar};
 use querymt::chat::Tool;
 use querymt::{FunctionCall, ToolCall};
 use serde_json::{Map, Value};
@@ -64,14 +64,16 @@ impl ToolFormat {
 
 #[cfg(test)]
 pub(crate) fn parse_assistant_format(text: &str) -> ParsedFormat {
-    parse_assistant_format_with_state(text, false)
+    parse_assistant_format_with_state(text, ReasoningFormat::ThinkTags, false)
 }
 
 pub(crate) fn parse_assistant_format_with_state(
     text: &str,
+    reasoning_format: ReasoningFormat,
     starts_in_thinking: bool,
 ) -> ParsedFormat {
-    let (thinking, without_thinking) = extract_reasoning_blocks(text, starts_in_thinking);
+    let (thinking, without_thinking) =
+        extract_reasoning_blocks(text, reasoning_format, starts_in_thinking);
     let calls = extract_tool_calls(&without_thinking);
     let content = strip_tool_blocks(&without_thinking).trim().to_string();
 
@@ -116,34 +118,51 @@ fn detect_from_hints(architecture: Option<&str>, model_name: Option<&str>) -> Op
     None
 }
 
-fn extract_reasoning_blocks(text: &str, starts_in_thinking: bool) -> (Option<String>, String) {
+fn extract_reasoning_blocks(
+    text: &str,
+    reasoning_format: ReasoningFormat,
+    starts_in_thinking: bool,
+) -> (Option<String>, String) {
+    let open_tag = reasoning_format.open_tag();
+    let close_tag = reasoning_format.close_tag();
     let mut rest = text;
     let mut output = String::with_capacity(text.len());
     let mut reasoning = String::new();
     let mut in_thinking = starts_in_thinking;
 
+    if starts_in_thinking {
+        if let ReasoningFormat::GemmaChannel {
+            implicit_leading_reasoning_prefix: true,
+        } = reasoning_format
+        {
+            rest = rest.strip_prefix("thought\n").unwrap_or(rest);
+        }
+    }
+
     while !rest.is_empty() {
         if in_thinking {
-            if let Some(end) = rest.find("</think>") {
-                if !reasoning.is_empty() {
+            if let Some(end) = rest.find(close_tag) {
+                let block = reasoning_format.strip_reasoning_prefix(rest[..end].trim());
+                if !reasoning.is_empty() && !block.is_empty() {
                     reasoning.push('\n');
                 }
-                reasoning.push_str(rest[..end].trim());
-                rest = &rest[end + "</think>".len()..];
+                reasoning.push_str(block.trim());
+                rest = &rest[end + close_tag.len()..];
                 in_thinking = false;
             } else {
-                if !reasoning.is_empty() && !rest.trim().is_empty() {
+                let block = reasoning_format.strip_reasoning_prefix(rest.trim());
+                if !reasoning.is_empty() && !block.is_empty() {
                     reasoning.push('\n');
                 }
-                reasoning.push_str(rest.trim());
+                reasoning.push_str(block.trim());
                 rest = "";
             }
             continue;
         }
 
-        if let Some(start) = rest.find("<think>") {
+        if let Some(start) = rest.find(open_tag) {
             output.push_str(&rest[..start]);
-            rest = &rest[start + "<think>".len()..];
+            rest = &rest[start + open_tag.len()..];
             in_thinking = true;
         } else {
             output.push_str(rest);
@@ -901,6 +920,7 @@ mod tests {
     fn parses_when_generation_starts_inside_thinking() {
         let parsed = parse_assistant_format_with_state(
             "Thinking Process:\n1. test\n</think><tool_call>{\"name\":\"glob\",\"arguments\":{\"pattern\":\"**/*.rs\"}}</tool_call>",
+            ReasoningFormat::ThinkTags,
             true,
         );
         assert_eq!(
@@ -909,5 +929,51 @@ mod tests {
         );
         assert!(parsed.content.is_empty());
         assert_eq!(parsed.tool_calls.unwrap()[0].function.name, "glob");
+    }
+
+    #[test]
+    fn parses_gemma_channel_reasoning() {
+        let parsed = parse_assistant_format_with_state(
+            "<|channel>thought\ncheck system<channel|>All good",
+            ReasoningFormat::GemmaChannel {
+                implicit_leading_reasoning_prefix: false,
+            },
+            false,
+        );
+        assert_eq!(parsed.thinking.as_deref(), Some("check system"));
+        assert_eq!(parsed.content, "All good");
+    }
+
+    #[test]
+    fn parses_implicit_gemma_channel_reasoning() {
+        let parsed = parse_assistant_format_with_state(
+            "thought\nconsider options<channel|>Final",
+            ReasoningFormat::GemmaChannel {
+                implicit_leading_reasoning_prefix: true,
+            },
+            true,
+        );
+        assert_eq!(parsed.thinking.as_deref(), Some("consider options"));
+        assert_eq!(parsed.content, "Final");
+    }
+
+    #[test]
+    fn parses_gemma4_tool_call_with_nested_values() {
+        let parsed = parse_assistant_format_with_state(
+            "<|tool_call>call:create_event{name:<|\"|>Meeting<|\"|>,location:{city:<|\"|>NYC<|\"|>,floor:3},tags:[<|\"|>work<|\"|>,<|\"|>urgent<|\"|>],rating:4.5}<tool_call|>",
+            ReasoningFormat::GemmaChannel {
+                implicit_leading_reasoning_prefix: false,
+            },
+            false,
+        );
+        let calls = parsed.tool_calls.unwrap();
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(calls[0].function.name, "create_event");
+        assert_eq!(args["name"], "Meeting");
+        assert_eq!(args["location"]["city"], "NYC");
+        assert_eq!(args["location"]["floor"], 3);
+        assert_eq!(args["tags"][0], "work");
+        assert_eq!(args["tags"][1], "urgent");
+        assert_eq!(args["rating"], 4.5);
     }
 }
