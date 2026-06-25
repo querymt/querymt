@@ -1,0 +1,157 @@
+name: Publish querymt Python Package
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  validate-version:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Check version alignment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/sync_python_package_versions.py --check --tag "$GITHUB_REF_NAME"
+
+  build-querymt:
+    name: Build querymt wheels (${{ matrix.artifact_suffix }})
+    needs: validate-version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: '2014'
+            artifact_suffix: linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            manylinux: '2014'
+            artifact_suffix: linux-aarch64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact_suffix: macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_suffix: windows-x86_64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          key: publish-querymt-${{ matrix.target }}
+
+      - name: Build Linux wheel
+        if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --manifest-path crates/py/querymt-py/Cargo.toml --out dist --compatibility pypi
+
+      - name: Build host wheel
+        if: runner.os != 'Linux'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: --release --manifest-path crates/py/querymt-py/Cargo.toml --out dist --compatibility pypi
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: querymt-wheel-${{ matrix.artifact_suffix }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  build-querymt-sdist:
+    name: Build querymt sdist
+    needs: validate-version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          key: publish-querymt-sdist
+
+      - name: Install maturin
+        run: python -m pip install --upgrade pip maturin
+
+      - name: Build sdist
+        run: maturin sdist --manifest-path crates/py/querymt-py/Cargo.toml --out dist
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: querymt-sdist
+          path: dist/*
+          if-no-files-found: error
+
+  publish-querymt:
+    name: Publish querymt to PyPI
+    needs:
+      - build-querymt
+      - build-querymt-sdist
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-querymt
+      url: https://pypi.org/project/querymt/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download querymt wheel artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: querymt-wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download querymt sdist artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: querymt-sdist
+          path: dist
+
+      - name: Publish querymt
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

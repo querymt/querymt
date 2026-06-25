@@ -1,0 +1,192 @@
+name: Publish querymt-agent Python Package
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  validate-version:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Check version alignment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/sync_python_package_versions.py --check --tag "$GITHUB_REF_NAME"
+
+  wait-for-querymt-release:
+    name: Wait for querymt release on PyPI
+    needs: validate-version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Wait for querymt release to become visible on PyPI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.request
+
+          version = os.environ["GITHUB_REF_NAME"][1:]
+          url = "https://pypi.org/pypi/querymt/json"
+
+          for attempt in range(40):
+              with urllib.request.urlopen(url) as response:
+                  payload = json.load(response)
+              if version in payload.get("releases", {}):
+                  print(f"querymt {version} is visible on PyPI")
+                  break
+              if attempt == 39:
+                  raise SystemExit(f"querymt {version} did not appear on PyPI in time")
+              print(f"querymt {version} not visible yet, retrying in 15 seconds")
+              time.sleep(15)
+          PY
+
+  build-querymt-agent:
+    name: Build querymt-agent wheels (${{ matrix.artifact_suffix }})
+    needs: wait-for-querymt-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: '2014'
+            artifact_suffix: linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            manylinux: '2014'
+            artifact_suffix: linux-aarch64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact_suffix: macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_suffix: windows-x86_64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          key: publish-querymt-agent-${{ matrix.target }}
+
+      - name: Build Linux wheel
+        if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --manifest-path crates/py/querymt-agent-py/Cargo.toml --out dist --compatibility pypi
+
+      - name: Build host wheel
+        if: runner.os != 'Linux'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: --release --manifest-path crates/py/querymt-agent-py/Cargo.toml --out dist --compatibility pypi
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: querymt-agent-wheel-${{ matrix.artifact_suffix }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  build-querymt-agent-sdist:
+    name: Build querymt-agent sdist
+    needs: wait-for-querymt-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          key: publish-querymt-agent-sdist
+
+      - name: Install maturin
+        run: python -m pip install --upgrade pip maturin
+
+      - name: Build sdist
+        run: maturin sdist --manifest-path crates/py/querymt-agent-py/Cargo.toml --out dist
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: querymt-agent-sdist
+          path: dist/*
+          if-no-files-found: error
+
+  publish-querymt-agent:
+    name: Publish querymt-agent to PyPI
+    needs:
+      - build-querymt-agent
+      - build-querymt-agent-sdist
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-querymt-agent
+      url: https://pypi.org/project/querymt-agent/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download querymt-agent wheel artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: querymt-agent-wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download querymt-agent sdist artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: querymt-agent-sdist
+          path: dist
+
+      - name: Publish querymt-agent
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
