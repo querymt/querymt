@@ -683,8 +683,8 @@ mod remote_impl {
             // ── Phase 1: Prepare (NO lock held) ─────────────────────────────
             // Initialize MCP, spawn actor for EXISTING session.
             // This is the heavy work that should NOT hold the registry lock.
-            let req = agent_client_protocol::schema::LoadSessionRequest::new(
-                agent_client_protocol::schema::SessionId::from(session_id.clone()),
+            let req = crate::acp::protocol::LoadSessionRequest::new(
+                crate::acp::protocol::SessionId::from(session_id.clone()),
                 cwd_path.clone().unwrap_or_default(),
             );
 

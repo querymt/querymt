@@ -14,6 +14,7 @@ use crate::agent::core::ToolPolicy;
 use crate::config::{MiddlewareEntry, QuorumConfig, resolve_tools};
 use crate::delegation::AgentInfo;
 
+use crate::acp::protocol::{ContentBlock, PromptRequest, TextContent};
 use crate::agent::handle::AgentHandle as AgentHandleTrait;
 use crate::middleware::MIDDLEWARE_REGISTRY;
 use crate::runner::ChatSession;
@@ -24,7 +25,6 @@ use crate::session::{SqliteStorage, StorageBackend};
 use crate::snapshot::GitSnapshotBackend;
 use crate::tools::CapabilityRequirement;
 use crate::tools::builtins::all_builtin_tools;
-use agent_client_protocol::schema::{ContentBlock, PromptRequest, TextContent};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 #[cfg(feature = "remote")]

@@ -4,7 +4,7 @@
 //! sessions materialized on this node, independent of transport (ACP, mesh
 //! remote, scheduler, CLI).
 
-use agent_client_protocol::schema::{Error, McpServer};
+use crate::acp::protocol::{Error, McpServer};
 use async_trait::async_trait;
 use rmcp::RoleClient;
 use rmcp::service::Peer;

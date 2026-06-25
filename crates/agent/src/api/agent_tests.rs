@@ -3,6 +3,7 @@ use super::RemoteSessionMode;
 use super::{
     Agent, AgentInfra, AgentProfiles, AgentSessions, ListSessionsOptions, SessionListMode,
 };
+use crate::acp::protocol::ListSessionsRequest as AcpListSessionsRequest;
 use crate::events::{AgentEventKind, EventOrigin, ExecutionMetrics};
 use crate::model::AgentMessage;
 use crate::profiles::{LocalProfileCatalog, ProfileCatalog};
@@ -11,7 +12,6 @@ use crate::session::projection::{EventJournal, NewDurableEvent};
 #[cfg(feature = "remote")]
 use crate::session::store::RemoteSessionBookmark;
 use crate::test_utils::helpers::empty_plugin_registry;
-use agent_client_protocol::schema::ListSessionsRequest as AcpListSessionsRequest;
 use anyhow::Result;
 use querymt::chat::{ChatRole, FinishReason};
 use std::path::PathBuf;

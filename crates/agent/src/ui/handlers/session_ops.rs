@@ -17,6 +17,7 @@ use super::super::session::{
     mode_for_session, reasoning_effort_for_session, resolve_profile_id,
     resolve_profile_id_for_session, session_ref_for_session,
 };
+use crate::acp::protocol::{LoadSessionRequest, SessionId};
 use crate::agent::LocalAgentHandle;
 use crate::agent::core::AgentMode;
 use crate::api::{AgentSessions, ListSessionsOptions, RemoteSessionMode, SessionListMode};
@@ -27,7 +28,6 @@ use crate::session::load_session_snapshot;
 use crate::session::projection::SessionScope;
 use crate::ui::cursor_from_events;
 use crate::ui::mentions::{filter_index_for_cwd, filter_index_for_cwd_entries};
-use agent_client_protocol::schema::{LoadSessionRequest, SessionId};
 use querymt::chat::ReasoningEffort;
 use std::path::PathBuf;
 use std::sync::Arc;

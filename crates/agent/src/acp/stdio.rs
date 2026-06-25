@@ -36,17 +36,17 @@
 //! ```
 
 use crate::acp::client_bridge::{ClientBridgeMessage, ClientBridgeSender};
-use crate::acp::shared::{AcpLiveEventTranslator, replay_agent_events_to_session_notifications};
-use crate::acp::shutdown;
-use crate::event_fanout::EventFanout;
-use crate::send_agent::SendAgent;
-use agent_client_protocol::schema::{
+use crate::acp::protocol::{
     AgentRequest, AuthenticateRequest, CancelNotification, ClientNotification, ClientRequest,
     CloseSessionRequest, DeleteSessionRequest, ExtRequest, ForkSessionRequest, InitializeRequest,
     ListSessionsRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
     ResumeSessionRequest, SessionId, SessionNotification, SetSessionConfigOptionRequest,
     SetSessionModeRequest, SetSessionModelRequest,
 };
+use crate::acp::shared::{AcpLiveEventTranslator, replay_agent_events_to_session_notifications};
+use crate::acp::shutdown;
+use crate::event_fanout::EventFanout;
+use crate::send_agent::SendAgent;
 use agent_client_protocol::{self as acp, ByteStreams, ConnectionTo};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -94,7 +94,7 @@ async fn run_bridge_task(
                 let _span = info_span!("acp.ext_notification").entered();
                 log::debug!("Bridge: forwarding ext notification");
                 if let Err(e) =
-                    connection.send_notification(acp::ClientNotification::ExtNotification(notif))
+                    connection.send_notification(ClientNotification::ExtNotification(notif))
                 {
                     log::error!("Bridge: ext_notification failed: {:?}", e);
                 }
@@ -604,7 +604,7 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
 #[cfg(test)]
 mod stdio_tests {
     use super::{CancelNotification, PromptRequest, agent_ext_request};
-    use agent_client_protocol::schema::{AgentRequest, PromptResponse, StopReason};
+    use crate::acp::protocol::{AgentRequest, PromptResponse, StopReason};
     use agent_client_protocol::{Agent, ByteStreams, JsonRpcMessage};
     use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};

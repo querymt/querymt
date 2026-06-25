@@ -30,6 +30,15 @@ mod utils;
 mod tests;
 
 use crate::acp::client_bridge::ClientBridgeSender;
+use crate::acp::protocol::{
+    AuthenticateRequest, AuthenticateResponse, CancelNotification, CloseSessionRequest,
+    CloseSessionResponse, DeleteSessionRequest, DeleteSessionResponse, Error, ExtNotification,
+    ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    ResumeSessionRequest, ResumeSessionResponse, SessionConfigOption, SetSessionModelRequest,
+    SetSessionModelResponse,
+};
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, ClientState};
 use crate::agent::remote::SessionActorRef;
@@ -44,15 +53,6 @@ use crate::profiles::{ProfileCatalog, ProfileRuntimeManager};
 use crate::send_agent::SendAgent;
 use crate::session::store::LLMConfig;
 use crate::tools::ToolRegistry;
-use agent_client_protocol::schema::{
-    AuthenticateRequest, AuthenticateResponse, CancelNotification, CloseSessionRequest,
-    CloseSessionResponse, DeleteSessionRequest, DeleteSessionResponse, Error, ExtNotification,
-    ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
-    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    ResumeSessionRequest, ResumeSessionResponse, SessionConfigOption, SetSessionModelRequest,
-    SetSessionModelResponse,
-};
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;

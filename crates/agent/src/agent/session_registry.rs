@@ -3,6 +3,11 @@
 //! Lives on the server layer. Not an actor — just a plain data structure
 //! protected by a mutex (acceptable: only accessed for routing, not during execution).
 
+use crate::acp::protocol::{
+    Error, ListSessionsRequest, ListSessionsResponse, McpServer, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionInfo, SessionMode,
+    SessionModeState,
+};
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, SessionRuntime};
 use crate::agent::remote::SessionActorRef;
@@ -13,11 +18,6 @@ use crate::agent::remote::scope::{MeshScopeId, scoped_event_relay, scoped_sessio
 use crate::agent::session_actor::SessionActor;
 use crate::error::AgentError;
 use crate::profiles::ProfileMetadata;
-use agent_client_protocol::schema::{
-    Error, ListSessionsRequest, ListSessionsResponse, McpServer, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOption, SessionInfo, SessionMode,
-    SessionModeState,
-};
 use kameo::actor::{ActorRef, Spawn};
 #[cfg(feature = "remote")]
 use querymt_remote::MeshRuntimeHandle;
@@ -786,8 +786,8 @@ impl SessionRegistry {
     /// Fork an existing session at the latest message.
     pub async fn fork_session(
         &self,
-        req: agent_client_protocol::schema::ForkSessionRequest,
-    ) -> Result<agent_client_protocol::schema::ForkSessionResponse, Error> {
+        req: crate::acp::protocol::ForkSessionRequest,
+    ) -> Result<crate::acp::protocol::ForkSessionResponse, Error> {
         let source_session_id = req.session_id.to_string();
 
         let _session = self
@@ -829,7 +829,7 @@ impl SessionRegistry {
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
-        Ok(agent_client_protocol::schema::ForkSessionResponse::new(
+        Ok(crate::acp::protocol::ForkSessionResponse::new(
             new_session_id,
         ))
     }
@@ -837,8 +837,8 @@ impl SessionRegistry {
     /// Resume an existing session without history replay.
     pub async fn resume_session(
         &mut self,
-        req: agent_client_protocol::schema::ResumeSessionRequest,
-    ) -> Result<agent_client_protocol::schema::ResumeSessionResponse, Error> {
+        req: crate::acp::protocol::ResumeSessionRequest,
+    ) -> Result<crate::acp::protocol::ResumeSessionResponse, Error> {
         let session_id = req.session_id.to_string();
         let _session = self
             .config
@@ -897,7 +897,7 @@ impl SessionRegistry {
             session_ref.get_mode().await.map_err(Error::from)?
         };
 
-        Ok(agent_client_protocol::schema::ResumeSessionResponse::new()
+        Ok(crate::acp::protocol::ResumeSessionResponse::new()
             .modes(mode_state(current_mode))
             .config_options(config_options(
                 current_mode,
@@ -922,7 +922,7 @@ impl SessionRegistry {
             .into_iter()
             .map(|s| {
                 let mut info = SessionInfo::new(
-                    agent_client_protocol::schema::SessionId::from(s.public_id),
+                    crate::acp::protocol::SessionId::from(s.public_id),
                     std::path::PathBuf::new(),
                 );
                 if let Some(name) = s.name {
@@ -1081,7 +1081,7 @@ mod tests {
         assert_eq!(options[0].id.0.as_ref(), "mode");
 
         let select = match &options[0].kind {
-            agent_client_protocol::schema::SessionConfigKind::Select(select) => select,
+            crate::acp::protocol::SessionConfigKind::Select(select) => select,
             _ => panic!("expected select mode option"),
         };
         assert_eq!(select.current_value.0.as_ref(), "review");
@@ -1234,8 +1234,8 @@ mod tests {
 
         let registry = SessionRegistry::new(config);
 
-        let req = agent_client_protocol::schema::ForkSessionRequest::new(
-            agent_client_protocol::schema::SessionId::from("source-session".to_string()),
+        let req = crate::acp::protocol::ForkSessionRequest::new(
+            crate::acp::protocol::SessionId::from("source-session".to_string()),
             std::path::PathBuf::from("/tmp"),
         );
         let result = registry.fork_session(req).await;
@@ -1280,7 +1280,7 @@ mod tests {
     #[tokio::test]
     async fn merged_mcp_servers_request_only() {
         let f = RegistryFixture::new().await;
-        let req_server = agent_client_protocol::schema::McpServerHttp::new(
+        let req_server = crate::acp::protocol::McpServerHttp::new(
             "req-server".to_string(),
             "https://req.example.com/mcp".to_string(),
         );
@@ -1304,7 +1304,7 @@ mod tests {
             });
 
         // Request provides a different URL for the same name — should win.
-        let req_server = agent_client_protocol::schema::McpServerHttp::new(
+        let req_server = crate::acp::protocol::McpServerHttp::new(
             "shared-name".to_string(),
             "https://override.example.com/mcp".to_string(),
         );
@@ -1331,7 +1331,7 @@ mod tests {
                 headers: std::collections::HashMap::new(),
             });
 
-        let req_server = agent_client_protocol::schema::McpServerHttp::new(
+        let req_server = crate::acp::protocol::McpServerHttp::new(
             "req-server".to_string(),
             "https://req.example.com/mcp".to_string(),
         );

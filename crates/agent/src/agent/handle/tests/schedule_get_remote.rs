@@ -13,7 +13,7 @@ async fn ext_method_json(
     method: &str,
     params: serde_json::Value,
 ) -> serde_json::Value {
-    let req = agent_client_protocol::schema::ExtRequest::new(
+    let req = crate::acp::protocol::ExtRequest::new(
         method,
         std::sync::Arc::from(serde_json::value::RawValue::from_string(params.to_string()).unwrap()),
     );
@@ -114,7 +114,7 @@ async fn test_querymt_schedule_get_remote_missing_returns_not_found() {
     mesh.inject_known_peer_for_test(peer_id);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let req = agent_client_protocol::schema::ExtRequest::new(
+    let req = crate::acp::protocol::ExtRequest::new(
         "querymt/schedules/get",
         std::sync::Arc::from(
             serde_json::value::RawValue::from_string(

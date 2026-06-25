@@ -43,20 +43,18 @@ pub fn is_no_cwd_path(path: &Path) -> bool {
 /// - Sentinel path -> `Ok(None)`
 /// - Non-absolute path -> `Err(invalid_params)`
 /// - Valid absolute path -> `Ok(Some(path))`
-pub fn acp_cwd_to_optional(
-    cwd: &Path,
-) -> Result<Option<PathBuf>, agent_client_protocol::schema::Error> {
+pub fn acp_cwd_to_optional(cwd: &Path) -> Result<Option<PathBuf>, crate::acp::protocol::Error> {
     if cwd.as_os_str().is_empty() || cwd == no_cwd_path() {
         return Ok(None);
     }
 
     if !cwd.is_absolute() {
-        return Err(agent_client_protocol::schema::Error::invalid_params().data(
-            serde_json::json!({
+        return Err(
+            crate::acp::protocol::Error::invalid_params().data(serde_json::json!({
                 "message": "cwd must be an absolute path",
                 "cwd": cwd.display().to_string(),
-            }),
-        ));
+            })),
+        );
     }
 
     Ok(Some(cwd.to_path_buf()))

@@ -1,8 +1,8 @@
-use crate::slash_commands::registry::SlashCommandRegistry;
-use agent_client_protocol::schema::{
+use crate::acp::protocol::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, SessionId,
     SessionNotification, SessionUpdate, UnstructuredCommandInput,
 };
+use crate::slash_commands::registry::SlashCommandRegistry;
 
 /// Convert the registry into an ACP `AvailableCommandsUpdate`.
 pub fn registry_to_acp_update(registry: &SlashCommandRegistry) -> AvailableCommandsUpdate {

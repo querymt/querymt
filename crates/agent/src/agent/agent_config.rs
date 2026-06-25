@@ -18,10 +18,10 @@ use crate::middleware::{CompositeDriver, MiddlewareDriver};
 use crate::session::backend::StorageBackend;
 use crate::session::compaction::SessionCompaction;
 
+use crate::acp::protocol::AuthMethod;
 use crate::session::provider::SessionProvider;
 use crate::session::store::SessionExecutionConfig;
 use crate::tools::ToolRegistry;
-use agent_client_protocol::schema::AuthMethod;
 use arc_swap::ArcSwap;
 use kameo::actor::ActorRef;
 use querymt::chat::ReasoningEffort;
@@ -162,9 +162,9 @@ impl AgentConfig {
         self.mutating_tools.contains(tool_name)
             || matches!(
                 crate::agent::utils::tool_kind_for_tool(tool_name),
-                agent_client_protocol::schema::ToolKind::Edit
-                    | agent_client_protocol::schema::ToolKind::Delete
-                    | agent_client_protocol::schema::ToolKind::Execute
+                crate::acp::protocol::ToolKind::Edit
+                    | crate::acp::protocol::ToolKind::Delete
+                    | crate::acp::protocol::ToolKind::Execute
             )
     }
 

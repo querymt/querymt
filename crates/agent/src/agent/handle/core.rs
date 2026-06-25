@@ -395,8 +395,8 @@ impl LocalAgentHandle {
     /// 4. Finalize (NO lock): DHT registration, event emission
     pub async fn load_session(
         &self,
-        req: agent_client_protocol::schema::LoadSessionRequest,
-    ) -> std::result::Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
+        req: crate::acp::protocol::LoadSessionRequest,
+    ) -> std::result::Result<crate::acp::protocol::LoadSessionResponse, Error> {
         let session_id = req.session_id.to_string();
 
         if let Some(profiles) = self.profiles()

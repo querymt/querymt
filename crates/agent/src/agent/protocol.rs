@@ -1,8 +1,8 @@
 //! Agent Client Protocol helper functions for MCP server management
+use crate::acp::protocol::{Error, McpServer, McpServerHttp, McpServerStdio};
 use crate::agent::core::McpToolState;
 use crate::agent::session_mcp::ConnectedMcpPeer;
 use crate::error::AgentError;
-use agent_client_protocol::schema::{Error, McpServer, McpServerHttp, McpServerStdio};
 use log::warn;
 use querymt::tool_decorator::CallFunctionTool;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -219,9 +219,7 @@ async fn start_mcp_server(
 }
 
 /// Converts HTTP headers from protocol format to reqwest format
-fn headers_to_map(
-    headers: &[agent_client_protocol::schema::HttpHeader],
-) -> Result<HeaderMap, Error> {
+fn headers_to_map(headers: &[crate::acp::protocol::HttpHeader]) -> Result<HeaderMap, Error> {
     let mut map = HeaderMap::new();
     for header in headers {
         let name = HeaderName::from_bytes(header.name.as_bytes()).map_err(|e| {

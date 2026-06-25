@@ -11,11 +11,11 @@
 //! contain non-serializable types.
 
 use crate::acp::client_bridge::ClientBridgeSender;
-use crate::agent::core::AgentMode;
-use crate::agent::remote::NodeId;
-use agent_client_protocol::schema::{
+use crate::acp::protocol::{
     ExtNotification as AcpExtNotification, ExtRequest, PromptRequest, SetSessionModelRequest,
 };
+use crate::agent::core::AgentMode;
+use crate::agent::remote::NodeId;
 use querymt::LLMParams;
 use querymt::chat::ReasoningEffort;
 use serde::{Deserialize, Serialize};

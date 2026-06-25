@@ -43,7 +43,7 @@
 //! }
 //! ```
 
-use agent_client_protocol::schema::{
+use crate::acp::protocol::{
     Error, ExtNotification, RequestPermissionRequest, RequestPermissionResponse,
     SessionNotification,
 };

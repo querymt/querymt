@@ -5,7 +5,7 @@ impl LocalAgentHandle {
         &self,
         req: InitializeRequest,
     ) -> Result<InitializeResponse, Error> {
-        use agent_client_protocol::schema::{
+        use crate::acp::protocol::{
             AgentCapabilities, Implementation, McpCapabilities, PromptCapabilities,
             ProtocolVersion, SessionCapabilities, SessionCloseCapabilities,
             SessionDeleteCapabilities, SessionForkCapabilities, SessionListCapabilities,

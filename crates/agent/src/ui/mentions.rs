@@ -5,13 +5,13 @@
 //! read-style text chunks in the same user turn.
 
 use super::messages::UiPromptBlock;
+use crate::acp::protocol::{ContentBlock, ImageContent, TextContent};
 use crate::agent::file_proxy::ReadRemoteFileResponse;
 use crate::index::{
     FileIndex, FileIndexEntry, WorkspaceIndexManagerActor, get_or_create_workspace_with_timeout,
     resolve_workspace_root,
 };
 use crate::tools::builtins::read_shared::{DEFAULT_READ_LIMIT, render_read_output};
-use agent_client_protocol::schema::{ContentBlock, ImageContent, TextContent};
 use base64::Engine;
 use kameo::actor::ActorRef;
 use std::collections::{HashMap, HashSet};
