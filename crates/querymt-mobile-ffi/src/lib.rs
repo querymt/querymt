@@ -31,6 +31,7 @@ mod mcp;
 
 use async_trait::async_trait;
 use ffi_helpers::{set_last_error, take_last_error_code, take_last_error_message};
+use querymt_agent::acp::protocol::Error as AcpError;
 use querymt_agent::session::projection::ViewStore;
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
@@ -67,7 +68,7 @@ impl querymt_agent::acp::shared::AcpSessionHooks for MobileAcpSessionHooks {
         agent: &querymt_agent::agent::LocalAgentHandle,
         session_id: &str,
         response: &mut serde_json::Value,
-    ) -> Result<(), agent_client_protocol::schema::Error> {
+    ) -> Result<(), AcpError> {
         inject_session_load_snapshot(agent, self.view_store.clone(), session_id, response).await
     }
 
@@ -76,7 +77,7 @@ impl querymt_agent::acp::shared::AcpSessionHooks for MobileAcpSessionHooks {
         agent: &querymt_agent::agent::LocalAgentHandle,
         session_id: &str,
         response: &mut serde_json::Value,
-    ) -> Result<(), agent_client_protocol::schema::Error> {
+    ) -> Result<(), AcpError> {
         ensure_remote_attach_snapshot(agent, self.view_store.clone(), session_id, response).await
     }
 }
@@ -95,17 +96,14 @@ impl querymt_agent::agent::session_mcp::SessionMcpAttachmentSource
     async fn attachments(
         &self,
         _context: &querymt_agent::agent::session_mcp::SessionMcpAttachmentContext,
-    ) -> Result<
-        Vec<querymt_agent::agent::session_mcp::SessionMcpAttachment>,
-        agent_client_protocol::schema::Error,
-    > {
+    ) -> Result<Vec<querymt_agent::agent::session_mcp::SessionMcpAttachment>, AcpError> {
         let agent_handle = self
             .agent_handle_cell
             .load(std::sync::atomic::Ordering::Acquire);
         let peers = mcp::collect_connected_mcp_peers(agent_handle)
             .await
             .map_err(|e| {
-                agent_client_protocol::schema::Error::internal_error().data(serde_json::json!({
+                AcpError::internal_error().data(serde_json::json!({
                     "message": "collect connected MCP peers failed",
                     "ffiCode": e as i32,
                 }))
@@ -136,10 +134,10 @@ async fn inject_session_load_snapshot(
     view_store: Arc<dyn ViewStore>,
     session_id: &str,
     response: &mut serde_json::Value,
-) -> Result<(), agent_client_protocol::schema::Error> {
+) -> Result<(), AcpError> {
     let snapshot = querymt_agent::session::load_session_snapshot(agent, view_store, session_id)
         .await
-        .map_err(|e| agent_client_protocol::schema::Error::internal_error().data(e.to_string()))?;
+        .map_err(|e| AcpError::internal_error().data(e.to_string()))?;
 
     let event_count = snapshot.audit.events.len();
     log::info!(
@@ -149,16 +147,14 @@ async fn inject_session_load_snapshot(
     );
 
     let Some(obj) = response.as_object_mut() else {
-        return Err(agent_client_protocol::schema::Error::internal_error()
-            .data("session/load returned non-object response"));
+        return Err(AcpError::internal_error().data("session/load returned non-object response"));
     };
 
     let meta = obj
         .entry("_meta")
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
     let Some(meta_obj) = meta.as_object_mut() else {
-        return Err(agent_client_protocol::schema::Error::internal_error()
-            .data("session/load returned non-object _meta"));
+        return Err(AcpError::internal_error().data("session/load returned non-object _meta"));
     };
     meta_obj.insert(
         "querymt/sessionLoadSnapshot.v1".to_string(),
@@ -172,10 +168,9 @@ async fn ensure_remote_attach_snapshot(
     view_store: Arc<dyn ViewStore>,
     session_id: &str,
     response: &mut serde_json::Value,
-) -> Result<(), agent_client_protocol::schema::Error> {
+) -> Result<(), AcpError> {
     let Some(result_obj) = response.as_object_mut() else {
-        return Err(agent_client_protocol::schema::Error::internal_error()
-            .data("remote attach returned non-object response"));
+        return Err(AcpError::internal_error().data("remote attach returned non-object response"));
     };
 
     if result_obj.contains_key("snapshot") {
@@ -188,7 +183,7 @@ async fn ensure_remote_attach_snapshot(
 
     let snapshot = querymt_agent::session::load_session_snapshot(agent, view_store, session_id)
         .await
-        .map_err(|e| agent_client_protocol::schema::Error::internal_error().data(e.to_string()))?;
+        .map_err(|e| AcpError::internal_error().data(e.to_string()))?;
     let event_count = snapshot.audit.events.len();
     log::info!(
         "ffi remote attach fallback snapshot injected: session_id={}, events={}",

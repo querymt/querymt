@@ -11207,7 +11207,6 @@ dependencies = [
 name = "querymt-mobile-ffi"
 version = "0.5.0"
 dependencies = [
- "agent-client-protocol",
  "anyhow",
  "async-trait",
  "jni",

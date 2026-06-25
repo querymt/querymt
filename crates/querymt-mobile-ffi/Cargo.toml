@@ -30,9 +30,6 @@ querymt = { path = "../querymt", default-features = false, features = ["runtime"
 querymt-agent = { path = "../agent", default-features = false }
 querymt-utils = { path = "../querymt-utils", features = ["providers", "serde", "secret-store"] }
 
-# Agent client protocol for session/prompt types
-agent-client-protocol = { version = "1.0", features = ["unstable"] }
-
 # Provider crates for static registration
 qmt-anthropic = { path = "../providers/anthropic", optional = true, default-features = false, features = ["api"] }
 qmt-openai = { path = "../providers/openai", optional = true, default-features = false, features = ["api"] }
