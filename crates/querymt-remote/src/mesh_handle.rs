@@ -320,6 +320,12 @@ impl MeshHandle {
             .collect()
     }
 
+    pub fn request_shutdown(&self) {
+        self.re_register_fns.write().clear();
+        self.config_scopes.write().clear();
+        let _ = self.swarm_cmd_tx.send(SwarmCommand::Shutdown);
+    }
+
     pub fn leave_iroh_scope(&self, mesh_id: &str) -> Result<bool, InviteError> {
         let Some(store) = &self.mesh_state_store else {
             return Ok(false);

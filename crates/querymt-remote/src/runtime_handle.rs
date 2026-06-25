@@ -67,6 +67,10 @@ impl MeshRuntimeHandle {
         self.inner.joined_iroh_scopes()
     }
 
+    pub fn request_shutdown(&self) {
+        self.inner.request_shutdown();
+    }
+
     pub async fn register_actor<A>(&self, actor_ref: ActorRef<A>, name: impl Into<String>)
     where
         A: kameo::Actor + kameo::remote::RemoteActor,
@@ -491,6 +495,18 @@ mod tests {
         runtime.as_mesh_handle().emit_scope_joined(scope.clone());
 
         assert!(matches!(rx.try_recv().unwrap(), MeshEvent::ScopeJoined(found) if found == scope));
+    }
+
+    #[test]
+    fn request_shutdown_delegates_to_mesh_handle_command_channel() {
+        let (runtime, mut swarm_cmd_rx) = test_runtime(MeshTransportMode::Composite);
+
+        runtime.request_shutdown();
+
+        match swarm_cmd_rx.try_recv().unwrap() {
+            SwarmCommand::Shutdown => {}
+            other => panic!("expected Shutdown command, got {other:?}"),
+        }
     }
 
     #[test]

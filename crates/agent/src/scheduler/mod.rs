@@ -238,11 +238,23 @@ impl SchedulerHandle {
             .unwrap_or_default()
     }
 
-    /// Shutdown the scheduler and its background tasks.
+    /// Request scheduler shutdown without waiting for actor work to drain.
+    pub fn request_shutdown(&self) {
+        let actor_ref = self.actor_ref.clone();
+        tokio::spawn(async move {
+            let _ = actor_ref.tell(Shutdown).await;
+        });
+    }
+
+    /// Shutdown the scheduler and wait for the actor to process lease release.
     pub async fn shutdown(&self) {
-        let _ = self.actor_ref.tell(Shutdown).await;
-        // Give the actor a moment to process shutdown before the ref is dropped
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = self
+            .actor_ref
+            .ask(Shutdown)
+            .mailbox_timeout(Self::CONTROL_TIMEOUT)
+            .reply_timeout(Self::CONTROL_TIMEOUT)
+            .send()
+            .await;
     }
 }
 

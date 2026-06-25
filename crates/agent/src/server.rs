@@ -12,7 +12,6 @@ use axum::{
 use rust_embed::RustEmbed;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "dashboard")]
@@ -83,21 +82,11 @@ impl AgentServer {
             })
             .await?;
 
-        // Profiles are lazily materialized side runtimes; stop their background tasks too.
-        if let Some(profiles) = profiles
-            && tokio::time::timeout(Duration::from_secs(3), profiles.shutdown())
-                .await
-                .is_err()
-        {
-            log::warn!("Timed out while shutting down profile runtimes");
+        // Request shutdown without waiting for background drains.
+        if let Some(profiles) = profiles {
+            profiles.shutdown().await;
         }
-        // Run graceful agent shutdown (releases scheduler lease, stops background tasks)
-        if tokio::time::timeout(Duration::from_secs(3), agent.shutdown())
-            .await
-            .is_err()
-        {
-            log::warn!("Timed out while shutting down agent background tasks");
-        }
+        agent.shutdown().await;
 
         Ok(())
     }

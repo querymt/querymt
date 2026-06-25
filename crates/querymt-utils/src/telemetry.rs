@@ -306,9 +306,8 @@ pub fn flush_telemetry() {
                 log::warn!("OTLP tracer provider shutdown failed: {e}");
             }
             if let Err(e) = logger_provider.shutdown() {
-                log::warn!("OTLP logger provider shutdown failed: {e}");
+                eprintln!("OTLP logger provider shutdown failed: {e}");
             }
-            log::info!("OTLP telemetry providers flushed and shut down.");
         }
         None => {
             // Either OTLP was never enabled or already flushed.

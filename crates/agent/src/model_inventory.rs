@@ -246,6 +246,11 @@ impl ModelInventory {
         *self.inner.mesh.write() = Some(mesh.into());
     }
 
+    #[cfg(feature = "remote")]
+    pub fn clear_mesh(&self) {
+        *self.inner.mesh.write() = None;
+    }
+
     pub fn local_snapshot_entries_blocking(&self) -> Vec<ModelEntry> {
         (*self.inner.local_snapshot.load_full()).clone()
     }

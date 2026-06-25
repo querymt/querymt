@@ -358,9 +358,13 @@ fn spawn_event_source_forwarder(
     tokio::spawn(async move {
         loop {
             tokio::select! {
+                biased;
                 _ = shutdown_token.cancelled() => break,
                 result = events.recv() => match result {
                     Ok(event) => {
+                        if shutdown_token.is_cancelled() {
+                            break;
+                        }
                         if forward_event_to_ui(&state, &conn_id, &tx, event)
                             .await
                             .is_err()

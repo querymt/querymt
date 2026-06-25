@@ -23,6 +23,7 @@ pub(crate) enum SwarmCommand {
     LeaveIrohScope {
         mesh_id: String,
     },
+    Shutdown,
 }
 
 pub(crate) fn resolve_local_hostname() -> String {

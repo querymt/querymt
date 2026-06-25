@@ -427,6 +427,15 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
                                 }
                             }
                         }
+                        SwarmCommand::Shutdown => {
+                            reconnect_targets.clear();
+                            reconnect_targets_by_scope.clear();
+                            pending_dials.clear();
+                            reconnect_attempts.clear();
+                            reconnect_next_due.clear();
+                            peer_iroh_scope_loop.clear();
+                            break;
+                        }
                     }
                 }
                 event = swarm.select_next_some() => {
