@@ -18,7 +18,7 @@
 /// - `new_session`: Session creation with CWD and MCP servers
 /// - `prompt`: The main interaction method
 /// - `cancel`: Cancellation support
-use agent_client_protocol::schema::{
+use crate::acp::protocol::{
     AuthenticateRequest, AuthenticateResponse, CancelNotification, CloseSessionRequest,
     CloseSessionResponse, DeleteSessionRequest, DeleteSessionResponse, Error, ExtNotification,
     ExtRequest, ExtResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,

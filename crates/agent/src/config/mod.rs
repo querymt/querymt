@@ -2,9 +2,7 @@
 //!
 //! Supports both single-agent and multi-agent (quorum) configurations from TOML files.
 
-use agent_client_protocol::schema::{
-    EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerStdio,
-};
+use crate::acp::protocol::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerStdio};
 use anyhow::{Context, Result, anyhow};
 use regex::{Captures, Regex};
 use schemars::JsonSchema;

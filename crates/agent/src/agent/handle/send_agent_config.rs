@@ -14,8 +14,8 @@ impl LocalAgentHandle {
 
     pub(super) async fn handle_set_session_mode(
         &self,
-        req: agent_client_protocol::schema::SetSessionModeRequest,
-    ) -> Result<agent_client_protocol::schema::SetSessionModeResponse, Error> {
+        req: crate::acp::protocol::SetSessionModeRequest,
+    ) -> Result<crate::acp::protocol::SetSessionModeResponse, Error> {
         let mode = req
             .mode_id
             .0
@@ -26,14 +26,14 @@ impl LocalAgentHandle {
         let session_ref = self.session_ref_for_agent_session(&session_id).await?;
 
         session_ref.set_mode(mode).await.map_err(Error::from)?;
-        Ok(agent_client_protocol::schema::SetSessionModeResponse::new())
+        Ok(crate::acp::protocol::SetSessionModeResponse::new())
     }
 
     pub(super) async fn handle_set_session_config_option(
         &self,
-        req: agent_client_protocol::schema::SetSessionConfigOptionRequest,
-    ) -> Result<agent_client_protocol::schema::SetSessionConfigOptionResponse, Error> {
-        use agent_client_protocol::schema::SessionConfigOptionValue;
+        req: crate::acp::protocol::SetSessionConfigOptionRequest,
+    ) -> Result<crate::acp::protocol::SetSessionConfigOptionResponse, Error> {
+        use crate::acp::protocol::SessionConfigOptionValue;
 
         let config_id = req.config_id.0.as_ref();
 
@@ -99,11 +99,9 @@ impl LocalAgentHandle {
                 let config_options = self
                     .session_config_options(Some(&session_id), mode, effort)
                     .await?;
-                Ok(
-                    agent_client_protocol::schema::SetSessionConfigOptionResponse::new(
-                        config_options,
-                    ),
-                )
+                Ok(crate::acp::protocol::SetSessionConfigOptionResponse::new(
+                    config_options,
+                ))
             }
             "profile" => {
                 let profile_id = value_id.0.to_string();
@@ -148,11 +146,9 @@ impl LocalAgentHandle {
                 let config_options = self
                     .session_config_options(Some(&session_id), mode, effort)
                     .await?;
-                Ok(
-                    agent_client_protocol::schema::SetSessionConfigOptionResponse::new(
-                        config_options,
-                    ),
-                )
+                Ok(crate::acp::protocol::SetSessionConfigOptionResponse::new(
+                    config_options,
+                ))
             }
             "mode" => {
                 let mode = value_id
@@ -167,11 +163,9 @@ impl LocalAgentHandle {
                 let config_options = self
                     .session_config_options(Some(&session_id), mode, effort)
                     .await?;
-                Ok(
-                    agent_client_protocol::schema::SetSessionConfigOptionResponse::new(
-                        config_options,
-                    ),
-                )
+                Ok(crate::acp::protocol::SetSessionConfigOptionResponse::new(
+                    config_options,
+                ))
             }
             "reasoning_effort" => {
                 let effort_str = value_id.0.as_ref();
@@ -202,11 +196,9 @@ impl LocalAgentHandle {
                     .session_config_options(Some(&session_id), mode, effort)
                     .await?;
 
-                Ok(
-                    agent_client_protocol::schema::SetSessionConfigOptionResponse::new(
-                        config_options,
-                    ),
-                )
+                Ok(crate::acp::protocol::SetSessionConfigOptionResponse::new(
+                    config_options,
+                ))
             }
             _ => Err(Error::invalid_params().data(serde_json::json!({
                 "error": format!("Unsupported configId: {}", config_id),

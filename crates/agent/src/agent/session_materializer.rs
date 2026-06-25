@@ -18,6 +18,10 @@
 //! like prompt lookup, session listing, or model setting.
 
 use crate::acp::cwd::acp_cwd_to_optional;
+use crate::acp::protocol::{
+    Error, ForkSessionRequest, ForkSessionResponse, LoadSessionRequest, McpServer,
+    NewSessionRequest, ResumeSessionRequest,
+};
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::SessionRuntime;
 use crate::agent::remote::SessionActorRef;
@@ -31,10 +35,6 @@ use crate::agent::session_registry::{
     SessionMaterialization, SessionMaterializationOptions, SessionRegistry,
 };
 use crate::events::AgentEventKind;
-use agent_client_protocol::schema::{
-    Error, ForkSessionRequest, ForkSessionResponse, LoadSessionRequest, McpServer,
-    NewSessionRequest, ResumeSessionRequest,
-};
 use kameo::actor::{ActorRef, Spawn};
 #[cfg(feature = "remote")]
 use querymt_remote::MeshRuntimeHandle;

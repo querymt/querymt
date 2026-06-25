@@ -4,6 +4,7 @@
 //! `Cancel`, `SetMode`, and other messages between turns.
 
 use crate::acp::client_bridge::ClientBridgeSender;
+use crate::acp::protocol::{ExtResponse, PromptResponse, SetSessionModelResponse, StopReason};
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, SessionRuntime, ToolConfig};
 use crate::agent::execution::CycleOutcome;
@@ -18,9 +19,6 @@ use crate::hooks::HookNotice;
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::LLMConfig;
-use agent_client_protocol::schema::{
-    ExtResponse, PromptResponse, SetSessionModelResponse, StopReason,
-};
 use kameo::Actor;
 use kameo::message::{Context, Message};
 use kameo::reply::DelegatedReply;
@@ -662,7 +660,7 @@ impl Message<SetSessionModel> for SessionActor {
         msg: SetSessionModel,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        use agent_client_protocol::schema::SetSessionModelResponse;
+        use crate::acp::protocol::SetSessionModelResponse;
 
         let session_id = msg.req.session_id.to_string();
         let _session = self
@@ -1501,10 +1499,10 @@ impl Message<ScheduledPrompt> for SessionActor {
         }
 
         // Build a PromptRequest from the schedule's prompt text
-        let prompt_request = agent_client_protocol::schema::PromptRequest::new(
-            agent_client_protocol::schema::SessionId::from(self.session_id.clone()),
-            vec![agent_client_protocol::schema::ContentBlock::Text(
-                agent_client_protocol::schema::TextContent::new(msg.prompt_text),
+        let prompt_request = crate::acp::protocol::PromptRequest::new(
+            crate::acp::protocol::SessionId::from(self.session_id.clone()),
+            vec![crate::acp::protocol::ContentBlock::Text(
+                crate::acp::protocol::TextContent::new(msg.prompt_text),
             )],
         );
 
@@ -1595,7 +1593,7 @@ impl Message<ScheduledPrompt> for SessionActor {
 /// This function gathers all needed state upfront and runs the full execution cycle.
 /// It does NOT access the actor — everything is passed as parameters.
 struct DetachedPromptExecution {
-    req: agent_client_protocol::schema::PromptRequest,
+    req: crate::acp::protocol::PromptRequest,
     session_id: String,
     runtime: Arc<SessionRuntime>,
     config: Arc<AgentConfig>,
@@ -1765,8 +1763,7 @@ async fn execute_prompt_detached(
 
     // 4. Slash command expansion (before storing user messages)
     let mut req = req;
-    if let Some(agent_client_protocol::schema::ContentBlock::Text(text_content)) =
-        req.prompt.first()
+    if let Some(crate::acp::protocol::ContentBlock::Text(text_content)) = req.prompt.first()
         && let Some(expansion) =
             crate::slash_commands::try_expand(&text_content.text, &config.slash_command_registry)
     {
@@ -1776,8 +1773,8 @@ async fn execute_prompt_detached(
             expansion.invocation.name
         );
         // Replace the first text block with the expanded prompt
-        req.prompt[0] = agent_client_protocol::schema::ContentBlock::Text(
-            agent_client_protocol::schema::TextContent::new(expansion.prompt_text),
+        req.prompt[0] = crate::acp::protocol::ContentBlock::Text(
+            crate::acp::protocol::TextContent::new(expansion.prompt_text),
         );
     }
 
@@ -2529,7 +2526,7 @@ mod tests {
         let result = f
             .actor_ref
             .ask(ExtMethod {
-                req: agent_client_protocol::schema::ExtRequest::new("custom_method", null_params),
+                req: crate::acp::protocol::ExtRequest::new("custom_method", null_params),
             })
             .await
             .expect("ask ExtMethod");
@@ -2545,10 +2542,7 @@ mod tests {
         );
         f.actor_ref
             .ask(ExtNotification {
-                notif: agent_client_protocol::schema::ExtNotification::new(
-                    "my_notification",
-                    null_params,
-                ),
+                notif: crate::acp::protocol::ExtNotification::new("my_notification", null_params),
             })
             .await
             .expect("ask ExtNotification");

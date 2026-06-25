@@ -1,4 +1,8 @@
 use super::*;
+use crate::acp::protocol::{
+    CancelNotification, CloseSessionRequest, DeleteSessionRequest, InitializeRequest,
+    ListSessionsRequest, ProtocolVersion, SessionId,
+};
 use crate::agent::SessionActor;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::ToolPolicy;
@@ -9,10 +13,6 @@ use crate::session::store::SessionStore;
 use crate::test_utils::{
     MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory,
     empty_plugin_registry, mock_llm_config, mock_plugin_registry, mock_session,
-};
-use agent_client_protocol::schema::{
-    CancelNotification, CloseSessionRequest, DeleteSessionRequest, InitializeRequest,
-    ListSessionsRequest, ProtocolVersion, SessionId,
 };
 use querymt::LLMParams;
 use std::collections::HashSet;
@@ -260,12 +260,10 @@ async fn profile_config_options(
 
 fn select_options(
     option: &SessionConfigOption,
-) -> &[agent_client_protocol::schema::SessionConfigSelectOption] {
+) -> &[crate::acp::protocol::SessionConfigSelectOption] {
     match &option.kind {
-        agent_client_protocol::schema::SessionConfigKind::Select(select) => match &select.options {
-            agent_client_protocol::schema::SessionConfigSelectOptions::Ungrouped(options) => {
-                options
-            }
+        crate::acp::protocol::SessionConfigKind::Select(select) => match &select.options {
+            crate::acp::protocol::SessionConfigSelectOptions::Ungrouped(options) => options,
             _ => panic!("expected ungrouped select config option"),
         },
         _ => panic!("expected select config option"),

@@ -8,7 +8,7 @@ async fn ext_method_json(
     method: &str,
     params: serde_json::Value,
 ) -> serde_json::Value {
-    let req = agent_client_protocol::schema::ExtRequest::new(
+    let req = crate::acp::protocol::ExtRequest::new(
         method,
         std::sync::Arc::from(serde_json::value::RawValue::from_string(params.to_string()).unwrap()),
     );
@@ -87,7 +87,7 @@ async fn test_querymt_mesh_create_invite_with_lan_mesh_returns_clear_error() {
     let mesh = get_test_mesh().await.clone();
     f.handle.set_mesh(mesh);
 
-    let req = agent_client_protocol::schema::ExtRequest::new(
+    let req = crate::acp::protocol::ExtRequest::new(
         "querymt/mesh/createInvite",
         std::sync::Arc::from(
             serde_json::value::RawValue::from_string(

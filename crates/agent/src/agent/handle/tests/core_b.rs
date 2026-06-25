@@ -5,7 +5,7 @@ async fn test_unknown_ext_method_returns_method_not_found() {
     let f = HandleFixture::new().await;
     let null_params =
         std::sync::Arc::from(serde_json::value::RawValue::from_string("null".to_string()).unwrap());
-    let req = agent_client_protocol::schema::ExtRequest::new("my_method", null_params);
+    let req = crate::acp::protocol::ExtRequest::new("my_method", null_params);
     let err = f
         .handle
         .ext_method(req)
@@ -19,7 +19,7 @@ async fn test_querymt_models_ext_method_returns_models() {
     let f = HandleFixture::new().await;
     let null_params =
         std::sync::Arc::from(serde_json::value::RawValue::from_string("null".to_string()).unwrap());
-    let req = agent_client_protocol::schema::ExtRequest::new("querymt/models", null_params);
+    let req = crate::acp::protocol::ExtRequest::new("querymt/models", null_params);
     let resp = f.handle.ext_method(req).await.expect("ext_method");
     let value: serde_json::Value = serde_json::from_str(resp.0.get()).expect("valid JSON");
     assert!(value.get("models").is_some());
@@ -29,7 +29,7 @@ async fn test_querymt_models_ext_method_returns_models() {
 async fn test_querymt_profile_ext_methods_return_method_not_found() {
     let f = HandleFixture::new().await;
     for method in ["querymt/profiles", "querymt/profile/setActive"] {
-        let req = agent_client_protocol::schema::ExtRequest::new(method, raw_params("null"));
+        let req = crate::acp::protocol::ExtRequest::new(method, raw_params("null"));
         let err = f
             .handle
             .ext_method(req)
@@ -44,7 +44,7 @@ async fn test_querymt_refresh_models_ext_method_returns_immediately_with_trigger
     let f = HandleFixture::new().await;
     let null_params =
         std::sync::Arc::from(serde_json::value::RawValue::from_string("null".to_string()).unwrap());
-    let req = agent_client_protocol::schema::ExtRequest::new("querymt/refreshModels", null_params);
+    let req = crate::acp::protocol::ExtRequest::new("querymt/refreshModels", null_params);
     let resp = tokio::time::timeout(
         tokio::time::Duration::from_millis(500),
         f.handle.ext_method(req),
@@ -67,7 +67,7 @@ async fn test_ext_notification_ok() {
     let f = HandleFixture::new().await;
     let null_params =
         std::sync::Arc::from(serde_json::value::RawValue::from_string("null".to_string()).unwrap());
-    let notif = agent_client_protocol::schema::ExtNotification::new("my_event", null_params);
+    let notif = crate::acp::protocol::ExtNotification::new("my_event", null_params);
     f.handle
         .ext_notification(notif)
         .await

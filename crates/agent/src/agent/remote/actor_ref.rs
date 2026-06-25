@@ -5,6 +5,9 @@
 //! `actor_ref.ask(msg).await`. For the `Remote` variant (behind the `remote`
 //! feature), each method delegates to `remote_ref.ask(&msg).await`.
 
+use crate::acp::protocol::{
+    Error as AcpError, PromptRequest, PromptResponse, SetSessionModelResponse,
+};
 use crate::agent::core::AgentMode;
 use crate::agent::file_proxy::{FileProxyError, GetFileIndexResponse, ReadRemoteFileResponse};
 use crate::agent::messages;
@@ -14,9 +17,6 @@ use crate::error::AgentError;
 use crate::events::SessionLimits;
 use crate::model::AgentMessage;
 use crate::session::store::LLMConfig;
-use agent_client_protocol::schema::{
-    Error as AcpError, PromptRequest, PromptResponse, SetSessionModelResponse,
-};
 use kameo::actor::ActorRef;
 use querymt::chat::ReasoningEffort;
 use std::time::Duration;
@@ -381,7 +381,7 @@ impl SessionActorRef {
     /// Set session model via ACP protocol.
     pub async fn set_session_model(
         &self,
-        req: agent_client_protocol::schema::SetSessionModelRequest,
+        req: crate::acp::protocol::SetSessionModelRequest,
     ) -> Result<SetSessionModelResponse, AcpError> {
         self.set_session_model_with_node(messages::SetSessionModel {
             req,

@@ -6,7 +6,7 @@ async fn ext_method_json(
     method: &str,
     params: serde_json::Value,
 ) -> serde_json::Value {
-    let req = agent_client_protocol::schema::ExtRequest::new(
+    let req = crate::acp::protocol::ExtRequest::new(
         method,
         std::sync::Arc::from(serde_json::value::RawValue::from_string(params.to_string()).unwrap()),
     );
@@ -75,7 +75,7 @@ async fn test_querymt_schedule_ext_create_remote_missing_session_surfaces_error(
         .await
         .expect("delete persisted remote session row");
 
-    let req = agent_client_protocol::schema::ExtRequest::new(
+    let req = crate::acp::protocol::ExtRequest::new(
         "querymt/schedules/create",
         std::sync::Arc::from(
             serde_json::value::RawValue::from_string(
@@ -144,7 +144,7 @@ async fn test_querymt_remote_attach_session_missing_persisted_session_surfaces_e
 
     let missing_session_id = uuid::Uuid::now_v7().to_string();
 
-    let req = agent_client_protocol::schema::ExtRequest::new(
+    let req = crate::acp::protocol::ExtRequest::new(
         "querymt/remote/attachSession",
         std::sync::Arc::from(
             serde_json::value::RawValue::from_string(
@@ -306,7 +306,7 @@ async fn test_list_schedules_returns_empty_when_scheduler_actor_stops() {
 async fn test_querymt_schedule_get_missing_returns_not_found() {
     let f = RealStorageHandleFixture::new().await;
 
-    let req = agent_client_protocol::schema::ExtRequest::new(
+    let req = crate::acp::protocol::ExtRequest::new(
         "querymt/schedules/get",
         std::sync::Arc::from(
             serde_json::value::RawValue::from_string(

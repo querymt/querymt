@@ -130,7 +130,7 @@ async fn emit_schedule_changed_notification(
     };
 
     let _ = bridge
-        .notify_ext(agent_client_protocol::schema::ExtNotification::new(
+        .notify_ext(crate::acp::protocol::ExtNotification::new(
             crate::acp::shared::QMT_NOTIFICATION_SCHEDULES_CHANGED,
             params,
         ))

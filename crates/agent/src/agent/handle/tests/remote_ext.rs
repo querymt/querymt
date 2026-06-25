@@ -12,7 +12,7 @@ async fn ext_method_json(
     method: &str,
     params: serde_json::Value,
 ) -> serde_json::Value {
-    let req = agent_client_protocol::schema::ExtRequest::new(
+    let req = crate::acp::protocol::ExtRequest::new(
         method,
         std::sync::Arc::from(serde_json::value::RawValue::from_string(params.to_string()).unwrap()),
     );

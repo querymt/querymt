@@ -1,13 +1,13 @@
 use super::session::AgentSession;
+use crate::acp::protocol::{
+    ListSessionsRequest as AcpListSessionsRequest, ListSessionsResponse as AcpListSessionsResponse,
+    LoadSessionRequest, Meta, NewSessionRequest, SessionId, SessionInfo,
+};
 use crate::agent::LocalAgentHandle;
 use crate::agent::messages::SessionRuntimeStatus;
 use crate::session::load_snapshot::{SessionLoadSnapshot, load_session_snapshot};
 use crate::session::projection::{SessionListItem, SessionScope, ViewStore};
 use crate::session::store::SessionStore;
-use agent_client_protocol::schema::{
-    ListSessionsRequest as AcpListSessionsRequest, ListSessionsResponse as AcpListSessionsResponse,
-    LoadSessionRequest, Meta, NewSessionRequest, SessionId, SessionInfo,
-};
 use anyhow::{Result, anyhow};
 use querymt::chat::FinishReason;
 use serde::{Deserialize, Serialize};

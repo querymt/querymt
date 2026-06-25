@@ -4,18 +4,18 @@
 //! ACP server implementations, including JSON-RPC types, event translation, and
 //! RPC message handling.
 
+use crate::acp::protocol::AGENT_METHOD_NAMES;
+use crate::acp::protocol::{
+    Content, ContentBlock, ContentChunk, Error, MessageId, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, RequestPermissionOutcome, SessionUpdate, TextContent, ToolCall,
+    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+};
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::control::remote::{AttachRemoteSessionRequest, RemoteSessionAttachInfo};
 use crate::event_fanout::EventFanout;
 use crate::events::{AgentEvent, AgentEventKind, EventEnvelope};
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
-use agent_client_protocol::schema::{
-    Content, ContentBlock, ContentChunk, Error, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, RequestPermissionOutcome, SessionUpdate, TextContent, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-};
-use agent_client_protocol_schema::AGENT_METHOD_NAMES;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -185,7 +185,7 @@ where
 pub fn replay_agent_events_to_session_notifications<I>(
     session_id: &str,
     events: I,
-) -> Vec<agent_client_protocol::schema::SessionNotification>
+) -> Vec<crate::acp::protocol::SessionNotification>
 where
     I: IntoIterator<Item = AgentEvent>,
 {
@@ -194,8 +194,8 @@ where
         .filter_map(|event| {
             let envelope = EventEnvelope::from(event);
             translate_replay_event_to_update(&envelope).map(|update| {
-                agent_client_protocol::schema::SessionNotification::new(
-                    agent_client_protocol::schema::SessionId::from(session_id.to_string()),
+                crate::acp::protocol::SessionNotification::new(
+                    crate::acp::protocol::SessionId::from(session_id.to_string()),
                     update,
                 )
             })
@@ -275,7 +275,7 @@ impl AcpLiveEventTranslator {
                     .insert((event.session_id().to_owned(), message_id.clone()));
                 Some(SessionUpdate::AgentMessageChunk(
                     ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
-                        .message_id(Some(message_id.clone())),
+                        .message_id(MessageId::from(message_id.clone())),
                 ))
             }
             AgentEventKind::AssistantMessageStored {
@@ -292,7 +292,7 @@ impl AcpLiveEventTranslator {
                 } else {
                     Some(SessionUpdate::AgentMessageChunk(
                         ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
-                            .message_id(Some(message_id.clone())),
+                            .message_id(MessageId::from(message_id.clone())),
                     ))
                 }
             }
@@ -357,7 +357,7 @@ fn translate_event_to_update_for_mode(
             message_id,
         } => Some(SessionUpdate::UserMessageChunk(
             ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
-                .message_id(message_id.clone()),
+                .message_id(message_id.clone().map(MessageId::from)),
         )),
         AgentEventKind::AssistantMessageStored {
             content,
@@ -369,7 +369,7 @@ fn translate_event_to_update_for_mode(
             }
             Some(SessionUpdate::AgentMessageChunk(
                 ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
-                    .message_id(message_id.clone()),
+                    .message_id(message_id.clone().map(MessageId::from)),
             ))
         }
         // Streaming text deltas: forward to ACP clients so they also benefit from streaming.
@@ -382,7 +382,7 @@ fn translate_event_to_update_for_mode(
             }
             Some(SessionUpdate::AgentMessageChunk(
                 ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
-                    .message_id(Some(message_id.clone())),
+                    .message_id(MessageId::from(message_id.clone())),
             ))
         }
         // Thinking/reasoning deltas: ACP has no thinking content type yet — drop.
@@ -596,321 +596,313 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
 ) -> RpcDispatchOutput {
     let rpc_method = req.method.clone();
     let rpc_params = req.params.clone();
-    let result: Result<serde_json::Value, Error> = run_with_acp_span(&rpc_method, &rpc_params, async {
-        let method = req.method.clone();
-        match method.as_str() {
-            m if m == AGENT_METHOD_NAMES.initialize => match serde_json::from_value(req.params) {
-                Ok(params) => agent
-                    .initialize(params)
-                    .await
-                    .map(|r| serde_json::to_value(r).unwrap()),
-                Err(e) => {
-                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
-                }
-            },
-            m if m == AGENT_METHOD_NAMES.authenticate => match serde_json::from_value(req.params) {
-                Ok(params) => agent
-                    .authenticate(params)
-                    .await
-                    .map(|r| serde_json::to_value(r).unwrap()),
-                Err(e) => {
-                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
-                }
-            },
-
-            m if m == AGENT_METHOD_NAMES.session_new => match serde_json::from_value(req.params) {
-                Ok(params) => {
-                    // MCP attachments are now resolved internally by the
-                    // materializer via the runtime attachment source.
-                    let response = agent.new_session(params).await;
-                    match response {
-                        Ok(r) => {
-                            let session_id = r.session_id.to_string();
-                            let mut owners = session_owners.lock().await;
-                            owners.insert(session_id, conn_id.to_string());
-                            Ok(serde_json::to_value(r).unwrap())
-                        }
-                        Err(e) => Err(e),
+    let result: Result<serde_json::Value, Error> =
+        run_with_acp_span(&rpc_method, &rpc_params, async {
+            let method = req.method.clone();
+            match method.as_str() {
+                m if m == AGENT_METHOD_NAMES.initialize => {
+                    match serde_json::from_value(req.params) {
+                        Ok(params) => agent
+                            .initialize(params)
+                            .await
+                            .map(|r| serde_json::to_value(r).unwrap()),
+                        Err(e) => Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()}))),
                     }
                 }
-                Err(e) => Err(Error::invalid_params().data(serde_json::json!({
-                    "error": e.to_string()
-                }))),
-            },
-            m if m == AGENT_METHOD_NAMES.session_prompt => match serde_json::from_value(req.params)
-            {
-                Ok(params) => agent
-                    .prompt(params)
-                    .await
-                    .map(|r| serde_json::to_value(r).unwrap()),
-                Err(e) => {
-                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+                m if m == AGENT_METHOD_NAMES.authenticate => {
+                    match serde_json::from_value(req.params) {
+                        Ok(params) => agent
+                            .authenticate(params)
+                            .await
+                            .map(|r| serde_json::to_value(r).unwrap()),
+                        Err(e) => Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()}))),
+                    }
                 }
-            },
 
-            m if m == AGENT_METHOD_NAMES.session_cancel => match serde_json::from_value(req.params)
-            {
-                Ok(params) => agent.cancel(params).await.map(|_| serde_json::Value::Null),
-                Err(e) => {
-                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+                m if m == AGENT_METHOD_NAMES.session_new => {
+                    match serde_json::from_value(req.params) {
+                        Ok(params) => {
+                            // MCP attachments are now resolved internally by the
+                            // materializer via the runtime attachment source.
+                            let response = agent.new_session(params).await;
+                            match response {
+                                Ok(r) => {
+                                    let session_id = r.session_id.to_string();
+                                    let mut owners = session_owners.lock().await;
+                                    owners.insert(session_id, conn_id.to_string());
+                                    Ok(serde_json::to_value(r).unwrap())
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(Error::invalid_params().data(serde_json::json!({
+                            "error": e.to_string()
+                        }))),
+                    }
                 }
-            },
-            m if m == AGENT_METHOD_NAMES.session_fork => match serde_json::from_value(req.params) {
-                Ok(params) => agent
-                    .fork_session(params)
-                    .await
-                    .map(|r| serde_json::to_value(r).unwrap()),
-                Err(e) => {
-                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+                m if m == AGENT_METHOD_NAMES.session_prompt => {
+                    match serde_json::from_value(req.params) {
+                        Ok(params) => agent
+                            .prompt(params)
+                            .await
+                            .map(|r| serde_json::to_value(r).unwrap()),
+                        Err(e) => Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()}))),
+                    }
                 }
-            },
-            m if m == AGENT_METHOD_NAMES.session_list => match serde_json::from_value(req.params) {
-                Ok(params) => agent
-                    .list_sessions(params)
-                    .await
-                    .map(|r| serde_json::to_value(r).unwrap()),
-                Err(e) => {
-                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
+
+                m if m == AGENT_METHOD_NAMES.session_cancel => {
+                    match serde_json::from_value(req.params) {
+                        Ok(params) => agent.cancel(params).await.map(|_| serde_json::Value::Null),
+                        Err(e) => Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()}))),
+                    }
                 }
-            },
-            m if m == AGENT_METHOD_NAMES.session_load => {
-                match serde_json::from_value::<agent_client_protocol::schema::LoadSessionRequest>(
-                    req.params,
-                ) {
-                    Ok(params) => {
-                        let session_id = params.session_id.to_string();
-                        // MCP attachments are now resolved internally by the
-                        // materializer via the runtime attachment source.
-                        let response = agent.load_session(params).await;
-                        match response {
-                            Ok(r) => {
+                m if m == AGENT_METHOD_NAMES.session_fork => {
+                    match serde_json::from_value(req.params) {
+                        Ok(params) => agent
+                            .fork_session(params)
+                            .await
+                            .map(|r| serde_json::to_value(r).unwrap()),
+                        Err(e) => Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()}))),
+                    }
+                }
+                m if m == AGENT_METHOD_NAMES.session_list => {
+                    match serde_json::from_value(req.params) {
+                        Ok(params) => agent
+                            .list_sessions(params)
+                            .await
+                            .map(|r| serde_json::to_value(r).unwrap()),
+                        Err(e) => Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()}))),
+                    }
+                }
+                m if m == AGENT_METHOD_NAMES.session_load => {
+                    match serde_json::from_value::<crate::acp::protocol::LoadSessionRequest>(
+                        req.params,
+                    ) {
+                        Ok(params) => {
+                            let session_id = params.session_id.to_string();
+                            // MCP attachments are now resolved internally by the
+                            // materializer via the runtime attachment source.
+                            let response = agent.load_session(params).await;
+                            match response {
+                                Ok(r) => {
+                                    let mut owners = session_owners.lock().await;
+                                    owners.insert(session_id.clone(), conn_id.to_string());
+                                    drop(owners);
+
+                                    let mut value = serde_json::to_value(r).unwrap();
+                                    if let (Some(hooks), Some(local_agent)) = (
+                                        context.session_hooks.as_ref(),
+                                        agent.as_any().downcast_ref::<AgentHandle>(),
+                                    ) {
+                                        hooks
+                                            .on_session_loaded(local_agent, &session_id, &mut value)
+                                            .await?;
+                                    }
+                                    Ok(value)
+                                }
+
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()}))),
+                    }
+                }
+                m if m == AGENT_METHOD_NAMES.session_resume => {
+                    match serde_json::from_value(req.params) {
+                        Ok(params) => agent
+                            .resume_session(params)
+                            .await
+                            .map(|r| serde_json::to_value(r).unwrap()),
+                        Err(e) => Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()}))),
+                    }
+                }
+                m if m == AGENT_METHOD_NAMES.session_close => {
+                    match serde_json::from_value(req.params) {
+                        Ok(params) => agent
+                            .close_session(params)
+                            .await
+                            .map(|r| serde_json::to_value(r).unwrap()),
+                        Err(e) => Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()}))),
+                    }
+                }
+                m if m == AGENT_METHOD_NAMES.session_delete => {
+                    match serde_json::from_value(req.params) {
+                        Ok(params) => agent
+                            .delete_session(params)
+                            .await
+                            .map(|r| serde_json::to_value(r).unwrap()),
+                        Err(e) => Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()}))),
+                    }
+                }
+                m if m == AGENT_METHOD_NAMES.session_set_config_option => {
+                    match serde_json::from_value(req.params) {
+                        Ok(params) => agent
+                            .set_session_config_option(params)
+                            .await
+                            .map(|r| serde_json::to_value(r).unwrap()),
+                        Err(e) => Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()}))),
+                    }
+                }
+                m if m == AGENT_METHOD_NAMES.session_set_mode => {
+                    match serde_json::from_value(req.params) {
+                        Ok(params) => agent
+                            .set_session_mode(params)
+                            .await
+                            .map(|r| serde_json::to_value(r).unwrap()),
+                        Err(e) => Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()}))),
+                    }
+                }
+                m if m == crate::acp::protocol::SET_SESSION_MODEL_METHOD_NAME => {
+                    match serde_json::from_value(req.params) {
+                        Ok(params) => agent
+                            .set_session_model(params)
+                            .await
+                            .map(|r| serde_json::to_value(r).unwrap()),
+                        Err(e) => Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()}))),
+                    }
+                }
+
+                "permission_result" => {
+                    #[derive(Deserialize)]
+                    struct PermissionResultParams {
+                        tool_call_id: String,
+                        outcome: RequestPermissionOutcome,
+                    }
+                    match serde_json::from_value::<PermissionResultParams>(req.params) {
+                        Ok(params) => {
+                            let mut pending = pending_permissions.lock().await;
+                            if let Some(tx) = pending.remove(&params.tool_call_id) {
+                                let _ = tx.send(params.outcome);
+                                Ok(serde_json::Value::Null)
+                            } else {
+                                Err(Error::internal_error()
+                                    .data("No pending permission for this tool_call_id"))
+                            }
+                        }
+                        Err(e) => Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()}))),
+                    }
+                }
+
+                "elicitation_result" => {
+                    #[derive(Deserialize)]
+                    struct ElicitationResultParams {
+                        elicitation_id: String,
+                        action: String,
+                        content: Option<serde_json::Value>,
+                    }
+                    match serde_json::from_value::<ElicitationResultParams>(req.params) {
+                        Ok(params) => {
+                            // Parse action string to enum
+                            let action_result = match params.action.as_str() {
+                                "accept" => Ok(crate::elicitation::ElicitationAction::Accept),
+                                "decline" => Ok(crate::elicitation::ElicitationAction::Decline),
+                                "cancel" => Ok(crate::elicitation::ElicitationAction::Cancel),
+                                _ => Err(Error::invalid_params().data(serde_json::json!({
+                                    "error": format!("Invalid action: {}", params.action)
+                                }))),
+                            };
+
+                            match action_result {
+                                Ok(action) => {
+                                    let response = crate::elicitation::ElicitationResponse {
+                                        action,
+                                        content: params.content,
+                                    };
+
+                                    let mut tx = {
+                                        let mut pending = pending_elicitations.lock().await;
+                                        pending
+                                            .remove(&params.elicitation_id)
+                                            .map(|entry| entry.sender)
+                                    };
+
+                                    if tx.is_none()
+                                        && let Some(query_agent) =
+                                            agent.as_any().downcast_ref::<AgentHandle>()
+                                    {
+                                        tx = crate::elicitation::take_pending_elicitation_sender(
+                                            query_agent,
+                                            &params.elicitation_id,
+                                        )
+                                        .await;
+                                    }
+
+                                    if let Some(tx) = tx {
+                                        let _ = tx.send(response);
+                                        Ok(serde_json::Value::Null)
+                                    } else {
+                                        Err(Error::internal_error()
+                                            .data("No pending elicitation for this elicitation_id"))
+                                    }
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(Error::invalid_params()
+                            .data(serde_json::json!({"error": e.to_string()}))),
+                    }
+                }
+
+                // Forward _querymt/* extension methods to the agent's ext_method handler.
+                m if m.starts_with("_querymt/") || m.starts_with("querymt/") => {
+                    let session_id_for_owner = querymt_session_id_from_request(m, &req.params);
+                    let raw_params = serde_json::value::RawValue::from_string(
+                        serde_json::to_string(&req.params).unwrap_or_else(|_| "null".to_string()),
+                    )
+                    .unwrap_or_else(|_| {
+                        serde_json::value::RawValue::from_string("null".to_string()).unwrap()
+                    });
+                    let ext_req =
+                        crate::acp::protocol::ExtRequest::new(m, std::sync::Arc::from(raw_params));
+                    let response = agent.ext_method(ext_req).await.map(|r| {
+                        serde_json::from_str(r.0.get()).unwrap_or(serde_json::Value::Null)
+                    });
+                    match response {
+                        Ok(mut value) => {
+                            let session_id = session_id_for_owner
+                                .or_else(|| querymt_session_id_from_response(m, &value));
+                            if let Some(session_id) = session_id {
                                 let mut owners = session_owners.lock().await;
                                 owners.insert(session_id.clone(), conn_id.to_string());
                                 drop(owners);
 
-                                let mut value = serde_json::to_value(r).unwrap();
                                 if let (Some(hooks), Some(local_agent)) = (
                                     context.session_hooks.as_ref(),
                                     agent.as_any().downcast_ref::<AgentHandle>(),
                                 ) {
                                     hooks
-                                        .on_session_loaded(local_agent, &session_id, &mut value)
+                                        .on_remote_session_attached(
+                                            local_agent,
+                                            &session_id,
+                                            &mut value,
+                                        )
                                         .await?;
                                 }
-                                Ok(value)
                             }
-
-                            Err(e) => Err(e),
+                            Ok(value)
                         }
-                    }
-                    Err(e) => {
-                        Err(Error::invalid_params()
-                            .data(serde_json::json!({"error": e.to_string()})))
+                        Err(e) => Err(e),
                     }
                 }
+
+                _ => Err(Error::method_not_found()),
             }
-            m if m == AGENT_METHOD_NAMES.session_resume => match serde_json::from_value(req.params)
-            {
-                Ok(params) => agent
-                    .resume_session(params)
-                    .await
-                    .map(|r| serde_json::to_value(r).unwrap()),
-                Err(e) => {
-                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
-                }
-            },
-            m if m == AGENT_METHOD_NAMES.session_close => {
-                match serde_json::from_value(req.params) {
-                    Ok(params) => agent
-                        .close_session(params)
-                        .await
-                        .map(|r| serde_json::to_value(r).unwrap()),
-                    Err(e) => {
-                        Err(Error::invalid_params()
-                            .data(serde_json::json!({"error": e.to_string()})))
-                    }
-                }
-            }
-            m if m == AGENT_METHOD_NAMES.session_delete => match serde_json::from_value(req.params)
-            {
-                Ok(params) => agent
-                    .delete_session(params)
-                    .await
-                    .map(|r| serde_json::to_value(r).unwrap()),
-                Err(e) => {
-                    Err(Error::invalid_params().data(serde_json::json!({"error": e.to_string()})))
-                }
-            },
-            m if m == AGENT_METHOD_NAMES.session_set_config_option => {
-                match serde_json::from_value(req.params) {
-                    Ok(params) => agent
-                        .set_session_config_option(params)
-                        .await
-                        .map(|r| serde_json::to_value(r).unwrap()),
-                    Err(e) => {
-                        Err(Error::invalid_params()
-                            .data(serde_json::json!({"error": e.to_string()})))
-                    }
-                }
-            }
-            m if m == AGENT_METHOD_NAMES.session_set_mode => {
-                match serde_json::from_value(req.params) {
-                    Ok(params) => agent
-                        .set_session_mode(params)
-                        .await
-                        .map(|r| serde_json::to_value(r).unwrap()),
-                    Err(e) => {
-                        Err(Error::invalid_params()
-                            .data(serde_json::json!({"error": e.to_string()})))
-                    }
-                }
-            }
-            m if m == AGENT_METHOD_NAMES.session_set_model => {
-                match serde_json::from_value(req.params) {
-                    Ok(params) => agent
-                        .set_session_model(params)
-                        .await
-                        .map(|r| serde_json::to_value(r).unwrap()),
-                    Err(e) => {
-                        Err(Error::invalid_params()
-                            .data(serde_json::json!({"error": e.to_string()})))
-                    }
-                }
-            }
-
-            "permission_result" => {
-                #[derive(Deserialize)]
-                struct PermissionResultParams {
-                    tool_call_id: String,
-                    outcome: RequestPermissionOutcome,
-                }
-                match serde_json::from_value::<PermissionResultParams>(req.params) {
-                    Ok(params) => {
-                        let mut pending = pending_permissions.lock().await;
-                        if let Some(tx) = pending.remove(&params.tool_call_id) {
-                            let _ = tx.send(params.outcome);
-                            Ok(serde_json::Value::Null)
-                        } else {
-                            Err(Error::internal_error()
-                                .data("No pending permission for this tool_call_id"))
-                        }
-                    }
-                    Err(e) => {
-                        Err(Error::invalid_params()
-                            .data(serde_json::json!({"error": e.to_string()})))
-                    }
-                }
-            }
-
-            "elicitation_result" => {
-                #[derive(Deserialize)]
-                struct ElicitationResultParams {
-                    elicitation_id: String,
-                    action: String,
-                    content: Option<serde_json::Value>,
-                }
-                match serde_json::from_value::<ElicitationResultParams>(req.params) {
-                    Ok(params) => {
-                        // Parse action string to enum
-                        let action_result = match params.action.as_str() {
-                            "accept" => Ok(crate::elicitation::ElicitationAction::Accept),
-                            "decline" => Ok(crate::elicitation::ElicitationAction::Decline),
-                            "cancel" => Ok(crate::elicitation::ElicitationAction::Cancel),
-                            _ => Err(Error::invalid_params().data(serde_json::json!({
-                                "error": format!("Invalid action: {}", params.action)
-                            }))),
-                        };
-
-                        match action_result {
-                            Ok(action) => {
-                                let response = crate::elicitation::ElicitationResponse {
-                                    action,
-                                    content: params.content,
-                                };
-
-                                let mut tx = {
-                                    let mut pending = pending_elicitations.lock().await;
-                                    pending.remove(&params.elicitation_id).map(|entry| entry.sender)
-                                };
-
-                                if tx.is_none()
-                                    && let Some(query_agent) =
-                                        agent.as_any().downcast_ref::<AgentHandle>()
-                                {
-                                    tx = crate::elicitation::take_pending_elicitation_sender(
-                                        query_agent,
-                                        &params.elicitation_id,
-                                    )
-                                    .await;
-                                }
-
-                                if let Some(tx) = tx {
-                                    let _ = tx.send(response);
-                                    Ok(serde_json::Value::Null)
-                                } else {
-                                    Err(Error::internal_error()
-                                        .data("No pending elicitation for this elicitation_id"))
-                                }
-                            }
-                            Err(e) => Err(e),
-                        }
-                    }
-                    Err(e) => {
-                        Err(Error::invalid_params()
-                            .data(serde_json::json!({"error": e.to_string()})))
-                    }
-                }
-            }
-
-            // Forward _querymt/* extension methods to the agent's ext_method handler.
-            m if m.starts_with("_querymt/") || m.starts_with("querymt/") => {
-                let session_id_for_owner = querymt_session_id_from_request(m, &req.params);
-                let raw_params = serde_json::value::RawValue::from_string(
-                    serde_json::to_string(&req.params).unwrap_or_else(|_| "null".to_string()),
-                )
-                .unwrap_or_else(|_| {
-                    serde_json::value::RawValue::from_string("null".to_string()).unwrap()
-                });
-                let ext_req = agent_client_protocol::schema::ExtRequest::new(
-                    m,
-                    std::sync::Arc::from(raw_params),
-                );
-                let response = agent
-                    .ext_method(ext_req)
-                    .await
-                    .map(|r| serde_json::from_str(r.0.get()).unwrap_or(serde_json::Value::Null));
-                match response {
-                    Ok(mut value) => {
-                        let session_id = session_id_for_owner
-                            .or_else(|| querymt_session_id_from_response(m, &value));
-                        if let Some(session_id) = session_id {
-                            let mut owners = session_owners.lock().await;
-                            owners.insert(session_id.clone(), conn_id.to_string());
-                            drop(owners);
-
-                            if let (Some(hooks), Some(local_agent)) = (
-                                context.session_hooks.as_ref(),
-                                agent.as_any().downcast_ref::<AgentHandle>(),
-                            ) {
-                                hooks
-                                    .on_remote_session_attached(
-                                        local_agent,
-                                        &session_id,
-                                        &mut value,
-                                    )
-                                    .await?;
-                            }
-                        }
-                        Ok(value)
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-
-            _ => Err(Error::method_not_found()),
-        }
-    })
-    .await;
+        })
+        .await;
 
     let response = match result {
         Ok(res) => RpcResponse {
@@ -1089,7 +1081,10 @@ mod tests {
             panic!("expected user message chunk");
         };
 
-        assert_eq!(chunk.message_id.as_deref(), Some("u-1"));
+        assert_eq!(
+            chunk.message_id.as_ref().map(|id| id.0.as_ref()),
+            Some("u-1")
+        );
     }
 
     #[test]
@@ -1205,8 +1200,14 @@ mod tests {
             panic!("expected delta assistant chunk");
         };
 
-        assert_eq!(stored_chunk.message_id.as_deref(), Some("a-1"));
-        assert_eq!(delta_chunk.message_id.as_deref(), Some("a-1"));
+        assert_eq!(
+            stored_chunk.message_id.as_ref().map(|id| id.0.as_ref()),
+            Some("a-1")
+        );
+        assert_eq!(
+            delta_chunk.message_id.as_ref().map(|id| id.0.as_ref()),
+            Some("a-1")
+        );
     }
 
     #[test]
@@ -1268,7 +1269,10 @@ mod tests {
             panic!("expected text content");
         };
         assert_eq!(text.text, "answer");
-        assert_eq!(chunk.message_id.as_deref(), Some("a-1"));
+        assert_eq!(
+            chunk.message_id.as_ref().map(|id| id.0.as_ref()),
+            Some("a-1")
+        );
     }
 
     #[test]
@@ -1428,14 +1432,14 @@ mod tests {
 
     #[test]
     fn mode_config_option_contains_expected_shape() {
-        use agent_client_protocol::schema::SessionConfigOptionCategory;
+        use crate::acp::protocol::SessionConfigOptionCategory;
         let options = session_config_options(AgentMode::Plan, None);
         assert_eq!(options.len(), 2);
         assert_eq!(options[0].id.0.as_ref(), "mode");
         assert_eq!(options[0].category, Some(SessionConfigOptionCategory::Mode));
 
         let select = match &options[0].kind {
-            agent_client_protocol::schema::SessionConfigKind::Select(select) => select,
+            crate::acp::protocol::SessionConfigKind::Select(select) => select,
             _ => panic!("expected select config option"),
         };
         assert_eq!(select.current_value.0.as_ref(), "plan");
@@ -1443,7 +1447,7 @@ mod tests {
 
     #[test]
     fn reasoning_effort_config_option_contains_expected_shape() {
-        use agent_client_protocol::schema::SessionConfigOptionCategory;
+        use crate::acp::protocol::SessionConfigOptionCategory;
         let options =
             session_config_options(AgentMode::Build, Some(querymt::chat::ReasoningEffort::High));
         assert_eq!(options.len(), 2);
@@ -1454,7 +1458,7 @@ mod tests {
         );
 
         let select = match &options[1].kind {
-            agent_client_protocol::schema::SessionConfigKind::Select(select) => select,
+            crate::acp::protocol::SessionConfigKind::Select(select) => select,
             _ => panic!("expected select config option"),
         };
         assert_eq!(select.current_value.0.as_ref(), "high");
@@ -1464,7 +1468,7 @@ mod tests {
     fn reasoning_effort_config_option_auto_when_none() {
         let options = session_config_options(AgentMode::Build, None);
         let select = match &options[1].kind {
-            agent_client_protocol::schema::SessionConfigKind::Select(select) => select,
+            crate::acp::protocol::SessionConfigKind::Select(select) => select,
             _ => panic!("expected select config option"),
         };
         assert_eq!(select.current_value.0.as_ref(), "auto");
@@ -1482,87 +1486,85 @@ mod tests {
         impl SendAgent for Dummy {
             async fn initialize(
                 &self,
-                _: agent_client_protocol::schema::InitializeRequest,
-            ) -> Result<agent_client_protocol::schema::InitializeResponse, Error> {
+                _: crate::acp::protocol::InitializeRequest,
+            ) -> Result<crate::acp::protocol::InitializeResponse, Error> {
                 unreachable!()
             }
             async fn authenticate(
                 &self,
-                _: agent_client_protocol::schema::AuthenticateRequest,
-            ) -> Result<agent_client_protocol::schema::AuthenticateResponse, Error> {
+                _: crate::acp::protocol::AuthenticateRequest,
+            ) -> Result<crate::acp::protocol::AuthenticateResponse, Error> {
                 unreachable!()
             }
             async fn new_session(
                 &self,
-                _: agent_client_protocol::schema::NewSessionRequest,
-            ) -> Result<agent_client_protocol::schema::NewSessionResponse, Error> {
-                Ok(agent_client_protocol::schema::NewSessionResponse::new(
-                    "s-plain",
-                ))
+                _: crate::acp::protocol::NewSessionRequest,
+            ) -> Result<crate::acp::protocol::NewSessionResponse, Error> {
+                Ok(crate::acp::protocol::NewSessionResponse::new("s-plain"))
             }
             async fn prompt(
                 &self,
-                _: agent_client_protocol::schema::PromptRequest,
-            ) -> Result<agent_client_protocol::schema::PromptResponse, Error> {
+                _: crate::acp::protocol::PromptRequest,
+            ) -> Result<crate::acp::protocol::PromptResponse, Error> {
                 unreachable!()
             }
             async fn cancel(
                 &self,
-                _: agent_client_protocol::schema::CancelNotification,
+                _: crate::acp::protocol::CancelNotification,
             ) -> Result<(), Error> {
                 unreachable!()
             }
             async fn load_session(
                 &self,
-                _: agent_client_protocol::schema::LoadSessionRequest,
-            ) -> Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
+                _: crate::acp::protocol::LoadSessionRequest,
+            ) -> Result<crate::acp::protocol::LoadSessionResponse, Error> {
                 unreachable!()
             }
             async fn list_sessions(
                 &self,
-                _: agent_client_protocol::schema::ListSessionsRequest,
-            ) -> Result<agent_client_protocol::schema::ListSessionsResponse, Error> {
+                _: crate::acp::protocol::ListSessionsRequest,
+            ) -> Result<crate::acp::protocol::ListSessionsResponse, Error> {
                 unreachable!()
             }
             async fn fork_session(
                 &self,
-                _: agent_client_protocol::schema::ForkSessionRequest,
-            ) -> Result<agent_client_protocol::schema::ForkSessionResponse, Error> {
+                _: crate::acp::protocol::ForkSessionRequest,
+            ) -> Result<crate::acp::protocol::ForkSessionResponse, Error> {
                 unreachable!()
             }
             async fn resume_session(
                 &self,
-                _: agent_client_protocol::schema::ResumeSessionRequest,
-            ) -> Result<agent_client_protocol::schema::ResumeSessionResponse, Error> {
+                _: crate::acp::protocol::ResumeSessionRequest,
+            ) -> Result<crate::acp::protocol::ResumeSessionResponse, Error> {
                 unreachable!()
             }
             async fn close_session(
                 &self,
-                _: agent_client_protocol::schema::CloseSessionRequest,
-            ) -> Result<agent_client_protocol::schema::CloseSessionResponse, Error> {
+                _: crate::acp::protocol::CloseSessionRequest,
+            ) -> Result<crate::acp::protocol::CloseSessionResponse, Error> {
                 unreachable!()
             }
             async fn delete_session(
                 &self,
-                _: agent_client_protocol::schema::DeleteSessionRequest,
-            ) -> Result<agent_client_protocol::schema::DeleteSessionResponse, Error> {
+                _: crate::acp::protocol::DeleteSessionRequest,
+            ) -> Result<crate::acp::protocol::DeleteSessionResponse, Error> {
                 unreachable!()
             }
             async fn set_session_model(
                 &self,
-                _: agent_client_protocol::schema::SetSessionModelRequest,
-            ) -> Result<agent_client_protocol::schema::SetSessionModelResponse, Error> {
+                _: crate::acp::protocol::SetSessionModelRequest,
+            ) -> Result<crate::acp::protocol::SetSessionModelResponse, Error> {
                 unreachable!()
             }
             async fn ext_method(
                 &self,
-                _: agent_client_protocol::schema::ExtRequest,
-            ) -> Result<agent_client_protocol::schema::ExtResponse, Error> {
+                _: crate::acp::protocol::ExtRequest,
+            ) -> Result<crate::acp::protocol::ExtResponse, Error> {
                 unreachable!()
             }
             async fn ext_notification(
                 &self,
-                _: agent_client_protocol::schema::ExtNotification,
+                _: crate::acp::protocol::ExtNotification,
             ) -> Result<(), Error> {
                 unreachable!()
             }
@@ -1608,91 +1610,89 @@ mod tests {
         impl SendAgent for Dummy {
             async fn initialize(
                 &self,
-                _: agent_client_protocol::schema::InitializeRequest,
-            ) -> Result<agent_client_protocol::schema::InitializeResponse, Error> {
+                _: crate::acp::protocol::InitializeRequest,
+            ) -> Result<crate::acp::protocol::InitializeResponse, Error> {
                 unreachable!()
             }
             async fn authenticate(
                 &self,
-                _: agent_client_protocol::schema::AuthenticateRequest,
-            ) -> Result<agent_client_protocol::schema::AuthenticateResponse, Error> {
+                _: crate::acp::protocol::AuthenticateRequest,
+            ) -> Result<crate::acp::protocol::AuthenticateResponse, Error> {
                 unreachable!()
             }
             async fn new_session(
                 &self,
-                _: agent_client_protocol::schema::NewSessionRequest,
-            ) -> Result<agent_client_protocol::schema::NewSessionResponse, Error> {
+                _: crate::acp::protocol::NewSessionRequest,
+            ) -> Result<crate::acp::protocol::NewSessionResponse, Error> {
                 unreachable!()
             }
             async fn prompt(
                 &self,
-                _: agent_client_protocol::schema::PromptRequest,
-            ) -> Result<agent_client_protocol::schema::PromptResponse, Error> {
+                _: crate::acp::protocol::PromptRequest,
+            ) -> Result<crate::acp::protocol::PromptResponse, Error> {
                 unreachable!()
             }
             async fn cancel(
                 &self,
-                _: agent_client_protocol::schema::CancelNotification,
+                _: crate::acp::protocol::CancelNotification,
             ) -> Result<(), Error> {
                 unreachable!()
             }
             async fn load_session(
                 &self,
-                _: agent_client_protocol::schema::LoadSessionRequest,
-            ) -> Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
+                _: crate::acp::protocol::LoadSessionRequest,
+            ) -> Result<crate::acp::protocol::LoadSessionResponse, Error> {
                 unreachable!()
             }
             async fn list_sessions(
                 &self,
-                _: agent_client_protocol::schema::ListSessionsRequest,
-            ) -> Result<agent_client_protocol::schema::ListSessionsResponse, Error> {
+                _: crate::acp::protocol::ListSessionsRequest,
+            ) -> Result<crate::acp::protocol::ListSessionsResponse, Error> {
                 unreachable!()
             }
             async fn fork_session(
                 &self,
-                _: agent_client_protocol::schema::ForkSessionRequest,
-            ) -> Result<agent_client_protocol::schema::ForkSessionResponse, Error> {
+                _: crate::acp::protocol::ForkSessionRequest,
+            ) -> Result<crate::acp::protocol::ForkSessionResponse, Error> {
                 unreachable!()
             }
             async fn resume_session(
                 &self,
-                _: agent_client_protocol::schema::ResumeSessionRequest,
-            ) -> Result<agent_client_protocol::schema::ResumeSessionResponse, Error> {
+                _: crate::acp::protocol::ResumeSessionRequest,
+            ) -> Result<crate::acp::protocol::ResumeSessionResponse, Error> {
                 unreachable!()
             }
             async fn close_session(
                 &self,
-                _: agent_client_protocol::schema::CloseSessionRequest,
-            ) -> Result<agent_client_protocol::schema::CloseSessionResponse, Error> {
+                _: crate::acp::protocol::CloseSessionRequest,
+            ) -> Result<crate::acp::protocol::CloseSessionResponse, Error> {
                 unreachable!()
             }
             async fn delete_session(
                 &self,
-                _: agent_client_protocol::schema::DeleteSessionRequest,
-            ) -> Result<agent_client_protocol::schema::DeleteSessionResponse, Error> {
+                _: crate::acp::protocol::DeleteSessionRequest,
+            ) -> Result<crate::acp::protocol::DeleteSessionResponse, Error> {
                 unreachable!()
             }
             async fn set_session_model(
                 &self,
-                _: agent_client_protocol::schema::SetSessionModelRequest,
-            ) -> Result<agent_client_protocol::schema::SetSessionModelResponse, Error> {
+                _: crate::acp::protocol::SetSessionModelRequest,
+            ) -> Result<crate::acp::protocol::SetSessionModelResponse, Error> {
                 unreachable!()
             }
             async fn ext_method(
                 &self,
-                _: agent_client_protocol::schema::ExtRequest,
-            ) -> Result<agent_client_protocol::schema::ExtResponse, Error> {
+                _: crate::acp::protocol::ExtRequest,
+            ) -> Result<crate::acp::protocol::ExtResponse, Error> {
                 let raw = serde_json::value::RawValue::from_string(
                     serde_json::json!({"attached": true}).to_string(),
                 )
                 .unwrap();
-                Ok(agent_client_protocol::schema::ExtResponse::new(Arc::from(
-                    raw,
-                )))
+                Ok(crate::acp::protocol::ExtResponse::new(Arc::from(raw)))
             }
             async fn ext_notification(
                 &self,
-                _: agent_client_protocol::schema::ExtNotification,
+                _: crate::acp::protocol::ExtNotification,
             ) -> Result<(), Error> {
                 unreachable!()
             }
@@ -1736,91 +1736,89 @@ mod tests {
         impl SendAgent for Dummy {
             async fn initialize(
                 &self,
-                _: agent_client_protocol::schema::InitializeRequest,
-            ) -> Result<agent_client_protocol::schema::InitializeResponse, Error> {
+                _: crate::acp::protocol::InitializeRequest,
+            ) -> Result<crate::acp::protocol::InitializeResponse, Error> {
                 unreachable!()
             }
             async fn authenticate(
                 &self,
-                _: agent_client_protocol::schema::AuthenticateRequest,
-            ) -> Result<agent_client_protocol::schema::AuthenticateResponse, Error> {
+                _: crate::acp::protocol::AuthenticateRequest,
+            ) -> Result<crate::acp::protocol::AuthenticateResponse, Error> {
                 unreachable!()
             }
             async fn new_session(
                 &self,
-                _: agent_client_protocol::schema::NewSessionRequest,
-            ) -> Result<agent_client_protocol::schema::NewSessionResponse, Error> {
+                _: crate::acp::protocol::NewSessionRequest,
+            ) -> Result<crate::acp::protocol::NewSessionResponse, Error> {
                 unreachable!()
             }
             async fn prompt(
                 &self,
-                _: agent_client_protocol::schema::PromptRequest,
-            ) -> Result<agent_client_protocol::schema::PromptResponse, Error> {
+                _: crate::acp::protocol::PromptRequest,
+            ) -> Result<crate::acp::protocol::PromptResponse, Error> {
                 unreachable!()
             }
             async fn cancel(
                 &self,
-                _: agent_client_protocol::schema::CancelNotification,
+                _: crate::acp::protocol::CancelNotification,
             ) -> Result<(), Error> {
                 unreachable!()
             }
             async fn load_session(
                 &self,
-                _: agent_client_protocol::schema::LoadSessionRequest,
-            ) -> Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
+                _: crate::acp::protocol::LoadSessionRequest,
+            ) -> Result<crate::acp::protocol::LoadSessionResponse, Error> {
                 unreachable!()
             }
             async fn list_sessions(
                 &self,
-                _: agent_client_protocol::schema::ListSessionsRequest,
-            ) -> Result<agent_client_protocol::schema::ListSessionsResponse, Error> {
+                _: crate::acp::protocol::ListSessionsRequest,
+            ) -> Result<crate::acp::protocol::ListSessionsResponse, Error> {
                 unreachable!()
             }
             async fn fork_session(
                 &self,
-                _: agent_client_protocol::schema::ForkSessionRequest,
-            ) -> Result<agent_client_protocol::schema::ForkSessionResponse, Error> {
+                _: crate::acp::protocol::ForkSessionRequest,
+            ) -> Result<crate::acp::protocol::ForkSessionResponse, Error> {
                 unreachable!()
             }
             async fn resume_session(
                 &self,
-                _: agent_client_protocol::schema::ResumeSessionRequest,
-            ) -> Result<agent_client_protocol::schema::ResumeSessionResponse, Error> {
+                _: crate::acp::protocol::ResumeSessionRequest,
+            ) -> Result<crate::acp::protocol::ResumeSessionResponse, Error> {
                 unreachable!()
             }
             async fn close_session(
                 &self,
-                _: agent_client_protocol::schema::CloseSessionRequest,
-            ) -> Result<agent_client_protocol::schema::CloseSessionResponse, Error> {
+                _: crate::acp::protocol::CloseSessionRequest,
+            ) -> Result<crate::acp::protocol::CloseSessionResponse, Error> {
                 unreachable!()
             }
             async fn delete_session(
                 &self,
-                _: agent_client_protocol::schema::DeleteSessionRequest,
-            ) -> Result<agent_client_protocol::schema::DeleteSessionResponse, Error> {
+                _: crate::acp::protocol::DeleteSessionRequest,
+            ) -> Result<crate::acp::protocol::DeleteSessionResponse, Error> {
                 unreachable!()
             }
             async fn set_session_model(
                 &self,
-                _: agent_client_protocol::schema::SetSessionModelRequest,
-            ) -> Result<agent_client_protocol::schema::SetSessionModelResponse, Error> {
+                _: crate::acp::protocol::SetSessionModelRequest,
+            ) -> Result<crate::acp::protocol::SetSessionModelResponse, Error> {
                 unreachable!()
             }
             async fn ext_method(
                 &self,
-                _: agent_client_protocol::schema::ExtRequest,
-            ) -> Result<agent_client_protocol::schema::ExtResponse, Error> {
+                _: crate::acp::protocol::ExtRequest,
+            ) -> Result<crate::acp::protocol::ExtResponse, Error> {
                 let raw = serde_json::value::RawValue::from_string(
                     serde_json::json!({"session_id": "s-cr","node_id": "n-1","attached":false,"config_options":[]}).to_string(),
                 )
                 .unwrap();
-                Ok(agent_client_protocol::schema::ExtResponse::new(Arc::from(
-                    raw,
-                )))
+                Ok(crate::acp::protocol::ExtResponse::new(Arc::from(raw)))
             }
             async fn ext_notification(
                 &self,
-                _: agent_client_protocol::schema::ExtNotification,
+                _: crate::acp::protocol::ExtNotification,
             ) -> Result<(), Error> {
                 unreachable!()
             }
@@ -1864,85 +1862,85 @@ mod tests {
         impl SendAgent for Dummy {
             async fn initialize(
                 &self,
-                _: agent_client_protocol::schema::InitializeRequest,
-            ) -> Result<agent_client_protocol::schema::InitializeResponse, Error> {
+                _: crate::acp::protocol::InitializeRequest,
+            ) -> Result<crate::acp::protocol::InitializeResponse, Error> {
                 unreachable!()
             }
             async fn authenticate(
                 &self,
-                _: agent_client_protocol::schema::AuthenticateRequest,
-            ) -> Result<agent_client_protocol::schema::AuthenticateResponse, Error> {
+                _: crate::acp::protocol::AuthenticateRequest,
+            ) -> Result<crate::acp::protocol::AuthenticateResponse, Error> {
                 unreachable!()
             }
             async fn new_session(
                 &self,
-                _: agent_client_protocol::schema::NewSessionRequest,
-            ) -> Result<agent_client_protocol::schema::NewSessionResponse, Error> {
+                _: crate::acp::protocol::NewSessionRequest,
+            ) -> Result<crate::acp::protocol::NewSessionResponse, Error> {
                 unreachable!()
             }
             async fn prompt(
                 &self,
-                _: agent_client_protocol::schema::PromptRequest,
-            ) -> Result<agent_client_protocol::schema::PromptResponse, Error> {
+                _: crate::acp::protocol::PromptRequest,
+            ) -> Result<crate::acp::protocol::PromptResponse, Error> {
                 unreachable!()
             }
             async fn cancel(
                 &self,
-                _: agent_client_protocol::schema::CancelNotification,
+                _: crate::acp::protocol::CancelNotification,
             ) -> Result<(), Error> {
                 unreachable!()
             }
             async fn load_session(
                 &self,
-                _: agent_client_protocol::schema::LoadSessionRequest,
-            ) -> Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
-                Ok(agent_client_protocol::schema::LoadSessionResponse::new())
+                _: crate::acp::protocol::LoadSessionRequest,
+            ) -> Result<crate::acp::protocol::LoadSessionResponse, Error> {
+                Ok(crate::acp::protocol::LoadSessionResponse::new())
             }
             async fn list_sessions(
                 &self,
-                _: agent_client_protocol::schema::ListSessionsRequest,
-            ) -> Result<agent_client_protocol::schema::ListSessionsResponse, Error> {
+                _: crate::acp::protocol::ListSessionsRequest,
+            ) -> Result<crate::acp::protocol::ListSessionsResponse, Error> {
                 unreachable!()
             }
             async fn fork_session(
                 &self,
-                _: agent_client_protocol::schema::ForkSessionRequest,
-            ) -> Result<agent_client_protocol::schema::ForkSessionResponse, Error> {
+                _: crate::acp::protocol::ForkSessionRequest,
+            ) -> Result<crate::acp::protocol::ForkSessionResponse, Error> {
                 unreachable!()
             }
             async fn resume_session(
                 &self,
-                _: agent_client_protocol::schema::ResumeSessionRequest,
-            ) -> Result<agent_client_protocol::schema::ResumeSessionResponse, Error> {
+                _: crate::acp::protocol::ResumeSessionRequest,
+            ) -> Result<crate::acp::protocol::ResumeSessionResponse, Error> {
                 unreachable!()
             }
             async fn close_session(
                 &self,
-                _: agent_client_protocol::schema::CloseSessionRequest,
-            ) -> Result<agent_client_protocol::schema::CloseSessionResponse, Error> {
+                _: crate::acp::protocol::CloseSessionRequest,
+            ) -> Result<crate::acp::protocol::CloseSessionResponse, Error> {
                 unreachable!()
             }
             async fn delete_session(
                 &self,
-                _: agent_client_protocol::schema::DeleteSessionRequest,
-            ) -> Result<agent_client_protocol::schema::DeleteSessionResponse, Error> {
+                _: crate::acp::protocol::DeleteSessionRequest,
+            ) -> Result<crate::acp::protocol::DeleteSessionResponse, Error> {
                 unreachable!()
             }
             async fn set_session_model(
                 &self,
-                _: agent_client_protocol::schema::SetSessionModelRequest,
-            ) -> Result<agent_client_protocol::schema::SetSessionModelResponse, Error> {
+                _: crate::acp::protocol::SetSessionModelRequest,
+            ) -> Result<crate::acp::protocol::SetSessionModelResponse, Error> {
                 unreachable!()
             }
             async fn ext_method(
                 &self,
-                _: agent_client_protocol::schema::ExtRequest,
-            ) -> Result<agent_client_protocol::schema::ExtResponse, Error> {
+                _: crate::acp::protocol::ExtRequest,
+            ) -> Result<crate::acp::protocol::ExtResponse, Error> {
                 unreachable!()
             }
             async fn ext_notification(
                 &self,
-                _: agent_client_protocol::schema::ExtNotification,
+                _: crate::acp::protocol::ExtNotification,
             ) -> Result<(), Error> {
                 unreachable!()
             }
@@ -1990,85 +1988,85 @@ mod tests {
         impl SendAgent for Dummy {
             async fn initialize(
                 &self,
-                _: agent_client_protocol::schema::InitializeRequest,
-            ) -> Result<agent_client_protocol::schema::InitializeResponse, Error> {
+                _: crate::acp::protocol::InitializeRequest,
+            ) -> Result<crate::acp::protocol::InitializeResponse, Error> {
                 unreachable!()
             }
             async fn authenticate(
                 &self,
-                _: agent_client_protocol::schema::AuthenticateRequest,
-            ) -> Result<agent_client_protocol::schema::AuthenticateResponse, Error> {
+                _: crate::acp::protocol::AuthenticateRequest,
+            ) -> Result<crate::acp::protocol::AuthenticateResponse, Error> {
                 unreachable!()
             }
             async fn new_session(
                 &self,
-                _: agent_client_protocol::schema::NewSessionRequest,
-            ) -> Result<agent_client_protocol::schema::NewSessionResponse, Error> {
+                _: crate::acp::protocol::NewSessionRequest,
+            ) -> Result<crate::acp::protocol::NewSessionResponse, Error> {
                 unreachable!()
             }
             async fn prompt(
                 &self,
-                _: agent_client_protocol::schema::PromptRequest,
-            ) -> Result<agent_client_protocol::schema::PromptResponse, Error> {
+                _: crate::acp::protocol::PromptRequest,
+            ) -> Result<crate::acp::protocol::PromptResponse, Error> {
                 unreachable!()
             }
             async fn cancel(
                 &self,
-                _: agent_client_protocol::schema::CancelNotification,
+                _: crate::acp::protocol::CancelNotification,
             ) -> Result<(), Error> {
                 unreachable!()
             }
             async fn load_session(
                 &self,
-                _: agent_client_protocol::schema::LoadSessionRequest,
-            ) -> Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
+                _: crate::acp::protocol::LoadSessionRequest,
+            ) -> Result<crate::acp::protocol::LoadSessionResponse, Error> {
                 unreachable!()
             }
             async fn list_sessions(
                 &self,
-                _: agent_client_protocol::schema::ListSessionsRequest,
-            ) -> Result<agent_client_protocol::schema::ListSessionsResponse, Error> {
+                _: crate::acp::protocol::ListSessionsRequest,
+            ) -> Result<crate::acp::protocol::ListSessionsResponse, Error> {
                 unreachable!()
             }
             async fn fork_session(
                 &self,
-                _: agent_client_protocol::schema::ForkSessionRequest,
-            ) -> Result<agent_client_protocol::schema::ForkSessionResponse, Error> {
+                _: crate::acp::protocol::ForkSessionRequest,
+            ) -> Result<crate::acp::protocol::ForkSessionResponse, Error> {
                 unreachable!()
             }
             async fn resume_session(
                 &self,
-                _: agent_client_protocol::schema::ResumeSessionRequest,
-            ) -> Result<agent_client_protocol::schema::ResumeSessionResponse, Error> {
+                _: crate::acp::protocol::ResumeSessionRequest,
+            ) -> Result<crate::acp::protocol::ResumeSessionResponse, Error> {
                 unreachable!()
             }
             async fn close_session(
                 &self,
-                _: agent_client_protocol::schema::CloseSessionRequest,
-            ) -> Result<agent_client_protocol::schema::CloseSessionResponse, Error> {
-                Ok(agent_client_protocol::schema::CloseSessionResponse::new())
+                _: crate::acp::protocol::CloseSessionRequest,
+            ) -> Result<crate::acp::protocol::CloseSessionResponse, Error> {
+                Ok(crate::acp::protocol::CloseSessionResponse::new())
             }
             async fn delete_session(
                 &self,
-                _: agent_client_protocol::schema::DeleteSessionRequest,
-            ) -> Result<agent_client_protocol::schema::DeleteSessionResponse, Error> {
-                Ok(agent_client_protocol::schema::DeleteSessionResponse::new())
+                _: crate::acp::protocol::DeleteSessionRequest,
+            ) -> Result<crate::acp::protocol::DeleteSessionResponse, Error> {
+                Ok(crate::acp::protocol::DeleteSessionResponse::new())
             }
             async fn set_session_model(
                 &self,
-                _: agent_client_protocol::schema::SetSessionModelRequest,
-            ) -> Result<agent_client_protocol::schema::SetSessionModelResponse, Error> {
+                _: crate::acp::protocol::SetSessionModelRequest,
+            ) -> Result<crate::acp::protocol::SetSessionModelResponse, Error> {
                 unreachable!()
             }
             async fn ext_method(
                 &self,
-                _: agent_client_protocol::schema::ExtRequest,
-            ) -> Result<agent_client_protocol::schema::ExtResponse, Error> {
+                _: crate::acp::protocol::ExtRequest,
+            ) -> Result<crate::acp::protocol::ExtResponse, Error> {
                 unreachable!()
             }
             async fn ext_notification(
                 &self,
-                _: agent_client_protocol::schema::ExtNotification,
+                _: crate::acp::protocol::ExtNotification,
             ) -> Result<(), Error> {
                 unreachable!()
             }
@@ -2118,85 +2116,85 @@ mod tests {
         impl SendAgent for Dummy {
             async fn initialize(
                 &self,
-                _: agent_client_protocol::schema::InitializeRequest,
-            ) -> Result<agent_client_protocol::schema::InitializeResponse, Error> {
+                _: crate::acp::protocol::InitializeRequest,
+            ) -> Result<crate::acp::protocol::InitializeResponse, Error> {
                 unreachable!()
             }
             async fn authenticate(
                 &self,
-                _: agent_client_protocol::schema::AuthenticateRequest,
-            ) -> Result<agent_client_protocol::schema::AuthenticateResponse, Error> {
+                _: crate::acp::protocol::AuthenticateRequest,
+            ) -> Result<crate::acp::protocol::AuthenticateResponse, Error> {
                 unreachable!()
             }
             async fn new_session(
                 &self,
-                _: agent_client_protocol::schema::NewSessionRequest,
-            ) -> Result<agent_client_protocol::schema::NewSessionResponse, Error> {
+                _: crate::acp::protocol::NewSessionRequest,
+            ) -> Result<crate::acp::protocol::NewSessionResponse, Error> {
                 unreachable!()
             }
             async fn prompt(
                 &self,
-                _: agent_client_protocol::schema::PromptRequest,
-            ) -> Result<agent_client_protocol::schema::PromptResponse, Error> {
+                _: crate::acp::protocol::PromptRequest,
+            ) -> Result<crate::acp::protocol::PromptResponse, Error> {
                 unreachable!()
             }
             async fn cancel(
                 &self,
-                _: agent_client_protocol::schema::CancelNotification,
+                _: crate::acp::protocol::CancelNotification,
             ) -> Result<(), Error> {
                 unreachable!()
             }
             async fn load_session(
                 &self,
-                _: agent_client_protocol::schema::LoadSessionRequest,
-            ) -> Result<agent_client_protocol::schema::LoadSessionResponse, Error> {
+                _: crate::acp::protocol::LoadSessionRequest,
+            ) -> Result<crate::acp::protocol::LoadSessionResponse, Error> {
                 unreachable!()
             }
             async fn list_sessions(
                 &self,
-                _: agent_client_protocol::schema::ListSessionsRequest,
-            ) -> Result<agent_client_protocol::schema::ListSessionsResponse, Error> {
+                _: crate::acp::protocol::ListSessionsRequest,
+            ) -> Result<crate::acp::protocol::ListSessionsResponse, Error> {
                 unreachable!()
             }
             async fn fork_session(
                 &self,
-                _: agent_client_protocol::schema::ForkSessionRequest,
-            ) -> Result<agent_client_protocol::schema::ForkSessionResponse, Error> {
+                _: crate::acp::protocol::ForkSessionRequest,
+            ) -> Result<crate::acp::protocol::ForkSessionResponse, Error> {
                 unreachable!()
             }
             async fn resume_session(
                 &self,
-                _: agent_client_protocol::schema::ResumeSessionRequest,
-            ) -> Result<agent_client_protocol::schema::ResumeSessionResponse, Error> {
+                _: crate::acp::protocol::ResumeSessionRequest,
+            ) -> Result<crate::acp::protocol::ResumeSessionResponse, Error> {
                 unreachable!()
             }
             async fn close_session(
                 &self,
-                _: agent_client_protocol::schema::CloseSessionRequest,
-            ) -> Result<agent_client_protocol::schema::CloseSessionResponse, Error> {
+                _: crate::acp::protocol::CloseSessionRequest,
+            ) -> Result<crate::acp::protocol::CloseSessionResponse, Error> {
                 unreachable!()
             }
             async fn delete_session(
                 &self,
-                _: agent_client_protocol::schema::DeleteSessionRequest,
-            ) -> Result<agent_client_protocol::schema::DeleteSessionResponse, Error> {
+                _: crate::acp::protocol::DeleteSessionRequest,
+            ) -> Result<crate::acp::protocol::DeleteSessionResponse, Error> {
                 unreachable!()
             }
             async fn set_session_model(
                 &self,
-                _: agent_client_protocol::schema::SetSessionModelRequest,
-            ) -> Result<agent_client_protocol::schema::SetSessionModelResponse, Error> {
+                _: crate::acp::protocol::SetSessionModelRequest,
+            ) -> Result<crate::acp::protocol::SetSessionModelResponse, Error> {
                 unreachable!()
             }
             async fn ext_method(
                 &self,
-                _: agent_client_protocol::schema::ExtRequest,
-            ) -> Result<agent_client_protocol::schema::ExtResponse, Error> {
+                _: crate::acp::protocol::ExtRequest,
+            ) -> Result<crate::acp::protocol::ExtResponse, Error> {
                 unreachable!()
             }
             async fn ext_notification(
                 &self,
-                _: agent_client_protocol::schema::ExtNotification,
+                _: crate::acp::protocol::ExtNotification,
             ) -> Result<(), Error> {
                 unreachable!()
             }
@@ -2463,7 +2461,7 @@ mod tests {
     }
 
     mod prompt_response_json {
-        use agent_client_protocol::schema::{PromptResponse, StopReason};
+        use crate::acp::protocol::{PromptResponse, StopReason};
 
         #[test]
         fn end_turn_serializes_to_acp_json() {

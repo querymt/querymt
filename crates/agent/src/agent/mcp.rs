@@ -1,6 +1,6 @@
 //! MCP (Model Context Protocol) integration utilities
 
-use agent_client_protocol::schema::{Error, HttpHeader, McpServer};
+use crate::acp::protocol::{Error, HttpHeader, McpServer};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 /// Converts HTTP headers from protocol format to reqwest format

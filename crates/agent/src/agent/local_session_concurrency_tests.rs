@@ -11,6 +11,9 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::acp::protocol::{
+        LoadSessionRequest, NewSessionRequest, ResumeSessionRequest, SessionId,
+    };
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
     use crate::agent::handle::LocalAgentHandle;
@@ -19,9 +22,6 @@ mod tests {
     use crate::send_agent::SendAgent;
     use crate::test_utils::{
         MockLlmProvider, SharedLlmProvider, TestProviderFactory, mock_plugin_registry,
-    };
-    use agent_client_protocol::schema::{
-        LoadSessionRequest, NewSessionRequest, ResumeSessionRequest, SessionId,
     };
     use querymt::LLMParams;
     use std::path::PathBuf;

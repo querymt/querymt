@@ -14,7 +14,7 @@ use querymt_remote::{
     ask_remote_with_timeout,
 };
 
-use agent_client_protocol::schema::{
+use crate::acp::protocol::{
     CancelNotification, Error, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
     NewSessionResponse, PromptRequest, PromptResponse,
 };

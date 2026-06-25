@@ -4,6 +4,7 @@
 //! `AgentBuilderExt` pattern. It constructs an `AgentConfig` without going
 //! through the old fat-struct intermediate.
 
+use crate::acp::protocol::AuthMethod;
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{
     AgentMode, ClientState, DelegationContextConfig, DelegationContextTiming, SnapshotPolicy,
@@ -28,7 +29,6 @@ use crate::session::compaction::SessionCompaction;
 use crate::session::projection::EventJournal;
 use crate::session::provider::SessionProvider;
 use crate::tools::ToolRegistry;
-use agent_client_protocol::schema::AuthMethod;
 use arc_swap::ArcSwap;
 use querymt::LLMParams;
 use querymt::plugin::host::PluginRegistry;

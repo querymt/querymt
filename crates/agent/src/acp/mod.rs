@@ -6,6 +6,7 @@ pub mod websocket;
 // Internal modules
 pub(crate) mod client_bridge;
 pub mod cwd;
+pub mod protocol;
 pub mod shared;
 pub(crate) mod stdio;
 pub(crate) mod trace_context;

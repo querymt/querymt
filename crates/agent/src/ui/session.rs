@@ -6,15 +6,15 @@
 use super::error::format_prefixed_error_chain;
 use super::messages::{RoutingMode, UiAgentInfo, UiProfileInfo, UiPromptBlock, UiServerMessage};
 use super::{ServerState, cursor_from_events};
+use crate::acp::protocol::{
+    ContentBlock, LoadSessionRequest, NewSessionRequest, PromptRequest, SessionId,
+};
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::core::AgentMode;
 use crate::agent::handle::AgentHandle as AgentHandleTrait;
 use crate::agent::remote::SessionActorRef;
 use crate::events::EventEnvelope;
 use crate::index::{get_or_create_workspace_with_timeout, normalize_cwd, resolve_workspace_root};
-use agent_client_protocol::schema::{
-    ContentBlock, LoadSessionRequest, NewSessionRequest, PromptRequest, SessionId,
-};
 use querymt::chat::ReasoningEffort;
 use std::path::PathBuf;
 use std::sync::Arc;

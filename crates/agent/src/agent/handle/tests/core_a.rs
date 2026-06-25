@@ -236,7 +236,7 @@ async fn test_delete_unknown_session_is_noop() {
 #[tokio::test]
 async fn test_prompt_unknown_session_returns_error() {
     let f = HandleFixture::new().await;
-    let req = agent_client_protocol::schema::PromptRequest::new(
+    let req = crate::acp::protocol::PromptRequest::new(
         SessionId::from("no-such-session".to_string()),
         vec![],
     );
@@ -329,7 +329,7 @@ fn test_config_options_with_profiles_uses_profile_metadata() {
 
     assert_eq!(options[0].id.0.as_ref(), "profile");
     let select = match &options[0].kind {
-        agent_client_protocol::schema::SessionConfigKind::Select(select) => select,
+        crate::acp::protocol::SessionConfigKind::Select(select) => select,
         _ => panic!("expected select config option"),
     };
     assert_eq!(select.current_value.0.as_ref(), "beta");
@@ -353,8 +353,7 @@ async fn test_new_session_binds_requested_profile_from_querymt_meta() {
         "querymt".to_string(),
         serde_json::json!({ "profile_id": "beta" }),
     );
-    let req =
-        agent_client_protocol::schema::NewSessionRequest::new(std::path::PathBuf::new()).meta(meta);
+    let req = crate::acp::protocol::NewSessionRequest::new(std::path::PathBuf::new()).meta(meta);
 
     let response = f.handle.new_session(req).await.expect("new session");
     let session_id = response.session_id.to_string();
@@ -381,11 +380,8 @@ async fn test_set_profile_config_option_rejects_unknown_profile() {
     let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
     register_bound_test_session(&f, "session-1", "alpha").await;
 
-    let req = agent_client_protocol::schema::SetSessionConfigOptionRequest::new(
-        "session-1",
-        "profile",
-        "missing",
-    );
+    let req =
+        crate::acp::protocol::SetSessionConfigOptionRequest::new("session-1", "profile", "missing");
 
     let err = f
         .handle
@@ -404,11 +400,8 @@ async fn test_set_profile_config_option_rejects_different_bound_profile() {
     .await;
     register_bound_test_session(&f, "session-1", "alpha").await;
 
-    let req = agent_client_protocol::schema::SetSessionConfigOptionRequest::new(
-        "session-1",
-        "profile",
-        "beta",
-    );
+    let req =
+        crate::acp::protocol::SetSessionConfigOptionRequest::new("session-1", "profile", "beta");
 
     let err = f
         .handle
@@ -422,11 +415,8 @@ async fn test_set_profile_config_option_rejects_different_bound_profile() {
 async fn test_set_profile_config_option_accepts_same_bound_profile() {
     let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
     register_bound_test_session(&f, "session-1", "alpha").await;
-    let req = agent_client_protocol::schema::SetSessionConfigOptionRequest::new(
-        "session-1",
-        "profile",
-        "alpha",
-    );
+    let req =
+        crate::acp::protocol::SetSessionConfigOptionRequest::new("session-1", "profile", "alpha");
 
     let resp = f
         .handle

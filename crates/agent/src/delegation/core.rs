@@ -1,3 +1,4 @@
+use crate::acp::protocol::{ContentBlock, PromptRequest, StopReason, TextContent};
 use crate::event_fanout::EventFanout;
 use crate::event_sink::EventSink;
 use crate::events::{AgentEventKind, EventEnvelope};
@@ -10,7 +11,6 @@ use crate::session::store::SessionStore;
 use crate::tools::ToolRegistry;
 use crate::verification::VerificationSpec;
 use crate::verification::service::{VerificationContext, VerificationService};
-use agent_client_protocol::schema::{ContentBlock, PromptRequest, StopReason, TextContent};
 use log::{debug, error, warn};
 use querymt::chat::ChatRole;
 use serde::{Deserialize, Serialize};
@@ -1304,14 +1304,14 @@ impl AgentRegistry for DefaultAgentRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::protocol::{
+        CancelNotification, Error, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+        NewSessionResponse, PromptRequest, PromptResponse,
+    };
     use crate::agent::handle::AgentHandle;
     use crate::agent::remote::SessionActorRef;
     use crate::event_fanout::EventFanout;
     use crate::events::EventEnvelope;
-    use agent_client_protocol::schema::{
-        CancelNotification, Error, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-        NewSessionResponse, PromptRequest, PromptResponse,
-    };
     use async_trait::async_trait;
 
     // ── Minimal stub AgentHandle ──────────────────────────────────────────────
@@ -1341,7 +1341,7 @@ mod tests {
 
         async fn prompt(&self, _req: PromptRequest) -> std::result::Result<PromptResponse, Error> {
             Ok(PromptResponse::new(
-                agent_client_protocol::schema::StopReason::EndTurn,
+                crate::acp::protocol::StopReason::EndTurn,
             ))
         }
 

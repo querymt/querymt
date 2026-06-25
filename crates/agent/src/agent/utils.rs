@@ -1,8 +1,6 @@
 //! Utility functions for the agent
 
-use agent_client_protocol::schema::{
-    ContentBlock, EmbeddedResourceResource, ToolCallLocation, ToolKind,
-};
+use crate::acp::protocol::{ContentBlock, EmbeddedResourceResource, ToolCallLocation, ToolKind};
 use log::warn;
 
 const ATTACHMENTS_DISPLAY_FALLBACK: &str = "(attachments included)";
@@ -182,7 +180,7 @@ pub fn u32_from_usize(value: usize, field_name: &str, session_id: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::{format_prompt_user_text_only, render_prompt_for_display};
-    use agent_client_protocol::schema::{ContentBlock, TextContent};
+    use crate::acp::protocol::{ContentBlock, TextContent};
 
     #[test]
     fn render_prompt_for_display_prefers_user_text() {

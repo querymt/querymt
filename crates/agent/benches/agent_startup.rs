@@ -1,5 +1,5 @@
-use agent_client_protocol::schema::NewSessionRequest;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use querymt_agent::acp::protocol::NewSessionRequest;
 use querymt_agent::agent::AgentHandle;
 use querymt_agent::config::ConfigSource;
 use querymt_agent::runner::{AgentRunner, from_config};

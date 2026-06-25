@@ -1,6 +1,6 @@
 //! Core agent structures and basic implementations
 
-use agent_client_protocol::schema::{ClientCapabilities, Implementation, ProtocolVersion};
+use crate::acp::protocol::{ClientCapabilities, Implementation, ProtocolVersion};
 use arc_swap::ArcSwap;
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};

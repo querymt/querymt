@@ -11,9 +11,9 @@ async fn test_tool_registry_accessible() {
 #[tokio::test]
 async fn test_set_session_model_unknown_session_fails() {
     let f = HandleFixture::new().await;
-    let req = agent_client_protocol::schema::SetSessionModelRequest::new(
+    let req = crate::acp::protocol::SetSessionModelRequest::new(
         SessionId::from("no-session".to_string()),
-        agent_client_protocol::schema::ModelId::from("anthropic/claude-3-5-sonnet".to_string()),
+        crate::acp::protocol::ModelId::from("anthropic/claude-3-5-sonnet".to_string()),
     );
     let result = f.handle.set_session_model(req).await;
     assert!(result.is_err());
@@ -29,7 +29,7 @@ async fn test_authenticate_no_auth_methods_always_succeeds() {
         .await
         .unwrap();
 
-    let req = agent_client_protocol::schema::AuthenticateRequest::new("any-method".to_string());
+    let req = crate::acp::protocol::AuthenticateRequest::new("any-method".to_string());
     // With no auth_methods configured, any method id is accepted
     let result = f.handle.authenticate(req).await;
     assert!(result.is_ok());

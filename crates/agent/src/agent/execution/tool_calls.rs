@@ -541,11 +541,11 @@ pub(super) async fn ensure_tool_permission(
     bridge: Option<&ClientBridgeSender>,
     turn_id: &str,
 ) -> Result<bool, agent_client_protocol::Error> {
-    use crate::agent::utils::{extract_locations, tool_kind_for_tool};
-    use agent_client_protocol::schema::{
+    use crate::acp::protocol::{
         PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
         RequestPermissionRequest, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
     };
+    use crate::agent::utils::{extract_locations, tool_kind_for_tool};
 
     let requires_permission = config.requires_permission_for_tool(tool_name);
     Span::current().record("requires_permission", requires_permission);

@@ -71,15 +71,15 @@ impl SendAgent for LocalAgentHandle {
 
     async fn set_session_mode(
         &self,
-        req: agent_client_protocol::schema::SetSessionModeRequest,
-    ) -> Result<agent_client_protocol::schema::SetSessionModeResponse, Error> {
+        req: crate::acp::protocol::SetSessionModeRequest,
+    ) -> Result<crate::acp::protocol::SetSessionModeResponse, Error> {
         self.handle_set_session_mode(req).await
     }
 
     async fn set_session_config_option(
         &self,
-        req: agent_client_protocol::schema::SetSessionConfigOptionRequest,
-    ) -> Result<agent_client_protocol::schema::SetSessionConfigOptionResponse, Error> {
+        req: crate::acp::protocol::SetSessionConfigOptionRequest,
+    ) -> Result<crate::acp::protocol::SetSessionConfigOptionResponse, Error> {
         self.handle_set_session_config_option(req).await
     }
 

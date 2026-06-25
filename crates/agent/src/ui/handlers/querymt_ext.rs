@@ -1,7 +1,7 @@
 use super::connection::{send_error, send_message};
 use super::messages::UiServerMessage;
 use super::ServerState;
-use agent_client_protocol::schema::ExtRequest;
+use crate::acp::protocol::ExtRequest;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
