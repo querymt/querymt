@@ -21,7 +21,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-agent = ["querymt-agent==0.5.0"]
+agent = ["querymt-agent==0.5.1"]
 
 [tool.maturin]
 module-name = "querymt"
