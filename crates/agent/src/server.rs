@@ -12,6 +12,8 @@ use axum::{
 use rust_embed::RustEmbed;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "dashboard")]
 #[derive(RustEmbed)]
@@ -63,7 +65,8 @@ impl AgentServer {
 
     pub async fn run(self, addr: &str, mode: ServerMode) -> anyhow::Result<()> {
         let profiles = self.profiles.clone();
-        let app = self.build_app(mode)?;
+        let shutdown_token = CancellationToken::new();
+        let app = self.build_app(mode, shutdown_token.clone())?;
         let agent = self.agent.clone();
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -73,23 +76,37 @@ impl AgentServer {
             ServerMode::Api => log::info!("API server listening on http://{}", addr),
         }
         axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
+            .with_graceful_shutdown(async move {
+                crate::acp::shutdown::signal().await;
+                shutdown_token.cancel();
                 log::info!("Received shutdown signal, stopping UI server...");
             })
             .await?;
 
         // Profiles are lazily materialized side runtimes; stop their background tasks too.
-        if let Some(profiles) = profiles {
-            profiles.shutdown().await;
+        if let Some(profiles) = profiles
+            && tokio::time::timeout(Duration::from_secs(3), profiles.shutdown())
+                .await
+                .is_err()
+        {
+            log::warn!("Timed out while shutting down profile runtimes");
         }
         // Run graceful agent shutdown (releases scheduler lease, stops background tasks)
-        agent.shutdown().await;
+        if tokio::time::timeout(Duration::from_secs(3), agent.shutdown())
+            .await
+            .is_err()
+        {
+            log::warn!("Timed out while shutting down agent background tasks");
+        }
 
         Ok(())
     }
 
-    fn build_app(&self, mode: ServerMode) -> anyhow::Result<Router> {
+    fn build_app(
+        &self,
+        mode: ServerMode,
+        shutdown_token: CancellationToken,
+    ) -> anyhow::Result<Router> {
         let acp_router = AcpServer::new(self.agent.clone()).router();
         let view_store = self.storage.view_store().ok_or_else(|| {
             anyhow::anyhow!("ViewStore is required to serve the UI websocket API")
@@ -101,12 +118,14 @@ impl AgentServer {
                 self.storage.session_store().clone(),
                 self.default_cwd.clone(),
                 profiles,
+                shutdown_token.clone(),
             ),
             None => UiServer::new(
                 self.agent.clone(),
                 view_store,
                 self.storage.session_store().clone(),
                 self.default_cwd.clone(),
+                shutdown_token,
             ),
         };
         let ui_router = ui_server.router();

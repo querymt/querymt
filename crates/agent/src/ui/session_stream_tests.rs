@@ -7,7 +7,7 @@ use crate::profiles::{LocalProfileCatalog, ProfileRuntimeManager};
 use crate::session::backend::StorageBackend;
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::test_utils::{TestAgent, TestServerState, empty_plugin_registry};
-use crate::ui::connection::spawn_event_forwarders;
+use crate::ui::connection::{send_message, spawn_event_forwarders};
 use crate::ui::handlers::{handle_load_session, handle_subscribe_session};
 use crate::ui::messages::StreamCursor;
 use anyhow::Result;
@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep, timeout};
+use tokio_util::sync::CancellationToken;
 
 fn parse_message(json: &str) -> Value {
     serde_json::from_str(json).expect("message should be valid json")
@@ -184,6 +185,7 @@ async fn forwarder_drops_event_when_seq_is_at_or_below_cursor() -> Result<()> {
             crate::index::WorkspaceIndexManagerConfig::default(),
         ),
         oauth_service: agent.handle.oauth_service.clone(),
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
         #[cfg(feature = "remote")]
         remote_node_cache: Arc::new(tokio::sync::Mutex::new(None)),
     };
@@ -320,6 +322,7 @@ async fn forwarder_uses_shared_profile_runtime_fanout_without_polling() -> Resul
             crate::index::WorkspaceIndexManagerConfig::default(),
         ),
         oauth_service: agent.handle.oauth_service.clone(),
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
         #[cfg(feature = "remote")]
         remote_node_cache: Arc::new(tokio::sync::Mutex::new(None)),
     };
@@ -405,6 +408,95 @@ async fn forwarder_uses_shared_profile_runtime_fanout_without_polling() -> Resul
 /// Ephemeral events have no sequence (seq=0) and must always be forwarded
 /// to live subscribers regardless of cursor position.
 #[tokio::test]
+async fn forwarder_stops_when_shutdown_token_is_cancelled() -> Result<()> {
+    let agent = TestAgent::new().await;
+    let fanout = Arc::new(crate::event_fanout::EventFanout::new());
+    let shutdown_token = CancellationToken::new();
+
+    let session_id = "s-shutdown".to_string();
+    let conn_id = "conn-shutdown".to_string();
+    let state = super::ServerState {
+        agent: agent.handle.clone(),
+        view_store: agent.storage.view_store().expect("view store"),
+        session_store: agent.storage.session_store(),
+        default_cwd: None,
+        event_sources: vec![fanout.clone()],
+        profiles: None,
+        connections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        connection_senders: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        session_agents: Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            session_id.clone(),
+            super::session::PRIMARY_AGENT_ID.to_string(),
+        )]))),
+        session_cwds: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
+            crate::index::WorkspaceIndexManagerConfig::default(),
+        ),
+        oauth_service: agent.handle.oauth_service.clone(),
+        shutdown_token: shutdown_token.clone(),
+        #[cfg(feature = "remote")]
+        remote_node_cache: Arc::new(tokio::sync::Mutex::new(None)),
+    };
+
+    {
+        let mut connections = state.connections.lock().await;
+        connections.insert(
+            conn_id.clone(),
+            super::ConnectionState {
+                routing_mode: crate::ui::messages::RoutingMode::Single,
+                active_agent_id: super::session::PRIMARY_AGENT_ID.to_string(),
+                sessions: HashMap::new(),
+                subscribed_sessions: HashSet::from([session_id.clone()]),
+                session_cursors: HashMap::new(),
+                current_workspace_root: None,
+                file_index_forwarder: None,
+            },
+        );
+    }
+
+    let (tx, mut rx) = mpsc::channel(8);
+    spawn_event_forwarders(state.clone(), conn_id.clone(), tx.clone());
+    shutdown_token.cancel();
+
+    fanout.publish(crate::events::EventEnvelope::Ephemeral(
+        crate::events::EphemeralEvent {
+            timestamp: 1,
+            session_id,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::AssistantContentDelta {
+                content: "after shutdown".to_string(),
+                message_id: "m-shutdown".to_string(),
+            },
+        },
+    ));
+
+    let received = timeout(Duration::from_millis(200), rx.recv()).await;
+    assert!(
+        matches!(received, Ok(None) | Err(_)),
+        "forwarder should close or remain silent once the shutdown token is cancelled"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn send_message_returns_error_when_shutdown_closes_channel() {
+    let (tx, rx) = mpsc::channel::<String>(1);
+    drop(rx);
+
+    let err = send_message(
+        &tx,
+        crate::ui::messages::UiServerMessage::Error {
+            message: "closed".to_string(),
+        },
+    )
+    .await
+    .expect_err("closed connection should return an error");
+    assert!(err.contains("Failed to send"));
+}
+
+#[tokio::test]
 async fn forwarder_does_not_drop_ephemeral_events_despite_cursor() -> Result<()> {
     let agent = TestAgent::new().await;
     let fanout = Arc::new(crate::event_fanout::EventFanout::new());
@@ -434,6 +526,7 @@ async fn forwarder_does_not_drop_ephemeral_events_despite_cursor() -> Result<()>
             crate::index::WorkspaceIndexManagerConfig::default(),
         ),
         oauth_service: agent.handle.oauth_service.clone(),
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
         #[cfg(feature = "remote")]
         remote_node_cache: Arc::new(tokio::sync::Mutex::new(None)),
     };

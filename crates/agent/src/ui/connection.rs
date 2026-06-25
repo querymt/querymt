@@ -65,6 +65,7 @@ pub fn encode_binary_frame(header_json: &str, payload: &[u8]) -> Vec<u8> {
 /// Handle a new WebSocket connection.
 pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) {
     let conn_id = Uuid::new_v4().to_string();
+    let shutdown_token = state.shutdown_token.clone();
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (tx, mut rx) = mpsc::channel::<String>(100);
     // Parallel channel for binary frames (audio responses).
@@ -96,9 +97,11 @@ pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) 
     spawn_peer_event_watcher(state.clone(), tx.clone());
     send_state(&state, &conn_id, &tx).await;
 
-    let send_task = tokio::spawn(async move {
+    let shutdown_for_send = shutdown_token.clone();
+    let mut send_task = tokio::spawn(async move {
         loop {
             tokio::select! {
+                _ = shutdown_for_send.cancelled() => break,
                 msg = rx.recv() => match msg {
                     Some(json) => {
                         if ws_sender.send(Message::Text(json.into())).await.is_err() {
@@ -123,72 +126,89 @@ pub async fn handle_websocket_connection(socket: WebSocket, state: ServerState) 
     let conn_id_for_receive = conn_id.clone();
     let tx_for_receive = tx.clone();
     let bin_tx_for_receive = bin_tx.clone();
-    let receive_task = tokio::spawn(async move {
-        while let Some(result) = FuturesStreamExt::next(&mut ws_receiver).await {
-            match result {
-                Ok(Message::Text(text)) => {
-                    let msg = match serde_json::from_str::<UiClientMessage>(&text) {
-                        Ok(msg) => msg,
-                        Err(e) => {
-                            let _ = send_error(&tx_for_receive, format!("Invalid message: {}", e))
-                                .await;
-                            continue;
-                        }
+    let shutdown_for_receive = shutdown_token.clone();
+    let mut receive_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_for_receive.cancelled() => break,
+                result = FuturesStreamExt::next(&mut ws_receiver) => {
+                    let Some(result) = result else {
+                        break;
                     };
-                    super::handlers::handle_ui_message(
-                        &state_for_receive,
-                        &conn_id_for_receive,
-                        &tx_for_receive,
-                        &bin_tx_for_receive,
-                        msg,
-                    )
-                    .await;
-                }
-                Ok(Message::Binary(data)) => {
-                    let (header, payload) = match parse_binary_frame(&data) {
-                        Ok(parsed) => parsed,
-                        Err(e) => {
-                            let _ =
-                                send_error(&tx_for_receive, format!("Invalid binary frame: {e}"))
-                                    .await;
-                            continue;
-                        }
-                    };
-                    let msg = match serde_json::from_str::<UiClientMessage>(header) {
-                        Ok(msg) => msg,
-                        Err(e) => {
-                            let _ = send_error(
+                    match result {
+                        Ok(Message::Text(text)) => {
+                            let msg = match serde_json::from_str::<UiClientMessage>(&text) {
+                                Ok(msg) => msg,
+                                Err(e) => {
+                                    let _ = send_error(&tx_for_receive, format!("Invalid message: {}", e))
+                                        .await;
+                                    continue;
+                                }
+                            };
+                            super::handlers::handle_ui_message(
+                                &state_for_receive,
+                                &conn_id_for_receive,
                                 &tx_for_receive,
-                                format!("Invalid binary frame header: {e}"),
+                                &bin_tx_for_receive,
+                                msg,
                             )
                             .await;
-                            continue;
                         }
-                    };
-                    super::handlers::handle_binary_message(
-                        &state_for_receive,
-                        &conn_id_for_receive,
-                        &tx_for_receive,
-                        &bin_tx_for_receive,
-                        msg,
-                        payload.to_vec(),
-                    )
-                    .await;
-                }
-                Ok(Message::Close(_)) => break,
-                Ok(Message::Ping(_)) => {}
-                Ok(_) => {}
-                Err(e) => {
-                    log::error!("UI WebSocket error: {}", e);
-                    break;
+                        Ok(Message::Binary(data)) => {
+                            let (header, payload) = match parse_binary_frame(&data) {
+                                Ok(parsed) => parsed,
+                                Err(e) => {
+                                    let _ =
+                                        send_error(&tx_for_receive, format!("Invalid binary frame: {e}"))
+                                            .await;
+                                    continue;
+                                }
+                            };
+                            let msg = match serde_json::from_str::<UiClientMessage>(header) {
+                                Ok(msg) => msg,
+                                Err(e) => {
+                                    let _ = send_error(
+                                        &tx_for_receive,
+                                        format!("Invalid binary frame header: {e}"),
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                            };
+                            super::handlers::handle_binary_message(
+                                &state_for_receive,
+                                &conn_id_for_receive,
+                                &tx_for_receive,
+                                &bin_tx_for_receive,
+                                msg,
+                                payload.to_vec(),
+                            )
+                            .await;
+                        }
+                        Ok(Message::Close(_)) => break,
+                        Ok(Message::Ping(_)) => {}
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::error!("UI WebSocket error: {}", e);
+                            break;
+                        }
+                    }
                 }
             }
         }
     });
 
     tokio::select! {
-        _ = send_task => {},
-        _ = receive_task => {},
+        _ = shutdown_token.cancelled() => {
+            send_task.abort();
+            receive_task.abort();
+        }
+        _ = &mut send_task => {
+            receive_task.abort();
+        },
+        _ = &mut receive_task => {
+            send_task.abort();
+        },
     }
 
     {
@@ -334,13 +354,22 @@ fn spawn_event_source_forwarder(
     event_source: Arc<crate::event_fanout::EventFanout>,
 ) {
     let mut events = event_source.subscribe();
+    let shutdown_token = state.shutdown_token.clone();
     tokio::spawn(async move {
-        while let Ok(event) = events.recv().await {
-            if forward_event_to_ui(&state, &conn_id, &tx, event)
-                .await
-                .is_err()
-            {
-                break;
+        loop {
+            tokio::select! {
+                _ = shutdown_token.cancelled() => break,
+                result = events.recv() => match result {
+                    Ok(event) => {
+                        if forward_event_to_ui(&state, &conn_id, &tx, event)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
         }
     });
@@ -580,200 +609,184 @@ pub fn spawn_peer_event_watcher(state: ServerState, tx: mpsc::Sender<String>) {
     };
 
     let mut rx = mesh.subscribe_peer_events();
+    let shutdown_token = state.shutdown_token.clone();
 
     tokio::spawn(async move {
         loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    if tx.is_closed() {
-                        break;
-                    }
-
-                    // On Expired we can push the update immediately because
-                    // the node is gone and the DHT doesn't need time to settle.
-                    // On Discovered we use a retry loop: the remote node needs
-                    // time to bootstrap and register its actors in the DHT, so
-                    // we poll with exponential back-off rather than a fixed sleep.
-                    let needs_retry = match event {
-                        PeerEvent::Discovered(peer_id) => {
-                            log::debug!(
-                                "spawn_peer_event_watcher: peer discovered {peer_id}, will poll until actor is visible"
-                            );
-                            // Invalidate cache — topology changed.
-                            state.invalidate_remote_node_cache().await;
-                            // Also invalidate remote model inventory so model list
-                            // is refreshed when the peer becomes visible.
-                            state.agent.model_inventory.invalidate_remote().await;
-                            true
+            tokio::select! {
+                _ = shutdown_token.cancelled() => break,
+                result = rx.recv() => match result {
+                    Ok(event) => {
+                        if tx.is_closed() {
+                            break;
                         }
-                        PeerEvent::Expired(peer_id) => {
-                            log::debug!(
-                                "spawn_peer_event_watcher: peer expired {peer_id}, refreshing remote nodes"
-                            );
-                            // Invalidate cache — topology changed.
-                            state.invalidate_remote_node_cache().await;
-                            // Also invalidate remote model inventory so stale
-                            // remote models are removed from the list.
-                            state.agent.model_inventory.invalidate_remote().await;
-                            false
+
+                        // On Expired we can push the update immediately because
+                        // the node is gone and the DHT doesn't need time to settle.
+                        // On Discovered we use a retry loop: the remote node needs
+                        // time to bootstrap and register its actors in the DHT, so
+                        // we poll with exponential back-off rather than a fixed sleep.
+                        let needs_retry = match event {
+                            PeerEvent::Discovered(peer_id) => {
+                                log::debug!(
+                                    "spawn_peer_event_watcher: peer discovered {peer_id}, will poll until actor is visible"
+                                );
+                                state.invalidate_remote_node_cache().await;
+                                state.agent.model_inventory.invalidate_remote().await;
+                                true
+                            }
+                            PeerEvent::Expired(peer_id) => {
+                                log::debug!(
+                                    "spawn_peer_event_watcher: peer expired {peer_id}, refreshing remote nodes"
+                                );
+                                state.invalidate_remote_node_cache().await;
+                                state.agent.model_inventory.invalidate_remote().await;
+                                false
+                            }
+                            _ => {
+                                continue;
+                            }
+                        };
+
+                        if tx.is_closed() || shutdown_token.is_cancelled() {
+                            break;
                         }
-                        _ => {
-                            continue;
-                        }
-                    };
 
-                    if tx.is_closed() {
-                        break;
-                    }
+                        if needs_retry {
+                            const DELAYS_MS: &[u64] = &[500, 1_000, 2_000, 4_000, 8_000];
+                            let mut pushed = false;
+                            for &delay_ms in DELAYS_MS {
+                                tokio::select! {
+                                    _ = shutdown_token.cancelled() => break,
+                                    _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+                                }
 
-                    if needs_retry {
-                        // Exponential back-off: 500 ms, 1 s, 2 s, 4 s, 8 s.
-                        // We stop as soon as the newly discovered peer shows up
-                        // in list_remote_nodes(), giving up after ~15 s total.
-                        //
-                        // Invalidate cache before each retry so we always get a
-                        // fresh DHT snapshot.
-                        const DELAYS_MS: &[u64] = &[500, 1_000, 2_000, 4_000, 8_000];
-                        let mut pushed = false;
-                        for &delay_ms in DELAYS_MS {
-                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                                if tx.is_closed() || shutdown_token.is_cancelled() {
+                                    break;
+                                }
 
-                            if tx.is_closed() {
-                                break;
+                                state.invalidate_remote_node_cache().await;
+                                let nodes = state.get_remote_nodes_cached().await;
+
+                                let msg = UiServerMessage::RemoteNodes {
+                                    nodes: crate::control::remote::list_remote_nodes(&state.agent)
+                                        .await,
+                                };
+
+                                if send_message(&tx, msg).await.is_err() {
+                                    break;
+                                }
+
+                                if !nodes.is_empty() {
+                                    pushed = true;
+                                    break;
+                                }
+
+                                log::debug!(
+                                    "spawn_peer_event_watcher: no remote nodes yet, retrying in {}ms",
+                                    delay_ms * 2
+                                );
                             }
 
-                            state.invalidate_remote_node_cache().await;
+                            if !pushed && !shutdown_token.is_cancelled() {
+                                log::warn!(
+                                    "spawn_peer_event_watcher: peer discovered but no remote nodes visible after all retries — peer may not have registered its actors yet"
+                                );
+                            }
+                        } else {
                             let nodes = state.get_remote_nodes_cached().await;
 
+                            let available_hostnames: HashSet<&str> =
+                                nodes.iter().map(|n| n.hostname.as_str()).collect();
+                            let remote_sessions = {
+                                let registry = state.agent.registry.lock().await;
+                                registry.remote_sessions()
+                            };
+
+                            for (session_id, peer_label, _) in remote_sessions {
+                                if !available_hostnames.contains(peer_label.as_str()) {
+                                    match state.agent.get_session_llm_config(&session_id).await {
+                                        Ok(Some(config)) => {
+                                            state.agent.emit_event(
+                                                &session_id,
+                                                crate::events::AgentEventKind::ProviderChanged {
+                                                    provider: config.provider,
+                                                    model: config.model,
+                                                    config_id: config.id,
+                                                    context_limit: None,
+                                                    provider_node_id: None,
+                                                },
+                                            );
+                                            log::info!(
+                                                "spawn_peer_event_watcher: cleared provider_node_id for session {} (peer {} expired)",
+                                                session_id,
+                                                peer_label
+                                            );
+                                        }
+                                        Ok(None) => {
+                                            log::debug!(
+                                                "spawn_peer_event_watcher: no LLM config for session {} (peer {} expired)",
+                                                session_id,
+                                                peer_label
+                                            );
+                                        }
+                                        Err(e) => {
+                                            log::warn!(
+                                                "spawn_peer_event_watcher: failed to get LLM config for session {} (peer {} expired): {}",
+                                                session_id,
+                                                peer_label,
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
                             let msg = UiServerMessage::RemoteNodes {
-                                nodes: crate::control::remote::list_remote_nodes(&state.agent)
-                                    .await,
+                                nodes: crate::control::remote::list_remote_nodes(&state.agent).await,
                             };
 
                             if send_message(&tx, msg).await.is_err() {
                                 break;
                             }
 
-                            // Stop retrying once we can see at least one remote node
-                            // — the UI has been updated and the peer is reachable.
-                            if !nodes.is_empty() {
-                                pushed = true;
-                                break;
-                            }
-
-                            log::debug!(
-                                "spawn_peer_event_watcher: no remote nodes yet, retrying in {}ms",
-                                delay_ms * 2
-                            );
-                        }
-
-                        if !pushed {
-                            log::warn!(
-                                "spawn_peer_event_watcher: peer discovered but no remote nodes \
-                                 visible after all retries — peer may not have registered its actors yet"
-                            );
-                        }
-                    } else {
-                        let nodes = state.get_remote_nodes_cached().await;
-
-                        // Clear provider_node_id for any session that was using the
-                        // expired peer. We detect stale sessions by comparing the
-                        // remote_sessions() peer_label against the set of nodes
-                        // still visible after expiry.
-                        let available_hostnames: HashSet<&str> =
-                            nodes.iter().map(|n| n.hostname.as_str()).collect();
-                        let remote_sessions = {
-                            let registry = state.agent.registry.lock().await;
-                            registry.remote_sessions()
-                        };
-
-                        for (session_id, peer_label, _) in remote_sessions {
-                            if !available_hostnames.contains(peer_label.as_str()) {
-                                match state.agent.get_session_llm_config(&session_id).await {
-                                    Ok(Some(config)) => {
-                                        state.agent.emit_event(
-                                            &session_id,
-                                            crate::events::AgentEventKind::ProviderChanged {
-                                                provider: config.provider,
-                                                model: config.model,
-                                                config_id: config.id,
-                                                context_limit: None,
-                                                provider_node_id: None,
-                                            },
-                                        );
-                                        log::info!(
-                                            "spawn_peer_event_watcher: cleared provider_node_id \
-                                             for session {} (peer {} expired)",
-                                            session_id,
-                                            peer_label
-                                        );
-                                    }
-                                    Ok(None) => {
-                                        log::debug!(
-                                            "spawn_peer_event_watcher: no LLM config for \
-                                             session {} (peer {} expired)",
-                                            session_id,
-                                            peer_label
-                                        );
-                                    }
-                                    Err(e) => {
-                                        log::warn!(
-                                            "spawn_peer_event_watcher: failed to get LLM \
-                                             config for session {} (peer {} expired): {}",
-                                            session_id,
-                                            peer_label,
-                                            e
-                                        );
-                                    }
+                            let state_delayed = state.clone();
+                            let tx_delayed = tx.clone();
+                            let shutdown_delayed = shutdown_token.clone();
+                            tokio::spawn(async move {
+                                tokio::select! {
+                                    _ = shutdown_delayed.cancelled() => return,
+                                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
                                 }
-                            }
+                                if tx_delayed.is_closed() || shutdown_delayed.is_cancelled() {
+                                    return;
+                                }
+                                let _nodes = state_delayed.get_remote_nodes_cached().await;
+                                let msg = UiServerMessage::RemoteNodes {
+                                    nodes: crate::control::remote::list_remote_nodes(
+                                        &state_delayed.agent,
+                                    )
+                                    .await,
+                                };
+                                let _ = send_message(&tx_delayed, msg).await;
+                            });
                         }
-
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!("spawn_peer_event_watcher: lagged by {n} events, re-querying");
+                        state.invalidate_remote_node_cache().await;
+                        state.agent.model_inventory.invalidate_remote().await;
+                        let _nodes = state.get_remote_nodes_cached().await;
                         let msg = UiServerMessage::RemoteNodes {
                             nodes: crate::control::remote::list_remote_nodes(&state.agent).await,
                         };
-
                         if send_message(&tx, msg).await.is_err() {
                             break;
                         }
-
-                        // Schedule a delayed re-check to catch any stale DHT
-                        // records that resolved between the immediate push and
-                        // the DHT eventually purging the expired peer.
-                        let state_delayed = state.clone();
-                        let tx_delayed = tx.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                            if tx_delayed.is_closed() {
-                                return;
-                            }
-                            let _nodes = state_delayed.get_remote_nodes_cached().await;
-                            let msg = UiServerMessage::RemoteNodes {
-                                nodes: crate::control::remote::list_remote_nodes(
-                                    &state_delayed.agent,
-                                )
-                                .await,
-                            };
-                            let _ = send_message(&tx_delayed, msg).await;
-                        });
                     }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    // We missed some events — re-query immediately to catch up.
-                    log::warn!("spawn_peer_event_watcher: lagged by {n} events, re-querying");
-                    state.invalidate_remote_node_cache().await;
-                    state.agent.model_inventory.invalidate_remote().await;
-                    let _nodes = state.get_remote_nodes_cached().await;
-                    let msg = UiServerMessage::RemoteNodes {
-                        nodes: crate::control::remote::list_remote_nodes(&state.agent).await,
-                    };
-                    if send_message(&tx, msg).await.is_err() {
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         break;
                     }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    // The swarm is shutting down — nothing to do.
-                    break;
                 }
             }
         }
@@ -790,21 +803,27 @@ pub async fn subscribe_to_file_index(
     tx: mpsc::Sender<String>,
     workspace_root: std::path::PathBuf,
 ) {
+    let shutdown_token = state.shutdown_token.clone();
     // Get the workspace and subscribe to its file index updates
     let manager = &state.workspace_manager;
-    let handle =
-        match crate::index::get_or_create_workspace_with_timeout(manager, workspace_root.clone())
-            .await
-        {
-            Ok(handle) => handle,
-            Err(err) => {
-                log::error!(
-                    "Failed to get workspace for file index subscription: {}",
-                    err
-                );
-                return;
+    let handle = match tokio::select! {
+        _ = shutdown_token.cancelled() => None,
+        result = crate::index::get_or_create_workspace_with_timeout(manager, workspace_root.clone()) => {
+            match result {
+                Ok(handle) => Some(handle),
+                Err(err) => {
+                    log::error!(
+                        "Failed to get workspace for file index subscription: {}",
+                        err
+                    );
+                    None
+                }
             }
-        };
+        }
+    } {
+        Some(handle) => handle,
+        None => return,
+    };
 
     // Ensure each connection has at most one active forwarder task.
     let existing_forwarder = {
@@ -843,8 +862,17 @@ pub async fn subscribe_to_file_index(
     let tx_for_forward = tx.clone();
 
     // Spawn a task to forward file index updates to the client
+    let shutdown_for_forward = state.shutdown_token.clone();
     let forwarder = tokio::spawn(async move {
-        while let Ok(index) = index_rx.recv().await {
+        loop {
+            let index = tokio::select! {
+                _ = shutdown_for_forward.cancelled() => break,
+                result = index_rx.recv() => match result {
+                    Ok(index) => index,
+                    Err(_) => break,
+                }
+            };
+
             // Get the current session's cwd to filter the index appropriately
             let session_id = {
                 let connections = state_for_forward.connections.lock().await;
@@ -865,26 +893,24 @@ pub async fn subscribe_to_file_index(
 
             let session_id = match session_id {
                 Some(id) => id,
-                None => continue, // No active session, skip this update
+                None => continue,
             };
 
             let cwd = {
                 let cwds = state_for_forward.session_cwds.lock().await;
                 match cwds.get(&session_id).cloned() {
                     Some(cwd) => cwd,
-                    None => continue, // No cwd for this session, skip
+                    None => continue,
                 }
             };
 
-            // Filter the index to the session's cwd
             let relative_cwd = match cwd.strip_prefix(&workspace_root_for_forward) {
                 Ok(relative) => relative,
-                Err(_) => continue, // cwd outside workspace root, skip
+                Err(_) => continue,
             };
 
             let files = super::mentions::filter_index_for_cwd(&index, relative_cwd);
 
-            // Send the filtered index to the client
             if send_message(
                 &tx_for_forward,
                 UiServerMessage::FileIndex {

@@ -195,14 +195,21 @@ pub async fn handle_ui_message(
             let conn_id = conn_id.to_string();
             let tx = tx.clone();
             tokio::spawn(async move {
+                if state.shutdown_token.is_cancelled() {
+                    return;
+                }
                 let cwd = resolve_cwd(None);
                 if let Err(err) =
                     prompt_for_mode(&state, &conn_id, &prompt, cwd.as_ref(), &tx).await
+                    && !state.shutdown_token.is_cancelled()
                 {
                     log::error!("prompt_for_mode failed: {}", err);
                     let _ = super::connection::send_error(&tx, err).await;
                 }
-                handle_list_sessions(&state, &tx, ListSessionsRequest::root_browse()).await;
+
+                if !state.shutdown_token.is_cancelled() {
+                    handle_list_sessions(&state, &tx, ListSessionsRequest::root_browse()).await;
+                }
             });
         }
         UiClientMessage::ListSessions {
@@ -226,7 +233,9 @@ pub async fn handle_ui_message(
             let state = state.clone();
             let tx = tx.clone();
             tokio::spawn(async move {
-                handle_list_sessions(&state, &tx, request).await;
+                if !state.shutdown_token.is_cancelled() {
+                    handle_list_sessions(&state, &tx, request).await;
+                }
             });
         }
         UiClientMessage::ListSessionChildren {
@@ -341,7 +350,9 @@ pub async fn handle_ui_message(
             let state = state.clone();
             let tx = tx.clone();
             tokio::spawn(async move {
-                handle_list_remote_nodes(&state, &tx).await;
+                if !state.shutdown_token.is_cancelled() {
+                    handle_list_remote_nodes(&state, &tx).await;
+                }
             });
         }
         UiClientMessage::ListRemoteSessions {

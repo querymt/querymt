@@ -288,31 +288,40 @@ pub async fn ensure_session(
         .await;
 
         tokio::spawn(async move {
-            let status = match get_or_create_workspace_with_timeout(&manager, root.clone()).await {
-                Ok(_) => {
-                    // Subscribe to file index updates for this workspace
-                    super::connection::subscribe_to_file_index(
-                        state_clone,
-                        conn_id_clone,
-                        tx_clone.clone(),
-                        root,
-                    )
-                    .await;
+            let status = tokio::select! {
+                _ = state_clone.shutdown_token.cancelled() => None,
+                result = get_or_create_workspace_with_timeout(&manager, root.clone()) => {
+                    Some(match result {
+                        Ok(_) => {
+                            // Subscribe to file index updates for this workspace
+                            super::connection::subscribe_to_file_index(
+                                state_clone.clone(),
+                                conn_id_clone,
+                                tx_clone.clone(),
+                                root,
+                            )
+                            .await;
 
-                    UiServerMessage::WorkspaceIndexStatus {
-                        session_id: session_id_clone,
-                        status: "ready".to_string(),
-                        message: None,
-                    }
+                            UiServerMessage::WorkspaceIndexStatus {
+                                session_id: session_id_clone,
+                                status: "ready".to_string(),
+                                message: None,
+                            }
+                        }
+                        Err(err) => UiServerMessage::WorkspaceIndexStatus {
+                            session_id: session_id_clone,
+                            status: "error".to_string(),
+                            message: Some(err.to_string()),
+                        },
+                    })
                 }
-                Err(err) => UiServerMessage::WorkspaceIndexStatus {
-                    session_id: session_id_clone,
-                    status: "error".to_string(),
-                    message: Some(err.to_string()),
-                },
             };
 
-            let _ = super::connection::send_message(&tx_clone, status).await;
+            if let Some(status) = status
+                && !state_clone.shutdown_token.is_cancelled()
+            {
+                let _ = super::connection::send_message(&tx_clone, status).await;
+            }
         });
     }
 
