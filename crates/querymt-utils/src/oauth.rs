@@ -28,8 +28,8 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use oauth2::basic::BasicClient;
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, PkceCodeVerifier,
-    RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
+    AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeVerifier, RedirectUrl, RefreshToken,
+    Scope, TokenResponse, TokenUrl,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -411,9 +411,8 @@ impl XaiProvider {
         let (authorization_url, oauth_state) = client
             .authorize_url(|| CsrfToken::new(state.to_string()))
             .add_scope(Scope::new(Self::SCOPE.to_string()))
-            .set_pkce_challenge(PkceCodeChallenge::from_code_verifier_sha256(
-                &PkceCodeVerifier::new(code_challenge.to_string()),
-            ))
+            .add_extra_param("code_challenge", code_challenge)
+            .add_extra_param("code_challenge_method", "S256")
             .add_extra_param("nonce", nonce)
             .add_extra_param("plan", "generic")
             .add_extra_param("referrer", "querymt")
@@ -1143,7 +1142,7 @@ mod tests {
             XaiProvider::DEFAULT_REDIRECT_URI,
             state,
             nonce,
-            verifier,
+            &challenge,
         )
         .unwrap();
         let parsed = url::Url::parse(&url).unwrap();
@@ -1224,6 +1223,47 @@ mod tests {
         assert_eq!(form.get("code_verifier"), Some(&"verifier"));
         assert_eq!(form.get("code_challenge"), Some(&"challenge"));
         assert_eq!(form.get("code_challenge_method"), Some(&"S256"));
+    }
+
+    #[test]
+    fn xai_pkce_challenge_matches_verifier_across_authorize_and_exchange() {
+        let code_verifier = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
+        let code_challenge = XaiProvider::code_challenge(code_verifier);
+        let authorize_url = XaiProvider::build_authorization_url(
+            XaiProvider::DEFAULT_AUTH_URL,
+            XaiProvider::DEFAULT_CLIENT_ID,
+            XaiProvider::DEFAULT_REDIRECT_URI,
+            "state-value",
+            "nonce-value",
+            &code_challenge,
+        )
+        .unwrap();
+        let authorize_params: std::collections::HashMap<_, _> = url::Url::parse(&authorize_url)
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+        let snapshot = XaiFlowSnapshot {
+            code_verifier: code_verifier.to_string(),
+            code_challenge: code_challenge.clone(),
+            token_endpoint: XaiProvider::DEFAULT_TOKEN_URL.to_string(),
+            redirect_uri: XaiProvider::DEFAULT_REDIRECT_URI.to_string(),
+            client_id: XaiProvider::DEFAULT_CLIENT_ID.to_string(),
+        };
+        let exchange_form: std::collections::HashMap<_, _> =
+            XaiProvider::exchange_form("auth-code", &snapshot)
+                .into_iter()
+                .collect();
+
+        assert_eq!(
+            authorize_params.get("code_challenge").map(String::as_str),
+            Some(code_challenge.as_str())
+        );
+        assert_eq!(exchange_form.get("code_verifier"), Some(&code_verifier));
+        assert_eq!(
+            exchange_form.get("code_challenge"),
+            Some(&code_challenge.as_str())
+        );
     }
 
     #[test]
