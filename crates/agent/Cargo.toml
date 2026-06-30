@@ -144,7 +144,7 @@ name = "querymt_agent"
 path = "src/lib.rs"
 
 [dev-dependencies]
-mockall = "0.14"
+mockall = "0.15"
 env_logger = "0.11"
 tempfile = "3.0"
 clap = { version = "4.5", features = ["derive"] }
