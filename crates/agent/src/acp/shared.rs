@@ -385,8 +385,18 @@ fn translate_event_to_update_for_mode(
                     .message_id(MessageId::from(message_id.clone())),
             ))
         }
-        // Thinking/reasoning deltas: ACP has no thinking content type yet — drop.
-        AgentEventKind::AssistantThinkingDelta { .. } => None,
+        AgentEventKind::AssistantThinkingDelta {
+            content,
+            message_id,
+        } => {
+            if content.is_empty() {
+                return None;
+            }
+            Some(SessionUpdate::AgentThoughtChunk(
+                ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
+                    .message_id(MessageId::from(message_id.clone())),
+            ))
+        }
         AgentEventKind::ToolCallStart {
             tool_call_id,
             tool_name,
@@ -1289,6 +1299,54 @@ mod tests {
         });
 
         assert!(translate_replay_event_to_update(&delta).is_none());
+    }
+
+    #[test]
+    fn live_translator_forwards_thinking_delta_as_agent_thought_chunk() {
+        let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::AssistantThinkingDelta {
+                content: "thinking".to_string(),
+                message_id: "a-1".to_string(),
+            },
+        });
+
+        let Some(SessionUpdate::AgentThoughtChunk(chunk)) =
+            AcpLiveEventTranslator::new().translate_update(&delta)
+        else {
+            panic!("expected thought chunk");
+        };
+        let ContentBlock::Text(text) = chunk.content else {
+            panic!("expected text content");
+        };
+        assert_eq!(text.text, "thinking");
+        assert_eq!(
+            chunk.message_id.as_ref().map(|id| id.0.as_ref()),
+            Some("a-1")
+        );
+    }
+
+    #[test]
+    fn live_translator_skips_empty_thinking_delta() {
+        let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::AssistantThinkingDelta {
+                content: String::new(),
+                message_id: "a-1".to_string(),
+            },
+        });
+
+        assert!(
+            AcpLiveEventTranslator::new()
+                .translate_update(&delta)
+                .is_none()
+        );
     }
 
     #[test]
