@@ -350,3 +350,4 @@ mod remote_ext;
 mod schedule_get_remote;
 mod schedule_notifications;
 mod scheduler;
+mod session_ops_ext;

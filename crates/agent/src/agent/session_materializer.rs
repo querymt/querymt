@@ -346,8 +346,8 @@ impl SessionMaterializer {
             }
         }
 
-        // Validate session exists in DB (heavy I/O)
-        let _session = self
+        // Validate session exists in DB (heavy I/O) and prefer its persisted cwd.
+        let session = self
             .config
             .provider
             .history_store()
@@ -361,7 +361,8 @@ impl SessionMaterializer {
                 }))
             })?;
 
-        let cwd = acp_cwd_to_optional(&req.cwd)?;
+        let request_cwd = acp_cwd_to_optional(&req.cwd)?;
+        let cwd = session.cwd.or(request_cwd);
 
         // Resolve MCP inputs (config + request + runtime attachments)
         let resolved = self

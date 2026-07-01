@@ -14,6 +14,7 @@ mod ext_models;
 mod ext_plugins;
 mod ext_remote;
 mod ext_schedules;
+mod ext_session_ops;
 mod model_registry;
 mod remote_mesh;
 mod remote_nodes;

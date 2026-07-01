@@ -41,6 +41,20 @@ async fn test_querymt_capabilities_lists_control_surface() {
             .iter()
             .any(|method| method == "querymt/schedules/get")
     );
+    for expected in [
+        "querymt/session/undo",
+        "querymt/session/redo",
+        "querymt/session/undoStack",
+    ] {
+        assert!(
+            result["methods"]
+                .as_array()
+                .expect("methods array")
+                .iter()
+                .any(|method| method == expected),
+            "missing capability method {expected}"
+        );
+    }
     assert!(
         result["notifications"]
             .as_array()
