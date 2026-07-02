@@ -507,6 +507,11 @@ impl SessionMaterializer {
     ///
     /// This does NOT hold the registry lock. After this returns, the caller
     /// can use the returned session ID to load the forked session.
+    ///
+    /// Native ACP has no fork-point field, so QueryMT clients may pass
+    /// `_meta.querymt.message_id` (or `messageId`) to fork at a historical
+    /// message boundary. Without that hint, this follows ACP's latest-state
+    /// behavior by forking at the last stored message.
     pub async fn prepare_fork_session(
         &self,
         req: ForkSessionRequest,
@@ -537,9 +542,9 @@ impl SessionMaterializer {
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
-        let target_message_id = history
-            .last()
-            .map(|msg| msg.id.clone())
+        let target_message_id = fork_message_id_from_meta(req.meta.as_ref())
+            .map(ToOwned::to_owned)
+            .or_else(|| history.last().map(|msg| msg.id.clone()))
             .ok_or(crate::error::AgentError::EmptySessionFork)?;
 
         // Fork session in DB (heavy I/O)
@@ -788,5 +793,192 @@ impl SessionMaterializer {
         // We defer this to avoid needing the registry lock
 
         Ok(SessionMaterialization { actor_ref, runtime })
+    }
+}
+
+fn fork_message_id_from_meta(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<&str> {
+    let querymt = meta?.get("querymt")?;
+    querymt
+        .get("message_id")
+        .or_else(|| querymt.get("messageId"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|message_id| !message_id.is_empty())
+}
+
+#[cfg(test)]
+mod fork_meta_tests {
+    use super::*;
+    use crate::agent::agent_config_builder::AgentConfigBuilder;
+    use crate::agent::core::ToolPolicy;
+    use crate::model::AgentMessage;
+    use crate::session::backend::StorageBackend;
+    use crate::session::domain::ForkOrigin;
+    use crate::session::provider::SessionProvider;
+    use crate::session::store::SessionStore;
+    use crate::test_utils::{
+        MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
+        mock_plugin_registry, mock_session,
+    };
+    use querymt::LLMParams;
+    use querymt::chat::ChatRole;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn message(id: &str, session_id: &str) -> AgentMessage {
+        let mut message = AgentMessage::new(session_id.to_string(), ChatRole::User);
+        message.id = id.to_string();
+        message
+    }
+
+    async fn materializer_with_store(store: MockSessionStore) -> SessionMaterializer {
+        let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
+        let shared = SharedLlmProvider {
+            inner: provider,
+            tools: vec![].into_boxed_slice(),
+        };
+        let factory = Arc::new(TestProviderFactory { provider: shared });
+        let (plugin_registry, _temp) = mock_plugin_registry(factory).expect("registry");
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("create event store"),
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        let provider = Arc::new(SessionProvider::new(
+            Arc::new(plugin_registry),
+            store,
+            LLMParams::new().provider("mock").model("mock-model"),
+        ));
+        let config = Arc::new(
+            AgentConfigBuilder::from_provider(storage.clone(), provider, storage.event_journal())
+                .with_tool_policy(ToolPolicy::ProviderOnly)
+                .build(),
+        );
+        SessionMaterializer::new(config)
+    }
+
+    #[tokio::test]
+    async fn prepare_fork_session_uses_querymt_message_id_meta() {
+        let source_session_id = "source-session".to_string();
+        let history_session_id = source_session_id.clone();
+        let fork_source_id = source_session_id.clone();
+        let session = mock_session(&source_session_id);
+        let llm_config = mock_llm_config();
+        let mut store = MockSessionStore::new();
+        store
+            .expect_get_session()
+            .returning(move |_| Ok(Some(session.clone())))
+            .times(1);
+        store
+            .expect_get_history()
+            .returning(move |_| {
+                Ok(vec![
+                    message("msg-1", &history_session_id),
+                    message("msg-2", &history_session_id),
+                ])
+            })
+            .times(1);
+        store
+            .expect_fork_session()
+            .withf(move |source, target, origin| {
+                source == fork_source_id && target == "msg-1" && *origin == ForkOrigin::User
+            })
+            .returning(|_, _, _| Ok("forked-session".to_string()))
+            .times(1);
+        store
+            .expect_get_session_llm_config()
+            .returning(move |_| Ok(Some(llm_config.clone())))
+            .times(0..);
+        store
+            .expect_list_sessions()
+            .returning(|| Ok(vec![]))
+            .times(0..);
+
+        let materializer = materializer_with_store(store).await;
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "querymt".to_string(),
+            serde_json::json!({ "message_id": "msg-1" }),
+        );
+        let req = ForkSessionRequest::new(
+            crate::acp::protocol::SessionId::from(source_session_id),
+            std::path::PathBuf::from("/tmp"),
+        )
+        .meta(meta);
+
+        let response = materializer
+            .prepare_fork_session(req)
+            .await
+            .expect("fork session");
+        assert_eq!(response.session_id.to_string(), "forked-session");
+    }
+
+    #[tokio::test]
+    async fn prepare_fork_session_without_meta_uses_latest_message() {
+        let source_session_id = "source-session".to_string();
+        let history_session_id = source_session_id.clone();
+        let fork_source_id = source_session_id.clone();
+        let session = mock_session(&source_session_id);
+        let llm_config = mock_llm_config();
+        let mut store = MockSessionStore::new();
+        store
+            .expect_get_session()
+            .returning(move |_| Ok(Some(session.clone())))
+            .times(1);
+        store
+            .expect_get_history()
+            .returning(move |_| {
+                Ok(vec![
+                    message("msg-1", &history_session_id),
+                    message("msg-2", &history_session_id),
+                ])
+            })
+            .times(1);
+        store
+            .expect_fork_session()
+            .withf(move |source, target, origin| {
+                source == fork_source_id && target == "msg-2" && *origin == ForkOrigin::User
+            })
+            .returning(|_, _, _| Ok("forked-session".to_string()))
+            .times(1);
+        store
+            .expect_get_session_llm_config()
+            .returning(move |_| Ok(Some(llm_config.clone())))
+            .times(0..);
+        store
+            .expect_list_sessions()
+            .returning(|| Ok(vec![]))
+            .times(0..);
+
+        let materializer = materializer_with_store(store).await;
+        let req = ForkSessionRequest::new(
+            crate::acp::protocol::SessionId::from(source_session_id),
+            std::path::PathBuf::from("/tmp"),
+        );
+
+        let response = materializer
+            .prepare_fork_session(req)
+            .await
+            .expect("fork session");
+        assert_eq!(response.session_id.to_string(), "forked-session");
+    }
+
+    #[test]
+    fn fork_message_id_from_meta_accepts_snake_and_camel_case() {
+        let mut snake = serde_json::Map::new();
+        snake.insert(
+            "querymt".to_string(),
+            serde_json::json!({ "message_id": "msg-1" }),
+        );
+        assert_eq!(fork_message_id_from_meta(Some(&snake)), Some("msg-1"));
+
+        let mut camel = serde_json::Map::new();
+        camel.insert(
+            "querymt".to_string(),
+            serde_json::json!({ "messageId": "msg-2" }),
+        );
+        assert_eq!(fork_message_id_from_meta(Some(&camel)), Some("msg-2"));
     }
 }
