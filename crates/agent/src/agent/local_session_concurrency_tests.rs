@@ -287,7 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_session_prefers_stored_cwd_over_request_cwd() {
-        let (materializer, _registry, config, _temp_dir) = create_test_setup().await;
+        let (materializer, _registry, _config, _temp_dir) = create_test_setup().await;
         let stored_cwd = PathBuf::from("/tmp/stored-session-cwd");
         let request_cwd = PathBuf::from("/tmp/request-cwd");
 
