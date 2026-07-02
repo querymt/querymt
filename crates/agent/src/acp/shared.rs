@@ -150,8 +150,12 @@ pub fn schedules_changed_notification(
     )
 }
 
+fn normalize_querymt_ext_method(method: &str) -> &str {
+    method.strip_prefix('_').unwrap_or(method)
+}
+
 fn querymt_session_id_from_request(method: &str, params: &serde_json::Value) -> Option<String> {
-    match method {
+    match normalize_querymt_ext_method(method) {
         "querymt/remote/attachSession" => {
             serde_json::from_value::<AttachRemoteSessionRequest>(params.clone())
                 .ok()
@@ -162,7 +166,7 @@ fn querymt_session_id_from_request(method: &str, params: &serde_json::Value) -> 
 }
 
 fn querymt_session_id_from_response(method: &str, value: &serde_json::Value) -> Option<String> {
-    match method {
+    match normalize_querymt_ext_method(method) {
         "querymt/remote/createSession" => {
             serde_json::from_value::<RemoteSessionAttachInfo>(value.clone())
                 .ok()
@@ -867,24 +871,30 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                     }
                 }
 
-                // Forward _querymt/* extension methods to the agent's ext_method handler.
+                // Forward QueryMT extension methods to the agent's ext_method handler.
+                // SDK ACP strips the leading underscore for extension requests;
+                // WebSocket clients may send either shape, so normalize here.
                 m if m.starts_with("_querymt/") || m.starts_with("querymt/") => {
-                    let session_id_for_owner = querymt_session_id_from_request(m, &req.params);
+                    let ext_method = normalize_querymt_ext_method(m);
+                    let session_id_for_owner =
+                        querymt_session_id_from_request(ext_method, &req.params);
                     let raw_params = serde_json::value::RawValue::from_string(
                         serde_json::to_string(&req.params).unwrap_or_else(|_| "null".to_string()),
                     )
                     .unwrap_or_else(|_| {
                         serde_json::value::RawValue::from_string("null".to_string()).unwrap()
                     });
-                    let ext_req =
-                        crate::acp::protocol::ExtRequest::new(m, std::sync::Arc::from(raw_params));
+                    let ext_req = crate::acp::protocol::ExtRequest::new(
+                        ext_method,
+                        std::sync::Arc::from(raw_params),
+                    );
                     let response = agent.ext_method(ext_req).await.map(|r| {
                         serde_json::from_str(r.0.get()).unwrap_or(serde_json::Value::Null)
                     });
                     match response {
                         Ok(mut value) => {
                             let session_id = session_id_for_owner
-                                .or_else(|| querymt_session_id_from_response(m, &value));
+                                .or_else(|| querymt_session_id_from_response(ext_method, &value));
                             if let Some(session_id) = session_id {
                                 let mut owners = session_owners.lock().await;
                                 owners.insert(session_id.clone(), conn_id.to_string());
@@ -1740,8 +1750,9 @@ mod tests {
             }
             async fn ext_method(
                 &self,
-                _: crate::acp::protocol::ExtRequest,
+                req: crate::acp::protocol::ExtRequest,
             ) -> Result<crate::acp::protocol::ExtResponse, Error> {
+                assert_eq!(req.method.as_ref(), "querymt/remote/attachSession");
                 let raw = serde_json::value::RawValue::from_string(
                     serde_json::json!({"attached": true}).to_string(),
                 )
@@ -1767,7 +1778,7 @@ mod tests {
             "conn-9",
             RpcRequest {
                 jsonrpc: "2.0".to_string(),
-                method: "querymt/remote/attachSession".to_string(),
+                method: "_querymt/remote/attachSession".to_string(),
                 params: serde_json::json!({"session_id": "s-remote", "node_id": "n-1"}),
                 id: serde_json::json!(1),
             },

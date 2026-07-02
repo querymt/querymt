@@ -54,6 +54,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "api")]
 const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:3000";
+const DEFAULT_ACP_WS_ADDR: &str = "127.0.0.1:3030";
 #[cfg(feature = "remote")]
 const DEFAULT_MESH_ADDR: &str = "/ip4/0.0.0.0/tcp/0";
 #[cfg(feature = "remote")]
@@ -68,15 +69,23 @@ const DEFAULT_MESH_STREAM_RECONNECT_GRACE: std::time::Duration =
     about = "Run QueryMT coder agent in ACP mode, API mode, dashboard mode, or as a mesh node"
 )]
 #[command(
-    after_help = "Examples:\n  qmtcode --acp\n  qmtcode --api\n  qmtcode --api=0.0.0.0:8080\n  qmtcode --dashboard\n  qmtcode --dashboard=0.0.0.0:8080\n  qmtcode --mesh\n  qmtcode --mesh=/ip4/0.0.0.0/tcp/9001\n  qmtcode --api --mesh\n  qmtcode --mesh --mesh-invite\n  qmtcode --mesh --mesh-invite=\"My Mesh\"\n  qmtcode --mesh-join=qmt://mesh/join/TOKEN\n  qmtcode path/to/config.toml --acp"
+    after_help = "Examples:\n  qmtcode --acp\n  qmtcode --acp-ws\n  qmtcode --acp-ws=0.0.0.0:42069\n  qmtcode --api\n  qmtcode --api=0.0.0.0:8080\n  qmtcode --dashboard\n  qmtcode --dashboard=0.0.0.0:8080\n  qmtcode --mesh\n  qmtcode --mesh=/ip4/0.0.0.0/tcp/9001\n  qmtcode --api --mesh\n  qmtcode --mesh --mesh-invite\n  qmtcode --mesh --mesh-invite=\"My Mesh\"\n  qmtcode --mesh-join=qmt://mesh/join/TOKEN\n  qmtcode path/to/config.toml --acp"
 )]
 #[cfg_attr(
-    feature = "dashboard",
-    command(group(ArgGroup::new("transport").args(["acp", "api", "dashboard"]).multiple(false)))
+    all(feature = "api", feature = "dashboard"),
+    command(group(ArgGroup::new("transport").args(["acp", "acp_ws", "api", "dashboard"]).multiple(false)))
 )]
 #[cfg_attr(
     all(feature = "api", not(feature = "dashboard")),
-    command(group(ArgGroup::new("transport").args(["acp", "api"]).multiple(false)))
+    command(group(ArgGroup::new("transport").args(["acp", "acp_ws", "api"]).multiple(false)))
+)]
+#[cfg_attr(
+    all(not(feature = "api"), feature = "dashboard"),
+    command(group(ArgGroup::new("transport").args(["acp", "acp_ws", "dashboard"]).multiple(false)))
+)]
+#[cfg_attr(
+    all(not(feature = "api"), not(feature = "dashboard")),
+    command(group(ArgGroup::new("transport").args(["acp", "acp_ws"]).multiple(false)))
 )]
 struct Cli {
     /// Path to TOML config.
@@ -105,6 +114,10 @@ struct Cli {
     /// Run as ACP stdio server (for subprocess spawning)
     #[arg(long)]
     acp: bool,
+
+    /// Run as ACP WebSocket server; optionally set bind address
+    #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_ACP_WS_ADDR)]
+    acp_ws: Option<String>,
 
     /// Run API server for alternate UIs; optionally set bind address
     #[cfg(feature = "api")]
@@ -356,6 +369,7 @@ fn load_stored_iroh_scopes() -> anyhow::Result<Vec<querymt_agent::agent::remote:
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let is_acp = cli.acp;
+    let is_acp_ws = cli.acp_ws.is_some();
     #[cfg(feature = "api")]
     let is_api = cli.api.is_some();
     #[cfg(not(feature = "api"))]
@@ -412,9 +426,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if !is_acp && !is_api && !is_dashboard && !has_mesh {
+    if !is_acp && !is_acp_ws && !is_api && !is_dashboard && !has_mesh {
         return Err(
-            "No mode selected. Use --acp, --api, --dashboard, or --mesh, or --mesh-join.".into(),
+            "No mode selected. Use --acp, --acp-ws, --api, --dashboard, or --mesh, or --mesh-join."
+                .into(),
         );
     }
 
@@ -647,6 +662,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if is_acp {
         eprintln!("Starting ACP stdio server...");
         runner.acp("stdio").await?;
+    } else if let Some(addr) = cli.acp_ws.as_deref() {
+        eprintln!("Starting ACP WebSocket server at ws://{addr}/ws...");
+        let transport = format!("ws://{addr}");
+        runner.acp(&transport).await?;
     } else if is_api {
         #[cfg(feature = "api")]
         {
@@ -870,5 +889,23 @@ system = "inline"
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--db <path>"));
         assert!(help.contains("QMT_SESSIONS_DB"));
+    }
+
+    #[test]
+    fn acp_ws_flag_defaults_to_localhost() {
+        let cli = Cli::try_parse_from(["qmtcode", "--acp-ws"]).expect("CLI args should parse");
+        assert_eq!(cli.acp_ws.as_deref(), Some(DEFAULT_ACP_WS_ADDR));
+    }
+
+    #[test]
+    fn acp_ws_flag_accepts_bind_override() {
+        let cli = Cli::try_parse_from(["qmtcode", "--acp-ws=0.0.0.0:42069"])
+            .expect("CLI args should parse");
+        assert_eq!(cli.acp_ws.as_deref(), Some("0.0.0.0:42069"));
+    }
+
+    #[test]
+    fn acp_and_acp_ws_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["qmtcode", "--acp", "--acp-ws"]).is_err());
     }
 }
