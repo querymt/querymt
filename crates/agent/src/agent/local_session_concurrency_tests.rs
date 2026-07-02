@@ -285,6 +285,32 @@ mod tests {
         println!("✓ All 5 loads correctly resulted in only 1 actor creation");
     }
 
+    #[tokio::test]
+    async fn test_load_session_prefers_stored_cwd_over_request_cwd() {
+        let (materializer, _registry, _config, _temp_dir) = create_test_setup().await;
+        let stored_cwd = PathBuf::from("/tmp/stored-session-cwd");
+        let request_cwd = PathBuf::from("/tmp/request-cwd");
+
+        let create_req = NewSessionRequest::new(stored_cwd.clone());
+        let prepared = materializer
+            .prepare_new_session(create_req)
+            .await
+            .expect("create session");
+        let session_id = prepared.session_id.clone();
+        drop(prepared);
+
+        let load_req = LoadSessionRequest::new(SessionId::from(session_id), request_cwd);
+        let prepared = match materializer.prepare_load_session(load_req, None).await {
+            Ok(PreparedSessionResult::Prepared(prepared)) => prepared,
+            Ok(PreparedSessionResult::AlreadyRegistered(_)) => {
+                panic!("unexpected existing session")
+            }
+            Err(err) => panic!("load failed: {err:?}"),
+        };
+
+        assert_eq!(prepared.cwd.as_deref(), Some(stored_cwd.as_path()));
+    }
+
     /// Test that concurrent prepare_load_session calls for DIFFERENT session IDs
     /// create DIFFERENT actors (parallelism should still work for different sessions).
     ///
