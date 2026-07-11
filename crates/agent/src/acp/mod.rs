@@ -22,8 +22,8 @@ pub use stdio::serve_stdio;
 
 // Existing manual JSON-RPC implementation (for dashboard compatibility)
 use crate::acp::shared::{
-    AcpLiveEventTranslator, PendingElicitationMap, PermissionMap, RpcRequest, SessionOwnerMap,
-    collect_event_sources, handle_rpc_message, is_event_owned,
+    AcpLiveEventTranslator, PendingElicitationMap, PermissionMap, RpcMessage, SessionOwnerMap,
+    collect_event_sources, dispatch_rpc_message, is_event_owned,
 };
 use crate::event_fanout::EventFanout;
 
@@ -124,27 +124,17 @@ impl AcpServer {
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str::<RpcRequest>(&line) {
+            match serde_json::from_str::<RpcMessage>(&line) {
                 Ok(request) => {
-                    let output = handle_rpc_message(
-                        state.agent.as_ref(),
-                        &state.session_owners,
-                        &state.pending_permissions,
-                        &state.pending_elicitations,
-                        &conn_id,
+                    tokio::spawn(dispatch_rpc_message(
+                        state.agent.clone(),
+                        state.session_owners.clone(),
+                        state.pending_permissions.clone(),
+                        state.pending_elicitations.clone(),
+                        conn_id.clone(),
                         request,
-                    )
-                    .await;
-                    for notification in output.notifications {
-                        let json = serde_json::to_string(&notification).unwrap_or_default();
-                        if tx.send(json).await.is_err() {
-                            break;
-                        }
-                    }
-                    let json = serde_json::to_string(&output.response).unwrap_or_default();
-                    if tx.send(json).await.is_err() {
-                        break;
-                    }
+                        tx.clone(),
+                    ));
                 }
                 Err(e) => {
                     log::error!("Failed to parse stdio message: {}", e);
@@ -185,28 +175,18 @@ async fn handle_websocket_connection(socket: WebSocket, state: ServerState) {
     let receive_task = tokio::spawn(async move {
         while let Some(result) = FuturesStreamExt::next(&mut ws_receiver).await {
             match result {
-                Ok(Message::Text(text)) => match serde_json::from_str::<RpcRequest>(&text) {
+                Ok(Message::Text(text)) => match serde_json::from_str::<RpcMessage>(&text) {
                     Ok(request) => {
-                        let output = handle_rpc_message(
-                            state.agent.as_ref(),
-                            &state.session_owners,
-                            &state.pending_permissions,
-                            &state.pending_elicitations,
-                            &conn_id,
+                        // Keep ingress responsive while a prompt is still executing.
+                        tokio::spawn(dispatch_rpc_message(
+                            state.agent.clone(),
+                            state.session_owners.clone(),
+                            state.pending_permissions.clone(),
+                            state.pending_elicitations.clone(),
+                            conn_id.clone(),
                             request,
-                        )
-                        .await;
-                        for notification in output.notifications {
-                            let json = serde_json::to_string(&notification).unwrap_or_default();
-                            if tx.send(json).await.is_err() {
-                                break;
-                            }
-                        }
-                        let json = serde_json::to_string(&output.response).unwrap_or_default();
-
-                        if tx.send(json).await.is_err() {
-                            break;
-                        }
+                            tx.clone(),
+                        ));
                     }
                     Err(e) => {
                         log::error!("Failed to parse WebSocket message: {}", e);

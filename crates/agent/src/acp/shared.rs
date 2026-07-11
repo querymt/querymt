@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 /// Type alias for session ownership mapping (session_id -> connection_id)
 pub type SessionOwnerMap = Arc<Mutex<HashMap<String, String>>>;
@@ -31,14 +31,14 @@ pub type PermissionMap = Arc<Mutex<HashMap<String, oneshot::Sender<RequestPermis
 /// Type alias for pending elicitation requests (elicitation_id -> response sender)
 pub type PendingElicitationMap = crate::elicitation::PendingElicitationMap;
 
-/// JSON-RPC 2.0 request structure
+/// JSON-RPC 2.0 method call envelope for both requests and notifications.
 #[derive(Deserialize)]
-pub struct RpcRequest {
+pub struct RpcMessage {
     #[allow(dead_code)]
     pub jsonrpc: String,
     pub method: String,
     pub params: serde_json::Value,
-    pub id: serde_json::Value,
+    pub id: Option<serde_json::Value>,
 }
 
 /// JSON-RPC 2.0 response structure
@@ -54,7 +54,55 @@ pub struct RpcResponse {
 
 pub struct RpcDispatchOutput {
     pub notifications: Vec<serde_json::Value>,
-    pub response: RpcResponse,
+    pub response: Option<RpcResponse>,
+}
+
+/// Dispatch one JSON-RPC method call and forward all resulting wire messages.
+///
+/// Transports spawn this helper for each inbound call so a long-running request
+/// cannot prevent a later notification, such as `session/cancel`, from running.
+/// The dispatched work intentionally outlives a client connection; sessions are
+/// owned by the agent runtime rather than a transport connection.
+pub(crate) async fn dispatch_rpc_message<S: SendAgent>(
+    agent: Arc<S>,
+    session_owners: SessionOwnerMap,
+    pending_permissions: PermissionMap,
+    pending_elicitations: PendingElicitationMap,
+    conn_id: String,
+    request: RpcMessage,
+    tx: mpsc::Sender<String>,
+) {
+    let output = handle_rpc_message(
+        agent.as_ref(),
+        &session_owners,
+        &pending_permissions,
+        &pending_elicitations,
+        &conn_id,
+        request,
+    )
+    .await;
+
+    for notification in output.notifications {
+        let json = match serde_json::to_string(&notification) {
+            Ok(json) => json,
+            Err(err) => {
+                log::warn!("Failed to serialize JSON-RPC notification: {}", err);
+                continue;
+            }
+        };
+        if tx.send(json).await.is_err() {
+            return;
+        }
+    }
+
+    if let Some(response) = output.response {
+        match serde_json::to_string(&response) {
+            Ok(json) => {
+                let _ = tx.send(json).await;
+            }
+            Err(err) => log::warn!("Failed to serialize JSON-RPC response: {}", err),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -585,7 +633,7 @@ pub async fn handle_rpc_message<S: SendAgent>(
     pending_permissions: &PermissionMap,
     pending_elicitations: &PendingElicitationMap,
     conn_id: &str,
-    req: RpcRequest,
+    req: RpcMessage,
 ) -> RpcDispatchOutput {
     handle_rpc_message_with_context(
         agent,
@@ -605,7 +653,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
     pending_permissions: &PermissionMap,
     pending_elicitations: &PendingElicitationMap,
     conn_id: &str,
-    req: RpcRequest,
+    req: RpcMessage,
     context: RpcDispatchContext,
 ) -> RpcDispatchOutput {
     let rpc_method = req.method.clone();
@@ -924,19 +972,24 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
         })
         .await;
 
-    let response = match result {
-        Ok(res) => RpcResponse {
+    let response = match (req.id, result) {
+        (Some(id), Ok(res)) => Some(RpcResponse {
             jsonrpc: "2.0".to_string(),
             result: Some(res),
             error: None,
-            id: req.id,
-        },
-        Err(e) => RpcResponse {
+            id,
+        }),
+        (Some(id), Err(e)) => Some(RpcResponse {
             jsonrpc: "2.0".to_string(),
             result: None,
             error: Some(serde_json::to_value(e).unwrap()),
-            id: req.id,
-        },
+            id,
+        }),
+        (None, Ok(_)) => None,
+        (None, Err(e)) => {
+            log::warn!("JSON-RPC notification '{}' failed: {}", rpc_method, e);
+            None
+        }
     };
 
     RpcDispatchOutput {
@@ -1045,8 +1098,9 @@ mod tests {
     use crate::test_utils::DelegateTestFixture;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::sync::Mutex;
     use tokio::sync::oneshot;
+    use tokio::sync::{Mutex, Notify};
+    use tokio::time::{Duration, timeout};
 
     fn tool_start_event(tool_name: &str, arguments: serde_json::Value) -> EventEnvelope {
         EventEnvelope::Durable(DurableEvent {
@@ -1122,6 +1176,19 @@ mod tests {
         let value = serde_json::to_value(response).expect("serialize rpc response");
         assert!(value.get("result").is_none());
         assert_eq!(value["error"]["code"], serde_json::json!(-32602));
+    }
+
+    #[test]
+    fn rpc_message_deserializes_notification_without_id() {
+        let message: RpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": {"sessionId": "s-1"}
+        }))
+        .expect("notification envelope should deserialize without id");
+
+        assert_eq!(message.method, AGENT_METHOD_NAMES.session_cancel);
+        assert!(message.id.is_none());
     }
 
     #[test]
@@ -1542,6 +1609,232 @@ mod tests {
         assert_eq!(select.current_value.0.as_ref(), "auto");
     }
 
+    struct CancelTestAgent {
+        cancelled_session: Arc<Mutex<Option<String>>>,
+        prompt_started: Option<Arc<Notify>>,
+        release_prompt: Option<Arc<Notify>>,
+        cancel_seen: Option<Arc<Notify>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SendAgent for CancelTestAgent {
+        async fn initialize(
+            &self,
+            _: crate::acp::protocol::InitializeRequest,
+        ) -> Result<crate::acp::protocol::InitializeResponse, Error> {
+            unreachable!()
+        }
+        async fn authenticate(
+            &self,
+            _: crate::acp::protocol::AuthenticateRequest,
+        ) -> Result<crate::acp::protocol::AuthenticateResponse, Error> {
+            unreachable!()
+        }
+        async fn new_session(
+            &self,
+            _: crate::acp::protocol::NewSessionRequest,
+        ) -> Result<crate::acp::protocol::NewSessionResponse, Error> {
+            unreachable!()
+        }
+        async fn prompt(
+            &self,
+            _: crate::acp::protocol::PromptRequest,
+        ) -> Result<crate::acp::protocol::PromptResponse, Error> {
+            if let Some(prompt_started) = &self.prompt_started {
+                prompt_started.notify_one();
+            }
+            if let Some(release_prompt) = &self.release_prompt {
+                release_prompt.notified().await;
+            }
+            Ok(crate::acp::protocol::PromptResponse::new(
+                crate::acp::protocol::StopReason::Cancelled,
+            ))
+        }
+        async fn cancel(
+            &self,
+            notif: crate::acp::protocol::CancelNotification,
+        ) -> Result<(), Error> {
+            *self.cancelled_session.lock().await = Some(notif.session_id.to_string());
+            if let Some(cancel_seen) = &self.cancel_seen {
+                cancel_seen.notify_one();
+            }
+            Ok(())
+        }
+        async fn load_session(
+            &self,
+            _: crate::acp::protocol::LoadSessionRequest,
+        ) -> Result<crate::acp::protocol::LoadSessionResponse, Error> {
+            unreachable!()
+        }
+        async fn list_sessions(
+            &self,
+            _: crate::acp::protocol::ListSessionsRequest,
+        ) -> Result<crate::acp::protocol::ListSessionsResponse, Error> {
+            unreachable!()
+        }
+        async fn fork_session(
+            &self,
+            _: crate::acp::protocol::ForkSessionRequest,
+        ) -> Result<crate::acp::protocol::ForkSessionResponse, Error> {
+            unreachable!()
+        }
+        async fn resume_session(
+            &self,
+            _: crate::acp::protocol::ResumeSessionRequest,
+        ) -> Result<crate::acp::protocol::ResumeSessionResponse, Error> {
+            unreachable!()
+        }
+        async fn close_session(
+            &self,
+            _: crate::acp::protocol::CloseSessionRequest,
+        ) -> Result<crate::acp::protocol::CloseSessionResponse, Error> {
+            unreachable!()
+        }
+        async fn delete_session(
+            &self,
+            _: crate::acp::protocol::DeleteSessionRequest,
+        ) -> Result<crate::acp::protocol::DeleteSessionResponse, Error> {
+            unreachable!()
+        }
+        async fn set_session_model(
+            &self,
+            _: crate::acp::protocol::SetSessionModelRequest,
+        ) -> Result<crate::acp::protocol::SetSessionModelResponse, Error> {
+            unreachable!()
+        }
+        async fn ext_method(
+            &self,
+            _: crate::acp::protocol::ExtRequest,
+        ) -> Result<crate::acp::protocol::ExtResponse, Error> {
+            unreachable!()
+        }
+        async fn ext_notification(
+            &self,
+            _: crate::acp::protocol::ExtNotification,
+        ) -> Result<(), Error> {
+            unreachable!()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn cancel_test_agent() -> (CancelTestAgent, Arc<Mutex<Option<String>>>) {
+        let cancelled_session = Arc::new(Mutex::new(None));
+        (
+            CancelTestAgent {
+                cancelled_session: cancelled_session.clone(),
+                prompt_started: None,
+                release_prompt: None,
+                cancel_seen: None,
+            },
+            cancelled_session,
+        )
+    }
+
+    fn rpc_cancel_message(id: Option<serde_json::Value>, params: serde_json::Value) -> RpcMessage {
+        RpcMessage {
+            jsonrpc: "2.0".to_string(),
+            method: AGENT_METHOD_NAMES.session_cancel.to_string(),
+            params,
+            id,
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_dispatch_keeps_cancel_unblocked_by_prompt() {
+        let prompt_started = Arc::new(Notify::new());
+        let release_prompt = Arc::new(Notify::new());
+        let cancel_seen = Arc::new(Notify::new());
+        let cancelled_session = Arc::new(Mutex::new(None));
+        let agent = Arc::new(CancelTestAgent {
+            prompt_started: Some(prompt_started.clone()),
+            release_prompt: Some(release_prompt.clone()),
+            cancel_seen: Some(cancel_seen.clone()),
+            cancelled_session: cancelled_session.clone(),
+        });
+        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::channel(2);
+
+        let prompt_task = tokio::spawn(dispatch_rpc_message(
+            agent.clone(),
+            session_owners.clone(),
+            pending_permissions.clone(),
+            pending_elicitations.clone(),
+            "conn-1".to_string(),
+            RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                method: AGENT_METHOD_NAMES.session_prompt.to_string(),
+                params: serde_json::json!({
+                    "sessionId": "s-cancel",
+                    "prompt": [{"type": "text", "text": "long task"}]
+                }),
+                id: Some(serde_json::json!(1)),
+            },
+            tx.clone(),
+        ));
+
+        timeout(Duration::from_secs(2), prompt_started.notified())
+            .await
+            .expect("prompt should start");
+
+        let cancel_task = tokio::spawn(dispatch_rpc_message(
+            agent,
+            session_owners,
+            pending_permissions,
+            pending_elicitations,
+            "conn-1".to_string(),
+            rpc_cancel_message(None, serde_json::json!({"sessionId": "s-cancel"})),
+            tx,
+        ));
+
+        timeout(Duration::from_secs(2), cancel_seen.notified())
+            .await
+            .expect("cancel should be dispatched before prompt completes");
+        assert_eq!(cancelled_session.lock().await.as_deref(), Some("s-cancel"));
+        assert!(
+            timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+            "cancel notification must not emit a response"
+        );
+
+        release_prompt.notify_one();
+        let response = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("prompt response should arrive")
+            .expect("response channel should remain open");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).expect("response should be JSON")
+                ["id"],
+            serde_json::json!(1)
+        );
+
+        prompt_task.await.expect("prompt task should finish");
+        cancel_task.await.expect("cancel task should finish");
+    }
+
+    #[tokio::test]
+    async fn session_cancel_notification_dispatches_without_response() {
+        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let (agent, cancelled_session) = cancel_test_agent();
+
+        let output = handle_rpc_message(
+            &agent,
+            &session_owners,
+            &pending_permissions,
+            &pending_elicitations,
+            "conn-1",
+            rpc_cancel_message(None, serde_json::json!({"sessionId": "s-cancel"})),
+        )
+        .await;
+
+        assert!(output.response.is_none());
+        assert_eq!(cancelled_session.lock().await.as_deref(), Some("s-cancel"));
+    }
+
     #[tokio::test]
     async fn session_new_rpc_dispatches_to_agent_new_session() {
         let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
@@ -1647,11 +1940,11 @@ mod tests {
             &pending_permissions,
             &pending_elicitations,
             "conn-1",
-            RpcRequest {
+            RpcMessage {
                 jsonrpc: "2.0".to_string(),
                 method: AGENT_METHOD_NAMES.session_new.to_string(),
                 params: serde_json::json!({"cwd": "/tmp", "mcpServers": []}),
-                id: serde_json::json!(1),
+                id: Some(serde_json::json!(1)),
             },
             RpcDispatchContext {
                 session_hooks: None,
@@ -1659,9 +1952,10 @@ mod tests {
         )
         .await;
 
-        assert!(output.response.error.is_none());
+        let response = output.response.expect("request should produce response");
+        assert!(response.error.is_none());
         assert_eq!(
-            output.response.result,
+            response.result,
             Some(serde_json::json!({"sessionId": "s-plain"}))
         );
     }
@@ -1776,17 +2070,18 @@ mod tests {
             &pending_permissions,
             &pending_elicitations,
             "conn-9",
-            RpcRequest {
+            RpcMessage {
                 jsonrpc: "2.0".to_string(),
                 method: "_querymt/remote/attachSession".to_string(),
                 params: serde_json::json!({"session_id": "s-remote", "node_id": "n-1"}),
-                id: serde_json::json!(1),
+                id: Some(serde_json::json!(1)),
             },
             RpcDispatchContext::default(),
         )
         .await;
 
-        assert!(output.response.error.is_none());
+        let response = output.response.expect("request should produce response");
+        assert!(response.error.is_none());
         assert_eq!(
             session_owners.lock().await.get("s-remote").cloned(),
             Some("conn-9".to_string())
@@ -1902,17 +2197,18 @@ mod tests {
             &pending_permissions,
             &pending_elicitations,
             "conn-9",
-            RpcRequest {
+            RpcMessage {
                 jsonrpc: "2.0".to_string(),
                 method: "querymt/remote/createSession".to_string(),
                 params: serde_json::json!({"node_id": "n-1"}),
-                id: serde_json::json!(1),
+                id: Some(serde_json::json!(1)),
             },
             RpcDispatchContext::default(),
         )
         .await;
 
-        assert!(output.response.error.is_none());
+        let response = output.response.expect("request should produce response");
+        assert!(response.error.is_none());
         assert_eq!(
             session_owners.lock().await.get("s-cr").cloned(),
             Some("conn-9".to_string())
@@ -2024,7 +2320,7 @@ mod tests {
             &pending_permissions,
             &pending_elicitations,
             "conn-load",
-            RpcRequest {
+            RpcMessage {
                 jsonrpc: "2.0".to_string(),
                 method: AGENT_METHOD_NAMES.session_load.to_string(),
                 params: serde_json::json!({
@@ -2032,13 +2328,14 @@ mod tests {
                     "cwd": "/tmp",
                     "mcpServers": []
                 }),
-                id: serde_json::json!(1),
+                id: Some(serde_json::json!(1)),
             },
             RpcDispatchContext::default(),
         )
         .await;
 
-        assert!(output.response.error.is_none());
+        let response = output.response.expect("request should produce response");
+        assert!(response.error.is_none());
         assert_eq!(
             session_owners.lock().await.get("s-load").cloned(),
             Some("conn-load".to_string())
@@ -2150,17 +2447,17 @@ mod tests {
             &pending_permissions,
             &pending_elicitations,
             "conn-1",
-            RpcRequest {
+            RpcMessage {
                 jsonrpc: "2.0".to_string(),
                 method: AGENT_METHOD_NAMES.session_close.to_string(),
                 params: serde_json::json!({
                     "sessionId": "s-1"
                 }),
-                id: serde_json::json!(1),
+                id: Some(serde_json::json!(1)),
             },
         )
         .await;
-        let response = output.response;
+        let response = output.response.expect("request should produce response");
 
         assert!(
             response.error.is_none(),
@@ -2278,7 +2575,7 @@ mod tests {
             &pending_permissions,
             &pending_elicitations,
             "conn-1",
-            RpcRequest {
+            RpcMessage {
                 jsonrpc: "2.0".to_string(),
                 method: "session/set_config_option".to_string(),
                 params: serde_json::json!({
@@ -2286,11 +2583,11 @@ mod tests {
                     "configId": "mode",
                     "value": "plan"
                 }),
-                id: serde_json::json!(1),
+                id: Some(serde_json::json!(1)),
             },
         )
         .await;
-        let response = output.response;
+        let response = output.response.expect("request should produce response");
 
         // Default SendAgent impl returns method_not_found
         assert!(response.error.is_some(), "expected error from default impl");
@@ -2323,7 +2620,7 @@ mod tests {
             &pending_permissions,
             &pending_elicitations,
             "conn-1",
-            RpcRequest {
+            RpcMessage {
                 jsonrpc: "2.0".to_string(),
                 method: "elicitation_result".to_string(),
                 params: serde_json::json!({
@@ -2331,11 +2628,11 @@ mod tests {
                     "action": "accept",
                     "content": {"selection": "allow_once"}
                 }),
-                id: serde_json::json!(1),
+                id: Some(serde_json::json!(1)),
             },
         )
         .await;
-        let response = output.response;
+        let response = output.response.expect("request should produce response");
 
         assert!(
             response.error.is_none(),
