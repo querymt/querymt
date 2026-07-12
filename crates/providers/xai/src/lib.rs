@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use url::Url;
 
-const XAI_ADDITIONAL_LIST_MODELS: &[&str] = &["grok-composer-2.5-fast"];
+const XAI_ADDITIONAL_LIST_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5"];
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
