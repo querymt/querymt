@@ -23,8 +23,8 @@
 
 use crate::acp::client_bridge::ClientBridgeSender;
 use crate::acp::shared::{
-    AcpLiveEventTranslator, PendingElicitationMap, PermissionMap, RpcRequest, SessionOwnerMap,
-    collect_event_sources, handle_rpc_message, is_event_owned,
+    AcpLiveEventTranslator, PendingElicitationMap, PermissionMap, RpcMessage, SessionOwnerMap,
+    collect_event_sources, dispatch_rpc_message, is_event_owned,
 };
 use crate::acp::shutdown;
 use crate::event_fanout::EventFanout;
@@ -93,9 +93,8 @@ pub async fn serve_websocket(
 ) -> anyhow::Result<()> {
     log::info!("Starting standalone WebSocket ACP server on {}", addr);
 
-    // Set up bridge for ClientBridgeSender pattern
-    // Note: For WebSocket, the bridge is used for permission requests through the
-    // pending_permissions map, not for direct client communication like in stdio
+    // TODO: Route ClientBridgeMessage values through each WebSocket connection so
+    // permission, elicitation, and workspace-query requests match stdio behavior.
     let (tx, _rx) = mpsc::channel(100);
     let bridge_sender = ClientBridgeSender::new(tx);
     agent.set_bridge(bridge_sender).await;
@@ -166,28 +165,20 @@ async fn handle_websocket_connection(socket: WebSocket, state: WsServerState) {
     let receive_task = tokio::spawn(async move {
         while let Some(result) = FuturesStreamExt::next(&mut ws_receiver).await {
             match result {
-                Ok(Message::Text(text)) => match serde_json::from_str::<RpcRequest>(&text) {
+                Ok(Message::Text(text)) => match serde_json::from_str::<RpcMessage>(&text) {
                     Ok(request) => {
-                        let output = handle_rpc_message(
-                            state.agent.as_ref(),
-                            &state.session_owners,
-                            &state.pending_permissions,
-                            &state.pending_elicitations,
-                            &conn_id,
+                        // Dispatch each call independently so a long-running prompt
+                        // does not block subsequent cancellation notifications.
+                        // TODO: Add a session-load replay hook for reconnecting clients.
+                        tokio::spawn(dispatch_rpc_message(
+                            state.agent.clone(),
+                            state.session_owners.clone(),
+                            state.pending_permissions.clone(),
+                            state.pending_elicitations.clone(),
+                            conn_id.clone(),
                             request,
-                        )
-                        .await;
-                        for notification in output.notifications {
-                            let json = serde_json::to_string(&notification).unwrap_or_default();
-                            if tx.send(json).await.is_err() {
-                                break;
-                            }
-                        }
-                        let json = serde_json::to_string(&output.response).unwrap_or_default();
-
-                        if tx.send(json).await.is_err() {
-                            break;
-                        }
+                            tx.clone(),
+                        ));
                     }
                     Err(e) => {
                         log::error!("Failed to parse WebSocket message: {}", e);
