@@ -13,9 +13,9 @@ use super::super::messages::UiServerMessage;
 use super::remote::finalize_remote_session_attach;
 
 use super::super::session::{
-    PRIMARY_AGENT_ID, agent_for_profile_and_id, local_agent_for_profile, local_agent_for_session,
-    mode_for_session, reasoning_effort_for_session, resolve_profile_id,
-    resolve_profile_id_for_session, session_ref_for_session,
+    PRIMARY_AGENT_ID, agent_for_profile_and_id, local_agent_for_session, mode_for_session,
+    reasoning_effort_for_session, resolve_profile_id, resolve_profile_id_for_session,
+    session_ref_for_session,
 };
 use crate::acp::protocol::{LoadSessionRequest, SessionId};
 use crate::agent::LocalAgentHandle;
@@ -1189,27 +1189,17 @@ pub async fn handle_elicitation_response(
         content: content.cloned(),
     };
 
-    let mut tx = None;
-
-    if let Some(session_id) = session_id {
-        let profile_id = resolve_profile_id_for_session(state, Some(session_id), None)
-            .await
-            .ok()
-            .flatten();
-        if let Ok(agent) = local_agent_for_profile(state, profile_id.as_deref()).await {
-            tx =
-                crate::elicitation::take_pending_elicitation_sender(agent.as_ref(), elicitation_id)
-                    .await;
-        }
-    }
-
-    if tx.is_none() {
-        tx = crate::elicitation::take_pending_elicitation_sender(
+    let tx = if let Some(session_id) = session_id {
+        crate::elicitation::take_pending_elicitation_sender_for_session(
             state.agent.as_ref(),
+            session_id,
             elicitation_id,
         )
-        .await;
-    }
+        .await
+    } else {
+        crate::elicitation::take_pending_elicitation_sender(state.agent.as_ref(), elicitation_id)
+            .await
+    };
 
     if let Some(tx) = tx {
         if tx.send(response).is_err() {

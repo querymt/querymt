@@ -13,6 +13,8 @@ pub(crate) mod trace_context;
 
 #[cfg(test)]
 mod session_load_snapshot_tests;
+#[cfg(test)]
+mod websocket_tests;
 
 // Public re-exports
 pub use transport::AcpTransport;
@@ -27,21 +29,11 @@ use crate::acp::shared::{
 };
 use crate::event_fanout::EventFanout;
 
-use axum::{
-    Router,
-    extract::{
-        State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
-    },
-    response::IntoResponse,
-    routing::get,
-};
-use futures_util::{sink::SinkExt, stream::StreamExt as FuturesStreamExt};
+use axum::Router;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc};
-use uuid::Uuid;
 
 pub struct AcpServer {
     agent: Arc<crate::agent::LocalAgentHandle>,
@@ -58,6 +50,29 @@ struct ServerState {
     pending_elicitations: PendingElicitationMap,
     event_sources: Vec<Arc<EventFanout>>,
     session_owners: SessionOwnerMap,
+}
+
+fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sender<String>) {
+    for event_source in &state.event_sources {
+        let mut events = event_source.subscribe();
+        let tx_events = tx.clone();
+        let conn_id_events = conn_id.clone();
+        let session_owners = state.session_owners.clone();
+        tokio::spawn(async move {
+            let mut translator = AcpLiveEventTranslator::new();
+            while let Ok(event) = events.recv().await {
+                if !is_event_owned(&session_owners, &conn_id_events, &event).await {
+                    continue;
+                }
+                if let Some(notification) = translator.translate_notification(&event) {
+                    let json = serde_json::to_string(&notification).unwrap_or_default();
+                    if tx_events.send(json).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
 }
 
 impl AcpServer {
@@ -77,17 +92,7 @@ impl AcpServer {
     }
 
     pub fn router(self) -> Router {
-        let state = ServerState {
-            agent: self.agent,
-            pending_permissions: self.pending_permissions,
-            pending_elicitations: self.pending_elicitations,
-            event_sources: self.event_sources,
-            session_owners: self.session_owners,
-        };
-
-        Router::new()
-            .route("/ws", get(websocket_handler))
-            .with_state(state)
+        websocket::router(self.agent)
     }
 
     pub async fn run_stdio(self) -> anyhow::Result<()> {
@@ -147,94 +152,3 @@ impl AcpServer {
         Ok(())
     }
 }
-
-// Event translation functions and RPC types are now in shared.rs
-
-async fn websocket_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<ServerState>,
-) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_websocket_connection(socket, state))
-}
-
-async fn handle_websocket_connection(socket: WebSocket, state: ServerState) {
-    let conn_id = Uuid::new_v4().to_string();
-    let (mut ws_sender, mut ws_receiver) = socket.split();
-    let (tx, mut rx) = mpsc::channel::<String>(100);
-
-    spawn_event_forwarders(state.clone(), conn_id.clone(), tx.clone());
-
-    let send_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if ws_sender.send(Message::Text(msg.into())).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let receive_task = tokio::spawn(async move {
-        while let Some(result) = FuturesStreamExt::next(&mut ws_receiver).await {
-            match result {
-                Ok(Message::Text(text)) => match serde_json::from_str::<RpcMessage>(&text) {
-                    Ok(request) => {
-                        // Keep ingress responsive while a prompt is still executing.
-                        tokio::spawn(dispatch_rpc_message(
-                            state.agent.clone(),
-                            state.session_owners.clone(),
-                            state.pending_permissions.clone(),
-                            state.pending_elicitations.clone(),
-                            conn_id.clone(),
-                            request,
-                            tx.clone(),
-                        ));
-                    }
-                    Err(e) => {
-                        log::error!("Failed to parse WebSocket message: {}", e);
-                    }
-                },
-                Ok(Message::Close(_)) => {
-                    log::info!("WebSocket closed by client");
-                    break;
-                }
-                Ok(Message::Ping(_)) => {
-                    log::trace!("Received ping");
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    log::error!("WebSocket error: {}", e);
-                    break;
-                }
-            }
-        }
-    });
-
-    tokio::select! {
-        _ = send_task => {},
-        _ = receive_task => {},
-    }
-}
-
-fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sender<String>) {
-    for event_source in &state.event_sources {
-        let mut events = event_source.subscribe();
-        let tx_events = tx.clone();
-        let conn_id_events = conn_id.clone();
-        let session_owners = state.session_owners.clone();
-        tokio::spawn(async move {
-            let mut translator = AcpLiveEventTranslator::new();
-            while let Ok(event) = events.recv().await {
-                if !is_event_owned(&session_owners, &conn_id_events, &event).await {
-                    continue;
-                }
-                if let Some(notification) = translator.translate_notification(&event) {
-                    let json = serde_json::to_string(&notification).unwrap_or_default();
-                    if tx_events.send(json).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        });
-    }
-}
-
-// The old handle_rpc_message function has been removed - now using shared::handle_rpc_message

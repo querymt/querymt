@@ -12,8 +12,9 @@ use crate::session::projection::SessionScope;
 use crate::session::store::RemoteSessionBookmark;
 use crate::test_utils::empty_plugin_registry;
 use crate::ui::handlers::{
-    ListSessionsRequest, handle_cancel_session, handle_delete_session, handle_fork_session,
-    handle_list_session_children, handle_list_sessions, handle_load_session, handle_ui_message,
+    ListSessionsRequest, handle_cancel_session, handle_delete_session, handle_elicitation_response,
+    handle_fork_session, handle_list_session_children, handle_list_sessions, handle_load_session,
+    handle_ui_message,
 };
 use crate::ui::messages::UiClientMessage;
 #[cfg(feature = "remote")]
@@ -175,6 +176,53 @@ async fn next_message_of_type(
             return msg;
         }
     }
+}
+
+#[tokio::test]
+async fn elicitation_response_resolves_profile_runtime_waiter() {
+    let mut fixture = crate::test_utils::TestServerState::new().await;
+    let profile_dir = tempfile::tempdir().expect("profile dir");
+    write_profile(profile_dir.path(), "default.toml");
+    let profiles = attach_profiles(&mut fixture, "default", profile_dir.path()).await;
+    fixture.agent.handle.set_profiles(profiles.clone());
+
+    let session_id = "profile-elicitation-session";
+    profiles
+        .bind_session_to_profile(session_id, "default")
+        .await
+        .expect("bind session to profile");
+    let runtime = profiles
+        .runtime_for_profile("default")
+        .await
+        .expect("load profile runtime");
+    let profile_agent = runtime.agent().handle();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    crate::elicitation::insert_pending_elicitation(
+        &profile_agent.pending_elicitations(),
+        "profile-elicitation".to_string(),
+        session_id.to_string(),
+        tx,
+    )
+    .await;
+
+    handle_elicitation_response(
+        &fixture.state,
+        "profile-elicitation",
+        Some(session_id),
+        "accept",
+        Some(&serde_json::json!({"selection": "Option B"})),
+    )
+    .await;
+
+    let response = rx.await.expect("profile waiter should receive response");
+    assert_eq!(
+        response.action,
+        crate::elicitation::ElicitationAction::Accept
+    );
+    assert_eq!(
+        response.content,
+        Some(serde_json::json!({"selection": "Option B"}))
+    );
 }
 
 async fn insert_test_actor(agent: &Arc<crate::agent::LocalAgentHandle>, session_id: &str) {

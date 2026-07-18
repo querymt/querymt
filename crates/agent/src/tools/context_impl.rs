@@ -22,6 +22,53 @@ pub struct ElicitationRequest {
     pub response_tx: oneshot::Sender<ElicitationResponse>,
 }
 
+fn question_option_schema(label: &str, description: &str) -> serde_json::Value {
+    json!({
+        "const": label,
+        "title": label,
+        "_meta": {
+            "querymt": {
+                "description": description
+            }
+        }
+    })
+}
+
+fn question_schema(
+    question: &str,
+    header: &str,
+    options: &[(String, String)],
+    multiple: bool,
+) -> serde_json::Value {
+    let choices: Vec<serde_json::Value> = options
+        .iter()
+        .map(|(label, description)| question_option_schema(label, description))
+        .collect();
+    let selection = if multiple {
+        json!({
+            "type": "array",
+            "title": header,
+            "description": question,
+            "items": { "anyOf": choices }
+        })
+    } else {
+        json!({
+            "type": "string",
+            "title": header,
+            "description": question,
+            "oneOf": choices
+        })
+    };
+
+    json!({
+        "type": "object",
+        "properties": {
+            "selection": selection
+        },
+        "required": ["selection"]
+    })
+}
+
 /// Implementation of ToolContext that provides access to agent services
 pub struct AgentToolContext {
     session_id: String,
@@ -161,56 +208,7 @@ impl ToolContext for AgentToolContext {
         multiple: bool,
     ) -> Result<Vec<String>, ToolError> {
         if let Some(tx) = &self.elicitation_tx {
-            // Build MCP elicitation schema from question options
-            let mut properties = serde_json::Map::new();
-
-            if multiple {
-                // Multi-select: use array type with items.anyOf
-                let any_of: Vec<serde_json::Value> = options
-                    .iter()
-                    .map(|(label, desc)| {
-                        json!({
-                            "const": label,
-                            "title": desc
-                        })
-                    })
-                    .collect();
-                properties.insert(
-                    "selection".to_string(),
-                    json!({
-                        "type": "array",
-                        "title": header,
-                        "description": question,
-                        "items": { "anyOf": any_of }
-                    }),
-                );
-            } else {
-                // Single select: use string type with oneOf
-                let one_of: Vec<serde_json::Value> = options
-                    .iter()
-                    .map(|(label, desc)| {
-                        json!({
-                            "const": label,
-                            "title": desc
-                        })
-                    })
-                    .collect();
-                properties.insert(
-                    "selection".to_string(),
-                    json!({
-                        "type": "string",
-                        "title": header,
-                        "description": question,
-                        "oneOf": one_of
-                    }),
-                );
-            }
-
-            let schema = json!({
-                "type": "object",
-                "properties": properties,
-                "required": ["selection"]
-            });
+            let schema = question_schema(question, header, options, multiple);
 
             // Send through elicitation channel
             let (response_tx, response_rx) = oneshot::channel();
@@ -342,5 +340,52 @@ mod tests {
         let context = AgentToolContext::basic("session".to_string(), None);
 
         assert_eq!(context.cwd(), None);
+    }
+
+    #[test]
+    fn question_schema_uses_labels_as_titles_and_preserves_descriptions() {
+        let schema = question_schema(
+            "Choose a deployment target",
+            "Target",
+            &[(
+                "Production".to_string(),
+                "Deploy to the customer-facing environment".to_string(),
+            )],
+            false,
+        );
+
+        let option = &schema["properties"]["selection"]["oneOf"][0];
+        assert_eq!(option["const"], "Production");
+        assert_eq!(option["title"], "Production");
+        assert_eq!(
+            option["_meta"]["querymt"]["description"],
+            "Deploy to the customer-facing environment"
+        );
+        serde_json::from_value::<crate::acp::protocol::ElicitationSchema>(schema)
+            .expect("question schema should be valid ACP elicitation schema");
+    }
+
+    #[test]
+    fn multi_select_question_schema_uses_titled_any_of_options() {
+        let schema = question_schema(
+            "Choose environments",
+            "Environments",
+            &[
+                ("Staging".to_string(), "Internal validation".to_string()),
+                ("Production".to_string(), "Customer traffic".to_string()),
+            ],
+            true,
+        );
+
+        let selection = &schema["properties"]["selection"];
+        assert_eq!(selection["type"], "array");
+        assert_eq!(selection["items"]["anyOf"][1]["const"], "Production");
+        assert_eq!(selection["items"]["anyOf"][1]["title"], "Production");
+        assert_eq!(
+            selection["items"]["anyOf"][1]["_meta"]["querymt"]["description"],
+            "Customer traffic"
+        );
+        serde_json::from_value::<crate::acp::protocol::ElicitationSchema>(schema)
+            .expect("multi-select schema should be valid ACP elicitation schema");
     }
 }
