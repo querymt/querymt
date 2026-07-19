@@ -214,7 +214,10 @@ async fn elicitation_response_resolves_profile_runtime_waiter() {
     )
     .await;
 
-    let response = rx.await.expect("profile waiter should receive response");
+    let response = tokio::time::timeout(Duration::from_secs(2), rx)
+        .await
+        .expect("profile waiter should resolve promptly")
+        .expect("profile waiter should receive response");
     assert_eq!(
         response.action,
         crate::elicitation::ElicitationAction::Accept

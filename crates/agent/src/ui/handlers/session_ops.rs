@@ -1190,8 +1190,9 @@ pub async fn handle_elicitation_response(
     };
 
     let tx = if let Some(session_id) = session_id {
-        crate::elicitation::take_pending_elicitation_sender_for_session(
+        crate::elicitation::take_pending_elicitation_sender_for_session_with_profiles(
             state.agent.as_ref(),
+            state.profiles.as_ref(),
             session_id,
             elicitation_id,
         )

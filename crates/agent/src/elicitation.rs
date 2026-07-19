@@ -116,7 +116,27 @@ pub async fn take_pending_elicitation_sender_for_session(
     session_id: &str,
     elicitation_id: &str,
 ) -> Option<oneshot::Sender<ElicitationResponse>> {
-    if let Some(profiles) = agent.profiles()
+    take_pending_elicitation_sender_for_session_with_profiles(
+        agent,
+        agent.profiles().as_ref(),
+        session_id,
+        elicitation_id,
+    )
+    .await
+}
+
+/// Session-aware variant for transports that own a profile manager separately
+/// from the root agent handle.
+pub async fn take_pending_elicitation_sender_for_session_with_profiles(
+    agent: &crate::agent::LocalAgentHandle,
+    profiles: Option<&crate::api::ProfileRuntimeHandle>,
+    session_id: &str,
+    elicitation_id: &str,
+) -> Option<oneshot::Sender<ElicitationResponse>> {
+    let agent_profiles = agent.profiles();
+    let profiles = profiles.or(agent_profiles.as_ref());
+
+    if let Some(profiles) = profiles
         && let Some(binding) = profiles.session_binding(session_id).await
     {
         match profiles.runtime_for_profile(&binding.profile_id).await {
