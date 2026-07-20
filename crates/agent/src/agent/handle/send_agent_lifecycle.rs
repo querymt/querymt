@@ -189,7 +189,9 @@ impl LocalAgentHandle {
         req: CloseSessionRequest,
     ) -> Result<CloseSessionResponse, Error> {
         let session_id = req.session_id.to_string();
-        self.stop_session(&session_id).await?;
+        let result = self.stop_session(&session_id).await;
+        self.clear_delegate_model_overrides(&session_id).await;
+        result?;
         Ok(CloseSessionResponse::new())
     }
 
@@ -217,6 +219,7 @@ impl LocalAgentHandle {
             .map_err(|e| Error::internal_error().data(serde_json::json!({"error": e.to_string()})))?
             .is_some();
         if !exists {
+            self.clear_delegate_model_overrides(&session_id).await;
             return Ok(DeleteSessionResponse::new());
         }
 
@@ -228,7 +231,30 @@ impl LocalAgentHandle {
             .map_err(|e| {
                 Error::internal_error().data(serde_json::json!({"error": e.to_string()}))
             })?;
+        self.clear_delegate_model_overrides(&session_id).await;
 
         Ok(DeleteSessionResponse::new())
+    }
+
+    pub(super) async fn clear_delegate_model_overrides(&self, session_id: &str) {
+        self.config
+            .delegate_model_overrides
+            .clear_parent(session_id)
+            .await;
+
+        let Some(profiles) = self.profiles() else {
+            return;
+        };
+        if let Some(binding) = profiles.session_binding(session_id).await
+            && let Ok(runtime) = profiles.runtime_for_profile(&binding.profile_id).await
+        {
+            runtime
+                .agent()
+                .handle()
+                .config
+                .delegate_model_overrides
+                .clear_parent(session_id)
+                .await;
+        }
     }
 }

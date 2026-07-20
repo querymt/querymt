@@ -108,6 +108,7 @@ pub struct DelegationOrchestrator {
     active_delegations: ActiveDelegations,
     /// Optional summarizer for generating planning context
     delegation_summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
+    delegate_model_overrides: super::DelegateModelOverrideStore,
     /// Optional routing snapshot for per-agent routing decisions.
     routing_snapshot: Option<crate::agent::remote::RoutingSnapshotHandle>,
 }
@@ -133,6 +134,7 @@ impl DelegationOrchestrator {
             max_parallel: Arc::new(tokio::sync::Semaphore::new(5)),
             active_delegations: Arc::new(Mutex::new(HashMap::new())),
             delegation_summarizer: None,
+            delegate_model_overrides: super::DelegateModelOverrideStore::default(),
             routing_snapshot: None,
         }
     }
@@ -174,6 +176,14 @@ impl DelegationOrchestrator {
         summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
     ) -> Self {
         self.delegation_summarizer = summarizer;
+        self
+    }
+
+    pub fn with_delegate_model_overrides(
+        mut self,
+        overrides: super::DelegateModelOverrideStore,
+    ) -> Self {
+        self.delegate_model_overrides = overrides;
         self
     }
 
@@ -233,6 +243,7 @@ impl DelegationOrchestrator {
                 let config = self.config.clone();
                 let max_parallel = self.max_parallel.clone();
                 let delegation_summarizer = self.delegation_summarizer.clone();
+                let delegate_model_overrides = self.delegate_model_overrides.clone();
                 let routing_snapshot = self.routing_snapshot.clone();
                 let parent_session_id = session_id.to_string();
                 let parent_session_id_for_insert = parent_session_id.clone();
@@ -283,6 +294,7 @@ impl DelegationOrchestrator {
                         hooks,
                         active_delegations: active_delegations_for_spawn,
                         delegation_summarizer,
+                        delegate_model_overrides,
                         routing_snapshot,
                     };
                     match target_handle {
@@ -400,6 +412,7 @@ struct DelegationContext {
     config: DelegationOrchestratorConfig,
     active_delegations: ActiveDelegations,
     delegation_summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
+    delegate_model_overrides: super::DelegateModelOverrideStore,
     routing_snapshot: Option<crate::agent::remote::RoutingSnapshotHandle>,
 }
 
@@ -574,6 +587,78 @@ async fn execute_delegation(
         }
         .instrument(routing_span)
         .await;
+    }
+
+    if let Some(model_override) = ctx
+        .delegate_model_overrides
+        .get(&parent_session_id, &delegation.target_agent_id)
+        .await
+    {
+        #[cfg(feature = "remote")]
+        let provider_node_id = match model_override.node_id.as_deref() {
+            Some(node_id) => match crate::agent::remote::NodeId::parse(node_id) {
+                Ok(node_id) => Some(node_id),
+                Err(err) => {
+                    let error_message = format!(
+                        "Invalid provider node '{}' for delegate model override: {err}",
+                        node_id
+                    );
+                    let _ = session_ref.shutdown().await;
+                    fail_delegation(
+                        DelegationFailureContext {
+                            event_sink: &ctx.event_sink,
+                            delegator: &ctx.delegator,
+                            store: &ctx.store,
+                            hooks: Some(&ctx.hooks),
+                            config: &ctx.config,
+                            parent_session_id: &parent_session_id,
+                            delegation_id: &delegation.public_id,
+                            target_agent_id: Some(&delegation.target_agent_id),
+                            objective: Some(&delegation.objective),
+                        },
+                        &error_message,
+                    )
+                    .await;
+                    ctx.active_delegations.lock().await.remove(&delegation_id);
+                    return;
+                }
+            },
+            None => None,
+        };
+        let model_request = crate::agent::messages::SetSessionModel {
+            req: crate::acp::protocol::SetSessionModelRequest::new(
+                child_session_id.clone(),
+                model_override.model_id.clone(),
+            ),
+            #[cfg(feature = "remote")]
+            provider_node_id,
+            #[cfg(not(feature = "remote"))]
+            provider_node_id: None,
+        };
+        if let Err(err) = session_ref.set_session_model_with_node(model_request).await {
+            let error_message = format!(
+                "Failed to apply model '{}' to delegate '{}': {err}",
+                model_override.model_id, delegation.target_agent_id
+            );
+            let _ = session_ref.shutdown().await;
+            fail_delegation(
+                DelegationFailureContext {
+                    event_sink: &ctx.event_sink,
+                    delegator: &ctx.delegator,
+                    store: &ctx.store,
+                    hooks: Some(&ctx.hooks),
+                    config: &ctx.config,
+                    parent_session_id: &parent_session_id,
+                    delegation_id: &delegation.public_id,
+                    target_agent_id: Some(&delegation.target_agent_id),
+                    objective: Some(&delegation.objective),
+                },
+                &error_message,
+            )
+            .await;
+            ctx.active_delegations.lock().await.remove(&delegation_id);
+            return;
+        }
     }
 
     emit_delegation_event(

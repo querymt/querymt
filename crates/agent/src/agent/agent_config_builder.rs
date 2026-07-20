@@ -58,6 +58,7 @@ pub struct AgentConfigBuilder {
     middleware_drivers: Vec<Arc<dyn MiddlewareDriver>>,
     auth_methods: Vec<AuthMethod>,
     agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
+    delegate_model_overrides: crate::delegation::DelegateModelOverrideStore,
     delegation_context_config: DelegationContextConfig,
     workspace_manager_actor: kameo::actor::ActorRef<WorkspaceIndexManagerActor>,
     execution_timeout_secs: u64,
@@ -111,6 +112,7 @@ impl AgentConfigBuilder {
             middleware_drivers: Vec::new(),
             auth_methods: Vec::new(),
             agent_registry: Arc::new(DefaultAgentRegistry::new()),
+            delegate_model_overrides: crate::delegation::DelegateModelOverrideStore::default(),
             delegation_context_config: DelegationContextConfig {
                 timing: DelegationContextTiming::FirstTurnOnly,
                 auto_inject: true,
@@ -163,6 +165,7 @@ impl AgentConfigBuilder {
             middleware_drivers: Vec::new(),
             auth_methods: Vec::new(),
             agent_registry: Arc::new(DefaultAgentRegistry::new()),
+            delegate_model_overrides: crate::delegation::DelegateModelOverrideStore::default(),
             delegation_context_config: DelegationContextConfig {
                 timing: DelegationContextTiming::FirstTurnOnly,
                 auto_inject: true,
@@ -199,6 +202,7 @@ impl AgentConfigBuilder {
             storage: self.storage,
             event_sink,
             agent_registry: self.agent_registry,
+            delegate_model_overrides: self.delegate_model_overrides,
             workspace_manager_actor: self.workspace_manager_actor,
             default_mode: self.default_mode,
             default_reasoning_effort: Arc::new(ArcSwap::from_pointee(None)),
@@ -286,6 +290,14 @@ impl AgentConfigBuilder {
         registry: Arc<dyn AgentRegistry + Send + Sync>,
     ) -> Self {
         self.agent_registry = registry;
+        self
+    }
+
+    pub fn with_delegate_model_overrides(
+        mut self,
+        overrides: crate::delegation::DelegateModelOverrideStore,
+    ) -> Self {
+        self.delegate_model_overrides = overrides;
         self
     }
 

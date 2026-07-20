@@ -94,6 +94,15 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         "querymt/schedules/delete".to_string(),
     ];
 
+    if agent.profiles().is_some() {
+        methods.extend([
+            "querymt/profiles".to_string(),
+            "querymt/profile/agents".to_string(),
+            "querymt/profile/setActive".to_string(),
+            "querymt/session/setDelegateModel".to_string(),
+        ]);
+    }
+
     #[cfg(feature = "remote")]
     {
         methods.extend([

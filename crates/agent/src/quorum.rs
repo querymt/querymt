@@ -316,6 +316,11 @@ impl AgentQuorumBuilder {
                 .map(|handle| handle.config.hooks.clone())
                 .unwrap_or_else(crate::hooks::Hooks::disabled);
 
+            let delegate_model_overrides = planner
+                .as_any()
+                .downcast_ref::<crate::agent::LocalAgentHandle>()
+                .map(|handle| handle.config.delegate_model_overrides.clone())
+                .unwrap_or_default();
             let mut orch = DelegationOrchestrator::new(
                 planner.clone(),
                 delegation_sink,
@@ -325,6 +330,7 @@ impl AgentQuorumBuilder {
                 planner_hooks,
                 self.cwd.clone(),
             )
+            .with_delegate_model_overrides(delegate_model_overrides)
             .with_verification(self.verification_enabled)
             .with_wait_policy(self.wait_policy.clone())
             .with_wait_timeout_secs(self.wait_timeout_secs)

@@ -12,6 +12,7 @@ mod ext_auth;
 mod ext_mesh;
 mod ext_models;
 mod ext_plugins;
+mod ext_profiles;
 mod ext_remote;
 mod ext_schedules;
 mod ext_session_ops;

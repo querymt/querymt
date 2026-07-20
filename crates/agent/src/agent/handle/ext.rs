@@ -8,6 +8,10 @@ impl LocalAgentHandle {
     pub(super) async fn handle_ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
         match req.method.as_ref() {
             "querymt/models" => self.handle_ext_models().await,
+            "querymt/profiles" => self.handle_ext_profiles().await,
+            "querymt/profile/agents" => self.handle_ext_profile_agents(req).await,
+            "querymt/profile/setActive" => self.handle_ext_set_active_profile(req).await,
+            "querymt/session/setDelegateModel" => self.handle_ext_set_delegate_model(req).await,
             "querymt/refreshModels" => self.handle_ext_refresh_models().await,
             "querymt/modelInfo" => self.handle_ext_model_info(req).await,
             "querymt/chat" | "querymt/tokenCount" => Err(Error::from(
