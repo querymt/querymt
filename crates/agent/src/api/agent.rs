@@ -801,7 +801,7 @@ impl Agent {
     ///
     /// # Transports
     /// - `"stdio"` - Use stdin/stdout for JSON-RPC communication (for subprocess spawning)
-    /// - `"ws://host:port"` - Start a WebSocket server (not yet implemented, use .server() instead)
+    /// - `"ws://host:port"` - Start an ACP WebSocket server at `/ws`
     ///
     /// # Example
     /// ```rust,no_run

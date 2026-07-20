@@ -774,8 +774,9 @@ system = "inline"
     )
     .await;
 
-    let response = rx
+    let response = tokio::time::timeout(Duration::from_secs(2), rx)
         .await
+        .expect("profile runtime elicitation response should arrive promptly")
         .expect("profile runtime elicitation response should be delivered");
     assert_eq!(response.action, ElicitationAction::Accept);
     assert_eq!(

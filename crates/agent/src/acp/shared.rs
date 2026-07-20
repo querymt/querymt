@@ -6,9 +6,11 @@
 
 use crate::acp::protocol::AGENT_METHOD_NAMES;
 use crate::acp::protocol::{
-    Content, ContentBlock, ContentChunk, Error, MessageId, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, RequestPermissionOutcome, SessionUpdate, TextContent, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    Content, ContentBlock, ContentChunk, CreateElicitationRequest, CreateElicitationResponse,
+    ElicitationAction as AcpElicitationAction, ElicitationFormMode, ElicitationSchema,
+    ElicitationSessionScope, Error, MessageId, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    RequestPermissionOutcome, SessionId, SessionUpdate, TextContent, ToolCall, ToolCallContent,
+    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::control::remote::{AttachRemoteSessionRequest, RemoteSessionAttachInfo};
@@ -30,6 +32,61 @@ pub type PermissionMap = Arc<Mutex<HashMap<String, oneshot::Sender<RequestPermis
 
 /// Type alias for pending elicitation requests (elicitation_id -> response sender)
 pub type PendingElicitationMap = crate::elicitation::PendingElicitationMap;
+
+pub(crate) fn create_elicitation_request(
+    elicitation_id: String,
+    session_id: String,
+    message: String,
+    requested_schema: serde_json::Value,
+    source: String,
+) -> Result<CreateElicitationRequest, Error> {
+    let schema = serde_json::from_value::<ElicitationSchema>(requested_schema).map_err(|err| {
+        Error::invalid_params().data(format!("Invalid elicitation schema: {err}"))
+    })?;
+    let scope = ElicitationSessionScope::new(SessionId::from(session_id));
+    let mode = ElicitationFormMode::new(scope, schema);
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "querymt".to_string(),
+        serde_json::json!({
+            "elicitation_id": elicitation_id,
+            "source": source,
+        }),
+    );
+
+    Ok(CreateElicitationRequest::new(mode, message).meta(meta))
+}
+
+pub(crate) fn convert_elicitation_response(
+    response: CreateElicitationResponse,
+) -> Result<crate::elicitation::ElicitationResponse, Error> {
+    let (action, content) = match response.action {
+        AcpElicitationAction::Accept(accepted) => {
+            let content = accepted
+                .content
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(Error::into_internal_error)?;
+            (crate::elicitation::ElicitationAction::Accept, content)
+        }
+        AcpElicitationAction::Decline => (crate::elicitation::ElicitationAction::Decline, None),
+        AcpElicitationAction::Cancel => (crate::elicitation::ElicitationAction::Cancel, None),
+        _ => {
+            return Err(Error::invalid_params().data("Unsupported elicitation response action"));
+        }
+    };
+
+    Ok(crate::elicitation::ElicitationResponse { action, content })
+}
+
+pub(crate) fn convert_elicitation_response_value(
+    value: serde_json::Value,
+) -> Result<crate::elicitation::ElicitationResponse, Error> {
+    let response = serde_json::from_value(value).map_err(|err| {
+        Error::invalid_params().data(format!("Invalid elicitation response: {err}"))
+    })?;
+    convert_elicitation_response(response)
+}
 
 /// JSON-RPC 2.0 method call envelope for both requests and notifications.
 #[derive(Deserialize)]
@@ -863,6 +920,8 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                     #[derive(Deserialize)]
                     struct ElicitationResultParams {
                         elicitation_id: String,
+                        #[serde(default, alias = "sessionId")]
+                        session_id: Option<String>,
                         action: String,
                         content: Option<serde_json::Value>,
                     }
@@ -885,16 +944,32 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                         content: params.content,
                                     };
 
-                                    let mut tx = {
-                                        let mut pending = pending_elicitations.lock().await;
-                                        pending
-                                            .remove(&params.elicitation_id)
-                                            .map(|entry| entry.sender)
+                                    let query_agent =
+                                        agent.as_any().downcast_ref::<AgentHandle>();
+                                    let mut tx = if let (Some(query_agent), Some(session_id)) =
+                                        (query_agent, params.session_id.as_deref())
+                                    {
+                                        crate::elicitation::take_pending_elicitation_sender_for_session(
+                                            query_agent,
+                                            session_id,
+                                            &params.elicitation_id,
+                                        )
+                                        .await
+                                    } else {
+                                        None
                                     };
 
+                                    if tx.is_none() {
+                                        tx = {
+                                            let mut pending = pending_elicitations.lock().await;
+                                            pending
+                                                .remove(&params.elicitation_id)
+                                                .map(|entry| entry.sender)
+                                        };
+                                    }
+
                                     if tx.is_none()
-                                        && let Some(query_agent) =
-                                            agent.as_any().downcast_ref::<AgentHandle>()
+                                        && let Some(query_agent) = query_agent
                                     {
                                         tx = crate::elicitation::take_pending_elicitation_sender(
                                             query_agent,
@@ -907,8 +982,11 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                         let _ = tx.send(response);
                                         Ok(serde_json::Value::Null)
                                     } else {
-                                        Err(Error::internal_error()
-                                            .data("No pending elicitation for this elicitation_id"))
+                                        Err(Error::internal_error().data(serde_json::json!({
+                                            "message": "No pending elicitation for this elicitation_id",
+                                            "elicitationId": params.elicitation_id,
+                                            "sessionId": params.session_id,
+                                        })))
                                     }
                                 }
                                 Err(e) => Err(e),

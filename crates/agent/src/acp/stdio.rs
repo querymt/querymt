@@ -7,32 +7,18 @@
 //! ## Architecture
 //!
 //! ```text
-//! ┌──────────────────────────────────────────────────────────────────────────────┐
-//! │                              LocalSet                                         │
-//! │                                                                               │
-//! │  ┌─────────────────────┐         ┌─────────────────────────────────────┐     │
-//! │  │ AgentSideConnection │◄────────│      Bridge Task                    │     │
-//! │  │  (impl Client)      │         │  - Receives ClientBridgeMessage     │     │
-//! │  │  (impl Agent via    │         │  - Calls connection.notify(...)     │     │
-//! │  │   adapter)          │         │  - Calls connection.request_perm()  │     │
-//! │  └──────────┬──────────┘         └──────────────────▲──────────────────┘     │
-//! │             │                                        │                        │
-//! │             │ calls Agent                            │ mpsc::channel          │
-//! │             ▼                                        │ (Send types)           │
-//! │  ┌─────────────────────┐                            │                        │
-//! │  │  ApcAgentAdapter    │                            │                        │
-//! │  └──────────┬──────────┘                            │                        │
-//! │             │                                        │                        │
-//! │             │ forwards                               │                        │
-//! │             ▼                                        │                        │
-//! │  ┌───────────────────────────────────────────────────┴──────────────────┐    │
-//! │  │                     T: SendAgent                                      │    │
-//! │  │  - Holds ClientBridgeSender (Send + Sync)                            │    │
-//! │  │  - Can spawn tokio::spawn() tasks for parallel work                  │    │
-//! │  │  - Calls bridge.notify() / bridge.request_permission()               │    │
-//! │  └──────────────────────────────────────────────────────────────────────┘    │
-//! │                                                                               │
-//! └───────────────────────────────────────────────────────────────────────────────┘
+//! ┌─────────────────────┐         ┌─────────────────────────────────────┐
+//! │   ACP Connection    │◄────────│             Bridge Task             │
+//! │  - Client requests  │         │  - Receives ClientBridgeMessage    │
+//! │  - Agent responses  │         │  - Uses ACP-managed spawned tasks  │
+//! └──────────┬──────────┘         └──────────────────▲──────────────────┘
+//!            │                                        │
+//!            │ calls Agent                            │ mpsc::channel
+//!            ▼                                        │
+//! ┌─────────────────────┐                ┌─────────────┴─────────────┐
+//! │  ApcAgentAdapter    │───────────────►│ QueryMTAgent (Send+Sync) │
+//! └─────────────────────┘                │ - Holds bridge sender    │
+//!                                        └───────────────────────────┘
 //! ```
 
 use crate::acp::client_bridge::{ClientBridgeMessage, ClientBridgeSender};
@@ -43,12 +29,16 @@ use crate::acp::protocol::{
     ResumeSessionRequest, SessionId, SessionNotification, SetSessionConfigOptionRequest,
     SetSessionModeRequest, SetSessionModelRequest,
 };
-use crate::acp::shared::{AcpLiveEventTranslator, replay_agent_events_to_session_notifications};
+use crate::acp::shared::{
+    AcpLiveEventTranslator, convert_elicitation_response, create_elicitation_request,
+    replay_agent_events_to_session_notifications,
+};
 use crate::acp::shutdown;
 use crate::event_fanout::EventFanout;
 use crate::send_agent::SendAgent;
 use agent_client_protocol::{self as acp, ByteStreams, ConnectionTo};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::info_span;
@@ -66,10 +56,11 @@ fn agent_ext_request(
     )))
 }
 
-/// Run the client bridge task inside LocalSet.
+/// Run the client bridge task for the active ACP connection.
 ///
-/// This task receives messages from the agent (Send world via mpsc channel)
-/// and forwards them to the AgentSideConnection (LocalSet world, !Send).
+/// This task receives messages from agent tasks via an mpsc channel and forwards
+/// them through the connection. Long-lived response waits use `ConnectionTo::spawn`
+/// so the bridge can continue handling other messages.
 ///
 /// # Message Handling
 ///
@@ -113,67 +104,57 @@ async fn run_bridge_task(
             }
             ClientBridgeMessage::Elicit {
                 elicitation_id,
+                session_id,
                 message,
                 requested_schema,
                 source,
                 response_tx,
             } => {
-                let _span = info_span!("acp.elicit").entered();
                 log::debug!(
-                    "Bridge: forwarding elicitation via ACP extension request: {}",
+                    "Bridge: forwarding native ACP elicitation request: {}",
                     elicitation_id
                 );
+                let task_connection = connection.clone();
+                let response_tx = Arc::new(Mutex::new(Some(response_tx)));
+                let task_response_tx = response_tx.clone();
+                let spawn_result = connection.spawn(async move {
+                    let result = match create_elicitation_request(
+                        elicitation_id,
+                        session_id,
+                        message,
+                        requested_schema,
+                        source,
+                    ) {
+                        Ok(request) => task_connection
+                            .send_request(request)
+                            .block_task()
+                            .await
+                            .and_then(convert_elicitation_response),
+                        Err(err) => Err(err),
+                    };
 
-                let params = serde_json::json!({
-                    "elicitationId": elicitation_id,
-                    "message": message,
-                    "requestedSchema": requested_schema,
-                    "source": source,
+                    let response_tx = task_response_tx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if response_tx.is_some_and(|tx| tx.send(result).is_err()) {
+                        log::error!(
+                            "Bridge: failed to send elicitation response (receiver dropped)"
+                        );
+                    }
+                    Ok(())
                 });
-                let result = match agent_ext_request("_querymt/elicit", params) {
-                    Ok(ext_req) => connection.send_request(ext_req).block_task().await,
-                    Err(err) => Err(err),
-                };
 
-                let parsed = match result {
-                    Ok(ext_resp) => {
-                        #[derive(serde::Deserialize)]
-                        struct ElicitResponse {
-                            action: String,
-                            content: Option<serde_json::Value>,
-                        }
-                        match serde_json::from_value::<ElicitResponse>(ext_resp) {
-                            Ok(resp) => {
-                                let action = match resp.action.as_str() {
-                                    "accept" => crate::elicitation::ElicitationAction::Accept,
-                                    "cancel" => crate::elicitation::ElicitationAction::Cancel,
-                                    _ => crate::elicitation::ElicitationAction::Decline,
-                                };
-                                crate::elicitation::ElicitationResponse {
-                                    action,
-                                    content: resp.content,
-                                }
-                            }
-                            Err(e) => {
-                                log::error!("Failed to parse elicitation response: {}", e);
-                                crate::elicitation::ElicitationResponse {
-                                    action: crate::elicitation::ElicitationAction::Decline,
-                                    content: None,
-                                }
-                            }
-                        }
+                if let Err(err) = spawn_result {
+                    let response_tx = response_tx
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if response_tx.is_some_and(|tx| tx.send(Err(err)).is_err()) {
+                        log::error!(
+                            "Bridge: failed to report elicitation task spawn failure (receiver dropped)"
+                        );
                     }
-                    Err(e) => {
-                        log::error!("Elicitation ext_method failed: {:?}", e);
-                        crate::elicitation::ElicitationResponse {
-                            action: crate::elicitation::ElicitationAction::Decline,
-                            content: None,
-                        }
-                    }
-                };
-
-                if response_tx.send(parsed).is_err() {
-                    log::error!("Bridge: failed to send elicitation response (receiver dropped)");
                 }
             }
             ClientBridgeMessage::WorkspaceQuery { query, response_tx } => {
@@ -218,6 +199,8 @@ async fn run_bridge_task(
 fn spawn_event_bridge_forwarder(
     event_fanout: Arc<EventFanout>,
     bridge: ClientBridgeSender,
+    agent: Arc<crate::agent::LocalAgentHandle>,
+    forwarded_elicitations: Arc<Mutex<HashSet<(String, String)>>>,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -230,6 +213,87 @@ fn spawn_event_bridge_forwarder(
         loop {
             match events.recv().await {
                 Ok(event) => {
+                    if let crate::events::AgentEventKind::ElicitationRequested {
+                        elicitation_id,
+                        session_id,
+                        message,
+                        requested_schema,
+                        source,
+                    } = event.kind()
+                    {
+                        let key = (session_id.clone(), elicitation_id.clone());
+                        let should_forward = forwarded_elicitations
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(key);
+                        if should_forward {
+                            let agent = agent.clone();
+                            let bridge = bridge.clone();
+                            let elicitation_id = elicitation_id.clone();
+                            let session_id = session_id.clone();
+                            let message = message.clone();
+                            let requested_schema = requested_schema.clone();
+                            let source = source.clone();
+                            tokio::spawn(async move {
+                                let response = match bridge
+                                    .elicit(
+                                        elicitation_id.clone(),
+                                        session_id.clone(),
+                                        message,
+                                        requested_schema,
+                                        source,
+                                    )
+                                    .await
+                                {
+                                    Ok(response) => response,
+                                    Err(err) => {
+                                        log::warn!(
+                                            "Native ACP elicitation {} failed: {}",
+                                            elicitation_id,
+                                            err
+                                        );
+                                        crate::elicitation::ElicitationResponse {
+                                            action: crate::elicitation::ElicitationAction::Cancel,
+                                            content: None,
+                                        }
+                                    }
+                                };
+
+                                match crate::elicitation::take_pending_elicitation_sender_for_session(
+                                    &agent,
+                                    &session_id,
+                                    &elicitation_id,
+                                )
+                                .await
+                                {
+                                    Some(sender) => {
+                                        if sender.send(response).is_err() {
+                                            log::warn!(
+                                                "Elicitation response receiver dropped: session_id={} elicitation_id={}",
+                                                session_id,
+                                                elicitation_id
+                                            );
+                                        } else {
+                                            log::debug!(
+                                                "Elicitation response delivered: session_id={} elicitation_id={}",
+                                                session_id,
+                                                elicitation_id
+                                            );
+                                        }
+                                    }
+                                    None => {
+                                        log::warn!(
+                                            "No pending elicitation found: session_id={} elicitation_id={}",
+                                            session_id,
+                                            elicitation_id
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                        continue;
+                    }
+
                     // Translate event to a live ACP SessionUpdate
                     if let Some(update) = translator.translate_update(&event) {
                         let notification = SessionNotification::new(
@@ -333,9 +397,15 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
 
     // 5. Spawn event bridge forwarders (one per EventFanout)
     let mut forwarder_handles = Vec::new();
+    let forwarded_elicitations = Arc::new(Mutex::new(HashSet::new()));
     for (idx, event_fanout) in event_sources.into_iter().enumerate() {
-        let handle =
-            spawn_event_bridge_forwarder(event_fanout, bridge_sender.clone(), shutdown_tx.clone());
+        let handle = spawn_event_bridge_forwarder(
+            event_fanout,
+            bridge_sender.clone(),
+            agent.clone(),
+            forwarded_elicitations.clone(),
+            shutdown_tx.clone(),
+        );
         forwarder_handles.push(handle);
         log::debug!("Spawned event forwarder #{}", idx);
     }
@@ -603,12 +673,22 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
 
 #[cfg(test)]
 mod stdio_tests {
-    use super::{CancelNotification, PromptRequest, agent_ext_request};
-    use crate::acp::protocol::{AgentRequest, PromptResponse, StopReason};
-    use agent_client_protocol::{Agent, ByteStreams, JsonRpcMessage};
+    use super::{
+        CancelNotification, ClientBridgeMessage, PromptRequest, agent_ext_request,
+        create_elicitation_request, run_bridge_task,
+    };
+    use crate::acp::client_bridge::ClientBridgeSender;
+    use crate::acp::protocol::{
+        AgentRequest, CreateElicitationRequest, ElicitationAcceptAction,
+        ElicitationAction as AcpElicitationAction, ElicitationContentValue, PromptResponse,
+        SessionId, SessionNotification, StopReason,
+    };
+    use crate::elicitation::ElicitationAction;
+    use agent_client_protocol::{Agent, ByteStreams, Client, JsonRpcMessage};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
-    use tokio::sync::{Mutex, Notify};
+    use tokio::sync::{Mutex, Notify, mpsc};
     use tokio::time::{Duration, timeout};
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -630,6 +710,188 @@ mod stdio_tests {
 
         let untyped = request.to_untyped_message().expect("untyped ext request");
         assert_eq!(untyped.method, "_workspace/query");
+    }
+
+    #[test]
+    fn native_elicitation_request_preserves_scope_schema_and_metadata() {
+        let request = create_elicitation_request(
+            "e-1".to_string(),
+            "s-1".to_string(),
+            "Choose one".to_string(),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selection": {
+                        "type": "string",
+                        "oneOf": [{"const": "A", "title": "A"}]
+                    }
+                },
+                "required": ["selection"]
+            }),
+            "builtin:question".to_string(),
+        )
+        .expect("native elicitation request");
+
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(value["mode"], "form");
+        assert_eq!(value["sessionId"], "s-1");
+        assert_eq!(value["message"], "Choose one");
+        assert_eq!(
+            value["requestedSchema"]["properties"]["selection"]["oneOf"][0]["const"],
+            "A"
+        );
+        assert_eq!(value["_meta"]["querymt"]["elicitation_id"], "e-1");
+        assert_eq!(value["_meta"]["querymt"]["source"], "builtin:question");
+        assert_eq!(request.method(), "elicitation/create");
+    }
+
+    #[test]
+    fn native_elicitation_rejects_invalid_schema() {
+        let result = create_elicitation_request(
+            "e-1".to_string(),
+            "s-1".to_string(),
+            "Invalid".to_string(),
+            serde_json::json!({"type": "object", "properties": {"nested": {"type": "object"}}}),
+            "test".to_string(),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn native_elicitation_preserves_decline_and_cancel_actions() {
+        let declined = super::convert_elicitation_response(
+            crate::acp::protocol::CreateElicitationResponse::new(AcpElicitationAction::Decline),
+        )
+        .expect("decline response");
+        let cancelled = super::convert_elicitation_response(
+            crate::acp::protocol::CreateElicitationResponse::new(AcpElicitationAction::Cancel),
+        )
+        .expect("cancel response");
+
+        assert_eq!(declined.action, ElicitationAction::Decline);
+        assert_eq!(cancelled.action, ElicitationAction::Cancel);
+        assert_eq!(declined.content, None);
+        assert_eq!(cancelled.content, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_elicitation_round_trip_uses_typed_acp_request() {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let (client_read, client_write) = split(client_stream);
+        let (server_read, server_write) = split(server_stream);
+        let seen_request = Arc::new(Mutex::new(None::<CreateElicitationRequest>));
+        let seen_request_for_handler = seen_request.clone();
+
+        let client_task = tokio::spawn(async move {
+            Client
+                .builder()
+                .on_receive_request(
+                    async move |request: CreateElicitationRequest, responder, _cx| {
+                        *seen_request_for_handler.lock().await = Some(request);
+                        let content = BTreeMap::from([(
+                            "selection".to_string(),
+                            ElicitationContentValue::String("Production".to_string()),
+                        )]);
+                        responder.respond(crate::acp::protocol::CreateElicitationResponse::new(
+                            AcpElicitationAction::Accept(
+                                ElicitationAcceptAction::new().content(content),
+                            ),
+                        ))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(ByteStreams::new(
+                    client_write.compat_write(),
+                    client_read.compat(),
+                ))
+                .await
+                .expect("client should run")
+        });
+
+        let (bridge_tx, bridge_rx) = mpsc::channel::<ClientBridgeMessage>(4);
+        let bridge = ClientBridgeSender::new(bridge_tx);
+        let server = Agent.builder().connect_with(
+            ByteStreams::new(server_write.compat_write(), server_read.compat()),
+            async move |connection| {
+                run_bridge_task(bridge_rx, connection).await;
+                Ok(())
+            },
+        );
+        let interaction = async move {
+            let response = bridge
+                .elicit(
+                    "e-2".to_string(),
+                    "s-2".to_string(),
+                    "Pick a target".to_string(),
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "selection": {
+                                "type": "string",
+                                "oneOf": [{"const": "Production", "title": "Production"}]
+                            }
+                        },
+                        "required": ["selection"]
+                    }),
+                    "builtin:question".to_string(),
+                )
+                .await
+                .expect("elicitation should succeed");
+
+            assert_eq!(response.action, ElicitationAction::Accept);
+            assert_eq!(
+                response.content,
+                Some(serde_json::json!({"selection": "Production"}))
+            );
+
+            let invalid_result = bridge
+                .elicit(
+                    "e-invalid".to_string(),
+                    "s-2".to_string(),
+                    "Invalid schema".to_string(),
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {"nested": {"type": "object"}}
+                    }),
+                    "test".to_string(),
+                )
+                .await;
+            assert!(invalid_result.is_err());
+
+            bridge
+                .notify(SessionNotification::new(
+                    SessionId::from("s-2"),
+                    crate::acp::protocol::SessionUpdate::AgentMessageChunk(
+                        crate::acp::protocol::ContentChunk::new(
+                            crate::acp::protocol::ContentBlock::Text(
+                                crate::acp::protocol::TextContent::new("still alive"),
+                            ),
+                        ),
+                    ),
+                ))
+                .await
+                .expect("bridge should remain alive after elicitation failure");
+        };
+
+        let (server_result, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(server, interaction)
+        })
+        .await
+        .expect("ordinary-runtime elicitation round trip should finish");
+        server_result.expect("server should stop cleanly after bridge closes");
+
+        let request = seen_request
+            .lock()
+            .await
+            .clone()
+            .expect("client should receive request");
+        let request_value = serde_json::to_value(request).expect("serialize captured request");
+        assert_eq!(request_value["sessionId"], "s-2");
+        assert_eq!(request_value["_meta"]["querymt"]["elicitation_id"], "e-2");
+
+        client_task.abort();
+        let _ = client_task.await;
     }
 
     #[tokio::test]

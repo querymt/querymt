@@ -1,30 +1,21 @@
 //! Client bridge for Send/!Send boundary crossing.
 //!
 //! This module provides types that allow a `Send + Sync` agent (like `AgentHandle`)
-//! to communicate with a `!Send` client connection (like `AgentSideConnection` from the SDK).
+//! to communicate with the active ACP client connection.
 //!
 //! ## Architecture
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                        LocalSet                              │
-//! │  ┌──────────────────┐      ┌──────────────────────────────┐ │
-//! │  │AgentSideConnection│◄─────│    Bridge Task               │ │
-//! │  │  (!Send)         │      │  - Receives from mpsc        │ │
-//! │  │                  │      │  - Calls connection methods  │ │
-//! │  └──────────────────┘      └──────────────▲───────────────┘ │
-//! │                                            │                 │
-//! │                                            │                 │
-//! └────────────────────────────────────────────┼─────────────────┘
-//!                                              │
-//!                                              │ ClientBridgeMessage
-//!                                              │ (Send types only)
-//!                                              │
-//!                          ┌───────────────────┴────────────────┐
-//!                          │  QueryMTAgent (Send + Sync)        │
-//!                          │  - Holds ClientBridgeSender        │
-//!                          │  - Sends messages via mpsc channel │
-//!                          └────────────────────────────────────┘
+//! ┌───────────────────┐      ┌──────────────────────────────┐
+//! │  ACP Connection   │◄─────│         Bridge Task          │
+//! │                   │      │  - Receives from mpsc        │
+//! │                   │      │  - Calls connection methods  │
+//! └───────────────────┘      └──────────────▲───────────────┘
+//!                                           │ ClientBridgeMessage
+//!                         ┌─────────────────┴──────────────────┐
+//!                         │  QueryMTAgent (Send + Sync)        │
+//!                         │  - Holds ClientBridgeSender        │
+//!                         └────────────────────────────────────┘
 //! ```
 //!
 //! ## Usage
@@ -49,11 +40,10 @@ use crate::acp::protocol::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-/// Messages sent from agent (Send context) to bridge task (LocalSet context).
+/// Messages sent from agent tasks to the active ACP bridge task.
 ///
-/// These messages cross the `Send`/`!Send` boundary via an mpsc channel.
-/// The bridge task running in a `LocalSet` receives these messages and
-/// forwards them to the `!Send` client connection.
+/// The mpsc channel keeps agent execution decoupled from the ACP connection's
+/// request and notification lifecycle.
 #[derive(Debug)]
 pub enum ClientBridgeMessage {
     /// Fire-and-forget session notification.
@@ -79,10 +69,11 @@ pub enum ClientBridgeMessage {
     /// The bridge task will handle elicitation and return the response.
     Elicit {
         elicitation_id: String,
+        session_id: String,
         message: String,
         requested_schema: serde_json::Value,
         source: String,
-        response_tx: oneshot::Sender<crate::elicitation::ElicitationResponse>,
+        response_tx: oneshot::Sender<Result<crate::elicitation::ElicitationResponse, Error>>,
     },
 
     /// Workspace query request (agent → client → VS Code LSP).
@@ -100,8 +91,8 @@ pub enum ClientBridgeMessage {
 /// Send-side handle for the client bridge.
 ///
 /// This type is `Send + Sync` and can be cloned and used from multi-threaded contexts.
-/// It allows a `Send + Sync` agent to communicate with a `!Send` client connection
-/// by sending messages through an mpsc channel to a bridge task running in `LocalSet`.
+/// It allows agent tasks to communicate with the ACP client by sending messages
+/// through an mpsc channel to the connection's bridge task.
 ///
 /// ## Examples
 ///
@@ -222,24 +213,26 @@ impl ClientBridgeSender {
     pub async fn elicit(
         &self,
         elicitation_id: String,
+        session_id: String,
         message: String,
         requested_schema: serde_json::Value,
         source: String,
-    ) -> Result<crate::elicitation::ElicitationResponse, String> {
+    ) -> Result<crate::elicitation::ElicitationResponse, Error> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
             .send(ClientBridgeMessage::Elicit {
                 elicitation_id,
+                session_id,
                 message,
                 requested_schema,
                 source,
                 response_tx,
             })
             .await
-            .map_err(|_| "Client bridge closed".to_string())?;
+            .map_err(|_| Error::from(crate::error::AgentError::ClientBridgeClosed))?;
 
         response_rx
             .await
-            .map_err(|_| "Elicitation response channel dropped".to_string())
+            .map_err(|_| Error::internal_error().data("Elicitation response channel dropped"))?
     }
 }

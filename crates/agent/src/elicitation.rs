@@ -107,6 +107,62 @@ pub async fn take_pending_elicitation_sender(
     None
 }
 
+/// Removes and returns a pending elicitation sender for a specific session.
+///
+/// Profile-bound sessions execute in their profile runtime, so that runtime and
+/// its delegates must be searched before falling back to the outer agent.
+pub async fn take_pending_elicitation_sender_for_session(
+    agent: &crate::agent::LocalAgentHandle,
+    session_id: &str,
+    elicitation_id: &str,
+) -> Option<oneshot::Sender<ElicitationResponse>> {
+    take_pending_elicitation_sender_for_session_with_profiles(
+        agent,
+        agent.profiles().as_ref(),
+        session_id,
+        elicitation_id,
+    )
+    .await
+}
+
+/// Session-aware variant for transports that own a profile manager separately
+/// from the root agent handle.
+pub async fn take_pending_elicitation_sender_for_session_with_profiles(
+    agent: &crate::agent::LocalAgentHandle,
+    profiles: Option<&crate::api::ProfileRuntimeHandle>,
+    session_id: &str,
+    elicitation_id: &str,
+) -> Option<oneshot::Sender<ElicitationResponse>> {
+    let agent_profiles = agent.profiles();
+    let profiles = profiles.or(agent_profiles.as_ref());
+
+    if let Some(profiles) = profiles
+        && let Some(binding) = profiles.session_binding(session_id).await
+    {
+        match profiles.runtime_for_profile(&binding.profile_id).await {
+            Ok(runtime) => {
+                let profile_agent = runtime.agent().handle();
+                if let Some(sender) =
+                    take_pending_elicitation_sender(profile_agent.as_ref(), elicitation_id).await
+                {
+                    return Some(sender);
+                }
+            }
+            Err(err) => {
+                log::warn!(
+                    "Failed to load profile runtime for elicitation response: session_id={} profile_id={} elicitation_id={} error={}",
+                    session_id,
+                    binding.profile_id,
+                    elicitation_id,
+                    err
+                );
+            }
+        }
+    }
+
+    take_pending_elicitation_sender(agent, elicitation_id).await
+}
+
 pub async fn insert_pending_elicitation(
     pending_map: &PendingElicitationMap,
     elicitation_id: String,
