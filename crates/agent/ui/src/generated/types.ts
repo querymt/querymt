@@ -190,6 +190,7 @@ export type AgentEventKind =
 }}
 	| { type: "delegation_requested", data: {
 	delegation: Delegation;
+	tool_call_id?: string;
 }}
 	| { type: "delegation_completed", data: {
 	delegation_id: string;
@@ -629,6 +630,31 @@ export interface CreateScheduleControlRequest {
 	max_runs?: number;
 }
 
+export enum DelegationUpdateState {
+	Requested = "requested",
+	Forked = "forked",
+	Completed = "completed",
+	Failed = "failed",
+	Cancelled = "cancelled",
+}
+
+export interface DelegationUpdateNotification {
+	version: number;
+	sessionId: string;
+	delegationId: string;
+	toolCallId?: string;
+	state: DelegationUpdateState;
+	targetAgentId: string;
+	objective: string;
+	childSessionId?: string;
+	requestedAt: number;
+	forkedAt?: number;
+	finishedAt?: number;
+	updatedAt: number;
+	resultSummary?: string;
+	error?: string;
+}
+
 export interface DismissRemoteSessionRequest {
 	session_id: string;
 }
@@ -1014,6 +1040,7 @@ export interface StreamCursor {
 export interface SessionLoadSnapshot {
 	audit: AuditView;
 	cursor: StreamCursor;
+	delegationUpdates: DelegationUpdateNotification[];
 }
 
 /** High-level runtime state for stop/resume orchestration. */
