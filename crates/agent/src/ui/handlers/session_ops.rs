@@ -480,12 +480,14 @@ pub async fn handle_delete_session(
     }
 
     if let Some(agent) = bound_agent.as_ref() {
+        agent.clear_delegate_model_overrides(session_id).await;
         remove_session_actor_from_agent(agent, session_id).await;
     }
     let removed_from_root = bound_agent
         .as_ref()
         .is_some_and(|agent| Arc::ptr_eq(agent, &state.agent));
     if !removed_from_root {
+        state.agent.clear_delegate_model_overrides(session_id).await;
         remove_session_actor_from_agent(&state.agent, session_id).await;
     }
 

@@ -158,6 +158,38 @@ async fn list_sessions_groups_and_children_use_shared_api() -> Result<()> {
 }
 
 #[tokio::test]
+async fn delete_session_clears_delegate_model_overrides() -> Result<()> {
+    let agent = test_agent().await?;
+    let session_id = agent.create_session().await?;
+    agent
+        .inner
+        .config
+        .delegate_model_overrides
+        .set(
+            &session_id,
+            "coder",
+            crate::delegation::DelegateModelOverride {
+                model_id: "mock/alternate".into(),
+                node_id: None,
+            },
+        )
+        .await;
+
+    agent.sessions().delete(&session_id).await?;
+
+    assert!(
+        agent
+            .inner
+            .config
+            .delegate_model_overrides
+            .get(&session_id, "coder")
+            .await
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn acp_list_sessions_orders_by_updated_at_and_paginates() -> Result<()> {
     let agent = test_agent().await?;
     let session_store = agent.storage_backend().session_store();

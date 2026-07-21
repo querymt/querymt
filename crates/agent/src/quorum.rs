@@ -13,12 +13,14 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-type DelegateFactory = Box<dyn FnOnce(Arc<dyn StorageBackend>) -> Arc<dyn AgentHandle> + Send>;
+type DelegateFactory =
+    Box<dyn FnOnce(Arc<dyn StorageBackend>, Arc<EventFanout>) -> Arc<dyn AgentHandle> + Send>;
 
 type PlannerFactory = Box<
     dyn FnOnce(
             Arc<dyn StorageBackend>,
             Arc<dyn AgentRegistry + Send + Sync>,
+            Arc<EventFanout>,
         ) -> Arc<dyn AgentHandle>
         + Send,
 >;
@@ -31,6 +33,8 @@ pub enum AgentQuorumError {
     Store(#[from] SessionError),
     #[error("missing required capability: {0:?}")]
     MissingCapability(CapabilityRequirement),
+    #[error("{agent_id} agent did not use the quorum event fanout")]
+    EventFanoutMismatch { agent_id: String },
 }
 
 pub struct DelegateAgent {
@@ -183,6 +187,9 @@ impl AgentQuorumBuilder {
     }
 
     /// Use a caller-provided event bus for the planner, delegates, and orchestrator.
+    ///
+    /// The bus is passed to each factory and the build fails if a returned local agent uses a
+    /// different bus.
     pub fn with_event_fanout(mut self, event_fanout: Arc<EventFanout>) -> Self {
         self.event_fanout = event_fanout;
         self
@@ -190,7 +197,9 @@ impl AgentQuorumBuilder {
 
     pub fn add_delegate_agent<F>(mut self, info: AgentInfo, factory: F) -> Self
     where
-        F: FnOnce(Arc<dyn StorageBackend>) -> Arc<dyn AgentHandle> + Send + 'static,
+        F: FnOnce(Arc<dyn StorageBackend>, Arc<EventFanout>) -> Arc<dyn AgentHandle>
+            + Send
+            + 'static,
     {
         self.delegate_factories.push((info, Box::new(factory)));
         self
@@ -201,6 +210,7 @@ impl AgentQuorumBuilder {
         F: FnOnce(
                 Arc<dyn StorageBackend>,
                 Arc<dyn AgentRegistry + Send + Sync>,
+                Arc<EventFanout>,
             ) -> Arc<dyn AgentHandle>
             + Send
             + 'static,
@@ -290,7 +300,12 @@ impl AgentQuorumBuilder {
         }
 
         for (info, factory) in self.delegate_factories {
-            let agent = factory(self.storage.clone());
+            let agent = factory(self.storage.clone(), self.event_fanout.clone());
+            if !Arc::ptr_eq(agent.event_fanout(), &self.event_fanout) {
+                return Err(AgentQuorumError::EventFanoutMismatch {
+                    agent_id: info.id.clone(),
+                });
+            }
 
             registry.register_handle(info.clone(), agent.clone());
             delegates.push(DelegateAgent { info, agent });
@@ -301,7 +316,16 @@ impl AgentQuorumBuilder {
         let planner_factory = self
             .planner_factory
             .ok_or(AgentQuorumError::MissingPlanner)?;
-        let planner = planner_factory(self.storage.clone(), registry.clone());
+        let planner = planner_factory(
+            self.storage.clone(),
+            registry.clone(),
+            self.event_fanout.clone(),
+        );
+        if !Arc::ptr_eq(planner.event_fanout(), &self.event_fanout) {
+            return Err(AgentQuorumError::EventFanoutMismatch {
+                agent_id: "planner".to_string(),
+            });
+        }
 
         let orchestrator = if self.delegation_enabled {
             // We need to get the tool_registry. For now, we'll use a default/empty one
@@ -348,25 +372,17 @@ impl AgentQuorumBuilder {
             }
             let orchestrator = Arc::new(orch);
 
-            // Subscribe the orchestrator to the planner's event fanout so it can
-            // react to delegation-related events (e.g. DelegationRequested).
-            // Using planner.event_fanout() ensures the orchestrator subscribes to
-            // the same fanout that the planner emits on — fixing the PR #158 bug.
-            let planner_fanout = planner.event_fanout().clone();
-            let _listener_handle = orchestrator.start_listening(&planner_fanout);
+            // All local agents are validated against this fanout above.
+            let _listener_handle = orchestrator.start_listening(&self.event_fanout);
 
             Some(orchestrator)
         } else {
             None
         };
 
-        // Use the planner's event fanout as the quorum's event fanout — this
-        // ensures all consumers see the same events the planner emits.
-        let event_fanout = planner.event_fanout().clone();
-
         Ok(AgentQuorum {
             storage: self.storage,
-            event_fanout,
+            event_fanout: self.event_fanout,
             registry,
             planner,
             delegates,
@@ -402,14 +418,14 @@ mod tests {
                 required_capabilities: vec![],
                 meta: None,
             },
-            move |storage| {
+            move |storage, event_fanout| {
                 let config = Arc::new(
                     AgentConfigBuilder::new(
                         delegate_registry.clone(),
                         storage,
                         LLMParams::new().provider("mock").model("mock-model"),
                     )
-                    .with_event_fanout(shared_fanout.clone())
+                    .with_event_fanout(event_fanout)
                     .build(),
                 );
                 Arc::new(LocalAgentHandle::from_config(config)) as Arc<dyn AgentHandle>
@@ -417,8 +433,7 @@ mod tests {
         );
 
         let planner_registry = plugin_registry.clone();
-        let expected_fanout = builder.event_fanout.clone();
-        builder = builder.with_planner(move |storage, agent_registry| {
+        builder = builder.with_planner(move |storage, agent_registry, event_fanout| {
             let config = Arc::new(
                 AgentConfigBuilder::new(
                     planner_registry.clone(),
@@ -426,7 +441,7 @@ mod tests {
                     LLMParams::new().provider("mock").model("mock-model"),
                 )
                 .with_agent_registry(agent_registry)
-                .with_event_fanout(expected_fanout.clone())
+                .with_event_fanout(event_fanout)
                 .build(),
             );
             Arc::new(LocalAgentHandle::from_config(config)) as Arc<dyn AgentHandle>
@@ -447,6 +462,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quorum_rejects_planner_with_a_different_event_fanout() {
+        let backend = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let mut builder = AgentQuorumBuilder::from_backend(backend);
+        let (plugin_registry, _temp_dir) = empty_plugin_registry().unwrap();
+        let plugin_registry = Arc::new(plugin_registry);
+
+        builder = builder.with_planner(move |storage, agent_registry, _event_fanout| {
+            let config = Arc::new(
+                AgentConfigBuilder::new(
+                    plugin_registry.clone(),
+                    storage,
+                    LLMParams::new().provider("mock").model("mock-model"),
+                )
+                .with_agent_registry(agent_registry)
+                .with_event_fanout(Arc::new(EventFanout::new()))
+                .build(),
+            );
+            Arc::new(LocalAgentHandle::from_config(config)) as Arc<dyn AgentHandle>
+        });
+
+        assert!(matches!(
+            builder.build(),
+            Err(AgentQuorumError::EventFanoutMismatch { agent_id }) if agent_id == "planner"
+        ));
+    }
+
+    #[tokio::test]
     async fn quorum_exposes_planner_event_fanout() {
         let backend = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
         let mut builder = AgentQuorumBuilder::from_backend(backend);
@@ -454,7 +496,7 @@ mod tests {
         let (plugin_registry, _temp_dir) = empty_plugin_registry().unwrap();
         let plugin_registry = Arc::new(plugin_registry);
 
-        builder = builder.with_planner(move |storage, agent_registry| {
+        builder = builder.with_planner(move |storage, agent_registry, event_fanout| {
             let config = Arc::new(
                 AgentConfigBuilder::new(
                     plugin_registry.clone(),
@@ -462,6 +504,7 @@ mod tests {
                     LLMParams::new().provider("mock").model("mock-model"),
                 )
                 .with_agent_registry(agent_registry)
+                .with_event_fanout(event_fanout)
                 .build(),
             );
             Arc::new(LocalAgentHandle::from_config(config)) as Arc<dyn AgentHandle>

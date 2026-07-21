@@ -236,7 +236,7 @@ impl LocalAgentHandle {
         Ok(DeleteSessionResponse::new())
     }
 
-    pub(super) async fn clear_delegate_model_overrides(&self, session_id: &str) {
+    pub(crate) async fn clear_delegate_model_overrides(&self, session_id: &str) {
         self.config
             .delegate_model_overrides
             .clear_parent(session_id)

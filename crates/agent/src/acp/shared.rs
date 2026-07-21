@@ -344,7 +344,8 @@ impl AcpLiveEventTranslator {
         Self {
             streamed_assistant_messages: HashSet::new(),
             delegation_updates:
-                crate::control::delegation_notifications::DelegationUpdateProjector::default(),
+                crate::control::delegation_notifications::DelegationUpdateProjector::for_live_stream(
+                ),
         }
     }
 
