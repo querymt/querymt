@@ -54,21 +54,11 @@ pub struct DelegationUpdateNotification {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DelegationUpdateProjector {
     snapshots: HashMap<String, DelegationUpdateNotification>,
     pending: HashMap<String, Vec<PendingDelegationTransition>>,
     max_tracked: Option<usize>,
-}
-
-impl Default for DelegationUpdateProjector {
-    fn default() -> Self {
-        Self {
-            snapshots: HashMap::new(),
-            pending: HashMap::new(),
-            max_tracked: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
