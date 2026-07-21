@@ -182,6 +182,12 @@ impl AgentQuorumBuilder {
         self
     }
 
+    /// Use a caller-provided event bus for the planner, delegates, and orchestrator.
+    pub fn with_event_fanout(mut self, event_fanout: Arc<EventFanout>) -> Self {
+        self.event_fanout = event_fanout;
+        self
+    }
+
     pub fn add_delegate_agent<F>(mut self, info: AgentInfo, factory: F) -> Self
     where
         F: FnOnce(Arc<dyn StorageBackend>) -> Arc<dyn AgentHandle> + Send + 'static,
@@ -376,6 +382,69 @@ mod tests {
     use crate::agent::{AgentConfigBuilder, LocalAgentHandle};
     use crate::test_utils::empty_plugin_registry;
     use querymt::LLMParams;
+
+    #[tokio::test]
+    async fn quorum_uses_injected_event_fanout_for_all_local_agents() {
+        let backend = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let shared_fanout = Arc::new(EventFanout::new());
+        let mut builder =
+            AgentQuorumBuilder::from_backend(backend).with_event_fanout(shared_fanout.clone());
+
+        let (plugin_registry, _temp_dir) = empty_plugin_registry().unwrap();
+        let plugin_registry = Arc::new(plugin_registry);
+        let delegate_registry = plugin_registry.clone();
+        builder = builder.add_delegate_agent(
+            AgentInfo {
+                id: "coder".into(),
+                name: "Coder".into(),
+                description: String::new(),
+                capabilities: vec![],
+                required_capabilities: vec![],
+                meta: None,
+            },
+            move |storage| {
+                let config = Arc::new(
+                    AgentConfigBuilder::new(
+                        delegate_registry.clone(),
+                        storage,
+                        LLMParams::new().provider("mock").model("mock-model"),
+                    )
+                    .with_event_fanout(shared_fanout.clone())
+                    .build(),
+                );
+                Arc::new(LocalAgentHandle::from_config(config)) as Arc<dyn AgentHandle>
+            },
+        );
+
+        let planner_registry = plugin_registry.clone();
+        let expected_fanout = builder.event_fanout.clone();
+        builder = builder.with_planner(move |storage, agent_registry| {
+            let config = Arc::new(
+                AgentConfigBuilder::new(
+                    planner_registry.clone(),
+                    storage,
+                    LLMParams::new().provider("mock").model("mock-model"),
+                )
+                .with_agent_registry(agent_registry)
+                .with_event_fanout(expected_fanout.clone())
+                .build(),
+            );
+            Arc::new(LocalAgentHandle::from_config(config)) as Arc<dyn AgentHandle>
+        });
+
+        let expected_fanout = builder.event_fanout.clone();
+        let quorum = builder.build().unwrap();
+
+        assert!(Arc::ptr_eq(&quorum.event_fanout(), &expected_fanout));
+        assert!(Arc::ptr_eq(
+            quorum.planner().event_fanout(),
+            &expected_fanout
+        ));
+        assert!(Arc::ptr_eq(
+            quorum.delegate("coder").unwrap().event_fanout(),
+            &expected_fanout
+        ));
+    }
 
     #[tokio::test]
     async fn quorum_exposes_planner_event_fanout() {
