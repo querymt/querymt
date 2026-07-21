@@ -887,6 +887,7 @@ pub(super) async fn record_tool_side_effects(
                 &exec_ctx.session_id,
                 AgentEventKind::DelegationRequested {
                     delegation: delegation.clone(),
+                    tool_call_id: Some(result.call_id.clone()),
                 },
             );
             return Ok(Some(WaitCondition::delegation(

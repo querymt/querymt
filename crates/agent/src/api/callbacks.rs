@@ -139,7 +139,7 @@ fn dispatch_event(callbacks: &EventCallbacks, event: &EventEnvelope) {
                 callback("assistant".to_string(), content.clone());
             }
         }
-        AgentEventKind::DelegationRequested { delegation } => {
+        AgentEventKind::DelegationRequested { delegation, .. } => {
             if let Some(callback) = callbacks.on_delegation.as_ref() {
                 callback(
                     delegation.target_agent_id.clone(),

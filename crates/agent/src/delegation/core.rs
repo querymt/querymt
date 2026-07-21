@@ -234,7 +234,7 @@ impl DelegationOrchestrator {
     async fn handle_envelope(&self, envelope: &EventEnvelope) {
         let session_id = envelope.session_id();
         match envelope.kind() {
-            AgentEventKind::DelegationRequested { delegation } => {
+            AgentEventKind::DelegationRequested { delegation, .. } => {
                 tracing::Span::current().record("event_kind", "DelegationRequested");
                 let delegator = self.delegator.clone();
                 let event_sink = self.event_sink.clone();

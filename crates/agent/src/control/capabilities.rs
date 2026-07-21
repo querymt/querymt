@@ -155,6 +155,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
             "querymt/mesh/peerExpired".to_string(),
             "querymt/models/changed".to_string(),
             "querymt/schedules/changed".to_string(),
+            "querymt/session/delegationUpdate".to_string(),
         ],
     }
 }

@@ -55,12 +55,18 @@ async fn test_querymt_capabilities_lists_control_surface() {
             "missing capability method {expected}"
         );
     }
+    let notifications = result["notifications"]
+        .as_array()
+        .expect("notifications array");
     assert!(
-        result["notifications"]
-            .as_array()
-            .expect("notifications array")
+        notifications
             .iter()
             .any(|method| method == "querymt/models/changed")
+    );
+    assert!(
+        notifications
+            .iter()
+            .any(|method| method == "querymt/session/delegationUpdate")
     );
     assert_eq!(result["transport"]["mesh_transport"], "none");
     assert_eq!(result["features"]["mesh_invites"], false);

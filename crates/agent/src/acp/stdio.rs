@@ -30,8 +30,8 @@ use crate::acp::protocol::{
     SetSessionModeRequest, SetSessionModelRequest,
 };
 use crate::acp::shared::{
-    AcpLiveEventTranslator, convert_elicitation_response, create_elicitation_request,
-    replay_agent_events_to_session_notifications,
+    AcpLiveEventTranslator, QMT_NOTIFICATION_DELEGATION_UPDATE, convert_elicitation_response,
+    create_elicitation_request, replay_agent_events_to_session_notifications,
 };
 use crate::acp::shutdown;
 use crate::event_fanout::EventFanout;
@@ -201,6 +201,7 @@ fn spawn_event_bridge_forwarder(
     bridge: ClientBridgeSender,
     agent: Arc<crate::agent::LocalAgentHandle>,
     forwarded_elicitations: Arc<Mutex<HashSet<(String, String)>>>,
+    translator: Arc<Mutex<AcpLiveEventTranslator>>,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -208,7 +209,6 @@ fn spawn_event_bridge_forwarder(
         let mut events = event_fanout.subscribe();
 
         let mut forwarded_count = 0u64;
-        let mut translator = AcpLiveEventTranslator::new();
 
         loop {
             match events.recv().await {
@@ -294,30 +294,60 @@ fn spawn_event_bridge_forwarder(
                         continue;
                     }
 
-                    // Translate event to a live ACP SessionUpdate
-                    if let Some(update) = translator.translate_update(&event) {
-                        let notification = SessionNotification::new(
-                            SessionId::from(event.session_id().to_owned()),
-                            update,
-                        );
-
-                        // Forward via bridge
-                        if let Err(e) = bridge.notify(notification).await {
-                            log::info!(
-                                "Bridge closed after forwarding {} events, stopping forwarder: {}",
-                                forwarded_count,
-                                e
-                            );
-                            break;
+                    let (delegation_update, session_update) = {
+                        let mut translator = translator
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let delegation_update = translator.translate_delegation_update(&event);
+                        let session_update = delegation_update
+                            .is_none()
+                            .then(|| translator.translate_update(&event))
+                            .flatten();
+                        (delegation_update, session_update)
+                    };
+                    let result = if let Some(update) = delegation_update {
+                        let params = serde_json::value::RawValue::from_string(
+                            serde_json::to_string(&update).unwrap_or_else(|_| "null".to_string()),
+                        )
+                        .map(Arc::from)
+                        .map_err(acp::Error::into_internal_error);
+                        match params {
+                            Ok(params) => {
+                                bridge
+                                    .notify_ext(crate::acp::protocol::ExtNotification::new(
+                                        QMT_NOTIFICATION_DELEGATION_UPDATE,
+                                        params,
+                                    ))
+                                    .await
+                            }
+                            Err(err) => Err(err),
                         }
+                    } else if let Some(update) = session_update {
+                        bridge
+                            .notify(SessionNotification::new(
+                                SessionId::from(event.session_id().to_owned()),
+                                update,
+                            ))
+                            .await
+                    } else {
+                        continue;
+                    };
 
-                        forwarded_count += 1;
-                        log::trace!(
-                            "Forwarded event {} for session {}",
+                    if let Err(e) = result {
+                        log::info!(
+                            "Bridge closed after forwarding {} events, stopping forwarder: {}",
                             forwarded_count,
-                            event.session_id()
+                            e
                         );
+                        break;
                     }
+
+                    forwarded_count += 1;
+                    log::trace!(
+                        "Forwarded event {} for session {}",
+                        forwarded_count,
+                        event.session_id()
+                    );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     log::info!(
@@ -398,12 +428,14 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
     // 5. Spawn event bridge forwarders (one per EventFanout)
     let mut forwarder_handles = Vec::new();
     let forwarded_elicitations = Arc::new(Mutex::new(HashSet::new()));
+    let translator = Arc::new(Mutex::new(AcpLiveEventTranslator::new()));
     for (idx, event_fanout) in event_sources.into_iter().enumerate() {
         let handle = spawn_event_bridge_forwarder(
             event_fanout,
             bridge_sender.clone(),
             agent.clone(),
             forwarded_elicitations.clone(),
+            translator.clone(),
             shutdown_tx.clone(),
         );
         forwarder_handles.push(handle);
@@ -674,8 +706,9 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
 #[cfg(test)]
 mod stdio_tests {
     use super::{
-        CancelNotification, ClientBridgeMessage, PromptRequest, agent_ext_request,
-        create_elicitation_request, run_bridge_task,
+        AcpLiveEventTranslator, CancelNotification, ClientBridgeMessage, PromptRequest,
+        agent_ext_request, create_elicitation_request, run_bridge_task,
+        spawn_event_bridge_forwarder,
     };
     use crate::acp::client_bridge::ClientBridgeSender;
     use crate::acp::protocol::{
@@ -691,6 +724,77 @@ mod stdio_tests {
     use tokio::sync::{Mutex, Notify, mpsc};
     use tokio::time::{Duration, timeout};
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+    #[tokio::test]
+    async fn delegation_update_uses_typed_ext_notification_bridge() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let (bridge_tx, mut bridge_rx) = mpsc::channel(4);
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+        let forwarder = spawn_event_bridge_forwarder(
+            fixture.config.event_sink.fanout().clone(),
+            ClientBridgeSender::new(bridge_tx),
+            fixture.handle.clone(),
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            Arc::new(std::sync::Mutex::new(AcpLiveEventTranslator::new())),
+            shutdown_tx,
+        );
+        tokio::task::yield_now().await;
+        let delegation = crate::session::domain::Delegation {
+            id: 0,
+            public_id: "delegation-1".into(),
+            session_id: 0,
+            task_id: None,
+            target_agent_id: "coder".into(),
+            objective: "Implement it".into(),
+            objective_hash: crate::hash::RapidHash::default(),
+            context: None,
+            constraints: None,
+            expected_output: None,
+            verification_spec: None,
+            planning_summary: None,
+            status: crate::session::domain::DelegationStatus::Requested,
+            retry_count: 0,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            completed_at: None,
+        };
+        fixture
+            .config
+            .event_sink
+            .fanout()
+            .publish(crate::events::EventEnvelope::Durable(
+                crate::events::DurableEvent {
+                    event_id: "event-1".into(),
+                    stream_seq: 1,
+                    session_id: "parent-1".into(),
+                    timestamp: 10,
+                    origin: crate::events::EventOrigin::Local,
+                    source_node: None,
+                    kind: crate::events::AgentEventKind::DelegationRequested {
+                        delegation,
+                        tool_call_id: Some("call-1".into()),
+                    },
+                },
+            ));
+
+        let message = timeout(Duration::from_secs(2), bridge_rx.recv())
+            .await
+            .expect("notification should arrive")
+            .expect("bridge should remain open");
+        match message {
+            ClientBridgeMessage::ExtNotification(notification) => {
+                assert_eq!(
+                    notification.method.as_ref(),
+                    crate::acp::shared::QMT_NOTIFICATION_DELEGATION_UPDATE
+                );
+                let params: serde_json::Value =
+                    serde_json::from_str(notification.params.get()).expect("valid params");
+                assert_eq!(params["delegationId"], "delegation-1");
+                assert_eq!(params["toolCallId"], "call-1");
+            }
+            _ => panic!("expected extension notification"),
+        }
+        forwarder.abort();
+    }
 
     #[test]
     fn outbound_workspace_query_preserves_wire_extension_method() {
