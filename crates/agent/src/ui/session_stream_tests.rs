@@ -37,6 +37,26 @@ system = "inline"
     .expect("failed to write profile");
 }
 
+fn write_quorum_profile(dir: &Path, name: &str) {
+    std::fs::write(
+        dir.join(name),
+        r#"
+[quorum]
+delegation = true
+
+[planner]
+provider = "test"
+model = "test-model"
+
+[[delegates]]
+id = "coder"
+provider = "test"
+model = "test-model"
+"#,
+    )
+    .expect("failed to write quorum profile");
+}
+
 async fn test_profile_manager_with_infra(
     dir: &Path,
     storage: Arc<SqliteStorage>,
@@ -397,6 +417,137 @@ async fn forwarder_uses_shared_profile_runtime_fanout_without_polling() -> Resul
             Some(1)
         );
     }
+
+    profiles.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn forwarder_uses_shared_quorum_profile_fanout_without_polling() -> Result<()> {
+    let agent = TestAgent::new().await;
+    let dir = tempfile::TempDir::new().expect("create temp profile dir");
+    write_quorum_profile(dir.path(), "alpha.toml");
+    let root_fanout = agent.handle.config.event_sink.fanout().clone();
+    let profiles =
+        test_profile_manager_with_infra(dir.path(), agent.storage.clone(), root_fanout.clone())
+            .await;
+
+    let session_id = "s-quorum-profile-live".to_string();
+    let conn_id = "conn-quorum-profile-live".to_string();
+    let state = super::ServerState {
+        agent: agent.handle.clone(),
+        view_store: agent.storage.view_store().expect("view store"),
+        session_store: agent.storage.session_store(),
+        default_cwd: None,
+        event_sources: vec![root_fanout.clone()],
+        profiles: Some(profiles.clone()),
+        connections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        connection_senders: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        session_agents: Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            session_id.clone(),
+            super::session::PRIMARY_AGENT_ID.to_string(),
+        )]))),
+        session_cwds: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
+            crate::index::WorkspaceIndexManagerConfig::default(),
+        ),
+        oauth_service: agent.handle.oauth_service.clone(),
+        shutdown_token: CancellationToken::new(),
+        #[cfg(feature = "remote")]
+        remote_node_cache: Arc::new(tokio::sync::Mutex::new(None)),
+    };
+    state.connections.lock().await.insert(
+        conn_id.clone(),
+        super::ConnectionState {
+            routing_mode: crate::ui::messages::RoutingMode::Single,
+            active_agent_id: super::session::PRIMARY_AGENT_ID.to_string(),
+            sessions: HashMap::new(),
+            subscribed_sessions: HashSet::from([session_id.clone()]),
+            session_cursors: HashMap::new(),
+            current_workspace_root: None,
+            file_index_forwarder: None,
+        },
+    );
+
+    let (tx, mut rx) = mpsc::channel(8);
+    spawn_event_forwarders(state, conn_id, tx);
+
+    let runtime = profiles
+        .runtime_for_profile("alpha")
+        .await
+        .expect("quorum runtime materializes after forwarders start");
+    profiles
+        .bind_session_to_runtime(session_id.clone(), &runtime)
+        .await
+        .expect("session binds to quorum runtime");
+    let quorum = runtime.agent().quorum().expect("quorum runtime");
+    let planner = quorum.planner();
+    let delegate = quorum.delegate("coder").expect("coder delegate");
+
+    assert!(Arc::ptr_eq(&root_fanout, &quorum.event_fanout()));
+    assert!(Arc::ptr_eq(&root_fanout, planner.event_fanout()));
+    assert!(Arc::ptr_eq(&root_fanout, delegate.event_fanout()));
+
+    for (stream_seq, event_id, content, source) in [
+        (
+            1,
+            "e-quorum-planner",
+            "from planner",
+            planner.event_fanout(),
+        ),
+        (
+            2,
+            "e-quorum-delegate",
+            "from delegate",
+            delegate.event_fanout(),
+        ),
+    ] {
+        source.publish(crate::events::EventEnvelope::Durable(
+            crate::events::DurableEvent {
+                event_id: event_id.into(),
+                stream_seq,
+                timestamp: 1,
+                session_id: session_id.clone(),
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::PromptReceived {
+                    content: content.into(),
+                    message_id: Some(format!("{event_id}-message")),
+                },
+            },
+        ));
+    }
+
+    let first = timeout(Duration::from_millis(500), rx.recv())
+        .await
+        .expect("planner event should arrive")
+        .expect("channel should remain open");
+    let second = timeout(Duration::from_millis(500), rx.recv())
+        .await
+        .expect("delegate event should arrive")
+        .expect("channel should remain open");
+    let event_ids = HashSet::from([
+        parse_message(&first)["data"]["event"]["data"]["event_id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        parse_message(&second)["data"]["event"]["data"]["event_id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    ]);
+    assert_eq!(
+        event_ids,
+        HashSet::from([
+            "e-quorum-planner".to_string(),
+            "e-quorum-delegate".to_string()
+        ])
+    );
+    assert!(
+        timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .is_err()
+    );
 
     profiles.shutdown().await;
     Ok(())

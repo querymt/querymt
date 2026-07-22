@@ -795,6 +795,21 @@ async fn handle_delete_session_clears_bound_profile_registry_after_active_profil
         .expect("alpha runtime should load")
         .agent()
         .handle();
+    let model_override = crate::delegation::DelegateModelOverride {
+        model_id: "mock/alternate".into(),
+        node_id: None,
+    };
+    alpha_agent
+        .config
+        .delegate_model_overrides
+        .set(&session_id, "coder", model_override.clone())
+        .await;
+    f.state
+        .agent
+        .config
+        .delegate_model_overrides
+        .set(&session_id, "coder", model_override)
+        .await;
     insert_test_actor(&alpha_agent, &session_id).await;
     profiles
         .set_active_profile("beta")
@@ -811,6 +826,23 @@ async fn handle_delete_session_clears_bound_profile_registry_after_active_profil
     assert!(alpha_registry.get(&session_id).is_none());
     drop(alpha_registry);
     assert!(profiles.session_binding(&session_id).await.is_none());
+    assert!(
+        alpha_agent
+            .config
+            .delegate_model_overrides
+            .get(&session_id, "coder")
+            .await
+            .is_none()
+    );
+    assert!(
+        f.state
+            .agent
+            .config
+            .delegate_model_overrides
+            .get(&session_id, "coder")
+            .await
+            .is_none()
+    );
     assert!(
         f.agent
             .storage

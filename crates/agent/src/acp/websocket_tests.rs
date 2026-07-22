@@ -3,7 +3,7 @@ use super::websocket::{
     cancel_pending_websocket_requests, route_websocket_response, spawn_event_forwarders,
 };
 use crate::elicitation::{ElicitationAction, insert_pending_elicitation};
-use crate::events::{AgentEventKind, EphemeralEvent, EventEnvelope, EventOrigin};
+use crate::events::{AgentEventKind, DurableEvent, EphemeralEvent, EventEnvelope, EventOrigin};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -113,6 +113,78 @@ async fn websocket_event_forwarder_sends_native_elicitation_and_resolves_respons
         response.content,
         Some(serde_json::json!({"selection": "A"}))
     );
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn websocket_event_forwarder_emits_owned_delegation_update() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let state = WsServerState::new(fixture.handle.clone());
+    let session_id = "ws-session";
+    state
+        .session_owners
+        .lock()
+        .await
+        .insert(session_id.to_string(), "conn".to_string());
+
+    let (wire_tx, mut wire_rx) = mpsc::channel::<String>(4);
+    let cancel = CancellationToken::new();
+    spawn_event_forwarders(
+        state,
+        ConnectionEventState {
+            conn_id: "conn".to_string(),
+            tx: wire_tx,
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            forwarded_elicitations: Arc::new(Mutex::new(HashSet::new())),
+            request_counter: Arc::new(AtomicU64::new(1)),
+            connection_cancel: cancel.clone(),
+        },
+    );
+
+    let delegation = crate::session::domain::Delegation {
+        id: 0,
+        public_id: "delegation-1".into(),
+        session_id: 0,
+        task_id: None,
+        target_agent_id: "coder".into(),
+        objective: "Implement it".into(),
+        objective_hash: crate::hash::RapidHash::default(),
+        context: None,
+        constraints: None,
+        expected_output: None,
+        verification_spec: None,
+        planning_summary: None,
+        status: crate::session::domain::DelegationStatus::Requested,
+        retry_count: 0,
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
+        completed_at: None,
+    };
+    fixture
+        .config
+        .event_sink
+        .fanout()
+        .publish(EventEnvelope::Durable(DurableEvent {
+            event_id: "event-1".into(),
+            stream_seq: 1,
+            session_id: session_id.into(),
+            timestamp: 10,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::DelegationRequested {
+                delegation,
+                tool_call_id: Some("call-1".into()),
+            },
+        }));
+
+    let wire = timeout(Duration::from_secs(2), wire_rx.recv())
+        .await
+        .expect("delegation update should be sent")
+        .expect("wire channel should remain open");
+    let value: serde_json::Value = serde_json::from_str(&wire).expect("valid notification");
+    assert_eq!(value["method"], "querymt/session/delegationUpdate");
+    assert_eq!(value["params"]["sessionId"], session_id);
+    assert_eq!(value["params"]["delegationId"], "delegation-1");
+    assert_eq!(value["params"]["toolCallId"], "call-1");
     cancel.cancel();
 }
 

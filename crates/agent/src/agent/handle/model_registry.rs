@@ -215,6 +215,8 @@ impl LocalAgentHandle {
             events.len()
         );
         let cursor = crate::session::cursor_from_events(&events);
+        let delegation_updates =
+            crate::control::delegation_notifications::delegation_updates_from_events(&events);
         let audit = crate::session::projection::AuditView {
             session_id: session_id.to_string(),
             events,
@@ -230,6 +232,7 @@ impl LocalAgentHandle {
         Ok(serde_json::json!({
             "audit": audit,
             "cursor": cursor,
+            "delegationUpdates": delegation_updates,
         }))
     }
 }

@@ -430,6 +430,7 @@ impl AgentSessions {
     pub async fn delete(&self, session_id: impl AsRef<str>) -> Result<()> {
         let session_id = session_id.as_ref().to_string();
         self.session_store().delete_session(&session_id).await?;
+        self.agent.clear_delegate_model_overrides(&session_id).await;
         let mut registry = self.agent.registry.lock().await;
         #[cfg(feature = "remote")]
         {

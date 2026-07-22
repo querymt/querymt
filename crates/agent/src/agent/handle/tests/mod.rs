@@ -171,6 +171,29 @@ model = "test-model"
 system = "beta"
 "#;
 
+const QUORUM_PROFILE_TOML: &str = r#"
+[quorum]
+delegation = true
+
+[planner]
+provider = "test"
+model = "test-model"
+
+[[delegates]]
+id = "reviewer"
+provider = "test"
+model = "test-model"
+description = "Reviews changes"
+capabilities = ["review"]
+
+[[delegates]]
+id = "coder"
+provider = "test"
+model = "test-model"
+description = "Writes code"
+capabilities = ["coding"]
+"#;
+
 fn write_profile(dir: &Path, name: &str, content: &str) {
     std::fs::write(dir.join(name), content).expect("profile should be written");
 }

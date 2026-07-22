@@ -31,7 +31,7 @@ use crate::event_fanout::EventFanout;
 
 use axum::Router;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc};
 
@@ -53,18 +53,23 @@ struct ServerState {
 }
 
 fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sender<String>) {
+    let translator = Arc::new(StdMutex::new(AcpLiveEventTranslator::new()));
     for event_source in &state.event_sources {
         let mut events = event_source.subscribe();
         let tx_events = tx.clone();
         let conn_id_events = conn_id.clone();
         let session_owners = state.session_owners.clone();
+        let translator = translator.clone();
         tokio::spawn(async move {
-            let mut translator = AcpLiveEventTranslator::new();
             while let Ok(event) = events.recv().await {
                 if !is_event_owned(&session_owners, &conn_id_events, &event).await {
                     continue;
                 }
-                if let Some(notification) = translator.translate_notification(&event) {
+                let notification = translator
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .translate_notification(&event);
+                if let Some(notification) = notification {
                     let json = serde_json::to_string(&notification).unwrap_or_default();
                     if tx_events.send(json).await.is_err() {
                         break;

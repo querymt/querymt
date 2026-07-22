@@ -193,6 +193,7 @@ pub const QMT_NOTIFICATION_MESH_JOINED: &str = "querymt/mesh/joined";
 pub const QMT_NOTIFICATION_MESH_PEER_EXPIRED: &str = "querymt/mesh/peerExpired";
 pub const QMT_NOTIFICATION_MODELS_CHANGED: &str = "querymt/models/changed";
 pub const QMT_NOTIFICATION_SCHEDULES_CHANGED: &str = "querymt/schedules/changed";
+pub const QMT_NOTIFICATION_DELEGATION_UPDATE: &str = "querymt/session/delegationUpdate";
 
 fn ext_notification(method: &str, params: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
@@ -252,6 +253,15 @@ pub fn schedules_changed_notification(
     ext_notification(
         QMT_NOTIFICATION_SCHEDULES_CHANGED,
         serde_json::to_value(payload).expect("serialize schedules changed notification"),
+    )
+}
+
+pub fn delegation_update_notification(
+    payload: crate::control::delegation_notifications::DelegationUpdateNotification,
+) -> serde_json::Value {
+    ext_notification(
+        QMT_NOTIFICATION_DELEGATION_UPDATE,
+        serde_json::to_value(payload).expect("serialize delegation update notification"),
     )
 }
 
@@ -320,6 +330,7 @@ enum AcpTranslateMode {
 
 pub struct AcpLiveEventTranslator {
     streamed_assistant_messages: HashSet<(String, String)>,
+    delegation_updates: crate::control::delegation_notifications::DelegationUpdateProjector,
 }
 
 impl Default for AcpLiveEventTranslator {
@@ -332,10 +343,24 @@ impl AcpLiveEventTranslator {
     pub fn new() -> Self {
         Self {
             streamed_assistant_messages: HashSet::new(),
+            delegation_updates:
+                crate::control::delegation_notifications::DelegationUpdateProjector::for_live_stream(
+                ),
         }
     }
 
+    pub fn translate_delegation_update(
+        &mut self,
+        event: &EventEnvelope,
+    ) -> Option<crate::control::delegation_notifications::DelegationUpdateNotification> {
+        self.delegation_updates.project_envelope(event)
+    }
+
     pub fn translate_notification(&mut self, event: &EventEnvelope) -> Option<serde_json::Value> {
+        if let Some(update) = self.translate_delegation_update(event) {
+            return Some(delegation_update_notification(update));
+        }
+
         // Handle ElicitationRequested specially - it's a custom notification, not a session/update
         if let AgentEventKind::ElicitationRequested {
             elicitation_id,

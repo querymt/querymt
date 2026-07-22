@@ -55,15 +55,50 @@ async fn test_querymt_capabilities_lists_control_surface() {
             "missing capability method {expected}"
         );
     }
+    let notifications = result["notifications"]
+        .as_array()
+        .expect("notifications array");
     assert!(
-        result["notifications"]
-            .as_array()
-            .expect("notifications array")
+        notifications
             .iter()
             .any(|method| method == "querymt/models/changed")
     );
+    assert!(
+        notifications
+            .iter()
+            .any(|method| method == "querymt/session/delegationUpdate")
+    );
     assert_eq!(result["transport"]["mesh_transport"], "none");
     assert_eq!(result["features"]["mesh_invites"], false);
+    assert_eq!(result["features"]["profiles"], false);
+    assert!(
+        !result["methods"]
+            .as_array()
+            .expect("methods array")
+            .iter()
+            .any(|method| method == "querymt/profiles")
+    );
+}
+
+#[tokio::test]
+async fn test_querymt_capabilities_advertises_profile_methods_when_configured() {
+    let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
+
+    let result = ext_method_json(&f.handle, "querymt/capabilities", serde_json::json!({})).await;
+    let methods = result["methods"].as_array().expect("methods array");
+
+    assert_eq!(result["features"]["profiles"], true);
+    for expected in [
+        "querymt/profiles",
+        "querymt/profile/agents",
+        "querymt/profile/setActive",
+        "querymt/session/setDelegateModel",
+    ] {
+        assert!(
+            methods.iter().any(|method| method == expected),
+            "missing profile capability method {expected}"
+        );
+    }
 }
 
 #[cfg(feature = "remote")]

@@ -94,6 +94,15 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         "querymt/schedules/delete".to_string(),
     ];
 
+    if agent.profiles().is_some() {
+        methods.extend([
+            "querymt/profiles".to_string(),
+            "querymt/profile/agents".to_string(),
+            "querymt/profile/setActive".to_string(),
+            "querymt/session/setDelegateModel".to_string(),
+        ]);
+    }
+
     #[cfg(feature = "remote")]
     {
         methods.extend([
@@ -146,6 +155,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
             "querymt/mesh/peerExpired".to_string(),
             "querymt/models/changed".to_string(),
             "querymt/schedules/changed".to_string(),
+            "querymt/session/delegationUpdate".to_string(),
         ],
     }
 }

@@ -42,6 +42,7 @@ pub struct AgentConfig {
     pub storage: Arc<dyn StorageBackend>,
     pub event_sink: Arc<EventSink>,
     pub agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
+    pub delegate_model_overrides: crate::delegation::DelegateModelOverrideStore,
     pub workspace_manager_actor: ActorRef<WorkspaceIndexManagerActor>,
 
     // ── Defaults (used when spawning new sessions) ───────────────

@@ -226,15 +226,18 @@ impl TestHarness {
         let delegator: Arc<dyn crate::agent::handle::AgentHandle> =
             Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone()));
 
-        let orchestrator = Arc::new(DelegationOrchestrator::new(
-            delegator,
-            config.event_sink.clone(),
-            store.clone(),
-            agent_registry.clone(),
-            config.tool_registry_arc(),
-            config.hooks.clone(),
-            None,
-        ));
+        let orchestrator = Arc::new(
+            DelegationOrchestrator::new(
+                delegator,
+                config.event_sink.clone(),
+                store.clone(),
+                agent_registry.clone(),
+                config.tool_registry_arc(),
+                config.hooks.clone(),
+                None,
+            )
+            .with_delegate_model_overrides(config.delegate_model_overrides.clone()),
+        );
         let _orchestrator_handle = orchestrator.start_listening(config.event_sink.fanout());
 
         // Create a SessionRuntime for the execution context
@@ -438,6 +441,83 @@ fn agent_info(id: &str) -> AgentInfo {
 }
 
 // Helper functions moved to crate::test_utils::helpers
+
+#[tokio::test]
+async fn test_delegate_model_override_applies_before_prompt() {
+    let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
+    harness
+        .config
+        .delegate_model_overrides
+        .set(
+            harness.exec_ctx.session_id.clone(),
+            "agent",
+            crate::delegation::DelegateModelOverride {
+                model_id: "mock/override-model".into(),
+                node_id: None,
+            },
+        )
+        .await;
+
+    let delegate_call = mock_querymt_tool_call(
+        "call-1",
+        "delegate",
+        r#"{"target_agent_id":"agent","objective":"task"}"#,
+    );
+    let mut seq = Sequence::new();
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |_| {
+            Ok(Box::new(MockChatResponse::with_tools(
+                "Delegating task",
+                vec![delegate_call.clone()],
+            )))
+        });
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(|_| Ok(Box::new(MockChatResponse::text_only("Done"))));
+    harness
+        .provider_mut()
+        .await
+        .expect_call_tool()
+        .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
+        .times(1);
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    let outcome = harness.run().await;
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+    let child_sessions = harness
+        .config
+        .provider
+        .history_store()
+        .list_child_sessions(&harness.exec_ctx.session_id)
+        .await
+        .expect("child sessions");
+    let child_session_id = child_sessions.first().expect("child session id");
+    let child_config = harness
+        .config
+        .provider
+        .history_store()
+        .get_session_llm_config(child_session_id)
+        .await
+        .expect("child config lookup")
+        .expect("child config");
+    assert_eq!(child_config.provider, "mock");
+    assert_eq!(child_config.model, "override-model");
+}
 
 #[tokio::test]
 async fn test_multiple_sequential_delegations() {

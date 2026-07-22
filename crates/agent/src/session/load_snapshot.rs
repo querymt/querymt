@@ -22,6 +22,9 @@ pub struct StreamCursor {
 pub struct SessionLoadSnapshot {
     pub audit: AuditView,
     pub cursor: StreamCursor,
+    #[serde(rename = "delegationUpdates")]
+    pub delegation_updates:
+        Vec<crate::control::delegation_notifications::DelegationUpdateNotification>,
 }
 
 pub fn cursor_from_events(events: &[AgentEvent]) -> StreamCursor {
@@ -98,5 +101,11 @@ pub async fn load_session_snapshot(
     };
 
     let cursor = cursor_from_events(&audit.events);
-    Ok(SessionLoadSnapshot { audit, cursor })
+    let delegation_updates =
+        crate::control::delegation_notifications::delegation_updates_from_events(&audit.events);
+    Ok(SessionLoadSnapshot {
+        audit,
+        cursor,
+        delegation_updates,
+    })
 }

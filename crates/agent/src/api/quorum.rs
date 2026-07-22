@@ -201,9 +201,10 @@ impl QuorumBuilder {
             ));
         }
 
-        let (registry, backend): (
+        let (registry, backend, event_fanout): (
             Arc<querymt::plugin::host::PluginRegistry>,
             Arc<dyn StorageBackend>,
+            Option<Arc<crate::event_fanout::EventFanout>>,
         ) = match self.infra {
             Some(infra) => {
                 let storage = match infra.storage {
@@ -213,17 +214,20 @@ impl QuorumBuilder {
                         Arc::new(SqliteStorage::connect(path).await?)
                     }
                 };
-                (infra.plugin_registry, storage)
+                (infra.plugin_registry, storage, infra.event_fanout)
             }
             None => {
                 let reg = Arc::new(default_registry().await?);
                 let path = resolve_agent_db_path(self.db_path)?;
                 let storage = Arc::new(SqliteStorage::connect(path).await?);
-                (reg, storage)
+                (reg, storage, None)
             }
         };
 
         let mut builder = AgentQuorumBuilder::from_backend(backend.clone());
+        if let Some(event_fanout) = event_fanout.as_ref() {
+            builder = builder.with_event_fanout(event_fanout.clone());
+        }
 
         if let Some(cwd_path) = cwd.clone() {
             builder = builder.cwd(cwd_path);
@@ -289,12 +293,13 @@ impl QuorumBuilder {
             let delegation_wait_policy_for_delegate = self.delegation_wait_policy.clone();
             let delegation_wait_timeout_for_delegate = self.delegation_wait_timeout_secs;
             let delegation_cancel_grace_for_delegate = self.delegation_cancel_grace_secs;
-            builder = builder.add_delegate_agent(agent_info, move |storage| {
+            builder = builder.add_delegate_agent(agent_info, move |storage, event_fanout| {
                 let mut b =
                     AgentConfigBuilder::new(registry.clone(), storage.clone(), llm_config.clone())
                         .with_agent_id(delegate_agent_id.clone())
                         .with_tool_policy(ToolPolicy::BuiltInOnly)
-                        .with_snapshot_policy(snapshot_policy_for_delegate);
+                        .with_snapshot_policy(snapshot_policy_for_delegate)
+                        .with_event_fanout(event_fanout);
 
                 if snapshot_policy_for_delegate != SnapshotPolicy::None {
                     b = b.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
@@ -409,7 +414,7 @@ impl QuorumBuilder {
         let delegation_wait_policy_for_planner = self.delegation_wait_policy.clone();
         let delegation_wait_timeout_for_planner = self.delegation_wait_timeout_secs;
         let delegation_cancel_grace_for_planner = self.delegation_cancel_grace_secs;
-        builder = builder.with_planner(move |storage, agent_registry| {
+        builder = builder.with_planner(move |storage, agent_registry, event_fanout| {
             let mut b = AgentConfigBuilder::new(
                 registry_for_planner.clone(),
                 storage.clone(),
@@ -417,7 +422,8 @@ impl QuorumBuilder {
             )
             .with_agent_id("planner")
             .with_agent_registry(agent_registry)
-            .with_snapshot_policy(snapshot_policy_for_planner);
+            .with_snapshot_policy(snapshot_policy_for_planner)
+            .with_event_fanout(event_fanout);
 
             if snapshot_policy_for_planner != SnapshotPolicy::None {
                 b = b.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));

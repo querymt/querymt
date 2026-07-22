@@ -41,8 +41,8 @@ use axum::{
 use futures_util::{sink::SinkExt, stream::StreamExt as FuturesStreamExt};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -365,6 +365,7 @@ pub(crate) struct ConnectionEventState {
 }
 
 pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: ConnectionEventState) {
+    let translator = Arc::new(StdMutex::new(AcpLiveEventTranslator::new()));
     for event_source in &state.event_sources {
         let mut events = event_source.subscribe();
         let tx_events = connection.tx.clone();
@@ -374,9 +375,9 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
         let forwarded_events = connection.forwarded_elicitations.clone();
         let request_counter = connection.request_counter.clone();
         let connection_cancel = connection.connection_cancel.clone();
+        let translator = translator.clone();
 
         tokio::spawn(async move {
-            let mut translator = AcpLiveEventTranslator::new();
             loop {
                 let event = tokio::select! {
                     _ = connection_cancel.cancelled() => break,
@@ -525,7 +526,11 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
                     continue;
                 }
 
-                if let Some(notification) = translator.translate_notification(&event) {
+                let notification = translator
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .translate_notification(&event);
+                if let Some(notification) = notification {
                     let json = serde_json::to_string(&notification).unwrap_or_default();
                     if tx_events.send(json).await.is_err() {
                         break;
