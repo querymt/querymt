@@ -167,6 +167,10 @@ pub struct PlannerConfig {
     /// Execution policy (tool output, pruning, compaction, snapshot, rate limit).
     #[serde(default)]
     pub execution: ExecutionPolicy,
+
+    /// Skills system configuration.
+    #[serde(default)]
+    pub skills: SkillsConfig,
 }
 
 /// Delegate (worker) agent configuration.
@@ -226,6 +230,10 @@ pub struct DelegateConfig {
     /// Execution policy (tool output, pruning, compaction, snapshot, rate limit).
     #[serde(default)]
     pub execution: ExecutionPolicy,
+
+    /// Skills system configuration.
+    #[serde(default)]
+    pub skills: SkillsConfig,
 
     /// Whether to treat unknown tools as mutating, requiring snapshot + permission confirmation.
     /// Set to `false` and use `mutating_tools` for explicit control.

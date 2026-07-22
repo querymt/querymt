@@ -425,66 +425,21 @@ impl AgentBuilder {
             builder = builder.with_execution_timeout_secs(execution_timeout_secs);
         }
 
-        // Initialize skills system if enabled
-        if let Some(skills_config) = self.skills_config {
-            if skills_config.enabled {
-                use crate::skills::{SkillRegistry, SkillTool, default_search_paths};
-                use std::sync::Mutex;
-
-                let project_root = cwd.as_deref().unwrap_or_else(|| std::path::Path::new("."));
-                let mut search_paths = default_search_paths(project_root);
-                for custom_path in &skills_config.paths {
-                    search_paths.push(crate::skills::types::SkillSource::Configured(
-                        custom_path.clone(),
-                    ));
-                }
-
-                let mut skill_registry = SkillRegistry::new();
-                match skill_registry
-                    .load_from_sources(&search_paths, skills_config.include_external)
-                {
-                    Ok(count) => {
-                        if count > 0 {
-                            let compatible_skills =
-                                skill_registry.compatible_with(&skills_config.agent_id);
-                            let compatible_names: Vec<_> = compatible_skills
-                                .iter()
-                                .map(|s| s.metadata.name.clone())
-                                .collect();
-                            log::info!(
-                                "Skills system initialized: {} skills discovered, {} compatible with agent '{}'",
-                                count,
-                                compatible_names.len(),
-                                skills_config.agent_id
-                            );
-                            if !compatible_names.is_empty() {
-                                log::debug!("Compatible skills: {}", compatible_names.join(", "));
-                            }
-                        } else {
-                            log::debug!(
-                                "Skills system enabled but no skills found in {} search paths",
-                                search_paths.len()
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to discover skills: {}. Skills system will be unavailable.",
-                            e
-                        );
-                    }
-                }
-
-                let registry_arc = Arc::new(Mutex::new(skill_registry));
-                let skill_tool = SkillTool::new(
-                    registry_arc,
-                    Some(skills_config.agent_id.clone()),
-                    Arc::new(skills_config.permissions.clone()),
-                );
-                builder.tool_registry_mut().add(Arc::new(skill_tool));
-            } else {
-                log::debug!("Skills system disabled in configuration");
-            }
+        if let Some(skills_config) = self.skills_config
+            && skills_config.enabled
+            && (self.tools.is_empty()
+                || self
+                    .tools
+                    .iter()
+                    .any(|tool| tool == crate::skills::SkillTool::NAME))
+        {
+            let project_root = cwd.as_deref().unwrap_or_else(|| std::path::Path::new("."));
+            builder
+                .tool_registry_mut()
+                .add(crate::skills::build_skill_tool(
+                    &skills_config,
+                    project_root,
+                ));
         }
 
         if !self.tools.is_empty() {

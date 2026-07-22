@@ -14,6 +14,8 @@ pub struct SkillTool {
 }
 
 impl SkillTool {
+    pub const NAME: &'static str = "skill";
+
     pub fn new(
         registry: Arc<Mutex<SkillRegistry>>,
         agent_id: Option<String>,
@@ -59,7 +61,7 @@ impl SkillTool {
 #[async_trait]
 impl Tool for SkillTool {
     fn name(&self) -> &str {
-        "skill"
+        Self::NAME
     }
 
     fn definition(&self) -> querymt::chat::Tool {
@@ -78,7 +80,7 @@ impl Tool for SkillTool {
         querymt::chat::Tool {
             tool_type: "function".to_string(),
             function: querymt::chat::FunctionTool {
-                name: "skill".to_string(),
+                name: Self::NAME.to_string(),
                 description: format!(
                     "Load a skill to gain domain-specific knowledge and workflows.\n\n\
                     Available skills:\n{}\n\n\
@@ -324,7 +326,7 @@ mod tests {
         let tool = SkillTool::new(registry, None, permissions);
         let def = tool.definition();
 
-        assert_eq!(def.function.name, "skill");
+        assert_eq!(def.function.name, SkillTool::NAME);
         assert!(!def.function.description.is_empty());
         let desc = &def.function.description;
         assert!(desc.contains("skill-a"));
