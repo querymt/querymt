@@ -15,6 +15,7 @@ use crate::test_utils::{
     empty_plugin_registry, mock_llm_config, mock_plugin_registry, mock_session,
 };
 use querymt::LLMParams;
+use querymt::chat::ReasoningEffort;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -300,6 +301,40 @@ fn select_option_values(option: &SessionConfigOption) -> Vec<String> {
         .collect()
 }
 
+fn config_option_value(options: &[SessionConfigOption], id: &str) -> Option<String> {
+    options
+        .iter()
+        .find(|option| option.id.0.as_ref() == id)
+        .and_then(|option| match &option.kind {
+            crate::acp::protocol::SessionConfigKind::Select(select) => {
+                Some(select.current_value.0.to_string())
+            }
+            _ => None,
+        })
+}
+
+async fn seed_session_with_reasoning(
+    fixture: &RealStorageHandleFixture,
+    effort: Option<ReasoningEffort>,
+) -> String {
+    let store = fixture.storage.session_store();
+    let session = store
+        .create_session(None, None, None, None)
+        .await
+        .expect("create session");
+    let mut params = LLMParams::new().provider("mock").model("mock-model");
+    params.reasoning_effort = effort;
+    let config = store
+        .create_or_get_llm_config(&params)
+        .await
+        .expect("create LLM config");
+    store
+        .set_session_llm_config(&session.public_id, config.id)
+        .await
+        .expect("set session LLM config");
+    session.public_id
+}
+
 fn test_profile_metadata(
     id: &str,
     name: &str,
@@ -320,6 +355,10 @@ fn test_profile_metadata(
 
 impl RealStorageHandleFixture {
     async fn new() -> Self {
+        Self::new_with_initial_reasoning(None).await
+    }
+
+    async fn new_with_initial_reasoning(reasoning_effort: Option<ReasoningEffort>) -> Self {
         let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
         let shared = SharedLlmProvider {
             inner: provider,
@@ -334,12 +373,11 @@ impl RealStorageHandleFixture {
                 .expect("create storage"),
         );
 
-        let mut builder = AgentConfigBuilder::new(
-            Arc::new(plugin_registry),
-            storage.clone(),
-            LLMParams::new().provider("mock").model("mock-model"),
-        )
-        .with_tool_policy(ToolPolicy::ProviderOnly);
+        let mut initial_config = LLMParams::new().provider("mock").model("mock-model");
+        initial_config.reasoning_effort = reasoning_effort;
+        let mut builder =
+            AgentConfigBuilder::new(Arc::new(plugin_registry), storage.clone(), initial_config)
+                .with_tool_policy(ToolPolicy::ProviderOnly);
 
         if let Some(repo) = storage.schedule_repository() {
             builder = builder.with_schedule_repository(repo);

@@ -119,7 +119,7 @@ impl LocalAgentHandle {
         };
 
         if let Some(existing_ref) = existing_actor_ref {
-            // Registry lock is now dropped, safe to make async actor call
+            // Registry lock is now dropped, safe to make async actor calls.
             let current_mode = existing_ref
                 .ask(crate::agent::messages::GetMode)
                 .mailbox_timeout(std::time::Duration::from_secs(10))
@@ -127,13 +127,13 @@ impl LocalAgentHandle {
                 .send()
                 .await
                 .map_err(|e| Error::internal_error().data(e.to_string()))?;
+            let session_ref = SessionActorRef::from(existing_ref);
+            let reasoning_effort = self
+                .session_reasoning_effort(&session_ref, &session_id)
+                .await;
 
             let config_options = self
-                .session_config_options(
-                    Some(&session_id),
-                    current_mode,
-                    **self.config.default_reasoning_effort.load(),
-                )
+                .session_config_options(Some(&session_id), current_mode, reasoning_effort)
                 .await?;
             return Ok(ResumeSessionResponse::new()
                 .modes(crate::agent::session_registry::mode_state(current_mode))
@@ -168,15 +168,14 @@ impl LocalAgentHandle {
                 .await?;
         }
 
-        // Get current mode for response
+        // Get current per-session settings for the response.
         let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+        let reasoning_effort = self
+            .session_reasoning_effort(&session_ref, &session_id)
+            .await;
 
         let config_options = self
-            .session_config_options(
-                Some(&session_id),
-                current_mode,
-                **self.config.default_reasoning_effort.load(),
-            )
+            .session_config_options(Some(&session_id), current_mode, reasoning_effort)
             .await?;
 
         Ok(ResumeSessionResponse::new()

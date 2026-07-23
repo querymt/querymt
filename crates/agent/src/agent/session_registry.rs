@@ -888,21 +888,27 @@ impl SessionRegistry {
                 .emit_event(&session_id, crate::events::AgentEventKind::SessionCreated);
         }
 
-        let current_mode = {
-            let session_ref = self
-                .sessions
-                .get(&session_id)
-                .ok_or_else(|| Error::internal_error().data("session actor missing after resume"))?
-                .clone();
-            session_ref.get_mode().await.map_err(Error::from)?
+        let session_ref = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| Error::internal_error().data("session actor missing after resume"))?
+            .clone();
+        let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+        let reasoning_effort = match session_ref.get_reasoning_effort().await {
+            Ok(effort) => effort,
+            Err(err) => {
+                tracing::warn!(
+                    session_id,
+                    error = %err,
+                    "failed to get session reasoning effort; using initial config"
+                );
+                self.config.provider.initial_config().reasoning_effort
+            }
         };
 
         Ok(crate::acp::protocol::ResumeSessionResponse::new()
             .modes(mode_state(current_mode))
-            .config_options(config_options(
-                current_mode,
-                **self.config.default_reasoning_effort.load(),
-            )))
+            .config_options(config_options(current_mode, reasoning_effort)))
     }
 
     /// List all sessions (queries the store, not the actors).

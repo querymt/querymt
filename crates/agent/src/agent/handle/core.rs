@@ -326,6 +326,9 @@ impl LocalAgentHandle {
                 })?;
 
             let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+            let reasoning_effort = profile_handle
+                .session_reasoning_effort(&session_ref, &session_id)
+                .await;
             let profile_list = profiles.list_profiles().await.map_err(|err| {
                 Error::internal_error().data(serde_json::json!({
                     "message": format_prefixed_error_chain("Failed to list profiles", &err),
@@ -333,7 +336,7 @@ impl LocalAgentHandle {
             })?;
             let config_options = crate::agent::session_registry::config_options_with_profiles(
                 current_mode,
-                **profile_handle.config.default_reasoning_effort.load(),
+                reasoning_effort,
                 Some(profile_id.as_str()),
                 &profile_list,
             );
@@ -369,15 +372,14 @@ impl LocalAgentHandle {
             .finalize_session(&prepared, bridge)
             .await?;
 
-        // Get current mode for response
+        // Get current per-session settings for the response.
         let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+        let reasoning_effort = self
+            .session_reasoning_effort(&session_ref, &session_id)
+            .await;
 
         let config_options = self
-            .session_config_options(
-                Some(&session_id),
-                current_mode,
-                **self.config.default_reasoning_effort.load(),
-            )
+            .session_config_options(Some(&session_id), current_mode, reasoning_effort)
             .await?;
 
         Ok(NewSessionResponse::new(session_id)
@@ -453,6 +455,9 @@ impl LocalAgentHandle {
                 }
             };
             let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+            let reasoning_effort = profile_handle
+                .session_reasoning_effort(&session_ref, &session_id)
+                .await;
             let profile_list = profiles.list_profiles().await.map_err(|err| {
                 Error::internal_error().data(serde_json::json!({
                     "message": format_prefixed_error_chain("Failed to list profiles", &err),
@@ -460,7 +465,7 @@ impl LocalAgentHandle {
             })?;
             let config_options = crate::agent::session_registry::config_options_with_profiles(
                 current_mode,
-                **profile_handle.config.default_reasoning_effort.load(),
+                reasoning_effort,
                 Some(binding.profile_id.as_str()),
                 &profile_list,
             );
@@ -482,14 +487,13 @@ impl LocalAgentHandle {
         };
 
         if let Some(session_ref) = existing_session_ref {
-            // Registry lock is now dropped, safe to make async actor call
+            // Registry lock is now dropped, safe to make async actor calls.
             let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+            let reasoning_effort = self
+                .session_reasoning_effort(&session_ref, &session_id)
+                .await;
             let config_options = self
-                .session_config_options(
-                    Some(&session_id),
-                    current_mode,
-                    **self.config.default_reasoning_effort.load(),
-                )
+                .session_config_options(Some(&session_id), current_mode, reasoning_effort)
                 .await?;
             let mut response = LoadSessionResponse::new()
                 .modes(crate::agent::session_registry::mode_state(current_mode))
@@ -528,15 +532,14 @@ impl LocalAgentHandle {
                 .await?;
         }
 
-        // Get current mode for response
+        // Get current per-session settings for the response.
         let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+        let reasoning_effort = self
+            .session_reasoning_effort(&session_ref, &session_id)
+            .await;
 
         let config_options = self
-            .session_config_options(
-                Some(&session_id),
-                current_mode,
-                **self.config.default_reasoning_effort.load(),
-            )
+            .session_config_options(Some(&session_id), current_mode, reasoning_effort)
             .await?;
 
         let mut response = LoadSessionResponse::new()

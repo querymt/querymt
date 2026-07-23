@@ -94,7 +94,9 @@ impl LocalAgentHandle {
                 session_ref.set_session_model_with_node(msg).await?;
 
                 let mode = session_ref.get_mode().await.unwrap_or(AgentMode::Build);
-                let effort = session_ref.get_reasoning_effort().await.ok().flatten();
+                let effort = self
+                    .session_reasoning_effort(&session_ref, &session_id)
+                    .await;
 
                 let config_options = self
                     .session_config_options(Some(&session_id), mode, effort)
@@ -142,7 +144,9 @@ impl LocalAgentHandle {
 
                 let session_ref = self.session_ref_for_agent_session(&session_id).await?;
                 let mode = session_ref.get_mode().await.unwrap_or(AgentMode::Build);
-                let effort = session_ref.get_reasoning_effort().await.ok().flatten();
+                let effort = self
+                    .session_reasoning_effort(&session_ref, &session_id)
+                    .await;
                 let config_options = self
                     .session_config_options(Some(&session_id), mode, effort)
                     .await?;
@@ -159,7 +163,9 @@ impl LocalAgentHandle {
                 let session_ref = self.session_ref_for_agent_session(&session_id).await?;
                 session_ref.set_mode(mode).await.map_err(Error::from)?;
 
-                let effort = session_ref.get_reasoning_effort().await.ok().flatten();
+                let effort = self
+                    .session_reasoning_effort(&session_ref, &session_id)
+                    .await;
                 let config_options = self
                     .session_config_options(Some(&session_id), mode, effort)
                     .await?;

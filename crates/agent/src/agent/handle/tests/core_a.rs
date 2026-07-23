@@ -412,6 +412,96 @@ async fn test_set_profile_config_option_rejects_different_bound_profile() {
 }
 
 #[tokio::test]
+async fn test_load_session_reports_persisted_reasoning_effort() {
+    let f = RealStorageHandleFixture::new().await;
+    let session_id = seed_session_with_reasoning(&f, Some(ReasoningEffort::High)).await;
+    let req = crate::acp::protocol::LoadSessionRequest::new(
+        SessionId::from(session_id),
+        std::path::PathBuf::new(),
+    );
+
+    let response = f.handle.load_session(req).await.expect("load session");
+
+    assert_eq!(
+        config_option_value(
+            response.config_options.as_deref().expect("config options"),
+            "reasoning_effort",
+        )
+        .as_deref(),
+        Some("high")
+    );
+}
+
+#[tokio::test]
+async fn test_load_session_reports_auto_when_reasoning_effort_is_unset() {
+    let f = RealStorageHandleFixture::new_with_initial_reasoning(Some(ReasoningEffort::Low)).await;
+    let session_id = seed_session_with_reasoning(&f, None).await;
+    let req = crate::acp::protocol::LoadSessionRequest::new(
+        SessionId::from(session_id),
+        std::path::PathBuf::new(),
+    );
+
+    let response = f.handle.load_session(req).await.expect("load session");
+
+    assert_eq!(
+        config_option_value(
+            response.config_options.as_deref().expect("config options"),
+            "reasoning_effort",
+        )
+        .as_deref(),
+        Some("auto")
+    );
+}
+
+#[tokio::test]
+async fn test_load_session_falls_back_to_initial_reasoning_when_config_is_missing() {
+    let f = RealStorageHandleFixture::new_with_initial_reasoning(Some(ReasoningEffort::Low)).await;
+    let session = f
+        .storage
+        .create_session(None, None, None, None)
+        .await
+        .expect("create session");
+    let req = crate::acp::protocol::LoadSessionRequest::new(
+        SessionId::from(session.public_id),
+        std::path::PathBuf::new(),
+    );
+
+    let response = f.handle.load_session(req).await.expect("load session");
+
+    assert_eq!(
+        config_option_value(
+            response.config_options.as_deref().expect("config options"),
+            "reasoning_effort",
+        )
+        .as_deref(),
+        Some("low")
+    );
+}
+
+#[tokio::test]
+async fn test_reasoning_query_failure_falls_back_to_initial_config() {
+    let f = RealStorageHandleFixture::new_with_initial_reasoning(Some(ReasoningEffort::Low)).await;
+    let actor = SessionActor::new(
+        f.handle.config.clone(),
+        "stopped-session".to_string(),
+        crate::agent::core::SessionRuntime::new(
+            None,
+            std::collections::HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        ),
+    );
+    let session_ref = SessionActorRef::from(SessionActor::spawn(actor));
+    session_ref.shutdown().await.expect("shutdown actor");
+
+    assert_eq!(
+        f.handle
+            .session_reasoning_effort(&session_ref, "stopped-session")
+            .await,
+        Some(ReasoningEffort::Low)
+    );
+}
+
+#[tokio::test]
 async fn test_set_profile_config_option_accepts_same_bound_profile() {
     let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
     register_bound_test_session(&f, "session-1", "alpha").await;

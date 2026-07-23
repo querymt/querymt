@@ -21,8 +21,8 @@ use crate::test_utils::{
 };
 use mockall::Sequence;
 use querymt::LLMParams;
-use querymt::chat::ChatRole;
 use querymt::chat::FinishReason;
+use querymt::chat::{ChatRole, ReasoningEffort};
 use querymt::plugin::host::PluginRegistry;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -135,6 +135,14 @@ struct TestHarness {
 
 impl TestHarness {
     async fn new(history: Vec<AgentMessage>, behavior: DelegateBehavior) -> Self {
+        Self::new_with_delegate_reasoning(history, behavior, None).await
+    }
+
+    async fn new_with_delegate_reasoning(
+        history: Vec<AgentMessage>,
+        behavior: DelegateBehavior,
+        delegate_reasoning_effort: Option<ReasoningEffort>,
+    ) -> Self {
         let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
         let shared_provider = SharedLlmProvider {
             inner: provider.clone(),
@@ -203,7 +211,9 @@ impl TestHarness {
         // resolves correctly when creating delegation sessions.
         let mut agent_registry = DefaultAgentRegistry::new();
         for id in ["agent", "agent1", "agent2"] {
-            let delegate_handle = build_delegate_handle(behavior.clone(), store.clone()).await;
+            let delegate_handle =
+                build_delegate_handle(behavior.clone(), store.clone(), delegate_reasoning_effort)
+                    .await;
             agent_registry.register_handle(
                 agent_info(id),
                 delegate_handle as Arc<dyn crate::agent::handle::AgentHandle>,
@@ -274,6 +284,92 @@ impl TestHarness {
         .expect("state machine")
     }
 
+    async fn set_parent_reasoning_effort(&self, effort: Option<ReasoningEffort>) {
+        let store = self.config.provider.history_store();
+        let current = store
+            .get_session_llm_config(&self.exec_ctx.session_id)
+            .await
+            .expect("parent config lookup")
+            .expect("parent config");
+        let mut params = current
+            .params
+            .map(serde_json::from_value::<LLMParams>)
+            .transpose()
+            .expect("deserialize parent params")
+            .unwrap_or_default()
+            .provider(&current.provider)
+            .model(&current.model);
+        params.reasoning_effort = effort;
+        let updated = store
+            .create_or_get_llm_config(&params)
+            .await
+            .expect("create parent config");
+        store
+            .set_session_llm_config(&self.exec_ctx.session_id, updated.id)
+            .await
+            .expect("set parent config");
+    }
+
+    async fn run_single_delegation(&mut self) -> CycleOutcome {
+        let delegate_call = mock_querymt_tool_call(
+            "call-1",
+            "delegate",
+            r#"{"target_agent_id":"agent","objective":"task"}"#,
+        );
+        let mut seq = Sequence::new();
+        self.provider_mut()
+            .await
+            .expect_chat()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(move |_| {
+                Ok(Box::new(MockChatResponse::with_tools(
+                    "Delegating task",
+                    vec![delegate_call.clone()],
+                )))
+            });
+        self.provider_mut()
+            .await
+            .expect_chat()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(Box::new(MockChatResponse::text_only("Done"))));
+        self.provider_mut()
+            .await
+            .expect_call_tool()
+            .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
+            .times(1);
+        self.provider_mut()
+            .await
+            .expect_tools()
+            .return_const(None)
+            .times(0..);
+
+        self.run().await
+    }
+
+    async fn child_llm_params(&self) -> (String, LLMParams) {
+        let store = self.config.provider.history_store();
+        let child_sessions = store
+            .list_child_sessions(&self.exec_ctx.session_id)
+            .await
+            .expect("child sessions");
+        let child_session_id = child_sessions.first().expect("child session id");
+        let config = store
+            .get_session_llm_config(child_session_id)
+            .await
+            .expect("child config lookup")
+            .expect("child config");
+        let params = config
+            .params
+            .map(serde_json::from_value::<LLMParams>)
+            .transpose()
+            .expect("deserialize child params")
+            .unwrap_or_default();
+
+        (config.model, params)
+    }
+
     async fn provider_mut(&self) -> tokio::sync::MutexGuard<'_, MockLlmProvider> {
         self.provider.lock().await
     }
@@ -284,6 +380,7 @@ impl TestHarness {
 async fn build_delegate_handle(
     behavior: DelegateBehavior,
     shared_store: Arc<dyn SessionStore>,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> Arc<crate::agent::LocalAgentHandle> {
     let delegate_provider = Arc::new(Mutex::new(MockLlmProvider::new()));
     {
@@ -373,10 +470,12 @@ async fn build_delegate_handle(
     }));
     let delegate_plugin_registry = Arc::new(delegate_plugin_registry);
 
+    let mut delegate_params = LLMParams::new().provider("mock").model("mock-model");
+    delegate_params.reasoning_effort = reasoning_effort;
     let delegate_session_provider = Arc::new(crate::session::provider::SessionProvider::new(
         delegate_plugin_registry,
         shared_store,
-        LLMParams::new().provider("mock").model("mock-model"),
+        delegate_params,
     ));
     let delegate_event_storage = Arc::new(
         SqliteStorage::connect(":memory:".into())
@@ -443,8 +542,51 @@ fn agent_info(id: &str) -> AgentInfo {
 // Helper functions moved to crate::test_utils::helpers
 
 #[tokio::test]
+async fn test_delegate_inherits_parent_reasoning_effort() {
+    let mut harness = TestHarness::new_with_delegate_reasoning(
+        vec![],
+        DelegateBehavior::AlwaysOk,
+        Some(ReasoningEffort::Low),
+    )
+    .await;
+    harness
+        .set_parent_reasoning_effort(Some(ReasoningEffort::High))
+        .await;
+
+    let outcome = harness.run_single_delegation().await;
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+    let (_, child_params) = harness.child_llm_params().await;
+    assert_eq!(child_params.reasoning_effort, Some(ReasoningEffort::High));
+}
+
+#[tokio::test]
+async fn test_delegate_inherits_parent_auto_reasoning_effort() {
+    let mut harness = TestHarness::new_with_delegate_reasoning(
+        vec![],
+        DelegateBehavior::AlwaysOk,
+        Some(ReasoningEffort::Low),
+    )
+    .await;
+
+    let outcome = harness.run_single_delegation().await;
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+    let (_, child_params) = harness.child_llm_params().await;
+    assert_eq!(child_params.reasoning_effort, None);
+}
+
+#[tokio::test]
 async fn test_delegate_model_override_applies_before_prompt() {
-    let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
+    let mut harness = TestHarness::new_with_delegate_reasoning(
+        vec![],
+        DelegateBehavior::AlwaysOk,
+        Some(ReasoningEffort::Low),
+    )
+    .await;
+    harness
+        .set_parent_reasoning_effort(Some(ReasoningEffort::High))
+        .await;
     harness
         .config
         .delegate_model_overrides
@@ -458,65 +600,12 @@ async fn test_delegate_model_override_applies_before_prompt() {
         )
         .await;
 
-    let delegate_call = mock_querymt_tool_call(
-        "call-1",
-        "delegate",
-        r#"{"target_agent_id":"agent","objective":"task"}"#,
-    );
-    let mut seq = Sequence::new();
-    harness
-        .provider_mut()
-        .await
-        .expect_chat()
-        .times(1)
-        .in_sequence(&mut seq)
-        .returning(move |_| {
-            Ok(Box::new(MockChatResponse::with_tools(
-                "Delegating task",
-                vec![delegate_call.clone()],
-            )))
-        });
-    harness
-        .provider_mut()
-        .await
-        .expect_chat()
-        .times(1)
-        .in_sequence(&mut seq)
-        .returning(|_| Ok(Box::new(MockChatResponse::text_only("Done"))));
-    harness
-        .provider_mut()
-        .await
-        .expect_call_tool()
-        .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
-        .times(1);
-    harness
-        .provider_mut()
-        .await
-        .expect_tools()
-        .return_const(None)
-        .times(0..);
-
-    let outcome = harness.run().await;
+    let outcome = harness.run_single_delegation().await;
 
     assert_eq!(outcome, CycleOutcome::Completed);
-    let child_sessions = harness
-        .config
-        .provider
-        .history_store()
-        .list_child_sessions(&harness.exec_ctx.session_id)
-        .await
-        .expect("child sessions");
-    let child_session_id = child_sessions.first().expect("child session id");
-    let child_config = harness
-        .config
-        .provider
-        .history_store()
-        .get_session_llm_config(child_session_id)
-        .await
-        .expect("child config lookup")
-        .expect("child config");
-    assert_eq!(child_config.provider, "mock");
-    assert_eq!(child_config.model, "override-model");
+    let (child_model, child_params) = harness.child_llm_params().await;
+    assert_eq!(child_model, "override-model");
+    assert_eq!(child_params.reasoning_effort, Some(ReasoningEffort::High));
 }
 
 #[tokio::test]

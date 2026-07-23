@@ -776,9 +776,52 @@ impl SessionMaterializer {
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
         }
 
+        let initial_reasoning_effort = self.config.provider.initial_config().reasoning_effort;
+        let reasoning_effort = match self
+            .config
+            .provider
+            .history_store()
+            .get_session_llm_config(&session_id)
+            .await
+        {
+            Ok(Some(config)) => match config
+                .params
+                .as_ref()
+                .and_then(|params| params.get("reasoning_effort"))
+            {
+                Some(value) => match serde_json::from_value(value.clone()) {
+                    Ok(effort) => Some(effort),
+                    Err(err) => {
+                        tracing::warn!(
+                            session_id,
+                            error = %err,
+                            "invalid persisted reasoning effort; using initial config"
+                        );
+                        initial_reasoning_effort
+                    }
+                },
+                None => None,
+            },
+            Ok(None) => {
+                tracing::warn!(
+                    session_id,
+                    "session LLM config missing; using initial reasoning config"
+                );
+                initial_reasoning_effort
+            }
+            Err(err) => {
+                tracing::warn!(
+                    session_id,
+                    error = %err,
+                    "failed to load persisted reasoning effort; using initial config"
+                );
+                initial_reasoning_effort
+            }
+        };
         let runtime = SessionRuntime::new(cwd.clone(), mcp_services, tool_state);
         #[cfg(feature = "remote")]
         let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone())
+            .with_reasoning_effort(reasoning_effort)
             .with_mesh(if _options.attach_mesh_handle {
                 // Use the mesh handle from the materializer's shared state
                 self.mesh()
@@ -786,7 +829,8 @@ impl SessionMaterializer {
                 None
             });
         #[cfg(not(feature = "remote"))]
-        let actor = { SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone()) };
+        let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone())
+            .with_reasoning_effort(reasoning_effort);
         let actor_ref = SessionActor::spawn(actor);
 
         // Bridge will be set during registration if available
