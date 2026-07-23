@@ -27,6 +27,8 @@ tools = [
   "read_tool",
   # Search & navigation
   "glob", "search_text", "ls", "index", "get_symbol", "get_function", "find_symbol_references",
+  # Skill usage
+  "skill",
   # Execution
   "shell",
   # Task management

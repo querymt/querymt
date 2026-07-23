@@ -185,6 +185,53 @@ impl QuorumBuilder {
             .planner_config
             .ok_or_else(|| anyhow!("Planner configuration is required"))?;
 
+        if planner_config
+            .tools
+            .iter()
+            .any(|tool| tool == crate::skills::SkillTool::NAME)
+        {
+            match planner_config.skills.as_ref() {
+                Some(skills) if skills.enabled => {}
+                Some(_) => {
+                    return Err(anyhow!(
+                        "Tool '{}' requested for planner, but skills are disabled",
+                        crate::skills::SkillTool::NAME
+                    ));
+                }
+                None => {
+                    return Err(anyhow!(
+                        "Tool '{}' requested for planner, but skills are not configured",
+                        crate::skills::SkillTool::NAME
+                    ));
+                }
+            }
+        }
+        for delegate in &self.delegates {
+            if delegate
+                .tools
+                .iter()
+                .any(|tool| tool == crate::skills::SkillTool::NAME)
+            {
+                match delegate.skills.as_ref() {
+                    Some(skills) if skills.enabled => {}
+                    Some(_) => {
+                        return Err(anyhow!(
+                            "Tool '{}' requested for delegate '{}', but skills are disabled",
+                            crate::skills::SkillTool::NAME,
+                            delegate.id
+                        ));
+                    }
+                    None => {
+                        return Err(anyhow!(
+                            "Tool '{}' requested for delegate '{}', but skills are not configured",
+                            crate::skills::SkillTool::NAME,
+                            delegate.id
+                        ));
+                    }
+                }
+            }
+        }
+
         // Convert cwd to absolute path if provided
         let cwd = self.cwd.map(to_absolute_path).transpose()?;
 
@@ -272,6 +319,7 @@ impl QuorumBuilder {
             }
         }
 
+        let skills_project_root = cwd.clone().unwrap_or_else(|| PathBuf::from("."));
         for delegate in self.delegates {
             let agent_info = AgentInfo {
                 id: delegate.id.clone(),
@@ -285,6 +333,8 @@ impl QuorumBuilder {
             let tools = delegate.tools.clone();
             let middleware_entries = delegate.middleware.clone();
             let exec = delegate.execution.clone();
+            let skills = delegate.skills.clone();
+            let skills_project_root_for_delegate = skills_project_root.clone();
             let assume_mutating = delegate.assume_mutating;
             let mutating_tools = delegate.mutating_tools.clone().unwrap_or_default();
             let registry = registry.clone();
@@ -303,6 +353,19 @@ impl QuorumBuilder {
 
                 if snapshot_policy_for_delegate != SnapshotPolicy::None {
                     b = b.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
+                }
+
+                if let Some(skills) = skills.as_ref()
+                    && skills.enabled
+                    && (tools.is_empty()
+                        || tools
+                            .iter()
+                            .any(|tool| tool == crate::skills::SkillTool::NAME))
+                {
+                    b.tool_registry_mut().add(crate::skills::build_skill_tool(
+                        skills,
+                        &skills_project_root_for_delegate,
+                    ));
                 }
 
                 if !tools.is_empty() {
@@ -409,6 +472,8 @@ impl QuorumBuilder {
         let planner_tools = planner_config.tools.clone();
         let planner_middleware = planner_config.middleware.clone();
         let planner_exec = planner_config.execution.clone();
+        let planner_skills = planner_config.skills.clone();
+        let skills_project_root_for_planner = skills_project_root;
         let registry_for_planner = registry.clone();
         let snapshot_policy_for_planner = self.snapshot_policy;
         let delegation_wait_policy_for_planner = self.delegation_wait_policy.clone();
@@ -427,6 +492,19 @@ impl QuorumBuilder {
 
             if snapshot_policy_for_planner != SnapshotPolicy::None {
                 b = b.with_snapshot_backend(Arc::new(GitSnapshotBackend::new()));
+            }
+
+            if let Some(skills) = planner_skills.as_ref()
+                && skills.enabled
+                && (planner_tools.is_empty()
+                    || planner_tools
+                        .iter()
+                        .any(|tool| tool == crate::skills::SkillTool::NAME))
+            {
+                b.tool_registry_mut().add(crate::skills::build_skill_tool(
+                    skills,
+                    &skills_project_root_for_planner,
+                ));
             }
 
             if !planner_tools.is_empty() {
@@ -703,11 +781,11 @@ impl super::agent::Agent {
         // Parse snapshot policy
         let snapshot_policy = parse_snapshot_policy(config.quorum.snapshot_policy)?;
 
-        // Build the set of builtin tool names for validation
-        let builtin_names: HashSet<String> = all_builtin_tools()
+        let mut available_local_tool_names: HashSet<String> = all_builtin_tools()
             .iter()
-            .map(|t| t.name().to_string())
+            .map(|tool| tool.name().to_string())
             .collect();
+        available_local_tool_names.insert(crate::skills::SkillTool::NAME.to_string());
 
         // Configure planner with tool resolution
         let mut planner_config = AgentConfig::new("planner");
@@ -729,10 +807,14 @@ impl super::agent::Agent {
         }
         planner_config.llm_config = Some(llm);
 
-        // Resolve planner tools (validates builtin tools and prepares for MCP)
-        let planner_resolved =
-            resolve_tools(&config.planner.tools, &config.mcp, &[], &builtin_names)?;
-        planner_config.tools = planner_resolved.builtins;
+        // Resolve planner tools (validates local tools and prepares for MCP)
+        let planner_resolved = resolve_tools(
+            &config.planner.tools,
+            &config.mcp,
+            &[],
+            &available_local_tool_names,
+        )?;
+        planner_config.tools = planner_resolved.local_tools;
 
         // Note: MCP tools are not yet supported in the simple Quorum API.
         if !planner_resolved.mcp_servers.is_empty() {
@@ -743,6 +825,7 @@ impl super::agent::Agent {
 
         planner_config.middleware = config.planner.middleware;
         planner_config.execution = config.planner.execution;
+        planner_config.skills = Some(config.planner.skills);
         planner_config.hooks = crate::config::HooksConfig::default();
 
         builder.planner_config = Some(planner_config);
@@ -774,9 +857,13 @@ impl super::agent::Agent {
             delegate_config.description = delegate.description;
             delegate_config.capabilities = delegate.capabilities;
 
-            let delegate_resolved =
-                resolve_tools(&delegate.tools, &config.mcp, &delegate.mcp, &builtin_names)?;
-            delegate_config.tools = delegate_resolved.builtins;
+            let delegate_resolved = resolve_tools(
+                &delegate.tools,
+                &config.mcp,
+                &delegate.mcp,
+                &available_local_tool_names,
+            )?;
+            delegate_config.tools = delegate_resolved.local_tools;
 
             if !delegate_resolved.mcp_servers.is_empty() {
                 log::warn!(
@@ -792,6 +879,7 @@ impl super::agent::Agent {
 
             delegate_config.middleware = delegate.middleware;
             delegate_config.execution = delegate.execution;
+            delegate_config.skills = Some(delegate.skills);
             delegate_config.assume_mutating = Some(delegate.assume_mutating);
             delegate_config.mutating_tools = Some(delegate.mutating_tools);
             delegate_config.hooks = crate::config::HooksConfig::default();
@@ -977,6 +1065,36 @@ fn apply_middleware_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::helpers::empty_plugin_registry;
+
+    fn skill_quorum_config(skills_enabled: bool) -> QuorumConfig {
+        let toml = format!(
+            r#"
+[quorum]
+cwd = "."
+
+[planner]
+provider = "test"
+model = "planner-model"
+tools = ["delegate", "skill"]
+
+[planner.skills]
+enabled = {skills_enabled}
+include_external = false
+
+[[delegates]]
+id = "coder"
+provider = "test"
+model = "coder-model"
+tools = ["skill"]
+
+[delegates.skills]
+enabled = {skills_enabled}
+include_external = false
+"#
+        );
+        toml::from_str(&toml).expect("parse skill quorum config")
+    }
 
     #[test]
     fn test_quorum_delegate_builder_system() {
@@ -999,6 +1117,224 @@ mod tests {
         assert_eq!(
             delegate.llm_config.as_ref().map(|c| c.system.clone()),
             Some(vec!["Coder system prompt".to_string()])
+        );
+    }
+
+    #[test]
+    fn programmatic_quorum_does_not_configure_skills_by_default() {
+        let builder = QuorumBuilder::new()
+            .planner(|planner| planner.provider("test", "planner-model"))
+            .delegate("coder", |delegate| delegate.provider("test", "coder-model"));
+
+        assert!(
+            builder
+                .planner_config
+                .as_ref()
+                .expect("planner config")
+                .skills
+                .is_none()
+        );
+        assert!(builder.delegates[0].skills.is_none());
+    }
+
+    #[tokio::test]
+    async fn programmatic_quorum_rejects_unconfigured_skill_tool() {
+        let error = match QuorumBuilder::new()
+            .planner(|planner| {
+                planner
+                    .provider("test", "planner-model")
+                    .tools([crate::skills::SkillTool::NAME])
+            })
+            .build()
+            .await
+        {
+            Ok(_) => panic!("unconfigured skill should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Tool 'skill' requested for planner, but skills are not configured"
+        );
+    }
+
+    #[test]
+    fn quorum_config_accepts_skill_when_enabled() {
+        let builder =
+            super::super::agent::Agent::builder_from_quorum_config(skill_quorum_config(true), None)
+                .expect("enabled skill should validate");
+
+        assert!(
+            builder
+                .planner_config
+                .as_ref()
+                .expect("planner config")
+                .tools
+                .contains(&crate::skills::SkillTool::NAME.to_string())
+        );
+        assert!(
+            builder.delegates[0]
+                .tools
+                .contains(&crate::skills::SkillTool::NAME.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn quorum_config_rejects_skill_when_disabled() {
+        let error = match super::super::agent::Agent::builder_from_quorum_config(
+            skill_quorum_config(false),
+            None,
+        )
+        .expect("config should parse")
+        .build()
+        .await
+        {
+            Ok(_) => panic!("disabled skill should fail validation"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Tool 'skill' requested for planner, but skills are disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn quorum_config_rejects_delegate_skill_when_disabled() {
+        let mut config = skill_quorum_config(true);
+        config.delegates[0].skills.enabled = false;
+
+        let error = match super::super::agent::Agent::builder_from_quorum_config(config, None)
+            .expect("config should parse")
+            .build()
+            .await
+        {
+            Ok(_) => panic!("disabled delegate skill should fail validation"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Tool 'skill' requested for delegate 'coder', but skills are disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn programmatic_quorum_skips_skill_tool_when_not_selected() {
+        let (plugin_registry, _registry_dir) = empty_plugin_registry().expect("empty registry");
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("in-memory storage"),
+        );
+        let infra = super::super::agent::AgentInfra {
+            plugin_registry: Arc::new(plugin_registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        };
+
+        let agent = QuorumBuilder::new()
+            .infra(infra)
+            .planner(|planner| {
+                planner
+                    .provider("test", "planner-model")
+                    .tools(["delegate"])
+                    .skills(crate::config::SkillsConfig::default())
+            })
+            .delegate("coder", |delegate| {
+                delegate
+                    .provider("test", "coder-model")
+                    .tools(["question"])
+                    .skills(crate::config::SkillsConfig::default())
+            })
+            .build()
+            .await
+            .expect("quorum should build");
+
+        let planner = agent.planner().expect("planner handle");
+        let planner = planner
+            .as_any()
+            .downcast_ref::<AgentHandle>()
+            .expect("local planner");
+        assert!(
+            planner
+                .config
+                .tool_registry
+                .find(crate::skills::SkillTool::NAME)
+                .is_none()
+        );
+
+        let delegate = agent.delegate("coder").expect("coder delegate");
+        let delegate = delegate
+            .as_any()
+            .downcast_ref::<AgentHandle>()
+            .expect("local delegate");
+        assert!(
+            delegate
+                .config
+                .tool_registry
+                .find(crate::skills::SkillTool::NAME)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn quorum_registers_skill_tool_for_planner_and_delegate() {
+        let (plugin_registry, _registry_dir) = empty_plugin_registry().expect("empty registry");
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("in-memory storage"),
+        );
+        let infra = super::super::agent::AgentInfra {
+            plugin_registry: Arc::new(plugin_registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        };
+
+        let agent = super::super::agent::Agent::from_quorum_config_with_infra(
+            skill_quorum_config(true),
+            infra,
+        )
+        .await
+        .expect("skill quorum should build");
+
+        let planner = agent.planner().expect("planner handle");
+        let planner = planner
+            .as_any()
+            .downcast_ref::<AgentHandle>()
+            .expect("local planner");
+        assert!(
+            planner
+                .config
+                .tool_registry
+                .find(crate::skills::SkillTool::NAME)
+                .is_some()
+        );
+        assert!(
+            planner
+                .config
+                .is_tool_allowed(crate::skills::SkillTool::NAME)
+        );
+
+        let delegate = agent.delegate("coder").expect("coder delegate");
+        let delegate = delegate
+            .as_any()
+            .downcast_ref::<AgentHandle>()
+            .expect("local delegate");
+        assert!(
+            delegate
+                .config
+                .tool_registry
+                .find(crate::skills::SkillTool::NAME)
+                .is_some()
+        );
+        assert!(
+            delegate
+                .config
+                .is_tool_allowed(crate::skills::SkillTool::NAME)
         );
     }
 

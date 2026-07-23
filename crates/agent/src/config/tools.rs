@@ -19,21 +19,21 @@ pub fn parse_tool_spec(tool: &str) -> ToolSpec {
     }
 }
 
-/// Resolved tools for an agent
+/// Resolved tools for an agent.
 #[derive(Debug, Clone)]
 pub struct ResolvedTools {
-    pub builtins: Vec<String>,
+    pub local_tools: Vec<String>,
     pub mcp_servers: HashMap<String, (McpServerConfig, Option<Vec<String>>)>,
 }
 
-/// Resolve tools for an agent, combining builtin tools and MCP servers
+/// Resolve local and MCP tool specifications for an agent.
 pub fn resolve_tools(
     tools: &[String],
     global_mcp: &[McpServerConfig],
     delegate_mcp: &[McpServerConfig],
-    builtin_names: &HashSet<String>,
+    local_tool_names: &HashSet<String>,
 ) -> Result<ResolvedTools> {
-    let mut builtins = Vec::new();
+    let mut local_tools = Vec::new();
     let mut mcp_servers: HashMap<String, (McpServerConfig, Option<Vec<String>>)> = HashMap::new();
 
     // Combine global and delegate MCP servers
@@ -46,10 +46,10 @@ pub fn resolve_tools(
     for tool in tools {
         match parse_tool_spec(tool) {
             ToolSpec::Builtin(name) => {
-                if !builtin_names.contains(&name) {
-                    return Err(anyhow!("Unknown builtin tool: {}", name));
+                if !local_tool_names.contains(&name) {
+                    return Err(anyhow!("Unknown local tool: {}", name));
                 }
-                builtins.push(name);
+                local_tools.push(name);
             }
             ToolSpec::McpAll(mcp_name) => {
                 let config = all_mcp
@@ -74,7 +74,7 @@ pub fn resolve_tools(
     }
 
     Ok(ResolvedTools {
-        builtins,
+        local_tools,
         mcp_servers,
     })
 }

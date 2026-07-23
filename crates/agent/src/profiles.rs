@@ -1221,7 +1221,12 @@ mod tests {
             .load_profile("coder-delegate")
             .await
             .expect("coder delegate profile should load");
-        assert!(matches!(delegate_document.config, Config::Multi(_)));
+        let delegate_config = match delegate_document.config {
+            Config::Multi(config) => config,
+            Config::Single(_) => panic!("expected coder delegate quorum config"),
+        };
+        crate::api::Agent::builder_from_quorum_config(*delegate_config, None)
+            .expect("embedded coder delegate tools should validate");
     }
 
     #[test]

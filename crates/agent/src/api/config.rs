@@ -1,7 +1,7 @@
 //! Agent configuration types for the simple builder API
 
 use super::utils::infer_required_capabilities;
-use crate::config::{ExecutionPolicy, HooksConfig, MiddlewareEntry};
+use crate::config::{ExecutionPolicy, HooksConfig, MiddlewareEntry, SkillsConfig};
 use crate::tools::CapabilityRequirement;
 use querymt::{LLMParams, chat::ReasoningEffort};
 use serde_json::Value;
@@ -17,6 +17,7 @@ pub(super) struct AgentConfig {
     pub required_capabilities: Vec<CapabilityRequirement>,
     pub middleware: Vec<MiddlewareEntry>,
     pub execution: ExecutionPolicy,
+    pub skills: Option<SkillsConfig>,
     pub assume_mutating: Option<bool>,
     pub mutating_tools: Option<Vec<String>>,
     pub hooks: HooksConfig,
@@ -33,6 +34,7 @@ impl AgentConfig {
             required_capabilities: Vec::new(),
             middleware: Vec::new(),
             execution: ExecutionPolicy::default(),
+            skills: None,
             assume_mutating: None,
             mutating_tools: None,
             hooks: HooksConfig::default(),
@@ -112,6 +114,11 @@ impl PlannerConfigBuilder {
         S: Into<String>,
     {
         self.config.tools = tools.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn skills(mut self, config: SkillsConfig) -> Self {
+        self.config.skills = Some(config);
         self
     }
 
@@ -206,6 +213,11 @@ impl DelegateConfigBuilder {
         S: Into<String>,
     {
         self.config.tools = tools.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn skills(mut self, config: SkillsConfig) -> Self {
+        self.config.skills = Some(config);
         self
     }
 
