@@ -1,6 +1,24 @@
 use super::*;
 
 impl LocalAgentHandle {
+    pub(super) async fn session_reasoning_effort(
+        &self,
+        session_ref: &crate::agent::remote::SessionActorRef,
+        session_id: &str,
+    ) -> Option<querymt::chat::ReasoningEffort> {
+        match session_ref.get_reasoning_effort().await {
+            Ok(effort) => effort,
+            Err(err) => {
+                tracing::warn!(
+                    session_id,
+                    error = %err,
+                    "failed to get session reasoning effort; using initial config"
+                );
+                self.config.provider.initial_config().reasoning_effort
+            }
+        }
+    }
+
     /// Switch provider and model for a session (simple form)
     pub async fn set_provider(
         &self,

@@ -12,7 +12,7 @@ use crate::tools::ToolRegistry;
 use crate::verification::VerificationSpec;
 use crate::verification::service::{VerificationContext, VerificationService};
 use log::{debug, error, warn};
-use querymt::chat::ChatRole;
+use querymt::chat::{ChatRole, ReasoningEffort};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -437,6 +437,20 @@ struct DelegationFailureContext<'a> {
 /// This creates sessions via `AgentHandle::create_delegation_session()`. History and
 /// planning context are exchanged via kameo messages (`GetHistory`,
 /// `SetPlanningContext`), so this path works for both local and remote sessions.
+fn reasoning_effort_from_llm_config(
+    config: &crate::session::store::LLMConfig,
+) -> Result<Option<ReasoningEffort>, serde_json::Error> {
+    let Some(value) = config
+        .params
+        .as_ref()
+        .and_then(|params| params.get("reasoning_effort"))
+    else {
+        return Ok(None);
+    };
+
+    serde_json::from_value(value.clone())
+}
+
 #[instrument(
     name = "delegation.execute",
     skip(ctx, target, cancel_token),
@@ -497,6 +511,83 @@ async fn execute_delegation(
     {
         warn!("Failed to update delegation status to Running: {}", e);
     }
+
+    // Snapshot the parent's current per-session setting. UI changes persist this value
+    // before returning, so delegation inherits the value active when it starts.
+    let parent_reasoning_effort = match ctx.store.get_session_llm_config(&parent_session_id).await {
+        Ok(Some(config)) => match reasoning_effort_from_llm_config(&config) {
+            Ok(effort) => effort,
+            Err(err) => {
+                let error_message = format!(
+                    "Failed to read reasoning effort from parent session '{}': {err}",
+                    parent_session_id
+                );
+                fail_delegation(
+                    DelegationFailureContext {
+                        event_sink: &ctx.event_sink,
+                        delegator: &ctx.delegator,
+                        store: &ctx.store,
+                        hooks: Some(&ctx.hooks),
+                        config: &ctx.config,
+                        parent_session_id: &parent_session_id,
+                        delegation_id: &delegation.public_id,
+                        target_agent_id: Some(&delegation.target_agent_id),
+                        objective: Some(&delegation.objective),
+                    },
+                    &error_message,
+                )
+                .await;
+                ctx.active_delegations.lock().await.remove(&delegation_id);
+                return;
+            }
+        },
+        Ok(None) => {
+            let error_message = format!(
+                "Parent session '{}' has no LLM configuration",
+                parent_session_id
+            );
+            fail_delegation(
+                DelegationFailureContext {
+                    event_sink: &ctx.event_sink,
+                    delegator: &ctx.delegator,
+                    store: &ctx.store,
+                    hooks: Some(&ctx.hooks),
+                    config: &ctx.config,
+                    parent_session_id: &parent_session_id,
+                    delegation_id: &delegation.public_id,
+                    target_agent_id: Some(&delegation.target_agent_id),
+                    objective: Some(&delegation.objective),
+                },
+                &error_message,
+            )
+            .await;
+            ctx.active_delegations.lock().await.remove(&delegation_id);
+            return;
+        }
+        Err(err) => {
+            let error_message = format!(
+                "Failed to load LLM configuration for parent session '{}': {err}",
+                parent_session_id
+            );
+            fail_delegation(
+                DelegationFailureContext {
+                    event_sink: &ctx.event_sink,
+                    delegator: &ctx.delegator,
+                    store: &ctx.store,
+                    hooks: Some(&ctx.hooks),
+                    config: &ctx.config,
+                    parent_session_id: &parent_session_id,
+                    delegation_id: &delegation.public_id,
+                    target_agent_id: Some(&delegation.target_agent_id),
+                    objective: Some(&delegation.objective),
+                },
+                &error_message,
+            )
+            .await;
+            ctx.active_delegations.lock().await.remove(&delegation_id);
+            return;
+        }
+    };
 
     // 1. Create session via AgentHandle trait
     // Prefer parent session's cwd over orchestrator default
@@ -659,6 +750,36 @@ async fn execute_delegation(
             ctx.active_delegations.lock().await.remove(&delegation_id);
             return;
         }
+    }
+
+    // Apply this after any model override because SetSessionModel rebuilds the
+    // child's LLM configuration. None deliberately propagates the parent's Auto setting.
+    if let Err(err) = session_ref
+        .set_reasoning_effort(parent_reasoning_effort)
+        .await
+    {
+        let error_message = format!(
+            "Failed to inherit reasoning effort for delegate '{}': {err}",
+            delegation.target_agent_id
+        );
+        let _ = session_ref.shutdown().await;
+        fail_delegation(
+            DelegationFailureContext {
+                event_sink: &ctx.event_sink,
+                delegator: &ctx.delegator,
+                store: &ctx.store,
+                hooks: Some(&ctx.hooks),
+                config: &ctx.config,
+                parent_session_id: &parent_session_id,
+                delegation_id: &delegation.public_id,
+                target_agent_id: Some(&delegation.target_agent_id),
+                objective: Some(&delegation.objective),
+            },
+            &error_message,
+        )
+        .await;
+        ctx.active_delegations.lock().await.remove(&delegation_id);
+        return;
     }
 
     emit_delegation_event(

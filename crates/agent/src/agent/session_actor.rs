@@ -381,6 +381,12 @@ impl SessionActor {
         }
     }
 
+    /// Override the reasoning effort restored for this session.
+    pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
     /// Attach a [`MeshHandle`] to this actor (builder pattern, for remote sessions).
     ///
     /// Called by `RemoteNodeManager` after `new()` so the `SubscribeEvents`

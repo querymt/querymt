@@ -43,6 +43,24 @@ pub struct RemoteAgentHandle {
 }
 
 impl RemoteAgentHandle {
+    async fn session_reasoning_effort(
+        &self,
+        session_ref: &SessionActorRef,
+        session_id: &str,
+    ) -> Option<querymt::chat::ReasoningEffort> {
+        match session_ref.get_reasoning_effort().await {
+            Ok(effort) => effort,
+            Err(err) => {
+                tracing::warn!(
+                    session_id,
+                    error = %err,
+                    "failed to get remote session reasoning effort; falling back to Auto"
+                );
+                None
+            }
+        }
+    }
+
     /// Create a new `RemoteAgentHandle` for a remote peer.
     pub fn new(peer_label: String, target_node_id: Option<String>, mesh: MeshHandle) -> Self {
         Self {
@@ -341,11 +359,14 @@ impl AgentHandle for RemoteAgentHandle {
 
         if let Some(session_ref) = self.sessions.lock().await.get(&session_id).cloned() {
             let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+            let reasoning_effort = self
+                .session_reasoning_effort(&session_ref, &session_id)
+                .await;
             return Ok(LoadSessionResponse::new()
                 .modes(crate::agent::session_registry::mode_state(current_mode))
                 .config_options(crate::agent::session_registry::config_options(
                     current_mode,
-                    None,
+                    reasoning_effort,
                 )));
         }
 
@@ -364,12 +385,15 @@ impl AgentHandle for RemoteAgentHandle {
             .attach_handoff_session(&session_id, response.handoff)
             .await?;
         let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
+        let reasoning_effort = self
+            .session_reasoning_effort(&session_ref, &session_id)
+            .await;
 
         Ok(LoadSessionResponse::new()
             .modes(crate::agent::session_registry::mode_state(current_mode))
             .config_options(crate::agent::session_registry::config_options(
                 current_mode,
-                None,
+                reasoning_effort,
             )))
     }
 
