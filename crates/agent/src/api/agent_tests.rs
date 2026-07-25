@@ -247,16 +247,15 @@ async fn acp_list_sessions_orders_by_updated_at_and_paginates() -> Result<()> {
     );
     assert!(cursor_page.next_cursor.is_none());
 
-    let invalid_cursor_page = AgentSessions::list_for_acp_from_view_store(
+    let invalid_cursor_error = AgentSessions::list_for_acp_from_view_store(
         view_store.clone(),
         AcpListSessionsRequest::new().cursor("not-a-number"),
     )
-    .await?;
-    assert_eq!(invalid_cursor_page.total_count, 2);
-    assert_eq!(invalid_cursor_page.sessions.len(), 2);
+    .await
+    .expect_err("invalid ACP cursors must be rejected");
     assert_eq!(
-        invalid_cursor_page.sessions[0].session_id.to_string(),
-        second.public_id
+        invalid_cursor_error.to_string(),
+        "invalid session list cursor"
     );
 
     let untitled = session_store
@@ -305,6 +304,104 @@ async fn acp_list_sessions_orders_by_updated_at_and_paginates() -> Result<()> {
         intent_info.title.as_deref(),
         Some("This title comes from the initial intent snapshot and should be truncated if ...")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn acp_list_sessions_pages_workspace_sessions_without_cross_workspace_leaks() -> Result<()> {
+    let agent = test_agent().await?;
+    let session_store = agent.storage_backend().session_store();
+    let workspace = PathBuf::from("/tmp/acp-workspace");
+    let other_workspace = PathBuf::from("/tmp/acp-other-workspace");
+    let mut workspace_session_ids = Vec::new();
+
+    for index in 0..12 {
+        let session = session_store
+            .create_session(
+                Some(format!("Workspace Session {index}")),
+                Some(workspace.clone()),
+                None,
+                None,
+            )
+            .await?;
+        workspace_session_ids.push(session.public_id);
+    }
+    for index in 0..90 {
+        session_store
+            .create_session(
+                Some(format!("Other Workspace Session {index}")),
+                Some(other_workspace.clone()),
+                None,
+                None,
+            )
+            .await?;
+    }
+
+    let view_store = agent.storage_backend().view_store().expect("view store");
+    let first_page = AgentSessions::list_for_acp_from_view_store(
+        view_store.clone(),
+        AcpListSessionsRequest::new().cwd(workspace.clone()),
+    )
+    .await?;
+    assert_eq!(first_page.total_count, 12);
+    assert_eq!(first_page.sessions.len(), 10);
+    assert!(
+        first_page
+            .sessions
+            .iter()
+            .all(|session| session.cwd == workspace)
+    );
+    assert_eq!(
+        first_page
+            .sessions
+            .iter()
+            .map(|session| session.session_id.to_string())
+            .collect::<Vec<_>>(),
+        workspace_session_ids[2..]
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let next_cursor = first_page
+        .next_cursor
+        .expect("workspace page should continue");
+
+    let second_page = AgentSessions::list_for_acp_from_view_store(
+        view_store.clone(),
+        AcpListSessionsRequest::new()
+            .cwd(workspace.clone())
+            .cursor(next_cursor),
+    )
+    .await?;
+    assert_eq!(second_page.total_count, 12);
+    assert_eq!(second_page.sessions.len(), 2);
+    assert!(
+        second_page
+            .sessions
+            .iter()
+            .all(|session| session.cwd == workspace)
+    );
+    assert_eq!(
+        second_page
+            .sessions
+            .iter()
+            .map(|session| session.session_id.to_string())
+            .collect::<Vec<_>>(),
+        workspace_session_ids[..2]
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    assert!(second_page.next_cursor.is_none());
+
+    let unfiltered =
+        AgentSessions::list_for_acp_from_view_store(view_store, AcpListSessionsRequest::new())
+            .await?;
+    assert_eq!(unfiltered.total_count, 102);
+    assert_eq!(unfiltered.sessions.len(), 100);
+    assert_eq!(unfiltered.next_cursor.as_deref(), Some("100"));
     Ok(())
 }
 

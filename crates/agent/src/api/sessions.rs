@@ -101,6 +101,36 @@ pub struct AcpSessionListPage {
     pub total_count: u64,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AcpSessionListError {
+    #[error("invalid session list cursor")]
+    InvalidCursor,
+    #[error(transparent)]
+    Backend(#[from] anyhow::Error),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AcpSessionCursor(i64);
+
+impl AcpSessionCursor {
+    fn parse(cursor: Option<&str>) -> std::result::Result<Option<Self>, AcpSessionListError> {
+        cursor
+            .map(|cursor| {
+                cursor
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|offset| *offset >= 0)
+                    .map(Self)
+                    .ok_or(AcpSessionListError::InvalidCursor)
+            })
+            .transpose()
+    }
+
+    fn into_string(self) -> String {
+        self.0.to_string()
+    }
+}
+
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
@@ -238,14 +268,16 @@ impl AgentSessions {
         &self,
         request: AcpListSessionsRequest,
     ) -> Result<AcpSessionListPage> {
-        Self::list_for_acp_with_runtime(&self.agent, self.view_store()?, request).await
+        Self::list_for_acp_with_runtime(&self.agent, self.view_store()?, request)
+            .await
+            .map_err(anyhow::Error::from)
     }
 
     pub(crate) async fn list_for_acp_with_runtime(
         agent: &LocalAgentHandle,
         view_store: Arc<dyn ViewStore>,
         request: AcpListSessionsRequest,
-    ) -> Result<AcpSessionListPage> {
+    ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {
         let mut page = Self::list_for_acp_from_view_store(view_store.clone(), request).await?;
         Self::hydrate_acp_session_meta(agent, view_store, &mut page.sessions).await?;
         Ok(page)
@@ -254,13 +286,21 @@ impl AgentSessions {
     pub(crate) async fn list_for_acp_from_view_store(
         view_store: Arc<dyn ViewStore>,
         request: AcpListSessionsRequest,
-    ) -> Result<AcpSessionListPage> {
+    ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {
+        let cursor = AcpSessionCursor::parse(request.cursor.as_deref())?;
         let requested_cwd = request.cwd.map(|cwd| cwd.display().to_string());
-        let limit = 100usize;
+        // ACP workspace requests load incrementally; global discovery remains a larger flat page.
+        let limit = if requested_cwd.is_some() { 10 } else { 100 };
 
         let (sessions, next_cursor, total_count) = view_store
-            .list_session_items(requested_cwd, request.cursor, limit, SessionScope::All)
-            .await?;
+            .list_session_items(
+                requested_cwd,
+                cursor.map(AcpSessionCursor::into_string),
+                limit,
+                SessionScope::All,
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
 
         Ok(AcpSessionListPage {
             sessions: sessions

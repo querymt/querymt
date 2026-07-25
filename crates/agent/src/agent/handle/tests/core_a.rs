@@ -187,25 +187,98 @@ async fn test_list_sessions_empty() {
 }
 
 #[tokio::test]
-async fn test_list_sessions_filters_by_cwd() {
-    let cwd_a = std::env::temp_dir().join("querymt-list-sessions-a");
-    let cwd_b = std::env::temp_dir().join("querymt-list-sessions-b");
+async fn test_list_sessions_cwd_pagination_and_cursor_errors() {
+    let f = RealStorageHandleFixture::new().await;
+    let workspace = std::env::temp_dir().join("querymt-list-sessions-workspace");
+    let other_workspace = std::env::temp_dir().join("querymt-list-sessions-other-workspace");
+    let session_store = f.storage.session_store();
+    let mut workspace_session_ids = HashSet::new();
 
-    let mut session_a = mock_session("session-a");
-    session_a.cwd = Some(cwd_a.clone());
-    let mut session_b = mock_session("session-b");
-    session_b.cwd = Some(cwd_b.clone());
+    for index in 0..12 {
+        let session = session_store
+            .create_session(
+                Some(format!("Workspace Session {index}")),
+                Some(workspace.clone()),
+                None,
+                None,
+            )
+            .await
+            .expect("create workspace session");
+        workspace_session_ids.insert(session.public_id);
+    }
+    for index in 0..2 {
+        session_store
+            .create_session(
+                Some(format!("Other Workspace Session {index}")),
+                Some(other_workspace.clone()),
+                None,
+                None,
+            )
+            .await
+            .expect("create other workspace session");
+    }
 
-    let f = HandleFixture::with_list_sessions(vec![session_a, session_b]).await;
-
-    let resp = f
+    let first_page = f
         .handle
-        .list_sessions(ListSessionsRequest::new().cwd(cwd_a.clone()))
+        .list_sessions(ListSessionsRequest::new().cwd(workspace.clone()))
         .await
-        .expect("list_sessions filtered by cwd");
+        .expect("list first workspace page");
+    assert_eq!(first_page.sessions.len(), 10);
+    assert!(
+        first_page
+            .sessions
+            .iter()
+            .all(|session| session.cwd == workspace)
+    );
+    let first_page_ids: HashSet<_> = first_page
+        .sessions
+        .iter()
+        .map(|session| session.session_id.to_string())
+        .collect();
+    assert_eq!(first_page_ids.len(), 10);
+    let next_cursor = first_page
+        .next_cursor
+        .expect("workspace page should continue");
 
-    assert_eq!(resp.sessions.len(), 1);
-    assert_eq!(resp.sessions[0].cwd, cwd_a);
+    let second_page = f
+        .handle
+        .list_sessions(
+            ListSessionsRequest::new()
+                .cwd(workspace.clone())
+                .cursor(next_cursor),
+        )
+        .await
+        .expect("list second workspace page");
+    assert_eq!(second_page.sessions.len(), 2);
+    assert!(
+        second_page
+            .sessions
+            .iter()
+            .all(|session| session.cwd == workspace)
+    );
+    let second_page_ids: HashSet<_> = second_page
+        .sessions
+        .iter()
+        .map(|session| session.session_id.to_string())
+        .collect();
+    assert!(first_page_ids.is_disjoint(&second_page_ids));
+    assert_eq!(
+        first_page_ids
+            .union(&second_page_ids)
+            .cloned()
+            .collect::<HashSet<_>>(),
+        workspace_session_ids
+    );
+    assert!(second_page.next_cursor.is_none());
+
+    for cursor in ["not-a-number", "9223372036854775808"] {
+        let error = f
+            .handle
+            .list_sessions(ListSessionsRequest::new().cursor(cursor))
+            .await
+            .expect_err("invalid ACP cursor should fail");
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+    }
 }
 
 #[tokio::test]

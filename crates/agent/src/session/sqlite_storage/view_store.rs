@@ -1007,7 +1007,8 @@ impl ViewStore for SqliteStorage {
     ) -> SessionResult<(Vec<SessionListItem>, Option<String>, usize)> {
         let offset = cursor
             .as_deref()
-            .and_then(|c| c.parse::<usize>().ok())
+            .and_then(|cursor| cursor.parse::<i64>().ok())
+            .filter(|offset| *offset >= 0)
             .unwrap_or(0);
         let limit = limit.clamp(1, 200);
         let scope_where = session_scope_where(session_scope, "s");
@@ -1046,7 +1047,7 @@ impl ViewStore for SqliteStorage {
                     LEFT JOIN intent_snapshots i
                         ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
                     WHERE s.cwd = ?1 AND {}
-                    ORDER BY s.updated_at DESC
+                    ORDER BY s.updated_at DESC, s.id DESC
                     LIMIT ?2 OFFSET ?3
                     "#,
                     scope_where
@@ -1070,7 +1071,7 @@ impl ViewStore for SqliteStorage {
                     LEFT JOIN intent_snapshots i
                         ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
                     WHERE {}
-                    ORDER BY s.updated_at DESC
+                    ORDER BY s.updated_at DESC, s.id DESC
                     LIMIT ?1 OFFSET ?2
                     "#,
                     scope_where
@@ -1078,18 +1079,16 @@ impl ViewStore for SqliteStorage {
             };
 
             let sessions = if let Some(ref cwd_value) = cwd {
-                stmt.query_map(params![cwd_value, limit as i64, offset as i64], map_session_list_item_row)?
+                stmt.query_map(params![cwd_value, limit as i64, offset], map_session_list_item_row)?
                     .collect::<Result<Vec<_>, _>>()?
             } else {
-                stmt.query_map(params![limit as i64, offset as i64], map_session_list_item_row)?
+                stmt.query_map(params![limit as i64, offset], map_session_list_item_row)?
                     .collect::<Result<Vec<_>, _>>()?
             };
 
-            let next_cursor = if offset + sessions.len() < total_count {
-                Some((offset + sessions.len()).to_string())
-            } else {
-                None
-            };
+            let next_cursor = offset.checked_add(sessions.len() as i64).and_then(|next_offset| {
+                (usize::try_from(next_offset).ok()? < total_count).then_some(next_offset.to_string())
+            });
 
             Ok((sessions, next_cursor, total_count))
         })
