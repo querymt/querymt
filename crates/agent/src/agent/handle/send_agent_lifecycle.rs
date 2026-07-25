@@ -88,7 +88,14 @@ impl LocalAgentHandle {
             .ok_or_else(|| Error::internal_error().data("view store unavailable"))?;
         let page = crate::api::AgentSessions::list_for_acp_with_runtime(self, view_store, req)
             .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+            .map_err(|error| match error {
+                crate::api::AcpSessionListError::InvalidCursor => {
+                    Error::invalid_params().data("invalid session list cursor")
+                }
+                crate::api::AcpSessionListError::Backend(error) => {
+                    Error::internal_error().data(error.to_string())
+                }
+            })?;
         Ok(ListSessionsResponse::new(page.sessions).next_cursor(page.next_cursor))
     }
 

@@ -74,6 +74,7 @@ pub use mesh::{AgentMesh, Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec};
 pub use profiles::{AgentProfiles, ProfileRuntimeHandle};
 pub use quorum::QuorumBuilder;
 pub use session::AgentSession;
+pub(crate) use sessions::AcpSessionListError;
 pub use sessions::{
     AgentLoadedSession, AgentSessions, ListSessionsOptions, RemoteSessionMode, SessionChildrenPage,
     SessionGroup, SessionListMode, SessionListPage, SessionMeta, SessionSummary,
