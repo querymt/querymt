@@ -406,35 +406,43 @@ async fn acp_list_sessions_pages_workspace_sessions_without_cross_workspace_leak
 }
 
 #[tokio::test]
-async fn acp_session_list_includes_meta_from_stats_and_finish_reason() -> Result<()> {
+async fn acp_session_list_includes_relationship_and_operational_meta() -> Result<()> {
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
     let agent = test_agent_with_storage(Some(storage.clone())).await?;
     let session_store = storage.session_store();
-    let session = session_store
+    let parent = session_store
         .create_session(
-            Some("Meta Session".to_string()),
+            Some("Parent Session".to_string()),
             Some("/tmp/meta".into()),
             None,
             None,
         )
         .await?;
+    let child = session_store
+        .create_session(
+            Some("Child Session".to_string()),
+            Some("/tmp/meta".into()),
+            Some(parent.public_id.clone()),
+            Some(crate::session::domain::ForkOrigin::User),
+        )
+        .await?;
 
     session_store
         .add_message(
-            &session.public_id,
-            AgentMessage::new(session.public_id.clone(), ChatRole::User),
+            &child.public_id,
+            AgentMessage::new(child.public_id.clone(), ChatRole::User),
         )
         .await?;
     session_store
         .add_message(
-            &session.public_id,
-            AgentMessage::new(session.public_id.clone(), ChatRole::Assistant),
+            &child.public_id,
+            AgentMessage::new(child.public_id.clone(), ChatRole::Assistant),
         )
         .await?;
     storage
         .append_durable(&NewDurableEvent {
-            session_id: session.public_id.clone(),
+            session_id: child.public_id.clone(),
             origin: EventOrigin::Local,
             source_node: None,
             kind: AgentEventKind::LlmRequestEnd {
@@ -453,17 +461,103 @@ async fn acp_session_list_includes_meta_from_stats_and_finish_reason() -> Result
         .sessions()
         .list_for_acp(AcpListSessionsRequest::new())
         .await?;
+    let parent_info = page
+        .sessions
+        .iter()
+        .find(|info| info.session_id.to_string() == parent.public_id)
+        .expect("parent session should be listed");
+    let parent_meta = parent_info
+        .meta
+        .as_ref()
+        .expect("parent ACP session meta should be set");
+    assert_eq!(
+        parent_meta.get("hasChildren"),
+        Some(&serde_json::json!(true))
+    );
+    assert_eq!(parent_meta.get("forkCount"), Some(&serde_json::json!(1)));
+    assert!(!parent_meta.contains_key("parentSessionId"));
+    assert!(!parent_meta.contains_key("forkOrigin"));
+    assert!(!parent_meta.contains_key("sessionKind"));
+
+    let child_info = page
+        .sessions
+        .iter()
+        .find(|info| info.session_id.to_string() == child.public_id)
+        .expect("child session should be listed");
+    let child_meta = child_info
+        .meta
+        .as_ref()
+        .expect("child ACP session meta should be set");
+    assert_eq!(
+        child_meta.get("parentSessionId"),
+        Some(&serde_json::json!(parent.public_id))
+    );
+    assert_eq!(
+        child_meta.get("forkOrigin"),
+        Some(&serde_json::json!("user"))
+    );
+    assert_eq!(
+        child_meta.get("hasChildren"),
+        Some(&serde_json::json!(false))
+    );
+    assert_eq!(child_meta.get("forkCount"), Some(&serde_json::json!(0)));
+    assert!(!child_meta.contains_key("sessionKind"));
+    assert_eq!(child_meta.get("messageCount"), Some(&serde_json::json!(2)));
+    assert_eq!(
+        child_meta.get("userMessageCount"),
+        Some(&serde_json::json!(1))
+    );
+    assert_eq!(child_meta.get("hasErrors"), Some(&serde_json::json!(true)));
+    assert_eq!(
+        child_meta.get("runtimeStatus"),
+        Some(&serde_json::json!("idle"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn acp_session_list_marks_scheduled_recurring_session() -> Result<()> {
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = test_agent_with_storage(Some(storage.clone())).await?;
+    let session = storage
+        .session_store()
+        .create_session(
+            Some("Scheduled Session".to_string()),
+            Some("/tmp/scheduled".into()),
+            None,
+            None,
+        )
+        .await?;
+
+    crate::control::schedules::create_schedule(
+        &agent.handle(),
+        crate::control::schedules::CreateScheduleControlRequest {
+            node_id: None,
+            session_id: session.public_id.clone(),
+            prompt: "daily summary".to_string(),
+            trigger: crate::session::domain_schedule::ScheduleTrigger::Interval { seconds: 300 },
+            max_steps: None,
+            max_cost_usd: None,
+            max_runs: None,
+        },
+    )
+    .await?;
+
+    let page = agent
+        .sessions()
+        .list_for_acp(AcpListSessionsRequest::new())
+        .await?;
     let info = page
         .sessions
         .iter()
         .find(|info| info.session_id.to_string() == session.public_id)
-        .expect("session should be listed");
+        .expect("scheduled session should be listed");
     let meta = info.meta.as_ref().expect("ACP session meta should be set");
-
-    assert_eq!(meta.get("messageCount"), Some(&serde_json::json!(2)));
-    assert_eq!(meta.get("userMessageCount"), Some(&serde_json::json!(1)));
-    assert_eq!(meta.get("hasErrors"), Some(&serde_json::json!(true)));
-    assert_eq!(meta.get("runtimeStatus"), Some(&serde_json::json!("idle")));
+    assert_eq!(
+        meta.get("sessionKind"),
+        Some(&serde_json::json!("recurring"))
+    );
     Ok(())
 }
 

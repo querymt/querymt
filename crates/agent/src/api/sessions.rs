@@ -360,7 +360,9 @@ impl AgentSessions {
                 has_errors,
                 runtime_status,
             };
-            info.meta = Some(meta.to_acp_meta());
+            let mut acp_meta = info.meta.take().unwrap_or_default();
+            acp_meta.extend(meta.to_acp_meta());
+            info.meta = Some(acp_meta);
         }
 
         Ok(())
@@ -707,6 +709,35 @@ fn session_list_item_to_acp_info(item: SessionListItem) -> SessionInfo {
     info.updated_at = item
         .updated_at
         .and_then(|updated_at| updated_at.format(&Rfc3339).ok());
+
+    let mut meta = Meta::new();
+    if let Some(parent_session_id) = item.parent_session_id {
+        meta.insert(
+            "parentSessionId".to_string(),
+            serde_json::Value::String(parent_session_id),
+        );
+    }
+    if let Some(fork_origin) = item.fork_origin {
+        meta.insert(
+            "forkOrigin".to_string(),
+            serde_json::Value::String(fork_origin),
+        );
+    }
+    if let Some(session_kind) = item.session_kind {
+        meta.insert(
+            "sessionKind".to_string(),
+            serde_json::Value::String(session_kind),
+        );
+    }
+    meta.insert(
+        "hasChildren".to_string(),
+        serde_json::Value::Bool(item.has_children),
+    );
+    meta.insert(
+        "forkCount".to_string(),
+        serde_json::Value::from(item.fork_count),
+    );
+    info.meta = Some(meta);
     info
 }
 

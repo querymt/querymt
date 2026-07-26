@@ -1039,7 +1039,10 @@ impl ViewStore for SqliteStorage {
                         s.updated_at,
                         p.public_id,
                         s.fork_origin,
-                        s.session_kind,
+                        CASE WHEN EXISTS(
+                            SELECT 1 FROM tasks t
+                            WHERE t.session_id = s.id AND t.kind = 'recurring'
+                        ) THEN 'recurring' ELSE s.session_kind END,
                         (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
                         i.summary
                     FROM sessions s
@@ -1063,7 +1066,10 @@ impl ViewStore for SqliteStorage {
                         s.updated_at,
                         p.public_id,
                         s.fork_origin,
-                        s.session_kind,
+                        CASE WHEN EXISTS(
+                            SELECT 1 FROM tasks t
+                            WHERE t.session_id = s.id AND t.kind = 'recurring'
+                        ) THEN 'recurring' ELSE s.session_kind END,
                         (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
                         i.summary
                     FROM sessions s
