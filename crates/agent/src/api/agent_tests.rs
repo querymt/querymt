@@ -515,6 +515,52 @@ async fn acp_session_list_includes_relationship_and_operational_meta() -> Result
     Ok(())
 }
 
+#[tokio::test]
+async fn acp_session_list_marks_scheduled_recurring_session() -> Result<()> {
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = test_agent_with_storage(Some(storage.clone())).await?;
+    let session = storage
+        .session_store()
+        .create_session(
+            Some("Scheduled Session".to_string()),
+            Some("/tmp/scheduled".into()),
+            None,
+            None,
+        )
+        .await?;
+
+    crate::control::schedules::create_schedule(
+        &agent.handle(),
+        crate::control::schedules::CreateScheduleControlRequest {
+            node_id: None,
+            session_id: session.public_id.clone(),
+            prompt: "daily summary".to_string(),
+            trigger: crate::session::domain_schedule::ScheduleTrigger::Interval { seconds: 300 },
+            max_steps: None,
+            max_cost_usd: None,
+            max_runs: None,
+        },
+    )
+    .await?;
+
+    let page = agent
+        .sessions()
+        .list_for_acp(AcpListSessionsRequest::new())
+        .await?;
+    let info = page
+        .sessions
+        .iter()
+        .find(|info| info.session_id.to_string() == session.public_id)
+        .expect("scheduled session should be listed");
+    let meta = info.meta.as_ref().expect("ACP session meta should be set");
+    assert_eq!(
+        meta.get("sessionKind"),
+        Some(&serde_json::json!("recurring"))
+    );
+    Ok(())
+}
+
 #[cfg(feature = "remote")]
 #[tokio::test]
 async fn list_sessions_remote_bookmarks_mode_includes_detached_bookmarks() -> Result<()> {
