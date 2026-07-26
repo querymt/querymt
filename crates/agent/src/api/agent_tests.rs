@@ -470,7 +470,10 @@ async fn acp_session_list_includes_relationship_and_operational_meta() -> Result
         .meta
         .as_ref()
         .expect("parent ACP session meta should be set");
-    assert_eq!(parent_meta.get("hasChildren"), Some(&serde_json::json!(true)));
+    assert_eq!(
+        parent_meta.get("hasChildren"),
+        Some(&serde_json::json!(true))
+    );
     assert_eq!(parent_meta.get("forkCount"), Some(&serde_json::json!(1)));
     assert!(!parent_meta.contains_key("parentSessionId"));
     assert!(!parent_meta.contains_key("forkOrigin"));
@@ -489,14 +492,26 @@ async fn acp_session_list_includes_relationship_and_operational_meta() -> Result
         child_meta.get("parentSessionId"),
         Some(&serde_json::json!(parent.public_id))
     );
-    assert_eq!(child_meta.get("forkOrigin"), Some(&serde_json::json!("user")));
-    assert_eq!(child_meta.get("hasChildren"), Some(&serde_json::json!(false)));
+    assert_eq!(
+        child_meta.get("forkOrigin"),
+        Some(&serde_json::json!("user"))
+    );
+    assert_eq!(
+        child_meta.get("hasChildren"),
+        Some(&serde_json::json!(false))
+    );
     assert_eq!(child_meta.get("forkCount"), Some(&serde_json::json!(0)));
     assert!(!child_meta.contains_key("sessionKind"));
     assert_eq!(child_meta.get("messageCount"), Some(&serde_json::json!(2)));
-    assert_eq!(child_meta.get("userMessageCount"), Some(&serde_json::json!(1)));
+    assert_eq!(
+        child_meta.get("userMessageCount"),
+        Some(&serde_json::json!(1))
+    );
     assert_eq!(child_meta.get("hasErrors"), Some(&serde_json::json!(true)));
-    assert_eq!(child_meta.get("runtimeStatus"), Some(&serde_json::json!("idle")));
+    assert_eq!(
+        child_meta.get("runtimeStatus"),
+        Some(&serde_json::json!("idle"))
+    );
     Ok(())
 }
 
