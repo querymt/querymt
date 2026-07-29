@@ -1,12 +1,13 @@
 use http::{Method, Request, Response, header::CONTENT_TYPE};
 use qmt_openai::api::{
-    OpenAIProviderConfig, openai_chat_request, openai_embed_request, openai_parse_chat,
-    openai_parse_embed, url_schema,
+    OpenAIProviderConfig, OpenAIToolUseState, openai_chat_request, openai_embed_request,
+    openai_parse_chat, openai_parse_embed, parse_openai_sse_chunk, url_schema,
 };
 use querymt::{
     HTTPLLMProvider,
     chat::{
-        ChatMessage, ChatResponse, StructuredOutputFormat, Tool, ToolChoice, http::HTTPChatProvider,
+        ChatMessage, ChatResponse, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
+        http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -16,6 +17,7 @@ use querymt::{
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
@@ -120,8 +122,37 @@ impl HTTPChatProvider for OpenRouter {
         openai_chat_request(self, messages, tools)
     }
 
+    fn chat_stream_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<Request<Vec<u8>>, LLMError> {
+        let mut cfg = self.clone();
+        cfg.stream = Some(true);
+        openai_chat_request(&cfg, messages, tools)
+    }
+
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         openai_parse_chat(self, response)
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        Ok(Box::new(OpenRouterStreamParser::default()))
+    }
+}
+
+#[derive(Default)]
+struct OpenRouterStreamParser {
+    tool_states: HashMap<usize, OpenAIToolUseState>,
+}
+
+impl ChatStreamParser for OpenRouterStreamParser {
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+        parse_openai_sse_chunk(chunk, &mut self.tool_states)
     }
 }
 
@@ -234,5 +265,95 @@ mod extism_exports {
         config = OpenRouter,
         factory = OpenRouterFactory,
         name   = "openrouter",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenRouter;
+    use querymt::chat::{StreamChunk, http::HTTPChatProvider};
+    use serde_json::Value;
+
+    fn test_provider() -> OpenRouter {
+        serde_json::from_value(serde_json::json!({
+            "api_key": "test-key",
+            "model": "openai/gpt-4o-mini"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn supports_streaming() {
+        assert!(test_provider().supports_streaming());
+    }
+
+    #[test]
+    fn chat_stream_request_forces_stream_true() {
+        let provider = test_provider();
+
+        let req = provider
+            .chat_stream_request(&[], None)
+            .expect("stream request should build");
+        let body: Value = serde_json::from_slice(req.body()).expect("body should be valid json");
+        assert_eq!(body.get("stream"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn stream_parsers_are_isolated_per_stream() {
+        let provider = test_provider();
+
+        let mut parser_a = provider
+            .chat_stream_parser()
+            .expect("parser A should initialize");
+        let mut parser_b = provider
+            .chat_stream_parser()
+            .expect("parser B should initialize");
+
+        let a_delta = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}
+"#;
+        let b_delta = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_b","type":"function","function":{"name":"write_file","arguments":"{\"path\":"}}]}}]}
+"#;
+        let a_more = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.txt\"}"}}]}}]}
+"#;
+        let b_more = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"b.txt\"}"}}]}}]}
+"#;
+        let a_done = br#"data: [DONE]
+"#;
+        let b_done = br#"data: [DONE]
+"#;
+
+        let _ = parser_a.parse_chunk(a_delta).expect("parse A delta");
+        let _ = parser_b.parse_chunk(b_delta).expect("parse B delta");
+        let _ = parser_a.parse_chunk(a_more).expect("parse A more");
+        let _ = parser_b.parse_chunk(b_more).expect("parse B more");
+
+        let a_events = parser_a.parse_chunk(a_done).expect("parse A done");
+        let b_events = parser_b.parse_chunk(b_done).expect("parse B done");
+
+        let a_complete = a_events.iter().find_map(|chunk| {
+            if let StreamChunk::ToolUseComplete { tool_call, .. } = chunk {
+                Some(tool_call)
+            } else {
+                None
+            }
+        });
+        let b_complete = b_events.iter().find_map(|chunk| {
+            if let StreamChunk::ToolUseComplete { tool_call, .. } = chunk {
+                Some(tool_call)
+            } else {
+                None
+            }
+        });
+
+        let a_complete = a_complete.expect("A should emit ToolUseComplete");
+        let b_complete = b_complete.expect("B should emit ToolUseComplete");
+
+        assert_eq!(a_complete.id, "call_a");
+        assert_eq!(a_complete.function.name, "read_file");
+        assert_eq!(a_complete.function.arguments, r#"{"path":"a.txt"}"#);
+
+        assert_eq!(b_complete.id, "call_b");
+        assert_eq!(b_complete.function.name, "write_file");
+        assert_eq!(b_complete.function.arguments, r#"{"path":"b.txt"}"#);
     }
 }
