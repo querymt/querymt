@@ -62,15 +62,14 @@ struct FlowIdentity {
     provider: String,
 }
 
-/// Shared OAuth service dependencies. Cheaply cloneable (all fields are `Arc`-backed).
+/// Shared auth service dependencies. Cheaply cloneable (all fields are `Arc`-backed).
 ///
 /// Groups the shared dependencies (`AgentConfig`, `ModelInventory`,
 /// `OAuthFlowMap`, `CallbackListenerSlot`) that every auth operation needs,
-/// providing a single entry point for all OAuth service methods.
+/// providing a single entry point for OAuth flows and API-token mutations.
 #[derive(Clone)]
 pub struct OAuthService {
     config: Arc<AgentConfig>,
-    #[cfg_attr(not(feature = "oauth"), allow(dead_code))]
     model_inventory: ModelInventory,
     flows: OAuthFlowMap,
     listener_slot: CallbackListenerSlot,
@@ -136,6 +135,18 @@ pub struct CompleteFlowResult {
 /// Result of `logout`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogoutResult {
+    pub provider: String,
+    pub success: bool,
+    pub message: String,
+}
+
+/// Result of API-token / auth-method mutations (`set_api_token`, `clear_api_token`,
+/// `set_auth_method`).
+///
+/// Same wire shape as [`LogoutResult`] / [`CompleteFlowResult`] so ACP clients and
+/// the dashboard can treat auth mutations uniformly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthMutationResult {
     pub provider: String,
     pub success: bool,
     pub message: String,
@@ -571,6 +582,210 @@ impl OAuthService {
         }
     }
 
+    // ── API token / auth method mutations ────────────────────────────────
+
+    /// Store an API token for a provider in the secret store.
+    ///
+    /// Shared by the dashboard `SetApiToken` handler and the ACP
+    /// `querymt/auth/setApiToken` extension method.
+    pub async fn set_api_token(&self, provider: &str, api_key: &str) -> AuthMutationResult {
+        let provider_name = provider.trim().to_string();
+        if provider_name.is_empty() {
+            return AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: "Provider name is required".to_string(),
+            };
+        }
+
+        let api_key = api_key.trim();
+        if api_key.is_empty() {
+            return AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: "API key cannot be empty".to_string(),
+            };
+        }
+
+        if let Err(e) = validate_provider_configured(&self.config, &provider_name) {
+            return AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: e,
+            };
+        }
+
+        let Some(name) = resolve_api_key_name(&self.config, &provider_name).await else {
+            return AuthMutationResult {
+                provider: provider_name.clone(),
+                success: false,
+                message: format!(
+                    "Provider '{}' does not have a known API key name",
+                    provider_name
+                ),
+            };
+        };
+
+        let mut store = match crate::auth::SecretStore::new() {
+            Ok(s) => s,
+            Err(err) => {
+                return AuthMutationResult {
+                    provider: provider_name,
+                    success: false,
+                    message: format!("Failed to open secret store: {}", err),
+                };
+            }
+        };
+
+        match store.set(&name, api_key) {
+            Ok(()) => {
+                self.invalidate_auth_caches().await;
+                AuthMutationResult {
+                    provider: provider_name.clone(),
+                    success: true,
+                    message: format!("API key stored for {} ({})", provider_name, name),
+                }
+            }
+            Err(err) => AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: format!("Failed to store API key: {}", err),
+            },
+        }
+    }
+
+    /// Clear a stored API token for a provider.
+    ///
+    /// Shared by the dashboard `ClearApiToken` handler and the ACP
+    /// `querymt/auth/clearApiToken` extension method. Delete is idempotent.
+    pub async fn clear_api_token(&self, provider: &str) -> AuthMutationResult {
+        let provider_name = provider.trim().to_string();
+        if provider_name.is_empty() {
+            return AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: "Provider name is required".to_string(),
+            };
+        }
+
+        if let Err(e) = validate_provider_configured(&self.config, &provider_name) {
+            return AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: e,
+            };
+        }
+
+        let Some(name) = resolve_api_key_name(&self.config, &provider_name).await else {
+            return AuthMutationResult {
+                provider: provider_name.clone(),
+                success: false,
+                message: format!(
+                    "Provider '{}' does not have a known API key name",
+                    provider_name
+                ),
+            };
+        };
+
+        let mut store = match crate::auth::SecretStore::new() {
+            Ok(s) => s,
+            Err(err) => {
+                return AuthMutationResult {
+                    provider: provider_name,
+                    success: false,
+                    message: format!("Failed to open secret store: {}", err),
+                };
+            }
+        };
+
+        match store.delete(&name) {
+            Ok(()) => {
+                self.invalidate_auth_caches().await;
+                AuthMutationResult {
+                    provider: provider_name.clone(),
+                    success: true,
+                    message: format!("API key cleared for {} ({})", provider_name, name),
+                }
+            }
+            Err(err) => AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: format!("Failed to clear API key: {}", err),
+            },
+        }
+    }
+
+    /// Persist the preferred auth method for a provider.
+    ///
+    /// Shared by the dashboard `SetAuthMethod` handler and the ACP
+    /// `querymt/auth/setMethod` extension method. Accepts `oauth`, `api_key`,
+    /// and `env_var` (case-sensitive snake_case).
+    pub async fn set_auth_method(&self, provider: &str, method: &str) -> AuthMutationResult {
+        let provider_name = provider.trim().to_string();
+        if provider_name.is_empty() {
+            return AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: "Provider name is required".to_string(),
+            };
+        }
+
+        if let Err(e) = validate_provider_configured(&self.config, &provider_name) {
+            return AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: e,
+            };
+        }
+
+        let parsed = match method.trim().parse::<crate::auth::AuthMethod>() {
+            Ok(m) => m,
+            Err(err) => {
+                return AuthMutationResult {
+                    provider: provider_name,
+                    success: false,
+                    message: err,
+                };
+            }
+        };
+
+        let key = format!("auth_method_{}", provider_name);
+        let mut store = match crate::auth::SecretStore::new() {
+            Ok(s) => s,
+            Err(err) => {
+                return AuthMutationResult {
+                    provider: provider_name,
+                    success: false,
+                    message: format!("Failed to open secret store: {}", err),
+                };
+            }
+        };
+
+        match store.set(&key, parsed.to_string()) {
+            Ok(()) => {
+                // Preferred method changes credential resolution order, so both
+                // the instantiated-provider cache and model inventory must refresh.
+                self.invalidate_auth_caches().await;
+                AuthMutationResult {
+                    provider: provider_name.clone(),
+                    success: true,
+                    message: format!("Auth method set to '{}' for {}", parsed, provider_name),
+                }
+            }
+            Err(err) => AuthMutationResult {
+                provider: provider_name,
+                success: false,
+                message: format!("Failed to set auth method: {}", err),
+            },
+        }
+    }
+
+    /// Drop cached providers and model inventory after credential changes.
+    async fn invalidate_auth_caches(&self) {
+        self.config.invalidate_provider_cache().await;
+        self.model_inventory.invalidate_all().await;
+    }
+
     // ── cleanup_owner ─────────────────────────────────────────────────────
 
     /// Clean up all OAuth state for a disconnecting owner (connection).
@@ -686,7 +901,6 @@ pub(crate) async fn persist_oauth_credentials(
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-#[cfg(feature = "oauth")]
 fn validate_provider_configured(config: &AgentConfig, provider: &str) -> Result<(), String> {
     let registry = config.provider.plugin_registry();
     let is_configured = registry
@@ -699,6 +913,17 @@ fn validate_provider_configured(config: &AgentConfig, provider: &str) -> Result<
     } else {
         Ok(())
     }
+}
+
+/// Resolve the secret-store key name for a provider's API token via the plugin
+/// factory's `api_key_name()`. Returns `None` for unknown or OAuth-only providers.
+async fn resolve_api_key_name(config: &AgentConfig, provider: &str) -> Option<String> {
+    let registry = config.provider.plugin_registry();
+    let factory = registry.get(provider).await;
+    factory
+        .as_ref()
+        .and_then(|f| f.as_http())
+        .and_then(|h| h.api_key_name())
 }
 
 #[cfg(feature = "oauth")]

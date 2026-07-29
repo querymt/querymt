@@ -148,9 +148,7 @@ impl TestHarness {
             inner: provider.clone(),
             tools: Vec::new().into_boxed_slice(),
         };
-        let factory = Arc::new(TestProviderFactory {
-            provider: shared_provider,
-        });
+        let factory = Arc::new(TestProviderFactory::new(shared_provider));
         let temp_dir = TempDir::new().expect("temp dir");
         let wasm_path = temp_dir.path().join("mock.wasm");
         std::fs::write(&wasm_path, "").expect("write wasm");
@@ -446,9 +444,7 @@ async fn build_delegate_handle(
         inner: delegate_provider,
         tools: Vec::new().into_boxed_slice(),
     };
-    let delegate_factory = Arc::new(TestProviderFactory {
-        provider: delegate_shared,
-    });
+    let delegate_factory = Arc::new(TestProviderFactory::new(delegate_shared));
 
     let delegate_temp_dir = TempDir::new().expect("temp dir");
     let delegate_wasm_path = delegate_temp_dir.path().join("mock.wasm");

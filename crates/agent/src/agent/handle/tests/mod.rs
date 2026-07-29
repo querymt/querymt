@@ -41,6 +41,41 @@ impl HandleFixture {
         Self::with_list_sessions(vec![]).await
     }
 
+    /// Build a fixture whose mock provider advertises an `api_key_name` so
+    /// API-token ACP methods can resolve a secret-store key.
+    async fn with_api_key_name(api_key_name: &str) -> Self {
+        let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
+        let shared = SharedLlmProvider {
+            inner: provider.clone(),
+            tools: vec![].into_boxed_slice(),
+        };
+        let factory = Arc::new(TestProviderFactory::new(shared).with_api_key_name(api_key_name));
+        let (plugin_registry, temp_dir) = mock_plugin_registry(factory).expect("plugin registry");
+
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("create event store"),
+        );
+
+        let mut builder = AgentConfigBuilder::new(
+            Arc::new(plugin_registry),
+            storage.clone(),
+            LLMParams::new().provider("mock").model("mock-model"),
+        )
+        .with_tool_policy(ToolPolicy::ProviderOnly);
+
+        if let Some(repo) = storage.schedule_repository() {
+            builder = builder.with_schedule_repository(repo);
+        }
+
+        let config = Arc::new(builder.build());
+        Self {
+            handle: LocalAgentHandle::from_config(config),
+            _temp_dir: temp_dir,
+        }
+    }
+
     async fn with_profiles(self, active_profile_id: &str, profile_dir: &Path) -> Self {
         let catalog: Arc<dyn ProfileCatalog> = Arc::new(
             crate::profiles::LocalProfileCatalog::builder()
@@ -69,7 +104,7 @@ impl HandleFixture {
             inner: provider.clone(),
             tools: vec![].into_boxed_slice(),
         };
-        let factory = Arc::new(TestProviderFactory { provider: shared });
+        let factory = Arc::new(TestProviderFactory::new(shared));
         let (plugin_registry, temp_dir) = mock_plugin_registry(factory).expect("plugin registry");
 
         let llm_config = mock_llm_config();
@@ -364,7 +399,7 @@ impl RealStorageHandleFixture {
             inner: provider,
             tools: vec![].into_boxed_slice(),
         };
-        let factory = Arc::new(TestProviderFactory { provider: shared });
+        let factory = Arc::new(TestProviderFactory::new(shared));
         let (plugin_registry, temp_dir) = mock_plugin_registry(factory).expect("plugin registry");
 
         let storage = Arc::new(
@@ -405,6 +440,7 @@ impl LocalAgentHandle {
 mod capabilities;
 mod core_a;
 mod core_b;
+mod ext_auth;
 mod mesh;
 mod remote;
 mod remote_ext;

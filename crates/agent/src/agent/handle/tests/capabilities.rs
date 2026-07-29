@@ -45,6 +45,13 @@ async fn test_querymt_capabilities_lists_control_surface() {
         "querymt/session/undo",
         "querymt/session/redo",
         "querymt/session/undoStack",
+        "querymt/auth/status",
+        "querymt/auth/start",
+        "querymt/auth/complete",
+        "querymt/auth/logout",
+        "querymt/auth/setApiToken",
+        "querymt/auth/clearApiToken",
+        "querymt/auth/setMethod",
     ] {
         assert!(
             result["methods"]
@@ -55,6 +62,7 @@ async fn test_querymt_capabilities_lists_control_surface() {
             "missing capability method {expected}"
         );
     }
+    assert_eq!(result["features"]["auth"], true);
     let notifications = result["notifications"]
         .as_array()
         .expect("notifications array");

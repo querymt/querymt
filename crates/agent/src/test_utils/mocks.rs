@@ -323,6 +323,53 @@ impl LLMProvider for SharedLlmProvider {
 
 pub struct TestProviderFactory {
     pub provider: SharedLlmProvider,
+    /// When set, this factory exposes [`querymt::plugin::http::HTTPLLMProviderFactory`]
+    /// so auth mutations can resolve an `api_key_name`.
+    pub api_key_name: Option<String>,
+}
+
+impl TestProviderFactory {
+    pub fn new(provider: SharedLlmProvider) -> Self {
+        Self {
+            provider,
+            api_key_name: None,
+        }
+    }
+
+    pub fn with_api_key_name(mut self, name: impl Into<String>) -> Self {
+        self.api_key_name = Some(name.into());
+        self
+    }
+}
+
+impl querymt::plugin::http::HTTPLLMProviderFactory for TestProviderFactory {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn api_key_name(&self) -> Option<String> {
+        self.api_key_name.clone()
+    }
+
+    fn config_schema(&self) -> String {
+        "{}".to_string()
+    }
+
+    fn list_models_request(&self, _cfg: &str) -> Result<http::Request<Vec<u8>>, LLMError> {
+        Err(LLMError::InvalidRequest(
+            "test factory does not support HTTP list_models".into(),
+        ))
+    }
+
+    fn parse_list_models(&self, _resp: http::Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
+        Ok(vec!["mock-model".to_string()])
+    }
+
+    fn from_config(&self, _cfg: &str) -> Result<Box<dyn querymt::HTTPLLMProvider>, LLMError> {
+        Err(LLMError::InvalidRequest(
+            "test factory does not support HTTP from_config".into(),
+        ))
+    }
 }
 
 impl LLMProviderFactory for TestProviderFactory {
@@ -340,6 +387,16 @@ impl LLMProviderFactory for TestProviderFactory {
 
     fn list_models<'a>(&'a self, _cfg: &str) -> Fut<'a, Result<Vec<String>, LLMError>> {
         Box::pin(async { Ok(vec!["mock-model".to_string()]) })
+    }
+
+    fn as_http(&self) -> Option<&dyn querymt::plugin::http::HTTPLLMProviderFactory> {
+        // Only advertise HTTP when a key name is configured so existing
+        // non-HTTP mock tests keep their previous factory path.
+        if self.api_key_name.is_some() {
+            Some(self)
+        } else {
+            None
+        }
     }
 }
 

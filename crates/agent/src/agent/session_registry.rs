@@ -1006,7 +1006,7 @@ mod tests {
                 inner: provider.clone(),
                 tools: vec![].into_boxed_slice(),
             };
-            let factory = Arc::new(TestProviderFactory { provider: shared });
+            let factory = Arc::new(TestProviderFactory::new(shared));
             let (plugin_registry, temp_dir) =
                 mock_plugin_registry(factory).expect("plugin registry");
 
@@ -1220,7 +1220,7 @@ mod tests {
             inner: provider,
             tools: vec![].into_boxed_slice(),
         };
-        let factory = Arc::new(TestProviderFactory { provider: shared });
+        let factory = Arc::new(TestProviderFactory::new(shared));
         let (plugin_registry, _temp) = mock_plugin_registry(factory).expect("registry");
         let storage = Arc::new(
             crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
