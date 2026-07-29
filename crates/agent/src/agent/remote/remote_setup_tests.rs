@@ -16,7 +16,7 @@ async fn mesh_publication_triggers_local_only_model_refresh() {
         inner: provider,
         tools: vec![].into_boxed_slice(),
     };
-    let factory = Arc::new(TestProviderFactory { provider: shared });
+    let factory = Arc::new(TestProviderFactory::new(shared));
     let (plugin_registry, _temp_dir) = mock_plugin_registry(factory).expect("plugin registry");
     let storage = Arc::new(
         crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())

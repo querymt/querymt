@@ -75,4 +75,60 @@ impl LocalAgentHandle {
         let result = self.oauth_service.logout("acp", &parsed.provider).await;
         ext_json_response(&result)
     }
+
+    pub(super) async fn handle_ext_auth_set_api_token(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
+        #[derive(serde::Deserialize)]
+        struct SetApiTokenReq {
+            provider: String,
+            api_key: String,
+        }
+
+        let parsed: SetApiTokenReq = serde_json::from_str(req.params.get()).map_err(|e| {
+            Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+        })?;
+        let result = self
+            .oauth_service
+            .set_api_token(&parsed.provider, &parsed.api_key)
+            .await;
+        ext_json_response(&result)
+    }
+
+    pub(super) async fn handle_ext_auth_clear_api_token(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
+        #[derive(serde::Deserialize)]
+        struct ClearApiTokenReq {
+            provider: String,
+        }
+
+        let parsed: ClearApiTokenReq = serde_json::from_str(req.params.get()).map_err(|e| {
+            Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+        })?;
+        let result = self.oauth_service.clear_api_token(&parsed.provider).await;
+        ext_json_response(&result)
+    }
+
+    pub(super) async fn handle_ext_auth_set_method(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
+        #[derive(serde::Deserialize)]
+        struct SetMethodReq {
+            provider: String,
+            method: String,
+        }
+
+        let parsed: SetMethodReq = serde_json::from_str(req.params.get()).map_err(|e| {
+            Error::invalid_params().data(serde_json::json!({"error": e.to_string()}))
+        })?;
+        let result = self
+            .oauth_service
+            .set_auth_method(&parsed.provider, &parsed.method)
+            .await;
+        ext_json_response(&result)
+    }
 }

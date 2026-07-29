@@ -52,9 +52,7 @@ impl TestHarness {
             inner: provider.clone(),
             tools: tools.into_boxed_slice(),
         };
-        let factory = Arc::new(TestProviderFactory {
-            provider: shared_provider,
-        });
+        let factory = Arc::new(TestProviderFactory::new(shared_provider));
 
         // Use shared helper to create mock plugin registry
         let (registry, temp_dir) = mock_plugin_registry(factory).expect("mock registry");

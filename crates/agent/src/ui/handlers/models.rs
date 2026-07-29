@@ -93,46 +93,19 @@ async fn finish_auth_op(
     handle_list_auth_providers(state, tx).await;
 }
 
-/// Resolve the `api_key_name` for a provider from the plugin registry.
-async fn resolve_env_var_name(state: &ServerState, provider: &str) -> Option<String> {
-    let registry = state.agent.config.provider.plugin_registry();
-    let factory = registry.get(provider).await;
-    factory
-        .as_ref()
-        .and_then(|f| f.as_http())
-        .and_then(|h| h.api_key_name())
-}
-
 pub async fn handle_set_api_token(
     state: &ServerState,
     provider: &str,
     api_key: &str,
     tx: &mpsc::Sender<String>,
 ) {
-    let api_key = api_key.trim();
-    if api_key.is_empty() {
-        finish_auth_op(state, provider, Err("API key cannot be empty".into()), tx).await;
-        return;
-    }
-
-    let result = match resolve_env_var_name(state, provider).await {
-        Some(name) => match crate::SecretStore::new() {
-            Ok(mut store) => match store.set(&name, api_key) {
-                Ok(()) => {
-                    state.agent.invalidate_model_cache().await;
-                    Ok(format!("API key stored for {} ({})", provider, name))
-                }
-                Err(e) => Err(format!("Failed to store API key: {}", e)),
-            },
-            Err(e) => Err(format!("Failed to open secret store: {}", e)),
-        },
-        None => Err(format!(
-            "Provider '{}' does not have a known API key name",
-            provider
-        )),
+    let result = state.oauth_service.set_api_token(provider, api_key).await;
+    let mapped = if result.success {
+        Ok(result.message)
+    } else {
+        Err(result.message)
     };
-
-    finish_auth_op(state, provider, result, tx).await;
+    finish_auth_op(state, provider, mapped, tx).await;
 }
 
 /// Handle clearing an API token for a provider.
@@ -141,24 +114,13 @@ pub async fn handle_clear_api_token(
     provider: &str,
     tx: &mpsc::Sender<String>,
 ) {
-    let result = match resolve_env_var_name(state, provider).await {
-        Some(name) => match crate::SecretStore::new() {
-            Ok(mut store) => match store.delete(&name) {
-                Ok(()) => {
-                    state.agent.invalidate_model_cache().await;
-                    Ok(format!("API key cleared for {} ({})", provider, name))
-                }
-                Err(e) => Err(format!("Failed to clear API key: {}", e)),
-            },
-            Err(e) => Err(format!("Failed to open secret store: {}", e)),
-        },
-        None => Err(format!(
-            "Provider '{}' does not have a known API key name",
-            provider
-        )),
+    let result = state.oauth_service.clear_api_token(provider).await;
+    let mapped = if result.success {
+        Ok(result.message)
+    } else {
+        Err(result.message)
     };
-
-    finish_auth_op(state, provider, result, tx).await;
+    finish_auth_op(state, provider, mapped, tx).await;
 }
 
 /// Handle setting the preferred auth method for a provider.
@@ -168,17 +130,16 @@ pub async fn handle_set_auth_method(
     method: &AuthMethod,
     tx: &mpsc::Sender<String>,
 ) {
-    let key = format!("auth_method_{}", provider);
-
-    let result = match crate::SecretStore::new() {
-        Ok(mut store) => match store.set(&key, method.to_string()) {
-            Ok(()) => Ok(format!("Auth method set to '{}' for {}", method, provider)),
-            Err(e) => Err(format!("Failed to set auth method: {}", e)),
-        },
-        Err(e) => Err(format!("Failed to open secret store: {}", e)),
+    let result = state
+        .oauth_service
+        .set_auth_method(provider, &method.to_string())
+        .await;
+    let mapped = if result.success {
+        Ok(result.message)
+    } else {
+        Err(result.message)
     };
-
-    finish_auth_op(state, provider, result, tx).await;
+    finish_auth_op(state, provider, mapped, tx).await;
 }
 
 /// Handle model listing request using the shared `ModelInventory`.
@@ -641,11 +602,11 @@ mod tests {
         let msg = next_msg(&mut rx).await;
         assert_eq!(msg["type"], "api_token_result");
         assert_eq!(msg["data"]["success"], false);
+        let message = msg["data"]["message"].as_str().unwrap();
         assert!(
-            msg["data"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("does not have a known API key name")
+            message.contains("is not configured")
+                || message.contains("does not have a known API key name"),
+            "unexpected message: {message}"
         );
     }
 
@@ -661,11 +622,11 @@ mod tests {
         let msg = next_msg(&mut rx).await;
         assert_eq!(msg["type"], "api_token_result");
         assert_eq!(msg["data"]["success"], false);
+        let message = msg["data"]["message"].as_str().unwrap();
         assert!(
-            msg["data"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("does not have a known API key name")
+            message.contains("is not configured")
+                || message.contains("does not have a known API key name"),
+            "unexpected message: {message}"
         );
     }
 
