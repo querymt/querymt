@@ -3,13 +3,15 @@ use http::{
     header::{AUTHORIZATION, CONTENT_TYPE},
 };
 use qmt_openai::api::{
-    OpenAIProviderConfig, openai_chat_request, openai_embed_request, openai_list_models_request,
-    openai_parse_chat, openai_parse_embed, openai_parse_list_models, url_schema,
+    OpenAIProviderConfig, OpenAIToolUseState, openai_chat_request, openai_embed_request,
+    openai_list_models_request, openai_parse_chat, openai_parse_embed, openai_parse_list_models,
+    parse_openai_sse_chunk, url_schema,
 };
 use querymt::{
     HTTPLLMProvider, ToolCall,
     chat::{
-        ChatMessage, ChatResponse, StructuredOutputFormat, Tool, ToolChoice, http::HTTPChatProvider,
+        ChatMessage, ChatResponse, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
+        http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -20,6 +22,7 @@ use querymt::{
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
@@ -142,6 +145,12 @@ impl OpenAIProviderConfig for Groq {
         self.reasoning_effort
     }
 
+    // Groq rejects `reasoning_content` on input assistant messages even when
+    // models emit reasoning in responses (e.g. qwen3 tool loops).
+    fn include_reasoning_content(&self) -> bool {
+        false
+    }
+
     fn json_schema(&self) -> Option<&StructuredOutputFormat> {
         self.json_schema.as_ref()
     }
@@ -156,8 +165,37 @@ impl HTTPChatProvider for Groq {
         openai_chat_request(self, messages, tools)
     }
 
+    fn chat_stream_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<Request<Vec<u8>>, LLMError> {
+        let mut cfg = self.clone();
+        cfg.stream = Some(true);
+        openai_chat_request(&cfg, messages, tools)
+    }
+
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
         openai_parse_chat(self, response)
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        Ok(Box::new(GroqStreamParser::default()))
+    }
+}
+
+#[derive(Default)]
+struct GroqStreamParser {
+    tool_states: HashMap<usize, OpenAIToolUseState>,
+}
+
+impl ChatStreamParser for GroqStreamParser {
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+        parse_openai_sse_chunk(chunk, &mut self.tool_states)
     }
 }
 
@@ -247,9 +285,6 @@ impl HTTPLLMProviderFactory for GroqFactory {
     }
 
     fn parse_list_models(&self, resp: Response<Vec<u8>>) -> Result<Vec<String>, LLMError> {
-        let models = openai_parse_list_models(&resp)?;
-        println!("->> {:?}", models);
-
         openai_parse_list_models(&resp)
     }
 
@@ -285,5 +320,134 @@ mod extism_exports {
         config = Groq,
         factory = GroqFactory,
         name   = "groq",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Groq;
+    use querymt::chat::{ChatMessage, StreamChunk, http::HTTPChatProvider};
+    use serde_json::Value;
+
+    fn test_provider() -> Groq {
+        serde_json::from_value(serde_json::json!({
+            "api_key": "test-key",
+            "model": "llama-3.3-70b-versatile"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn supports_streaming() {
+        assert!(test_provider().supports_streaming());
+    }
+
+    #[test]
+    fn chat_request_omits_reasoning_content_for_assistant_tool_calls() {
+        let provider = test_provider();
+        let messages = vec![
+            ChatMessage::user().text("what's this project about?").build(),
+            ChatMessage::assistant()
+                .thinking("I should read the README.")
+                .tool_use(
+                    "call_1",
+                    "read_tool",
+                    serde_json::json!({"path": "README.md"}),
+                )
+                .build(),
+        ];
+
+        let request = provider
+            .chat_request(&messages, None)
+            .expect("request should build");
+        let body: Value =
+            serde_json::from_slice(request.body()).expect("body should be valid json");
+        let api_messages = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages array should be present");
+
+        let assistant_tool_msg = api_messages
+            .iter()
+            .find(|msg| {
+                msg.get("role").and_then(Value::as_str) == Some("assistant")
+                    && msg.get("tool_calls").is_some()
+            })
+            .expect("assistant tool call message should be present");
+
+        assert!(
+            assistant_tool_msg.get("reasoning_content").is_none(),
+            "Groq must not send reasoning_content on assistant messages"
+        );
+    }
+
+    #[test]
+    fn chat_stream_request_forces_stream_true() {
+        let provider = test_provider();
+
+        let req = provider
+            .chat_stream_request(&[], None)
+            .expect("stream request should build");
+        let body: Value = serde_json::from_slice(req.body()).expect("body should be valid json");
+        assert_eq!(body.get("stream"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn stream_parsers_are_isolated_per_stream() {
+        let provider = test_provider();
+
+        let mut parser_a = provider
+            .chat_stream_parser()
+            .expect("parser A should initialize");
+        let mut parser_b = provider
+            .chat_stream_parser()
+            .expect("parser B should initialize");
+
+        let a_delta = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}
+"#;
+        let b_delta = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_b","type":"function","function":{"name":"write_file","arguments":"{\"path\":"}}]}}]}
+"#;
+        let a_more = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.txt\"}"}}]}}]}
+"#;
+        let b_more = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"b.txt\"}"}}]}}]}
+"#;
+        let a_done = br#"data: [DONE]
+"#;
+        let b_done = br#"data: [DONE]
+"#;
+
+        let _ = parser_a.parse_chunk(a_delta).expect("parse A delta");
+        let _ = parser_b.parse_chunk(b_delta).expect("parse B delta");
+        let _ = parser_a.parse_chunk(a_more).expect("parse A more");
+        let _ = parser_b.parse_chunk(b_more).expect("parse B more");
+
+        let a_events = parser_a.parse_chunk(a_done).expect("parse A done");
+        let b_events = parser_b.parse_chunk(b_done).expect("parse B done");
+
+        let a_complete = a_events.iter().find_map(|chunk| {
+            if let StreamChunk::ToolUseComplete { tool_call, .. } = chunk {
+                Some(tool_call)
+            } else {
+                None
+            }
+        });
+        let b_complete = b_events.iter().find_map(|chunk| {
+            if let StreamChunk::ToolUseComplete { tool_call, .. } = chunk {
+                Some(tool_call)
+            } else {
+                None
+            }
+        });
+
+        let a_complete = a_complete.expect("A should emit ToolUseComplete");
+        let b_complete = b_complete.expect("B should emit ToolUseComplete");
+
+        assert_eq!(a_complete.id, "call_a");
+        assert_eq!(a_complete.function.name, "read_file");
+        assert_eq!(a_complete.function.arguments, r#"{"path":"a.txt"}"#);
+
+        assert_eq!(b_complete.id, "call_b");
+        assert_eq!(b_complete.function.name, "write_file");
+        assert_eq!(b_complete.function.arguments, r#"{"path":"b.txt"}"#);
     }
 }

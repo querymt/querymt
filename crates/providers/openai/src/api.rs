@@ -411,6 +411,14 @@ pub trait OpenAIProviderConfig {
     fn reasoning_effort(&self) -> Option<ReasoningEffort> {
         None
     }
+    /// Whether to serialize prior thinking into assistant messages as
+    /// `reasoning_content`.
+    ///
+    /// Some OpenAI-compatible APIs (DeepSeek, Kimi) require this when thinking
+    /// is enabled. Others (e.g. Groq) reject the field entirely.
+    fn include_reasoning_content(&self) -> bool {
+        true
+    }
     fn json_schema(&self) -> Option<&StructuredOutputFormat>;
     fn extra_body(&self) -> Option<Map<String, Value>> {
         None
@@ -791,9 +799,10 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
     let auth = determine_effective_auth(token, cfg.auth_type(), cfg.base_url())?;
 
     let mut openai_msgs: Vec<OpenAIChatMessage<'_>> = vec![];
+    let include_reasoning = cfg.include_reasoning_content();
 
     for msg in messages {
-        convert_chat_message_to_openai(msg, &mut openai_msgs);
+        convert_chat_message_to_openai(msg, &mut openai_msgs, include_reasoning);
     }
 
     let system_parts = cfg.system();
@@ -894,7 +903,13 @@ pub fn openai_parse_chat<C: OpenAIProviderConfig>(
 }
 
 /// Extract the thinking/reasoning content from a ChatMessage, if any.
-fn extract_reasoning_content<'a>(msg: &'a ChatMessage) -> Option<Cow<'a, str>> {
+fn extract_reasoning_content<'a>(
+    msg: &'a ChatMessage,
+    include: bool,
+) -> Option<Cow<'a, str>> {
+    if !include {
+        return None;
+    }
     msg.thinking().map(Cow::Borrowed)
 }
 
@@ -904,6 +919,7 @@ fn extract_reasoning_content<'a>(msg: &'a ChatMessage) -> Option<Cow<'a, str>> {
 fn convert_chat_message_to_openai<'a>(
     chat_msg: &'a ChatMessage,
     out: &mut Vec<OpenAIChatMessage<'a>>,
+    include_reasoning: bool,
 ) {
     let role: Cow<'a, str> = match chat_msg.role {
         ChatRole::User => Cow::Borrowed("user"),
@@ -953,7 +969,7 @@ fn convert_chat_message_to_openai<'a>(
                     tool_call_id: None,
                     tool_calls: None,
                     content: Some(Right(Cow::Owned(text))),
-                    reasoning_content: extract_reasoning_content(chat_msg),
+                    reasoning_content: extract_reasoning_content(chat_msg, include_reasoning),
                 });
             }
         }
@@ -1004,7 +1020,7 @@ fn convert_chat_message_to_openai<'a>(
                 Some(tool_calls)
             },
             content: content_val,
-            reasoning_content: extract_reasoning_content(chat_msg),
+            reasoning_content: extract_reasoning_content(chat_msg, include_reasoning),
         });
         return;
     }
@@ -1046,7 +1062,7 @@ fn convert_chat_message_to_openai<'a>(
             tool_call_id: None,
             tool_calls: None,
             content: Some(Left(content_blocks)),
-            reasoning_content: extract_reasoning_content(chat_msg),
+            reasoning_content: extract_reasoning_content(chat_msg, include_reasoning),
         });
     } else {
         // Simple text-only message
@@ -1056,7 +1072,7 @@ fn convert_chat_message_to_openai<'a>(
             tool_call_id: None,
             tool_calls: None,
             content: Some(Right(Cow::Owned(text))),
-            reasoning_content: extract_reasoning_content(chat_msg),
+            reasoning_content: extract_reasoning_content(chat_msg, include_reasoning),
         });
     }
 }
@@ -1435,6 +1451,174 @@ mod tests {
             }
             other => panic!("expected AuthError, got {other}"),
         }
+    }
+
+    #[test]
+    fn chat_request_includes_reasoning_content_by_default() {
+        use super::{OpenAIProviderConfig, openai_chat_request};
+        use querymt::chat::{ChatMessage, StructuredOutputFormat, Tool, ToolChoice};
+        use serde_json::Value;
+        use url::Url;
+
+        struct Cfg {
+            base_url: Url,
+        }
+
+        impl OpenAIProviderConfig for Cfg {
+            fn api_key(&self) -> &str {
+                "test-key"
+            }
+            fn base_url(&self) -> &Url {
+                &self.base_url
+            }
+            fn model(&self) -> &str {
+                "gpt-test"
+            }
+            fn max_tokens(&self) -> Option<&u32> {
+                None
+            }
+            fn temperature(&self) -> Option<&f32> {
+                None
+            }
+            fn system(&self) -> &[String] {
+                &[]
+            }
+            fn timeout_seconds(&self) -> Option<&u64> {
+                None
+            }
+            fn stream(&self) -> Option<&bool> {
+                None
+            }
+            fn top_p(&self) -> Option<&f32> {
+                None
+            }
+            fn top_k(&self) -> Option<&u32> {
+                None
+            }
+            fn tools(&self) -> Option<&[Tool]> {
+                None
+            }
+            fn tool_choice(&self) -> Option<&ToolChoice> {
+                None
+            }
+            fn embedding_encoding_format(&self) -> Option<&str> {
+                None
+            }
+            fn embedding_dimensions(&self) -> Option<&u32> {
+                None
+            }
+            fn json_schema(&self) -> Option<&StructuredOutputFormat> {
+                None
+            }
+        }
+
+        let cfg = Cfg {
+            base_url: Url::parse("https://api.openai.com/v1/").unwrap(),
+        };
+        let messages = vec![
+            ChatMessage::user().text("run tool").build(),
+            ChatMessage::assistant()
+                .thinking("need to run tool")
+                .tool_use("call_1", "run", serde_json::json!({}))
+                .build(),
+        ];
+
+        let request = openai_chat_request(&cfg, &messages, None).unwrap();
+        let body: Value = serde_json::from_slice(request.body()).unwrap();
+        let assistant = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m.get("tool_calls").is_some())
+            .unwrap();
+        assert_eq!(
+            assistant.get("reasoning_content").and_then(Value::as_str),
+            Some("need to run tool")
+        );
+    }
+
+    #[test]
+    fn chat_request_omits_reasoning_content_when_disabled() {
+        use super::{OpenAIProviderConfig, openai_chat_request};
+        use querymt::chat::{ChatMessage, StructuredOutputFormat, Tool, ToolChoice};
+        use serde_json::Value;
+        use url::Url;
+
+        struct Cfg {
+            base_url: Url,
+        }
+
+        impl OpenAIProviderConfig for Cfg {
+            fn api_key(&self) -> &str {
+                "test-key"
+            }
+            fn base_url(&self) -> &Url {
+                &self.base_url
+            }
+            fn model(&self) -> &str {
+                "gpt-test"
+            }
+            fn max_tokens(&self) -> Option<&u32> {
+                None
+            }
+            fn temperature(&self) -> Option<&f32> {
+                None
+            }
+            fn system(&self) -> &[String] {
+                &[]
+            }
+            fn timeout_seconds(&self) -> Option<&u64> {
+                None
+            }
+            fn stream(&self) -> Option<&bool> {
+                None
+            }
+            fn top_p(&self) -> Option<&f32> {
+                None
+            }
+            fn top_k(&self) -> Option<&u32> {
+                None
+            }
+            fn tools(&self) -> Option<&[Tool]> {
+                None
+            }
+            fn tool_choice(&self) -> Option<&ToolChoice> {
+                None
+            }
+            fn embedding_encoding_format(&self) -> Option<&str> {
+                None
+            }
+            fn embedding_dimensions(&self) -> Option<&u32> {
+                None
+            }
+            fn include_reasoning_content(&self) -> bool {
+                false
+            }
+            fn json_schema(&self) -> Option<&StructuredOutputFormat> {
+                None
+            }
+        }
+
+        let cfg = Cfg {
+            base_url: Url::parse("https://api.openai.com/v1/").unwrap(),
+        };
+        let messages = vec![
+            ChatMessage::user().text("run tool").build(),
+            ChatMessage::assistant()
+                .thinking("need to run tool")
+                .tool_use("call_1", "run", serde_json::json!({}))
+                .build(),
+        ];
+
+        let request = openai_chat_request(&cfg, &messages, None).unwrap();
+        let body: Value = serde_json::from_slice(request.body()).unwrap();
+        let assistant = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m.get("tool_calls").is_some())
+            .unwrap();
+        assert!(assistant.get("reasoning_content").is_none());
     }
 
     #[test]
