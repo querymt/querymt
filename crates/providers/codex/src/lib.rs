@@ -137,6 +137,10 @@ impl api::CodexProviderConfig for Codex {
 }
 
 impl HTTPChatProvider for Codex {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
+        api::classify_codex_http_error("codex", response)
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
@@ -174,7 +178,7 @@ struct CodexStreamParser {
 
 impl ChatStreamParser for CodexStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        api::codex_parse_stream_chunk_with_state(chunk, &self.tool_states)
+        api::codex_parse_stream_chunk_with_state("codex", chunk, &self.tool_states)
     }
 }
 

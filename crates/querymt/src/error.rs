@@ -15,9 +15,22 @@ pub enum TransportErrorKind {
     Other,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderErrorKind {
+    ServerOverloaded,
+    RateLimited,
+    QuotaExceeded,
+    ContextWindowExceeded,
+    Authentication,
+    InvalidRequest,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderErrorContext {
     pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ProviderErrorKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -33,6 +46,7 @@ impl ProviderErrorContext {
     pub fn builder(provider: impl Into<String>) -> ProviderErrorContextBuilder {
         ProviderErrorContextBuilder {
             provider: provider.into(),
+            kind: None,
             code: None,
             error_type: None,
             request_id: None,
@@ -45,6 +59,7 @@ impl ProviderErrorContext {
 #[derive(Debug, Clone)]
 pub struct ProviderErrorContextBuilder {
     provider: String,
+    kind: Option<ProviderErrorKind>,
     code: Option<String>,
     error_type: Option<String>,
     request_id: Option<String>,
@@ -53,6 +68,11 @@ pub struct ProviderErrorContextBuilder {
 }
 
 impl ProviderErrorContextBuilder {
+    pub fn kind(mut self, kind: ProviderErrorKind) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+
     pub fn code(mut self, code: Option<String>) -> Self {
         self.code = code;
         self
@@ -81,6 +101,7 @@ impl ProviderErrorContextBuilder {
     pub fn build(self) -> ProviderErrorContext {
         ProviderErrorContext {
             provider: self.provider,
+            kind: self.kind,
             code: self.code,
             error_type: self.error_type,
             request_id: self.request_id,
@@ -100,18 +121,6 @@ pub enum LLMErrorPayload {
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context: Option<ProviderErrorContext>,
-    },
-    ServerOverloaded {
-        message: String,
-        context: ProviderErrorContext,
-    },
-    QuotaExceeded {
-        message: String,
-        context: ProviderErrorContext,
-    },
-    ContextWindowExceeded {
-        message: String,
-        context: ProviderErrorContext,
     },
     AuthError {
         message: String,
@@ -174,8 +183,7 @@ impl LLMErrorPayload {
                 context: Some(context),
                 ..
             } => context.transient,
-            Self::ServerOverloaded { .. }
-            | Self::RateLimited { .. }
+            Self::RateLimited { .. }
             | Self::HttpError { .. }
             | Self::Transport { .. }
             | Self::PluginError { .. }
@@ -183,8 +191,6 @@ impl LLMErrorPayload {
             Self::HttpStatus { status_code, .. } => matches!(status_code, 429 | 500..=599),
             Self::GenericError { .. }
             | Self::ProviderError { context: None, .. }
-            | Self::QuotaExceeded { .. }
-            | Self::ContextWindowExceeded { .. }
             | Self::AuthError { .. }
             | Self::ToolConfigError { .. }
             | Self::InvalidRequest { .. }
@@ -238,6 +244,27 @@ pub enum LLMError {
     /// Prompt/context exceeds the model window.
     #[error("Context window exceeded: {message}")]
     ContextWindowExceeded {
+        message: String,
+        context: ProviderErrorContext,
+    },
+
+    /// Provider rate limit with diagnostics retained for ACP/remote consumers.
+    #[error("Rate limited: {message}")]
+    ProviderRateLimited {
+        message: String,
+        context: ProviderErrorContext,
+    },
+
+    /// Provider authentication failure with diagnostics retained.
+    #[error("Auth Error: {message}")]
+    ProviderAuthError {
+        message: String,
+        context: ProviderErrorContext,
+    },
+
+    /// Provider request rejection with diagnostics retained.
+    #[error("Invalid Request: {message}")]
+    ProviderInvalidRequest {
         message: String,
         context: ProviderErrorContext,
     },
@@ -332,20 +359,15 @@ impl LLMError {
                 message: message.clone(),
                 context: Some(context.clone()),
             },
-            Self::ServerOverloaded { message, context } => LLMErrorPayload::ServerOverloaded {
+            Self::ServerOverloaded { message, context }
+            | Self::ProviderRateLimited { message, context }
+            | Self::QuotaExceeded { message, context }
+            | Self::ContextWindowExceeded { message, context }
+            | Self::ProviderAuthError { message, context }
+            | Self::ProviderInvalidRequest { message, context } => LLMErrorPayload::ProviderError {
                 message: message.clone(),
-                context: context.clone(),
+                context: Some(context.clone()),
             },
-            Self::QuotaExceeded { message, context } => LLMErrorPayload::QuotaExceeded {
-                message: message.clone(),
-                context: context.clone(),
-            },
-            Self::ContextWindowExceeded { message, context } => {
-                LLMErrorPayload::ContextWindowExceeded {
-                    message: message.clone(),
-                    context: context.clone(),
-                }
-            }
             Self::AuthError(message) => LLMErrorPayload::AuthError {
                 message: message.clone(),
             },
@@ -416,18 +438,29 @@ impl LLMError {
         match payload {
             LLMErrorPayload::GenericError { message } => Self::GenericError(message),
             LLMErrorPayload::ProviderError { message, context } => match context {
-                Some(context) => Self::ProviderResponseError { message, context },
+                Some(context) => match context.kind {
+                    Some(ProviderErrorKind::ServerOverloaded) => {
+                        Self::ServerOverloaded { message, context }
+                    }
+                    Some(ProviderErrorKind::RateLimited) => {
+                        Self::ProviderRateLimited { message, context }
+                    }
+                    Some(ProviderErrorKind::QuotaExceeded) => {
+                        Self::QuotaExceeded { message, context }
+                    }
+                    Some(ProviderErrorKind::ContextWindowExceeded) => {
+                        Self::ContextWindowExceeded { message, context }
+                    }
+                    Some(ProviderErrorKind::Authentication) => {
+                        Self::ProviderAuthError { message, context }
+                    }
+                    Some(ProviderErrorKind::InvalidRequest) => {
+                        Self::ProviderInvalidRequest { message, context }
+                    }
+                    None => Self::ProviderResponseError { message, context },
+                },
                 None => Self::ProviderError(message),
             },
-            LLMErrorPayload::ServerOverloaded { message, context } => {
-                Self::ServerOverloaded { message, context }
-            }
-            LLMErrorPayload::QuotaExceeded { message, context } => {
-                Self::QuotaExceeded { message, context }
-            }
-            LLMErrorPayload::ContextWindowExceeded { message, context } => {
-                Self::ContextWindowExceeded { message, context }
-            }
             LLMErrorPayload::AuthError { message } => Self::AuthError(message),
             LLMErrorPayload::ToolConfigError { message } => Self::ToolConfigError(message),
             LLMErrorPayload::PluginError { message } => Self::PluginError(message),
@@ -484,8 +517,11 @@ impl LLMError {
             } => *retry_after_secs,
             Self::ProviderResponseError { context, .. }
             | Self::ServerOverloaded { context, .. }
+            | Self::ProviderRateLimited { context, .. }
             | Self::QuotaExceeded { context, .. }
-            | Self::ContextWindowExceeded { context, .. } => context.retry_after_secs,
+            | Self::ContextWindowExceeded { context, .. }
+            | Self::ProviderAuthError { context, .. }
+            | Self::ProviderInvalidRequest { context, .. } => context.retry_after_secs,
             _ => None,
         }
     }
@@ -508,7 +544,7 @@ impl LLMError {
             // Always retry: transient infrastructure / capacity
             Self::Transport { .. } => true,
             Self::HttpError(_) => true, // unclassified HTTP transport error — could be transient
-            Self::RateLimited { .. } => true,
+            Self::RateLimited { .. } | Self::ProviderRateLimited { .. } => true,
             // QueryMT product choice: retry overload (upstream Codex marks this non-retryable).
             Self::ServerOverloaded { .. } => true,
             Self::HttpStatus { status_code, .. } => {
@@ -518,8 +554,8 @@ impl LLMError {
             Self::IoError { .. } => true,
 
             // Never retry: semantic errors
-            Self::AuthError(_) => false,
-            Self::InvalidRequest(_) => false,
+            Self::AuthError(_) | Self::ProviderAuthError { .. } => false,
+            Self::InvalidRequest(_) | Self::ProviderInvalidRequest { .. } => false,
             Self::ProviderError(_) => false,
             // Catch-all: providers set `context.transient` when they intentionally
             // emit an unclassified-but-retryable failure.
@@ -1010,6 +1046,12 @@ mod tests {
         assert_eq!(err.retry_after_secs(), Some(60));
     }
 
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum LegacyPayload {
+        ProviderError { message: String },
+    }
+
     #[test]
     fn legacy_provider_payload_deserialization() {
         let payload: LLMErrorPayload = serde_json::from_value(serde_json::json!({
@@ -1032,10 +1074,11 @@ mod tests {
     }
 
     #[test]
-    fn structured_semantic_errors_round_trip() {
+    fn structured_semantic_errors_round_trip_through_legacy_provider_tag() {
         let overloaded = LLMError::ServerOverloaded {
             message: "busy".into(),
             context: ProviderErrorContext::builder("codex")
+                .kind(ProviderErrorKind::ServerOverloaded)
                 .code(Some("server_is_overloaded".into()))
                 .request_id(Some("req-1".into()))
                 .transient(true)
@@ -1043,8 +1086,14 @@ mod tests {
         };
         let payload = overloaded.to_payload();
         let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["type"], "server_overloaded");
+        assert_eq!(json["type"], "provider_error");
+        assert_eq!(json["context"]["kind"], "server_overloaded");
         assert_eq!(json["context"]["code"], "server_is_overloaded");
+        let legacy: LegacyPayload = serde_json::from_value(json.clone()).unwrap();
+        assert!(matches!(
+            legacy,
+            LegacyPayload::ProviderError { message } if message == "busy"
+        ));
         let restored =
             LLMError::from_payload(serde_json::from_value::<LLMErrorPayload>(json).unwrap());
         assert!(matches!(
@@ -1058,6 +1107,7 @@ mod tests {
         let quota = LLMError::QuotaExceeded {
             message: "no credits".into(),
             context: ProviderErrorContext::builder("openai")
+                .kind(ProviderErrorKind::QuotaExceeded)
                 .code(Some("insufficient_quota".into()))
                 .build(),
         };
@@ -1067,18 +1117,24 @@ mod tests {
             LLMError::QuotaExceeded { .. }
         ));
 
-        let ctx = LLMError::ContextWindowExceeded {
+        let context = LLMError::ContextWindowExceeded {
             message: "too long".into(),
             context: ProviderErrorContext::builder("codex")
+                .kind(ProviderErrorKind::ContextWindowExceeded)
                 .code(Some("context_length_exceeded".into()))
                 .build(),
         };
-        assert!(!ctx.is_retryable());
+        assert!(!context.is_retryable());
+        assert!(matches!(
+            LLMError::from_payload(context.to_payload()),
+            LLMError::ContextWindowExceeded { .. }
+        ));
     }
 
     #[test]
     fn provider_error_context_builder_sets_optional_metadata() {
         let context = ProviderErrorContext::builder("codex")
+            .kind(ProviderErrorKind::ServerOverloaded)
             .code(Some("server_is_overloaded".into()))
             .error_type(Some("server_error".into()))
             .request_id(Some("req-1".into()))

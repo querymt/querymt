@@ -4,13 +4,14 @@ use http::{
     header::{AUTHORIZATION, CONTENT_TYPE},
 };
 use qmt_codex::api::{
-    CodexToolUseState, codex_parse_chat_with_state, codex_parse_stream_chunk_with_state,
+    CodexToolUseState, classify_codex_http_error, codex_parse_chat_with_state,
+    codex_parse_stream_chunk_with_state,
 };
 use qmt_openai::{
     AuthType,
     api::{
-        OpenAIProviderConfig, openai_chat_request, openai_embed_request,
-        openai_list_models_request, openai_parse_chat, openai_parse_embed,
+        OpenAIProviderConfig, classify_openai_http_error, openai_chat_request,
+        openai_embed_request, openai_list_models_request, openai_parse_chat, openai_parse_embed,
         openai_parse_list_models, parse_openai_sse_chunk, url_schema,
     },
 };
@@ -106,6 +107,10 @@ struct AssistantMessage {
 }
 
 impl OpenAIProviderConfig for Xai {
+    fn provider_name(&self) -> &str {
+        "xai"
+    }
+
     fn api_key(&self) -> &str {
         &self.api_key
     }
@@ -176,6 +181,14 @@ impl OpenAIProviderConfig for Xai {
 }
 
 impl HTTPChatProvider for Xai {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
+        if self.should_use_responses_api() {
+            classify_codex_http_error(self.provider_name(), response)
+        } else {
+            classify_openai_http_error(self.provider_name(), response)
+        }
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
@@ -356,9 +369,9 @@ impl XaiStreamParser {
 impl ChatStreamParser for XaiStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
         if self.use_responses_api {
-            codex_parse_stream_chunk_with_state(chunk, &self.codex_tool_state)
+            codex_parse_stream_chunk_with_state("xai", chunk, &self.codex_tool_state)
         } else {
-            parse_openai_sse_chunk(chunk, &mut self.openai_tool_state)
+            parse_openai_sse_chunk("xai", chunk, &mut self.openai_tool_state)
         }
     }
 }

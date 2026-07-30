@@ -251,6 +251,7 @@ mod tests {
             message: "capacity exhausted".to_string(),
             context: Some(ProviderErrorContext {
                 provider: "openai".to_string(),
+                kind: None,
                 code: Some("server_error".to_string()),
                 error_type: Some("api_error".to_string()),
                 request_id: Some("req-123".to_string()),
@@ -323,6 +324,7 @@ mod tests {
                     message: "overloaded".to_string(),
                     context: ProviderErrorContext {
                         provider: "codex".to_string(),
+                        kind: Some(querymt::error::ProviderErrorKind::ServerOverloaded),
                         code: Some("server_is_overloaded".to_string()),
                         error_type: None,
                         request_id: None,

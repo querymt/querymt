@@ -3,9 +3,9 @@ use http::{
     header::{AUTHORIZATION, CONTENT_TYPE},
 };
 use qmt_openai::api::{
-    OpenAIProviderConfig, OpenAIToolUseState, openai_chat_request, openai_embed_request,
-    openai_list_models_request, openai_parse_chat, openai_parse_embed, openai_parse_list_models,
-    parse_openai_sse_chunk, url_schema,
+    OpenAIProviderConfig, OpenAIToolUseState, classify_openai_http_error, openai_chat_request,
+    openai_embed_request, openai_list_models_request, openai_parse_chat, openai_parse_embed,
+    openai_parse_list_models, parse_openai_sse_chunk, url_schema,
 };
 use querymt::{
     HTTPLLMProvider, ToolCall,
@@ -85,6 +85,10 @@ struct AssistantMessage {
 }
 
 impl OpenAIProviderConfig for Groq {
+    fn provider_name(&self) -> &str {
+        "groq"
+    }
+
     fn api_key(&self) -> &str {
         &self.api_key
     }
@@ -157,6 +161,10 @@ impl OpenAIProviderConfig for Groq {
 }
 
 impl HTTPChatProvider for Groq {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
+        classify_openai_http_error(self.provider_name(), response)
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
@@ -195,7 +203,7 @@ struct GroqStreamParser {
 
 impl ChatStreamParser for GroqStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        parse_openai_sse_chunk(chunk, &mut self.tool_states)
+        parse_openai_sse_chunk("groq", chunk, &mut self.tool_states)
     }
 }
 
@@ -346,7 +354,9 @@ mod tests {
     fn chat_request_omits_reasoning_content_for_assistant_tool_calls() {
         let provider = test_provider();
         let messages = vec![
-            ChatMessage::user().text("what's this project about?").build(),
+            ChatMessage::user()
+                .text("what's this project about?")
+                .build(),
             ChatMessage::assistant()
                 .thinking("I should read the README.")
                 .tool_use(

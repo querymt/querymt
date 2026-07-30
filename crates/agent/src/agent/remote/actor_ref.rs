@@ -924,6 +924,7 @@ mod tests {
                     message: "provider overloaded".to_string(),
                     context: Some(ProviderErrorContext {
                         provider: "openai".to_string(),
+                        kind: None,
                         code: Some("server_error".to_string()),
                         error_type: None,
                         request_id: None,

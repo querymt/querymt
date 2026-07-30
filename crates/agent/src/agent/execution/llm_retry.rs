@@ -11,6 +11,7 @@ use querymt::chat::StreamChunk;
 use querymt::error::LLMError;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tracing::{Span, instrument};
@@ -136,15 +137,32 @@ fn apply_jitter(delay_secs: f64, ratio: f64, sample: f64) -> u64 {
 }
 
 fn jitter_sample() -> f64 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.subsec_nanos())
+    static STATE: AtomicU64 = AtomicU64::new(0);
+    let seed = STATE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+            let seed = if state == 0 {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos() as u64)
+                    .unwrap_or(0)
+                    ^ u64::from(std::process::id())
+            } else {
+                state
+            };
+            Some(xorshift64(seed))
+        })
         .unwrap_or(0);
-    jitter_sample_from_nanos(nanos)
+    let sample = xorshift64(seed);
+    (sample >> 11) as f64 / (1_u64 << 53) as f64
 }
 
-fn jitter_sample_from_nanos(nanos: u32) -> f64 {
-    f64::from(nanos) / 1_000_000_000.0
+fn xorshift64(mut value: u64) -> u64 {
+    if value == 0 {
+        value = 0x9e37_79b9_7f4a_7c15;
+    }
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^ (value << 17)
 }
 
 /// Wait for a retry delay, returning a typed cancellation error if interrupted.
@@ -177,6 +195,9 @@ fn extract_rate_limit_info(error: &LLMError) -> Option<(String, Option<u64>)> {
             message,
             retry_after_secs,
         } => Some((message.clone(), *retry_after_secs)),
+        LLMError::ProviderRateLimited { message, context } => {
+            Some((message.clone(), context.retry_after_secs))
+        }
         LLMError::HttpStatus {
             status_code,
             message,
@@ -194,6 +215,7 @@ pub(super) async fn create_stream_with_retry<F, Fut>(
     config: &AgentConfig,
     session_id: &str,
     cancel_token: &CancellationToken,
+    attempts_used: &mut usize,
     create_stream: F,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
 where
@@ -206,10 +228,15 @@ where
     >,
 {
     let max_attempts = config.execution_policy.rate_limit.max_retries.max(1);
-    let mut attempt = 0;
 
     loop {
-        attempt += 1;
+        if *attempts_used >= max_attempts {
+            return Err(LLMError::HttpError(
+                "LLM stream request budget exhausted".to_string(),
+            ));
+        }
+        *attempts_used += 1;
+        let attempt = *attempts_used;
 
         if cancel_token.is_cancelled() {
             return Err(LLMError::Cancelled);
@@ -304,12 +331,15 @@ pub(super) fn begin_stream_retry(
     semantic_output_seen: bool,
     retries_used: &mut usize,
     max_stream_retries: usize,
+    attempts_used: usize,
+    max_attempts: usize,
     cancelled: bool,
 ) -> Option<usize> {
     if cancelled
         || semantic_output_seen
         || !error.is_retryable()
         || *retries_used >= max_stream_retries
+        || attempts_used >= max_attempts
     {
         return None;
     }
@@ -441,6 +471,7 @@ mod tests {
             message: "server broke".to_string(),
             context: ProviderErrorContext {
                 provider: "openai".to_string(),
+                kind: None,
                 code: Some("server_error".to_string()),
                 error_type: Some("api_error".to_string()),
                 request_id: None,
@@ -454,6 +485,7 @@ mod tests {
             message: "busy".into(),
             context: ProviderErrorContext {
                 provider: "codex".into(),
+                kind: Some(querymt::error::ProviderErrorKind::ServerOverloaded),
                 code: Some("server_is_overloaded".into()),
                 error_type: None,
                 request_id: None,
@@ -504,9 +536,9 @@ mod tests {
 
     #[test]
     fn test_jitter_sample_uses_full_unit_interval() {
-        assert_eq!(jitter_sample_from_nanos(0), 0.0);
-        assert_eq!(jitter_sample_from_nanos(500_000_000), 0.5);
-        assert!(jitter_sample_from_nanos(999_999_999) > 0.999_999_998);
+        let samples: Vec<_> = (0..16).map(|_| jitter_sample()).collect();
+        assert!(samples.iter().all(|sample| (0.0..1.0).contains(sample)));
+        assert!(samples.windows(2).any(|pair| pair[0] != pair[1]));
     }
 
     #[tokio::test]
@@ -772,25 +804,28 @@ mod tests {
         let token = CancellationToken::new();
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count2 = call_count.clone();
+        let mut attempts_used = 0;
 
-        let result = create_stream_with_retry(&config, "test-session", &token, || {
-            let count = call_count2.clone();
-            async move {
-                count.fetch_add(1, Ordering::SeqCst);
-                Err(LLMError::ServerOverloaded {
-                    message: "overloaded".into(),
-                    context: ProviderErrorContext {
-                        provider: "test".into(),
-                        code: Some("server_is_overloaded".into()),
-                        error_type: None,
-                        request_id: Some("request-3".into()),
-                        retry_after_secs: Some(0),
-                        transient: true,
-                    },
-                })
-            }
-        })
-        .await;
+        let result =
+            create_stream_with_retry(&config, "test-session", &token, &mut attempts_used, || {
+                let count = call_count2.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Err(LLMError::ServerOverloaded {
+                        message: "overloaded".into(),
+                        context: ProviderErrorContext {
+                            provider: "test".into(),
+                            kind: Some(querymt::error::ProviderErrorKind::ServerOverloaded),
+                            code: Some("server_is_overloaded".into()),
+                            error_type: None,
+                            request_id: Some("request-3".into()),
+                            retry_after_secs: Some(0),
+                            transient: true,
+                        },
+                    })
+                }
+            })
+            .await;
 
         assert!(matches!(
             result,
@@ -799,6 +834,7 @@ mod tests {
                     && context.request_id.as_deref() == Some("request-3")
         ));
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
+        assert_eq!(attempts_used, 3);
     }
 
     #[tokio::test]
@@ -890,12 +926,30 @@ mod tests {
                     stream_chunk_commits_output(&chunk),
                     &mut retries_used,
                     1,
+                    1,
+                    3,
                     false,
                 ),
                 None,
             );
             assert_eq!(retries_used, 0);
         }
+    }
+
+    #[test]
+    fn test_stream_retry_policy_stops_when_shared_request_budget_is_exhausted() {
+        let error = LLMError::HttpStatus {
+            status_code: 503,
+            message: "unavailable".into(),
+            retry_after_secs: None,
+        };
+        let mut retries_used = 0;
+
+        assert_eq!(
+            begin_stream_retry(&error, false, &mut retries_used, 5, 3, 3, false),
+            None
+        );
+        assert_eq!(retries_used, 0);
     }
 
     #[test]
@@ -908,20 +962,20 @@ mod tests {
         let mut retries_used = 0;
 
         assert_eq!(
-            begin_stream_retry(&error, false, &mut retries_used, 1, false),
+            begin_stream_retry(&error, false, &mut retries_used, 1, 1, 3, false),
             Some(1)
         );
         assert_eq!(retries_used, 1);
         assert_eq!(
-            begin_stream_retry(&error, false, &mut retries_used, 1, false),
+            begin_stream_retry(&error, false, &mut retries_used, 1, 1, 3, false),
             None
         );
         assert_eq!(
-            begin_stream_retry(&error, true, &mut retries_used, 2, false),
+            begin_stream_retry(&error, true, &mut retries_used, 2, 1, 3, false),
             None
         );
         assert_eq!(
-            begin_stream_retry(&error, false, &mut retries_used, 2, true),
+            begin_stream_retry(&error, false, &mut retries_used, 2, 1, 3, true),
             None
         );
     }

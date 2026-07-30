@@ -1,7 +1,7 @@
 use crate::{
     Tool,
     chat::{ChatMessage, ChatResponse, StreamChunk},
-    error::LLMError,
+    error::{LLMError, classify_http_status},
 };
 use http::{Request, Response};
 
@@ -14,6 +14,14 @@ pub trait ChatStreamParser: Send {
 }
 
 pub trait HTTPChatProvider: Send + Sync {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
+        classify_http_status(
+            response.status().as_u16(),
+            response.headers(),
+            response.body(),
+        )
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],

@@ -1,8 +1,8 @@
 use http::{Request, Response};
 use qmt_openai::api::{
-    OpenAIProviderConfig, OpenAIToolUseState, openai_chat_request, openai_embed_request,
-    openai_list_models_request, openai_parse_chat, openai_parse_embed, openai_parse_list_models,
-    parse_openai_sse_chunk, url_schema,
+    OpenAIProviderConfig, OpenAIToolUseState, classify_openai_http_error, openai_chat_request,
+    openai_embed_request, openai_list_models_request, openai_parse_chat, openai_parse_embed,
+    openai_parse_list_models, parse_openai_sse_chunk, url_schema,
 };
 use querymt::{
     HTTPLLMProvider,
@@ -65,6 +65,10 @@ pub struct Zai {
 }
 
 impl OpenAIProviderConfig for Zai {
+    fn provider_name(&self) -> &str {
+        "zai"
+    }
+
     fn api_key(&self) -> &str {
         &self.api_key
     }
@@ -135,6 +139,10 @@ impl OpenAIProviderConfig for Zai {
 }
 
 impl HTTPChatProvider for Zai {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
+        classify_openai_http_error(self.provider_name(), response)
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
@@ -173,7 +181,7 @@ struct ZaiStreamParser {
 
 impl ChatStreamParser for ZaiStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        parse_openai_sse_chunk(chunk, &mut self.tool_states)
+        parse_openai_sse_chunk("zai", chunk, &mut self.tool_states)
     }
 }
 

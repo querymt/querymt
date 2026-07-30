@@ -105,6 +105,10 @@ impl OpenAI {
 pub mod api;
 
 impl api::OpenAIProviderConfig for OpenAI {
+    fn provider_name(&self) -> &str {
+        "openai"
+    }
+
     fn api_key(&self) -> &str {
         &self.api_key
     }
@@ -179,6 +183,10 @@ impl api::OpenAIProviderConfig for OpenAI {
 }
 
 impl HTTPChatProvider for OpenAI {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
+        api::classify_openai_http_error("openai", response)
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
@@ -206,18 +214,27 @@ impl HTTPChatProvider for OpenAI {
     }
 
     fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
-        Ok(Box::new(OpenAIStreamParser::default()))
+        Ok(Box::new(OpenAIStreamParser::new("openai")))
     }
 }
 
-#[derive(Default)]
 struct OpenAIStreamParser {
+    provider: String,
     tool_states: HashMap<usize, api::OpenAIToolUseState>,
+}
+
+impl OpenAIStreamParser {
+    fn new(provider: &str) -> Self {
+        Self {
+            provider: provider.to_string(),
+            tool_states: HashMap::new(),
+        }
+    }
 }
 
 impl ChatStreamParser for OpenAIStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        api::parse_openai_sse_chunk(chunk, &mut self.tool_states)
+        api::parse_openai_sse_chunk(&self.provider, chunk, &mut self.tool_states)
     }
 }
 

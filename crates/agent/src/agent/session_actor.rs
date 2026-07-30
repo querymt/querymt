@@ -2237,6 +2237,7 @@ mod tests {
     fn prompt_error_preserves_wrapped_llm_payload() {
         let context = ProviderErrorContext {
             provider: "openai".to_string(),
+            kind: None,
             code: Some("server_error".to_string()),
             error_type: Some("api_error".to_string()),
             request_id: Some("req-456".to_string()),

@@ -45,6 +45,9 @@ impl LLMProviderFromHTTP {
         let req = self.inner.chat_request(messages, tools)?;
 
         let resp = call_outbound(req).await?;
+        if !resp.status().is_success() {
+            return Err(self.inner.classify_chat_error(&resp));
+        }
 
         self.inner.parse_chat(resp)
     }
@@ -88,9 +91,20 @@ impl ChatProvider for LLMProviderFromHTTP {
 
         let req = self.inner.chat_stream_request(messages, tools)?;
 
-        let stream = call_outbound_stream(req).await?;
-        let mut parser = self.inner.chat_stream_parser()?;
+        let (response, stream) = call_outbound_stream(req).await?;
+        if !response.status().is_success() {
+            let mut stream = Box::pin(stream);
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                body.extend_from_slice(&chunk.map_err(LLMError::from)?);
+            }
+            let (parts, ()) = response.into_parts();
+            return Err(self
+                .inner
+                .classify_chat_error(&http::Response::from_parts(parts, body)));
+        }
 
+        let mut parser = self.inner.chat_stream_parser()?;
         let s = stream
             .map(move |res: reqwest::Result<bytes::Bytes>| res.map_err(LLMError::from))
             .chain(futures::stream::iter([

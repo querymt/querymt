@@ -1,7 +1,7 @@
 mod http_client {
     #[cfg(not(target_arch = "wasm32"))]
     pub mod imp {
-        use crate::error::{LLMError, classify_http_status};
+        use crate::error::LLMError;
         use http::{Request, Response};
         use once_cell::sync::Lazy;
         use reqwest::Client;
@@ -171,7 +171,6 @@ mod http_client {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("<missing>")
                 );
-                return Err(classify_http_status(status.as_u16(), &headers, &bytes));
             }
 
             let mut builder = Response::builder().status(status.as_u16());
@@ -183,7 +182,15 @@ mod http_client {
 
         pub async fn call_outbound_stream(
             req: Request<Vec<u8>>,
-        ) -> Result<impl futures::Stream<Item = reqwest::Result<bytes::Bytes>>, LLMError> {
+        ) -> Result<
+            (
+                Response<()>,
+                std::pin::Pin<
+                    Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
+                >,
+            ),
+            LLMError,
+        > {
             let client = &*CLIENT;
 
             let method = req
@@ -251,9 +258,25 @@ mod http_client {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("<missing>")
                 );
-                return Err(classify_http_status(status.as_u16(), &headers, &bytes));
+                let mut builder = Response::builder().status(status.as_u16());
+                for (name, value) in headers.iter() {
+                    builder = builder.header(name.as_str(), value.as_bytes());
+                }
+                let response = builder.body(()).unwrap();
+                return Ok((
+                    response,
+                    Box::pin(futures::stream::once(async move {
+                        Ok(bytes::Bytes::from(bytes))
+                    })),
+                ));
             }
-            Ok(resp.bytes_stream())
+
+            let headers = resp.headers().clone();
+            let mut builder = Response::builder().status(status.as_u16());
+            for (name, value) in headers.iter() {
+                builder = builder.header(name.as_str(), value.as_bytes());
+            }
+            Ok((builder.body(()).unwrap(), Box::pin(resp.bytes_stream())))
         }
     }
 
@@ -268,7 +291,15 @@ mod http_client {
 
         pub async fn call_outbound_stream(
             _req: Request<Vec<u8>>,
-        ) -> Result<futures::stream::Empty<reqwest::Result<bytes::Bytes>>, LLMError> {
+        ) -> Result<
+            (
+                Response<()>,
+                std::pin::Pin<
+                    Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
+                >,
+            ),
+            LLMError,
+        > {
             Err(LLMError::InvalidRequest("".into()))
         }
     }

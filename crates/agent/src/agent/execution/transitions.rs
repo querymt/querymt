@@ -309,6 +309,8 @@ pub(super) async fn transition_call_llm(
             // A retry is safe only while the failed attempt has produced no
             // semantic output, so no user-visible content can be rolled back.
             let mut stream_retries_used = 0;
+            let mut stream_attempts_used = 0;
+            let max_stream_attempts = config.execution_policy.rate_limit.max_retries.max(1);
             'stream: loop {
                 let mut semantic_output_seen = false;
 
@@ -316,6 +318,7 @@ pub(super) async fn transition_call_llm(
                     config,
                     session_id,
                     &exec_ctx.cancellation_token,
+                    &mut stream_attempts_used,
                     || {
                         let provider = &provider;
                         let messages_with_cache = &messages_with_cache;
@@ -371,6 +374,8 @@ pub(super) async fn transition_call_llm(
                                 semantic_output_seen,
                                 &mut stream_retries_used,
                                 max_stream_retries,
+                                stream_attempts_used,
+                                max_stream_attempts,
                                 exec_ctx.cancellation_token.is_cancelled(),
                             );
                             let Some(retry_number) = retry_number else {

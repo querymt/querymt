@@ -1,7 +1,7 @@
 use http::{Request, Response};
 use qmt_openai::api::{
-    OpenAIProviderConfig, openai_chat_request, openai_list_models_request, openai_parse_chat,
-    openai_parse_list_models, url_schema,
+    OpenAIProviderConfig, classify_openai_http_error, openai_chat_request,
+    openai_list_models_request, openai_parse_chat, openai_parse_list_models, url_schema,
 };
 use querymt::{
     HTTPLLMProvider,
@@ -44,6 +44,10 @@ pub struct MoonshotAI {
 }
 
 impl OpenAIProviderConfig for MoonshotAI {
+    fn provider_name(&self) -> &str {
+        "moonshot"
+    }
+
     fn api_key(&self) -> &str {
         &self.api_key
     }
@@ -128,6 +132,10 @@ impl OpenAIProviderConfig for MoonshotAI {
 }
 
 impl HTTPChatProvider for MoonshotAI {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
+        classify_openai_http_error(self.provider_name(), response)
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],

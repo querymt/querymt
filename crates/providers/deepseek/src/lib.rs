@@ -1,8 +1,8 @@
 use http::{Request, Response};
 use qmt_openai::api::{
-    OpenAIProviderConfig, OpenAIToolUseState, openai_chat_request, openai_embed_request,
-    openai_list_models_request, openai_parse_chat, openai_parse_embed, openai_parse_list_models,
-    parse_openai_sse_chunk, url_schema,
+    OpenAIProviderConfig, OpenAIToolUseState, classify_openai_http_error, openai_chat_request,
+    openai_embed_request, openai_list_models_request, openai_parse_chat, openai_parse_embed,
+    openai_parse_list_models, parse_openai_sse_chunk, url_schema,
 };
 use querymt::{
     HTTPLLMProvider,
@@ -66,6 +66,10 @@ pub struct Deepseek {
 }
 
 impl OpenAIProviderConfig for Deepseek {
+    fn provider_name(&self) -> &str {
+        "deepseek"
+    }
+
     fn api_key(&self) -> &str {
         &self.api_key
     }
@@ -148,6 +152,10 @@ impl OpenAIProviderConfig for Deepseek {
 }
 
 impl HTTPChatProvider for Deepseek {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
+        classify_openai_http_error(self.provider_name(), response)
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
@@ -186,7 +194,7 @@ struct DeepseekStreamParser {
 
 impl ChatStreamParser for DeepseekStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        parse_openai_sse_chunk(chunk, &mut self.tool_states)
+        parse_openai_sse_chunk("deepseek", chunk, &mut self.tool_states)
     }
 }
 

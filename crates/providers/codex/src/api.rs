@@ -14,8 +14,8 @@ use querymt::{
         Tool, ToolChoice,
     },
     error::{
-        LLMError, ProviderErrorContext, extract_retry_after_from_json,
-        parse_retry_after_from_message,
+        LLMError, ProviderErrorContext, ProviderErrorKind, extract_retry_after_from_json,
+        parse_retry_after, parse_retry_after_from_message,
     },
     handle_http_error,
 };
@@ -784,11 +784,64 @@ pub fn codex_parse_chat_with_state(
     }
 }
 
+pub fn classify_codex_http_error(provider: &str, response: &Response<Vec<u8>>) -> LLMError {
+    let status = response.status().as_u16();
+    let retry_after_secs = parse_retry_after(response.headers());
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .or_else(|| response.headers().get("request-id"))
+        .and_then(|value| value.to_str().ok());
+    let envelope = serde_json::from_slice::<Value>(response.body()).ok();
+    if let Some(envelope) = envelope.as_ref() {
+        let response_value = envelope.get("response").unwrap_or(envelope);
+        if let Some(error) = response_value
+            .get("error")
+            .or_else(|| envelope.get("error"))
+        {
+            let mut mapped = map_codex_response_failed(provider, error, response_value, request_id);
+            if mapped.retry_after_secs().is_none()
+                && let Some(retry_after_secs) = retry_after_secs
+            {
+                mapped = match mapped {
+                    LLMError::ProviderRateLimited {
+                        message,
+                        mut context,
+                    }
+                    | LLMError::ServerOverloaded {
+                        message,
+                        mut context,
+                    }
+                    | LLMError::ProviderResponseError {
+                        message,
+                        mut context,
+                    } => {
+                        context.retry_after_secs = Some(retry_after_secs);
+                        match context.kind {
+                            Some(ProviderErrorKind::RateLimited) => {
+                                LLMError::ProviderRateLimited { message, context }
+                            }
+                            Some(ProviderErrorKind::ServerOverloaded) => {
+                                LLMError::ServerOverloaded { message, context }
+                            }
+                            _ => LLMError::ProviderResponseError { message, context },
+                        }
+                    }
+                    other => other,
+                };
+            }
+            return mapped;
+        }
+    }
+
+    querymt::error::classify_http_status(status, response.headers(), response.body())
+}
+
 pub fn codex_parse_stream_chunk_with_state(
+    provider: &str,
     chunk: &[u8],
     tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
 ) -> Result<Vec<StreamChunk>, LLMError> {
-    let provider = "codex";
     if chunk.is_empty() {
         return Ok(Vec::new());
     }
@@ -989,7 +1042,7 @@ fn recognized_codex_error_kind(kind: &str) -> Option<&str> {
 ///
 /// Code table follows openai/codex (`codex-api` SSE `response.failed` handlers):
 /// - `server_is_overloaded` | `slow_down` → [`LLMError::ServerOverloaded`] (retryable here)
-/// - `rate_limit_exceeded` → [`LLMError::RateLimited`] (+ message delay parse)
+/// - `rate_limit_exceeded` → [`LLMError::ProviderRateLimited`] (+ message delay parse)
 /// - `context_length_exceeded` → [`LLMError::ContextWindowExceeded`]
 /// - `insufficient_quota` | `usage_not_included` → [`LLMError::QuotaExceeded`]
 /// - `cyber_policy` | `invalid_prompt` | `bio_policy` → [`LLMError::InvalidRequest`]
@@ -1035,36 +1088,47 @@ fn map_codex_response_failed(
         .and_then(recognized_codex_error_kind)
         .or_else(|| type_norm.as_deref().and_then(recognized_codex_error_kind));
 
-    let context = |transient, retry_after_secs| {
-        ProviderErrorContext::builder(provider)
+    let context = |kind, transient, retry_after_secs| {
+        let builder = ProviderErrorContext::builder(provider)
             .code(code.clone())
             .error_type(error_type.clone())
             .request_id(request_id.clone())
             .retry_after_secs(retry_after_secs)
-            .transient(transient)
-            .build()
+            .transient(transient);
+        match kind {
+            Some(kind) => builder.kind(kind).build(),
+            None => builder.build(),
+        }
     };
 
     match kind {
         Some("server_is_overloaded" | "slow_down" | "overloaded_error") => {
             LLMError::ServerOverloaded {
                 message,
-                context: context(true, retry_after_secs),
+                context: context(
+                    Some(ProviderErrorKind::ServerOverloaded),
+                    true,
+                    retry_after_secs,
+                ),
             }
         }
-        Some("rate_limit_exceeded" | "rate_limit_error") => LLMError::RateLimited {
-            retry_after_secs: retry_after_secs.or_else(|| parse_retry_after_from_message(&message)),
-            message,
-        },
+        Some("rate_limit_exceeded" | "rate_limit_error") => {
+            let retry_after_secs =
+                retry_after_secs.or_else(|| parse_retry_after_from_message(&message));
+            LLMError::ProviderRateLimited {
+                message,
+                context: context(Some(ProviderErrorKind::RateLimited), true, retry_after_secs),
+            }
+        }
         Some("context_length_exceeded" | "context_length_error") => {
             LLMError::ContextWindowExceeded {
                 message,
-                context: context(false, None),
+                context: context(Some(ProviderErrorKind::ContextWindowExceeded), false, None),
             }
         }
         Some("insufficient_quota" | "usage_not_included") => LLMError::QuotaExceeded {
             message,
-            context: context(false, None),
+            context: context(Some(ProviderErrorKind::QuotaExceeded), false, None),
         },
         Some(
             "cyber_policy"
@@ -1072,13 +1136,19 @@ fn map_codex_response_failed(
             | "bio_policy"
             | "invalid_request"
             | "invalid_request_error",
-        ) => LLMError::InvalidRequest(message),
+        ) => LLMError::ProviderInvalidRequest {
+            message,
+            context: context(Some(ProviderErrorKind::InvalidRequest), false, None),
+        },
         Some("authentication_error" | "invalid_api_key" | "unauthorized") => {
-            LLMError::AuthError(message)
+            LLMError::ProviderAuthError {
+                message,
+                context: context(Some(ProviderErrorKind::Authentication), false, None),
+            }
         }
         _ => LLMError::ProviderResponseError {
             message,
-            context: context(true, retry_after_secs),
+            context: context(None, true, retry_after_secs),
         },
     }
 }
@@ -1469,14 +1539,14 @@ fn codex_effort_str(e: ReasoningEffort) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodexChatResponse, CodexToolUseState, chatgpt_account_id, codex_chat_body_json,
-        codex_chat_request, codex_parse_stream_chunk_with_state,
+        CodexChatResponse, CodexToolUseState, chatgpt_account_id, classify_codex_http_error,
+        codex_chat_body_json, codex_chat_request, codex_parse_stream_chunk_with_state,
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use http::header::AUTHORIZATION;
+    use http::{Response, header::AUTHORIZATION};
     use querymt::{
         chat::{ChatMessage, ChatResponse, ChatRole, Content, FinishReason, StreamChunk},
-        error::LLMError,
+        error::{LLMError, ProviderErrorKind},
     };
     use serde_json::Value;
     use std::collections::HashMap;
@@ -1883,9 +1953,30 @@ mod tests {
             (usize::MAX, CodexToolUseState::default()),
         ])));
         let chunk = format!("data: {payload}\n\n");
-        let error = codex_parse_stream_chunk_with_state(chunk.as_bytes(), &state)
+        let error = codex_parse_stream_chunk_with_state("codex", chunk.as_bytes(), &state)
             .expect_err("response.failed should return an error");
         (error, state)
+    }
+
+    #[test]
+    fn classify_http_error_maps_codex_envelope_and_headers() {
+        let response = Response::builder()
+            .status(503)
+            .header("retry-after", "3")
+            .header("x-request-id", "req-http")
+            .body(br#"{"error":{"message":"busy","code":"server_is_overloaded"}}"#.to_vec())
+            .unwrap();
+
+        let error = classify_codex_http_error("xai", &response);
+        match error {
+            LLMError::ServerOverloaded { message, context } => {
+                assert_eq!(message, "busy");
+                assert_eq!(context.provider, "xai");
+                assert_eq!(context.request_id.as_deref(), Some("req-http"));
+                assert_eq!(context.retry_after_secs, Some(3));
+            }
+            other => panic!("expected ServerOverloaded, got {other}"),
+        }
     }
 
     #[test]
@@ -1930,7 +2021,7 @@ mod tests {
             );
             let (error, _) = parse_failed_event(&payload);
             assert!(
-                matches!(error, LLMError::InvalidRequest(ref message) if message == "bad"),
+                matches!(error, LLMError::ProviderInvalidRequest { ref message, .. } if message == "bad"),
                 "code={code}, got {error}"
             );
             assert!(!error.is_retryable());
@@ -1958,12 +2049,10 @@ mod tests {
             r#"{"type":"response.failed","response":{"error":{"message":"Rate limit reached for gpt-5.1. Please try again in 11.054s.","type":"rate_limit_error","code":"rate_limit_exceeded"}}}"#,
         );
         match &error {
-            LLMError::RateLimited {
-                message,
-                retry_after_secs,
-            } => {
+            LLMError::ProviderRateLimited { message, context } => {
                 assert!(message.contains("Rate limit reached"));
-                assert_eq!(*retry_after_secs, Some(12));
+                assert_eq!(context.retry_after_secs, Some(12));
+                assert_eq!(context.kind, Some(ProviderErrorKind::RateLimited));
             }
             other => panic!("expected rate limit, got {other}"),
         }
@@ -1989,7 +2078,7 @@ mod tests {
         let (error, _) = parse_failed_event(
             r#"{"type":"response.failed","response":{"error":{"message":"slow down","code":"vendor_specific","type":"rate_limit_error"}}}"#,
         );
-        assert!(matches!(error, LLMError::RateLimited { .. }));
+        assert!(matches!(error, LLMError::ProviderRateLimited { .. }));
         assert!(error.is_retryable());
     }
 
@@ -1998,7 +2087,10 @@ mod tests {
         let (error, _) = parse_failed_event(
             r#"{"type":"response.failed","response":{"error":{"message":"bad key","type":"authentication_error"}}}"#,
         );
-        assert!(matches!(error, LLMError::AuthError(ref message) if message == "bad key"));
+        assert!(matches!(
+            error,
+            LLMError::ProviderAuthError { ref message, .. } if message == "bad key"
+        ));
         assert!(!error.is_retryable());
     }
 
@@ -2044,7 +2136,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
         assert_eq!(events.len(), 3);
 
         match &events[0] {
@@ -2068,7 +2160,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "think"),
@@ -2083,7 +2175,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "why"),
@@ -2098,7 +2190,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "why because details"),
@@ -2113,7 +2205,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
         assert_eq!(events.len(), 2);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "why because details"),
@@ -2138,7 +2230,8 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 
 "#;
 
-        let first_events = codex_parse_stream_chunk_with_state(first_delta, &state).unwrap();
+        let first_events =
+            codex_parse_stream_chunk_with_state("codex", first_delta, &state).unwrap();
         assert_eq!(first_events.len(), 1);
         match &first_events[0] {
             StreamChunk::Thinking(text) => {
@@ -2147,14 +2240,16 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
             other => panic!("expected thinking chunk, got {other:?}"),
         }
 
-        let second_events = codex_parse_stream_chunk_with_state(second_delta, &state).unwrap();
+        let second_events =
+            codex_parse_stream_chunk_with_state("codex", second_delta, &state).unwrap();
         assert_eq!(second_events.len(), 1);
         match &second_events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "with consideration!"),
             other => panic!("expected thinking chunk, got {other:?}"),
         }
 
-        let done_events = codex_parse_stream_chunk_with_state(output_item_done, &state).unwrap();
+        let done_events =
+            codex_parse_stream_chunk_with_state("codex", output_item_done, &state).unwrap();
         assert!(done_events.is_empty(), "unexpected events: {done_events:?}");
     }
 
@@ -2170,7 +2265,8 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"with consideratio
 
 "#;
 
-        let delta_events = codex_parse_stream_chunk_with_state(delta_chunk, &state).unwrap();
+        let delta_events =
+            codex_parse_stream_chunk_with_state("codex", delta_chunk, &state).unwrap();
         assert_eq!(delta_events.len(), 2);
         match &delta_events[0] {
             StreamChunk::Thinking(text) => {
@@ -2184,7 +2280,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"with consideratio
         }
 
         let completed_events =
-            codex_parse_stream_chunk_with_state(completed_chunk, &state).unwrap();
+            codex_parse_stream_chunk_with_state("codex", completed_chunk, &state).unwrap();
         assert_eq!(completed_events.len(), 2);
         match &completed_events[0] {
             StreamChunk::Usage(usage) => {
@@ -2212,7 +2308,8 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"with consideratio
 
 "#;
 
-        let delta_events = codex_parse_stream_chunk_with_state(delta_chunk, &state).unwrap();
+        let delta_events =
+            codex_parse_stream_chunk_with_state("codex", delta_chunk, &state).unwrap();
         assert_eq!(delta_events.len(), 1);
         match &delta_events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "first part"),
@@ -2220,7 +2317,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"with consideratio
         }
 
         let completed_events =
-            codex_parse_stream_chunk_with_state(completed_chunk, &state).unwrap();
+            codex_parse_stream_chunk_with_state("codex", completed_chunk, &state).unwrap();
         assert_eq!(completed_events.len(), 3);
         match &completed_events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, " plus final"),
@@ -2250,7 +2347,7 @@ data: {"type":"response.completed","response":{"output":[{"type":"reasoning","su
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
         assert_eq!(events.len(), 2);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "why"),
@@ -2271,7 +2368,7 @@ data: {"type":"response.completed","response":{"output":[{"type":"reasoning","su
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
         assert_eq!(events.len(), 3);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "why"),
@@ -2294,7 +2391,7 @@ data: {"type":"response.completed","response":{"output":[{"type":"reasoning","su
 
 "#;
 
-        let first_events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
+        let first_events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
         assert_eq!(first_events.len(), 2);
         match &first_events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "same final thought"),
@@ -2305,7 +2402,7 @@ data: {"type":"response.completed","response":{"output":[{"type":"reasoning","su
             other => panic!("expected done chunk, got {other:?}"),
         }
 
-        let second_events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
+        let second_events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
         assert_eq!(second_events.len(), 2);
         match &second_events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "same final thought"),
