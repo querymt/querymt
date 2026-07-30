@@ -5,6 +5,7 @@
 //! error code via the `From<AgentError> for AcpError` impl.
 
 use agent_client_protocol::Error as AcpError;
+use querymt::error::LLMErrorPayload;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -53,7 +54,12 @@ pub enum AgentError {
     Provider(String),
 
     #[error("provider chat failed ({operation}): {reason}")]
-    ProviderChat { operation: String, reason: String },
+    ProviderChat {
+        operation: String,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        llm_error: Option<LLMErrorPayload>,
+    },
 
     // --- Client bridge ---
     #[error("client bridge closed")]
@@ -99,6 +105,26 @@ pub enum AgentError {
 /// | -32603  | InternalError      | everything else (replaces the old -32000 catch-all) |
 impl From<AgentError> for AcpError {
     fn from(e: AgentError) -> Self {
+        if let AgentError::ProviderChat {
+            operation,
+            reason,
+            llm_error,
+        } = &e
+        {
+            let message = if provider_error_is_transient(llm_error.as_ref()) {
+                "LLM provider temporarily unavailable"
+            } else {
+                "LLM provider request failed"
+            };
+            return AcpError::new(-32603, message).data(serde_json::json!({
+                "schema": "querymt.error.v1",
+                "kind": "llm",
+                "operation": operation,
+                "reason": reason,
+                "llm_error": llm_error,
+            }));
+        }
+
         let code: i32 = match &e {
             AgentError::MethodNotImplemented { .. } => -32601, // MethodNotFound
             AgentError::SessionNotFound { .. }
@@ -108,6 +134,13 @@ impl From<AgentError> for AcpError {
         };
         AcpError::new(code, e.to_string())
     }
+}
+
+fn provider_error_is_transient(payload: Option<&LLMErrorPayload>) -> bool {
+    payload
+        .cloned()
+        .map(querymt::error::LLMError::from_payload)
+        .is_some_and(|error| error.is_retryable())
 }
 
 impl From<anyhow::Error> for AgentError {
@@ -142,6 +175,7 @@ impl From<crate::middleware::error::MiddlewareError> for AgentError {
 mod tests {
     use super::*;
     use agent_client_protocol::ErrorCode;
+    use querymt::error::ProviderErrorContext;
 
     // ── From<AgentError> for AcpError ──────────────────────────────────────
 
@@ -215,15 +249,134 @@ mod tests {
     }
 
     #[test]
-    fn provider_chat_maps_to_internal_error() {
+    fn provider_chat_maps_to_structured_internal_error() {
+        let llm_error = LLMErrorPayload::ProviderError {
+            message: "capacity exhausted".to_string(),
+            context: Some(ProviderErrorContext {
+                provider: "openai".to_string(),
+                code: Some("server_error".to_string()),
+                error_type: Some("api_error".to_string()),
+                request_id: Some("req-123".to_string()),
+                retry_after_secs: Some(2),
+                transient: false,
+            }),
+        };
         let acp: AcpError = AgentError::ProviderChat {
-            operation: "chat_with_tools".to_string(),
-            reason: "rate limit".to_string(),
+            operation: "chat_stream".to_string(),
+            reason: "LLM streaming error: LLM Provider Error: capacity exhausted".to_string(),
+            llm_error: Some(llm_error),
         }
         .into();
+
         assert_eq!(acp.code, ErrorCode::InternalError);
-        assert!(acp.message.contains("chat_with_tools"));
-        assert!(acp.message.contains("rate limit"));
+        assert_eq!(acp.message, "LLM provider request failed");
+        assert_eq!(
+            acp.data,
+            Some(serde_json::json!({
+                "schema": "querymt.error.v1",
+                "kind": "llm",
+                "operation": "chat_stream",
+                "reason": "LLM streaming error: LLM Provider Error: capacity exhausted",
+                "llm_error": {
+                    "type": "provider_error",
+                    "message": "capacity exhausted",
+                    "context": {
+                        "provider": "openai",
+                        "code": "server_error",
+                        "error_type": "api_error",
+                        "request_id": "req-123",
+                        "retry_after_secs": 2,
+                        "transient": false
+                    }
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn provider_chat_legacy_payload_maps_llm_error_to_null() {
+        let acp: AcpError = AgentError::ProviderChat {
+            operation: "chat_stream".to_string(),
+            reason: "legacy failure".to_string(),
+            llm_error: None,
+        }
+        .into();
+
+        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.message, "LLM provider request failed");
+        assert_eq!(
+            acp.data,
+            Some(serde_json::json!({
+                "schema": "querymt.error.v1",
+                "kind": "llm",
+                "operation": "chat_stream",
+                "reason": "legacy failure",
+                "llm_error": null
+            }))
+        );
+    }
+
+    #[test]
+    fn transient_provider_chat_has_temporary_unavailable_message() {
+        let acp: AcpError = AgentError::ProviderChat {
+            operation: "chat_stream".to_string(),
+            reason: "provider overloaded".to_string(),
+            llm_error: Some(
+                querymt::error::LLMError::ServerOverloaded {
+                    message: "overloaded".to_string(),
+                    context: ProviderErrorContext {
+                        provider: "codex".to_string(),
+                        code: Some("server_is_overloaded".to_string()),
+                        error_type: None,
+                        request_id: None,
+                        retry_after_secs: None,
+                        transient: true,
+                    },
+                }
+                .to_payload(),
+            ),
+        }
+        .into();
+
+        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.message, "LLM provider temporarily unavailable");
+    }
+
+    #[test]
+    fn rate_limited_and_retryable_http_status_are_temporary() {
+        let rate_limited: AcpError = AgentError::ProviderChat {
+            operation: "chat".to_string(),
+            reason: "rate limited".to_string(),
+            llm_error: Some(LLMErrorPayload::RateLimited {
+                message: "slow down".to_string(),
+                retry_after_secs: Some(5),
+            }),
+        }
+        .into();
+        assert_eq!(rate_limited.message, "LLM provider temporarily unavailable");
+
+        let http_503: AcpError = AgentError::ProviderChat {
+            operation: "chat_stream".to_string(),
+            reason: "upstream 503".to_string(),
+            llm_error: Some(LLMErrorPayload::HttpStatus {
+                status_code: 503,
+                message: "unavailable".to_string(),
+                retry_after_secs: None,
+            }),
+        }
+        .into();
+        assert_eq!(http_503.message, "LLM provider temporarily unavailable");
+
+        let transport: AcpError = AgentError::ProviderChat {
+            operation: "chat".to_string(),
+            reason: "reset".to_string(),
+            llm_error: Some(LLMErrorPayload::Transport {
+                kind: querymt::error::TransportErrorKind::ConnectionReset,
+                message: "connection reset".to_string(),
+            }),
+        }
+        .into();
+        assert_eq!(transport.message, "LLM provider temporarily unavailable");
     }
 
     #[test]
@@ -340,12 +493,41 @@ mod tests {
     #[test]
     fn agent_error_provider_chat_serde_round_trip() {
         let original = AgentError::ProviderChat {
-            operation: "stream".to_string(),
+            operation: "chat_stream".to_string(),
             reason: "context too long".to_string(),
+            llm_error: Some(LLMErrorPayload::InvalidRequest {
+                message: "maximum context length exceeded".to_string(),
+            }),
         };
         let json = serde_json::to_string(&original).unwrap();
         let restored: AgentError = serde_json::from_str(&json).unwrap();
+
         assert_eq!(original.to_string(), restored.to_string());
+        assert!(matches!(
+            restored,
+            AgentError::ProviderChat {
+                operation,
+                reason,
+                llm_error: Some(LLMErrorPayload::InvalidRequest { message }),
+            } if operation == "chat_stream"
+                && reason == "context too long"
+                && message == "maximum context length exceeded"
+        ));
+    }
+
+    #[test]
+    fn agent_error_provider_chat_deserializes_legacy_payload() {
+        let json = r#"{"ProviderChat":{"operation":"chat_stream","reason":"legacy"}}"#;
+        let restored: AgentError = serde_json::from_str(json).unwrap();
+
+        assert!(matches!(
+            restored,
+            AgentError::ProviderChat {
+                operation,
+                reason,
+                llm_error: None,
+            } if operation == "chat_stream" && reason == "legacy"
+        ));
     }
 
     // ── Display messages ───────────────────────────────────────────────────

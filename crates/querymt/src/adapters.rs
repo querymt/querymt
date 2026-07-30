@@ -42,10 +42,7 @@ impl LLMProviderFromHTTP {
     ) -> Result<Box<dyn ChatResponse>, LLMError> {
         self.ensure_credential_fresh().await?;
 
-        let req = self
-            .inner
-            .chat_request(messages, tools)
-            .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))?;
+        let req = self.inner.chat_request(messages, tools)?;
 
         let resp = call_outbound(req).await?;
 
@@ -89,16 +86,10 @@ impl ChatProvider for LLMProviderFromHTTP {
 
         self.ensure_credential_fresh().await?;
 
-        let req = self
-            .inner
-            .chat_stream_request(messages, tools)
-            .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))?;
+        let req = self.inner.chat_stream_request(messages, tools)?;
 
         let stream = call_outbound_stream(req).await?;
-        let mut parser = self
-            .inner
-            .chat_stream_parser()
-            .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))?;
+        let mut parser = self.inner.chat_stream_parser()?;
 
         let s = stream
             .map(move |res: reqwest::Result<bytes::Bytes>| res.map_err(LLMError::from))
@@ -179,9 +170,7 @@ impl EmbeddingProvider for LLMProviderFromHTTP {
         let resp = call_outbound(req)
             .await
             .map_err(|e| LLMError::HttpError(format!("{:#}", e)))?;
-        self.inner
-            .parse_embed(resp)
-            .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))
+        self.inner.parse_embed(resp)
     }
 }
 
@@ -197,9 +186,7 @@ impl CompletionProvider for LLMProviderFromHTTP {
         let resp = call_outbound(req)
             .await
             .map_err(|e| LLMError::HttpError(format!("{:#}", e)))?;
-        self.inner
-            .parse_complete(resp)
-            .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))
+        self.inner.parse_complete(resp)
     }
 }
 
@@ -227,9 +214,7 @@ impl LLMProvider for LLMProviderFromHTTP {
         let resp = call_outbound(req)
             .await
             .map_err(|e| LLMError::HttpError(format!("{:#}", e)))?;
-        self.inner
-            .parse_stt(resp)
-            .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))
+        self.inner.parse_stt(resp)
     }
 
     #[cfg_attr(
@@ -242,9 +227,7 @@ impl LLMProvider for LLMProviderFromHTTP {
         let resp = call_outbound(req)
             .await
             .map_err(|e| LLMError::HttpError(format!("{:#}", e)))?;
-        self.inner
-            .parse_tts(resp)
-            .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))
+        self.inner.parse_tts(resp)
     }
 }
 

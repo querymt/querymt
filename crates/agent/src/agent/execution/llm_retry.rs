@@ -5,12 +5,13 @@
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::utils::u32_from_usize;
 use crate::events::AgentEventKind;
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use log::{debug, info};
 use querymt::chat::StreamChunk;
 use querymt::error::LLMError;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tracing::{Span, instrument};
 
@@ -28,12 +29,12 @@ pub(super) async fn call_llm_with_retry<F, Fut>(
     session_id: &str,
     cancel_token: &CancellationToken,
     mut call_fn: F,
-) -> Result<Box<dyn querymt::chat::ChatResponse>, anyhow::Error>
+) -> Result<Box<dyn querymt::chat::ChatResponse>, LLMError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<Box<dyn querymt::chat::ChatResponse>, LLMError>>,
 {
-    let max_retries = config.execution_policy.rate_limit.max_retries;
+    let max_attempts = config.execution_policy.rate_limit.max_retries.max(1);
     let mut attempt = 0;
     Span::current().record("rate_limited", false);
 
@@ -41,7 +42,7 @@ where
         attempt += 1;
 
         if cancel_token.is_cancelled() {
-            return Err(anyhow::anyhow!("Cancelled"));
+            return Err(LLMError::Cancelled);
         }
 
         match call_fn().await {
@@ -50,54 +51,50 @@ where
                 return Ok(response);
             }
             Err(e) => {
-                if let Some((message, retry_after)) = extract_rate_limit_info(&e) {
-                    Span::current().record("rate_limited", true);
-                    if attempt >= max_retries {
-                        return Err(anyhow::anyhow!(
-                            "Rate limit exceeded after {} attempts: {}",
-                            max_retries,
-                            message
-                        ));
-                    }
+                Span::current().record("attempt", attempt);
+                let rate_limit_info = extract_rate_limit_info(&e);
+                Span::current().record("rate_limited", rate_limit_info.is_some());
 
-                    let wait_secs = calculate_rate_limit_wait(config, retry_after, attempt);
+                if !e.is_retryable() || attempt >= max_attempts {
+                    return Err(e);
+                }
+
+                let wait_secs = retry_delay_secs(config, &e, attempt);
+                if let Some((message, _)) = rate_limit_info {
                     let started_at = time::OffsetDateTime::now_utc().unix_timestamp();
-
                     info!(
                         "Session {} rate limited, attempt {}/{}, waiting {}s",
-                        session_id, attempt, max_retries, wait_secs
+                        session_id, attempt, max_attempts, wait_secs
                     );
-
                     config.emit_event(
                         session_id,
                         AgentEventKind::RateLimited {
-                            message: message.clone(),
+                            message,
                             wait_secs,
                             started_at,
                             attempt: u32_from_usize(attempt, "attempt", Some(session_id)),
                             max_attempts: u32_from_usize(
-                                max_retries,
-                                "max_retries",
+                                max_attempts,
+                                "max_attempts",
                                 Some(session_id),
                             ),
                         },
                     );
+                } else {
+                    debug!(
+                        "Session {} transient setup error on attempt {}, retrying in {}s: {}",
+                        session_id, attempt, wait_secs, e
+                    );
+                }
 
-                    let cancelled = wait_with_cancellation(wait_secs, cancel_token).await;
-                    if cancelled {
-                        debug!(
-                            "Rate limit wait cancelled for session {} during attempt {}",
-                            session_id, attempt
-                        );
-                        return Err(anyhow::anyhow!("Cancelled during rate limit wait"));
-                    }
+                wait_for_retry_delay(wait_secs, cancel_token).await?;
 
+                if extract_rate_limit_info(&e).is_some() {
                     info!(
                         "Session {} resuming after rate limit wait, attempt {}",
                         session_id,
                         attempt + 1
                     );
-
                     config.emit_event(
                         session_id,
                         AgentEventKind::RateLimitResume {
@@ -108,57 +105,60 @@ where
                             ),
                         },
                     );
-
-                    continue;
-                } else if is_transient_error(&e) && attempt < max_retries {
-                    Span::current().record("rate_limited", false);
-                    let wait_secs =
-                        calculate_rate_limit_wait(config, e.retry_after_secs(), attempt);
-                    debug!(
-                        "Session {} transient setup error on attempt {}, retrying in {}s: {}",
-                        session_id, attempt, wait_secs, e
-                    );
-                    let cancelled = wait_with_cancellation(wait_secs, cancel_token).await;
-                    if cancelled {
-                        return Err(anyhow::anyhow!("Cancelled during retry wait"));
-                    }
-                    continue;
-                } else {
-                    Span::current().record("rate_limited", false);
-                    return Err(anyhow::Error::from(e));
                 }
             }
         }
     }
 }
 
-/// Calculate how long to wait before retrying after a rate limit.
-fn calculate_rate_limit_wait(
+/// Calculate the delay for a retry, preferring the provider's retry hint.
+pub(super) fn retry_delay_secs(
     config: &AgentConfig,
-    retry_after: Option<u64>,
-    attempt: usize,
+    error: &LLMError,
+    retry_ordinal: usize,
 ) -> u64 {
-    match retry_after {
-        Some(secs) => secs,
-        None => {
-            let base = config.execution_policy.rate_limit.default_wait_secs as f64;
-            let multiplier = config.execution_policy.rate_limit.backoff_multiplier;
-            (base * multiplier.powi((attempt - 1) as i32)) as u64
-        }
+    if let Some(secs) = error.retry_after_secs() {
+        return secs;
     }
+
+    let policy = &config.execution_policy.rate_limit;
+    let base = policy.default_wait_secs as f64;
+    let multiplier = policy.backoff_multiplier;
+    let calculated = base * multiplier.powi(retry_ordinal.saturating_sub(1) as i32);
+    let bounded = calculated.min(policy.max_wait_secs as f64);
+    apply_jitter(bounded, policy.jitter_ratio, jitter_sample())
 }
 
-/// Wait for a duration with support for cancellation.
-///
-/// Returns `true` if cancelled, `false` if the wait completed normally.
+fn apply_jitter(delay_secs: f64, ratio: f64, sample: f64) -> u64 {
+    let ratio = ratio.clamp(0.0, 1.0);
+    let sample = sample.clamp(0.0, 1.0);
+    let factor = 1.0 - ratio + (2.0 * ratio * sample);
+    (delay_secs * factor).round().max(0.0) as u64
+}
+
+fn jitter_sample() -> f64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0);
+    f64::from(nanos) / f64::from(u32::MAX)
+}
+
+/// Wait for a retry delay, returning a typed cancellation error if interrupted.
 #[instrument(name = "agent.llm.rate_limit_wait", skip(cancel_token), fields(wait_secs = wait_secs))]
-async fn wait_with_cancellation(wait_secs: u64, cancel_token: &CancellationToken) -> bool {
+pub(super) async fn wait_for_retry_delay(
+    wait_secs: u64,
+    cancel_token: &CancellationToken,
+) -> Result<(), LLMError> {
     tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => Err(LLMError::Cancelled),
         _ = tokio::time::sleep(std::time::Duration::from_secs(wait_secs)) => {
-            false
-        }
-        _ = cancel_token.cancelled() => {
-            true
+            if cancel_token.is_cancelled() {
+                Err(LLMError::Cancelled)
+            } else {
+                Ok(())
+            }
         }
     }
 }
@@ -167,6 +167,8 @@ async fn wait_with_cancellation(wait_secs: u64, cancel_token: &CancellationToken
 ///
 /// Returns `Some((message, retry_after_seconds))` if the error is a rate limit error.
 fn extract_rate_limit_info(error: &LLMError) -> Option<(String, Option<u64>)> {
+    // Providers map vendor rate-limit codes → LLMError::RateLimited before core.
+    // Do not re-sniff vendor identifiers here.
     match error {
         LLMError::RateLimited {
             message,
@@ -183,15 +185,14 @@ fn extract_rate_limit_info(error: &LLMError) -> Option<(String, Option<u64>)> {
 
 /// Create a streaming connection with retry logic for rate limits and transient errors.
 ///
-/// Unlike `call_llm_with_retry` which retries the entire request including consuming the
-/// response, this only retries stream *creation*. Once the stream yields its first chunk
-/// we are committed — tokens may already have been sent to the UI and we cannot roll back.
+/// This retries stream creation only. Mid-stream recovery is handled by the consumer,
+/// which may recreate a stream only before it observes semantic output.
 pub(super) async fn create_stream_with_retry<F, Fut>(
     config: &AgentConfig,
     session_id: &str,
     cancel_token: &CancellationToken,
     create_stream: F,
-) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, anyhow::Error>
+) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
 where
     F: Fn() -> Fut,
     Fut: Future<
@@ -201,57 +202,55 @@ where
         >,
     >,
 {
-    let max_retries = config.execution_policy.rate_limit.max_retries;
+    let max_attempts = config.execution_policy.rate_limit.max_retries.max(1);
     let mut attempt = 0;
 
     loop {
         attempt += 1;
 
         if cancel_token.is_cancelled() {
-            return Err(anyhow::anyhow!("Cancelled"));
+            return Err(LLMError::Cancelled);
         }
 
         match create_stream().await {
             Ok(stream) => return Ok(stream),
-
             Err(e) => {
-                if let Some((message, retry_after)) = extract_rate_limit_info(&e) {
-                    if attempt >= max_retries {
-                        return Err(anyhow::anyhow!(
-                            "Rate limit exceeded after {} attempts: {}",
-                            max_retries,
-                            message
-                        ));
-                    }
+                let rate_limit_info = extract_rate_limit_info(&e);
+                if !e.is_retryable() || attempt >= max_attempts {
+                    return Err(e);
+                }
 
-                    let wait_secs = calculate_rate_limit_wait(config, retry_after, attempt);
+                let wait_secs = retry_delay_secs(config, &e, attempt);
+                if let Some((message, _)) = rate_limit_info {
                     let started_at = time::OffsetDateTime::now_utc().unix_timestamp();
-
                     info!(
                         "Session {} rate limited (streaming), attempt {}/{}, waiting {}s",
-                        session_id, attempt, max_retries, wait_secs
+                        session_id, attempt, max_attempts, wait_secs
                     );
-
                     config.emit_event(
                         session_id,
                         AgentEventKind::RateLimited {
-                            message: message.clone(),
+                            message,
                             wait_secs,
                             started_at,
                             attempt: u32_from_usize(attempt, "attempt", Some(session_id)),
                             max_attempts: u32_from_usize(
-                                max_retries,
-                                "max_retries",
+                                max_attempts,
+                                "max_attempts",
                                 Some(session_id),
                             ),
                         },
                     );
+                } else {
+                    debug!(
+                        "Session {} transient stream setup error on attempt {}, retrying in {}s: {}",
+                        session_id, attempt, wait_secs, e
+                    );
+                }
 
-                    let cancelled = wait_with_cancellation(wait_secs, cancel_token).await;
-                    if cancelled {
-                        return Err(anyhow::anyhow!("Cancelled during rate limit wait"));
-                    }
+                wait_for_retry_delay(wait_secs, cancel_token).await?;
 
+                if extract_rate_limit_info(&e).is_some() {
                     config.emit_event(
                         session_id,
                         AgentEventKind::RateLimitResume {
@@ -262,22 +261,6 @@ where
                             ),
                         },
                     );
-
-                    continue;
-                } else if is_transient_error(&e) && attempt < max_retries {
-                    let wait_secs =
-                        calculate_rate_limit_wait(config, e.retry_after_secs(), attempt);
-                    debug!(
-                        "Session {} transient stream error on attempt {}, retrying in {}s: {}",
-                        session_id, attempt, wait_secs, e
-                    );
-                    let cancelled = wait_with_cancellation(wait_secs, cancel_token).await;
-                    if cancelled {
-                        return Err(anyhow::anyhow!("Cancelled during retry wait"));
-                    }
-                    continue;
-                } else {
-                    return Err(anyhow::Error::from(e));
                 }
             }
         }
@@ -285,8 +268,51 @@ where
 }
 
 /// Returns true for setup errors that are worth retrying.
+#[cfg(test)]
 fn is_transient_error(e: &LLMError) -> bool {
     e.is_retryable()
+}
+
+pub(super) async fn next_stream_chunk(
+    stream: &mut Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
+    cancel_token: &CancellationToken,
+) -> Result<StreamChunk, LLMError> {
+    tokio::select! {
+        item = stream.next() => item.unwrap_or_else(|| Err(LLMError::Transport {
+            kind: querymt::error::TransportErrorKind::ConnectionClosed,
+            message: "LLM stream ended before a completion marker".to_string(),
+        })),
+        _ = cancel_token.cancelled() => Err(LLMError::Cancelled),
+    }
+}
+
+pub(super) fn stream_chunk_commits_output(chunk: &StreamChunk) -> bool {
+    match chunk {
+        StreamChunk::Text(text) | StreamChunk::Thinking(text) => !text.is_empty(),
+        StreamChunk::ThinkingSignature(_) => true,
+        StreamChunk::ToolUseStart { .. } | StreamChunk::ToolUseComplete { .. } => true,
+        StreamChunk::ToolUseInputDelta { partial_json, .. } => !partial_json.is_empty(),
+        StreamChunk::Usage(_) | StreamChunk::Done { .. } => false,
+    }
+}
+
+pub(super) fn begin_stream_retry(
+    error: &LLMError,
+    semantic_output_seen: bool,
+    retries_used: &mut usize,
+    max_stream_retries: usize,
+    cancelled: bool,
+) -> Option<usize> {
+    if cancelled
+        || semantic_output_seen
+        || !error.is_retryable()
+        || *retries_used >= max_stream_retries
+    {
+        return None;
+    }
+
+    *retries_used += 1;
+    Some(*retries_used)
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -305,8 +331,8 @@ mod tests {
         mock_plugin_registry, mock_session,
     };
     use querymt::LLMParams;
-    use querymt::chat::ChatResponse;
-    use querymt::error::LLMError;
+    use querymt::chat::{ChatResponse, FinishReason, StreamChunk};
+    use querymt::error::{LLMError, ProviderErrorContext};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
@@ -397,26 +423,80 @@ mod tests {
         assert!(extract_rate_limit_info(&err).is_none());
     }
 
-    // ── calculate_rate_limit_wait tests ─────────────────────────────────────
+    #[test]
+    fn test_extract_rate_limit_info_unified_rate_limited_kind() {
+        let err = LLMError::RateLimited {
+            message: "Rate limit reached".to_string(),
+            retry_after_secs: Some(12),
+        };
+        let info = extract_rate_limit_info(&err).expect("RateLimited should extract");
+        assert_eq!(info.0, "Rate limit reached");
+        assert_eq!(info.1, Some(12));
+
+        // Catch-all provider errors are not rate-limit UI events even if retryable.
+        let non_rate = LLMError::ProviderResponseError {
+            message: "server broke".to_string(),
+            context: ProviderErrorContext {
+                provider: "openai".to_string(),
+                code: Some("server_error".to_string()),
+                error_type: Some("api_error".to_string()),
+                request_id: None,
+                retry_after_secs: None,
+                transient: true,
+            },
+        };
+        assert!(extract_rate_limit_info(&non_rate).is_none());
+
+        let overloaded = LLMError::ServerOverloaded {
+            message: "busy".into(),
+            context: ProviderErrorContext {
+                provider: "codex".into(),
+                code: Some("server_is_overloaded".into()),
+                error_type: None,
+                request_id: None,
+                retry_after_secs: None,
+                transient: true,
+            },
+        };
+        assert!(extract_rate_limit_info(&overloaded).is_none());
+        assert!(overloaded.is_retryable());
+    }
+
+    // ── retry delay tests ────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_calculate_rate_limit_wait_uses_retry_after() {
+    async fn test_retry_delay_uses_retry_after() {
         let (config, _temp) = make_config().await;
-        let wait = calculate_rate_limit_wait(&config, Some(60), 1);
-        assert_eq!(wait, 60, "should use retry_after_secs directly");
+        let error = LLMError::HttpStatus {
+            status_code: 503,
+            message: "unavailable".to_string(),
+            retry_after_secs: Some(60),
+        };
+        assert_eq!(retry_delay_secs(&config, &error, 1), 60);
     }
 
     #[tokio::test]
-    async fn test_calculate_rate_limit_wait_exponential_backoff_no_retry_after() {
+    async fn test_retry_delay_uses_retry_ordinal_for_exponential_backoff() {
         let (config, _temp) = make_config().await;
-        // attempt=1: base * 2^0 = 1 * 1.0 = 1s
-        let w1 = calculate_rate_limit_wait(&config, None, 1);
-        // attempt=2: base * 2^1 = 1 * 2.0 = 2s
-        let w2 = calculate_rate_limit_wait(&config, None, 2);
-        // attempt=3: base * 2^2 = 1 * 4.0 = 4s
-        let w3 = calculate_rate_limit_wait(&config, None, 3);
-        assert!(w2 >= w1, "wait should grow with attempt");
-        assert!(w3 >= w2, "wait should grow with attempt");
+        let error = LLMError::HttpStatus {
+            status_code: 503,
+            message: "unavailable".to_string(),
+            retry_after_secs: None,
+        };
+        for (ordinal, expected) in [(1, 1), (2, 2), (3, 4)] {
+            let actual = retry_delay_secs(&config, &error, ordinal);
+            assert!(
+                actual.abs_diff(expected) <= 1,
+                "ordinal {ordinal}: expected jitter near {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_calculated_jitter_is_bounded_and_deterministic() {
+        assert_eq!(apply_jitter(100.0, 0.2, 0.0), 80);
+        assert_eq!(apply_jitter(100.0, 0.2, 0.5), 100);
+        assert_eq!(apply_jitter(100.0, 0.2, 1.0), 120);
     }
 
     // ── is_transient_error tests ─────────────────────────────────────────────
@@ -470,38 +550,36 @@ mod tests {
         )));
     }
 
-    // ── wait_with_cancellation tests ─────────────────────────────────────────
+    // ── cancellation-aware wait tests ────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_wait_with_cancellation_completes_normally() {
+    async fn test_wait_for_retry_delay_completes_normally() {
         let token = CancellationToken::new();
-        // Very short wait (0s) should complete normally
-        let cancelled = wait_with_cancellation(0, &token).await;
-        assert!(
-            !cancelled,
-            "wait should complete normally, not be cancelled"
-        );
+        assert!(wait_for_retry_delay(0, &token).await.is_ok());
     }
 
     #[tokio::test]
-    async fn test_wait_with_cancellation_cancelled_early() {
+    async fn test_wait_for_retry_delay_cancelled_early() {
         let token = CancellationToken::new();
-        token.cancel(); // cancel before waiting
-        let cancelled = wait_with_cancellation(60, &token).await;
-        assert!(cancelled, "should return true when already cancelled");
+        token.cancel();
+        assert!(matches!(
+            wait_for_retry_delay(60, &token).await,
+            Err(LLMError::Cancelled)
+        ));
     }
 
     #[tokio::test]
-    async fn test_wait_with_cancellation_cancel_during_wait() {
+    async fn test_wait_for_retry_delay_cancelled_during_wait() {
         let token = CancellationToken::new();
         let token_clone = token.clone();
-        // Cancel after 10ms while waiting for 60s
         tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             token_clone.cancel();
         });
-        let cancelled = wait_with_cancellation(60, &token).await;
-        assert!(cancelled, "should be cancelled by background task");
+        assert!(matches!(
+            wait_for_retry_delay(60, &token).await,
+            Err(LLMError::Cancelled)
+        ));
     }
 
     // ── call_llm_with_retry tests ────────────────────────────────────────────
@@ -585,13 +663,36 @@ mod tests {
         })
         .await;
 
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("Cancelled"),
-            "expected Cancelled, got: {}",
-            msg
-        );
+        assert!(matches!(result, Err(LLMError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn test_call_llm_with_retry_cancellation_during_delay_starts_no_retry() {
+        let (config, _temp) = make_config().await;
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count2 = call_count.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            token_clone.cancel();
+        });
+        let result = call_llm_with_retry(&config, "test-session", &token, || {
+            let count = call_count2.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Err::<Box<dyn ChatResponse>, _>(LLMError::HttpStatus {
+                    status_code: 503,
+                    message: "unavailable".to_string(),
+                    retry_after_secs: Some(60),
+                })
+            }
+        })
+        .await;
+
+        assert!(matches!(result, Err(LLMError::Cancelled)));
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -614,14 +715,174 @@ mod tests {
         })
         .await;
 
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("Rate limit exceeded"),
-            "unexpected error: {}",
-            msg
-        );
-        // Should have tried max_retries times
+        assert!(matches!(
+            result,
+            Err(LLMError::RateLimited {
+                message,
+                retry_after_secs: Some(0),
+            }) if message == "rate limited"
+        ));
+        // max_retries is the total number of setup attempts.
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_create_stream_with_retry_preserves_typed_provider_error_on_exhaustion() {
+        let (config, _temp) = make_config().await;
+        let token = CancellationToken::new();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count2 = call_count.clone();
+
+        let result = create_stream_with_retry(&config, "test-session", &token, || {
+            let count = call_count2.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Err(LLMError::ServerOverloaded {
+                    message: "overloaded".into(),
+                    context: ProviderErrorContext {
+                        provider: "test".into(),
+                        code: Some("server_is_overloaded".into()),
+                        error_type: None,
+                        request_id: Some("request-3".into()),
+                        retry_after_secs: Some(0),
+                        transient: true,
+                    },
+                })
+            }
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(LLMError::ServerOverloaded { message, context })
+                if message == "overloaded"
+                    && context.request_id.as_deref() == Some("request-3")
+        ));
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_next_stream_chunk_maps_eof_and_cancellation() {
+        let mut empty: Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>> =
+            Box::pin(futures_util::stream::empty());
+        let error = next_stream_chunk(&mut empty, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            LLMError::Transport {
+                kind: querymt::error::TransportErrorKind::ConnectionClosed,
+                ..
+            }
+        ));
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut pending: Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>> =
+            Box::pin(futures_util::stream::pending());
+        assert!(matches!(
+            next_stream_chunk(&mut pending, &cancel).await,
+            Err(LLMError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn test_stream_chunk_commit_policy_covers_semantic_variants() {
+        assert!(!stream_chunk_commits_output(&StreamChunk::Text(
+            String::new()
+        )));
+        assert!(stream_chunk_commits_output(&StreamChunk::Text("x".into())));
+        assert!(!stream_chunk_commits_output(&StreamChunk::Thinking(
+            String::new()
+        )));
+        assert!(stream_chunk_commits_output(&StreamChunk::Thinking(
+            "x".into()
+        )));
+        assert!(stream_chunk_commits_output(
+            &StreamChunk::ThinkingSignature(String::new())
+        ));
+        assert!(stream_chunk_commits_output(&StreamChunk::ToolUseStart {
+            index: 0,
+            id: "call-1".into(),
+            name: "read".into(),
+        }));
+        assert!(!stream_chunk_commits_output(
+            &StreamChunk::ToolUseInputDelta {
+                index: 0,
+                partial_json: String::new(),
+            }
+        ));
+        assert!(stream_chunk_commits_output(
+            &StreamChunk::ToolUseInputDelta {
+                index: 0,
+                partial_json: "{".into(),
+            }
+        ));
+        assert!(!stream_chunk_commits_output(&StreamChunk::Done {
+            finish_reason: FinishReason::Stop,
+        }));
+    }
+
+    #[test]
+    fn test_thinking_and_tool_output_prevent_stream_retry() {
+        let error = LLMError::HttpStatus {
+            status_code: 503,
+            message: "unavailable".into(),
+            retry_after_secs: None,
+        };
+        for chunk in [
+            StreamChunk::Thinking("reasoning".into()),
+            StreamChunk::ThinkingSignature("signature".into()),
+            StreamChunk::ToolUseStart {
+                index: 0,
+                id: "call-1".into(),
+                name: "read".into(),
+            },
+            StreamChunk::ToolUseInputDelta {
+                index: 0,
+                partial_json: "{".into(),
+            },
+        ] {
+            let mut retries_used = 0;
+            assert_eq!(
+                begin_stream_retry(
+                    &error,
+                    stream_chunk_commits_output(&chunk),
+                    &mut retries_used,
+                    1,
+                    false,
+                ),
+                None,
+            );
+            assert_eq!(retries_used, 0);
+        }
+    }
+
+    #[test]
+    fn test_stream_retry_policy_counts_retries_and_stops_after_output_or_exhaustion() {
+        let error = LLMError::HttpStatus {
+            status_code: 503,
+            message: "unavailable".into(),
+            retry_after_secs: None,
+        };
+        let mut retries_used = 0;
+
+        assert_eq!(
+            begin_stream_retry(&error, false, &mut retries_used, 1, false),
+            Some(1)
+        );
+        assert_eq!(retries_used, 1);
+        assert_eq!(
+            begin_stream_retry(&error, false, &mut retries_used, 1, false),
+            None
+        );
+        assert_eq!(
+            begin_stream_retry(&error, true, &mut retries_used, 2, false),
+            None
+        );
+        assert_eq!(
+            begin_stream_retry(&error, false, &mut retries_used, 2, true),
+            None
+        );
     }
 }

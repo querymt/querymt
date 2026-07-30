@@ -213,6 +213,12 @@ pub const DEFAULT_RATE_LIMIT_BACKOFF_MULTIPLIER: f64 = 2.0;
 /// Default max retries for mid-stream transport failures
 pub const DEFAULT_STREAM_MAX_RETRIES: usize = 1;
 
+/// Default proportional jitter applied to calculated backoff delays
+pub const DEFAULT_RATE_LIMIT_JITTER_RATIO: f64 = 0.2;
+
+/// Default upper bound for calculated retry delays
+pub const DEFAULT_RATE_LIMIT_MAX_WAIT_SECS: u64 = 300;
+
 fn default_rate_limit_max_retries() -> usize {
     DEFAULT_RATE_LIMIT_MAX_RETRIES
 }
@@ -227,6 +233,14 @@ fn default_rate_limit_backoff_multiplier() -> f64 {
 
 fn default_stream_max_retries() -> usize {
     DEFAULT_STREAM_MAX_RETRIES
+}
+
+fn default_rate_limit_jitter_ratio() -> f64 {
+    DEFAULT_RATE_LIMIT_JITTER_RATIO
+}
+
+fn default_rate_limit_max_wait_secs() -> u64 {
+    DEFAULT_RATE_LIMIT_MAX_WAIT_SECS
 }
 
 /// Configuration for rate limit retry behavior
@@ -246,10 +260,19 @@ pub struct RateLimitConfig {
     #[serde(default = "default_rate_limit_backoff_multiplier")]
     pub backoff_multiplier: f64,
 
-    /// Max retries for mid-stream transport failures (default: 1).
-    /// On each retry, accumulated text is discarded and the stream is re-created.
+    /// Max retries for pre-output stream transport failures (default: 1).
+    /// Retries are only allowed before any semantic output has been emitted;
+    /// once text/thinking/tool output is observed, the stream is not recreated.
     #[serde(default = "default_stream_max_retries")]
     pub max_stream_retries: usize,
+
+    /// Proportional jitter for calculated delays. Provider retry hints are not jittered.
+    #[serde(default = "default_rate_limit_jitter_ratio")]
+    pub jitter_ratio: f64,
+
+    /// Upper bound for calculated delays. Provider retry hints remain authoritative.
+    #[serde(default = "default_rate_limit_max_wait_secs")]
+    pub max_wait_secs: u64,
 }
 
 impl Default for RateLimitConfig {
@@ -259,6 +282,8 @@ impl Default for RateLimitConfig {
             default_wait_secs: DEFAULT_RATE_LIMIT_WAIT_SECS,
             backoff_multiplier: DEFAULT_RATE_LIMIT_BACKOFF_MULTIPLIER,
             max_stream_retries: DEFAULT_STREAM_MAX_RETRIES,
+            jitter_ratio: DEFAULT_RATE_LIMIT_JITTER_RATIO,
+            max_wait_secs: DEFAULT_RATE_LIMIT_MAX_WAIT_SECS,
         }
     }
 }

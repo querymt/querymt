@@ -1633,6 +1633,40 @@ async fn acquire_execution_permit_with_timeout(
     }
 }
 
+fn map_prompt_execution_error(error: &anyhow::Error) -> AgentError {
+    let reason = format!("{error:#}");
+    let llm_error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<querymt::error::LLMError>());
+
+    match llm_error {
+        // Cancel must never surface as a provider-chat failure. Primary path is
+        // ExecutionState::Cancelled at the transition boundary; this is defense
+        // in depth if Cancelled still leaks through an anyhow chain.
+        Some(querymt::error::LLMError::Cancelled) => {
+            AgentError::Internal("prompt cancelled".to_string())
+        }
+        Some(llm_error) => AgentError::ProviderChat {
+            operation: infer_prompt_operation(error).to_string(),
+            reason,
+            llm_error: Some(llm_error.to_payload()),
+        },
+        None => AgentError::Internal(reason),
+    }
+}
+
+/// Infer chat vs chat_stream from distinct anyhow contexts attached in transitions.
+fn infer_prompt_operation(error: &anyhow::Error) -> &'static str {
+    // Prefer exact context phrases from `map_failed_llm_call` / mid-stream failures.
+    // Avoid broad "stream" substring matching (false positives in provider messages).
+    let chain = format!("{error:#}");
+    if chain.contains("LLM streaming error") {
+        "chat_stream"
+    } else {
+        "chat"
+    }
+}
+
 #[instrument(
     name = "agent.prompt.execute",
     skip(exec),
@@ -2016,10 +2050,10 @@ async fn execute_prompt_detached(
             config.emit_event(
                 &session_id,
                 AgentEventKind::Error {
-                    message: e.to_string(),
+                    message: format!("{e:#}"),
                 },
             );
-            Err(AgentError::Internal(e.to_string()))
+            Err(map_prompt_execution_error(&e))
         }
     }
 }
@@ -2090,6 +2124,7 @@ mod tests {
     };
     use kameo::actor::Spawn;
     use querymt::LLMParams;
+    use querymt::error::{LLMError, LLMErrorPayload, ProviderErrorContext};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -2194,6 +2229,85 @@ mod tests {
                 _temp_dir: temp_dir,
             }
         }
+    }
+
+    // ── Error conversion tests ───────────────────────────────────────────────
+
+    #[test]
+    fn prompt_error_preserves_wrapped_llm_payload() {
+        let context = ProviderErrorContext {
+            provider: "openai".to_string(),
+            code: Some("server_error".to_string()),
+            error_type: Some("api_error".to_string()),
+            request_id: Some("req-456".to_string()),
+            retry_after_secs: Some(1),
+            transient: true,
+        };
+        let error = anyhow::Error::new(LLMError::ProviderResponseError {
+            message: "service overloaded".to_string(),
+            context: context.clone(),
+        })
+        .context("LLM streaming error");
+
+        let mapped = map_prompt_execution_error(&error);
+
+        assert!(matches!(
+            mapped,
+            AgentError::ProviderChat {
+                operation,
+                reason,
+                llm_error: Some(LLMErrorPayload::ProviderError {
+                    message,
+                    context: Some(payload_context),
+                }),
+            } if operation == "chat_stream"
+                && reason == "LLM streaming error: LLM Provider Error: service overloaded"
+                && message == "service overloaded"
+                && payload_context == context
+        ));
+    }
+
+    #[test]
+    fn prompt_error_non_stream_reports_chat_operation() {
+        let error = anyhow::Error::new(LLMError::HttpError("upstream failed".into()))
+            .context("LLM chat error");
+
+        let mapped = map_prompt_execution_error(&error);
+
+        match mapped {
+            AgentError::ProviderChat {
+                operation,
+                llm_error: Some(LLMErrorPayload::HttpError { .. }),
+                ..
+            } => assert_eq!(operation, "chat"),
+            other => panic!("expected ProviderChat(chat), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_error_cancelled_does_not_become_provider_chat() {
+        let error = anyhow::Error::new(LLMError::Cancelled).context("LLM chat error");
+
+        let mapped = map_prompt_execution_error(&error);
+
+        assert!(
+            !matches!(mapped, AgentError::ProviderChat { .. }),
+            "Cancelled must not become ProviderChat, got {mapped:?}"
+        );
+        assert!(matches!(mapped, AgentError::Internal(reason) if reason.contains("cancel")));
+    }
+
+    #[test]
+    fn prompt_error_without_llm_source_preserves_full_chain_as_internal() {
+        let error = anyhow::anyhow!("database unavailable").context("session execution failed");
+
+        let mapped = map_prompt_execution_error(&error);
+
+        assert!(matches!(
+            mapped,
+            AgentError::Internal(reason)
+                if reason == "session execution failed: database unavailable"
+        ));
     }
 
     // ── Actor message handler tests ──────────────────────────────────────────

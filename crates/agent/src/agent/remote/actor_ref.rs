@@ -101,8 +101,15 @@ impl SessionActorRef {
 // For the Local variant we forward directly. For Remote, we forward through
 // the kameo remote transport.
 //
-// Error handling: local `SendError` and remote `RemoteSendError` are both
-// mapped to `AgentError::RemoteActor` for a uniform API.
+// Error handling keeps local delivery failures distinct from remote transport
+// failures and preserves handler-returned `AgentError` values.
+
+fn map_local_prompt_send_error<M>(error: kameo::error::SendError<M, AgentError>) -> AcpError {
+    AcpError::from(match error {
+        kameo::error::SendError::HandlerError(err) => err,
+        other => AgentError::Internal(format!("local session actor error: {other}")),
+    })
+}
 
 impl SessionActorRef {
     const REMOTE_CONTROL_MAILBOX_TIMEOUT: Duration = Duration::from_secs(10);
@@ -164,7 +171,7 @@ impl SessionActorRef {
             Self::Local(actor_ref) => actor_ref
                 .ask(messages::Prompt { req })
                 .await
-                .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
+                .map_err(map_local_prompt_send_error),
 
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
@@ -899,5 +906,69 @@ impl SessionActorRef {
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use querymt::error::{LLMErrorPayload, ProviderErrorContext};
+
+    #[test]
+    fn local_prompt_handler_error_preserves_structured_acp_data() {
+        let error =
+            kameo::error::SendError::<(), AgentError>::HandlerError(AgentError::ProviderChat {
+                operation: "chat_stream".to_string(),
+                reason: "LLM streaming error: provider overloaded".to_string(),
+                llm_error: Some(LLMErrorPayload::ProviderError {
+                    message: "provider overloaded".to_string(),
+                    context: Some(ProviderErrorContext {
+                        provider: "openai".to_string(),
+                        code: Some("server_error".to_string()),
+                        error_type: None,
+                        request_id: None,
+                        retry_after_secs: None,
+                        transient: true,
+                    }),
+                }),
+            });
+
+        let acp = map_local_prompt_send_error(error);
+
+        assert_eq!(acp.code, agent_client_protocol::ErrorCode::InternalError);
+        assert_eq!(acp.message, "LLM provider temporarily unavailable");
+        assert_eq!(
+            acp.data,
+            Some(serde_json::json!({
+                "schema": "querymt.error.v1",
+                "kind": "llm",
+                "operation": "chat_stream",
+                "reason": "LLM streaming error: provider overloaded",
+                "llm_error": {
+                    "type": "provider_error",
+                    "message": "provider overloaded",
+                    "context": {
+                        "provider": "openai",
+                        "code": "server_error",
+                        "transient": true
+                    }
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn local_prompt_delivery_error_is_not_labeled_remote() {
+        let error = kameo::error::SendError::<(), AgentError>::ActorStopped;
+
+        let acp = map_local_prompt_send_error(error);
+
+        assert_eq!(acp.code, agent_client_protocol::ErrorCode::InternalError);
+        assert_eq!(
+            acp.message,
+            "internal error: local session actor error: actor stopped"
+        );
+        assert!(!acp.message.contains("remote actor"));
+        assert_eq!(acp.data, None);
     }
 }

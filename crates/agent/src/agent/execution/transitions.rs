@@ -113,6 +113,22 @@ pub(super) fn apply_cache_breakpoints(messages: &[ChatMessage]) -> Vec<ChatMessa
         .collect()
 }
 
+/// Map a failed LLM setup/call into either `Cancelled` or a contextual anyhow error.
+///
+/// Cancel must never bubble as `Err` here — that would become `ProviderChat` via
+/// `map_prompt_execution_error`. Streaming vs non-streaming contexts attach distinct
+/// messages so the mapper can report `chat_stream` vs `chat`.
+pub(super) fn map_failed_llm_call(
+    error: LLMError,
+    streaming: bool,
+) -> Result<ExecutionState, anyhow::Error> {
+    match error {
+        LLMError::Cancelled => Ok(ExecutionState::Cancelled),
+        e if streaming => Err(anyhow::Error::from(e).context("LLM streaming error")),
+        e => Err(anyhow::Error::from(e).context("LLM chat error")),
+    }
+}
+
 /// Transition from CallLlm to AfterLlm.
 ///
 /// This invokes the LLM (with or without tools), handles streaming for codex provider,
@@ -175,7 +191,7 @@ pub(super) async fn transition_call_llm(
     ) = if tools.is_empty() {
         // No tools — always use the non-streaming simple submit path.
         let cancel = exec_ctx.cancellation_token.clone();
-        let resp = super::llm_retry::call_llm_with_retry(
+        let resp = match super::llm_retry::call_llm_with_retry(
             config,
             session_id,
             &exec_ctx.cancellation_token,
@@ -194,7 +210,11 @@ pub(super) async fn transition_call_llm(
                 }
             },
         )
-        .await?;
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) => return map_failed_llm_call(e, false),
+        };
 
         (
             resp.text().unwrap_or_default(),
@@ -219,7 +239,7 @@ pub(super) async fn transition_call_llm(
 
             // Accumulators live outside the retry loop so the post-stream
             // processing below can read them regardless of how many attempts
-            // were needed.  On each retry they are reset to empty.
+            // were needed. Retries are allowed only before semantic output.
             let mut text = String::new();
             let mut thinking = String::new();
             // Initial values are always overwritten inside the retry loop below
@@ -286,25 +306,13 @@ pub(super) async fn transition_call_llm(
             }
 
             // ── Outer retry loop ─────────────────────────────────────────────
-            // On transient mid-stream errors we discard accumulated text and
-            // re-create the stream.  The provider treats it as a fresh request.
-            let mut stream_attempt = 0;
+            // A retry is safe only while the failed attempt has produced no
+            // semantic output, so no user-visible content can be rolled back.
+            let mut stream_retries_used = 0;
             'stream: loop {
-                stream_attempt += 1;
+                let mut semantic_output_seen = false;
 
-                // Reset accumulators on retry so we start fresh.
-                text.clear();
-                thinking.clear();
-                thinking_signature = None;
-                stream_tool_calls.clear();
-                tool_call_ids.clear();
-                usage = None;
-                stream_finish_reason = None;
-                text_buffer.clear();
-                thinking_buffer.clear();
-                last_flush = Instant::now();
-
-                let mut stream = super::llm_retry::create_stream_with_retry(
+                let mut stream = match super::llm_retry::create_stream_with_retry(
                     config,
                     session_id,
                     &exec_ctx.cancellation_token,
@@ -319,20 +327,19 @@ pub(super) async fn transition_call_llm(
                         }
                     },
                 )
-                .await?;
+                .await
+                {
+                    Ok(stream) => stream,
+                    Err(e) => return map_failed_llm_call(e, true),
+                };
 
                 // ── Inner consume loop ───────────────────────────────────────
                 loop {
-                    let item = tokio::select! {
-                        item = stream.next() => item,
-                        _ = exec_ctx.cancellation_token.cancelled() => {
-                            return Ok(ExecutionState::Cancelled);
-                        }
-                    };
-
-                    let Some(item) = item else {
-                        break 'stream;
-                    };
+                    let item = super::llm_retry::next_stream_chunk(
+                        &mut stream,
+                        &exec_ctx.cancellation_token,
+                    )
+                    .await;
 
                     let chunk = match item {
                         Ok(chunk) => chunk,
@@ -357,19 +364,38 @@ pub(super) async fn transition_call_llm(
                             );
                             continue;
                         }
-                        Err(e) if e.is_retryable() && stream_attempt <= max_stream_retries => {
-                            debug!(
-                                "Session {}: retryable mid-stream error on attempt {}/{}: {}",
-                                session_id, stream_attempt, max_stream_retries, e
+                        Err(LLMError::Cancelled) => return Ok(ExecutionState::Cancelled),
+                        Err(e) => {
+                            let retry_number = super::llm_retry::begin_stream_retry(
+                                &e,
+                                semantic_output_seen,
+                                &mut stream_retries_used,
+                                max_stream_retries,
+                                exec_ctx.cancellation_token.is_cancelled(),
                             );
-                            flush_buffers!(true);
+                            let Some(retry_number) = retry_number else {
+                                if exec_ctx.cancellation_token.is_cancelled() {
+                                    return Ok(ExecutionState::Cancelled);
+                                }
+                                if semantic_output_seen {
+                                    flush_buffers!(false);
+                                }
+                                return Err(anyhow::Error::from(e).context("LLM streaming error"));
+                            };
+
+                            let wait_secs =
+                                super::llm_retry::retry_delay_secs(config, &e, retry_number);
+                            debug!(
+                                "Session {}: retryable pre-output stream error, retry {}/{}, waiting {}s: {}",
+                                session_id, retry_number, max_stream_retries, wait_secs, e
+                            );
                             config.emit_event(
                                 session_id,
                                 AgentEventKind::StreamRecovering {
                                     message: e.to_string(),
                                     attempt: u32_from_usize(
-                                        stream_attempt,
-                                        "stream_attempt",
+                                        retry_number,
+                                        "stream_retries_used",
                                         Some(session_id),
                                     ),
                                     max_attempts: u32_from_usize(
@@ -380,10 +406,33 @@ pub(super) async fn transition_call_llm(
                                     message_id: Some(message_id.clone()),
                                 },
                             );
-                            continue 'stream; // retry with fresh stream + accumulators
+
+                            if super::llm_retry::wait_for_retry_delay(
+                                wait_secs,
+                                &exec_ctx.cancellation_token,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                return Ok(ExecutionState::Cancelled);
+                            }
+
+                            // The failed attempt had no semantic output. Clear
+                            // metadata only after the cancellation-aware delay.
+                            text.clear();
+                            thinking.clear();
+                            thinking_signature = None;
+                            stream_tool_calls.clear();
+                            tool_call_ids.clear();
+                            usage = None;
+                            text_buffer.clear();
+                            thinking_buffer.clear();
+                            last_flush = Instant::now();
+                            continue 'stream;
                         }
-                        Err(e) => return Err(anyhow::Error::from(e).context("LLM streaming error")),
                     };
+
+                    semantic_output_seen |= super::llm_retry::stream_chunk_commits_output(&chunk);
 
                     match chunk {
                         StreamChunk::Text(delta) => {
@@ -542,7 +591,7 @@ pub(super) async fn transition_call_llm(
         } else {
             // === NON-STREAMING FALLBACK ===
             let cancel = exec_ctx.cancellation_token.clone();
-            let resp = super::llm_retry::call_llm_with_retry(
+            let resp = match super::llm_retry::call_llm_with_retry(
                 config,
                 session_id,
                 &exec_ctx.cancellation_token,
@@ -563,7 +612,11 @@ pub(super) async fn transition_call_llm(
                     }
                 },
             )
-            .await?;
+            .await
+            {
+                Ok(resp) => resp,
+                Err(e) => return map_failed_llm_call(e, false),
+            };
 
             (
                 resp.text().unwrap_or_default(),
@@ -1042,6 +1095,30 @@ mod tests {
             content: vec![Content::text(content)],
             cache: None,
         }
+    }
+
+    // ── map_failed_llm_call ───────────────────────────────────────────────────
+
+    #[test]
+    fn setup_cancel_maps_to_cancelled_not_error() {
+        let non_stream =
+            map_failed_llm_call(LLMError::Cancelled, false).expect("cancel must be Ok(Cancelled)");
+        assert!(matches!(non_stream, ExecutionState::Cancelled));
+
+        let stream = map_failed_llm_call(LLMError::Cancelled, true)
+            .expect("stream setup cancel must be Ok(Cancelled)");
+        assert!(matches!(stream, ExecutionState::Cancelled));
+    }
+
+    #[test]
+    fn setup_failures_use_chat_vs_stream_context() {
+        let chat_err = map_failed_llm_call(LLMError::GenericError("boom".into()), false)
+            .expect_err("non-stream failure is Err");
+        assert!(format!("{chat_err:#}").contains("LLM chat error"));
+
+        let stream_err = map_failed_llm_call(LLMError::GenericError("boom".into()), true)
+            .expect_err("stream failure is Err");
+        assert!(format!("{stream_err:#}").contains("LLM streaming error"));
     }
 
     // ── apply_cache_breakpoints ───────────────────────────────────────────────

@@ -13,7 +13,10 @@ use querymt::{
         ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort, StreamChunk,
         Tool, ToolChoice,
     },
-    error::LLMError,
+    error::{
+        LLMError, ProviderErrorContext, extract_retry_after_from_json,
+        parse_retry_after_from_message,
+    },
     handle_http_error,
 };
 use schemars::{Schema, SchemaGenerator, json_schema};
@@ -313,6 +316,8 @@ struct CodexSseEvent {
     delta: Option<String>,
     arguments: Option<String>,
     response: Option<Value>,
+    #[serde(alias = "requestId")]
+    request_id: Option<String>,
     item: Option<Value>,
     output_index: Option<usize>,
     item_id: Option<String>,
@@ -783,6 +788,7 @@ pub fn codex_parse_stream_chunk_with_state(
     chunk: &[u8],
     tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
 ) -> Result<Vec<StreamChunk>, LLMError> {
+    let provider = "codex";
     if chunk.is_empty() {
         return Ok(Vec::new());
     }
@@ -938,21 +944,102 @@ pub fn codex_parse_stream_chunk_with_state(
                 results.push(StreamChunk::Done { finish_reason });
             }
             "response.failed" => {
-                let message = event
-                    .response
-                    .as_ref()
-                    .and_then(|r| r.get("error"))
-                    .and_then(|e| e.get("message"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("Codex response failed");
-                clear_thinking_state(tool_state_buffer);
-                return Err(LLMError::ProviderError(message.to_string()));
+                let response = event.response.unwrap_or(Value::Null);
+                let error = response.get("error").unwrap_or(&Value::Null);
+                let provider_error = map_codex_response_failed(
+                    provider,
+                    error,
+                    &response,
+                    event.request_id.as_deref(),
+                );
+                tool_state_buffer.lock().unwrap().clear();
+                return Err(provider_error);
             }
             _ => {}
         }
     }
 
     Ok(results)
+}
+
+/// Map Codex `response.failed` error objects into unified [`LLMError`] kinds.
+///
+/// Code table follows openai/codex (`codex-api` SSE `response.failed` handlers):
+/// - `server_is_overloaded` | `slow_down` → [`LLMError::ServerOverloaded`] (retryable here)
+/// - `rate_limit_exceeded` → [`LLMError::RateLimited`] (+ message delay parse)
+/// - `context_length_exceeded` → [`LLMError::ContextWindowExceeded`]
+/// - `insufficient_quota` | `usage_not_included` → [`LLMError::QuotaExceeded`]
+/// - `cyber_policy` | `invalid_prompt` | `bio_policy` → [`LLMError::InvalidRequest`]
+/// - unknown structured code → retryable catch-all before semantic output
+///
+/// Vendor dialect stays in this provider; core only sees unified kinds.
+fn map_codex_response_failed(
+    provider: &str,
+    error: &Value,
+    response: &Value,
+    explicit_request_id: Option<&str>,
+) -> LLMError {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "codex response failed".to_owned());
+    let code = error.get("code").and_then(Value::as_str).map(str::to_owned);
+    let error_type = error
+        .get("type")
+        .or_else(|| error.get("error_type"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let request_id = explicit_request_id.map(str::to_owned).or_else(|| {
+        error
+            .get("request_id")
+            .or_else(|| error.get("requestId"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    let retry_after_secs =
+        extract_retry_after_from_json(error).or_else(|| extract_retry_after_from_json(response));
+    let code_norm = code
+        .as_deref()
+        .map(|code| code.trim().to_ascii_lowercase().replace(['-', ' '], "_"));
+
+    let context = |transient, retry_after_secs| {
+        ProviderErrorContext::builder(provider)
+            .code(code.clone())
+            .error_type(error_type.clone())
+            .request_id(request_id.clone())
+            .retry_after_secs(retry_after_secs)
+            .transient(transient)
+            .build()
+    };
+
+    match code_norm.as_deref() {
+        Some("server_is_overloaded" | "slow_down") => LLMError::ServerOverloaded {
+            message,
+            context: context(true, retry_after_secs),
+        },
+        Some("rate_limit_exceeded") => LLMError::RateLimited {
+            retry_after_secs: retry_after_secs.or_else(|| parse_retry_after_from_message(&message)),
+            message,
+        },
+        Some("context_length_exceeded") => LLMError::ContextWindowExceeded {
+            message,
+            context: context(false, None),
+        },
+        Some("insufficient_quota" | "usage_not_included") => LLMError::QuotaExceeded {
+            message,
+            context: context(false, None),
+        },
+        Some("cyber_policy" | "invalid_prompt" | "bio_policy" | "invalid_request") => {
+            LLMError::InvalidRequest(message)
+        }
+        _ => LLMError::ProviderResponseError {
+            message,
+            context: context(true, retry_after_secs),
+        },
+    }
 }
 
 fn mark_streamed_thinking_emitted(
@@ -1346,7 +1433,10 @@ mod tests {
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use http::header::AUTHORIZATION;
-    use querymt::chat::{ChatMessage, ChatResponse, ChatRole, Content, FinishReason, StreamChunk};
+    use querymt::{
+        chat::{ChatMessage, ChatResponse, ChatRole, Content, FinishReason, StreamChunk},
+        error::LLMError,
+    };
     use serde_json::Value;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -1742,6 +1832,146 @@ mod tests {
         let response: CodexChatResponse = serde_json::from_slice(body).unwrap();
         assert_eq!(response.text().as_deref(), Some("answer"));
         assert_eq!(response.thinking().as_deref(), Some("why because details"));
+    }
+
+    fn parse_failed_event(
+        payload: &str,
+    ) -> (LLMError, Arc<Mutex<HashMap<usize, CodexToolUseState>>>) {
+        let state = Arc::new(Mutex::new(HashMap::<usize, CodexToolUseState>::from([
+            (0, CodexToolUseState::default()),
+            (usize::MAX, CodexToolUseState::default()),
+        ])));
+        let chunk = format!("data: {payload}\n\n");
+        let error = codex_parse_stream_chunk_with_state(chunk.as_bytes(), &state)
+            .expect_err("response.failed should return an error");
+        (error, state)
+    }
+
+    #[test]
+    fn codex_response_failed_maps_server_is_overloaded_to_unified_kind() {
+        let (error, state) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"id":"resp_086d39fcd1bd4726016a6b3477038081919b8f301082107795","object":"response","status":"failed","error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}}"#,
+        );
+        match &error {
+            LLMError::ServerOverloaded { message, context } => {
+                assert_eq!(
+                    message,
+                    "Our servers are currently overloaded. Please try again later."
+                );
+                assert_eq!(context.provider, "codex");
+                assert_eq!(context.code.as_deref(), Some("server_is_overloaded"));
+                assert!(error.is_retryable());
+            }
+            other => panic!("expected ServerOverloaded, got {other}"),
+        }
+        assert!(state.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn codex_response_failed_maps_slow_down_to_server_overloaded() {
+        let (error, _) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"error":{"code":"slow_down","message":"slow down"}}}"#,
+        );
+        assert!(matches!(error, LLMError::ServerOverloaded { .. }));
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn codex_response_failed_maps_invalid_request_codes() {
+        for code in [
+            "invalid_request",
+            "invalid_prompt",
+            "bio_policy",
+            "cyber_policy",
+        ] {
+            let payload = format!(
+                r#"{{"type":"response.failed","response":{{"error":{{"message":"bad","code":"{code}"}}}}}}"#
+            );
+            let (error, _) = parse_failed_event(&payload);
+            assert!(
+                matches!(error, LLMError::InvalidRequest(ref message) if message == "bad"),
+                "code={code}, got {error}"
+            );
+            assert!(!error.is_retryable());
+        }
+    }
+
+    #[test]
+    fn codex_response_failed_maps_context_and_quota() {
+        let (ctx_err, _) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"error":{"message":"too long","code":"context_length_exceeded"}}}"#,
+        );
+        assert!(matches!(ctx_err, LLMError::ContextWindowExceeded { .. }));
+        assert!(!ctx_err.is_retryable());
+
+        let (quota_err, _) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"error":{"message":"no credits","code":"insufficient_quota"}}}"#,
+        );
+        assert!(matches!(quota_err, LLMError::QuotaExceeded { .. }));
+        assert!(!quota_err.is_retryable());
+    }
+
+    #[test]
+    fn codex_response_failed_maps_rate_limit_with_message_delay() {
+        let (error, _) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"error":{"message":"Rate limit reached for gpt-5.1. Please try again in 11.054s.","type":"rate_limit_error","code":"rate_limit_exceeded"}}}"#,
+        );
+        match &error {
+            LLMError::RateLimited {
+                message,
+                retry_after_secs,
+            } => {
+                assert!(message.contains("Rate limit reached"));
+                assert_eq!(*retry_after_secs, Some(12));
+            }
+            other => panic!("expected rate limit, got {other}"),
+        }
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn codex_response_failed_preserves_event_request_id_on_overload() {
+        let (error, _) = parse_failed_event(
+            r#"{"type":"response.failed","requestId":"req_event","response":{"id":"resp_not_request_id","error":{"message":"busy","code":"server_is_overloaded","retry_after":"2s"}}}"#,
+        );
+        match &error {
+            LLMError::ServerOverloaded { context, .. } => {
+                assert_eq!(context.request_id.as_deref(), Some("req_event"));
+                assert_eq!(context.retry_after_secs, Some(2));
+            }
+            other => panic!("expected ServerOverloaded, got {other}"),
+        }
+    }
+
+    #[test]
+    fn codex_response_failed_unknown_code_is_retryable_before_output() {
+        let (error, _) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"error":{"message":"Service unavailable; try again later","code":"unrecognized"}}}"#,
+        );
+        match &error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.code.as_deref(), Some("unrecognized"));
+                assert!(context.transient);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn codex_response_failed_without_error_is_retryable_before_output() {
+        let (error, _) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"id":"resp_not_request_id"}}"#,
+        );
+        match &error {
+            LLMError::ProviderResponseError { message, context } => {
+                assert_eq!(message, "codex response failed");
+                assert_eq!(context.request_id, None);
+                assert!(context.transient);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+        assert!(error.is_retryable());
     }
 
     #[test]
