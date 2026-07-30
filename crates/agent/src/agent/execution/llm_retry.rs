@@ -125,8 +125,7 @@ pub(super) fn retry_delay_secs(
     let base = policy.default_wait_secs as f64;
     let multiplier = policy.backoff_multiplier;
     let calculated = base * multiplier.powi(retry_ordinal.saturating_sub(1) as i32);
-    let bounded = calculated.min(policy.max_wait_secs as f64);
-    apply_jitter(bounded, policy.jitter_ratio, jitter_sample())
+    apply_jitter(calculated, policy.jitter_ratio, jitter_sample()).min(policy.max_wait_secs)
 }
 
 fn apply_jitter(delay_secs: f64, ratio: f64, sample: f64) -> u64 {
@@ -141,7 +140,11 @@ fn jitter_sample() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.subsec_nanos())
         .unwrap_or(0);
-    f64::from(nanos) / f64::from(u32::MAX)
+    jitter_sample_from_nanos(nanos)
+}
+
+fn jitter_sample_from_nanos(nanos: u32) -> f64 {
+    f64::from(nanos) / 1_000_000_000.0
 }
 
 /// Wait for a retry delay, returning a typed cancellation error if interrupted.
@@ -497,6 +500,43 @@ mod tests {
         assert_eq!(apply_jitter(100.0, 0.2, 0.0), 80);
         assert_eq!(apply_jitter(100.0, 0.2, 0.5), 100);
         assert_eq!(apply_jitter(100.0, 0.2, 1.0), 120);
+    }
+
+    #[test]
+    fn test_jitter_sample_uses_full_unit_interval() {
+        assert_eq!(jitter_sample_from_nanos(0), 0.0);
+        assert_eq!(jitter_sample_from_nanos(500_000_000), 0.5);
+        assert!(jitter_sample_from_nanos(999_999_999) > 0.999_999_998);
+    }
+
+    #[tokio::test]
+    async fn test_calculated_retry_delay_does_not_exceed_max_wait() {
+        let (mut config, _temp) = make_config().await;
+        let config = Arc::get_mut(&mut config).expect("config is uniquely owned");
+        config.execution_policy.rate_limit.default_wait_secs = 1_000;
+        config.execution_policy.rate_limit.max_wait_secs = 10;
+        config.execution_policy.rate_limit.jitter_ratio = 1.0;
+
+        let error = LLMError::HttpStatus {
+            status_code: 503,
+            message: "unavailable".to_string(),
+            retry_after_secs: None,
+        };
+        assert!(retry_delay_secs(config, &error, 1) <= 10);
+    }
+
+    #[tokio::test]
+    async fn test_provider_retry_hint_remains_authoritative_above_max_wait() {
+        let (mut config, _temp) = make_config().await;
+        let config = Arc::get_mut(&mut config).expect("config is uniquely owned");
+        config.execution_policy.rate_limit.max_wait_secs = 10;
+
+        let error = LLMError::HttpStatus {
+            status_code: 503,
+            message: "unavailable".to_string(),
+            retry_after_secs: Some(60),
+        };
+        assert_eq!(retry_delay_secs(config, &error, 1), 60);
     }
 
     // ── is_transient_error tests ─────────────────────────────────────────────

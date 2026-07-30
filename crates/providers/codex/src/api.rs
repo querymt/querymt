@@ -962,6 +962,29 @@ pub fn codex_parse_stream_chunk_with_state(
     Ok(results)
 }
 
+fn recognized_codex_error_kind(kind: &str) -> Option<&str> {
+    match kind {
+        "server_is_overloaded"
+        | "slow_down"
+        | "overloaded_error"
+        | "rate_limit_exceeded"
+        | "rate_limit_error"
+        | "context_length_exceeded"
+        | "context_length_error"
+        | "insufficient_quota"
+        | "usage_not_included"
+        | "cyber_policy"
+        | "invalid_prompt"
+        | "bio_policy"
+        | "invalid_request"
+        | "invalid_request_error"
+        | "authentication_error"
+        | "invalid_api_key"
+        | "unauthorized" => Some(kind),
+        _ => None,
+    }
+}
+
 /// Map Codex `response.failed` error objects into unified [`LLMError`] kinds.
 ///
 /// Code table follows openai/codex (`codex-api` SSE `response.failed` handlers):
@@ -1004,6 +1027,13 @@ fn map_codex_response_failed(
     let code_norm = code
         .as_deref()
         .map(|code| code.trim().to_ascii_lowercase().replace(['-', ' '], "_"));
+    let type_norm = error_type
+        .as_deref()
+        .map(|kind| kind.trim().to_ascii_lowercase().replace(['-', ' '], "_"));
+    let kind = code_norm
+        .as_deref()
+        .and_then(recognized_codex_error_kind)
+        .or_else(|| type_norm.as_deref().and_then(recognized_codex_error_kind));
 
     let context = |transient, retry_after_secs| {
         ProviderErrorContext::builder(provider)
@@ -1015,25 +1045,36 @@ fn map_codex_response_failed(
             .build()
     };
 
-    match code_norm.as_deref() {
-        Some("server_is_overloaded" | "slow_down") => LLMError::ServerOverloaded {
-            message,
-            context: context(true, retry_after_secs),
-        },
-        Some("rate_limit_exceeded") => LLMError::RateLimited {
+    match kind {
+        Some("server_is_overloaded" | "slow_down" | "overloaded_error") => {
+            LLMError::ServerOverloaded {
+                message,
+                context: context(true, retry_after_secs),
+            }
+        }
+        Some("rate_limit_exceeded" | "rate_limit_error") => LLMError::RateLimited {
             retry_after_secs: retry_after_secs.or_else(|| parse_retry_after_from_message(&message)),
             message,
         },
-        Some("context_length_exceeded") => LLMError::ContextWindowExceeded {
-            message,
-            context: context(false, None),
-        },
+        Some("context_length_exceeded" | "context_length_error") => {
+            LLMError::ContextWindowExceeded {
+                message,
+                context: context(false, None),
+            }
+        }
         Some("insufficient_quota" | "usage_not_included") => LLMError::QuotaExceeded {
             message,
             context: context(false, None),
         },
-        Some("cyber_policy" | "invalid_prompt" | "bio_policy" | "invalid_request") => {
-            LLMError::InvalidRequest(message)
+        Some(
+            "cyber_policy"
+            | "invalid_prompt"
+            | "bio_policy"
+            | "invalid_request"
+            | "invalid_request_error",
+        ) => LLMError::InvalidRequest(message),
+        Some("authentication_error" | "invalid_api_key" | "unauthorized") => {
+            LLMError::AuthError(message)
         }
         _ => LLMError::ProviderResponseError {
             message,
@@ -1941,6 +1982,24 @@ mod tests {
             }
             other => panic!("expected ServerOverloaded, got {other}"),
         }
+    }
+
+    #[test]
+    fn codex_response_failed_falls_back_from_unknown_code_to_known_type() {
+        let (error, _) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"error":{"message":"slow down","code":"vendor_specific","type":"rate_limit_error"}}}"#,
+        );
+        assert!(matches!(error, LLMError::RateLimited { .. }));
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn codex_response_failed_maps_type_only_permanent_error() {
+        let (error, _) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"error":{"message":"bad key","type":"authentication_error"}}}"#,
+        );
+        assert!(matches!(error, LLMError::AuthError(ref message) if message == "bad key"));
+        assert!(!error.is_retryable());
     }
 
     #[test]

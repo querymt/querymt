@@ -1200,6 +1200,36 @@ pub struct OpenAIToolUseState {
     pub started: bool,
 }
 
+fn recognized_openai_error_kind(kind: &str) -> Option<&str> {
+    match kind {
+        "server_is_overloaded"
+        | "slow_down"
+        | "overloaded_error"
+        | "overloaded"
+        | "rate_limit_exceeded"
+        | "rate_limit_error"
+        | "rate_limited"
+        | "rate_limit"
+        | "too_many_requests"
+        | "context_length_exceeded"
+        | "context_length_error"
+        | "context_length"
+        | "insufficient_quota"
+        | "usage_not_included"
+        | "invalid_request"
+        | "invalid_request_error"
+        | "invalid_prompt"
+        | "bio_policy"
+        | "cyber_policy"
+        | "authentication_error"
+        | "invalid_api_key"
+        | "unauthorized"
+        | "server_error"
+        | "internal_server_error" => Some(kind),
+        _ => None,
+    }
+}
+
 /// Map an OpenAI-compatible SSE/HTTP `{ "error": ... }` envelope into unified
 /// [`LLMError`] kinds. Vendor `code`/`type` dialect stays in this provider.
 fn map_openai_error_envelope(
@@ -1246,7 +1276,10 @@ fn map_openai_error_envelope(
     let type_norm = error_type
         .as_deref()
         .map(|kind| kind.trim().to_ascii_lowercase().replace(['-', ' '], "_"));
-    let kind = code_norm.as_deref().or(type_norm.as_deref());
+    let kind = code_norm
+        .as_deref()
+        .and_then(recognized_openai_error_kind)
+        .or_else(|| type_norm.as_deref().and_then(recognized_openai_error_kind));
 
     let context = |transient, retry_after_secs| {
         ProviderErrorContext::builder(provider)
@@ -1891,6 +1924,28 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         let error = parse_openai_sse_chunk(chunk, &mut tool_states).unwrap_err();
         assert!(matches!(error, LLMError::ServerOverloaded { .. }));
         assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn parse_sse_chunk_falls_back_from_unknown_code_to_known_type() {
+        let mut tool_states = HashMap::new();
+        let chunk = br#"data: {"error":{"message":"slow down","code":"vendor_specific","type":"rate_limit_error"}}
+
+"#;
+        let error = parse_openai_sse_chunk(chunk, &mut tool_states).unwrap_err();
+        assert!(matches!(error, LLMError::RateLimited { .. }));
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn parse_sse_chunk_maps_type_only_permanent_error() {
+        let mut tool_states = HashMap::new();
+        let chunk = br#"data: {"error":{"message":"too long","type":"context_length_error"}}
+
+"#;
+        let error = parse_openai_sse_chunk(chunk, &mut tool_states).unwrap_err();
+        assert!(matches!(error, LLMError::ContextWindowExceeded { .. }));
+        assert!(!error.is_retryable());
     }
 
     #[test]

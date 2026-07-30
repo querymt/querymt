@@ -166,6 +166,39 @@ pub enum LLMErrorPayload {
     },
 }
 
+impl LLMErrorPayload {
+    /// Whether this serialized error represents a transient failure worth retrying.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::ProviderError {
+                context: Some(context),
+                ..
+            } => context.transient,
+            Self::ServerOverloaded { .. }
+            | Self::RateLimited { .. }
+            | Self::HttpError { .. }
+            | Self::Transport { .. }
+            | Self::PluginError { .. }
+            | Self::IoError { .. } => true,
+            Self::HttpStatus { status_code, .. } => matches!(status_code, 429 | 500..=599),
+            Self::GenericError { .. }
+            | Self::ProviderError { context: None, .. }
+            | Self::QuotaExceeded { .. }
+            | Self::ContextWindowExceeded { .. }
+            | Self::AuthError { .. }
+            | Self::ToolConfigError { .. }
+            | Self::InvalidRequest { .. }
+            | Self::ResponseFormatError { .. }
+            | Self::Cancelled
+            | Self::RemoteStreamDisconnected { .. }
+            | Self::RemoteStreamReconnected { .. }
+            | Self::NotImplemented { .. }
+            | Self::JsonError { .. }
+            | Self::InvalidUrl { .. } => false,
+        }
+    }
+}
+
 /// Error types that can occur when interacting with LLM providers.
 #[derive(Error, Debug)]
 pub enum LLMError {
@@ -1093,6 +1126,46 @@ mod tests {
                 .build(),
         };
         assert!(!permanent.is_retryable());
+    }
+
+    #[test]
+    fn payload_retryability_is_stable_without_reconstruction() {
+        assert!(
+            !LLMErrorPayload::JsonError {
+                message: "bad JSON".into(),
+            }
+            .is_retryable()
+        );
+        assert!(
+            !LLMErrorPayload::InvalidUrl {
+                message: "bad URL".into(),
+            }
+            .is_retryable()
+        );
+        assert!(
+            LLMErrorPayload::IoError {
+                message: "connection reset".into(),
+            }
+            .is_retryable()
+        );
+        assert!(
+            LLMErrorPayload::ProviderError {
+                message: "temporary".into(),
+                context: Some(
+                    ProviderErrorContext::builder("test")
+                        .transient(true)
+                        .build(),
+                ),
+            }
+            .is_retryable()
+        );
+        assert!(
+            !LLMErrorPayload::ProviderError {
+                message: "permanent".into(),
+                context: None,
+            }
+            .is_retryable()
+        );
     }
 
     #[test]

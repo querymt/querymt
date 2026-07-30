@@ -137,10 +137,7 @@ impl From<AgentError> for AcpError {
 }
 
 fn provider_error_is_transient(payload: Option<&LLMErrorPayload>) -> bool {
-    payload
-        .cloned()
-        .map(querymt::error::LLMError::from_payload)
-        .is_some_and(|error| error.is_retryable())
+    payload.is_some_and(LLMErrorPayload::is_retryable)
 }
 
 impl From<anyhow::Error> for AgentError {
@@ -377,6 +374,36 @@ mod tests {
         }
         .into();
         assert_eq!(transport.message, "LLM provider temporarily unavailable");
+    }
+
+    #[test]
+    fn lossy_payload_variants_keep_stable_acp_retryability() {
+        for llm_error in [
+            LLMErrorPayload::JsonError {
+                message: "invalid JSON".to_string(),
+            },
+            LLMErrorPayload::InvalidUrl {
+                message: "invalid URL".to_string(),
+            },
+        ] {
+            let acp: AcpError = AgentError::ProviderChat {
+                operation: "chat".to_string(),
+                reason: "provider response failed".to_string(),
+                llm_error: Some(llm_error),
+            }
+            .into();
+            assert_eq!(acp.message, "LLM provider request failed");
+        }
+
+        let acp: AcpError = AgentError::ProviderChat {
+            operation: "chat".to_string(),
+            reason: "I/O failed".to_string(),
+            llm_error: Some(LLMErrorPayload::IoError {
+                message: "connection reset".to_string(),
+            }),
+        }
+        .into();
+        assert_eq!(acp.message, "LLM provider temporarily unavailable");
     }
 
     #[test]
