@@ -224,49 +224,49 @@ pub enum LLMError {
     #[error("LLM Provider Error: {message}")]
     ProviderResponseError {
         message: String,
-        context: ProviderErrorContext,
+        context: Box<ProviderErrorContext>,
     },
 
     /// Provider capacity / overload. Retryable in QueryMT (product choice).
     #[error("Server overloaded: {message}")]
     ServerOverloaded {
         message: String,
-        context: ProviderErrorContext,
+        context: Box<ProviderErrorContext>,
     },
 
     /// Plan/billing quota exhausted — not a short-term rate limit.
     #[error("Quota exceeded: {message}")]
     QuotaExceeded {
         message: String,
-        context: ProviderErrorContext,
+        context: Box<ProviderErrorContext>,
     },
 
     /// Prompt/context exceeds the model window.
     #[error("Context window exceeded: {message}")]
     ContextWindowExceeded {
         message: String,
-        context: ProviderErrorContext,
+        context: Box<ProviderErrorContext>,
     },
 
     /// Provider rate limit with diagnostics retained for ACP/remote consumers.
     #[error("Rate limited: {message}")]
     ProviderRateLimited {
         message: String,
-        context: ProviderErrorContext,
+        context: Box<ProviderErrorContext>,
     },
 
     /// Provider authentication failure with diagnostics retained.
     #[error("Auth Error: {message}")]
     ProviderAuthError {
         message: String,
-        context: ProviderErrorContext,
+        context: Box<ProviderErrorContext>,
     },
 
     /// Provider request rejection with diagnostics retained.
     #[error("Invalid Request: {message}")]
     ProviderInvalidRequest {
         message: String,
-        context: ProviderErrorContext,
+        context: Box<ProviderErrorContext>,
     },
 
     /// A wrapper for authentication/authorization errors.
@@ -357,7 +357,7 @@ impl LLMError {
             },
             Self::ProviderResponseError { message, context } => LLMErrorPayload::ProviderError {
                 message: message.clone(),
-                context: Some(context.clone()),
+                context: Some((**context).clone()),
             },
             Self::ServerOverloaded { message, context }
             | Self::ProviderRateLimited { message, context }
@@ -366,7 +366,7 @@ impl LLMError {
             | Self::ProviderAuthError { message, context }
             | Self::ProviderInvalidRequest { message, context } => LLMErrorPayload::ProviderError {
                 message: message.clone(),
-                context: Some(context.clone()),
+                context: Some((**context).clone()),
             },
             Self::AuthError(message) => LLMErrorPayload::AuthError {
                 message: message.clone(),
@@ -439,25 +439,34 @@ impl LLMError {
             LLMErrorPayload::GenericError { message } => Self::GenericError(message),
             LLMErrorPayload::ProviderError { message, context } => match context {
                 Some(context) => match context.kind {
-                    Some(ProviderErrorKind::ServerOverloaded) => {
-                        Self::ServerOverloaded { message, context }
-                    }
-                    Some(ProviderErrorKind::RateLimited) => {
-                        Self::ProviderRateLimited { message, context }
-                    }
-                    Some(ProviderErrorKind::QuotaExceeded) => {
-                        Self::QuotaExceeded { message, context }
-                    }
-                    Some(ProviderErrorKind::ContextWindowExceeded) => {
-                        Self::ContextWindowExceeded { message, context }
-                    }
-                    Some(ProviderErrorKind::Authentication) => {
-                        Self::ProviderAuthError { message, context }
-                    }
-                    Some(ProviderErrorKind::InvalidRequest) => {
-                        Self::ProviderInvalidRequest { message, context }
-                    }
-                    None => Self::ProviderResponseError { message, context },
+                    Some(ProviderErrorKind::ServerOverloaded) => Self::ServerOverloaded {
+                        message,
+                        context: Box::new(context),
+                    },
+                    Some(ProviderErrorKind::RateLimited) => Self::ProviderRateLimited {
+                        message,
+                        context: Box::new(context),
+                    },
+                    Some(ProviderErrorKind::QuotaExceeded) => Self::QuotaExceeded {
+                        message,
+                        context: Box::new(context),
+                    },
+                    Some(ProviderErrorKind::ContextWindowExceeded) => Self::ContextWindowExceeded {
+                        message,
+                        context: Box::new(context),
+                    },
+                    Some(ProviderErrorKind::Authentication) => Self::ProviderAuthError {
+                        message,
+                        context: Box::new(context),
+                    },
+                    Some(ProviderErrorKind::InvalidRequest) => Self::ProviderInvalidRequest {
+                        message,
+                        context: Box::new(context),
+                    },
+                    None => Self::ProviderResponseError {
+                        message,
+                        context: Box::new(context),
+                    },
                 },
                 None => Self::ProviderError(message),
             },
@@ -1077,12 +1086,14 @@ mod tests {
     fn structured_semantic_errors_round_trip_through_legacy_provider_tag() {
         let overloaded = LLMError::ServerOverloaded {
             message: "busy".into(),
-            context: ProviderErrorContext::builder("codex")
-                .kind(ProviderErrorKind::ServerOverloaded)
-                .code(Some("server_is_overloaded".into()))
-                .request_id(Some("req-1".into()))
-                .transient(true)
-                .build(),
+            context: Box::new(
+                ProviderErrorContext::builder("codex")
+                    .kind(ProviderErrorKind::ServerOverloaded)
+                    .code(Some("server_is_overloaded".into()))
+                    .request_id(Some("req-1".into()))
+                    .transient(true)
+                    .build(),
+            ),
         };
         let payload = overloaded.to_payload();
         let json = serde_json::to_value(&payload).unwrap();
@@ -1106,10 +1117,12 @@ mod tests {
 
         let quota = LLMError::QuotaExceeded {
             message: "no credits".into(),
-            context: ProviderErrorContext::builder("openai")
-                .kind(ProviderErrorKind::QuotaExceeded)
-                .code(Some("insufficient_quota".into()))
-                .build(),
+            context: Box::new(
+                ProviderErrorContext::builder("openai")
+                    .kind(ProviderErrorKind::QuotaExceeded)
+                    .code(Some("insufficient_quota".into()))
+                    .build(),
+            ),
         };
         assert!(!quota.is_retryable());
         assert!(matches!(
@@ -1119,10 +1132,12 @@ mod tests {
 
         let context = LLMError::ContextWindowExceeded {
             message: "too long".into(),
-            context: ProviderErrorContext::builder("codex")
-                .kind(ProviderErrorKind::ContextWindowExceeded)
-                .code(Some("context_length_exceeded".into()))
-                .build(),
+            context: Box::new(
+                ProviderErrorContext::builder("codex")
+                    .kind(ProviderErrorKind::ContextWindowExceeded)
+                    .code(Some("context_length_exceeded".into()))
+                    .build(),
+            ),
         };
         assert!(!context.is_retryable());
         assert!(matches!(
@@ -1154,9 +1169,11 @@ mod tests {
     fn server_overloaded_is_retryable_by_kind() {
         let err = LLMError::ServerOverloaded {
             message: "capacity".into(),
-            context: ProviderErrorContext::builder("codex")
-                .code(Some("server_is_overloaded".into()))
-                .build(),
+            context: Box::new(
+                ProviderErrorContext::builder("codex")
+                    .code(Some("server_is_overloaded".into()))
+                    .build(),
+            ),
         };
         // Kind wins even if context.transient were false.
         assert!(err.is_retryable());
@@ -1166,20 +1183,24 @@ mod tests {
     fn provider_response_error_honors_context_transient_flag() {
         let transient = LLMError::ProviderResponseError {
             message: "maybe".into(),
-            context: ProviderErrorContext::builder("x")
-                .code(Some("unknown".into()))
-                .retry_after_secs(Some(5))
-                .transient(true)
-                .build(),
+            context: Box::new(
+                ProviderErrorContext::builder("x")
+                    .code(Some("unknown".into()))
+                    .retry_after_secs(Some(5))
+                    .transient(true)
+                    .build(),
+            ),
         };
         assert!(transient.is_retryable());
         assert_eq!(transient.retry_after_secs(), Some(5));
 
         let permanent = LLMError::ProviderResponseError {
             message: "nope".into(),
-            context: ProviderErrorContext::builder("x")
-                .code(Some("unknown".into()))
-                .build(),
+            context: Box::new(
+                ProviderErrorContext::builder("x")
+                    .code(Some("unknown".into()))
+                    .build(),
+            ),
         };
         assert!(!permanent.is_retryable());
     }

@@ -1105,11 +1105,11 @@ fn map_codex_response_failed(
         Some("server_is_overloaded" | "slow_down" | "overloaded_error") => {
             LLMError::ServerOverloaded {
                 message,
-                context: context(
+                context: Box::new(context(
                     Some(ProviderErrorKind::ServerOverloaded),
                     true,
                     retry_after_secs,
-                ),
+                )),
             }
         }
         Some("rate_limit_exceeded" | "rate_limit_error") => {
@@ -1117,18 +1117,26 @@ fn map_codex_response_failed(
                 retry_after_secs.or_else(|| parse_retry_after_from_message(&message));
             LLMError::ProviderRateLimited {
                 message,
-                context: context(Some(ProviderErrorKind::RateLimited), true, retry_after_secs),
+                context: Box::new(context(
+                    Some(ProviderErrorKind::RateLimited),
+                    true,
+                    retry_after_secs,
+                )),
             }
         }
         Some("context_length_exceeded" | "context_length_error") => {
             LLMError::ContextWindowExceeded {
                 message,
-                context: context(Some(ProviderErrorKind::ContextWindowExceeded), false, None),
+                context: Box::new(context(
+                    Some(ProviderErrorKind::ContextWindowExceeded),
+                    false,
+                    None,
+                )),
             }
         }
         Some("insufficient_quota" | "usage_not_included") => LLMError::QuotaExceeded {
             message,
-            context: context(Some(ProviderErrorKind::QuotaExceeded), false, None),
+            context: Box::new(context(Some(ProviderErrorKind::QuotaExceeded), false, None)),
         },
         Some(
             "cyber_policy"
@@ -1138,17 +1146,25 @@ fn map_codex_response_failed(
             | "invalid_request_error",
         ) => LLMError::ProviderInvalidRequest {
             message,
-            context: context(Some(ProviderErrorKind::InvalidRequest), false, None),
+            context: Box::new(context(
+                Some(ProviderErrorKind::InvalidRequest),
+                false,
+                None,
+            )),
         },
         Some("authentication_error" | "invalid_api_key" | "unauthorized") => {
             LLMError::ProviderAuthError {
                 message,
-                context: context(Some(ProviderErrorKind::Authentication), false, None),
+                context: Box::new(context(
+                    Some(ProviderErrorKind::Authentication),
+                    false,
+                    None,
+                )),
             }
         }
         _ => LLMError::ProviderResponseError {
             message,
-            context: context(None, true, retry_after_secs),
+            context: Box::new(context(None, true, retry_after_secs)),
         },
     }
 }

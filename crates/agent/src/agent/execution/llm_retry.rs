@@ -469,7 +469,7 @@ mod tests {
         // Catch-all provider errors are not rate-limit UI events even if retryable.
         let non_rate = LLMError::ProviderResponseError {
             message: "server broke".to_string(),
-            context: ProviderErrorContext {
+            context: Box::new(ProviderErrorContext {
                 provider: "openai".to_string(),
                 kind: None,
                 code: Some("server_error".to_string()),
@@ -477,13 +477,13 @@ mod tests {
                 request_id: None,
                 retry_after_secs: None,
                 transient: true,
-            },
+            }),
         };
         assert!(extract_rate_limit_info(&non_rate).is_none());
 
         let overloaded = LLMError::ServerOverloaded {
             message: "busy".into(),
-            context: ProviderErrorContext {
+            context: Box::new(ProviderErrorContext {
                 provider: "codex".into(),
                 kind: Some(querymt::error::ProviderErrorKind::ServerOverloaded),
                 code: Some("server_is_overloaded".into()),
@@ -491,7 +491,7 @@ mod tests {
                 request_id: None,
                 retry_after_secs: None,
                 transient: true,
-            },
+            }),
         };
         assert!(extract_rate_limit_info(&overloaded).is_none());
         assert!(overloaded.is_retryable());
@@ -813,7 +813,7 @@ mod tests {
                     count.fetch_add(1, Ordering::SeqCst);
                     Err(LLMError::ServerOverloaded {
                         message: "overloaded".into(),
-                        context: ProviderErrorContext {
+                        context: Box::new(ProviderErrorContext {
                             provider: "test".into(),
                             kind: Some(querymt::error::ProviderErrorKind::ServerOverloaded),
                             code: Some("server_is_overloaded".into()),
@@ -821,7 +821,7 @@ mod tests {
                             request_id: Some("request-3".into()),
                             retry_after_secs: Some(0),
                             transient: true,
-                        },
+                        }),
                     })
                 }
             })

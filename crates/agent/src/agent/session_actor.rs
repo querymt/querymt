@@ -2246,7 +2246,7 @@ mod tests {
         };
         let error = anyhow::Error::new(LLMError::ProviderResponseError {
             message: "service overloaded".to_string(),
-            context: context.clone(),
+            context: Box::new(context.clone()),
         })
         .context("LLM streaming error");
 

@@ -322,15 +322,15 @@ mod tests {
             llm_error: Some(
                 querymt::error::LLMError::ServerOverloaded {
                     message: "overloaded".to_string(),
-                    context: ProviderErrorContext {
+                    context: Box::new(ProviderErrorContext {
                         provider: "codex".to_string(),
                         kind: Some(querymt::error::ProviderErrorKind::ServerOverloaded),
                         code: Some("server_is_overloaded".to_string()),
                         error_type: None,
-                        request_id: None,
+                        request_id: Some("req-1".to_string()),
                         retry_after_secs: None,
                         transient: true,
-                    },
+                    }),
                 }
                 .to_payload(),
             ),
