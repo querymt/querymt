@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vector = llm.embed(vec!["Hello world!".to_string()]).await?;
 
     // Print embedding statistics and data
-    println!("Data: {:?}", &vector);
+    println!("Data: {:?}", vector);
 
     Ok(())
 }
