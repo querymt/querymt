@@ -346,7 +346,9 @@ mod tests {
     fn chat_request_omits_reasoning_content_for_assistant_tool_calls() {
         let provider = test_provider();
         let messages = vec![
-            ChatMessage::user().text("what's this project about?").build(),
+            ChatMessage::user()
+                .text("what's this project about?")
+                .build(),
             ChatMessage::assistant()
                 .thinking("I should read the README.")
                 .tool_use(

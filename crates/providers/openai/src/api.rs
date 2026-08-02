@@ -903,10 +903,7 @@ pub fn openai_parse_chat<C: OpenAIProviderConfig>(
 }
 
 /// Extract the thinking/reasoning content from a ChatMessage, if any.
-fn extract_reasoning_content<'a>(
-    msg: &'a ChatMessage,
-    include: bool,
-) -> Option<Cow<'a, str>> {
+fn extract_reasoning_content<'a>(msg: &'a ChatMessage, include: bool) -> Option<Cow<'a, str>> {
     if !include {
         return None;
     }
