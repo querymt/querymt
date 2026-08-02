@@ -433,7 +433,8 @@ impl LLMProviderFactory for ExtismFactory {
                 Err(e) => return Box::pin(async move { Err(e) }),
             };
             return async move {
-                let resp = crate::outbound::call_outbound(req).await?;
+                let resp =
+                    crate::outbound::ensure_success(crate::outbound::call_outbound(req).await?)?;
                 <Self as HTTPLLMProviderFactory>::parse_list_models(self, resp)
             }
             .boxed();
@@ -1177,6 +1178,34 @@ impl ChatStreamParser for ExtismStreamParser {
 }
 
 impl HTTPChatProvider for ExtismProvider {
+    fn classify_chat_error(&self, response: &http::Response<Vec<u8>>) -> LLMError {
+        let cfg = match self.effective_config() {
+            Ok(cfg) => cfg,
+            Err(error) => return error,
+        };
+        let mut plug = self.plugin.lock().unwrap();
+        if !plug.function_exists("classify_chat_error") {
+            return crate::error::classify_http_status(
+                response.status().as_u16(),
+                response.headers(),
+                response.body(),
+            );
+        }
+
+        let response = response.clone();
+        let result: Result<Json<PluginError>, (extism::Error, i32)> = plug.call_get_error_code(
+            "classify_chat_error",
+            Json(ExtismChatParseRequest {
+                cfg,
+                resp: SerializableHttpResponse { resp: response },
+            }),
+        );
+        match result {
+            Ok(Json(error)) => LLMError::from_payload(error.payload),
+            Err((error, code)) => decode_plugin_error(error, code),
+        }
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],

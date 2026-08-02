@@ -799,7 +799,13 @@ pub fn classify_codex_http_error(provider: &str, response: &Response<Vec<u8>>) -
             .get("error")
             .or_else(|| envelope.get("error"))
         {
-            let mut mapped = map_codex_response_failed(provider, error, response_value, request_id);
+            let mut mapped = map_codex_response_failed(
+                provider,
+                error,
+                response_value,
+                request_id,
+                matches!(status, 429 | 500..=599),
+            );
             if mapped.retry_after_secs().is_none()
                 && let Some(retry_after_secs) = retry_after_secs
             {
@@ -1004,6 +1010,7 @@ pub fn codex_parse_stream_chunk_with_state(
                     error,
                     &response,
                     event.request_id.as_deref(),
+                    true,
                 );
                 tool_state_buffer.lock().unwrap().clear();
                 return Err(provider_error);
@@ -1054,6 +1061,7 @@ fn map_codex_response_failed(
     error: &Value,
     response: &Value,
     explicit_request_id: Option<&str>,
+    unknown_transient: bool,
 ) -> LLMError {
     let message = error
         .get("message")
@@ -1164,7 +1172,7 @@ fn map_codex_response_failed(
         }
         _ => LLMError::ProviderResponseError {
             message,
-            context: Box::new(context(None, true, retry_after_secs)),
+            context: Box::new(context(None, unknown_transient, retry_after_secs)),
         },
     }
 }
@@ -1992,6 +2000,21 @@ mod tests {
                 assert_eq!(context.retry_after_secs, Some(3));
             }
             other => panic!("expected ServerOverloaded, got {other}"),
+        }
+    }
+
+    #[test]
+    fn classify_http_unknown_error_uses_status_retryability() {
+        for (status, expected_retryable) in [(400, false), (429, true), (503, true)] {
+            let response = Response::builder()
+                .status(status)
+                .body(
+                    br#"{"error":{"message":"vendor failure","code":"vendor_specific"}}"#.to_vec(),
+                )
+                .unwrap();
+
+            let error = classify_codex_http_error("codex", &response);
+            assert_eq!(error.is_retryable(), expected_retryable, "status={status}");
         }
     }
 

@@ -305,4 +305,44 @@ mod http_client {
     }
 }
 
+use crate::error::LLMError;
+use http::Response;
 pub use http_client::imp::{call_outbound, call_outbound_stream};
+
+/// Preserve raw non-success responses for chat provider classification while
+/// giving operations without provider-specific classifiers the generic policy.
+pub fn ensure_success(response: Response<Vec<u8>>) -> Result<Response<Vec<u8>>, LLMError> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+
+    Err(crate::error::classify_http_status(
+        response.status().as_u16(),
+        response.headers(),
+        response.body(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_success_classifies_non_success_response() {
+        let response = Response::builder()
+            .status(429)
+            .header(http::header::RETRY_AFTER, "7")
+            .body(br#"{"error":{"message":"slow down"}}"#.to_vec())
+            .unwrap();
+
+        let error = ensure_success(response).unwrap_err();
+        assert!(matches!(error, LLMError::RateLimited { .. }));
+        assert_eq!(error.retry_after_secs(), Some(7));
+    }
+
+    #[test]
+    fn ensure_success_preserves_success_response() {
+        let response = Response::builder().status(200).body(vec![1, 2, 3]).unwrap();
+        assert_eq!(ensure_success(response).unwrap().body(), &[1, 2, 3]);
+    }
+}

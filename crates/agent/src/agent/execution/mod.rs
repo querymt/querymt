@@ -66,6 +66,53 @@ pub enum CycleOutcome {
     Stopped(StopReason),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LlmOperation {
+    Chat,
+    ChatStream,
+}
+
+impl LlmOperation {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::ChatStream => "chat_stream",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PromptLlmError {
+    operation: LlmOperation,
+    source: querymt::error::LLMError,
+}
+
+impl PromptLlmError {
+    pub(crate) fn new(operation: LlmOperation, source: querymt::error::LLMError) -> Self {
+        Self { operation, source }
+    }
+
+    pub(crate) fn operation(&self) -> LlmOperation {
+        self.operation
+    }
+}
+
+impl std::fmt::Display for PromptLlmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self.operation {
+            LlmOperation::Chat => "LLM chat error",
+            LlmOperation::ChatStream => "LLM streaming error",
+        };
+        f.write_str(label)
+    }
+}
+
+impl std::error::Error for PromptLlmError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 //  State machine implementation
 // ══════════════════════════════════════════════════════════════════════════

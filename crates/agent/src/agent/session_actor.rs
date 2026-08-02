@@ -1635,6 +1635,9 @@ async fn acquire_execution_permit_with_timeout(
 
 fn map_prompt_execution_error(error: &anyhow::Error) -> AgentError {
     let reason = format!("{error:#}");
+    let prompt_error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::agent::execution::PromptLlmError>());
     let llm_error = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<querymt::error::LLMError>());
@@ -1647,23 +1650,14 @@ fn map_prompt_execution_error(error: &anyhow::Error) -> AgentError {
             AgentError::Internal("prompt cancelled".to_string())
         }
         Some(llm_error) => AgentError::ProviderChat {
-            operation: infer_prompt_operation(error).to_string(),
+            operation: prompt_error
+                .map(|error| error.operation().as_str())
+                .unwrap_or("chat")
+                .to_string(),
             reason,
             llm_error: Some(llm_error.to_payload()),
         },
         None => AgentError::Internal(reason),
-    }
-}
-
-/// Infer chat vs chat_stream from distinct anyhow contexts attached in transitions.
-fn infer_prompt_operation(error: &anyhow::Error) -> &'static str {
-    // Prefer exact context phrases from `map_failed_llm_call` / mid-stream failures.
-    // Avoid broad "stream" substring matching (false positives in provider messages).
-    let chain = format!("{error:#}");
-    if chain.contains("LLM streaming error") {
-        "chat_stream"
-    } else {
-        "chat"
     }
 }
 
@@ -2244,11 +2238,13 @@ mod tests {
             retry_after_secs: Some(1),
             transient: true,
         };
-        let error = anyhow::Error::new(LLMError::ProviderResponseError {
-            message: "service overloaded".to_string(),
-            context: Box::new(context.clone()),
-        })
-        .context("LLM streaming error");
+        let error = anyhow::Error::new(crate::agent::execution::PromptLlmError::new(
+            crate::agent::execution::LlmOperation::ChatStream,
+            LLMError::ProviderResponseError {
+                message: "service overloaded".to_string(),
+                context: Box::new(context.clone()),
+            },
+        ));
 
         let mapped = map_prompt_execution_error(&error);
 
@@ -2270,8 +2266,10 @@ mod tests {
 
     #[test]
     fn prompt_error_non_stream_reports_chat_operation() {
-        let error = anyhow::Error::new(LLMError::HttpError("upstream failed".into()))
-            .context("LLM chat error");
+        let error = anyhow::Error::new(crate::agent::execution::PromptLlmError::new(
+            crate::agent::execution::LlmOperation::Chat,
+            LLMError::HttpError("upstream failed".into()),
+        ));
 
         let mapped = map_prompt_execution_error(&error);
 
@@ -2287,7 +2285,10 @@ mod tests {
 
     #[test]
     fn prompt_error_cancelled_does_not_become_provider_chat() {
-        let error = anyhow::Error::new(LLMError::Cancelled).context("LLM chat error");
+        let error = anyhow::Error::new(crate::agent::execution::PromptLlmError::new(
+            crate::agent::execution::LlmOperation::Chat,
+            LLMError::Cancelled,
+        ));
 
         let mapped = map_prompt_execution_error(&error);
 

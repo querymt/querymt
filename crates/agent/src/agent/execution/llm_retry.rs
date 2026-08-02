@@ -138,22 +138,27 @@ fn apply_jitter(delay_secs: f64, ratio: f64, sample: f64) -> u64 {
 
 fn jitter_sample() -> f64 {
     static STATE: AtomicU64 = AtomicU64::new(0);
-    let seed = STATE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
-            let seed = if state == 0 {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|duration| duration.as_nanos() as u64)
-                    .unwrap_or(0)
-                    ^ u64::from(std::process::id())
-            } else {
-                state
-            };
-            Some(xorshift64(seed))
-        })
-        .unwrap_or(0);
-    let sample = xorshift64(seed);
-    (sample >> 11) as f64 / (1_u64 << 53) as f64
+    let mut state = STATE.load(Ordering::Relaxed);
+    loop {
+        let seed = if state == 0 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos() as u64)
+                .unwrap_or(0)
+                ^ u64::from(std::process::id())
+        } else {
+            state
+        };
+        let next = xorshift64(seed);
+        match STATE.compare_exchange_weak(state, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return unit_sample(next),
+            Err(actual) => state = actual,
+        }
+    }
+}
+
+fn unit_sample(value: u64) -> f64 {
+    (value >> 11) as f64 / (1_u64 << 53) as f64
 }
 
 fn xorshift64(mut value: u64) -> u64 {
@@ -532,6 +537,12 @@ mod tests {
         assert_eq!(apply_jitter(100.0, 0.2, 0.0), 80);
         assert_eq!(apply_jitter(100.0, 0.2, 0.5), 100);
         assert_eq!(apply_jitter(100.0, 0.2, 1.0), 120);
+    }
+
+    #[test]
+    fn test_unit_sample_uses_updated_state() {
+        let seed = 0x1234_5678_9abc_def0;
+        assert_ne!(unit_sample(xorshift64(seed)), unit_sample(seed));
     }
 
     #[test]

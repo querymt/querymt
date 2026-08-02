@@ -1,5 +1,10 @@
 use super::{Fut, LLMProviderFactory, http::HTTPLLMProviderFactory};
-use crate::{LLMProvider, adapters::LLMProviderFromHTTP, error::LLMError, outbound::call_outbound};
+use crate::{
+    LLMProvider,
+    adapters::LLMProviderFromHTTP,
+    error::LLMError,
+    outbound::{call_outbound, ensure_success},
+};
 use futures::future::FutureExt;
 use http::{Request, Response};
 use std::{ops::Deref, sync::Arc};
@@ -52,11 +57,8 @@ impl LLMProviderFactory for HTTPFactoryAdapter {
             }
 
             let req: Request<Vec<u8>> = inner.list_models_request(&cloned_cfg)?;
-            let resp: Response<Vec<u8>> = call_outbound(req).await?;
-
-            inner
-                .parse_list_models(resp)
-                .map_err(|e| LLMError::PluginError(format!("{:#}", e)))
+            let resp: Response<Vec<u8>> = ensure_success(call_outbound(req).await?)?;
+            inner.parse_list_models(resp)
         }
         .boxed()
     }

@@ -8,6 +8,7 @@
 
 use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::agent_config::AgentConfig;
+use crate::agent::execution::{LlmOperation, PromptLlmError};
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::session_actor::ensure_pre_turn_snapshot_ready;
 use crate::agent::utils::u32_from_usize;
@@ -113,19 +114,24 @@ pub(super) fn apply_cache_breakpoints(messages: &[ChatMessage]) -> Vec<ChatMessa
         .collect()
 }
 
-/// Map a failed LLM setup/call into either `Cancelled` or a contextual anyhow error.
+/// Map a failed LLM setup/call into either `Cancelled` or a typed prompt error.
 ///
 /// Cancel must never bubble as `Err` here — that would become `ProviderChat` via
-/// `map_prompt_execution_error`. Streaming vs non-streaming contexts attach distinct
-/// messages so the mapper can report `chat_stream` vs `chat`.
+/// `map_prompt_execution_error`.
 pub(super) fn map_failed_llm_call(
     error: LLMError,
     streaming: bool,
 ) -> Result<ExecutionState, anyhow::Error> {
     match error {
         LLMError::Cancelled => Ok(ExecutionState::Cancelled),
-        e if streaming => Err(anyhow::Error::from(e).context("LLM streaming error")),
-        e => Err(anyhow::Error::from(e).context("LLM chat error")),
+        error => {
+            let operation = if streaming {
+                LlmOperation::ChatStream
+            } else {
+                LlmOperation::Chat
+            };
+            Err(PromptLlmError::new(operation, error).into())
+        }
     }
 }
 
@@ -385,7 +391,7 @@ pub(super) async fn transition_call_llm(
                                 if semantic_output_seen {
                                     flush_buffers!(false);
                                 }
-                                return Err(anyhow::Error::from(e).context("LLM streaming error"));
+                                return Err(PromptLlmError::new(LlmOperation::ChatStream, e).into());
                             };
 
                             let wait_secs =

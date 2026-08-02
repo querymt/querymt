@@ -1241,6 +1241,7 @@ fn map_openai_error_envelope(
     error: &Value,
     envelope: &Value,
     explicit_request_id: Option<&str>,
+    unknown_transient: bool,
 ) -> LLMError {
     let message = error
         .as_str()
@@ -1371,7 +1372,7 @@ fn map_openai_error_envelope(
         },
         _ => LLMError::ProviderResponseError {
             message,
-            context: Box::new(context(None, false, retry_after_secs)),
+            context: Box::new(context(None, unknown_transient, retry_after_secs)),
         },
     }
 }
@@ -1389,7 +1390,13 @@ pub fn classify_openai_http_error(provider: &str, response: &Response<Vec<u8>>) 
     if let Some(envelope) = envelope.as_ref()
         && let Some(error) = envelope.get("error")
     {
-        let mut mapped = map_openai_error_envelope(provider, error, envelope, request_id);
+        let mut mapped = map_openai_error_envelope(
+            provider,
+            error,
+            envelope,
+            request_id,
+            matches!(status, 429 | 500..=599),
+        );
         if mapped.retry_after_secs().is_none()
             && let Some(retry_after_secs) = retry_after_secs
         {
@@ -1500,6 +1507,7 @@ pub fn parse_openai_sse_chunk(
                 error,
                 &envelope,
                 explicit_request_id,
+                false,
             ));
         }
         let mut stream_chunk: OpenAIStreamChunk =
@@ -1941,6 +1949,21 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
                 assert_eq!(context.retry_after_secs, Some(4));
             }
             other => panic!("expected ProviderRateLimited, got {other}"),
+        }
+    }
+
+    #[test]
+    fn classify_http_unknown_error_uses_status_retryability() {
+        for (status, expected_retryable) in [(400, false), (429, true), (503, true)] {
+            let response = Response::builder()
+                .status(status)
+                .body(
+                    br#"{"error":{"message":"vendor failure","code":"vendor_specific"}}"#.to_vec(),
+                )
+                .unwrap();
+
+            let error = classify_openai_http_error("openai", &response);
+            assert_eq!(error.is_retryable(), expected_retryable, "status={status}");
         }
     }
 

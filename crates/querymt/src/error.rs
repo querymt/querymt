@@ -182,7 +182,16 @@ impl LLMErrorPayload {
             Self::ProviderError {
                 context: Some(context),
                 ..
-            } => context.transient,
+            } => match context.kind {
+                Some(ProviderErrorKind::ServerOverloaded | ProviderErrorKind::RateLimited) => true,
+                Some(
+                    ProviderErrorKind::QuotaExceeded
+                    | ProviderErrorKind::ContextWindowExceeded
+                    | ProviderErrorKind::Authentication
+                    | ProviderErrorKind::InvalidRequest,
+                ) => false,
+                None => context.transient,
+            },
             Self::RateLimited { .. }
             | Self::HttpError { .. }
             | Self::Transport { .. }
@@ -1144,6 +1153,31 @@ mod tests {
             LLMError::from_payload(context.to_payload()),
             LLMError::ContextWindowExceeded { .. }
         ));
+    }
+
+    #[test]
+    fn payload_retryability_uses_known_kind_instead_of_transient_hint() {
+        let overloaded = LLMErrorPayload::ProviderError {
+            message: "busy".into(),
+            context: Some(
+                ProviderErrorContext::builder("test")
+                    .kind(ProviderErrorKind::ServerOverloaded)
+                    .transient(false)
+                    .build(),
+            ),
+        };
+        assert!(overloaded.is_retryable());
+
+        let quota = LLMErrorPayload::ProviderError {
+            message: "no credits".into(),
+            context: Some(
+                ProviderErrorContext::builder("test")
+                    .kind(ProviderErrorKind::QuotaExceeded)
+                    .transient(true)
+                    .build(),
+            ),
+        };
+        assert!(!quota.is_retryable());
     }
 
     #[test]
