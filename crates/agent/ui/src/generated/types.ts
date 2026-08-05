@@ -67,8 +67,8 @@ export type AgentEventKind =
 	message_id?: string;
 }}
 	/**
-	 * Ephemeral signal emitted when mid-stream transport error is detected.
-	 * Accumulated text is discarded and a new stream is being created.
+	 * Ephemeral signal emitted when a pre-output stream error is retried.
+	 * This event is never emitted after text, thinking, or tool output is observed.
 	 */
 	| { type: "stream_recovering", data: {
 	/** Human-readable error message that triggered the retry */
