@@ -944,7 +944,6 @@ mod tests {
                 "schema": "querymt.error.v1",
                 "kind": "llm",
                 "operation": "chat_stream",
-                "reason": "LLM streaming error: provider overloaded",
                 "llm_error": {
                     "type": "provider_error",
                     "message": "provider overloaded",

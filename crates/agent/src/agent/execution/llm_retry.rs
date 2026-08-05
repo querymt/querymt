@@ -11,7 +11,6 @@ use querymt::chat::StreamChunk;
 use querymt::error::LLMError;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tracing::{Span, instrument};
@@ -137,37 +136,10 @@ fn apply_jitter(delay_secs: f64, ratio: f64, sample: f64) -> u64 {
 }
 
 fn jitter_sample() -> f64 {
-    static STATE: AtomicU64 = AtomicU64::new(0);
-    let mut state = STATE.load(Ordering::Relaxed);
-    loop {
-        let seed = if state == 0 {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_nanos() as u64)
-                .unwrap_or(0)
-                ^ u64::from(std::process::id())
-        } else {
-            state
-        };
-        let next = xorshift64(seed);
-        match STATE.compare_exchange_weak(state, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return unit_sample(next),
-            Err(actual) => state = actual,
-        }
-    }
-}
-
-fn unit_sample(value: u64) -> f64 {
-    (value >> 11) as f64 / (1_u64 << 53) as f64
-}
-
-fn xorshift64(mut value: u64) -> u64 {
-    if value == 0 {
-        value = 0x9e37_79b9_7f4a_7c15;
-    }
-    value ^= value << 13;
-    value ^= value >> 7;
-    value ^ (value << 17)
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.subsec_nanos());
+    f64::from(nanos) / (f64::from(u32::MAX) + 1.0)
 }
 
 /// Wait for a retry delay, returning a typed cancellation error if interrupted.
@@ -331,26 +303,45 @@ pub(super) fn stream_chunk_commits_output(chunk: &StreamChunk) -> bool {
     }
 }
 
-pub(super) fn begin_stream_retry(
-    error: &LLMError,
-    semantic_output_seen: bool,
-    retries_used: &mut usize,
-    max_stream_retries: usize,
+pub(super) struct StreamRetryBudget {
+    retries_used: usize,
+    max_retries: usize,
     attempts_used: usize,
     max_attempts: usize,
-    cancelled: bool,
-) -> Option<usize> {
-    if cancelled
-        || semantic_output_seen
-        || !error.is_retryable()
-        || *retries_used >= max_stream_retries
-        || attempts_used >= max_attempts
-    {
-        return None;
+}
+
+impl StreamRetryBudget {
+    pub(super) fn new(max_retries: usize, max_attempts: usize) -> Self {
+        Self {
+            retries_used: 0,
+            max_retries,
+            attempts_used: 0,
+            max_attempts: max_attempts.max(1),
+        }
     }
 
-    *retries_used += 1;
-    Some(*retries_used)
+    pub(super) fn attempts_used_mut(&mut self) -> &mut usize {
+        &mut self.attempts_used
+    }
+
+    pub(super) fn begin_retry(
+        &mut self,
+        error: &LLMError,
+        semantic_output_seen: bool,
+        cancelled: bool,
+    ) -> Option<usize> {
+        if cancelled
+            || semantic_output_seen
+            || !error.is_retryable()
+            || self.retries_used >= self.max_retries
+            || self.attempts_used >= self.max_attempts
+        {
+            return None;
+        }
+
+        self.retries_used += 1;
+        Some(self.retries_used)
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -537,19 +528,6 @@ mod tests {
         assert_eq!(apply_jitter(100.0, 0.2, 0.0), 80);
         assert_eq!(apply_jitter(100.0, 0.2, 0.5), 100);
         assert_eq!(apply_jitter(100.0, 0.2, 1.0), 120);
-    }
-
-    #[test]
-    fn test_unit_sample_uses_updated_state() {
-        let seed = 0x1234_5678_9abc_def0;
-        assert_ne!(unit_sample(xorshift64(seed)), unit_sample(seed));
-    }
-
-    #[test]
-    fn test_jitter_sample_uses_full_unit_interval() {
-        let samples: Vec<_> = (0..16).map(|_| jitter_sample()).collect();
-        assert!(samples.iter().all(|sample| (0.0..1.0).contains(sample)));
-        assert!(samples.windows(2).any(|pair| pair[0] != pair[1]));
     }
 
     #[tokio::test]
@@ -930,20 +908,13 @@ mod tests {
                 partial_json: "{".into(),
             },
         ] {
-            let mut retries_used = 0;
+            let mut budget = StreamRetryBudget::new(1, 3);
+            *budget.attempts_used_mut() = 1;
             assert_eq!(
-                begin_stream_retry(
-                    &error,
-                    stream_chunk_commits_output(&chunk),
-                    &mut retries_used,
-                    1,
-                    1,
-                    3,
-                    false,
-                ),
+                budget.begin_retry(&error, stream_chunk_commits_output(&chunk), false),
                 None,
             );
-            assert_eq!(retries_used, 0);
+            assert_eq!(budget.retries_used, 0);
         }
     }
 
@@ -954,13 +925,11 @@ mod tests {
             message: "unavailable".into(),
             retry_after_secs: None,
         };
-        let mut retries_used = 0;
+        let mut budget = StreamRetryBudget::new(5, 3);
+        *budget.attempts_used_mut() = 3;
 
-        assert_eq!(
-            begin_stream_retry(&error, false, &mut retries_used, 5, 3, 3, false),
-            None
-        );
-        assert_eq!(retries_used, 0);
+        assert_eq!(budget.begin_retry(&error, false, false), None);
+        assert_eq!(budget.retries_used, 0);
     }
 
     #[test]
@@ -970,24 +939,16 @@ mod tests {
             message: "unavailable".into(),
             retry_after_secs: None,
         };
-        let mut retries_used = 0;
+        let mut budget = StreamRetryBudget::new(1, 3);
+        *budget.attempts_used_mut() = 1;
 
-        assert_eq!(
-            begin_stream_retry(&error, false, &mut retries_used, 1, 1, 3, false),
-            Some(1)
-        );
-        assert_eq!(retries_used, 1);
-        assert_eq!(
-            begin_stream_retry(&error, false, &mut retries_used, 1, 1, 3, false),
-            None
-        );
-        assert_eq!(
-            begin_stream_retry(&error, true, &mut retries_used, 2, 1, 3, false),
-            None
-        );
-        assert_eq!(
-            begin_stream_retry(&error, false, &mut retries_used, 2, 1, 3, true),
-            None
-        );
+        assert_eq!(budget.begin_retry(&error, false, false), Some(1));
+        assert_eq!(budget.retries_used, 1);
+        assert_eq!(budget.begin_retry(&error, false, false), None);
+
+        let mut output_budget = StreamRetryBudget::new(2, 3);
+        *output_budget.attempts_used_mut() = 1;
+        assert_eq!(output_budget.begin_retry(&error, true, false), None);
+        assert_eq!(output_budget.begin_retry(&error, false, true), None);
     }
 }

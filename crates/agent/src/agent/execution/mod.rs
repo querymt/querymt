@@ -68,6 +68,7 @@ pub enum CycleOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LlmOperation {
+    ProviderInit,
     Chat,
     ChatStream,
 }
@@ -75,6 +76,7 @@ pub(crate) enum LlmOperation {
 impl LlmOperation {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::ProviderInit => "provider_init",
             Self::Chat => "chat",
             Self::ChatStream => "chat_stream",
         }
@@ -95,11 +97,16 @@ impl PromptLlmError {
     pub(crate) fn operation(&self) -> LlmOperation {
         self.operation
     }
+
+    pub(crate) fn llm_error(&self) -> &querymt::error::LLMError {
+        &self.source
+    }
 }
 
 impl std::fmt::Display for PromptLlmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let label = match self.operation {
+            LlmOperation::ProviderInit => "LLM provider initialization error",
             LlmOperation::Chat => "LLM chat error",
             LlmOperation::ChatStream => "LLM streaming error",
         };

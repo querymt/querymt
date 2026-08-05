@@ -107,8 +107,8 @@ impl From<AgentError> for AcpError {
     fn from(e: AgentError) -> Self {
         if let AgentError::ProviderChat {
             operation,
-            reason,
             llm_error,
+            ..
         } = &e
         {
             let message = if provider_error_is_transient(llm_error.as_ref()) {
@@ -120,7 +120,6 @@ impl From<AgentError> for AcpError {
                 "schema": "querymt.error.v1",
                 "kind": "llm",
                 "operation": operation,
-                "reason": reason,
                 "llm_error": llm_error,
             }));
         }
@@ -274,7 +273,6 @@ mod tests {
                 "schema": "querymt.error.v1",
                 "kind": "llm",
                 "operation": "chat_stream",
-                "reason": "LLM streaming error: LLM Provider Error: capacity exhausted",
                 "llm_error": {
                     "type": "provider_error",
                     "message": "capacity exhausted",
@@ -289,6 +287,28 @@ mod tests {
                 }
             }))
         );
+    }
+
+    #[test]
+    fn provider_chat_exports_raw_response_exactly_once() {
+        let raw_response = "FULL_PROVIDER_BODY".repeat(100);
+        let acp: AcpError = AgentError::ProviderChat {
+            operation: "chat".to_string(),
+            reason: format!("response failed: {raw_response}"),
+            llm_error: Some(LLMErrorPayload::ResponseFormatError {
+                message: "invalid provider response".to_string(),
+                raw_response: raw_response.clone(),
+            }),
+        }
+        .into();
+
+        let data = acp.data.expect("provider error data");
+        assert_eq!(
+            data.pointer("/llm_error/raw_response"),
+            Some(&serde_json::Value::String(raw_response.clone()))
+        );
+        assert_eq!(data.to_string().matches(&raw_response).count(), 1);
+        assert!(data.get("reason").is_none());
     }
 
     #[test]
@@ -308,7 +328,6 @@ mod tests {
                 "schema": "querymt.error.v1",
                 "kind": "llm",
                 "operation": "chat_stream",
-                "reason": "legacy failure",
                 "llm_error": null
             }))
         );

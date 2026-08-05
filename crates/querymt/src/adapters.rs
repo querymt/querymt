@@ -4,7 +4,7 @@ use crate::{
     completion::{CompletionProvider, CompletionRequest, CompletionResponse},
     embedding::EmbeddingProvider,
     error::LLMError,
-    outbound::{call_outbound, call_outbound_stream, ensure_success},
+    outbound::{call_outbound, call_outbound_raw, call_outbound_stream_raw, ensure_success},
     stt, tts,
 };
 use async_trait::async_trait;
@@ -44,7 +44,7 @@ impl LLMProviderFromHTTP {
 
         let req = self.inner.chat_request(messages, tools)?;
 
-        let resp = call_outbound(req).await?;
+        let resp = call_outbound_raw(req).await?;
         if !resp.status().is_success() {
             return Err(self.inner.classify_chat_error(&resp));
         }
@@ -91,7 +91,7 @@ impl ChatProvider for LLMProviderFromHTTP {
 
         let req = self.inner.chat_stream_request(messages, tools)?;
 
-        let (response, stream) = call_outbound_stream(req).await?;
+        let (response, stream) = call_outbound_stream_raw(req).await?;
         if !response.status().is_success() {
             let mut stream = Box::pin(stream);
             let mut body = Vec::new();

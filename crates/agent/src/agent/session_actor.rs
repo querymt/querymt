@@ -1633,31 +1633,34 @@ async fn acquire_execution_permit_with_timeout(
     }
 }
 
+fn prompt_execution_was_cancelled(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::agent::execution::PromptLlmError>()
+            .is_some_and(|error| matches!(error.llm_error(), querymt::error::LLMError::Cancelled))
+    })
+}
+
 fn map_prompt_execution_error(error: &anyhow::Error) -> AgentError {
     let reason = format!("{error:#}");
-    let prompt_error = error
+    let Some(prompt_error) = error
         .chain()
-        .find_map(|cause| cause.downcast_ref::<crate::agent::execution::PromptLlmError>());
-    let llm_error = error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<querymt::error::LLMError>());
+        .find_map(|cause| cause.downcast_ref::<crate::agent::execution::PromptLlmError>())
+    else {
+        return AgentError::Internal(reason);
+    };
 
-    match llm_error {
-        // Cancel must never surface as a provider-chat failure. Primary path is
-        // ExecutionState::Cancelled at the transition boundary; this is defense
-        // in depth if Cancelled still leaks through an anyhow chain.
-        Some(querymt::error::LLMError::Cancelled) => {
-            AgentError::Internal("prompt cancelled".to_string())
-        }
-        Some(llm_error) => AgentError::ProviderChat {
-            operation: prompt_error
-                .map(|error| error.operation().as_str())
-                .unwrap_or("chat")
-                .to_string(),
-            reason,
-            llm_error: Some(llm_error.to_payload()),
-        },
-        None => AgentError::Internal(reason),
+    if matches!(
+        prompt_error.llm_error(),
+        querymt::error::LLMError::Cancelled
+    ) {
+        return AgentError::Internal("prompt cancelled".to_string());
+    }
+
+    AgentError::ProviderChat {
+        operation: prompt_error.operation().as_str().to_string(),
+        reason,
+        llm_error: Some(prompt_error.llm_error().to_payload()),
     }
 }
 
@@ -2041,6 +2044,9 @@ async fn execute_prompt_detached(
         Ok(CycleOutcome::Cancelled) => Ok(PromptResponse::new(StopReason::Cancelled)),
         Ok(CycleOutcome::Stopped(stop_reason)) => Ok(PromptResponse::new(stop_reason)),
         Err(e) => {
+            if prompt_execution_was_cancelled(&e) {
+                return Ok(PromptResponse::new(StopReason::Cancelled));
+            }
             config.emit_event(
                 &session_id,
                 AgentEventKind::Error {
@@ -2265,6 +2271,25 @@ mod tests {
     }
 
     #[test]
+    fn prompt_error_provider_init_reports_provider_init_operation() {
+        let error = anyhow::Error::new(crate::agent::execution::PromptLlmError::new(
+            crate::agent::execution::LlmOperation::ProviderInit,
+            LLMError::HttpError("discovery failed".into()),
+        ));
+
+        let mapped = map_prompt_execution_error(&error);
+
+        match mapped {
+            AgentError::ProviderChat {
+                operation,
+                llm_error: Some(LLMErrorPayload::HttpError { .. }),
+                ..
+            } => assert_eq!(operation, "provider_init"),
+            other => panic!("expected ProviderChat(provider_init), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn prompt_error_non_stream_reports_chat_operation() {
         let error = anyhow::Error::new(crate::agent::execution::PromptLlmError::new(
             crate::agent::execution::LlmOperation::Chat,
@@ -2297,6 +2322,18 @@ mod tests {
             "Cancelled must not become ProviderChat, got {mapped:?}"
         );
         assert!(matches!(mapped, AgentError::Internal(reason) if reason.contains("cancel")));
+        assert!(prompt_execution_was_cancelled(&error));
+    }
+
+    #[test]
+    fn bare_llm_error_is_not_guessed_as_chat_operation() {
+        let error = anyhow::Error::new(LLMError::HttpError("upstream failed".into()));
+
+        let mapped = map_prompt_execution_error(&error);
+
+        assert!(
+            matches!(mapped, AgentError::Internal(reason) if reason.contains("upstream failed"))
+        );
     }
 
     #[test]

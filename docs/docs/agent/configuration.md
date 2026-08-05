@@ -145,11 +145,18 @@ backend = "git"           # "git" or "none"
 max_snapshots = 100       # Maximum snapshots to keep
 max_age_days = 30         # Maximum age of snapshots
 
-# Rate limit retry configuration
+# Provider retry configuration
 [agent.execution.rate_limit]
+# Total request-attempt budget, including the initial request.
 max_retries = 3
+# Maximum stream recreations after a failure before semantic output.
+max_stream_retries = 1
 default_wait_secs = 60
 backoff_multiplier = 2.0
+# Applied only to calculated delays; provider retry hints are used as-is.
+jitter_ratio = 0.2
+# Caps calculated delays; provider retry hints remain authoritative.
+max_wait_secs = 300
 ```
 
 ### Skills Configuration

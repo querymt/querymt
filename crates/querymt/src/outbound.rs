@@ -1,7 +1,8 @@
 mod http_client {
     #[cfg(not(target_arch = "wasm32"))]
     pub mod imp {
-        use crate::error::LLMError;
+        use crate::error::{LLMError, classify_http_status};
+        use futures::StreamExt;
         use http::{Request, Response};
         use once_cell::sync::Lazy;
         use reqwest::Client;
@@ -102,7 +103,12 @@ mod http_client {
             truncate_preview(value.to_string(), max_len)
         }
 
-        pub async fn call_outbound(req: Request<Vec<u8>>) -> Result<Response<Vec<u8>>, LLMError> {
+        /// Send an HTTP request and preserve the response status, headers, and body.
+        ///
+        /// Provider adapters use this to apply provider-specific error classification.
+        pub async fn call_outbound_raw(
+            req: Request<Vec<u8>>,
+        ) -> Result<Response<Vec<u8>>, LLMError> {
             let client = &*CLIENT;
 
             let method = req
@@ -180,7 +186,11 @@ mod http_client {
             Ok(builder.body(bytes).unwrap())
         }
 
-        pub async fn call_outbound_stream(
+        /// Send a streaming HTTP request and preserve the response metadata.
+        ///
+        /// Non-success bodies are returned as a one-item stream so provider adapters
+        /// can classify the complete response without changing the public stream API.
+        pub async fn call_outbound_stream_raw(
             req: Request<Vec<u8>>,
         ) -> Result<
             (
@@ -278,6 +288,43 @@ mod http_client {
             }
             Ok((builder.body(()).unwrap(), Box::pin(resp.bytes_stream())))
         }
+
+        /// Send an HTTP request using the generic status classifier.
+        pub async fn call_outbound(req: Request<Vec<u8>>) -> Result<Response<Vec<u8>>, LLMError> {
+            let response = call_outbound_raw(req).await?;
+            if response.status().is_success() {
+                return Ok(response);
+            }
+
+            Err(classify_http_status(
+                response.status().as_u16(),
+                response.headers(),
+                response.body(),
+            ))
+        }
+
+        /// Send a streaming HTTP request using the generic status classifier.
+        pub async fn call_outbound_stream(
+            req: Request<Vec<u8>>,
+        ) -> Result<
+            std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
+            LLMError,
+        > {
+            let (response, mut stream) = call_outbound_stream_raw(req).await?;
+            if response.status().is_success() {
+                return Ok(stream);
+            }
+
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                body.extend_from_slice(&chunk?);
+            }
+            Err(classify_http_status(
+                response.status().as_u16(),
+                response.headers(),
+                &body,
+            ))
+        }
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -285,11 +332,13 @@ mod http_client {
         use crate::error::LLMError;
         use http::{Request, Response};
 
-        pub async fn call_outbound(_req: Request<Vec<u8>>) -> Result<Response<Vec<u8>>, LLMError> {
+        pub async fn call_outbound_raw(
+            _req: Request<Vec<u8>>,
+        ) -> Result<Response<Vec<u8>>, LLMError> {
             Err(LLMError::InvalidRequest("".into()))
         }
 
-        pub async fn call_outbound_stream(
+        pub async fn call_outbound_stream_raw(
             _req: Request<Vec<u8>>,
         ) -> Result<
             (
@@ -302,15 +351,26 @@ mod http_client {
         > {
             Err(LLMError::InvalidRequest("".into()))
         }
+
+        pub async fn call_outbound(_req: Request<Vec<u8>>) -> Result<Response<Vec<u8>>, LLMError> {
+            Err(LLMError::InvalidRequest("".into()))
+        }
+
+        pub async fn call_outbound_stream(
+            _req: Request<Vec<u8>>,
+        ) -> Result<futures::stream::Empty<reqwest::Result<bytes::Bytes>>, LLMError> {
+            Err(LLMError::InvalidRequest("".into()))
+        }
     }
 }
 
 use crate::error::LLMError;
 use http::Response;
-pub use http_client::imp::{call_outbound, call_outbound_stream};
+pub use http_client::imp::{
+    call_outbound, call_outbound_raw, call_outbound_stream, call_outbound_stream_raw,
+};
 
-/// Preserve raw non-success responses for chat provider classification while
-/// giving operations without provider-specific classifiers the generic policy.
+/// Apply the generic HTTP status policy to a raw response.
 pub fn ensure_success(response: Response<Vec<u8>>) -> Result<Response<Vec<u8>>, LLMError> {
     if response.status().is_success() {
         return Ok(response);

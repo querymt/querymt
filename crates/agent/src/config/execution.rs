@@ -201,7 +201,7 @@ impl Default for CompactionConfig {
 // Rate Limit Configuration
 // ============================================================================
 
-/// Default maximum retry attempts for rate limiting
+/// Default total request-attempt budget, including the initial request
 pub const DEFAULT_RATE_LIMIT_MAX_RETRIES: usize = 3;
 
 /// Default wait time in seconds if no retry-after header
@@ -247,7 +247,7 @@ fn default_rate_limit_max_wait_secs() -> u64 {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
-    /// Maximum number of retry attempts (default: 3)
+    /// Total request-attempt budget, including the initial request (default: 3)
     #[serde(default = "default_rate_limit_max_retries")]
     pub max_retries: usize,
 
@@ -260,9 +260,9 @@ pub struct RateLimitConfig {
     #[serde(default = "default_rate_limit_backoff_multiplier")]
     pub backoff_multiplier: f64,
 
-    /// Max retries for pre-output stream transport failures (default: 1).
-    /// Retries are only allowed before any semantic output has been emitted;
-    /// once text/thinking/tool output is observed, the stream is not recreated.
+    /// Maximum stream recreations after a pre-output failure (default: 1).
+    /// This is additionally bounded by `max_retries`, the shared request-attempt budget.
+    /// Once text, thinking, or tool output is observed, the stream is not recreated.
     #[serde(default = "default_stream_max_retries")]
     pub max_stream_retries: usize,
 

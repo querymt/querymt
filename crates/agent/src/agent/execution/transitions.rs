@@ -231,10 +231,16 @@ pub(super) async fn transition_call_llm(
             resp.finish_reason(),
         )
     } else {
-        let provider = session_handle
-            .provider()
-            .await
-            .map_err(|e| anyhow::Error::from(e).context("Failed to build provider"))?;
+        let provider = match session_handle.provider().await {
+            Ok(provider) => provider,
+            Err(e) => {
+                let error = LLMError::from(e);
+                if matches!(error, LLMError::Cancelled) {
+                    return Ok(ExecutionState::Cancelled);
+                }
+                return Err(PromptLlmError::new(LlmOperation::ProviderInit, error).into());
+            }
+        };
 
         if provider.supports_streaming() {
             // === STREAMING PATH (all capable providers) ===
@@ -314,9 +320,10 @@ pub(super) async fn transition_call_llm(
             // ── Outer retry loop ─────────────────────────────────────────────
             // A retry is safe only while the failed attempt has produced no
             // semantic output, so no user-visible content can be rolled back.
-            let mut stream_retries_used = 0;
-            let mut stream_attempts_used = 0;
-            let max_stream_attempts = config.execution_policy.rate_limit.max_retries.max(1);
+            let mut retry_budget = super::llm_retry::StreamRetryBudget::new(
+                max_stream_retries,
+                config.execution_policy.rate_limit.max_retries,
+            );
             'stream: loop {
                 let mut semantic_output_seen = false;
 
@@ -324,7 +331,7 @@ pub(super) async fn transition_call_llm(
                     config,
                     session_id,
                     &exec_ctx.cancellation_token,
-                    &mut stream_attempts_used,
+                    retry_budget.attempts_used_mut(),
                     || {
                         let provider = &provider;
                         let messages_with_cache = &messages_with_cache;
@@ -375,13 +382,9 @@ pub(super) async fn transition_call_llm(
                         }
                         Err(LLMError::Cancelled) => return Ok(ExecutionState::Cancelled),
                         Err(e) => {
-                            let retry_number = super::llm_retry::begin_stream_retry(
+                            let retry_number = retry_budget.begin_retry(
                                 &e,
                                 semantic_output_seen,
-                                &mut stream_retries_used,
-                                max_stream_retries,
-                                stream_attempts_used,
-                                max_stream_attempts,
                                 exec_ctx.cancellation_token.is_cancelled(),
                             );
                             let Some(retry_number) = retry_number else {
