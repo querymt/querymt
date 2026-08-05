@@ -182,7 +182,7 @@ impl api::OpenAIProviderConfig for OpenAI {
 
 impl HTTPChatProvider for OpenAI {
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        api::classify_openai_http_error(response).into_llm_error(PROVIDER_NAME)
+        api::classify_openai_http_error(response).attribute(PROVIDER_NAME)
     }
 
     fn chat_request(
@@ -224,7 +224,7 @@ struct OpenAIStreamParser {
 impl ChatStreamParser for OpenAIStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
         api::parse_openai_sse_chunk(chunk, &mut self.tool_states)
-            .map_err(|error| error.into_llm_error(PROVIDER_NAME))
+            .map_err(|error| error.attribute(PROVIDER_NAME))
     }
 }
 

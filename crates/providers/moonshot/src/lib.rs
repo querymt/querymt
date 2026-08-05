@@ -132,7 +132,7 @@ impl OpenAIProviderConfig for MoonshotAI {
 
 impl HTTPChatProvider for MoonshotAI {
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        classify_openai_http_error(response).into_llm_error(PROVIDER_NAME)
+        classify_openai_http_error(response).attribute(PROVIDER_NAME)
     }
 
     fn chat_request(

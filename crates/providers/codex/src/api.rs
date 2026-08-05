@@ -14,7 +14,7 @@ use querymt::{
         Tool, ToolChoice,
     },
     error::{
-        ClassifiedProviderError, LLMError, ProviderErrorKind, ProviderWireError,
+        ClassifiedProviderError, LLMError, ProviderDecodeError, ProviderErrorKind,
         extract_retry_after_from_json, parse_retry_after, parse_retry_after_from_message,
     },
     handle_http_error,
@@ -784,7 +784,7 @@ pub fn codex_parse_chat_with_state(
     }
 }
 
-pub fn classify_codex_http_error(response: &Response<Vec<u8>>) -> ProviderWireError {
+pub fn classify_codex_http_error(response: &Response<Vec<u8>>) -> ProviderDecodeError {
     let status = response.status().as_u16();
     let retry_after_secs = parse_retry_after(response.headers());
     let request_id = response
@@ -810,13 +810,17 @@ pub fn classify_codex_http_error(response: &Response<Vec<u8>>) -> ProviderWireEr
         }
     }
 
-    querymt::error::classify_http_status(status, response.headers(), response.body()).into()
+    ProviderDecodeError::terminal(querymt::error::classify_http_status(
+        status,
+        response.headers(),
+        response.body(),
+    ))
 }
 
 pub fn codex_parse_stream_chunk_with_state(
     chunk: &[u8],
     tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
-) -> Result<Vec<StreamChunk>, ProviderWireError> {
+) -> Result<Vec<StreamChunk>, ProviderDecodeError> {
     if chunk.is_empty() {
         return Ok(Vec::new());
     }
@@ -1089,13 +1093,16 @@ fn map_codex_response_failed(
         _ => (None, unknown_transient, retry_after_secs),
     };
 
-    ClassifiedProviderError::new(message)
-        .kind(kind)
+    let mut classified = ClassifiedProviderError::new(message)
         .code(code)
         .error_type(error_type)
         .request_id(request_id)
         .retry_after_secs(retry_after_secs)
-        .transient(transient)
+        .transient(transient);
+    if let Some(kind) = kind {
+        classified = classified.kind(kind);
+    }
+    classified
 }
 
 fn mark_streamed_thinking_emitted(
@@ -1901,7 +1908,7 @@ mod tests {
         let chunk = format!("data: {payload}\n\n");
         let error = codex_parse_stream_chunk_with_state(chunk.as_bytes(), &state)
             .expect_err("response.failed should return an error")
-            .into_llm_error(PROVIDER_NAME);
+            .attribute(PROVIDER_NAME);
         (error, state)
     }
 
@@ -1914,7 +1921,7 @@ mod tests {
             .body(br#"{"error":{"message":"busy","code":"server_is_overloaded"}}"#.to_vec())
             .unwrap();
 
-        let error = classify_codex_http_error(&response).into_llm_error("xai");
+        let error = classify_codex_http_error(&response).attribute("xai");
         match error {
             LLMError::ServerOverloaded { message, context } => {
                 assert_eq!(message, "busy");
@@ -1936,7 +1943,7 @@ mod tests {
                 )
                 .unwrap();
 
-            let error = classify_codex_http_error(&response).into_llm_error(PROVIDER_NAME);
+            let error = classify_codex_http_error(&response).attribute(PROVIDER_NAME);
             assert_eq!(error.is_retryable(), expected_retryable, "status={status}");
         }
     }

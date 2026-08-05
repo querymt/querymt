@@ -138,7 +138,7 @@ impl OpenAIProviderConfig for Zai {
 
 impl HTTPChatProvider for Zai {
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        classify_openai_http_error(response).into_llm_error(PROVIDER_NAME)
+        classify_openai_http_error(response).attribute(PROVIDER_NAME)
     }
 
     fn chat_request(
@@ -180,7 +180,7 @@ struct ZaiStreamParser {
 impl ChatStreamParser for ZaiStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
         parse_openai_sse_chunk(chunk, &mut self.tool_states)
-            .map_err(|error| error.into_llm_error(PROVIDER_NAME))
+            .map_err(|error| error.attribute(PROVIDER_NAME))
     }
 }
 

@@ -180,9 +180,9 @@ impl OpenAIProviderConfig for Xai {
 impl HTTPChatProvider for Xai {
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
         if self.should_use_responses_api() {
-            classify_codex_http_error(response).into_llm_error(PROVIDER_NAME)
+            classify_codex_http_error(response).attribute(PROVIDER_NAME)
         } else {
-            classify_openai_http_error(response).into_llm_error(PROVIDER_NAME)
+            classify_openai_http_error(response).attribute(PROVIDER_NAME)
         }
     }
 
@@ -370,7 +370,7 @@ impl ChatStreamParser for XaiStreamParser {
         } else {
             parse_openai_sse_chunk(chunk, &mut self.openai_tool_state)
         }
-        .map_err(|error| error.into_llm_error(PROVIDER_NAME))
+        .map_err(|error| error.attribute(PROVIDER_NAME))
     }
 }
 

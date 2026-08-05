@@ -26,6 +26,8 @@ pub enum ProviderErrorKind {
     InvalidRequest,
 }
 
+/// Attributed provider-failure diagnostics carried on structured [`LLMError`]
+/// variants. Built only by attributing a [`ClassifiedProviderError`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderErrorContext {
     pub provider: String,
@@ -42,33 +44,11 @@ pub struct ProviderErrorContext {
     pub transient: bool,
 }
 
-impl ProviderErrorContext {
-    pub fn builder(provider: impl Into<String>) -> ProviderErrorContextBuilder {
-        ProviderErrorContextBuilder {
-            provider: provider.into(),
-            kind: None,
-            code: None,
-            error_type: None,
-            request_id: None,
-            retry_after_secs: None,
-            transient: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ProviderErrorContextBuilder {
-    provider: String,
-    kind: Option<ProviderErrorKind>,
-    code: Option<String>,
-    error_type: Option<String>,
-    request_id: Option<String>,
-    retry_after_secs: Option<u64>,
-    transient: bool,
-}
-
-/// Provider failure metadata decoded from a wire response before attribution to
-/// a concrete provider implementation.
+/// Provider failure decoded from a wire response, before provider identity is
+/// attached. This is the single builder for structured provider errors.
+///
+/// Wire classifiers produce this type. Provider implementations call
+/// [`ClassifiedProviderError::attribute`] at their boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassifiedProviderError {
     pub message: String,
@@ -93,8 +73,8 @@ impl ClassifiedProviderError {
         }
     }
 
-    pub fn kind(mut self, kind: Option<ProviderErrorKind>) -> Self {
-        self.kind = kind;
+    pub fn kind(mut self, kind: ProviderErrorKind) -> Self {
+        self.kind = Some(kind);
         self
     }
 
@@ -129,7 +109,10 @@ impl ClassifiedProviderError {
         }
     }
 
-    pub fn into_llm_error(self, provider: impl Into<String>) -> LLMError {
+    /// Attach provider identity and produce the matching structured [`LLMError`].
+    pub fn attribute(self, provider: impl Into<String>) -> LLMError {
+        let kind = self.kind;
+        let message = self.message;
         let context = Box::new(ProviderErrorContext {
             provider: provider.into(),
             kind: self.kind,
@@ -140,101 +123,31 @@ impl ClassifiedProviderError {
             transient: self.transient,
         });
 
-        match self.kind {
-            Some(ProviderErrorKind::ServerOverloaded) => LLMError::ServerOverloaded {
-                message: self.message,
-                context,
-            },
-            Some(ProviderErrorKind::RateLimited) => LLMError::ProviderRateLimited {
-                message: self.message,
-                context,
-            },
-            Some(ProviderErrorKind::QuotaExceeded) => LLMError::QuotaExceeded {
-                message: self.message,
-                context,
-            },
-            Some(ProviderErrorKind::ContextWindowExceeded) => LLMError::ContextWindowExceeded {
-                message: self.message,
-                context,
-            },
-            Some(ProviderErrorKind::Authentication) => LLMError::ProviderAuthError {
-                message: self.message,
-                context,
-            },
-            Some(ProviderErrorKind::InvalidRequest) => LLMError::ProviderInvalidRequest {
-                message: self.message,
-                context,
-            },
-            None => LLMError::ProviderResponseError {
-                message: self.message,
-                context,
-            },
+        match kind {
+            Some(ProviderErrorKind::ServerOverloaded) => {
+                LLMError::ServerOverloaded { message, context }
+            }
+            Some(ProviderErrorKind::RateLimited) => {
+                LLMError::ProviderRateLimited { message, context }
+            }
+            Some(ProviderErrorKind::QuotaExceeded) => LLMError::QuotaExceeded { message, context },
+            Some(ProviderErrorKind::ContextWindowExceeded) => {
+                LLMError::ContextWindowExceeded { message, context }
+            }
+            Some(ProviderErrorKind::Authentication) => {
+                LLMError::ProviderAuthError { message, context }
+            }
+            Some(ProviderErrorKind::InvalidRequest) => {
+                LLMError::ProviderInvalidRequest { message, context }
+            }
+            None => LLMError::ProviderResponseError { message, context },
         }
     }
-}
 
-/// Error produced while decoding a provider wire response.
-#[derive(Debug)]
-pub enum ProviderWireError {
-    Classified(ClassifiedProviderError),
-    Other(LLMError),
-}
-
-impl ProviderWireError {
-    pub fn into_llm_error(self, provider: impl Into<String>) -> LLMError {
-        match self {
-            Self::Classified(error) => error.into_llm_error(provider),
-            Self::Other(error) => error,
-        }
-    }
-}
-
-impl From<ClassifiedProviderError> for ProviderWireError {
-    fn from(error: ClassifiedProviderError) -> Self {
-        Self::Classified(error)
-    }
-}
-
-impl From<LLMError> for ProviderWireError {
-    fn from(error: LLMError) -> Self {
-        Self::Other(error)
-    }
-}
-
-impl ProviderErrorContextBuilder {
-    pub fn kind(mut self, kind: ProviderErrorKind) -> Self {
-        self.kind = Some(kind);
-        self
-    }
-
-    pub fn code(mut self, code: Option<String>) -> Self {
-        self.code = code;
-        self
-    }
-
-    pub fn error_type(mut self, error_type: Option<String>) -> Self {
-        self.error_type = error_type;
-        self
-    }
-
-    pub fn request_id(mut self, request_id: Option<String>) -> Self {
-        self.request_id = request_id;
-        self
-    }
-
-    pub fn retry_after_secs(mut self, retry_after_secs: Option<u64>) -> Self {
-        self.retry_after_secs = retry_after_secs;
-        self
-    }
-
-    pub fn transient(mut self, transient: bool) -> Self {
-        self.transient = transient;
-        self
-    }
-
-    pub fn build(self) -> ProviderErrorContext {
+    /// Attach provider identity without selecting an [`LLMError`] variant.
+    pub fn into_context(self, provider: impl Into<String>) -> ProviderErrorContext {
         ProviderErrorContext {
-            provider: self.provider,
+            provider: provider.into(),
             kind: self.kind,
             code: self.code,
             error_type: self.error_type,
@@ -242,6 +155,48 @@ impl ProviderErrorContextBuilder {
             retry_after_secs: self.retry_after_secs,
             transient: self.transient,
         }
+    }
+}
+
+/// Failure from a provider HTTP/SSE decoder before provider identity is attached.
+///
+/// - [`Self::Classified`]: vendor envelope mapped to a unified kind — needs
+///   [`Self::attribute`].
+/// - [`Self::Terminal`]: already-final error (status fallback, parse failure).
+///   [`Self::attribute`] returns it unchanged.
+///
+/// No `From<LLMError>`: construct terminal variants with the named helpers so
+/// accidental double-attribution is not a silent footgun.
+#[derive(Debug)]
+pub enum ProviderDecodeError {
+    Classified(ClassifiedProviderError),
+    Terminal(LLMError),
+}
+
+impl ProviderDecodeError {
+    pub fn response_format(message: impl Into<String>, raw_response: impl Into<String>) -> Self {
+        Self::Terminal(LLMError::ResponseFormatError {
+            message: message.into(),
+            raw_response: raw_response.into(),
+        })
+    }
+
+    pub fn terminal(error: LLMError) -> Self {
+        Self::Terminal(error)
+    }
+
+    /// Stamp provider identity onto classified failures; pass terminal errors through.
+    pub fn attribute(self, provider: impl Into<String>) -> LLMError {
+        match self {
+            Self::Classified(error) => error.attribute(provider),
+            Self::Terminal(error) => error,
+        }
+    }
+}
+
+impl From<ClassifiedProviderError> for ProviderDecodeError {
+    fn from(error: ClassifiedProviderError) -> Self {
+        Self::Classified(error)
     }
 }
 
@@ -1226,35 +1181,34 @@ mod tests {
     }
 
     #[test]
-    fn classified_provider_error_attaches_provider_at_conversion_boundary() {
+    fn classified_error_attributes_provider_and_selects_variant() {
         let error = ClassifiedProviderError::new("busy")
-            .kind(Some(ProviderErrorKind::ServerOverloaded))
+            .kind(ProviderErrorKind::ServerOverloaded)
             .code(Some("server_is_overloaded".into()))
             .error_type(Some("server_error".into()))
             .request_id(Some("req-1".into()))
             .retry_after_secs(Some(2))
             .transient(true)
-            .into_llm_error("xai");
+            .attribute("xai");
 
         match error {
             LLMError::ServerOverloaded { message, context } => {
                 assert_eq!(message, "busy");
                 assert_eq!(context.provider, "xai");
+                assert_eq!(context.kind, Some(ProviderErrorKind::ServerOverloaded));
                 assert_eq!(context.code.as_deref(), Some("server_is_overloaded"));
                 assert_eq!(context.request_id.as_deref(), Some("req-1"));
                 assert_eq!(context.retry_after_secs, Some(2));
+                assert!(context.transient);
             }
             other => panic!("expected ServerOverloaded, got {other}"),
         }
     }
 
     #[test]
-    fn provider_wire_error_preserves_non_provider_errors() {
-        let error = ProviderWireError::from(LLMError::ResponseFormatError {
-            message: "invalid chunk".into(),
-            raw_response: "raw".into(),
-        })
-        .into_llm_error("openai");
+    fn decode_error_terminal_ignores_provider_on_attribute() {
+        let error =
+            ProviderDecodeError::response_format("invalid chunk", "raw").attribute("openai");
 
         assert!(matches!(
             error,
@@ -1266,18 +1220,30 @@ mod tests {
     }
 
     #[test]
+    fn decode_error_classified_attributes_provider() {
+        let error = ProviderDecodeError::from(
+            ClassifiedProviderError::new("busy").kind(ProviderErrorKind::RateLimited),
+        )
+        .attribute("groq");
+
+        match error {
+            LLMError::ProviderRateLimited { message, context } => {
+                assert_eq!(message, "busy");
+                assert_eq!(context.provider, "groq");
+                assert_eq!(context.kind, Some(ProviderErrorKind::RateLimited));
+            }
+            other => panic!("expected ProviderRateLimited, got {other}"),
+        }
+    }
+
+    #[test]
     fn structured_semantic_errors_round_trip_through_legacy_provider_tag() {
-        let overloaded = LLMError::ServerOverloaded {
-            message: "busy".into(),
-            context: Box::new(
-                ProviderErrorContext::builder("codex")
-                    .kind(ProviderErrorKind::ServerOverloaded)
-                    .code(Some("server_is_overloaded".into()))
-                    .request_id(Some("req-1".into()))
-                    .transient(true)
-                    .build(),
-            ),
-        };
+        let overloaded = ClassifiedProviderError::new("busy")
+            .kind(ProviderErrorKind::ServerOverloaded)
+            .code(Some("server_is_overloaded".into()))
+            .request_id(Some("req-1".into()))
+            .transient(true)
+            .attribute("codex");
         let payload = overloaded.to_payload();
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["type"], "provider_error");
@@ -1298,30 +1264,20 @@ mod tests {
                     && restored.is_retryable()
         ));
 
-        let quota = LLMError::QuotaExceeded {
-            message: "no credits".into(),
-            context: Box::new(
-                ProviderErrorContext::builder("openai")
-                    .kind(ProviderErrorKind::QuotaExceeded)
-                    .code(Some("insufficient_quota".into()))
-                    .build(),
-            ),
-        };
+        let quota = ClassifiedProviderError::new("no credits")
+            .kind(ProviderErrorKind::QuotaExceeded)
+            .code(Some("insufficient_quota".into()))
+            .attribute("openai");
         assert!(!quota.is_retryable());
         assert!(matches!(
             LLMError::from_payload(quota.to_payload()),
             LLMError::QuotaExceeded { .. }
         ));
 
-        let context = LLMError::ContextWindowExceeded {
-            message: "too long".into(),
-            context: Box::new(
-                ProviderErrorContext::builder("codex")
-                    .kind(ProviderErrorKind::ContextWindowExceeded)
-                    .code(Some("context_length_exceeded".into()))
-                    .build(),
-            ),
-        };
+        let context = ClassifiedProviderError::new("too long")
+            .kind(ProviderErrorKind::ContextWindowExceeded)
+            .code(Some("context_length_exceeded".into()))
+            .attribute("codex");
         assert!(!context.is_retryable());
         assert!(matches!(
             LLMError::from_payload(context.to_payload()),
@@ -1334,10 +1290,10 @@ mod tests {
         let overloaded = LLMErrorPayload::ProviderError {
             message: "busy".into(),
             context: Some(
-                ProviderErrorContext::builder("test")
+                ClassifiedProviderError::new("busy")
                     .kind(ProviderErrorKind::ServerOverloaded)
                     .transient(false)
-                    .build(),
+                    .into_context("test"),
             ),
         };
         assert!(overloaded.is_retryable());
@@ -1345,27 +1301,28 @@ mod tests {
         let quota = LLMErrorPayload::ProviderError {
             message: "no credits".into(),
             context: Some(
-                ProviderErrorContext::builder("test")
+                ClassifiedProviderError::new("no credits")
                     .kind(ProviderErrorKind::QuotaExceeded)
                     .transient(true)
-                    .build(),
+                    .into_context("test"),
             ),
         };
         assert!(!quota.is_retryable());
     }
 
     #[test]
-    fn provider_error_context_builder_sets_optional_metadata() {
-        let context = ProviderErrorContext::builder("codex")
+    fn classified_error_into_context_copies_metadata() {
+        let context = ClassifiedProviderError::new("busy")
             .kind(ProviderErrorKind::ServerOverloaded)
             .code(Some("server_is_overloaded".into()))
             .error_type(Some("server_error".into()))
             .request_id(Some("req-1".into()))
             .retry_after_secs(Some(2))
             .transient(true)
-            .build();
+            .into_context("codex");
 
         assert_eq!(context.provider, "codex");
+        assert_eq!(context.kind, Some(ProviderErrorKind::ServerOverloaded));
         assert_eq!(context.code.as_deref(), Some("server_is_overloaded"));
         assert_eq!(context.error_type.as_deref(), Some("server_error"));
         assert_eq!(context.request_id.as_deref(), Some("req-1"));
@@ -1375,41 +1332,27 @@ mod tests {
 
     #[test]
     fn server_overloaded_is_retryable_by_kind() {
-        let err = LLMError::ServerOverloaded {
-            message: "capacity".into(),
-            context: Box::new(
-                ProviderErrorContext::builder("codex")
-                    .code(Some("server_is_overloaded".into()))
-                    .build(),
-            ),
-        };
+        let err = ClassifiedProviderError::new("capacity")
+            .kind(ProviderErrorKind::ServerOverloaded)
+            .code(Some("server_is_overloaded".into()))
+            .attribute("codex");
         // Kind wins even if context.transient were false.
         assert!(err.is_retryable());
     }
 
     #[test]
     fn provider_response_error_honors_context_transient_flag() {
-        let transient = LLMError::ProviderResponseError {
-            message: "maybe".into(),
-            context: Box::new(
-                ProviderErrorContext::builder("x")
-                    .code(Some("unknown".into()))
-                    .retry_after_secs(Some(5))
-                    .transient(true)
-                    .build(),
-            ),
-        };
+        let transient = ClassifiedProviderError::new("maybe")
+            .code(Some("unknown".into()))
+            .retry_after_secs(Some(5))
+            .transient(true)
+            .attribute("x");
         assert!(transient.is_retryable());
         assert_eq!(transient.retry_after_secs(), Some(5));
 
-        let permanent = LLMError::ProviderResponseError {
-            message: "nope".into(),
-            context: Box::new(
-                ProviderErrorContext::builder("x")
-                    .code(Some("unknown".into()))
-                    .build(),
-            ),
-        };
+        let permanent = ClassifiedProviderError::new("nope")
+            .code(Some("unknown".into()))
+            .attribute("x");
         assert!(!permanent.is_retryable());
     }
 
@@ -1437,9 +1380,9 @@ mod tests {
             LLMErrorPayload::ProviderError {
                 message: "temporary".into(),
                 context: Some(
-                    ProviderErrorContext::builder("test")
+                    ClassifiedProviderError::new("temporary")
                         .transient(true)
-                        .build(),
+                        .into_context("test"),
                 ),
             }
             .is_retryable()

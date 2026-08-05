@@ -126,7 +126,7 @@ impl OpenAIProviderConfig for Alibaba {
 
 impl HTTPChatProvider for Alibaba {
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        classify_openai_http_error(response).into_llm_error(PROVIDER_NAME)
+        classify_openai_http_error(response).attribute(PROVIDER_NAME)
     }
 
     fn chat_request(

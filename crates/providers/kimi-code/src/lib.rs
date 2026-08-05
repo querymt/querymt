@@ -145,7 +145,7 @@ impl OpenAIProviderConfig for KimiCode {
 
 impl HTTPChatProvider for KimiCode {
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        classify_openai_http_error(response).into_llm_error(PROVIDER_NAME)
+        classify_openai_http_error(response).attribute(PROVIDER_NAME)
     }
 
     fn supports_streaming(&self) -> bool {
@@ -202,7 +202,7 @@ impl ChatStreamParser for KimiCodeStreamParser {
         );
         let normalized = KimiCode::normalize_sse_data_prefix(chunk);
         parse_openai_sse_chunk(&normalized, &mut self.tool_states)
-            .map_err(|error| error.into_llm_error(PROVIDER_NAME))
+            .map_err(|error| error.attribute(PROVIDER_NAME))
     }
 }
 
