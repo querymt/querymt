@@ -20,6 +20,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use url::Url;
 
+const PROVIDER_NAME: &str = "codex";
+
 pub mod api;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
@@ -138,7 +140,7 @@ impl api::CodexProviderConfig for Codex {
 
 impl HTTPChatProvider for Codex {
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        api::classify_codex_http_error("codex", response)
+        api::classify_codex_http_error(PROVIDER_NAME, response)
     }
 
     fn chat_request(
@@ -178,7 +180,7 @@ struct CodexStreamParser {
 
 impl ChatStreamParser for CodexStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        api::codex_parse_stream_chunk_with_state("codex", chunk, &self.tool_states)
+        api::codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &self.tool_states)
     }
 }
 
@@ -240,7 +242,7 @@ struct CodexFactory;
 
 impl HTTPLLMProviderFactory for CodexFactory {
     fn name(&self) -> &str {
-        "codex"
+        PROVIDER_NAME
     }
 
     fn api_key_name(&self) -> Option<String> {
@@ -285,12 +287,12 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 
 #[cfg(feature = "extism")]
 mod extism_exports {
-    use super::{Codex, CodexFactory};
+    use super::{Codex, CodexFactory, PROVIDER_NAME};
     use querymt_extism_macros::impl_extism_http_plugin;
 
     impl_extism_http_plugin! {
         config = Codex,
         factory = CodexFactory,
-        name   = "codex",
+        name   = PROVIDER_NAME,
     }
 }

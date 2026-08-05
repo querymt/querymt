@@ -22,6 +22,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
+const PROVIDER_NAME: &str = "openrouter";
+
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct OpenRouter {
@@ -50,7 +52,7 @@ pub struct OpenRouter {
 
 impl OpenAIProviderConfig for OpenRouter {
     fn provider_name(&self) -> &str {
-        "openrouter"
+        PROVIDER_NAME
     }
 
     fn api_key(&self) -> &str {
@@ -161,7 +163,7 @@ struct OpenRouterStreamParser {
 
 impl ChatStreamParser for OpenRouterStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        parse_openai_sse_chunk("openrouter", chunk, &mut self.tool_states)
+        parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut self.tool_states)
     }
 }
 
@@ -201,7 +203,7 @@ struct OpenRouterFactory;
 
 impl HTTPLLMProviderFactory for OpenRouterFactory {
     fn name(&self) -> &str {
-        "openrouter"
+        PROVIDER_NAME
     }
 
     fn api_key_name(&self) -> Option<String> {
@@ -267,13 +269,13 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 
 #[cfg(feature = "extism")]
 mod extism_exports {
-    use super::{OpenRouter, OpenRouterFactory};
+    use super::{OpenRouter, OpenRouterFactory, PROVIDER_NAME};
     use querymt_extism_macros::impl_extism_http_plugin;
 
     impl_extism_http_plugin! {
         config = OpenRouter,
         factory = OpenRouterFactory,
-        name   = "openrouter",
+        name   = PROVIDER_NAME,
     }
 }
 

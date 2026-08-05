@@ -1566,6 +1566,7 @@ mod tests {
         CodexChatResponse, CodexToolUseState, chatgpt_account_id, classify_codex_http_error,
         codex_chat_body_json, codex_chat_request, codex_parse_stream_chunk_with_state,
     };
+    use crate::PROVIDER_NAME;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use http::{Response, header::AUTHORIZATION};
     use querymt::{
@@ -1977,7 +1978,7 @@ mod tests {
             (usize::MAX, CodexToolUseState::default()),
         ])));
         let chunk = format!("data: {payload}\n\n");
-        let error = codex_parse_stream_chunk_with_state("codex", chunk.as_bytes(), &state)
+        let error = codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk.as_bytes(), &state)
             .expect_err("response.failed should return an error");
         (error, state)
     }
@@ -2013,7 +2014,7 @@ mod tests {
                 )
                 .unwrap();
 
-            let error = classify_codex_http_error("codex", &response);
+            let error = classify_codex_http_error(PROVIDER_NAME, &response);
             assert_eq!(error.is_retryable(), expected_retryable, "status={status}");
         }
     }
@@ -2029,7 +2030,7 @@ mod tests {
                     message,
                     "Our servers are currently overloaded. Please try again later."
                 );
-                assert_eq!(context.provider, "codex");
+                assert_eq!(context.provider, PROVIDER_NAME);
                 assert_eq!(context.code.as_deref(), Some("server_is_overloaded"));
                 assert!(error.is_retryable());
             }
@@ -2175,7 +2176,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
         assert_eq!(events.len(), 3);
 
         match &events[0] {
@@ -2199,7 +2200,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "think"),
@@ -2214,7 +2215,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "why"),
@@ -2229,7 +2230,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "why because details"),
@@ -2244,7 +2245,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
         assert_eq!(events.len(), 2);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "why because details"),
@@ -2270,7 +2271,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 "#;
 
         let first_events =
-            codex_parse_stream_chunk_with_state("codex", first_delta, &state).unwrap();
+            codex_parse_stream_chunk_with_state(PROVIDER_NAME, first_delta, &state).unwrap();
         assert_eq!(first_events.len(), 1);
         match &first_events[0] {
             StreamChunk::Thinking(text) => {
@@ -2280,7 +2281,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
         }
 
         let second_events =
-            codex_parse_stream_chunk_with_state("codex", second_delta, &state).unwrap();
+            codex_parse_stream_chunk_with_state(PROVIDER_NAME, second_delta, &state).unwrap();
         assert_eq!(second_events.len(), 1);
         match &second_events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "with consideration!"),
@@ -2288,7 +2289,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
         }
 
         let done_events =
-            codex_parse_stream_chunk_with_state("codex", output_item_done, &state).unwrap();
+            codex_parse_stream_chunk_with_state(PROVIDER_NAME, output_item_done, &state).unwrap();
         assert!(done_events.is_empty(), "unexpected events: {done_events:?}");
     }
 
@@ -2305,7 +2306,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"with consideratio
 "#;
 
         let delta_events =
-            codex_parse_stream_chunk_with_state("codex", delta_chunk, &state).unwrap();
+            codex_parse_stream_chunk_with_state(PROVIDER_NAME, delta_chunk, &state).unwrap();
         assert_eq!(delta_events.len(), 2);
         match &delta_events[0] {
             StreamChunk::Thinking(text) => {
@@ -2319,7 +2320,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"with consideratio
         }
 
         let completed_events =
-            codex_parse_stream_chunk_with_state("codex", completed_chunk, &state).unwrap();
+            codex_parse_stream_chunk_with_state(PROVIDER_NAME, completed_chunk, &state).unwrap();
         assert_eq!(completed_events.len(), 2);
         match &completed_events[0] {
             StreamChunk::Usage(usage) => {
@@ -2348,7 +2349,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"with consideratio
 "#;
 
         let delta_events =
-            codex_parse_stream_chunk_with_state("codex", delta_chunk, &state).unwrap();
+            codex_parse_stream_chunk_with_state(PROVIDER_NAME, delta_chunk, &state).unwrap();
         assert_eq!(delta_events.len(), 1);
         match &delta_events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "first part"),
@@ -2356,7 +2357,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"with consideratio
         }
 
         let completed_events =
-            codex_parse_stream_chunk_with_state("codex", completed_chunk, &state).unwrap();
+            codex_parse_stream_chunk_with_state(PROVIDER_NAME, completed_chunk, &state).unwrap();
         assert_eq!(completed_events.len(), 3);
         match &completed_events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, " plus final"),
@@ -2386,7 +2387,7 @@ data: {"type":"response.completed","response":{"output":[{"type":"reasoning","su
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
         assert_eq!(events.len(), 2);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "why"),
@@ -2407,7 +2408,7 @@ data: {"type":"response.completed","response":{"output":[{"type":"reasoning","su
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
         assert_eq!(events.len(), 3);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "why"),
@@ -2430,7 +2431,8 @@ data: {"type":"response.completed","response":{"output":[{"type":"reasoning","su
 
 "#;
 
-        let first_events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
+        let first_events =
+            codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
         assert_eq!(first_events.len(), 2);
         match &first_events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "same final thought"),
@@ -2441,7 +2443,8 @@ data: {"type":"response.completed","response":{"output":[{"type":"reasoning","su
             other => panic!("expected done chunk, got {other:?}"),
         }
 
-        let second_events = codex_parse_stream_chunk_with_state("codex", chunk, &state).unwrap();
+        let second_events =
+            codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
         assert_eq!(second_events.len(), 2);
         match &second_events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "same final thought"),

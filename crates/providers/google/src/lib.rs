@@ -61,6 +61,8 @@ use serde_json::Value;
 use std::sync::Arc;
 use url::Url;
 
+const PROVIDER_NAME: &str = "google";
+
 /// Client for interacting with Google's Gemini API.
 ///
 /// This struct holds the configuration and state needed to make requests to the Gemini API.
@@ -1258,7 +1260,7 @@ fn extract_google_stream_chunks(response: GoogleChatResponse) -> Vec<querymt::ch
 struct GoogleFactory;
 impl HTTPLLMProviderFactory for GoogleFactory {
     fn name(&self) -> &str {
-        "google"
+        PROVIDER_NAME
     }
 
     fn api_key_name(&self) -> Option<String> {
@@ -1327,12 +1329,12 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 
 #[cfg(feature = "extism")]
 mod extism_exports {
-    use super::{Google, GoogleFactory};
+    use super::{Google, GoogleFactory, PROVIDER_NAME};
     use querymt_extism_macros::impl_extism_http_plugin;
 
     impl_extism_http_plugin! {
         config = Google,
         factory = GoogleFactory,
-        name   = "google",
+        name   = PROVIDER_NAME,
     }
 }

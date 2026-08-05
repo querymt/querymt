@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use url::Url;
 
+const PROVIDER_NAME: &str = "xai";
 const XAI_ADDITIONAL_LIST_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5"];
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
@@ -108,7 +109,7 @@ struct AssistantMessage {
 
 impl OpenAIProviderConfig for Xai {
     fn provider_name(&self) -> &str {
-        "xai"
+        PROVIDER_NAME
     }
 
     fn api_key(&self) -> &str {
@@ -369,9 +370,9 @@ impl XaiStreamParser {
 impl ChatStreamParser for XaiStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
         if self.use_responses_api {
-            codex_parse_stream_chunk_with_state("xai", chunk, &self.codex_tool_state)
+            codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &self.codex_tool_state)
         } else {
-            parse_openai_sse_chunk("xai", chunk, &mut self.openai_tool_state)
+            parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut self.openai_tool_state)
         }
     }
 }
@@ -816,7 +817,7 @@ struct XaiFactory;
 
 impl HTTPLLMProviderFactory for XaiFactory {
     fn name(&self) -> &str {
-        "xai"
+        PROVIDER_NAME
     }
 
     fn api_key_name(&self) -> Option<String> {
@@ -872,13 +873,13 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 
 #[cfg(feature = "extism")]
 mod extism_exports {
-    use super::{Xai, XaiFactory};
+    use super::{PROVIDER_NAME, Xai, XaiFactory};
     use querymt_extism_macros::impl_extism_http_plugin;
 
     impl_extism_http_plugin! {
         config = Xai,
         factory = XaiFactory,
-        name   = "xai",
+        name   = PROVIDER_NAME,
     }
 }
 

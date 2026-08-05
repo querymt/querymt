@@ -22,6 +22,8 @@ use serde_json::Value;
 use std::sync::Arc;
 use url::Url;
 
+const PROVIDER_NAME: &str = "ollama";
+
 pub fn url_schema(_gen: &mut SchemaGenerator) -> Schema {
     json_schema!({
         "type": "string",
@@ -650,7 +652,7 @@ impl HTTPLLMProvider for Ollama {
 struct OllamaFactory;
 impl HTTPLLMProviderFactory for OllamaFactory {
     fn name(&self) -> &str {
-        "ollama"
+        PROVIDER_NAME
     }
 
     fn api_key_name(&self) -> Option<String> {
@@ -724,13 +726,13 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 
 #[cfg(feature = "extism")]
 mod extism_exports {
-    use super::{Ollama, OllamaFactory};
+    use super::{Ollama, OllamaFactory, PROVIDER_NAME};
     use querymt_extism_macros::impl_extism_http_plugin;
 
     impl_extism_http_plugin! {
         config = Ollama,
         factory = OllamaFactory,
-        name   = "ollama",
+        name   = PROVIDER_NAME,
     }
 }
 

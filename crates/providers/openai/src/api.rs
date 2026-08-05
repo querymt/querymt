@@ -1637,6 +1637,7 @@ mod tests {
         MultipartForm, OpenAIChatResponse, OpenAIToolUseState, classify_openai_http_error,
         openai_parse_list_models, parse_openai_sse_chunk,
     };
+    use crate::PROVIDER_NAME;
 
     #[test]
     fn multipart_form_encodes_text_and_file_parts() {
@@ -1912,7 +1913,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
 
 "#;
 
-        let events = parse_openai_sse_chunk("openai", chunk, &mut tool_states).unwrap();
+        let events = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states).unwrap();
         assert_eq!(events.len(), 3);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "thought "),
@@ -1962,7 +1963,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
                 )
                 .unwrap();
 
-            let error = classify_openai_http_error("openai", &response);
+            let error = classify_openai_http_error(PROVIDER_NAME, &response);
             assert_eq!(error.is_retryable(), expected_retryable, "status={status}");
         }
     }
@@ -1989,12 +1990,12 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
 
 "#;
 
-        let error = parse_openai_sse_chunk("openai", chunk, &mut tool_states)
+        let error = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states)
             .expect_err("error envelope should return an error");
         match &error {
             LLMError::ProviderResponseError { message, context } => {
                 assert_eq!(message, "backend unavailable");
-                assert_eq!(context.provider, "openai");
+                assert_eq!(context.provider, PROVIDER_NAME);
                 assert_eq!(context.code.as_deref(), Some("server_error"));
                 assert_eq!(context.error_type.as_deref(), Some("server_error"));
                 assert_eq!(context.request_id.as_deref(), Some("req_123"));
@@ -2013,7 +2014,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
 
 "#;
 
-        let error = parse_openai_sse_chunk("openai", chunk, &mut tool_states)
+        let error = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states)
             .expect_err("error envelope should return an error");
         assert!(matches!(
             error,
@@ -2029,7 +2030,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
 
 "#;
 
-        let error = parse_openai_sse_chunk("openai", chunk, &mut tool_states)
+        let error = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states)
             .expect_err("rate limit envelope should return an error");
         match &error {
             LLMError::ProviderRateLimited { message, context } => {
@@ -2049,7 +2050,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
 
 "#;
 
-        let error = parse_openai_sse_chunk("openai", chunk, &mut tool_states)
+        let error = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states)
             .expect_err("quota envelope should return an error");
         match &error {
             LLMError::QuotaExceeded { message, context } => {
@@ -2067,7 +2068,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         let chunk = br#"data: {"error":{"message":"busy","type":"overloaded_error"}}
 
 "#;
-        let error = parse_openai_sse_chunk("openai", chunk, &mut tool_states).unwrap_err();
+        let error = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states).unwrap_err();
         assert!(matches!(error, LLMError::ServerOverloaded { .. }));
         assert!(error.is_retryable());
     }
@@ -2078,7 +2079,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         let chunk = br#"data: {"error":{"message":"slow down","code":"vendor_specific","type":"rate_limit_error"}}
 
 "#;
-        let error = parse_openai_sse_chunk("openai", chunk, &mut tool_states).unwrap_err();
+        let error = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states).unwrap_err();
         assert!(matches!(error, LLMError::ProviderRateLimited { .. }));
         assert!(error.is_retryable());
     }
@@ -2089,7 +2090,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         let chunk = br#"data: {"error":{"message":"too long","type":"context_length_error"}}
 
 "#;
-        let error = parse_openai_sse_chunk("openai", chunk, &mut tool_states).unwrap_err();
+        let error = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states).unwrap_err();
         assert!(matches!(error, LLMError::ContextWindowExceeded { .. }));
         assert!(!error.is_retryable());
     }
@@ -2101,7 +2102,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
 
 "#;
 
-        let error = parse_openai_sse_chunk("openai", chunk, &mut tool_states)
+        let error = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states)
             .expect_err("invalid normal chunk should return an error");
         assert!(matches!(error, LLMError::ResponseFormatError { .. }));
     }

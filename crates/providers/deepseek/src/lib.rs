@@ -22,6 +22,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
+const PROVIDER_NAME: &str = "deepseek";
+
 fn normalize_base_url(mut url: Url) -> Url {
     if !url.path().ends_with('/') {
         let p = url.path().to_string();
@@ -67,7 +69,7 @@ pub struct Deepseek {
 
 impl OpenAIProviderConfig for Deepseek {
     fn provider_name(&self) -> &str {
-        "deepseek"
+        PROVIDER_NAME
     }
 
     fn api_key(&self) -> &str {
@@ -194,7 +196,7 @@ struct DeepseekStreamParser {
 
 impl ChatStreamParser for DeepseekStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        parse_openai_sse_chunk("deepseek", chunk, &mut self.tool_states)
+        parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut self.tool_states)
     }
 }
 
@@ -234,7 +236,7 @@ struct DeepseekFactory;
 
 impl HTTPLLMProviderFactory for DeepseekFactory {
     fn name(&self) -> &str {
-        "deepseek"
+        PROVIDER_NAME
     }
 
     fn api_key_name(&self) -> Option<String> {
@@ -279,12 +281,12 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 
 #[cfg(feature = "extism")]
 mod extism_exports {
-    use super::{Deepseek, DeepseekFactory};
+    use super::{Deepseek, DeepseekFactory, PROVIDER_NAME};
     use querymt_extism_macros::impl_extism_http_plugin;
 
     impl_extism_http_plugin! {
         config = Deepseek,
         factory = DeepseekFactory,
-        name   = "deepseek",
+        name   = PROVIDER_NAME,
     }
 }

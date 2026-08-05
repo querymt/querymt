@@ -26,6 +26,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
+const PROVIDER_NAME: &str = "kimi-code";
+
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct KimiCode {
@@ -59,7 +61,7 @@ pub struct KimiCode {
 
 impl OpenAIProviderConfig for KimiCode {
     fn provider_name(&self) -> &str {
-        "kimi-code"
+        PROVIDER_NAME
     }
 
     fn api_key(&self) -> &str {
@@ -203,7 +205,7 @@ impl ChatStreamParser for KimiCodeStreamParser {
             String::from_utf8_lossy(chunk)
         );
         let normalized = KimiCode::normalize_sse_data_prefix(chunk);
-        parse_openai_sse_chunk("kimi-code", &normalized, &mut self.tool_states)
+        parse_openai_sse_chunk(PROVIDER_NAME, &normalized, &mut self.tool_states)
     }
 }
 
@@ -310,7 +312,7 @@ struct KimiCodeFactory;
 
 impl HTTPLLMProviderFactory for KimiCodeFactory {
     fn name(&self) -> &str {
-        "kimi-code"
+        PROVIDER_NAME
     }
 
     fn api_key_name(&self) -> Option<String> {
@@ -765,12 +767,12 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 
 #[cfg(feature = "extism")]
 mod extism_exports {
-    use super::{KimiCode, KimiCodeFactory};
+    use super::{KimiCode, KimiCodeFactory, PROVIDER_NAME};
     use querymt_extism_macros::impl_extism_http_plugin;
 
     impl_extism_http_plugin! {
         config = KimiCode,
         factory = KimiCodeFactory,
-        name   = "kimi-code",
+        name   = PROVIDER_NAME,
     }
 }

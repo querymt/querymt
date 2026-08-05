@@ -34,6 +34,8 @@ use serde_json::Value;
 use std::sync::Arc;
 use url::Url;
 
+const PROVIDER_NAME: &str = "anthropic";
+
 /// Authentication type for Anthropic API
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]

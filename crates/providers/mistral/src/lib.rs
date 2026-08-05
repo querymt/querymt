@@ -24,6 +24,8 @@ use serde_json::Value;
 use std::sync::Arc;
 use url::Url;
 
+const PROVIDER_NAME: &str = "mistral";
+
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Mistral {
@@ -84,7 +86,7 @@ struct AssistantMessage {
 
 impl OpenAIProviderConfig for Mistral {
     fn provider_name(&self) -> &str {
-        "mistral"
+        PROVIDER_NAME
     }
 
     fn api_key(&self) -> &str {
@@ -240,7 +242,7 @@ struct MistralFactory;
 
 impl HTTPLLMProviderFactory for MistralFactory {
     fn name(&self) -> &str {
-        "mistral"
+        PROVIDER_NAME
     }
 
     fn api_key_name(&self) -> Option<String> {
@@ -285,12 +287,12 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 
 #[cfg(feature = "extism")]
 mod extism_exports {
-    use super::{Mistral, MistralFactory};
+    use super::{Mistral, MistralFactory, PROVIDER_NAME};
     use querymt_extism_macros::impl_extism_http_plugin;
 
     impl_extism_http_plugin! {
         config = Mistral,
         factory = MistralFactory,
-        name   = "mistral",
+        name   = PROVIDER_NAME,
     }
 }

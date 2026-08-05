@@ -22,6 +22,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
+const PROVIDER_NAME: &str = "openai";
+
 fn normalize_base_url(mut url: Url) -> Url {
     if !url.path().ends_with('/') {
         let p = url.path().to_string();
@@ -106,7 +108,7 @@ pub mod api;
 
 impl api::OpenAIProviderConfig for OpenAI {
     fn provider_name(&self) -> &str {
-        "openai"
+        PROVIDER_NAME
     }
 
     fn api_key(&self) -> &str {
@@ -184,7 +186,7 @@ impl api::OpenAIProviderConfig for OpenAI {
 
 impl HTTPChatProvider for OpenAI {
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        api::classify_openai_http_error("openai", response)
+        api::classify_openai_http_error(PROVIDER_NAME, response)
     }
 
     fn chat_request(
@@ -214,27 +216,18 @@ impl HTTPChatProvider for OpenAI {
     }
 
     fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
-        Ok(Box::new(OpenAIStreamParser::new("openai")))
+        Ok(Box::new(OpenAIStreamParser::default()))
     }
 }
 
+#[derive(Default)]
 struct OpenAIStreamParser {
-    provider: String,
     tool_states: HashMap<usize, api::OpenAIToolUseState>,
-}
-
-impl OpenAIStreamParser {
-    fn new(provider: &str) -> Self {
-        Self {
-            provider: provider.to_string(),
-            tool_states: HashMap::new(),
-        }
-    }
 }
 
 impl ChatStreamParser for OpenAIStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        api::parse_openai_sse_chunk(&self.provider, chunk, &mut self.tool_states)
+        api::parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut self.tool_states)
     }
 }
 
@@ -283,7 +276,7 @@ impl HTTPLLMProvider for OpenAI {
 struct OpenAIFactory;
 impl HTTPLLMProviderFactory for OpenAIFactory {
     fn name(&self) -> &str {
-        "openai"
+        PROVIDER_NAME
     }
 
     fn api_key_name(&self) -> Option<String> {
@@ -433,12 +426,12 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 
 #[cfg(feature = "extism")]
 mod extism_exports {
-    use super::{OpenAI, OpenAIFactory};
+    use super::{OpenAI, OpenAIFactory, PROVIDER_NAME};
     use querymt_extism_macros::impl_extism_http_plugin;
 
     impl_extism_http_plugin! {
         config = OpenAI,
         factory = OpenAIFactory,
-        name   = "openai",
+        name   = PROVIDER_NAME,
     }
 }

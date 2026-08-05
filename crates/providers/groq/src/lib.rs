@@ -26,6 +26,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
+const PROVIDER_NAME: &str = "groq";
+
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Groq {
@@ -86,7 +88,7 @@ struct AssistantMessage {
 
 impl OpenAIProviderConfig for Groq {
     fn provider_name(&self) -> &str {
-        "groq"
+        PROVIDER_NAME
     }
 
     fn api_key(&self) -> &str {
@@ -203,7 +205,7 @@ struct GroqStreamParser {
 
 impl ChatStreamParser for GroqStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        parse_openai_sse_chunk("groq", chunk, &mut self.tool_states)
+        parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut self.tool_states)
     }
 }
 
@@ -276,7 +278,7 @@ struct GroqFactory;
 
 impl HTTPLLMProviderFactory for GroqFactory {
     fn name(&self) -> &str {
-        "groq"
+        PROVIDER_NAME
     }
 
     fn api_key_name(&self) -> Option<String> {
@@ -321,13 +323,13 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 
 #[cfg(feature = "extism")]
 mod extism_exports {
-    use super::{Groq, GroqFactory};
+    use super::{Groq, GroqFactory, PROVIDER_NAME};
     use querymt_extism_macros::impl_extism_http_plugin;
 
     impl_extism_http_plugin! {
         config = Groq,
         factory = GroqFactory,
-        name   = "groq",
+        name   = PROVIDER_NAME,
     }
 }
 

@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use url::Url;
 
-use crate::{Anthropic, detect_auth_type};
+use crate::{Anthropic, PROVIDER_NAME, detect_auth_type};
 
 /// Creates an Anthropic HTTP factory for direct static registration.
 pub fn create_http_factory() -> Arc<dyn HTTPLLMProviderFactory> {
@@ -18,7 +18,7 @@ struct AnthropicFactory;
 
 impl HTTPLLMProviderFactory for AnthropicFactory {
     fn name(&self) -> &str {
-        "anthropic"
+        PROVIDER_NAME
     }
 
     fn api_key_name(&self) -> Option<String> {
@@ -99,12 +99,12 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 
 #[cfg(feature = "extism")]
 mod extism_exports {
-    use super::{Anthropic, AnthropicFactory};
+    use super::{Anthropic, AnthropicFactory, PROVIDER_NAME};
     use querymt_extism_macros::impl_extism_http_plugin;
 
     impl_extism_http_plugin! {
         config = Anthropic,
         factory = AnthropicFactory,
-        name   = "anthropic",
+        name   = PROVIDER_NAME,
     }
 }

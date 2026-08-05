@@ -19,6 +19,9 @@ use serde_json::{Map, Value};
 use std::sync::Arc;
 use url::Url;
 
+const ERROR_PROVIDER_NAME: &str = "moonshot";
+const PROVIDER_NAME: &str = "moonshotai";
+
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct MoonshotAI {
@@ -45,7 +48,7 @@ pub struct MoonshotAI {
 
 impl OpenAIProviderConfig for MoonshotAI {
     fn provider_name(&self) -> &str {
-        "moonshot"
+        ERROR_PROVIDER_NAME
     }
 
     fn api_key(&self) -> &str {
@@ -185,7 +188,7 @@ struct MoonshotAIFactory;
 
 impl HTTPLLMProviderFactory for MoonshotAIFactory {
     fn name(&self) -> &str {
-        "moonshotai"
+        PROVIDER_NAME
     }
 
     fn api_key_name(&self) -> Option<String> {
@@ -230,12 +233,12 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 
 #[cfg(feature = "extism")]
 mod extism_exports {
-    use super::{MoonshotAI, MoonshotAIFactory};
+    use super::{MoonshotAI, MoonshotAIFactory, PROVIDER_NAME};
     use querymt_extism_macros::impl_extism_http_plugin;
 
     impl_extism_http_plugin! {
         config = MoonshotAI,
         factory = MoonshotAIFactory,
-        name   = "moonshotai",
+        name   = PROVIDER_NAME,
     }
 }

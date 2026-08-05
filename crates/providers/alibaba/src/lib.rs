@@ -19,6 +19,8 @@ use serde_json::{Map, Value};
 use std::sync::Arc;
 use url::Url;
 
+const PROVIDER_NAME: &str = "alibaba";
+
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct Alibaba {
@@ -48,7 +50,7 @@ pub struct Alibaba {
 
 impl OpenAIProviderConfig for Alibaba {
     fn provider_name(&self) -> &str {
-        "alibaba"
+        PROVIDER_NAME
     }
 
     fn api_key(&self) -> &str {
@@ -226,7 +228,7 @@ struct AlibabaFactory;
 
 impl HTTPLLMProviderFactory for AlibabaFactory {
     fn name(&self) -> &str {
-        "alibaba"
+        PROVIDER_NAME
     }
 
     fn api_key_name(&self) -> Option<String> {
@@ -273,12 +275,12 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 
 #[cfg(feature = "extism")]
 mod extism_exports {
-    use super::{Alibaba, AlibabaFactory};
+    use super::{Alibaba, AlibabaFactory, PROVIDER_NAME};
     use querymt_extism_macros::impl_extism_http_plugin;
 
     impl_extism_http_plugin! {
         config = Alibaba,
         factory = AlibabaFactory,
-        name   = "alibaba",
+        name   = PROVIDER_NAME,
     }
 }

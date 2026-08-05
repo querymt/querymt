@@ -22,6 +22,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
+const PROVIDER_NAME: &str = "zai";
+
 fn normalize_base_url(mut url: Url) -> Url {
     if !url.path().ends_with('/') {
         let p = url.path().to_string();
@@ -66,7 +68,7 @@ pub struct Zai {
 
 impl OpenAIProviderConfig for Zai {
     fn provider_name(&self) -> &str {
-        "zai"
+        PROVIDER_NAME
     }
 
     fn api_key(&self) -> &str {
@@ -181,7 +183,7 @@ struct ZaiStreamParser {
 
 impl ChatStreamParser for ZaiStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        parse_openai_sse_chunk("zai", chunk, &mut self.tool_states)
+        parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut self.tool_states)
     }
 }
 
@@ -221,7 +223,7 @@ struct ZaiFactory;
 
 impl HTTPLLMProviderFactory for ZaiFactory {
     fn name(&self) -> &str {
-        "zai"
+        PROVIDER_NAME
     }
 
     fn api_key_name(&self) -> Option<String> {
@@ -266,12 +268,12 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 
 #[cfg(feature = "extism")]
 mod extism_exports {
-    use super::{Zai, ZaiFactory};
+    use super::{PROVIDER_NAME, Zai, ZaiFactory};
     use querymt_extism_macros::impl_extism_http_plugin;
 
     impl_extism_http_plugin! {
         config = Zai,
         factory = ZaiFactory,
-        name   = "zai",
+        name   = PROVIDER_NAME,
     }
 }
