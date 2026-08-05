@@ -60,10 +60,6 @@ pub struct KimiCode {
 }
 
 impl OpenAIProviderConfig for KimiCode {
-    fn provider_name(&self) -> &str {
-        PROVIDER_NAME
-    }
-
     fn api_key(&self) -> &str {
         &self.api_key
     }
@@ -149,7 +145,7 @@ impl OpenAIProviderConfig for KimiCode {
 
 impl HTTPChatProvider for KimiCode {
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        classify_openai_http_error(self.provider_name(), response)
+        classify_openai_http_error(response).into_llm_error(PROVIDER_NAME)
     }
 
     fn supports_streaming(&self) -> bool {
@@ -205,7 +201,8 @@ impl ChatStreamParser for KimiCodeStreamParser {
             String::from_utf8_lossy(chunk)
         );
         let normalized = KimiCode::normalize_sse_data_prefix(chunk);
-        parse_openai_sse_chunk(PROVIDER_NAME, &normalized, &mut self.tool_states)
+        parse_openai_sse_chunk(&normalized, &mut self.tool_states)
+            .map_err(|error| error.into_llm_error(PROVIDER_NAME))
     }
 }
 

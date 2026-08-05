@@ -67,6 +67,140 @@ pub struct ProviderErrorContextBuilder {
     transient: bool,
 }
 
+/// Provider failure metadata decoded from a wire response before attribution to
+/// a concrete provider implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedProviderError {
+    pub message: String,
+    pub kind: Option<ProviderErrorKind>,
+    pub code: Option<String>,
+    pub error_type: Option<String>,
+    pub request_id: Option<String>,
+    pub retry_after_secs: Option<u64>,
+    pub transient: bool,
+}
+
+impl ClassifiedProviderError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: None,
+            code: None,
+            error_type: None,
+            request_id: None,
+            retry_after_secs: None,
+            transient: false,
+        }
+    }
+
+    pub fn kind(mut self, kind: Option<ProviderErrorKind>) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    pub fn code(mut self, code: Option<String>) -> Self {
+        self.code = code;
+        self
+    }
+
+    pub fn error_type(mut self, error_type: Option<String>) -> Self {
+        self.error_type = error_type;
+        self
+    }
+
+    pub fn request_id(mut self, request_id: Option<String>) -> Self {
+        self.request_id = request_id;
+        self
+    }
+
+    pub fn retry_after_secs(mut self, retry_after_secs: Option<u64>) -> Self {
+        self.retry_after_secs = retry_after_secs;
+        self
+    }
+
+    pub fn transient(mut self, transient: bool) -> Self {
+        self.transient = transient;
+        self
+    }
+
+    pub fn set_retry_after_if_missing(&mut self, retry_after_secs: Option<u64>) {
+        if self.retry_after_secs.is_none() {
+            self.retry_after_secs = retry_after_secs;
+        }
+    }
+
+    pub fn into_llm_error(self, provider: impl Into<String>) -> LLMError {
+        let context = Box::new(ProviderErrorContext {
+            provider: provider.into(),
+            kind: self.kind,
+            code: self.code,
+            error_type: self.error_type,
+            request_id: self.request_id,
+            retry_after_secs: self.retry_after_secs,
+            transient: self.transient,
+        });
+
+        match self.kind {
+            Some(ProviderErrorKind::ServerOverloaded) => LLMError::ServerOverloaded {
+                message: self.message,
+                context,
+            },
+            Some(ProviderErrorKind::RateLimited) => LLMError::ProviderRateLimited {
+                message: self.message,
+                context,
+            },
+            Some(ProviderErrorKind::QuotaExceeded) => LLMError::QuotaExceeded {
+                message: self.message,
+                context,
+            },
+            Some(ProviderErrorKind::ContextWindowExceeded) => LLMError::ContextWindowExceeded {
+                message: self.message,
+                context,
+            },
+            Some(ProviderErrorKind::Authentication) => LLMError::ProviderAuthError {
+                message: self.message,
+                context,
+            },
+            Some(ProviderErrorKind::InvalidRequest) => LLMError::ProviderInvalidRequest {
+                message: self.message,
+                context,
+            },
+            None => LLMError::ProviderResponseError {
+                message: self.message,
+                context,
+            },
+        }
+    }
+}
+
+/// Error produced while decoding a provider wire response.
+#[derive(Debug)]
+pub enum ProviderWireError {
+    Classified(ClassifiedProviderError),
+    Other(LLMError),
+}
+
+impl ProviderWireError {
+    pub fn into_llm_error(self, provider: impl Into<String>) -> LLMError {
+        match self {
+            Self::Classified(error) => error.into_llm_error(provider),
+            Self::Other(error) => error,
+        }
+    }
+}
+
+impl From<ClassifiedProviderError> for ProviderWireError {
+    fn from(error: ClassifiedProviderError) -> Self {
+        Self::Classified(error)
+    }
+}
+
+impl From<LLMError> for ProviderWireError {
+    fn from(error: LLMError) -> Self {
+        Self::Other(error)
+    }
+}
+
 impl ProviderErrorContextBuilder {
     pub fn kind(mut self, kind: ProviderErrorKind) -> Self {
         self.kind = Some(kind);
@@ -1088,6 +1222,46 @@ mod tests {
         assert!(matches!(
             LLMError::from_payload(payload),
             LLMError::ProviderError(message) if message == "legacy failure"
+        ));
+    }
+
+    #[test]
+    fn classified_provider_error_attaches_provider_at_conversion_boundary() {
+        let error = ClassifiedProviderError::new("busy")
+            .kind(Some(ProviderErrorKind::ServerOverloaded))
+            .code(Some("server_is_overloaded".into()))
+            .error_type(Some("server_error".into()))
+            .request_id(Some("req-1".into()))
+            .retry_after_secs(Some(2))
+            .transient(true)
+            .into_llm_error("xai");
+
+        match error {
+            LLMError::ServerOverloaded { message, context } => {
+                assert_eq!(message, "busy");
+                assert_eq!(context.provider, "xai");
+                assert_eq!(context.code.as_deref(), Some("server_is_overloaded"));
+                assert_eq!(context.request_id.as_deref(), Some("req-1"));
+                assert_eq!(context.retry_after_secs, Some(2));
+            }
+            other => panic!("expected ServerOverloaded, got {other}"),
+        }
+    }
+
+    #[test]
+    fn provider_wire_error_preserves_non_provider_errors() {
+        let error = ProviderWireError::from(LLMError::ResponseFormatError {
+            message: "invalid chunk".into(),
+            raw_response: "raw".into(),
+        })
+        .into_llm_error("openai");
+
+        assert!(matches!(
+            error,
+            LLMError::ResponseFormatError {
+                ref message,
+                ref raw_response,
+            } if message == "invalid chunk" && raw_response == "raw"
         ));
     }
 

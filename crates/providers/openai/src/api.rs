@@ -10,8 +10,8 @@ use querymt::{
         StructuredOutputFormat, Tool, ToolChoice,
     },
     error::{
-        LLMError, ProviderErrorContext, ProviderErrorKind, extract_retry_after_from_json,
-        parse_retry_after, parse_retry_after_from_message,
+        ClassifiedProviderError, LLMError, ProviderErrorKind, ProviderWireError,
+        extract_retry_after_from_json, parse_retry_after, parse_retry_after_from_message,
     },
     handle_http_error,
     stt::{SttRequest, SttResponse},
@@ -394,10 +394,6 @@ impl std::fmt::Display for OpenAIChatResponse {
 }
 
 pub trait OpenAIProviderConfig {
-    fn provider_name(&self) -> &str {
-        "openai"
-    }
-
     fn api_key(&self) -> &str;
     fn auth_type(&self) -> Option<&AuthType> {
         None
@@ -1237,12 +1233,11 @@ fn recognized_openai_error_kind(kind: &str) -> Option<&str> {
 /// Map an OpenAI-compatible SSE/HTTP `{ "error": ... }` envelope into unified
 /// [`LLMError`] kinds. Vendor `code`/`type` dialect stays in this provider.
 fn map_openai_error_envelope(
-    provider: &str,
     error: &Value,
     envelope: &Value,
     explicit_request_id: Option<&str>,
     unknown_transient: bool,
-) -> LLMError {
+) -> ClassifiedProviderError {
     let message = error
         .as_str()
         .map(str::to_owned)
@@ -1286,99 +1281,54 @@ fn map_openai_error_envelope(
         .and_then(recognized_openai_error_kind)
         .or_else(|| type_norm.as_deref().and_then(recognized_openai_error_kind));
 
-    let context = |kind, transient, retry_after_secs| {
-        let builder = ProviderErrorContext::builder(provider)
-            .code(code.clone())
-            .error_type(error_type.clone())
-            .request_id(request_id.clone())
-            .retry_after_secs(retry_after_secs)
-            .transient(transient);
-        match kind {
-            Some(kind) => builder.kind(kind).build(),
-            None => builder.build(),
-        }
-    };
-
-    match kind {
-        Some("server_is_overloaded" | "slow_down" | "overloaded_error" | "overloaded") => {
-            LLMError::ServerOverloaded {
-                message,
-                context: Box::new(context(
-                    Some(ProviderErrorKind::ServerOverloaded),
-                    true,
-                    retry_after_secs,
-                )),
-            }
-        }
+    let (kind, transient, retry_after_secs) = match kind {
+        Some("server_is_overloaded" | "slow_down" | "overloaded_error" | "overloaded") => (
+            Some(ProviderErrorKind::ServerOverloaded),
+            true,
+            retry_after_secs,
+        ),
         Some(
             "rate_limit_exceeded"
             | "rate_limit_error"
             | "rate_limited"
             | "rate_limit"
             | "too_many_requests",
-        ) => {
-            let retry_after_secs =
-                retry_after_secs.or_else(|| parse_retry_after_from_message(&message));
-            LLMError::ProviderRateLimited {
-                message,
-                context: Box::new(context(
-                    Some(ProviderErrorKind::RateLimited),
-                    true,
-                    retry_after_secs,
-                )),
-            }
-        }
+        ) => (
+            Some(ProviderErrorKind::RateLimited),
+            true,
+            retry_after_secs.or_else(|| parse_retry_after_from_message(&message)),
+        ),
         Some("context_length_exceeded" | "context_length_error" | "context_length") => {
-            LLMError::ContextWindowExceeded {
-                message,
-                context: Box::new(context(
-                    Some(ProviderErrorKind::ContextWindowExceeded),
-                    false,
-                    None,
-                )),
-            }
+            (Some(ProviderErrorKind::ContextWindowExceeded), false, None)
         }
-        Some("insufficient_quota" | "usage_not_included") => LLMError::QuotaExceeded {
-            message,
-            context: Box::new(context(Some(ProviderErrorKind::QuotaExceeded), false, None)),
-        },
+        Some("insufficient_quota" | "usage_not_included") => {
+            (Some(ProviderErrorKind::QuotaExceeded), false, None)
+        }
         Some(
             "invalid_request"
             | "invalid_request_error"
             | "invalid_prompt"
             | "bio_policy"
             | "cyber_policy",
-        ) => LLMError::ProviderInvalidRequest {
-            message,
-            context: Box::new(context(
-                Some(ProviderErrorKind::InvalidRequest),
-                false,
-                None,
-            )),
-        },
+        ) => (Some(ProviderErrorKind::InvalidRequest), false, None),
         Some("authentication_error" | "invalid_api_key" | "unauthorized") => {
-            LLMError::ProviderAuthError {
-                message,
-                context: Box::new(context(
-                    Some(ProviderErrorKind::Authentication),
-                    false,
-                    None,
-                )),
-            }
+            (Some(ProviderErrorKind::Authentication), false, None)
         }
-        Some("server_error" | "internal_server_error") => LLMError::ProviderResponseError {
-            message,
-            context: Box::new(context(None, true, retry_after_secs)),
-        },
-        _ => LLMError::ProviderResponseError {
-            message,
-            context: Box::new(context(None, unknown_transient, retry_after_secs)),
-        },
-    }
+        Some("server_error" | "internal_server_error") => (None, true, retry_after_secs),
+        _ => (None, unknown_transient, retry_after_secs),
+    };
+
+    ClassifiedProviderError::new(message)
+        .kind(kind)
+        .code(code)
+        .error_type(error_type)
+        .request_id(request_id)
+        .retry_after_secs(retry_after_secs)
+        .transient(transient)
 }
 
 /// Parse an OpenAI SSE chunk into StreamChunk events
-pub fn classify_openai_http_error(provider: &str, response: &Response<Vec<u8>>) -> LLMError {
+pub fn classify_openai_http_error(response: &Response<Vec<u8>>) -> ProviderWireError {
     let status = response.status().as_u16();
     let retry_after_secs = parse_retry_after(response.headers());
     let request_id = response
@@ -1391,53 +1341,22 @@ pub fn classify_openai_http_error(provider: &str, response: &Response<Vec<u8>>) 
         && let Some(error) = envelope.get("error")
     {
         let mut mapped = map_openai_error_envelope(
-            provider,
             error,
             envelope,
             request_id,
             matches!(status, 429 | 500..=599),
         );
-        if mapped.retry_after_secs().is_none()
-            && let Some(retry_after_secs) = retry_after_secs
-        {
-            mapped = match mapped {
-                LLMError::ProviderRateLimited {
-                    message,
-                    mut context,
-                }
-                | LLMError::ServerOverloaded {
-                    message,
-                    mut context,
-                }
-                | LLMError::ProviderResponseError {
-                    message,
-                    mut context,
-                } => {
-                    context.retry_after_secs = Some(retry_after_secs);
-                    match context.kind {
-                        Some(ProviderErrorKind::RateLimited) => {
-                            LLMError::ProviderRateLimited { message, context }
-                        }
-                        Some(ProviderErrorKind::ServerOverloaded) => {
-                            LLMError::ServerOverloaded { message, context }
-                        }
-                        _ => LLMError::ProviderResponseError { message, context },
-                    }
-                }
-                other => other,
-            };
-        }
-        return mapped;
+        mapped.set_retry_after_if_missing(retry_after_secs);
+        return mapped.into();
     }
 
-    querymt::error::classify_http_status(status, response.headers(), response.body())
+    querymt::error::classify_http_status(status, response.headers(), response.body()).into()
 }
 
 pub fn parse_openai_sse_chunk(
-    provider: &str,
     chunk: &[u8],
     tool_states: &mut HashMap<usize, OpenAIToolUseState>,
-) -> Result<Vec<StreamChunk>, LLMError> {
+) -> Result<Vec<StreamChunk>, ProviderWireError> {
     // Skip empty chunks
     if chunk.is_empty() {
         return Ok(Vec::new());
@@ -1492,28 +1411,27 @@ pub fn parse_openai_sse_chunk(
         }
 
         // Parse once so provider error envelopes and normal stream chunks share the same payload.
-        let envelope: Value =
-            serde_json::from_str(data).map_err(|e| LLMError::ResponseFormatError {
+        let envelope: Value = serde_json::from_str(data).map_err(|e| {
+            ProviderWireError::from(LLMError::ResponseFormatError {
                 message: format!("Failed to parse OpenAI stream chunk: {}", e),
                 raw_response: data.to_string(),
-            })?;
+            })
+        })?;
         if let Some(error) = envelope.get("error") {
             let explicit_request_id = envelope
                 .get("request_id")
                 .or_else(|| envelope.get("requestId"))
                 .and_then(Value::as_str);
-            return Err(map_openai_error_envelope(
-                provider,
-                error,
-                &envelope,
-                explicit_request_id,
-                false,
-            ));
+            return Err(
+                map_openai_error_envelope(error, &envelope, explicit_request_id, false).into(),
+            );
         }
         let mut stream_chunk: OpenAIStreamChunk =
-            serde_json::from_value(envelope).map_err(|e| LLMError::ResponseFormatError {
-                message: format!("Failed to parse OpenAI stream chunk: {}", e),
-                raw_response: data.to_string(),
+            serde_json::from_value(envelope).map_err(|e| {
+                ProviderWireError::from(LLMError::ResponseFormatError {
+                    message: format!("Failed to parse OpenAI stream chunk: {}", e),
+                    raw_response: data.to_string(),
+                })
             })?;
 
         // Emit usage metadata BEFORE Done so consumers that break on Done
@@ -1913,7 +1831,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
 
 "#;
 
-        let events = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states).unwrap();
+        let events = parse_openai_sse_chunk(chunk, &mut tool_states).unwrap();
         assert_eq!(events.len(), 3);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "thought "),
@@ -1941,7 +1859,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
             )
             .unwrap();
 
-        let error = classify_openai_http_error("openrouter", &response);
+        let error = classify_openai_http_error(&response).into_llm_error("openrouter");
         match error {
             LLMError::ProviderRateLimited { message, context } => {
                 assert_eq!(message, "slow down");
@@ -1963,18 +1881,20 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
                 )
                 .unwrap();
 
-            let error = classify_openai_http_error(PROVIDER_NAME, &response);
+            let error = classify_openai_http_error(&response).into_llm_error(PROVIDER_NAME);
             assert_eq!(error.is_retryable(), expected_retryable, "status={status}");
         }
     }
 
     #[test]
-    fn parse_sse_chunk_uses_explicit_provider_identity() {
+    fn parse_sse_chunk_attaches_provider_at_conversion_boundary() {
         let mut tool_states = HashMap::new();
         let chunk = br#"data: {"error":{"message":"busy","code":"server_error"}}
 
 "#;
-        let error = parse_openai_sse_chunk("groq", chunk, &mut tool_states).unwrap_err();
+        let error = parse_openai_sse_chunk(chunk, &mut tool_states)
+            .unwrap_err()
+            .into_llm_error("groq");
         match error {
             LLMError::ProviderResponseError { context, .. } => {
                 assert_eq!(context.provider, "groq");
@@ -1990,8 +1910,9 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
 
 "#;
 
-        let error = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states)
-            .expect_err("error envelope should return an error");
+        let error = parse_openai_sse_chunk(chunk, &mut tool_states)
+            .expect_err("error envelope should return an error")
+            .into_llm_error(PROVIDER_NAME);
         match &error {
             LLMError::ProviderResponseError { message, context } => {
                 assert_eq!(message, "backend unavailable");
@@ -2014,8 +1935,9 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
 
 "#;
 
-        let error = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states)
-            .expect_err("error envelope should return an error");
+        let error = parse_openai_sse_chunk(chunk, &mut tool_states)
+            .expect_err("error envelope should return an error")
+            .into_llm_error(PROVIDER_NAME);
         assert!(matches!(
             error,
             LLMError::ProviderInvalidRequest { ref message, .. } if message == "unsupported field"
@@ -2030,8 +1952,9 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
 
 "#;
 
-        let error = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states)
-            .expect_err("rate limit envelope should return an error");
+        let error = parse_openai_sse_chunk(chunk, &mut tool_states)
+            .expect_err("rate limit envelope should return an error")
+            .into_llm_error(PROVIDER_NAME);
         match &error {
             LLMError::ProviderRateLimited { message, context } => {
                 assert!(message.contains("Rate limit"));
@@ -2050,8 +1973,9 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
 
 "#;
 
-        let error = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states)
-            .expect_err("quota envelope should return an error");
+        let error = parse_openai_sse_chunk(chunk, &mut tool_states)
+            .expect_err("quota envelope should return an error")
+            .into_llm_error(PROVIDER_NAME);
         match &error {
             LLMError::QuotaExceeded { message, context } => {
                 assert!(message.contains("quota"));
@@ -2068,7 +1992,9 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         let chunk = br#"data: {"error":{"message":"busy","type":"overloaded_error"}}
 
 "#;
-        let error = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states).unwrap_err();
+        let error = parse_openai_sse_chunk(chunk, &mut tool_states)
+            .unwrap_err()
+            .into_llm_error(PROVIDER_NAME);
         assert!(matches!(error, LLMError::ServerOverloaded { .. }));
         assert!(error.is_retryable());
     }
@@ -2079,7 +2005,9 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         let chunk = br#"data: {"error":{"message":"slow down","code":"vendor_specific","type":"rate_limit_error"}}
 
 "#;
-        let error = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states).unwrap_err();
+        let error = parse_openai_sse_chunk(chunk, &mut tool_states)
+            .unwrap_err()
+            .into_llm_error(PROVIDER_NAME);
         assert!(matches!(error, LLMError::ProviderRateLimited { .. }));
         assert!(error.is_retryable());
     }
@@ -2090,7 +2018,9 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         let chunk = br#"data: {"error":{"message":"too long","type":"context_length_error"}}
 
 "#;
-        let error = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states).unwrap_err();
+        let error = parse_openai_sse_chunk(chunk, &mut tool_states)
+            .unwrap_err()
+            .into_llm_error(PROVIDER_NAME);
         assert!(matches!(error, LLMError::ContextWindowExceeded { .. }));
         assert!(!error.is_retryable());
     }
@@ -2102,8 +2032,9 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
 
 "#;
 
-        let error = parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut tool_states)
-            .expect_err("invalid normal chunk should return an error");
+        let error = parse_openai_sse_chunk(chunk, &mut tool_states)
+            .expect_err("invalid normal chunk should return an error")
+            .into_llm_error(PROVIDER_NAME);
         assert!(matches!(error, LLMError::ResponseFormatError { .. }));
     }
 

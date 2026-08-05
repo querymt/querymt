@@ -87,10 +87,6 @@ struct AssistantMessage {
 }
 
 impl OpenAIProviderConfig for Groq {
-    fn provider_name(&self) -> &str {
-        PROVIDER_NAME
-    }
-
     fn api_key(&self) -> &str {
         &self.api_key
     }
@@ -164,7 +160,7 @@ impl OpenAIProviderConfig for Groq {
 
 impl HTTPChatProvider for Groq {
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        classify_openai_http_error(self.provider_name(), response)
+        classify_openai_http_error(response).into_llm_error(PROVIDER_NAME)
     }
 
     fn chat_request(
@@ -205,7 +201,8 @@ struct GroqStreamParser {
 
 impl ChatStreamParser for GroqStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut self.tool_states)
+        parse_openai_sse_chunk(chunk, &mut self.tool_states)
+            .map_err(|error| error.into_llm_error(PROVIDER_NAME))
     }
 }
 

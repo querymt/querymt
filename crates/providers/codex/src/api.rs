@@ -14,8 +14,8 @@ use querymt::{
         Tool, ToolChoice,
     },
     error::{
-        LLMError, ProviderErrorContext, ProviderErrorKind, extract_retry_after_from_json,
-        parse_retry_after, parse_retry_after_from_message,
+        ClassifiedProviderError, LLMError, ProviderErrorKind, ProviderWireError,
+        extract_retry_after_from_json, parse_retry_after, parse_retry_after_from_message,
     },
     handle_http_error,
 };
@@ -784,7 +784,7 @@ pub fn codex_parse_chat_with_state(
     }
 }
 
-pub fn classify_codex_http_error(provider: &str, response: &Response<Vec<u8>>) -> LLMError {
+pub fn classify_codex_http_error(response: &Response<Vec<u8>>) -> ProviderWireError {
     let status = response.status().as_u16();
     let retry_after_secs = parse_retry_after(response.headers());
     let request_id = response
@@ -800,54 +800,23 @@ pub fn classify_codex_http_error(provider: &str, response: &Response<Vec<u8>>) -
             .or_else(|| envelope.get("error"))
         {
             let mut mapped = map_codex_response_failed(
-                provider,
                 error,
                 response_value,
                 request_id,
                 matches!(status, 429 | 500..=599),
             );
-            if mapped.retry_after_secs().is_none()
-                && let Some(retry_after_secs) = retry_after_secs
-            {
-                mapped = match mapped {
-                    LLMError::ProviderRateLimited {
-                        message,
-                        mut context,
-                    }
-                    | LLMError::ServerOverloaded {
-                        message,
-                        mut context,
-                    }
-                    | LLMError::ProviderResponseError {
-                        message,
-                        mut context,
-                    } => {
-                        context.retry_after_secs = Some(retry_after_secs);
-                        match context.kind {
-                            Some(ProviderErrorKind::RateLimited) => {
-                                LLMError::ProviderRateLimited { message, context }
-                            }
-                            Some(ProviderErrorKind::ServerOverloaded) => {
-                                LLMError::ServerOverloaded { message, context }
-                            }
-                            _ => LLMError::ProviderResponseError { message, context },
-                        }
-                    }
-                    other => other,
-                };
-            }
-            return mapped;
+            mapped.set_retry_after_if_missing(retry_after_secs);
+            return mapped.into();
         }
     }
 
-    querymt::error::classify_http_status(status, response.headers(), response.body())
+    querymt::error::classify_http_status(status, response.headers(), response.body()).into()
 }
 
 pub fn codex_parse_stream_chunk_with_state(
-    provider: &str,
     chunk: &[u8],
     tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
-) -> Result<Vec<StreamChunk>, LLMError> {
+) -> Result<Vec<StreamChunk>, ProviderWireError> {
     if chunk.is_empty() {
         return Ok(Vec::new());
     }
@@ -1005,15 +974,10 @@ pub fn codex_parse_stream_chunk_with_state(
             "response.failed" => {
                 let response = event.response.unwrap_or(Value::Null);
                 let error = response.get("error").unwrap_or(&Value::Null);
-                let provider_error = map_codex_response_failed(
-                    provider,
-                    error,
-                    &response,
-                    event.request_id.as_deref(),
-                    true,
-                );
+                let provider_error =
+                    map_codex_response_failed(error, &response, event.request_id.as_deref(), true);
                 tool_state_buffer.lock().unwrap().clear();
-                return Err(provider_error);
+                return Err(provider_error.into());
             }
             _ => {}
         }
@@ -1057,12 +1021,11 @@ fn recognized_codex_error_kind(kind: &str) -> Option<&str> {
 ///
 /// Vendor dialect stays in this provider; core only sees unified kinds.
 fn map_codex_response_failed(
-    provider: &str,
     error: &Value,
     response: &Value,
     explicit_request_id: Option<&str>,
     unknown_transient: bool,
-) -> LLMError {
+) -> ClassifiedProviderError {
     let message = error
         .get("message")
         .and_then(Value::as_str)
@@ -1096,85 +1059,43 @@ fn map_codex_response_failed(
         .and_then(recognized_codex_error_kind)
         .or_else(|| type_norm.as_deref().and_then(recognized_codex_error_kind));
 
-    let context = |kind, transient, retry_after_secs| {
-        let builder = ProviderErrorContext::builder(provider)
-            .code(code.clone())
-            .error_type(error_type.clone())
-            .request_id(request_id.clone())
-            .retry_after_secs(retry_after_secs)
-            .transient(transient);
-        match kind {
-            Some(kind) => builder.kind(kind).build(),
-            None => builder.build(),
-        }
-    };
-
-    match kind {
-        Some("server_is_overloaded" | "slow_down" | "overloaded_error") => {
-            LLMError::ServerOverloaded {
-                message,
-                context: Box::new(context(
-                    Some(ProviderErrorKind::ServerOverloaded),
-                    true,
-                    retry_after_secs,
-                )),
-            }
-        }
-        Some("rate_limit_exceeded" | "rate_limit_error") => {
-            let retry_after_secs =
-                retry_after_secs.or_else(|| parse_retry_after_from_message(&message));
-            LLMError::ProviderRateLimited {
-                message,
-                context: Box::new(context(
-                    Some(ProviderErrorKind::RateLimited),
-                    true,
-                    retry_after_secs,
-                )),
-            }
-        }
+    let (kind, transient, retry_after_secs) = match kind {
+        Some("server_is_overloaded" | "slow_down" | "overloaded_error") => (
+            Some(ProviderErrorKind::ServerOverloaded),
+            true,
+            retry_after_secs,
+        ),
+        Some("rate_limit_exceeded" | "rate_limit_error") => (
+            Some(ProviderErrorKind::RateLimited),
+            true,
+            retry_after_secs.or_else(|| parse_retry_after_from_message(&message)),
+        ),
         Some("context_length_exceeded" | "context_length_error") => {
-            LLMError::ContextWindowExceeded {
-                message,
-                context: Box::new(context(
-                    Some(ProviderErrorKind::ContextWindowExceeded),
-                    false,
-                    None,
-                )),
-            }
+            (Some(ProviderErrorKind::ContextWindowExceeded), false, None)
         }
-        Some("insufficient_quota" | "usage_not_included") => LLMError::QuotaExceeded {
-            message,
-            context: Box::new(context(Some(ProviderErrorKind::QuotaExceeded), false, None)),
-        },
+        Some("insufficient_quota" | "usage_not_included") => {
+            (Some(ProviderErrorKind::QuotaExceeded), false, None)
+        }
         Some(
             "cyber_policy"
             | "invalid_prompt"
             | "bio_policy"
             | "invalid_request"
             | "invalid_request_error",
-        ) => LLMError::ProviderInvalidRequest {
-            message,
-            context: Box::new(context(
-                Some(ProviderErrorKind::InvalidRequest),
-                false,
-                None,
-            )),
-        },
+        ) => (Some(ProviderErrorKind::InvalidRequest), false, None),
         Some("authentication_error" | "invalid_api_key" | "unauthorized") => {
-            LLMError::ProviderAuthError {
-                message,
-                context: Box::new(context(
-                    Some(ProviderErrorKind::Authentication),
-                    false,
-                    None,
-                )),
-            }
+            (Some(ProviderErrorKind::Authentication), false, None)
         }
-        _ => LLMError::ProviderResponseError {
-            message,
-            context: Box::new(context(None, unknown_transient, retry_after_secs)),
-        },
-    }
+        _ => (None, unknown_transient, retry_after_secs),
+    };
+
+    ClassifiedProviderError::new(message)
+        .kind(kind)
+        .code(code)
+        .error_type(error_type)
+        .request_id(request_id)
+        .retry_after_secs(retry_after_secs)
+        .transient(transient)
 }
 
 fn mark_streamed_thinking_emitted(
@@ -1978,8 +1899,9 @@ mod tests {
             (usize::MAX, CodexToolUseState::default()),
         ])));
         let chunk = format!("data: {payload}\n\n");
-        let error = codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk.as_bytes(), &state)
-            .expect_err("response.failed should return an error");
+        let error = codex_parse_stream_chunk_with_state(chunk.as_bytes(), &state)
+            .expect_err("response.failed should return an error")
+            .into_llm_error(PROVIDER_NAME);
         (error, state)
     }
 
@@ -1992,7 +1914,7 @@ mod tests {
             .body(br#"{"error":{"message":"busy","code":"server_is_overloaded"}}"#.to_vec())
             .unwrap();
 
-        let error = classify_codex_http_error("xai", &response);
+        let error = classify_codex_http_error(&response).into_llm_error("xai");
         match error {
             LLMError::ServerOverloaded { message, context } => {
                 assert_eq!(message, "busy");
@@ -2014,7 +1936,7 @@ mod tests {
                 )
                 .unwrap();
 
-            let error = classify_codex_http_error(PROVIDER_NAME, &response);
+            let error = classify_codex_http_error(&response).into_llm_error(PROVIDER_NAME);
             assert_eq!(error.is_retryable(), expected_retryable, "status={status}");
         }
     }
@@ -2176,7 +2098,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
         assert_eq!(events.len(), 3);
 
         match &events[0] {
@@ -2200,7 +2122,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "think"),
@@ -2215,7 +2137,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "why"),
@@ -2230,7 +2152,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "why because details"),
@@ -2245,7 +2167,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
         assert_eq!(events.len(), 2);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "why because details"),
@@ -2270,8 +2192,7 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
 
 "#;
 
-        let first_events =
-            codex_parse_stream_chunk_with_state(PROVIDER_NAME, first_delta, &state).unwrap();
+        let first_events = codex_parse_stream_chunk_with_state(first_delta, &state).unwrap();
         assert_eq!(first_events.len(), 1);
         match &first_events[0] {
             StreamChunk::Thinking(text) => {
@@ -2280,16 +2201,14 @@ data: {"type":"response.reasoning_text.delta","delta":"continued"}
             other => panic!("expected thinking chunk, got {other:?}"),
         }
 
-        let second_events =
-            codex_parse_stream_chunk_with_state(PROVIDER_NAME, second_delta, &state).unwrap();
+        let second_events = codex_parse_stream_chunk_with_state(second_delta, &state).unwrap();
         assert_eq!(second_events.len(), 1);
         match &second_events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "with consideration!"),
             other => panic!("expected thinking chunk, got {other:?}"),
         }
 
-        let done_events =
-            codex_parse_stream_chunk_with_state(PROVIDER_NAME, output_item_done, &state).unwrap();
+        let done_events = codex_parse_stream_chunk_with_state(output_item_done, &state).unwrap();
         assert!(done_events.is_empty(), "unexpected events: {done_events:?}");
     }
 
@@ -2305,8 +2224,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"with consideratio
 
 "#;
 
-        let delta_events =
-            codex_parse_stream_chunk_with_state(PROVIDER_NAME, delta_chunk, &state).unwrap();
+        let delta_events = codex_parse_stream_chunk_with_state(delta_chunk, &state).unwrap();
         assert_eq!(delta_events.len(), 2);
         match &delta_events[0] {
             StreamChunk::Thinking(text) => {
@@ -2320,7 +2238,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"with consideratio
         }
 
         let completed_events =
-            codex_parse_stream_chunk_with_state(PROVIDER_NAME, completed_chunk, &state).unwrap();
+            codex_parse_stream_chunk_with_state(completed_chunk, &state).unwrap();
         assert_eq!(completed_events.len(), 2);
         match &completed_events[0] {
             StreamChunk::Usage(usage) => {
@@ -2348,8 +2266,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"with consideratio
 
 "#;
 
-        let delta_events =
-            codex_parse_stream_chunk_with_state(PROVIDER_NAME, delta_chunk, &state).unwrap();
+        let delta_events = codex_parse_stream_chunk_with_state(delta_chunk, &state).unwrap();
         assert_eq!(delta_events.len(), 1);
         match &delta_events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "first part"),
@@ -2357,7 +2274,7 @@ data: {"type":"response.reasoning_summary_text.delta","delta":"with consideratio
         }
 
         let completed_events =
-            codex_parse_stream_chunk_with_state(PROVIDER_NAME, completed_chunk, &state).unwrap();
+            codex_parse_stream_chunk_with_state(completed_chunk, &state).unwrap();
         assert_eq!(completed_events.len(), 3);
         match &completed_events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, " plus final"),
@@ -2387,7 +2304,7 @@ data: {"type":"response.completed","response":{"output":[{"type":"reasoning","su
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
         assert_eq!(events.len(), 2);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "why"),
@@ -2408,7 +2325,7 @@ data: {"type":"response.completed","response":{"output":[{"type":"reasoning","su
 
 "#;
 
-        let events = codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
+        let events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
         assert_eq!(events.len(), 3);
         match &events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "why"),
@@ -2431,8 +2348,7 @@ data: {"type":"response.completed","response":{"output":[{"type":"reasoning","su
 
 "#;
 
-        let first_events =
-            codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
+        let first_events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
         assert_eq!(first_events.len(), 2);
         match &first_events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "same final thought"),
@@ -2443,8 +2359,7 @@ data: {"type":"response.completed","response":{"output":[{"type":"reasoning","su
             other => panic!("expected done chunk, got {other:?}"),
         }
 
-        let second_events =
-            codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &state).unwrap();
+        let second_events = codex_parse_stream_chunk_with_state(chunk, &state).unwrap();
         assert_eq!(second_events.len(), 2);
         match &second_events[0] {
             StreamChunk::Thinking(text) => assert_eq!(text, "same final thought"),

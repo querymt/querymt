@@ -49,10 +49,6 @@ pub struct Alibaba {
 }
 
 impl OpenAIProviderConfig for Alibaba {
-    fn provider_name(&self) -> &str {
-        PROVIDER_NAME
-    }
-
     fn api_key(&self) -> &str {
         &self.api_key
     }
@@ -130,7 +126,7 @@ impl OpenAIProviderConfig for Alibaba {
 
 impl HTTPChatProvider for Alibaba {
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        classify_openai_http_error(self.provider_name(), response)
+        classify_openai_http_error(response).into_llm_error(PROVIDER_NAME)
     }
 
     fn chat_request(

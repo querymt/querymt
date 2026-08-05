@@ -108,10 +108,6 @@ struct AssistantMessage {
 }
 
 impl OpenAIProviderConfig for Xai {
-    fn provider_name(&self) -> &str {
-        PROVIDER_NAME
-    }
-
     fn api_key(&self) -> &str {
         &self.api_key
     }
@@ -184,9 +180,9 @@ impl OpenAIProviderConfig for Xai {
 impl HTTPChatProvider for Xai {
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
         if self.should_use_responses_api() {
-            classify_codex_http_error(self.provider_name(), response)
+            classify_codex_http_error(response).into_llm_error(PROVIDER_NAME)
         } else {
-            classify_openai_http_error(self.provider_name(), response)
+            classify_openai_http_error(response).into_llm_error(PROVIDER_NAME)
         }
     }
 
@@ -370,10 +366,11 @@ impl XaiStreamParser {
 impl ChatStreamParser for XaiStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
         if self.use_responses_api {
-            codex_parse_stream_chunk_with_state(PROVIDER_NAME, chunk, &self.codex_tool_state)
+            codex_parse_stream_chunk_with_state(chunk, &self.codex_tool_state)
         } else {
-            parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut self.openai_tool_state)
+            parse_openai_sse_chunk(chunk, &mut self.openai_tool_state)
         }
+        .map_err(|error| error.into_llm_error(PROVIDER_NAME))
     }
 }
 
@@ -1015,6 +1012,24 @@ mod tests {
         let body: Value = serde_json::from_slice(req.body()).expect("body should be JSON");
 
         assert_eq!(body["stream"], Value::Bool(true));
+    }
+
+    #[test]
+    fn stream_parser_attaches_xai_provider_to_codex_errors() {
+        let mut xai = test_xai("xai-key");
+        xai.conversation_id = Some("conversation-id".to_string());
+        let mut parser = xai.chat_stream_parser().unwrap();
+        let chunk = br#"data: {"type":"response.failed","response":{"error":{"message":"busy","code":"server_is_overloaded"}}}
+
+"#;
+
+        let error = parser.parse_chunk(chunk).unwrap_err();
+        match error {
+            LLMError::ServerOverloaded { context, .. } => {
+                assert_eq!(context.provider, PROVIDER_NAME);
+            }
+            other => panic!("expected ServerOverloaded, got {other}"),
+        }
     }
 
     #[test]

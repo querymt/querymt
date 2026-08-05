@@ -107,10 +107,6 @@ impl OpenAI {
 pub mod api;
 
 impl api::OpenAIProviderConfig for OpenAI {
-    fn provider_name(&self) -> &str {
-        PROVIDER_NAME
-    }
-
     fn api_key(&self) -> &str {
         &self.api_key
     }
@@ -186,7 +182,7 @@ impl api::OpenAIProviderConfig for OpenAI {
 
 impl HTTPChatProvider for OpenAI {
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        api::classify_openai_http_error(PROVIDER_NAME, response)
+        api::classify_openai_http_error(response).into_llm_error(PROVIDER_NAME)
     }
 
     fn chat_request(
@@ -227,7 +223,8 @@ struct OpenAIStreamParser {
 
 impl ChatStreamParser for OpenAIStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        api::parse_openai_sse_chunk(PROVIDER_NAME, chunk, &mut self.tool_states)
+        api::parse_openai_sse_chunk(chunk, &mut self.tool_states)
+            .map_err(|error| error.into_llm_error(PROVIDER_NAME))
     }
 }
 
@@ -311,8 +308,11 @@ impl HTTPLLMProviderFactory for OpenAIFactory {
 
 #[cfg(test)]
 mod tests {
-    use super::OpenAI;
-    use querymt::chat::{StreamChunk, http::HTTPChatProvider};
+    use super::{OpenAI, PROVIDER_NAME};
+    use querymt::{
+        chat::{StreamChunk, http::HTTPChatProvider},
+        error::LLMError,
+    };
     use serde_json::Value;
 
     #[test]
@@ -345,6 +345,27 @@ mod tests {
             .expect("stream request should build");
         let body: Value = serde_json::from_slice(req.body()).expect("body should be valid json");
         assert_eq!(body.get("stream"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn stream_parser_attaches_openai_provider_to_classified_errors() {
+        let cfg = serde_json::json!({
+            "api_key": "test-key",
+            "model": "gpt-4o-mini"
+        });
+        let provider: OpenAI = serde_json::from_value(cfg).unwrap();
+        let mut parser = provider.chat_stream_parser().unwrap();
+        let chunk = br#"data: {"error":{"message":"busy","code":"server_error"}}
+
+"#;
+
+        let error = parser.parse_chunk(chunk).unwrap_err();
+        match error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.provider, PROVIDER_NAME);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
     }
 
     #[test]

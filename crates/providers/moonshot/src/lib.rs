@@ -19,8 +19,8 @@ use serde_json::{Map, Value};
 use std::sync::Arc;
 use url::Url;
 
-const ERROR_PROVIDER_NAME: &str = "moonshot";
-const PROVIDER_NAME: &str = "moonshotai";
+const PROVIDER_NAME: &str = "moonshot";
+const PLUGIN_NAME: &str = "moonshotai";
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -47,10 +47,6 @@ pub struct MoonshotAI {
 }
 
 impl OpenAIProviderConfig for MoonshotAI {
-    fn provider_name(&self) -> &str {
-        ERROR_PROVIDER_NAME
-    }
-
     fn api_key(&self) -> &str {
         &self.api_key
     }
@@ -136,7 +132,7 @@ impl OpenAIProviderConfig for MoonshotAI {
 
 impl HTTPChatProvider for MoonshotAI {
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        classify_openai_http_error(self.provider_name(), response)
+        classify_openai_http_error(response).into_llm_error(PROVIDER_NAME)
     }
 
     fn chat_request(
@@ -233,12 +229,12 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 
 #[cfg(feature = "extism")]
 mod extism_exports {
-    use super::{MoonshotAI, MoonshotAIFactory, PROVIDER_NAME};
+    use super::{MoonshotAI, MoonshotAIFactory, PLUGIN_NAME};
     use querymt_extism_macros::impl_extism_http_plugin;
 
     impl_extism_http_plugin! {
         config = MoonshotAI,
         factory = MoonshotAIFactory,
-        name   = PROVIDER_NAME,
+        name   = PLUGIN_NAME,
     }
 }
