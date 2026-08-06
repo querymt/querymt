@@ -226,10 +226,6 @@ impl HTTPCompletionProvider for KimiCode {
 }
 
 impl HTTPLLMProvider for KimiCode {
-    fn provider_name(&self) -> &str {
-        PROVIDER_NAME
-    }
-
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }

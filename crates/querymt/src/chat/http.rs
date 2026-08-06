@@ -7,7 +7,7 @@ use http::{Request, Response};
 
 pub trait ChatStreamParser: Send {
     /// Decode one SSE/frame chunk. Return unattributed decode errors — the HTTP
-    /// adapter stamps [`crate::HTTPLLMProvider::provider_name`] once.
+    /// adapter stamps factory identity once.
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, ProviderDecodeError>;
 
     fn finish(&mut self) -> Result<Vec<StreamChunk>, ProviderDecodeError> {
@@ -17,8 +17,7 @@ pub trait ChatStreamParser: Send {
 
 pub trait HTTPChatProvider: Send + Sync {
     /// Classify a non-success HTTP chat response **without** provider identity.
-    /// The HTTP adapter calls [`ProviderDecodeError::attribute`] with
-    /// [`crate::HTTPLLMProvider::provider_name`].
+    /// The HTTP adapter stamps factory identity via [`ProviderDecodeError::attribute`].
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> ProviderDecodeError {
         classify_status_only(
             response.status().as_u16(),

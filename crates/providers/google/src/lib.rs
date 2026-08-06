@@ -1009,10 +1009,6 @@ impl HTTPEmbeddingProvider for Google {
 }
 
 impl HTTPLLMProvider for Google {
-    fn provider_name(&self) -> &str {
-        PROVIDER_NAME
-    }
-
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }

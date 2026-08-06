@@ -15,17 +15,23 @@ use std::sync::Arc;
 use tracing::instrument;
 
 pub struct LLMProviderFromHTTP {
+    /// Registry / factory identity. Stamped onto structured errors once.
+    name: String,
     inner: Box<dyn HTTPLLMProvider>,
 }
 
 impl LLMProviderFromHTTP {
-    pub fn new(inner: Box<dyn HTTPLLMProvider>) -> Self {
-        Self { inner }
+    /// Wrap an HTTP provider. `name` should be [`crate::plugin::HTTPLLMProviderFactory::name`].
+    pub fn new(name: impl Into<String>, inner: Box<dyn HTTPLLMProvider>) -> Self {
+        Self {
+            name: name.into(),
+            inner,
+        }
     }
 
-    /// Stamp provider identity onto a decode/classify failure.
+    /// Stamp factory identity onto a decode/classify failure.
     fn attribute(&self, error: crate::error::ProviderDecodeError) -> LLMError {
-        error.attribute(self.inner.provider_name())
+        error.attribute(self.name.as_str())
     }
 
     /// Ensure the provider's credential is fresh before building a request.
@@ -104,7 +110,7 @@ impl ChatProvider for LLMProviderFromHTTP {
         };
 
         let mut parser = self.inner.chat_stream_parser()?;
-        let provider_name = self.inner.provider_name().to_owned();
+        let provider_name = self.name.clone();
         let s = stream
             .map(move |res: reqwest::Result<bytes::Bytes>| res.map_err(LLMError::from))
             .chain(futures::stream::iter([
@@ -341,10 +347,6 @@ mod tests {
     }
 
     impl HTTPLLMProvider for DummyHttpProvider {
-        fn provider_name(&self) -> &str {
-            "dummy"
-        }
-
         fn key_resolver(&self) -> Option<&Arc<dyn ApiKeyResolver>> {
             self.resolver.as_ref()
         }
@@ -404,10 +406,6 @@ mod tests {
     }
 
     impl HTTPLLMProvider for ResolveAwareHttpProvider {
-        fn provider_name(&self) -> &str {
-            "resolve-aware"
-        }
-
         fn key_resolver(&self) -> Option<&Arc<dyn ApiKeyResolver>> {
             Some(&self.resolver)
         }
@@ -416,7 +414,7 @@ mod tests {
     #[test]
     fn set_key_resolver_forwards_to_inner_provider() {
         let inner: Box<dyn HTTPLLMProvider> = Box::new(DummyHttpProvider { resolver: None });
-        let mut adapter = LLMProviderFromHTTP::new(inner);
+        let mut adapter = LLMProviderFromHTTP::new("dummy", inner);
         let resolver = static_key("resolver-token");
 
         adapter.set_key_resolver(resolver.clone());
@@ -433,7 +431,7 @@ mod tests {
         let inner: Box<dyn HTTPLLMProvider> = Box::new(ResolveAwareHttpProvider {
             resolver: resolver.clone(),
         });
-        let adapter = LLMProviderFromHTTP::new(inner);
+        let adapter = LLMProviderFromHTTP::new("resolve-aware", inner);
 
         assert_eq!(resolver.resolve_count(), 0);
         assert_eq!(

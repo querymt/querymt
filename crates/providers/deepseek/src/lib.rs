@@ -217,10 +217,6 @@ impl HTTPCompletionProvider for Deepseek {
 }
 
 impl HTTPLLMProvider for Deepseek {
-    fn provider_name(&self) -> &str {
-        PROVIDER_NAME
-    }
-
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }

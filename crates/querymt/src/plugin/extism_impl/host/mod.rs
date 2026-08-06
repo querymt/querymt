@@ -395,7 +395,6 @@ impl LLMProviderFactory for ExtismFactory {
 
         let provider = ExtismProvider {
             plugin: self.plugin.clone(),
-            name: self.name.clone(),
             config: cfg_value,
             user_data: self.user_data.clone(),
             key_resolver: None,
@@ -403,7 +402,11 @@ impl LLMProviderFactory for ExtismFactory {
 
         if self.supports_http_adapter_abi() {
             let http_provider: Box<dyn HTTPLLMProvider> = Box::new(provider);
-            return Ok(Box::new(LLMProviderFromHTTP::new(http_provider)));
+            // Factory name is the registry identity; adapter stamps errors.
+            return Ok(Box::new(LLMProviderFromHTTP::new(
+                self.name.as_str(),
+                http_provider,
+            )));
         }
 
         Ok(Box::new(provider))
@@ -513,7 +516,6 @@ impl HTTPLLMProviderFactory for ExtismFactory {
 
         let provider = ExtismProvider {
             plugin: self.plugin.clone(),
-            name: self.name.clone(),
             config: cfg_value,
             user_data: self.user_data.clone(),
             key_resolver: None,
@@ -587,8 +589,6 @@ impl HTTPLLMProviderFactory for ExtismFactory {
 
 pub struct ExtismProvider {
     plugin: Arc<Mutex<Plugin>>,
-    /// Plugin/factory identity — stamped onto structured errors by the HTTP adapter.
-    name: String,
     config: Value,
     user_data: Option<extism::UserData<functions::HostState>>,
     key_resolver: Option<Arc<dyn ApiKeyResolver>>,
@@ -1415,10 +1415,6 @@ impl HTTPEmbeddingProvider for ExtismProvider {
 }
 
 impl HTTPLLMProvider for ExtismProvider {
-    fn provider_name(&self) -> &str {
-        &self.name
-    }
-
     fn tools(&self) -> Option<&[Tool]> {
         None
     }

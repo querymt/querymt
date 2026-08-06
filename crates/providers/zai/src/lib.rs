@@ -204,10 +204,6 @@ impl HTTPCompletionProvider for Zai {
 }
 
 impl HTTPLLMProvider for Zai {
-    fn provider_name(&self) -> &str {
-        PROVIDER_NAME
-    }
-
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }

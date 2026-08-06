@@ -259,10 +259,6 @@ impl HTTPCompletionProvider for Groq {
 }
 
 impl HTTPLLMProvider for Groq {
-    fn provider_name(&self) -> &str {
-        PROVIDER_NAME
-    }
-
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }

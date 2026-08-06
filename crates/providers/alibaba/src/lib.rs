@@ -163,10 +163,6 @@ impl HTTPCompletionProvider for Alibaba {
 }
 
 impl HTTPLLMProvider for Alibaba {
-    fn provider_name(&self) -> &str {
-        PROVIDER_NAME
-    }
-
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }

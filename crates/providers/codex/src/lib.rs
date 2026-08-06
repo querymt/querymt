@@ -219,10 +219,6 @@ impl HTTPCompletionProvider for Codex {
 }
 
 impl HTTPLLMProvider for Codex {
-    fn provider_name(&self) -> &str {
-        PROVIDER_NAME
-    }
-
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }

@@ -37,7 +37,7 @@ impl LLMProviderFactory for HTTPFactoryAdapter {
             .from_config(cfg)
             .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
 
-        let adapter = LLMProviderFromHTTP::new(sync_provider);
+        let adapter = LLMProviderFromHTTP::new(self.inner.name(), sync_provider);
         Ok(Box::new(adapter))
     }
 

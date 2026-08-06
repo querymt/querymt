@@ -268,10 +268,6 @@ mod tests {
     }
 
     impl HTTPLLMProvider for DummyHttpProvider {
-        fn provider_name(&self) -> &str {
-            "dummy"
-        }
-
         fn tools(&self) -> Option<&[Tool]> {
             None
         }
