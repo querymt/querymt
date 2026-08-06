@@ -549,6 +549,46 @@ impl LLMError {
         }
     }
 
+    /// Whether this error is a rate-limit failure (for UI events / wait messaging).
+    ///
+    /// Two representations exist on purpose:
+    /// - [`Self::RateLimited`] / bare HTTP 429: unattributed generic HTTP path
+    /// - [`Self::ProviderResponseError`] with [`ProviderErrorKind::RateLimited`]:
+    ///   provider-attributed chat path
+    ///
+    /// Callers must use this helper instead of matching one form only.
+    pub fn is_rate_limited(&self) -> bool {
+        match self {
+            Self::RateLimited { .. } => true,
+            Self::HttpStatus { status_code: 429, .. } => true,
+            Self::ProviderResponseError { context, .. } => {
+                context.kind == Some(ProviderErrorKind::RateLimited)
+            }
+            _ => false,
+        }
+    }
+
+    /// Message + retry-after when [`Self::is_rate_limited`] is true.
+    pub fn rate_limit_info(&self) -> Option<(String, Option<u64>)> {
+        match self {
+            Self::RateLimited {
+                message,
+                retry_after_secs,
+            } => Some((message.clone(), *retry_after_secs)),
+            Self::HttpStatus {
+                status_code: 429,
+                message,
+                retry_after_secs,
+            } => Some((message.clone(), *retry_after_secs)),
+            Self::ProviderResponseError { message, context }
+                if context.kind == Some(ProviderErrorKind::RateLimited) =>
+            {
+                Some((message.clone(), context.retry_after_secs))
+            }
+            _ => None,
+        }
+    }
+
     pub fn is_retryable_setup_failure(&self) -> bool {
         self.is_retryable()
     }
@@ -822,6 +862,14 @@ pub fn classify_status_only(
     classified
 }
 
+/// Generic HTTP status classifier for paths that have no provider identity.
+///
+/// Rate limits stay on the legacy [`LLMError::RateLimited`] variant here so
+/// unattributed generic HTTP failures keep the stable wire payload shape.
+/// Provider-attributed chat paths must use [`classify_status_only`] +
+/// [`ClassifiedProviderError::attribute`] (or a vendor envelope classifier)
+/// and produce [`LLMError::ProviderResponseError`] instead — never emit both
+/// forms from the same boundary.
 pub fn classify_http_status(status_code: u16, headers: &http::HeaderMap, body: &[u8]) -> LLMError {
     if status_code == 499 {
         return LLMError::Cancelled;
@@ -1382,6 +1430,41 @@ mod tests {
         let weird = classify_status_only(418, &headers, b"teapot");
         assert_eq!(weird.kind, None);
         assert!(!weird.transient);
+    }
+
+    #[test]
+    fn rate_limit_info_covers_legacy_and_structured_forms() {
+        let legacy = LLMError::RateLimited {
+            message: "slow".into(),
+            retry_after_secs: Some(3),
+        };
+        assert!(legacy.is_rate_limited());
+        assert_eq!(legacy.rate_limit_info(), Some(("slow".into(), Some(3))));
+
+        let structured = ClassifiedProviderError::new("slow")
+            .kind(ProviderErrorKind::RateLimited)
+            .retry_after_secs(Some(4))
+            .attribute("openai");
+        assert!(structured.is_rate_limited());
+        assert_eq!(
+            structured.rate_limit_info(),
+            Some(("slow".into(), Some(4)))
+        );
+
+        let http_429 = LLMError::HttpStatus {
+            status_code: 429,
+            message: "too many".into(),
+            retry_after_secs: Some(1),
+        };
+        assert!(http_429.is_rate_limited());
+        assert_eq!(
+            http_429.rate_limit_info(),
+            Some(("too many".into(), Some(1)))
+        );
+
+        let other = LLMError::GenericError("nope".into());
+        assert!(!other.is_rate_limited());
+        assert!(other.rate_limit_info().is_none());
     }
 
     #[test]

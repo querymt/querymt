@@ -1200,10 +1200,19 @@ pub struct OpenAIToolUseState {
     pub started: bool,
 }
 
+/// Normalize a vendor error `code`/`type` token for table lookup.
+fn normalize_error_token(token: &str) -> String {
+    token.trim().to_ascii_lowercase().replace(['-', ' '], "_")
+}
+
 /// Map a normalized OpenAI-compatible error `code`/`type` to a unified kind.
-/// Unrecognized values return `None` — one match, no validation pre-pass.
+///
+/// Dialect table for chat-completions / OpenAI-compatible providers. Kept in
+/// this crate on purpose — core must not know vendor code strings. Codex has
+/// its own responses-api table.
 fn openai_error_kind(code: &str) -> Option<ProviderErrorKind> {
     match code {
+        // Chat Completions + common openai-compatible dialects.
         "server_is_overloaded" | "slow_down" | "overloaded_error" | "overloaded" => {
             Some(ProviderErrorKind::ServerOverloaded)
         }
@@ -1229,7 +1238,7 @@ fn openai_error_kind(code: &str) -> Option<ProviderErrorKind> {
 }
 
 /// Map an OpenAI-compatible SSE/HTTP `{ "error": ... }` envelope into unified
-/// [`LLMError`] kinds. Vendor `code`/`type` dialect stays in this provider.
+/// [`ClassifiedProviderError`] kinds. Vendor `code`/`type` dialect stays here.
 fn map_openai_error_envelope(
     error: &Value,
     envelope: &Value,
@@ -1268,12 +1277,8 @@ fn map_openai_error_envelope(
     });
     let retry_after_secs =
         extract_retry_after_from_json(error).or_else(|| extract_retry_after_from_json(envelope));
-    let code_norm = code
-        .as_deref()
-        .map(|code| code.trim().to_ascii_lowercase().replace(['-', ' '], "_"));
-    let type_norm = error_type
-        .as_deref()
-        .map(|kind| kind.trim().to_ascii_lowercase().replace(['-', ' '], "_"));
+    let code_norm = code.as_deref().map(normalize_error_token);
+    let type_norm = error_type.as_deref().map(normalize_error_token);
     let kind = code_norm
         .as_deref()
         .and_then(openai_error_kind)
@@ -1292,8 +1297,8 @@ fn map_openai_error_envelope(
         unknown_transient || server_side,
         ProviderErrorKind::is_retryable,
     );
-    // Rate-limit messages may embed the delay ("try again in 11s"). Retry
-    // hints are only meaningful for failures we actually retry.
+    // Rate-limit messages may embed the delay ("try again in 11s"), matching
+    // openai/codex's message parse. Only keep retry hints for failures we retry.
     let retry_after_secs = match kind {
         Some(ProviderErrorKind::RateLimited) => {
             retry_after_secs.or_else(|| parse_retry_after_from_message(&message))

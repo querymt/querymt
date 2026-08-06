@@ -4,7 +4,7 @@ use crate::{
     completion::{CompletionProvider, CompletionRequest, CompletionResponse},
     embedding::EmbeddingProvider,
     error::LLMError,
-    outbound::{call_outbound, call_outbound_raw, call_outbound_stream_raw, ensure_success},
+    outbound::{call_outbound, call_outbound_raw, call_outbound_stream_raw},
     stt, tts,
 };
 use async_trait::async_trait;
@@ -181,7 +181,8 @@ impl EmbeddingProvider for LLMProviderFromHTTP {
     async fn embed(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
         self.ensure_credential_fresh().await?;
         let req = self.inner.embed_request(&inputs)?;
-        let resp = ensure_success(call_outbound(req).await?)?;
+        // call_outbound already classifies non-success statuses.
+        let resp = call_outbound(req).await?;
         self.inner.parse_embed(resp)
     }
 }
@@ -195,7 +196,7 @@ impl CompletionProvider for LLMProviderFromHTTP {
     async fn complete(&self, req_obj: &CompletionRequest) -> Result<CompletionResponse, LLMError> {
         self.ensure_credential_fresh().await?;
         let req = self.inner.complete_request(req_obj)?;
-        let resp = ensure_success(call_outbound(req).await?)?;
+        let resp = call_outbound(req).await?;
         self.inner.parse_complete(resp)
     }
 }
@@ -221,7 +222,7 @@ impl LLMProvider for LLMProviderFromHTTP {
     async fn transcribe(&self, req_obj: &stt::SttRequest) -> Result<stt::SttResponse, LLMError> {
         self.ensure_credential_fresh().await?;
         let req = self.inner.stt_request(req_obj)?;
-        let resp = ensure_success(call_outbound(req).await?)?;
+        let resp = call_outbound(req).await?;
         self.inner.parse_stt(resp)
     }
 
@@ -232,7 +233,7 @@ impl LLMProvider for LLMProviderFromHTTP {
     async fn speech(&self, req_obj: &tts::TtsRequest) -> Result<tts::TtsResponse, LLMError> {
         self.ensure_credential_fresh().await?;
         let req = self.inner.tts_request(req_obj)?;
-        let resp = ensure_success(call_outbound(req).await?)?;
+        let resp = call_outbound(req).await?;
         self.inner.parse_tts(resp)
     }
 }

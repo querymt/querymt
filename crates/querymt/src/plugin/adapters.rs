@@ -3,7 +3,7 @@ use crate::{
     LLMProvider,
     adapters::LLMProviderFromHTTP,
     error::LLMError,
-    outbound::{call_outbound, ensure_success},
+    outbound::call_outbound,
 };
 use futures::future::FutureExt;
 use http::{Request, Response};
@@ -57,7 +57,8 @@ impl LLMProviderFactory for HTTPFactoryAdapter {
             }
 
             let req: Request<Vec<u8>> = inner.list_models_request(&cloned_cfg)?;
-            let resp: Response<Vec<u8>> = ensure_success(call_outbound(req).await?)?;
+            // call_outbound already classifies non-success statuses.
+            let resp: Response<Vec<u8>> = call_outbound(req).await?;
             inner.parse_list_models(resp)
         }
         .boxed()

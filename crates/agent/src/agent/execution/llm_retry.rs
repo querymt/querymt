@@ -8,7 +8,7 @@ use crate::events::AgentEventKind;
 use futures_util::{Stream, StreamExt};
 use log::{debug, info};
 use querymt::chat::StreamChunk;
-use querymt::error::{LLMError, ProviderErrorKind};
+use querymt::error::LLMError;
 use std::future::Future;
 use std::pin::Pin;
 use tokio_util::sync::CancellationToken;
@@ -160,27 +160,9 @@ pub(super) async fn wait_for_retry_delay(
 
 /// Extract rate limit information from an error.
 ///
-/// Returns `Some((message, retry_after_seconds))` if the error is a rate limit error.
+/// Thin wrapper over [`LLMError::rate_limit_info`] — the single dual-form matcher.
 fn extract_rate_limit_info(error: &LLMError) -> Option<(String, Option<u64>)> {
-    // Providers map vendor rate-limit codes → LLMError::RateLimited before core.
-    // Do not re-sniff vendor identifiers here.
-    match error {
-        LLMError::RateLimited {
-            message,
-            retry_after_secs,
-        } => Some((message.clone(), *retry_after_secs)),
-        LLMError::ProviderResponseError { message, context }
-            if context.kind == Some(ProviderErrorKind::RateLimited) =>
-        {
-            Some((message.clone(), context.retry_after_secs))
-        }
-        LLMError::HttpStatus {
-            status_code,
-            message,
-            retry_after_secs,
-        } if *status_code == 429 => Some((message.clone(), *retry_after_secs)),
-        _ => None,
-    }
+    error.rate_limit_info()
 }
 
 /// Create a streaming connection with retry logic for rate limits and transient errors.
@@ -206,15 +188,20 @@ where
     let max_attempts = config.execution_policy.rate_limit.max_attempts();
 
     loop {
-        // The caller (StreamRetryBudget) refuses to re-enter with an
-        // exhausted budget, so this only bounds attempts within one call.
-        debug_assert!(*attempts_used < max_attempts);
-        *attempts_used += 1;
-        let attempt = *attempts_used;
-
         if cancel_token.is_cancelled() {
             return Err(LLMError::Cancelled);
         }
+
+        // Shared request budget is enforced here, not via debug_assert.
+        // Callers should also refuse re-entry via StreamRetryBudget, but a
+        // broken invariant must still return a real error in release builds.
+        if *attempts_used >= max_attempts {
+            return Err(LLMError::HttpError(format!(
+                "stream request attempt budget exhausted ({attempts_used}/{max_attempts})"
+            )));
+        }
+        *attempts_used += 1;
+        let attempt = *attempts_used;
 
         match create_stream().await {
             Ok(stream) => return Ok(stream),
@@ -816,6 +803,41 @@ mod tests {
         ));
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
         assert_eq!(attempts_used, 3);
+    }
+
+    #[tokio::test]
+    async fn test_create_stream_with_retry_hard_errors_when_budget_already_exhausted() {
+        let (config, _temp) = make_config().await;
+        let token = CancellationToken::new();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count2 = call_count.clone();
+        // max_attempts defaults to 3; start already exhausted.
+        let mut attempts_used = config.execution_policy.rate_limit.max_attempts();
+
+        let result =
+            create_stream_with_retry(&config, "test-session", &token, &mut attempts_used, || {
+                let count = call_count2.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Err(LLMError::HttpStatus {
+                        status_code: 503,
+                        message: "should not be called".into(),
+                        retry_after_secs: None,
+                    })
+                }
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(LLMError::HttpError(message))
+                if message.contains("attempt budget exhausted")
+        ));
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            attempts_used,
+            config.execution_policy.rate_limit.max_attempts()
+        );
     }
 
     #[tokio::test]

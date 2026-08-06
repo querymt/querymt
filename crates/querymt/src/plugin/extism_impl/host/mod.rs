@@ -433,8 +433,8 @@ impl LLMProviderFactory for ExtismFactory {
                 Err(e) => return Box::pin(async move { Err(e) }),
             };
             return async move {
-                let resp =
-                    crate::outbound::ensure_success(crate::outbound::call_outbound(req).await?)?;
+                // call_outbound already classifies non-success statuses.
+                let resp = crate::outbound::call_outbound(req).await?;
                 <Self as HTTPLLMProviderFactory>::parse_list_models(self, resp)
             }
             .boxed();

@@ -805,7 +805,15 @@ pub fn classify_codex_http_error(response: &Response<Vec<u8>>) -> ProviderDecode
                 request_id,
                 matches!(status, 429 | 500..=599),
             );
-            mapped.set_retry_after_if_missing(retry_after_secs);
+            // Header Retry-After only for failures we actually retry.
+            // Permanent kinds (e.g. usage_limit_reached) must not sleep on a
+            // plan-cap header.
+            if mapped
+                .kind
+                .map_or(mapped.transient, ProviderErrorKind::is_retryable)
+            {
+                mapped.set_retry_after_if_missing(retry_after_secs);
+            }
             return mapped.into();
         }
     }
@@ -991,22 +999,32 @@ pub fn codex_parse_stream_chunk_with_state(
     Ok(results)
 }
 
-/// Map a normalized Codex error `code`/`type` to a unified kind.
-/// Unrecognized values return `None` — one match, no validation pre-pass.
+/// Normalize a Codex/Responses API error `code`/`type` token for table lookup.
+fn normalize_error_token(token: &str) -> String {
+    token.trim().to_ascii_lowercase().replace(['-', ' '], "_")
+}
+
+/// Map a normalized Codex Responses API error `code`/`type` to a unified kind.
+///
+/// Mirrors openai/codex `codex-api` SSE `response.failed` + http bridge handlers.
+/// Kept local — do not share with chat-completions openai dialect.
 fn codex_error_kind(code: &str) -> Option<ProviderErrorKind> {
     match code {
-        "server_is_overloaded" | "slow_down" | "overloaded_error" => {
-            Some(ProviderErrorKind::ServerOverloaded)
-        }
+        // Upstream codex: is_server_overloaded_error
+        "server_is_overloaded" | "slow_down" => Some(ProviderErrorKind::ServerOverloaded),
+        // Upstream: rate_limit_exceeded (code). `rate_limit_error` is the common
+        // OpenAI `type` field — accepted on type-fallback only for HTTP bodies.
         "rate_limit_exceeded" | "rate_limit_error" => Some(ProviderErrorKind::RateLimited),
-        "context_length_exceeded" | "context_length_error" => {
-            Some(ProviderErrorKind::ContextWindowExceeded)
+        // Upstream codex: context_length_exceeded → ContextWindowExceeded
+        "context_length_exceeded" => Some(ProviderErrorKind::ContextWindowExceeded),
+        // Upstream codex http 429 bridge: usage_limit_reached is a plan/account
+        // cap (UsageLimitReached), not a transient TPM rate limit — permanent.
+        // Also insufficient_quota / usage_not_included.
+        "usage_limit_reached" | "insufficient_quota" | "usage_not_included" => {
+            Some(ProviderErrorKind::QuotaExceeded)
         }
-        "insufficient_quota" | "usage_not_included" => Some(ProviderErrorKind::QuotaExceeded),
-        "cyber_policy"
-        | "invalid_prompt"
-        | "bio_policy"
-        | "invalid_request"
+        // Upstream codex: cyber_policy / invalid_prompt / bio_policy → fatal request
+        "cyber_policy" | "invalid_prompt" | "bio_policy" | "invalid_request"
         | "invalid_request_error" => Some(ProviderErrorKind::InvalidRequest),
         "authentication_error" | "invalid_api_key" | "unauthorized" => {
             Some(ProviderErrorKind::Authentication)
@@ -1015,17 +1033,11 @@ fn codex_error_kind(code: &str) -> Option<ProviderErrorKind> {
     }
 }
 
-/// Map Codex `response.failed` error objects into unified [`ProviderErrorKind`]s.
+/// Map Codex `response.failed` error objects into unified kinds.
 ///
-/// Code table follows openai/codex (`codex-api` SSE `response.failed` handlers):
-/// - `server_is_overloaded` | `slow_down` → overloaded (retryable here)
-/// - `rate_limit_exceeded` → rate limited (+ message delay parse)
-/// - `context_length_exceeded` → context window exceeded
-/// - `insufficient_quota` | `usage_not_included` → quota exceeded
-/// - `cyber_policy` | `invalid_prompt` | `bio_policy` → invalid request
-/// - unknown structured code → retryable catch-all before semantic output
-///
-/// Vendor dialect stays in this provider; core only sees unified kinds.
+/// Unknown structured codes stay retryable before semantic output
+/// (`unknown_transient: true` from the SSE path), matching upstream codex's
+/// catch-all `ApiError::Retryable` for unmapped response.failed codes.
 fn map_codex_response_failed(
     error: &Value,
     response: &Value,
@@ -1054,20 +1066,16 @@ fn map_codex_response_failed(
     });
     let retry_after_secs =
         extract_retry_after_from_json(error).or_else(|| extract_retry_after_from_json(response));
-    let code_norm = code
-        .as_deref()
-        .map(|code| code.trim().to_ascii_lowercase().replace(['-', ' '], "_"));
-    let type_norm = error_type
-        .as_deref()
-        .map(|kind| kind.trim().to_ascii_lowercase().replace(['-', ' '], "_"));
+    let code_norm = code.as_deref().map(normalize_error_token);
+    let type_norm = error_type.as_deref().map(normalize_error_token);
     let kind = code_norm
         .as_deref()
         .and_then(codex_error_kind)
         .or_else(|| type_norm.as_deref().and_then(codex_error_kind));
 
+    // Upstream: unmapped response.failed → Retryable. Known kinds own policy.
     let transient = kind.map_or(unknown_transient, ProviderErrorKind::is_retryable);
-    // Rate-limit messages may embed the delay ("try again in 11s"). Retry
-    // hints are only meaningful for failures we actually retry.
+    // Only rate_limit_exceeded parses "try again in Xs" (upstream try_parse_retry_after).
     let retry_after_secs = match kind {
         Some(ProviderErrorKind::RateLimited) => {
             retry_after_secs.or_else(|| parse_retry_after_from_message(&message))
@@ -1930,6 +1938,56 @@ mod tests {
             let error = classify_codex_http_error(&response).attribute(PROVIDER_NAME);
             assert_eq!(error.is_retryable(), expected_retryable, "status={status}");
         }
+    }
+
+    #[test]
+    fn classify_http_429_usage_limit_reached_is_permanent_quota() {
+        // Upstream api_bridge: 429 + error.type == usage_limit_reached →
+        // UsageLimitReached (not retryable). Must not look like RateLimited.
+        let response = Response::builder()
+            .status(429)
+            .header("retry-after", "60")
+            .body(
+                br#"{"error":{"message":"You have hit your usage limit.","type":"usage_limit_reached","resets_at":1710000000}}"#
+                    .to_vec(),
+            )
+            .unwrap();
+
+        let error = classify_codex_http_error(&response).attribute(PROVIDER_NAME);
+        match &error {
+            LLMError::ProviderResponseError { message, context } => {
+                assert_eq!(message, "You have hit your usage limit.");
+                assert_eq!(context.kind, Some(ProviderErrorKind::QuotaExceeded));
+                assert_eq!(context.error_type.as_deref(), Some("usage_limit_reached"));
+                // Permanent kinds drop retry hints — do not sleep on plan caps.
+                assert_eq!(context.retry_after_secs, None);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+        assert!(!error.is_retryable());
+        assert!(!error.is_rate_limited());
+    }
+
+    #[test]
+    fn classify_http_429_rate_limit_exceeded_stays_retryable() {
+        let response = Response::builder()
+            .status(429)
+            .body(
+                br#"{"error":{"message":"Rate limit reached. Please try again in 5s.","code":"rate_limit_exceeded"}}"#
+                    .to_vec(),
+            )
+            .unwrap();
+
+        let error = classify_codex_http_error(&response).attribute(PROVIDER_NAME);
+        match &error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.kind, Some(ProviderErrorKind::RateLimited));
+                assert_eq!(context.retry_after_secs, Some(5));
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+        assert!(error.is_retryable());
+        assert!(error.is_rate_limited());
     }
 
     #[test]
