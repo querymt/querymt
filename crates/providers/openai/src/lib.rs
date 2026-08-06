@@ -181,8 +181,11 @@ impl api::OpenAIProviderConfig for OpenAI {
 }
 
 impl HTTPChatProvider for OpenAI {
-    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        api::classify_openai_http_error(response).attribute(PROVIDER_NAME)
+    fn classify_chat_error(
+        &self,
+        response: &Response<Vec<u8>>,
+    ) -> querymt::error::ProviderDecodeError {
+        api::classify_openai_http_error(response)
     }
 
     fn chat_request(
@@ -222,9 +225,11 @@ struct OpenAIStreamParser {
 }
 
 impl ChatStreamParser for OpenAIStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+    fn parse_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
         api::parse_openai_sse_chunk(chunk, &mut self.tool_states)
-            .map_err(|error| error.attribute(PROVIDER_NAME))
     }
 }
 
@@ -249,6 +254,10 @@ impl HTTPCompletionProvider for OpenAI {
 }
 
 impl HTTPLLMProvider for OpenAI {
+    fn provider_name(&self) -> &str {
+        PROVIDER_NAME
+    }
+
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }
@@ -359,7 +368,10 @@ mod tests {
 
 "#;
 
-        let error = parser.parse_chunk(chunk).unwrap_err();
+        let error = parser
+            .parse_chunk(chunk)
+            .unwrap_err()
+            .attribute(PROVIDER_NAME);
         match error {
             LLMError::ProviderResponseError { context, .. } => {
                 assert_eq!(context.provider, PROVIDER_NAME);

@@ -274,7 +274,8 @@ macro_rules! impl_extism_http_plugin {
         pub fn classify_chat_error(
             Json(input): Json<querymt::plugin::extism_impl::ExtismChatParseRequest<$Config>>,
         ) -> FnResult<Json<querymt::plugin::extism_impl::PluginError>> {
-            let error = input.cfg.classify_chat_error(&input.resp.resp);
+            // Attribute with plugin name for the wire payload; host adapter may re-stamp.
+            let error = input.cfg.classify_chat_error(&input.resp.resp).attribute($name);
             Ok(Json(PluginError::from_llm_error(&error)))
         }
 
@@ -318,7 +319,9 @@ macro_rules! impl_extism_http_plugin {
                 let parser = parsers.get_mut(&input.parser_id).ok_or_else(|| {
                     PdkError::msg(format!("Unknown parser id {}", input.parser_id))
                 })?;
-                parser.parse_chunk(&input.chunk).map_err(llm_err_to_pdk)
+                parser
+                    .parse_chunk(&input.chunk)
+                    .map_err(|e| llm_err_to_pdk(e.attribute($name)))
             })?;
 
             let out = chunks
@@ -343,7 +346,9 @@ macro_rules! impl_extism_http_plugin {
                 let mut parser = parsers.remove(&parser_id).ok_or_else(|| {
                     PdkError::msg(format!("Unknown parser id {}", parser_id))
                 })?;
-                parser.finish().map_err(llm_err_to_pdk)
+                parser
+                    .finish()
+                    .map_err(|e| llm_err_to_pdk(e.attribute($name)))
             })?;
 
             let out = chunks

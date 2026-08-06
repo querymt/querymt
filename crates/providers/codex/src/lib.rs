@@ -139,8 +139,11 @@ impl api::CodexProviderConfig for Codex {
 }
 
 impl HTTPChatProvider for Codex {
-    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        api::classify_codex_http_error(response).attribute(PROVIDER_NAME)
+    fn classify_chat_error(
+        &self,
+        response: &Response<Vec<u8>>,
+    ) -> querymt::error::ProviderDecodeError {
+        api::classify_codex_http_error(response)
     }
 
     fn chat_request(
@@ -179,9 +182,11 @@ struct CodexStreamParser {
 }
 
 impl ChatStreamParser for CodexStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+    fn parse_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
         api::codex_parse_stream_chunk_with_state(chunk, &self.tool_states)
-            .map_err(|error| error.attribute(PROVIDER_NAME))
     }
 }
 
@@ -214,6 +219,10 @@ impl HTTPCompletionProvider for Codex {
 }
 
 impl HTTPLLMProvider for Codex {
+    fn provider_name(&self) -> &str {
+        PROVIDER_NAME
+    }
+
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }

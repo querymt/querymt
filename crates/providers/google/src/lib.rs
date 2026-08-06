@@ -1009,6 +1009,10 @@ impl HTTPEmbeddingProvider for Google {
 }
 
 impl HTTPLLMProvider for Google {
+    fn provider_name(&self) -> &str {
+        PROVIDER_NAME
+    }
+
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }
@@ -1028,13 +1032,14 @@ struct GoogleStreamParser {
 }
 
 impl ChatStreamParser for GoogleStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<querymt::chat::StreamChunk>, LLMError> {
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<querymt::chat::StreamChunk>, querymt::error::ProviderDecodeError> {
         let text =
-            std::str::from_utf8(chunk).map_err(|e| LLMError::GenericError(format!("{:#}", e)))?;
+            std::str::from_utf8(chunk).map_err(|e| querymt::error::ProviderDecodeError::terminal(LLMError::GenericError(format!("{:#}", e))))?;
 
         self.buffer.push_str(text);
 
-        let (extracted_chunks, bytes_consumed) = extract_complete_json_objects(&self.buffer)?;
+        let (extracted_chunks, bytes_consumed) = extract_complete_json_objects(&self.buffer)
+            .map_err(querymt::error::ProviderDecodeError::terminal)?;
 
         if bytes_consumed > 0 {
             self.buffer.drain(..bytes_consumed);

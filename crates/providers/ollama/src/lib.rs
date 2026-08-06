@@ -644,6 +644,10 @@ impl HTTPEmbeddingProvider for Ollama {
 }
 
 impl HTTPLLMProvider for Ollama {
+    fn provider_name(&self) -> &str {
+        PROVIDER_NAME
+    }
+
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }

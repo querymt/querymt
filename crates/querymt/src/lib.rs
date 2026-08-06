@@ -144,6 +144,10 @@ pub trait HTTPLLMProvider:
     + Send
     + Sync
 {
+    /// Stable provider identity used by the HTTP adapter to stamp structured
+    /// errors. Prefer this over per-call-site `.attribute("…")`.
+    fn provider_name(&self) -> &str;
+
     fn tools(&self) -> Option<&[Tool]> {
         None
     }

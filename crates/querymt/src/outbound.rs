@@ -6,14 +6,11 @@
 pub enum OutboundStreamResult {
     Success {
         response: http::Response<()>,
-        stream: std::pin::Pin<
-            Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
-        >,
+        stream:
+            std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
     },
     /// Non-success status with the full error body already buffered.
-    Failure {
-        response: http::Response<Vec<u8>>,
-    },
+    Failure { response: http::Response<Vec<u8>> },
 }
 
 mod http_client {
@@ -311,7 +308,6 @@ mod http_client {
                 response.body(),
             ))
         }
-
     }
 
     #[cfg(target_arch = "wasm32")]

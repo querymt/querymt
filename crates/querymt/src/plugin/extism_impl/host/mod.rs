@@ -395,6 +395,7 @@ impl LLMProviderFactory for ExtismFactory {
 
         let provider = ExtismProvider {
             plugin: self.plugin.clone(),
+            name: self.name.clone(),
             config: cfg_value,
             user_data: self.user_data.clone(),
             key_resolver: None,
@@ -512,6 +513,7 @@ impl HTTPLLMProviderFactory for ExtismFactory {
 
         let provider = ExtismProvider {
             plugin: self.plugin.clone(),
+            name: self.name.clone(),
             config: cfg_value,
             user_data: self.user_data.clone(),
             key_resolver: None,
@@ -585,6 +587,8 @@ impl HTTPLLMProviderFactory for ExtismFactory {
 
 pub struct ExtismProvider {
     plugin: Arc<Mutex<Plugin>>,
+    /// Plugin/factory identity — stamped onto structured errors by the HTTP adapter.
+    name: String,
     config: Value,
     user_data: Option<extism::UserData<functions::HostState>>,
     key_resolver: Option<Arc<dyn ApiKeyResolver>>,
@@ -1152,7 +1156,10 @@ impl Drop for ExtismStreamParser {
 }
 
 impl ChatStreamParser for ExtismStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+    fn parse_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<StreamChunk>, crate::error::ProviderDecodeError> {
         let mut plug = self.plugin.lock().unwrap();
         let out: Json<Vec<ExtismChatChunk>> = plug
             .call_get_error_code(
@@ -1162,34 +1169,43 @@ impl ChatStreamParser for ExtismStreamParser {
                     chunk: chunk.to_vec(),
                 }),
             )
-            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            .map_err(|(e, code)| {
+                crate::error::ProviderDecodeError::terminal(decode_plugin_error(e, code))
+            })?;
         Ok(out.0.into_iter().map(|item| item.chunk).collect())
     }
 
-    fn finish(&mut self) -> Result<Vec<StreamChunk>, LLMError> {
+    fn finish(&mut self) -> Result<Vec<StreamChunk>, crate::error::ProviderDecodeError> {
         let mut plug = self.plugin.lock().unwrap();
         let out: Json<Vec<ExtismChatChunk>> = plug
             .call_get_error_code("chat_stream_parser_finish", Json(self.parser_id))
-            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            .map_err(|(e, code)| {
+                crate::error::ProviderDecodeError::terminal(decode_plugin_error(e, code))
+            })?;
         drop(plug);
-        self.close()?;
+        self.close()
+            .map_err(crate::error::ProviderDecodeError::terminal)?;
         Ok(out.0.into_iter().map(|item| item.chunk).collect())
     }
 }
 
 impl HTTPChatProvider for ExtismProvider {
-    fn classify_chat_error(&self, response: &http::Response<Vec<u8>>) -> LLMError {
+    fn classify_chat_error(
+        &self,
+        response: &http::Response<Vec<u8>>,
+    ) -> crate::error::ProviderDecodeError {
         let cfg = match self.effective_config() {
             Ok(cfg) => cfg,
-            Err(error) => return error,
+            Err(error) => return crate::error::ProviderDecodeError::terminal(error),
         };
         let mut plug = self.plugin.lock().unwrap();
         if !plug.function_exists("classify_chat_error") {
-            return crate::error::classify_http_status(
+            return crate::error::classify_status_only(
                 response.status().as_u16(),
                 response.headers(),
                 response.body(),
-            );
+            )
+            .into();
         }
 
         let response = response.clone();
@@ -1201,8 +1217,13 @@ impl HTTPChatProvider for ExtismProvider {
             }),
         );
         match result {
-            Ok(Json(error)) => LLMError::from_payload(error.payload),
-            Err((error, code)) => decode_plugin_error(error, code),
+            // Plugin may already stamp identity; adapter will re-stamp with host name.
+            Ok(Json(error)) => {
+                crate::error::ProviderDecodeError::terminal(LLMError::from_payload(error.payload))
+            }
+            Err((error, code)) => {
+                crate::error::ProviderDecodeError::terminal(decode_plugin_error(error, code))
+            }
         }
     }
 
@@ -1394,6 +1415,10 @@ impl HTTPEmbeddingProvider for ExtismProvider {
 }
 
 impl HTTPLLMProvider for ExtismProvider {
+    fn provider_name(&self) -> &str {
+        &self.name
+    }
+
     fn tools(&self) -> Option<&[Tool]> {
         None
     }

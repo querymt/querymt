@@ -1037,8 +1037,11 @@ impl HTTPChatProvider for Anthropic {
         cfg.chat_request(messages, tools)
     }
 
-    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        classify_anthropic_http_error(response).attribute(PROVIDER_NAME)
+    fn classify_chat_error(
+        &self,
+        response: &Response<Vec<u8>>,
+    ) -> querymt::error::ProviderDecodeError {
+        classify_anthropic_http_error(response).into()
     }
 
     fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
@@ -1080,8 +1083,13 @@ struct AnthropicStreamParser {
 }
 
 impl ChatStreamParser for AnthropicStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<querymt::chat::StreamChunk>, LLMError> {
-        let text = std::str::from_utf8(chunk).map_err(|e| LLMError::GenericError(e.to_string()))?;
+    fn parse_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<querymt::chat::StreamChunk>, querymt::error::ProviderDecodeError> {
+        let text = std::str::from_utf8(chunk).map_err(|e| {
+            querymt::error::ProviderDecodeError::terminal(LLMError::GenericError(e.to_string()))
+        })?;
         let mut chunks = Vec::new();
 
         for line in text.lines() {
@@ -1092,9 +1100,11 @@ impl ChatStreamParser for AnthropicStreamParser {
                 }
 
                 let stream_resp: AnthropicStreamResponse =
-                    serde_json::from_str(data).map_err(|e| LLMError::ResponseFormatError {
-                        message: format!("Failed to parse Anthropic stream data: {}", e),
-                        raw_response: data.to_string(),
+                    serde_json::from_str(data).map_err(|e| {
+                        querymt::error::ProviderDecodeError::response_format(
+                            format!("Failed to parse Anthropic stream data: {}", e),
+                            data.to_string(),
+                        )
                     })?;
 
                 match stream_resp.response_type.as_str() {
@@ -1105,7 +1115,7 @@ impl ChatStreamParser for AnthropicStreamParser {
                             None,
                             false,
                         )
-                        .attribute(PROVIDER_NAME));
+                        .into());
                     }
                     "message_start" => {
                         if let Some(usage) = stream_resp.message.and_then(|m| m.usage) {
@@ -1233,10 +1243,9 @@ fn anthropic_error_kind(error_type: &str) -> Option<ProviderErrorKind> {
             Some(ProviderErrorKind::RateLimited)
         }
         "authentication_error" | "permission_error" => Some(ProviderErrorKind::Authentication),
-        "invalid_request_error"
-        | "invalid_request"
-        | "not_found_error"
-        | "request_too_large" => Some(ProviderErrorKind::InvalidRequest),
+        "invalid_request_error" | "invalid_request" | "not_found_error" | "request_too_large" => {
+            Some(ProviderErrorKind::InvalidRequest)
+        }
         // api_error is a generic server failure — leave kind unset; caller sets
         // transient from HTTP status / stream context.
         _ => None,
@@ -1263,17 +1272,14 @@ fn map_anthropic_api_error(
             }
         });
 
-    let type_norm = error_type
-        .as_deref()
-        .map(normalize_anthropic_error_token);
-    let kind = type_norm
-        .as_deref()
-        .and_then(anthropic_error_kind);
+    let type_norm = error_type.as_deref().map(normalize_anthropic_error_token);
+    let kind = type_norm.as_deref().and_then(anthropic_error_kind);
 
     let transient = kind.map_or(unknown_transient, ProviderErrorKind::is_retryable);
     let retry_after_secs = match kind {
-        Some(ProviderErrorKind::RateLimited) => header_retry_after
-            .or_else(|| parse_retry_after_from_message(&message)),
+        Some(ProviderErrorKind::RateLimited) => {
+            header_retry_after.or_else(|| parse_retry_after_from_message(&message))
+        }
         Some(k) if !k.is_retryable() => None,
         _ => header_retry_after,
     };
@@ -1297,24 +1303,23 @@ fn classify_anthropic_http_error(response: &Response<Vec<u8>>) -> ClassifiedProv
 
     // Prefer structured `{"type":"error","error":{...}}` or bare `{"error":{...}}`.
     if let Ok(envelope) = serde_json::from_slice::<Value>(response.body()) {
-        let error_value = envelope
-            .get("error")
-            .cloned()
-            .or_else(|| {
-                // Top-level error object with type/message (some gateway shapes).
-                if envelope.get("type").and_then(Value::as_str) == Some("error") {
-                    envelope.get("error").cloned()
-                } else if envelope.get("type").is_some() && envelope.get("message").is_some() {
-                    Some(envelope.clone())
-                } else {
-                    None
-                }
-            });
+        let error_value = envelope.get("error").cloned().or_else(|| {
+            // Top-level error object with type/message (some gateway shapes).
+            if envelope.get("type").and_then(Value::as_str) == Some("error") {
+                envelope.get("error").cloned()
+            } else if envelope.get("type").is_some() && envelope.get("message").is_some() {
+                Some(envelope.clone())
+            } else {
+                None
+            }
+        });
 
         if let Some(error_value) = error_value {
-            let parsed: Option<AnthropicApiErrorBody> =
-                serde_json::from_value(error_value).ok();
-            if parsed.as_ref().is_some_and(|e| e.error_type.is_some() || e.message.is_some()) {
+            let parsed: Option<AnthropicApiErrorBody> = serde_json::from_value(error_value).ok();
+            if parsed
+                .as_ref()
+                .is_some_and(|e| e.error_type.is_some() || e.message.is_some())
+            {
                 let status_guess_transient = matches!(status, 429 | 500..=599);
                 return map_anthropic_api_error(
                     parsed.as_ref(),
@@ -1357,6 +1362,10 @@ impl HTTPEmbeddingProvider for Anthropic {
 }
 
 impl HTTPLLMProvider for Anthropic {
+    fn provider_name(&self) -> &str {
+        PROVIDER_NAME
+    }
+
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }
@@ -2068,11 +2077,13 @@ mod tests {
     fn streaming_error_event_overloaded_is_retryable() {
         let anthropic = test_anthropic("sk-ant-api03-test");
         let mut parser = anthropic.chat_stream_parser().unwrap();
-        let line = br#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+        let line =
+            br#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
 "#;
         let err = parser
             .parse_chunk(line)
-            .expect_err("error event must fail the stream");
+            .expect_err("error event must fail the stream")
+            .attribute(PROVIDER_NAME);
         assert!(err.is_retryable());
         match err {
             LLMError::ProviderResponseError { context, .. } => {
@@ -2091,7 +2102,8 @@ mod tests {
 "#;
         let err = parser
             .parse_chunk(line)
-            .expect_err("error event must fail the stream");
+            .expect_err("error event must fail the stream")
+            .attribute(PROVIDER_NAME);
         assert!(!err.is_retryable());
         match err {
             LLMError::ProviderResponseError { context, .. } => {

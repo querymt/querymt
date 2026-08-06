@@ -144,8 +144,8 @@ impl OpenAIProviderConfig for KimiCode {
 }
 
 impl HTTPChatProvider for KimiCode {
-    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        classify_openai_http_error(response).attribute(PROVIDER_NAME)
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> querymt::error::ProviderDecodeError {
+        classify_openai_http_error(response)
     }
 
     fn supports_streaming(&self) -> bool {
@@ -194,7 +194,7 @@ struct KimiCodeStreamParser {
 }
 
 impl ChatStreamParser for KimiCodeStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
         log::trace!(
             "kimi-code SSE chunk ({} bytes): {:?}",
             chunk.len(),
@@ -202,7 +202,6 @@ impl ChatStreamParser for KimiCodeStreamParser {
         );
         let normalized = KimiCode::normalize_sse_data_prefix(chunk);
         parse_openai_sse_chunk(&normalized, &mut self.tool_states)
-            .map_err(|error| error.attribute(PROVIDER_NAME))
     }
 }
 
@@ -227,6 +226,10 @@ impl HTTPCompletionProvider for KimiCode {
 }
 
 impl HTTPLLMProvider for KimiCode {
+    fn provider_name(&self) -> &str {
+        PROVIDER_NAME
+    }
+
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }

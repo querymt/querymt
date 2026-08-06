@@ -117,8 +117,8 @@ impl OpenAIProviderConfig for OpenRouter {
 }
 
 impl HTTPChatProvider for OpenRouter {
-    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        classify_openai_http_error(response).attribute(PROVIDER_NAME)
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> querymt::error::ProviderDecodeError {
+        classify_openai_http_error(response)
     }
 
     fn chat_request(
@@ -158,9 +158,8 @@ struct OpenRouterStreamParser {
 }
 
 impl ChatStreamParser for OpenRouterStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
         parse_openai_sse_chunk(chunk, &mut self.tool_states)
-            .map_err(|error| error.attribute(PROVIDER_NAME))
     }
 }
 
@@ -185,6 +184,10 @@ impl HTTPCompletionProvider for OpenRouter {
 }
 
 impl HTTPLLMProvider for OpenRouter {
+    fn provider_name(&self) -> &str {
+        PROVIDER_NAME
+    }
+
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }

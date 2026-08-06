@@ -1,25 +1,31 @@
 use crate::{
     Tool,
     chat::{ChatMessage, ChatResponse, StreamChunk},
-    error::{LLMError, classify_http_status},
+    error::{LLMError, ProviderDecodeError, classify_status_only},
 };
 use http::{Request, Response};
 
 pub trait ChatStreamParser: Send {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError>;
+    /// Decode one SSE/frame chunk. Return unattributed decode errors — the HTTP
+    /// adapter stamps [`crate::HTTPLLMProvider::provider_name`] once.
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, ProviderDecodeError>;
 
-    fn finish(&mut self) -> Result<Vec<StreamChunk>, LLMError> {
+    fn finish(&mut self) -> Result<Vec<StreamChunk>, ProviderDecodeError> {
         Ok(Vec::new())
     }
 }
 
 pub trait HTTPChatProvider: Send + Sync {
-    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        classify_http_status(
+    /// Classify a non-success HTTP chat response **without** provider identity.
+    /// The HTTP adapter calls [`ProviderDecodeError::attribute`] with
+    /// [`crate::HTTPLLMProvider::provider_name`].
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> ProviderDecodeError {
+        classify_status_only(
             response.status().as_u16(),
             response.headers(),
             response.body(),
         )
+        .into()
     }
 
     fn chat_request(

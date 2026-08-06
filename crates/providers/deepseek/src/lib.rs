@@ -150,8 +150,8 @@ impl OpenAIProviderConfig for Deepseek {
 }
 
 impl HTTPChatProvider for Deepseek {
-    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        classify_openai_http_error(response).attribute(PROVIDER_NAME)
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> querymt::error::ProviderDecodeError {
+        classify_openai_http_error(response)
     }
 
     fn chat_request(
@@ -191,9 +191,8 @@ struct DeepseekStreamParser {
 }
 
 impl ChatStreamParser for DeepseekStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
         parse_openai_sse_chunk(chunk, &mut self.tool_states)
-            .map_err(|error| error.attribute(PROVIDER_NAME))
     }
 }
 
@@ -218,6 +217,10 @@ impl HTTPCompletionProvider for Deepseek {
 }
 
 impl HTTPLLMProvider for Deepseek {
+    fn provider_name(&self) -> &str {
+        PROVIDER_NAME
+    }
+
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }

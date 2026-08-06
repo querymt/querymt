@@ -178,11 +178,14 @@ impl OpenAIProviderConfig for Xai {
 }
 
 impl HTTPChatProvider for Xai {
-    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
+    fn classify_chat_error(
+        &self,
+        response: &Response<Vec<u8>>,
+    ) -> querymt::error::ProviderDecodeError {
         if self.should_use_responses_api() {
-            classify_codex_http_error(response).attribute(PROVIDER_NAME)
+            classify_codex_http_error(response)
         } else {
-            classify_openai_http_error(response).attribute(PROVIDER_NAME)
+            classify_openai_http_error(response)
         }
     }
 
@@ -364,17 +367,23 @@ impl XaiStreamParser {
 }
 
 impl ChatStreamParser for XaiStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+    fn parse_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
         if self.use_responses_api {
             codex_parse_stream_chunk_with_state(chunk, &self.codex_tool_state)
         } else {
             parse_openai_sse_chunk(chunk, &mut self.openai_tool_state)
         }
-        .map_err(|error| error.attribute(PROVIDER_NAME))
     }
 }
 
 impl HTTPLLMProvider for Xai {
+    fn provider_name(&self) -> &str {
+        PROVIDER_NAME
+    }
+
     fn tools(&self) -> Option<&[Tool]> {
         self.tools.as_deref()
     }
@@ -1023,7 +1032,11 @@ mod tests {
 
 "#;
 
-        let error = parser.parse_chunk(chunk).unwrap_err();
+        // Parser returns unattributed decode errors; adapter stamps identity.
+        let error = parser
+            .parse_chunk(chunk)
+            .unwrap_err()
+            .attribute(PROVIDER_NAME);
         match error {
             LLMError::ProviderResponseError { context, .. } => {
                 assert_eq!(context.provider, PROVIDER_NAME);

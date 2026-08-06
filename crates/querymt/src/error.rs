@@ -156,6 +156,10 @@ impl ClassifiedProviderError {
     }
 
     /// Attach provider identity and produce the structured [`LLMError`].
+    ///
+    /// Prefer letting the HTTP adapter call this once via
+    /// [`ProviderDecodeError::attribute`] rather than stamping at every
+    /// classifier call site.
     pub fn attribute(self, provider: impl Into<String>) -> LLMError {
         let message = self.message.clone();
         LLMError::ProviderResponseError {
@@ -209,7 +213,7 @@ impl ProviderDecodeError {
     pub fn attribute(self, provider: impl Into<String>) -> LLMError {
         match self {
             Self::Classified(error) => error.attribute(provider),
-            Self::Terminal(error) => error,
+            Self::Terminal(error) => error.with_provider(provider),
         }
     }
 }
@@ -569,6 +573,19 @@ impl LLMError {
             }
             _ => false,
         }
+    }
+
+    /// Stamp provider identity onto structured provider failures.
+    ///
+    /// Used by [`ProviderDecodeError::attribute`] for terminal variants that
+    /// already carry a [`Self::ProviderResponseError`] (e.g. status-only
+    /// classification) so the adapter can still attach identity once.
+    /// Non-provider variants are returned unchanged.
+    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+        if let Self::ProviderResponseError { context, .. } = &mut self {
+            context.provider = provider.into();
+        }
+        self
     }
 
     /// Message + retry-after when [`Self::is_rate_limited`] is true.
@@ -1463,14 +1480,18 @@ mod tests {
             }),
             LLMError::InvalidUrl(_)
         ));
-        assert!(!LLMErrorPayload::JsonError {
-            message: "x".into()
-        }
-        .is_retryable());
-        assert!(!LLMErrorPayload::InvalidUrl {
-            message: "x".into()
-        }
-        .is_retryable());
+        assert!(
+            !LLMErrorPayload::JsonError {
+                message: "x".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !LLMErrorPayload::InvalidUrl {
+                message: "x".into()
+            }
+            .is_retryable()
+        );
     }
 
     #[test]
