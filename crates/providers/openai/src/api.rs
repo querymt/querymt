@@ -1200,32 +1200,30 @@ pub struct OpenAIToolUseState {
     pub started: bool,
 }
 
-fn recognized_openai_error_kind(kind: &str) -> Option<&str> {
-    match kind {
-        "server_is_overloaded"
-        | "slow_down"
-        | "overloaded_error"
-        | "overloaded"
-        | "rate_limit_exceeded"
+/// Map a normalized OpenAI-compatible error `code`/`type` to a unified kind.
+/// Unrecognized values return `None` — one match, no validation pre-pass.
+fn openai_error_kind(code: &str) -> Option<ProviderErrorKind> {
+    match code {
+        "server_is_overloaded" | "slow_down" | "overloaded_error" | "overloaded" => {
+            Some(ProviderErrorKind::ServerOverloaded)
+        }
+        "rate_limit_exceeded"
         | "rate_limit_error"
         | "rate_limited"
         | "rate_limit"
-        | "too_many_requests"
-        | "context_length_exceeded"
-        | "context_length_error"
-        | "context_length"
-        | "insufficient_quota"
-        | "usage_not_included"
-        | "invalid_request"
+        | "too_many_requests" => Some(ProviderErrorKind::RateLimited),
+        "context_length_exceeded" | "context_length_error" | "context_length" => {
+            Some(ProviderErrorKind::ContextWindowExceeded)
+        }
+        "insufficient_quota" | "usage_not_included" => Some(ProviderErrorKind::QuotaExceeded),
+        "invalid_request"
         | "invalid_request_error"
         | "invalid_prompt"
         | "bio_policy"
-        | "cyber_policy"
-        | "authentication_error"
-        | "invalid_api_key"
-        | "unauthorized"
-        | "server_error"
-        | "internal_server_error" => Some(kind),
+        | "cyber_policy" => Some(ProviderErrorKind::InvalidRequest),
+        "authentication_error" | "invalid_api_key" | "unauthorized" => {
+            Some(ProviderErrorKind::Authentication)
+        }
         _ => None,
     }
 }
@@ -1278,44 +1276,30 @@ fn map_openai_error_envelope(
         .map(|kind| kind.trim().to_ascii_lowercase().replace(['-', ' '], "_"));
     let kind = code_norm
         .as_deref()
-        .and_then(recognized_openai_error_kind)
-        .or_else(|| type_norm.as_deref().and_then(recognized_openai_error_kind));
+        .and_then(openai_error_kind)
+        .or_else(|| type_norm.as_deref().and_then(openai_error_kind));
 
-    let (kind, transient, retry_after_secs) = match kind {
-        Some("server_is_overloaded" | "slow_down" | "overloaded_error" | "overloaded") => (
-            Some(ProviderErrorKind::ServerOverloaded),
-            true,
-            retry_after_secs,
-        ),
-        Some(
-            "rate_limit_exceeded"
-            | "rate_limit_error"
-            | "rate_limited"
-            | "rate_limit"
-            | "too_many_requests",
-        ) => (
-            Some(ProviderErrorKind::RateLimited),
-            true,
-            retry_after_secs.or_else(|| parse_retry_after_from_message(&message)),
-        ),
-        Some("context_length_exceeded" | "context_length_error" | "context_length") => {
-            (Some(ProviderErrorKind::ContextWindowExceeded), false, None)
+    // Unclassified server-side codes are transient; anything else unknown
+    // defers to the caller's status-based guess.
+    let server_side = matches!(
+        code_norm.as_deref(),
+        Some("server_error" | "internal_server_error")
+    ) || matches!(
+        type_norm.as_deref(),
+        Some("server_error" | "internal_server_error")
+    );
+    let transient = kind.map_or(
+        unknown_transient || server_side,
+        ProviderErrorKind::is_retryable,
+    );
+    // Rate-limit messages may embed the delay ("try again in 11s"). Retry
+    // hints are only meaningful for failures we actually retry.
+    let retry_after_secs = match kind {
+        Some(ProviderErrorKind::RateLimited) => {
+            retry_after_secs.or_else(|| parse_retry_after_from_message(&message))
         }
-        Some("insufficient_quota" | "usage_not_included") => {
-            (Some(ProviderErrorKind::QuotaExceeded), false, None)
-        }
-        Some(
-            "invalid_request"
-            | "invalid_request_error"
-            | "invalid_prompt"
-            | "bio_policy"
-            | "cyber_policy",
-        ) => (Some(ProviderErrorKind::InvalidRequest), false, None),
-        Some("authentication_error" | "invalid_api_key" | "unauthorized") => {
-            (Some(ProviderErrorKind::Authentication), false, None)
-        }
-        Some("server_error" | "internal_server_error") => (None, true, retry_after_secs),
-        _ => (None, unknown_transient, retry_after_secs),
+        Some(kind) if !kind.is_retryable() => None,
+        _ => retry_after_secs,
     };
 
     let mut classified = ClassifiedProviderError::new(message)
@@ -1353,11 +1337,12 @@ pub fn classify_openai_http_error(response: &Response<Vec<u8>>) -> ProviderDecod
         return mapped.into();
     }
 
-    ProviderDecodeError::terminal(querymt::error::classify_http_status(
-        status,
-        response.headers(),
-        response.body(),
-    ))
+    // No vendor envelope: classify from the status alone so the failure is
+    // still structured and picks up provider identity at `attribute`.
+    if status == 499 {
+        return ProviderDecodeError::terminal(LLMError::Cancelled);
+    }
+    querymt::error::classify_status_only(status, response.headers(), response.body()).into()
 }
 
 pub fn parse_openai_sse_chunk(
@@ -1868,13 +1853,14 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
 
         let error = classify_openai_http_error(&response).attribute("openrouter");
         match error {
-            LLMError::ProviderRateLimited { message, context } => {
+            LLMError::ProviderResponseError { message, context } => {
                 assert_eq!(message, "slow down");
+                assert_eq!(context.kind, Some(ProviderErrorKind::RateLimited));
                 assert_eq!(context.provider, "openrouter");
                 assert_eq!(context.request_id.as_deref(), Some("req-http"));
                 assert_eq!(context.retry_after_secs, Some(4));
             }
-            other => panic!("expected ProviderRateLimited, got {other}"),
+            other => panic!("expected ProviderResponseError, got {other}"),
         }
     }
 
@@ -1947,7 +1933,9 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
             .attribute(PROVIDER_NAME);
         assert!(matches!(
             error,
-            LLMError::ProviderInvalidRequest { ref message, .. } if message == "unsupported field"
+            LLMError::ProviderResponseError { ref message, ref context }
+                if message == "unsupported field"
+                    && context.kind == Some(ProviderErrorKind::InvalidRequest)
         ));
         assert!(!error.is_retryable());
     }
@@ -1963,7 +1951,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
             .expect_err("rate limit envelope should return an error")
             .attribute(PROVIDER_NAME);
         match &error {
-            LLMError::ProviderRateLimited { message, context } => {
+            LLMError::ProviderResponseError { message, context } => {
                 assert!(message.contains("Rate limit"));
                 assert_eq!(context.retry_after_secs, Some(2));
                 assert_eq!(context.kind, Some(ProviderErrorKind::RateLimited));
@@ -1984,8 +1972,9 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
             .expect_err("quota envelope should return an error")
             .attribute(PROVIDER_NAME);
         match &error {
-            LLMError::QuotaExceeded { message, context } => {
+            LLMError::ProviderResponseError { message, context } => {
                 assert!(message.contains("quota"));
+                assert_eq!(context.kind, Some(ProviderErrorKind::QuotaExceeded));
                 assert_eq!(context.code.as_deref(), Some("insufficient_quota"));
             }
             other => panic!("expected QuotaExceeded, got {other}"),
@@ -2002,7 +1991,11 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         let error = parse_openai_sse_chunk(chunk, &mut tool_states)
             .unwrap_err()
             .attribute(PROVIDER_NAME);
-        assert!(matches!(error, LLMError::ServerOverloaded { .. }));
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError { ref context, .. }
+                if context.kind == Some(ProviderErrorKind::ServerOverloaded)
+        ));
         assert!(error.is_retryable());
     }
 
@@ -2015,7 +2008,11 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         let error = parse_openai_sse_chunk(chunk, &mut tool_states)
             .unwrap_err()
             .attribute(PROVIDER_NAME);
-        assert!(matches!(error, LLMError::ProviderRateLimited { .. }));
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError { ref context, .. }
+                if context.kind == Some(ProviderErrorKind::RateLimited)
+        ));
         assert!(error.is_retryable());
     }
 
@@ -2028,7 +2025,11 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         let error = parse_openai_sse_chunk(chunk, &mut tool_states)
             .unwrap_err()
             .attribute(PROVIDER_NAME);
-        assert!(matches!(error, LLMError::ContextWindowExceeded { .. }));
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError { ref context, .. }
+                if context.kind == Some(ProviderErrorKind::ContextWindowExceeded)
+        ));
         assert!(!error.is_retryable());
     }
 

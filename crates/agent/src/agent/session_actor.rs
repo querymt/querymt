@@ -1633,14 +1633,6 @@ async fn acquire_execution_permit_with_timeout(
     }
 }
 
-fn prompt_execution_was_cancelled(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<crate::agent::execution::PromptLlmError>()
-            .is_some_and(|error| matches!(error.llm_error(), querymt::error::LLMError::Cancelled))
-    })
-}
-
 fn map_prompt_execution_error(error: &anyhow::Error) -> AgentError {
     let reason = format!("{error:#}");
     let Some(prompt_error) = error
@@ -1650,12 +1642,16 @@ fn map_prompt_execution_error(error: &anyhow::Error) -> AgentError {
         return AgentError::Internal(reason);
     };
 
-    if matches!(
-        prompt_error.llm_error(),
-        querymt::error::LLMError::Cancelled
-    ) {
-        return AgentError::Internal("prompt cancelled".to_string());
-    }
+    // Cancellation never reaches here as an error: `map_failed_llm_call`
+    // intercepts `LLMError::Cancelled` and returns `ExecutionState::Cancelled`,
+    // so a wrapped Cancelled is a bug, not a case to handle.
+    debug_assert!(
+        !matches!(
+            prompt_error.llm_error(),
+            querymt::error::LLMError::Cancelled
+        ),
+        "LLMError::Cancelled must not be wrapped in PromptLlmError"
+    );
 
     AgentError::ProviderChat {
         operation: prompt_error.operation().as_str().to_string(),
@@ -2044,9 +2040,6 @@ async fn execute_prompt_detached(
         Ok(CycleOutcome::Cancelled) => Ok(PromptResponse::new(StopReason::Cancelled)),
         Ok(CycleOutcome::Stopped(stop_reason)) => Ok(PromptResponse::new(stop_reason)),
         Err(e) => {
-            if prompt_execution_was_cancelled(&e) {
-                return Ok(PromptResponse::new(StopReason::Cancelled));
-            }
             config.emit_event(
                 &session_id,
                 AgentEventKind::Error {
@@ -2264,7 +2257,7 @@ mod tests {
                     context: Some(payload_context),
                 }),
             } if operation == "chat_stream"
-                && reason == "LLM streaming error: LLM Provider Error: service overloaded"
+                && reason == "LLM streaming error: LLM Provider Error (openai, request_id=req-456): service overloaded"
                 && message == "service overloaded"
                 && payload_context == context
         ));
@@ -2306,23 +2299,6 @@ mod tests {
             } => assert_eq!(operation, "chat"),
             other => panic!("expected ProviderChat(chat), got {other:?}"),
         }
-    }
-
-    #[test]
-    fn prompt_error_cancelled_does_not_become_provider_chat() {
-        let error = anyhow::Error::new(crate::agent::execution::PromptLlmError::new(
-            crate::agent::execution::LlmOperation::Chat,
-            LLMError::Cancelled,
-        ));
-
-        let mapped = map_prompt_execution_error(&error);
-
-        assert!(
-            !matches!(mapped, AgentError::ProviderChat { .. }),
-            "Cancelled must not become ProviderChat, got {mapped:?}"
-        );
-        assert!(matches!(mapped, AgentError::Internal(reason) if reason.contains("cancel")));
-        assert!(prompt_execution_was_cancelled(&error));
     }
 
     #[test]

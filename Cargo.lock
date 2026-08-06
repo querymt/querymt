@@ -11099,6 +11099,7 @@ dependencies = [
  "querymt-provider-common",
  "querymt-remote",
  "querymt-utils",
+ "rand 0.9.4",
  "rapidhash",
  "rayon",
  "regex",

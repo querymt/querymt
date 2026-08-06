@@ -810,11 +810,12 @@ pub fn classify_codex_http_error(response: &Response<Vec<u8>>) -> ProviderDecode
         }
     }
 
-    ProviderDecodeError::terminal(querymt::error::classify_http_status(
-        status,
-        response.headers(),
-        response.body(),
-    ))
+    // No vendor envelope: classify from the status alone so the failure is
+    // still structured and picks up provider identity at `attribute`.
+    if status == 499 {
+        return ProviderDecodeError::terminal(LLMError::Cancelled);
+    }
+    querymt::error::classify_status_only(status, response.headers(), response.body()).into()
 }
 
 pub fn codex_parse_stream_chunk_with_state(
@@ -990,37 +991,38 @@ pub fn codex_parse_stream_chunk_with_state(
     Ok(results)
 }
 
-fn recognized_codex_error_kind(kind: &str) -> Option<&str> {
-    match kind {
-        "server_is_overloaded"
-        | "slow_down"
-        | "overloaded_error"
-        | "rate_limit_exceeded"
-        | "rate_limit_error"
-        | "context_length_exceeded"
-        | "context_length_error"
-        | "insufficient_quota"
-        | "usage_not_included"
-        | "cyber_policy"
+/// Map a normalized Codex error `code`/`type` to a unified kind.
+/// Unrecognized values return `None` — one match, no validation pre-pass.
+fn codex_error_kind(code: &str) -> Option<ProviderErrorKind> {
+    match code {
+        "server_is_overloaded" | "slow_down" | "overloaded_error" => {
+            Some(ProviderErrorKind::ServerOverloaded)
+        }
+        "rate_limit_exceeded" | "rate_limit_error" => Some(ProviderErrorKind::RateLimited),
+        "context_length_exceeded" | "context_length_error" => {
+            Some(ProviderErrorKind::ContextWindowExceeded)
+        }
+        "insufficient_quota" | "usage_not_included" => Some(ProviderErrorKind::QuotaExceeded),
+        "cyber_policy"
         | "invalid_prompt"
         | "bio_policy"
         | "invalid_request"
-        | "invalid_request_error"
-        | "authentication_error"
-        | "invalid_api_key"
-        | "unauthorized" => Some(kind),
+        | "invalid_request_error" => Some(ProviderErrorKind::InvalidRequest),
+        "authentication_error" | "invalid_api_key" | "unauthorized" => {
+            Some(ProviderErrorKind::Authentication)
+        }
         _ => None,
     }
 }
 
-/// Map Codex `response.failed` error objects into unified [`LLMError`] kinds.
+/// Map Codex `response.failed` error objects into unified [`ProviderErrorKind`]s.
 ///
 /// Code table follows openai/codex (`codex-api` SSE `response.failed` handlers):
-/// - `server_is_overloaded` | `slow_down` → [`LLMError::ServerOverloaded`] (retryable here)
-/// - `rate_limit_exceeded` → [`LLMError::ProviderRateLimited`] (+ message delay parse)
-/// - `context_length_exceeded` → [`LLMError::ContextWindowExceeded`]
-/// - `insufficient_quota` | `usage_not_included` → [`LLMError::QuotaExceeded`]
-/// - `cyber_policy` | `invalid_prompt` | `bio_policy` → [`LLMError::InvalidRequest`]
+/// - `server_is_overloaded` | `slow_down` → overloaded (retryable here)
+/// - `rate_limit_exceeded` → rate limited (+ message delay parse)
+/// - `context_length_exceeded` → context window exceeded
+/// - `insufficient_quota` | `usage_not_included` → quota exceeded
+/// - `cyber_policy` | `invalid_prompt` | `bio_policy` → invalid request
 /// - unknown structured code → retryable catch-all before semantic output
 ///
 /// Vendor dialect stays in this provider; core only sees unified kinds.
@@ -1060,37 +1062,18 @@ fn map_codex_response_failed(
         .map(|kind| kind.trim().to_ascii_lowercase().replace(['-', ' '], "_"));
     let kind = code_norm
         .as_deref()
-        .and_then(recognized_codex_error_kind)
-        .or_else(|| type_norm.as_deref().and_then(recognized_codex_error_kind));
+        .and_then(codex_error_kind)
+        .or_else(|| type_norm.as_deref().and_then(codex_error_kind));
 
-    let (kind, transient, retry_after_secs) = match kind {
-        Some("server_is_overloaded" | "slow_down" | "overloaded_error") => (
-            Some(ProviderErrorKind::ServerOverloaded),
-            true,
-            retry_after_secs,
-        ),
-        Some("rate_limit_exceeded" | "rate_limit_error") => (
-            Some(ProviderErrorKind::RateLimited),
-            true,
-            retry_after_secs.or_else(|| parse_retry_after_from_message(&message)),
-        ),
-        Some("context_length_exceeded" | "context_length_error") => {
-            (Some(ProviderErrorKind::ContextWindowExceeded), false, None)
+    let transient = kind.map_or(unknown_transient, ProviderErrorKind::is_retryable);
+    // Rate-limit messages may embed the delay ("try again in 11s"). Retry
+    // hints are only meaningful for failures we actually retry.
+    let retry_after_secs = match kind {
+        Some(ProviderErrorKind::RateLimited) => {
+            retry_after_secs.or_else(|| parse_retry_after_from_message(&message))
         }
-        Some("insufficient_quota" | "usage_not_included") => {
-            (Some(ProviderErrorKind::QuotaExceeded), false, None)
-        }
-        Some(
-            "cyber_policy"
-            | "invalid_prompt"
-            | "bio_policy"
-            | "invalid_request"
-            | "invalid_request_error",
-        ) => (Some(ProviderErrorKind::InvalidRequest), false, None),
-        Some("authentication_error" | "invalid_api_key" | "unauthorized") => {
-            (Some(ProviderErrorKind::Authentication), false, None)
-        }
-        _ => (None, unknown_transient, retry_after_secs),
+        Some(kind) if !kind.is_retryable() => None,
+        _ => retry_after_secs,
     };
 
     let mut classified = ClassifiedProviderError::new(message)
@@ -1923,13 +1906,14 @@ mod tests {
 
         let error = classify_codex_http_error(&response).attribute("xai");
         match error {
-            LLMError::ServerOverloaded { message, context } => {
+            LLMError::ProviderResponseError { message, context } => {
                 assert_eq!(message, "busy");
+                assert_eq!(context.kind, Some(ProviderErrorKind::ServerOverloaded));
                 assert_eq!(context.provider, "xai");
                 assert_eq!(context.request_id.as_deref(), Some("req-http"));
                 assert_eq!(context.retry_after_secs, Some(3));
             }
-            other => panic!("expected ServerOverloaded, got {other}"),
+            other => panic!("expected ProviderResponseError, got {other}"),
         }
     }
 
@@ -1954,16 +1938,17 @@ mod tests {
             r#"{"type":"response.failed","response":{"id":"resp_086d39fcd1bd4726016a6b3477038081919b8f301082107795","object":"response","status":"failed","error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}}"#,
         );
         match &error {
-            LLMError::ServerOverloaded { message, context } => {
+            LLMError::ProviderResponseError { message, context } => {
                 assert_eq!(
                     message,
                     "Our servers are currently overloaded. Please try again later."
                 );
+                assert_eq!(context.kind, Some(ProviderErrorKind::ServerOverloaded));
                 assert_eq!(context.provider, PROVIDER_NAME);
                 assert_eq!(context.code.as_deref(), Some("server_is_overloaded"));
                 assert!(error.is_retryable());
             }
-            other => panic!("expected ServerOverloaded, got {other}"),
+            other => panic!("expected ProviderResponseError, got {other}"),
         }
         assert!(state.lock().unwrap().is_empty());
     }
@@ -1973,7 +1958,11 @@ mod tests {
         let (error, _) = parse_failed_event(
             r#"{"type":"response.failed","response":{"error":{"code":"slow_down","message":"slow down"}}}"#,
         );
-        assert!(matches!(error, LLMError::ServerOverloaded { .. }));
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError { ref context, .. }
+                if context.kind == Some(ProviderErrorKind::ServerOverloaded)
+        ));
         assert!(error.is_retryable());
     }
 
@@ -1990,7 +1979,8 @@ mod tests {
             );
             let (error, _) = parse_failed_event(&payload);
             assert!(
-                matches!(error, LLMError::ProviderInvalidRequest { ref message, .. } if message == "bad"),
+                matches!(error, LLMError::ProviderResponseError { ref message, ref context }
+                    if message == "bad" && context.kind == Some(ProviderErrorKind::InvalidRequest)),
                 "code={code}, got {error}"
             );
             assert!(!error.is_retryable());
@@ -2002,13 +1992,21 @@ mod tests {
         let (ctx_err, _) = parse_failed_event(
             r#"{"type":"response.failed","response":{"error":{"message":"too long","code":"context_length_exceeded"}}}"#,
         );
-        assert!(matches!(ctx_err, LLMError::ContextWindowExceeded { .. }));
+        assert!(matches!(
+            ctx_err,
+            LLMError::ProviderResponseError { ref context, .. }
+                if context.kind == Some(ProviderErrorKind::ContextWindowExceeded)
+        ));
         assert!(!ctx_err.is_retryable());
 
         let (quota_err, _) = parse_failed_event(
             r#"{"type":"response.failed","response":{"error":{"message":"no credits","code":"insufficient_quota"}}}"#,
         );
-        assert!(matches!(quota_err, LLMError::QuotaExceeded { .. }));
+        assert!(matches!(
+            quota_err,
+            LLMError::ProviderResponseError { ref context, .. }
+                if context.kind == Some(ProviderErrorKind::QuotaExceeded)
+        ));
         assert!(!quota_err.is_retryable());
     }
 
@@ -2018,7 +2016,7 @@ mod tests {
             r#"{"type":"response.failed","response":{"error":{"message":"Rate limit reached for gpt-5.1. Please try again in 11.054s.","type":"rate_limit_error","code":"rate_limit_exceeded"}}}"#,
         );
         match &error {
-            LLMError::ProviderRateLimited { message, context } => {
+            LLMError::ProviderResponseError { message, context } => {
                 assert!(message.contains("Rate limit reached"));
                 assert_eq!(context.retry_after_secs, Some(12));
                 assert_eq!(context.kind, Some(ProviderErrorKind::RateLimited));
@@ -2034,11 +2032,12 @@ mod tests {
             r#"{"type":"response.failed","requestId":"req_event","response":{"id":"resp_not_request_id","error":{"message":"busy","code":"server_is_overloaded","retry_after":"2s"}}}"#,
         );
         match &error {
-            LLMError::ServerOverloaded { context, .. } => {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.kind, Some(ProviderErrorKind::ServerOverloaded));
                 assert_eq!(context.request_id.as_deref(), Some("req_event"));
                 assert_eq!(context.retry_after_secs, Some(2));
             }
-            other => panic!("expected ServerOverloaded, got {other}"),
+            other => panic!("expected ProviderResponseError, got {other}"),
         }
     }
 
@@ -2047,7 +2046,11 @@ mod tests {
         let (error, _) = parse_failed_event(
             r#"{"type":"response.failed","response":{"error":{"message":"slow down","code":"vendor_specific","type":"rate_limit_error"}}}"#,
         );
-        assert!(matches!(error, LLMError::ProviderRateLimited { .. }));
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError { ref context, .. }
+                if context.kind == Some(ProviderErrorKind::RateLimited)
+        ));
         assert!(error.is_retryable());
     }
 
@@ -2058,7 +2061,8 @@ mod tests {
         );
         assert!(matches!(
             error,
-            LLMError::ProviderAuthError { ref message, .. } if message == "bad key"
+            LLMError::ProviderResponseError { ref message, ref context }
+                if message == "bad key" && context.kind == Some(ProviderErrorKind::Authentication)
         ));
         assert!(!error.is_retryable());
     }

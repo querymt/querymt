@@ -1025,10 +1025,14 @@ mod tests {
 
         let error = parser.parse_chunk(chunk).unwrap_err();
         match error {
-            LLMError::ServerOverloaded { context, .. } => {
+            LLMError::ProviderResponseError { context, .. } => {
                 assert_eq!(context.provider, PROVIDER_NAME);
+                assert_eq!(
+                    context.kind,
+                    Some(querymt::error::ProviderErrorKind::ServerOverloaded)
+                );
             }
-            other => panic!("expected ServerOverloaded, got {other}"),
+            other => panic!("expected ProviderResponseError, got {other}"),
         }
     }
 

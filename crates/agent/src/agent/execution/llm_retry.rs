@@ -8,10 +8,9 @@ use crate::events::AgentEventKind;
 use futures_util::{Stream, StreamExt};
 use log::{debug, info};
 use querymt::chat::StreamChunk;
-use querymt::error::LLMError;
+use querymt::error::{LLMError, ProviderErrorKind};
 use std::future::Future;
 use std::pin::Pin;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tracing::{Span, instrument};
 
@@ -34,7 +33,7 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<Box<dyn querymt::chat::ChatResponse>, LLMError>>,
 {
-    let max_attempts = config.execution_policy.rate_limit.max_retries.max(1);
+    let max_attempts = config.execution_policy.rate_limit.max_attempts();
     let mut attempt = 0;
     Span::current().record("rate_limited", false);
 
@@ -60,6 +59,7 @@ where
                 }
 
                 let wait_secs = retry_delay_secs(config, &e, attempt);
+                let is_rate_limited = rate_limit_info.is_some();
                 if let Some((message, _)) = rate_limit_info {
                     let started_at = time::OffsetDateTime::now_utc().unix_timestamp();
                     info!(
@@ -89,7 +89,7 @@ where
 
                 wait_for_retry_delay(wait_secs, cancel_token).await?;
 
-                if extract_rate_limit_info(&e).is_some() {
+                if is_rate_limited {
                     info!(
                         "Session {} resuming after rate limit wait, attempt {}",
                         session_id,
@@ -136,10 +136,7 @@ fn apply_jitter(delay_secs: f64, ratio: f64, sample: f64) -> u64 {
 }
 
 fn jitter_sample() -> f64 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.subsec_nanos());
-    f64::from(nanos) / (f64::from(u32::MAX) + 1.0)
+    rand::random::<f64>()
 }
 
 /// Wait for a retry delay, returning a typed cancellation error if interrupted.
@@ -172,7 +169,9 @@ fn extract_rate_limit_info(error: &LLMError) -> Option<(String, Option<u64>)> {
             message,
             retry_after_secs,
         } => Some((message.clone(), *retry_after_secs)),
-        LLMError::ProviderRateLimited { message, context } => {
+        LLMError::ProviderResponseError { message, context }
+            if context.kind == Some(ProviderErrorKind::RateLimited) =>
+        {
             Some((message.clone(), context.retry_after_secs))
         }
         LLMError::HttpStatus {
@@ -204,14 +203,12 @@ where
         >,
     >,
 {
-    let max_attempts = config.execution_policy.rate_limit.max_retries.max(1);
+    let max_attempts = config.execution_policy.rate_limit.max_attempts();
 
     loop {
-        if *attempts_used >= max_attempts {
-            return Err(LLMError::HttpError(
-                "LLM stream request budget exhausted".to_string(),
-            ));
-        }
+        // The caller (StreamRetryBudget) refuses to re-enter with an
+        // exhausted budget, so this only bounds attempts within one call.
+        debug_assert!(*attempts_used < max_attempts);
         *attempts_used += 1;
         let attempt = *attempts_used;
 
@@ -228,6 +225,7 @@ where
                 }
 
                 let wait_secs = retry_delay_secs(config, &e, attempt);
+                let is_rate_limited = rate_limit_info.is_some();
                 if let Some((message, _)) = rate_limit_info {
                     let started_at = time::OffsetDateTime::now_utc().unix_timestamp();
                     info!(
@@ -257,7 +255,7 @@ where
 
                 wait_for_retry_delay(wait_secs, cancel_token).await?;
 
-                if extract_rate_limit_info(&e).is_some() {
+                if is_rate_limited {
                     config.emit_event(
                         session_id,
                         AgentEventKind::RateLimitResume {
@@ -274,12 +272,7 @@ where
     }
 }
 
-/// Returns true for setup errors that are worth retrying.
-#[cfg(test)]
-fn is_transient_error(e: &LLMError) -> bool {
-    e.is_retryable()
-}
-
+/// Read the next chunk, mapping stream EOF and cancellation to typed errors.
 pub(super) async fn next_stream_chunk(
     stream: &mut Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
     cancel_token: &CancellationToken,
@@ -477,7 +470,7 @@ mod tests {
         };
         assert!(extract_rate_limit_info(&non_rate).is_none());
 
-        let overloaded = LLMError::ServerOverloaded {
+        let overloaded = LLMError::ProviderResponseError {
             message: "busy".into(),
             context: Box::new(ProviderErrorContext {
                 provider: "codex".into(),
@@ -560,55 +553,53 @@ mod tests {
         assert_eq!(retry_delay_secs(config, &error, 1), 60);
     }
 
-    // ── is_transient_error tests ─────────────────────────────────────────────
+    // ── is_retryable tests ─────────────────────────────────────────────────
 
     #[test]
-    fn test_is_transient_error_http_error() {
+    fn test_is_retryable_transport() {
         let err = LLMError::Transport {
             kind: querymt::error::TransportErrorKind::ConnectionReset,
             message: "connection reset".to_string(),
         };
-        assert!(is_transient_error(&err));
+        assert!(err.is_retryable());
     }
 
     #[test]
-    fn test_is_transient_error_http_error_generic() {
+    fn test_is_retryable_http_error_generic() {
         // HttpError (previously "error decoding response body" fell through here)
         let err = LLMError::HttpError("error decoding response body".to_string());
-        assert!(is_transient_error(&err));
+        assert!(err.is_retryable());
     }
 
     #[test]
-    fn test_is_transient_error_plugin_error() {
+    fn test_is_retryable_plugin_error() {
         let err = LLMError::PluginError("wasm stream failed".to_string());
-        assert!(is_transient_error(&err));
+        assert!(err.is_retryable());
     }
 
     #[test]
-    fn test_is_transient_error_transport_body() {
+    fn test_is_retryable_transport_body() {
         // The new typed path for reqwest is_body() errors
         let err = LLMError::Transport {
             kind: querymt::error::TransportErrorKind::Other,
             message: "error decoding response body".to_string(),
         };
-        assert!(is_transient_error(&err));
+        assert!(err.is_retryable());
     }
 
     #[test]
-    fn test_is_transient_error_http_status_503() {
+    fn test_is_retryable_http_status_503() {
         let err = LLMError::HttpStatus {
             status_code: 503,
             message: "upstream unavailable".to_string(),
             retry_after_secs: None,
         };
-        assert!(is_transient_error(&err));
+        assert!(err.is_retryable());
     }
 
     #[test]
-    fn test_is_transient_error_non_transient() {
-        assert!(!is_transient_error(&LLMError::GenericError(
-            "oops".to_string()
-        )));
+    fn test_is_retryable_non_transient() {
+        assert!(!LLMError::GenericError("oops".to_string()).is_retryable());
     }
 
     // ── cancellation-aware wait tests ────────────────────────────────────────
@@ -800,7 +791,7 @@ mod tests {
                 let count = call_count2.clone();
                 async move {
                     count.fetch_add(1, Ordering::SeqCst);
-                    Err(LLMError::ServerOverloaded {
+                    Err(LLMError::ProviderResponseError {
                         message: "overloaded".into(),
                         context: Box::new(ProviderErrorContext {
                             provider: "test".into(),
@@ -818,8 +809,9 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(LLMError::ServerOverloaded { message, context })
+            Err(LLMError::ProviderResponseError { message, context })
                 if message == "overloaded"
+                    && context.kind == Some(querymt::error::ProviderErrorKind::ServerOverloaded)
                     && context.request_id.as_deref() == Some("request-3")
         ));
         assert_eq!(call_count.load(Ordering::SeqCst), 3);

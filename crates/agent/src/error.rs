@@ -339,7 +339,7 @@ mod tests {
             operation: "chat_stream".to_string(),
             reason: "provider overloaded".to_string(),
             llm_error: Some(
-                querymt::error::LLMError::ServerOverloaded {
+                querymt::error::LLMError::ProviderResponseError {
                     message: "overloaded".to_string(),
                     context: Box::new(ProviderErrorContext {
                         provider: "codex".to_string(),

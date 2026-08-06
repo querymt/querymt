@@ -26,6 +26,18 @@ pub enum ProviderErrorKind {
     InvalidRequest,
 }
 
+impl ProviderErrorKind {
+    /// Unified retry policy for provider failures. This is the single source
+    /// of truth — both [`LLMError::is_retryable`] and
+    /// [`LLMErrorPayload::is_retryable`] defer to it.
+    ///
+    /// QueryMT product choice: overload is retried (upstream Codex marks it
+    /// non-retryable). Quota/context/auth/request failures never are.
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::ServerOverloaded | Self::RateLimited)
+    }
+}
+
 /// Attributed provider-failure diagnostics carried on structured [`LLMError`]
 /// variants. Built only by attributing a [`ClassifiedProviderError`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,7 +53,28 @@ pub struct ProviderErrorContext {
     pub request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_secs: Option<u64>,
+    /// Retryability for *unclassified* failures. A known [`Self::kind`] always
+    /// wins; this flag is only consulted when `kind` is `None`.
     pub transient: bool,
+}
+
+impl ProviderErrorContext {
+    /// Unified retry decision: known kinds follow [`ProviderErrorKind`]
+    /// policy; unknown kinds fall back to the provider's transient hint.
+    pub fn is_retryable(&self) -> bool {
+        self.kind
+            .map_or(self.transient, ProviderErrorKind::is_retryable)
+    }
+}
+
+impl std::fmt::Display for ProviderErrorContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.provider)?;
+        if let Some(request_id) = &self.request_id {
+            write!(f, ", request_id={request_id}")?;
+        }
+        Ok(())
+    }
 }
 
 /// Provider failure decoded from a wire response, before provider identity is
@@ -109,38 +142,12 @@ impl ClassifiedProviderError {
         }
     }
 
-    /// Attach provider identity and produce the matching structured [`LLMError`].
+    /// Attach provider identity and produce the structured [`LLMError`].
     pub fn attribute(self, provider: impl Into<String>) -> LLMError {
-        let kind = self.kind;
-        let message = self.message;
-        let context = Box::new(ProviderErrorContext {
-            provider: provider.into(),
-            kind: self.kind,
-            code: self.code,
-            error_type: self.error_type,
-            request_id: self.request_id,
-            retry_after_secs: self.retry_after_secs,
-            transient: self.transient,
-        });
-
-        match kind {
-            Some(ProviderErrorKind::ServerOverloaded) => {
-                LLMError::ServerOverloaded { message, context }
-            }
-            Some(ProviderErrorKind::RateLimited) => {
-                LLMError::ProviderRateLimited { message, context }
-            }
-            Some(ProviderErrorKind::QuotaExceeded) => LLMError::QuotaExceeded { message, context },
-            Some(ProviderErrorKind::ContextWindowExceeded) => {
-                LLMError::ContextWindowExceeded { message, context }
-            }
-            Some(ProviderErrorKind::Authentication) => {
-                LLMError::ProviderAuthError { message, context }
-            }
-            Some(ProviderErrorKind::InvalidRequest) => {
-                LLMError::ProviderInvalidRequest { message, context }
-            }
-            None => LLMError::ProviderResponseError { message, context },
+        let message = self.message.clone();
+        LLMError::ProviderResponseError {
+            message,
+            context: Box::new(self.into_context(provider)),
         }
     }
 
@@ -271,16 +278,7 @@ impl LLMErrorPayload {
             Self::ProviderError {
                 context: Some(context),
                 ..
-            } => match context.kind {
-                Some(ProviderErrorKind::ServerOverloaded | ProviderErrorKind::RateLimited) => true,
-                Some(
-                    ProviderErrorKind::QuotaExceeded
-                    | ProviderErrorKind::ContextWindowExceeded
-                    | ProviderErrorKind::Authentication
-                    | ProviderErrorKind::InvalidRequest,
-                ) => false,
-                None => context.transient,
-            },
+            } => context.is_retryable(),
             Self::RateLimited { .. }
             | Self::HttpError { .. }
             | Self::Transport { .. }
@@ -314,55 +312,14 @@ pub enum LLMError {
     #[error("LLM Provider Error: {0}")]
     ProviderError(String),
 
-    /// A provider response error with structured classification metadata.
+    /// A provider failure with structured classification metadata.
     ///
-    /// Prefer semantic variants ([`Self::ServerOverloaded`], [`Self::RateLimited`],
-    /// etc.) when the provider mapper knows the failure kind. This catch-all keeps
-    /// opaque vendor diagnostics (`code` / `request_id`) for unknown failures.
-    #[error("LLM Provider Error: {message}")]
+    /// The failure kind lives in `context.kind` — there is deliberately no
+    /// per-kind enum variant, so the classification can never disagree with
+    /// the context. Unknown failures keep opaque vendor diagnostics
+    /// (`code` / `request_id`) with `kind: None`.
+    #[error("LLM Provider Error ({context}): {message}")]
     ProviderResponseError {
-        message: String,
-        context: Box<ProviderErrorContext>,
-    },
-
-    /// Provider capacity / overload. Retryable in QueryMT (product choice).
-    #[error("Server overloaded: {message}")]
-    ServerOverloaded {
-        message: String,
-        context: Box<ProviderErrorContext>,
-    },
-
-    /// Plan/billing quota exhausted — not a short-term rate limit.
-    #[error("Quota exceeded: {message}")]
-    QuotaExceeded {
-        message: String,
-        context: Box<ProviderErrorContext>,
-    },
-
-    /// Prompt/context exceeds the model window.
-    #[error("Context window exceeded: {message}")]
-    ContextWindowExceeded {
-        message: String,
-        context: Box<ProviderErrorContext>,
-    },
-
-    /// Provider rate limit with diagnostics retained for ACP/remote consumers.
-    #[error("Rate limited: {message}")]
-    ProviderRateLimited {
-        message: String,
-        context: Box<ProviderErrorContext>,
-    },
-
-    /// Provider authentication failure with diagnostics retained.
-    #[error("Auth Error: {message}")]
-    ProviderAuthError {
-        message: String,
-        context: Box<ProviderErrorContext>,
-    },
-
-    /// Provider request rejection with diagnostics retained.
-    #[error("Invalid Request: {message}")]
-    ProviderInvalidRequest {
         message: String,
         context: Box<ProviderErrorContext>,
     },
@@ -457,15 +414,6 @@ impl LLMError {
                 message: message.clone(),
                 context: Some((**context).clone()),
             },
-            Self::ServerOverloaded { message, context }
-            | Self::ProviderRateLimited { message, context }
-            | Self::QuotaExceeded { message, context }
-            | Self::ContextWindowExceeded { message, context }
-            | Self::ProviderAuthError { message, context }
-            | Self::ProviderInvalidRequest { message, context } => LLMErrorPayload::ProviderError {
-                message: message.clone(),
-                context: Some((**context).clone()),
-            },
             Self::AuthError(message) => LLMErrorPayload::AuthError {
                 message: message.clone(),
             },
@@ -536,35 +484,9 @@ impl LLMError {
         match payload {
             LLMErrorPayload::GenericError { message } => Self::GenericError(message),
             LLMErrorPayload::ProviderError { message, context } => match context {
-                Some(context) => match context.kind {
-                    Some(ProviderErrorKind::ServerOverloaded) => Self::ServerOverloaded {
-                        message,
-                        context: Box::new(context),
-                    },
-                    Some(ProviderErrorKind::RateLimited) => Self::ProviderRateLimited {
-                        message,
-                        context: Box::new(context),
-                    },
-                    Some(ProviderErrorKind::QuotaExceeded) => Self::QuotaExceeded {
-                        message,
-                        context: Box::new(context),
-                    },
-                    Some(ProviderErrorKind::ContextWindowExceeded) => Self::ContextWindowExceeded {
-                        message,
-                        context: Box::new(context),
-                    },
-                    Some(ProviderErrorKind::Authentication) => Self::ProviderAuthError {
-                        message,
-                        context: Box::new(context),
-                    },
-                    Some(ProviderErrorKind::InvalidRequest) => Self::ProviderInvalidRequest {
-                        message,
-                        context: Box::new(context),
-                    },
-                    None => Self::ProviderResponseError {
-                        message,
-                        context: Box::new(context),
-                    },
+                Some(context) => Self::ProviderResponseError {
+                    message,
+                    context: Box::new(context),
                 },
                 None => Self::ProviderError(message),
             },
@@ -622,13 +544,7 @@ impl LLMError {
             | Self::HttpStatus {
                 retry_after_secs, ..
             } => *retry_after_secs,
-            Self::ProviderResponseError { context, .. }
-            | Self::ServerOverloaded { context, .. }
-            | Self::ProviderRateLimited { context, .. }
-            | Self::QuotaExceeded { context, .. }
-            | Self::ContextWindowExceeded { context, .. }
-            | Self::ProviderAuthError { context, .. }
-            | Self::ProviderInvalidRequest { context, .. } => context.retry_after_secs,
+            Self::ProviderResponseError { context, .. } => context.retry_after_secs,
             _ => None,
         }
     }
@@ -648,27 +564,24 @@ impl LLMError {
     /// in providers; they map wire errors into these variants before core sees them.
     pub fn is_retryable(&self) -> bool {
         match self {
-            // Always retry: transient infrastructure / capacity
+            // Always retry: transient infrastructure
             Self::Transport { .. } => true,
             Self::HttpError(_) => true, // unclassified HTTP transport error — could be transient
-            Self::RateLimited { .. } | Self::ProviderRateLimited { .. } => true,
-            // QueryMT product choice: retry overload (upstream Codex marks this non-retryable).
-            Self::ServerOverloaded { .. } => true,
+            Self::RateLimited { .. } => true,
             Self::HttpStatus { status_code, .. } => {
                 matches!(status_code, 429 | 500..=599)
             }
             Self::PluginError(_) => true, // may be a transient WASM/HTTP issue
             Self::IoError { .. } => true,
 
+            // Structured provider failure: unified kind policy, transient
+            // hint for unclassified failures.
+            Self::ProviderResponseError { context, .. } => context.is_retryable(),
+
             // Never retry: semantic errors
-            Self::AuthError(_) | Self::ProviderAuthError { .. } => false,
-            Self::InvalidRequest(_) | Self::ProviderInvalidRequest { .. } => false,
+            Self::AuthError(_) => false,
+            Self::InvalidRequest(_) => false,
             Self::ProviderError(_) => false,
-            // Catch-all: providers set `context.transient` when they intentionally
-            // emit an unclassified-but-retryable failure.
-            Self::ProviderResponseError { context, .. } => context.transient,
-            Self::QuotaExceeded { .. } => false,
-            Self::ContextWindowExceeded { .. } => false,
             Self::ToolConfigError(_) => false,
             Self::ResponseFormatError { .. } => false,
             Self::GenericError(_) => false,
@@ -849,11 +762,12 @@ pub fn parse_retry_after_from_message(message: &str) -> Option<u64> {
     None
 }
 
-pub fn classify_http_status(status_code: u16, headers: &http::HeaderMap, body: &[u8]) -> LLMError {
-    if status_code == 499 {
-        return LLMError::Cancelled;
-    }
-
+/// Extract the human-readable message and retry hint from an error response.
+fn status_message_and_retry(
+    status_code: u16,
+    headers: &http::HeaderMap,
+    body: &[u8],
+) -> (String, Option<u64>) {
     // Parse body JSON once; reuse for both retry-after and message extraction.
     let body_json = serde_json::from_slice::<serde_json::Value>(body).ok();
 
@@ -873,6 +787,47 @@ pub fn classify_http_status(status_code: u16, headers: &http::HeaderMap, body: &
     } else {
         clean_message
     };
+    (message, retry_after_secs)
+}
+
+/// Classify a non-success HTTP status into a structured provider error when
+/// the body carries no recognizable vendor error envelope.
+///
+/// Unlike [`classify_http_status`], the result is still unattributed:
+/// provider classifiers return this so the failure picks up provider identity
+/// at [`ProviderDecodeError::attribute`]. Callers must special-case status
+/// 499 ([`LLMError::Cancelled`]) themselves.
+pub fn classify_status_only(
+    status_code: u16,
+    headers: &http::HeaderMap,
+    body: &[u8],
+) -> ClassifiedProviderError {
+    let (message, retry_after_secs) = status_message_and_retry(status_code, headers, body);
+    let kind = match status_code {
+        429 => Some(ProviderErrorKind::RateLimited),
+        401 | 403 => Some(ProviderErrorKind::Authentication),
+        400 | 422 => Some(ProviderErrorKind::InvalidRequest),
+        _ => None,
+    };
+    let transient = kind.map_or(
+        matches!(status_code, 500..=599),
+        ProviderErrorKind::is_retryable,
+    );
+    let mut classified = ClassifiedProviderError::new(message)
+        .retry_after_secs(retry_after_secs)
+        .transient(transient);
+    if let Some(kind) = kind {
+        classified = classified.kind(kind);
+    }
+    classified
+}
+
+pub fn classify_http_status(status_code: u16, headers: &http::HeaderMap, body: &[u8]) -> LLMError {
+    if status_code == 499 {
+        return LLMError::Cancelled;
+    }
+
+    let (message, retry_after_secs) = status_message_and_retry(status_code, headers, body);
 
     match status_code {
         401 | 403 => LLMError::AuthError(message),
@@ -1181,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn classified_error_attributes_provider_and_selects_variant() {
+    fn classified_error_attributes_provider_and_preserves_kind() {
         let error = ClassifiedProviderError::new("busy")
             .kind(ProviderErrorKind::ServerOverloaded)
             .code(Some("server_is_overloaded".into()))
@@ -1192,7 +1147,7 @@ mod tests {
             .attribute("xai");
 
         match error {
-            LLMError::ServerOverloaded { message, context } => {
+            LLMError::ProviderResponseError { message, context } => {
                 assert_eq!(message, "busy");
                 assert_eq!(context.provider, "xai");
                 assert_eq!(context.kind, Some(ProviderErrorKind::ServerOverloaded));
@@ -1201,7 +1156,7 @@ mod tests {
                 assert_eq!(context.retry_after_secs, Some(2));
                 assert!(context.transient);
             }
-            other => panic!("expected ServerOverloaded, got {other}"),
+            other => panic!("expected ProviderResponseError, got {other}"),
         }
     }
 
@@ -1227,12 +1182,12 @@ mod tests {
         .attribute("groq");
 
         match error {
-            LLMError::ProviderRateLimited { message, context } => {
+            LLMError::ProviderResponseError { message, context } => {
                 assert_eq!(message, "busy");
                 assert_eq!(context.provider, "groq");
                 assert_eq!(context.kind, Some(ProviderErrorKind::RateLimited));
             }
-            other => panic!("expected ProviderRateLimited, got {other}"),
+            other => panic!("expected ProviderResponseError, got {other}"),
         }
     }
 
@@ -1258,8 +1213,9 @@ mod tests {
             LLMError::from_payload(serde_json::from_value::<LLMErrorPayload>(json).unwrap());
         assert!(matches!(
             restored,
-            LLMError::ServerOverloaded { message, context }
+            LLMError::ProviderResponseError { message, context }
                 if message == "busy"
+                    && context.kind == Some(ProviderErrorKind::ServerOverloaded)
                     && context.code.as_deref() == Some("server_is_overloaded")
                     && restored.is_retryable()
         ));
@@ -1271,7 +1227,8 @@ mod tests {
         assert!(!quota.is_retryable());
         assert!(matches!(
             LLMError::from_payload(quota.to_payload()),
-            LLMError::QuotaExceeded { .. }
+            LLMError::ProviderResponseError { context, .. }
+                if context.kind == Some(ProviderErrorKind::QuotaExceeded)
         ));
 
         let context = ClassifiedProviderError::new("too long")
@@ -1281,7 +1238,8 @@ mod tests {
         assert!(!context.is_retryable());
         assert!(matches!(
             LLMError::from_payload(context.to_payload()),
-            LLMError::ContextWindowExceeded { .. }
+            LLMError::ProviderResponseError { context, .. }
+                if context.kind == Some(ProviderErrorKind::ContextWindowExceeded)
         ));
     }
 
@@ -1394,6 +1352,51 @@ mod tests {
             }
             .is_retryable()
         );
+    }
+
+    #[test]
+    fn classify_status_only_maps_status_to_unified_kinds() {
+        let headers = http::HeaderMap::new();
+
+        let rate_limited =
+            classify_status_only(429, &headers, br#"{"error":{"message":"slow down"}}"#);
+        assert_eq!(rate_limited.kind, Some(ProviderErrorKind::RateLimited));
+        assert_eq!(rate_limited.message, "slow down");
+        assert!(rate_limited.transient);
+
+        let auth = classify_status_only(401, &headers, b"bad key");
+        assert_eq!(auth.kind, Some(ProviderErrorKind::Authentication));
+        assert!(!auth.transient);
+
+        let invalid = classify_status_only(422, &headers, b"bad field");
+        assert_eq!(invalid.kind, Some(ProviderErrorKind::InvalidRequest));
+        assert!(!invalid.transient);
+
+        // Unknown 5xx: unclassified but transient.
+        let overloaded = classify_status_only(503, &headers, b"Server Error");
+        assert_eq!(overloaded.kind, None);
+        assert!(overloaded.transient);
+        assert!(overloaded.attribute("x").is_retryable());
+
+        // Unknown 4xx: unclassified and permanent.
+        let weird = classify_status_only(418, &headers, b"teapot");
+        assert_eq!(weird.kind, None);
+        assert!(!weird.transient);
+    }
+
+    #[test]
+    fn display_includes_provider_and_request_id() {
+        let error = ClassifiedProviderError::new("busy")
+            .kind(ProviderErrorKind::ServerOverloaded)
+            .request_id(Some("req-9".into()))
+            .attribute("openai");
+        let rendered = error.to_string();
+        assert!(rendered.contains("openai"), "missing provider: {rendered}");
+        assert!(
+            rendered.contains("request_id=req-9"),
+            "missing request id: {rendered}"
+        );
+        assert!(rendered.contains("busy"), "missing message: {rendered}");
     }
 
     #[test]

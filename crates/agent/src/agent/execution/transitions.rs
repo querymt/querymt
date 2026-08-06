@@ -322,7 +322,7 @@ pub(super) async fn transition_call_llm(
             // semantic output, so no user-visible content can be rolled back.
             let mut retry_budget = super::llm_retry::StreamRetryBudget::new(
                 max_stream_retries,
-                config.execution_policy.rate_limit.max_retries,
+                config.execution_policy.rate_limit.max_attempts(),
             );
             'stream: loop {
                 let mut semantic_output_seen = false;

@@ -91,6 +91,12 @@ pub(crate) struct PromptLlmError {
 
 impl PromptLlmError {
     pub(crate) fn new(operation: LlmOperation, source: querymt::error::LLMError) -> Self {
+        // Cancellation is a control-flow outcome (`ExecutionState::Cancelled`),
+        // not an error. `map_failed_llm_call` intercepts it before wrapping.
+        debug_assert!(
+            !matches!(source, querymt::error::LLMError::Cancelled),
+            "LLMError::Cancelled must not be wrapped in PromptLlmError"
+        );
         Self { operation, source }
     }
 

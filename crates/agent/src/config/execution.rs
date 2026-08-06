@@ -275,6 +275,15 @@ pub struct RateLimitConfig {
     pub max_wait_secs: u64,
 }
 
+impl RateLimitConfig {
+    /// Total request-attempt budget, clamped to at least one attempt.
+    /// This is the single clamp site — call `max_attempts()`, never
+    /// `max_retries.max(1)` inline.
+    pub fn max_attempts(&self) -> usize {
+        self.max_retries.max(1)
+    }
+}
+
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
