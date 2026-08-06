@@ -107,6 +107,9 @@ impl ClassifiedProviderError {
 
     pub fn kind(mut self, kind: ProviderErrorKind) -> Self {
         self.kind = Some(kind);
+        // Known kinds own retry policy — keep transient consistent so the
+        // dual field cannot disagree with kind.is_retryable().
+        self.transient = kind.is_retryable();
         self
     }
 
@@ -130,8 +133,12 @@ impl ClassifiedProviderError {
         self
     }
 
+    /// Retryability hint for *unclassified* failures (`kind == None`).
+    /// Ignored once a known [`Self::kind`] is set (see [`Self::kind`]).
     pub fn transient(mut self, transient: bool) -> Self {
-        self.transient = transient;
+        if self.kind.is_none() {
+            self.transient = transient;
+        }
         self
     }
 
@@ -139,6 +146,13 @@ impl ClassifiedProviderError {
         if self.retry_after_secs.is_none() {
             self.retry_after_secs = retry_after_secs;
         }
+    }
+
+    /// Same policy as [`ProviderErrorContext::is_retryable`] — use this on
+    /// classified failures instead of open-coding `kind.map_or(transient, …)`.
+    pub fn is_retryable(&self) -> bool {
+        self.kind
+            .map_or(self.transient, ProviderErrorKind::is_retryable)
     }
 
     /// Attach provider identity and produce the structured [`LLMError`].
@@ -1290,27 +1304,58 @@ mod tests {
 
     #[test]
     fn payload_retryability_uses_known_kind_instead_of_transient_hint() {
+        // Builder: kind() forces transient to match kind policy. Wire payloads
+        // can still carry a disagreeing transient flag from older peers — kind
+        // still wins via is_retryable().
         let overloaded = LLMErrorPayload::ProviderError {
             message: "busy".into(),
-            context: Some(
-                ClassifiedProviderError::new("busy")
-                    .kind(ProviderErrorKind::ServerOverloaded)
-                    .transient(false)
-                    .into_context("test"),
-            ),
+            context: Some(ProviderErrorContext {
+                provider: "test".into(),
+                kind: Some(ProviderErrorKind::ServerOverloaded),
+                code: None,
+                error_type: None,
+                request_id: None,
+                retry_after_secs: None,
+                transient: false, // disagreeing hint must lose
+            }),
         };
         assert!(overloaded.is_retryable());
 
         let quota = LLMErrorPayload::ProviderError {
             message: "no credits".into(),
-            context: Some(
-                ClassifiedProviderError::new("no credits")
-                    .kind(ProviderErrorKind::QuotaExceeded)
-                    .transient(true)
-                    .into_context("test"),
-            ),
+            context: Some(ProviderErrorContext {
+                provider: "test".into(),
+                kind: Some(ProviderErrorKind::QuotaExceeded),
+                code: None,
+                error_type: None,
+                request_id: None,
+                retry_after_secs: None,
+                transient: true, // disagreeing hint must lose
+            }),
         };
         assert!(!quota.is_retryable());
+    }
+
+    #[test]
+    fn classified_kind_forces_transient_consistency() {
+        let overloaded = ClassifiedProviderError::new("busy")
+            .transient(false)
+            .kind(ProviderErrorKind::ServerOverloaded);
+        assert!(overloaded.is_retryable());
+        assert!(overloaded.transient);
+
+        let quota = ClassifiedProviderError::new("nope")
+            .transient(true)
+            .kind(ProviderErrorKind::QuotaExceeded);
+        assert!(!quota.is_retryable());
+        assert!(!quota.transient);
+
+        // After kind is set, transient() is a no-op.
+        let locked = ClassifiedProviderError::new("busy")
+            .kind(ProviderErrorKind::ServerOverloaded)
+            .transient(false);
+        assert!(locked.transient);
+        assert!(locked.is_retryable());
     }
 
     #[test]

@@ -1,7 +1,26 @@
+/// Outcome of a streaming outbound HTTP call before provider classification.
+///
+/// Success and failure are distinct variants so callers cannot treat an HTTP
+/// error status as a normal byte stream (the old `(Response<()>, stream)` pair
+/// returned `Ok` for both).
+pub enum OutboundStreamResult {
+    Success {
+        response: http::Response<()>,
+        stream: std::pin::Pin<
+            Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
+        >,
+    },
+    /// Non-success status with the full error body already buffered.
+    Failure {
+        response: http::Response<Vec<u8>>,
+    },
+}
+
 mod http_client {
     #[cfg(not(target_arch = "wasm32"))]
     pub mod imp {
         use crate::error::{LLMError, classify_http_status};
+        use crate::outbound::OutboundStreamResult;
         use http::{Request, Response};
         use once_cell::sync::Lazy;
         use reqwest::Client;
@@ -185,21 +204,13 @@ mod http_client {
             Ok(builder.body(bytes).unwrap())
         }
 
-        /// Send a streaming HTTP request and preserve the response metadata.
+        /// Send a streaming HTTP request.
         ///
-        /// Non-success bodies are returned as a one-item stream so provider adapters
-        /// can classify the complete response without changing the public stream API.
+        /// Returns [`OutboundStreamResult`] so callers cannot mistake an HTTP
+        /// error body for a successful byte stream.
         pub async fn call_outbound_stream_raw(
             req: Request<Vec<u8>>,
-        ) -> Result<
-            (
-                Response<()>,
-                std::pin::Pin<
-                    Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
-                >,
-            ),
-            LLMError,
-        > {
+        ) -> Result<OutboundStreamResult, LLMError> {
             let client = &*CLIENT;
 
             let method = req
@@ -271,13 +282,9 @@ mod http_client {
                 for (name, value) in headers.iter() {
                     builder = builder.header(name.as_str(), value.as_bytes());
                 }
-                let response = builder.body(()).unwrap();
-                return Ok((
-                    response,
-                    Box::pin(futures::stream::once(async move {
-                        Ok(bytes::Bytes::from(bytes))
-                    })),
-                ));
+                return Ok(OutboundStreamResult::Failure {
+                    response: builder.body(bytes).unwrap(),
+                });
             }
 
             let headers = resp.headers().clone();
@@ -285,7 +292,10 @@ mod http_client {
             for (name, value) in headers.iter() {
                 builder = builder.header(name.as_str(), value.as_bytes());
             }
-            Ok((builder.body(()).unwrap(), Box::pin(resp.bytes_stream())))
+            Ok(OutboundStreamResult::Success {
+                response: builder.body(()).unwrap(),
+                stream: Box::pin(resp.bytes_stream()),
+            })
         }
 
         /// Send an HTTP request using the generic status classifier.
@@ -317,15 +327,7 @@ mod http_client {
 
         pub async fn call_outbound_stream_raw(
             _req: Request<Vec<u8>>,
-        ) -> Result<
-            (
-                Response<()>,
-                std::pin::Pin<
-                    Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
-                >,
-            ),
-            LLMError,
-        > {
+        ) -> Result<crate::outbound::OutboundStreamResult, LLMError> {
             Err(LLMError::InvalidRequest("".into()))
         }
 

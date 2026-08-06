@@ -1346,10 +1346,7 @@ pub fn classify_openai_http_error(response: &Response<Vec<u8>>) -> ProviderDecod
         // Header Retry-After only for failures we actually retry.
         // Permanent kinds (e.g. usage_limit_reached) must not sleep on a
         // plan-cap header.
-        if mapped
-            .kind
-            .map_or(mapped.transient, ProviderErrorKind::is_retryable)
-        {
+        if mapped.is_retryable() {
             mapped.set_retry_after_if_missing(retry_after_secs);
         }
         return mapped.into();
