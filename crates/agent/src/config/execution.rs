@@ -267,11 +267,25 @@ pub struct RateLimitConfig {
     pub max_stream_retries: usize,
 
     /// Proportional jitter for calculated delays. Provider retry hints are not jittered.
-    #[serde(default = "default_rate_limit_jitter_ratio")]
+    ///
+    /// Runtime-only for now: not written into `session_execution_configs` so older
+    /// qmtcode builds (strict `deny_unknown_fields`) can still open sessions.
+    /// TODO(session-compat): drop `skip_serializing` and persist once older readers
+    /// are retired, or gate behind a session config migration.
+    #[serde(
+        default = "default_rate_limit_jitter_ratio",
+        skip_serializing
+    )]
     pub jitter_ratio: f64,
 
     /// Upper bound for calculated delays. Provider retry hints remain authoritative.
-    #[serde(default = "default_rate_limit_max_wait_secs")]
+    ///
+    /// Runtime-only for now — same session-compat rationale as `jitter_ratio`.
+    /// TODO(session-compat): persist with `jitter_ratio` when ready.
+    #[serde(
+        default = "default_rate_limit_max_wait_secs",
+        skip_serializing
+    )]
     pub max_wait_secs: u64,
 }
 
@@ -496,3 +510,70 @@ impl From<&ExecutionPolicy> for RuntimeExecutionPolicy {
 }
 
 // ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rate_limit_config_omits_runtime_only_fields_on_serialize() {
+        let mut cfg = RateLimitConfig::default();
+        cfg.jitter_ratio = 0.9;
+        cfg.max_wait_secs = 42;
+
+        let value = serde_json::to_value(&cfg).expect("serialize");
+        let obj = value.as_object().expect("object");
+
+        assert!(
+            !obj.contains_key("jitter_ratio"),
+            "jitter_ratio must stay runtime-only until session-compat is ready: {value}"
+        );
+        assert!(
+            !obj.contains_key("max_wait_secs"),
+            "max_wait_secs must stay runtime-only until session-compat is ready: {value}"
+        );
+
+        // Stable keys older qmtcode already understands.
+        for key in [
+            "max_retries",
+            "default_wait_secs",
+            "backoff_multiplier",
+            "max_stream_retries",
+        ] {
+            assert!(obj.contains_key(key), "missing expected key {key}: {value}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_config_deserializes_missing_runtime_only_fields_to_defaults() {
+        let cfg: RateLimitConfig = serde_json::from_value(json!({
+            "max_retries": 5,
+            "default_wait_secs": 30,
+            "backoff_multiplier": 1.5,
+            "max_stream_retries": 2,
+        }))
+        .expect("deserialize without runtime-only keys");
+
+        assert_eq!(cfg.max_retries, 5);
+        assert!((cfg.jitter_ratio - DEFAULT_RATE_LIMIT_JITTER_RATIO).abs() < f64::EPSILON);
+        assert_eq!(cfg.max_wait_secs, DEFAULT_RATE_LIMIT_MAX_WAIT_SECS);
+    }
+
+    #[test]
+    fn rate_limit_config_still_deserializes_runtime_only_fields_when_present() {
+        // Blobs already written by earlier builds of this branch should still load.
+        let cfg: RateLimitConfig = serde_json::from_value(json!({
+            "max_retries": 3,
+            "default_wait_secs": 60,
+            "backoff_multiplier": 2.0,
+            "max_stream_retries": 1,
+            "jitter_ratio": 0.5,
+            "max_wait_secs": 120,
+        }))
+        .expect("deserialize with runtime-only keys present");
+
+        assert!((cfg.jitter_ratio - 0.5).abs() < f64::EPSILON);
+        assert_eq!(cfg.max_wait_secs, 120);
+    }
+}
