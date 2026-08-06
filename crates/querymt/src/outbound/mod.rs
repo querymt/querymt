@@ -334,3 +334,6 @@ mod http_client {
 }
 
 pub use http_client::imp::{call_outbound, call_outbound_raw, call_outbound_stream_raw};
+
+#[cfg(test)]
+mod tests;
