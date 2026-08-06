@@ -10,7 +10,7 @@ use querymt::{
         StructuredOutputFormat, Tool, ToolChoice,
     },
     error::{
-        ProviderFailure, LLMError, ProviderDecodeError, ProviderErrorKind,
+        LLMError, ProviderDecodeError, ProviderErrorKind, ProviderFailure,
         extract_retry_after_from_json, parse_retry_after, parse_retry_after_from_message,
     },
     handle_http_error,
@@ -1936,10 +1936,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
                 assert_eq!(context.request_id.as_deref(), Some("req_123"));
                 assert_eq!(context.retry_after_secs, Some(3));
                 assert!(context.is_retryable());
-                assert_eq!(
-                    context.kind,
-                    ProviderErrorKind::UnknownTransient
-                );
+                assert_eq!(context.kind, ProviderErrorKind::UnknownTransient);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }

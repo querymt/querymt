@@ -56,7 +56,8 @@ impl ProviderErrorKind {
 ///
 /// Retryability is entirely determined by [`Self::kind`] — no dual `transient`
 /// field. Wire payloads from older peers that still carry a top-level
-/// `transient` flag are folded into [`ProviderErrorKind::Unknown`] on deser.
+/// `transient` flag are folded into [`ProviderErrorKind::UnknownTransient`] or
+/// [`ProviderErrorKind::UnknownPermanent`] on deserialize.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderErrorContext {
     /// Registry / factory identity. Empty string until the HTTP adapter stamps it.
@@ -112,8 +113,8 @@ impl<'de> Deserialize<'de> for ProviderErrorContext {
         struct Raw {
             #[serde(default)]
             provider: String,
-            /// Present on current payloads. Missing/null on legacy → fold
-            /// top-level `transient` into [`ProviderErrorKind::Unknown`].
+            /// Present on current payloads. Missing/null on legacy folds the
+            /// top-level `transient` flag into one of the `Unknown*` kinds.
             #[serde(default)]
             kind: Option<ProviderErrorKind>,
             #[serde(default)]
@@ -258,7 +259,7 @@ impl ProviderDecodeError {
         Self::Terminal(error)
     }
 
-    /// Stamp provider identity onto classified failures; pass terminal errors through.
+    /// Stamp provider identity onto classified failures and any structured terminal error.
     pub fn attribute(self, provider: impl Into<String>) -> LLMError {
         match self {
             Self::Classified(error) => error.attribute(provider),
@@ -363,7 +364,8 @@ pub enum LLMError {
     /// The failure kind lives in `context.kind` — there is deliberately no
     /// per-kind enum variant, so the classification can never disagree with
     /// the context. Unknown failures keep opaque vendor diagnostics
-    /// (`code` / `request_id`) with [`ProviderErrorKind::Unknown`].
+    /// (`code` / `request_id`) with [`ProviderErrorKind::UnknownTransient`] or
+    /// [`ProviderErrorKind::UnknownPermanent`].
     #[error("LLM Provider Error ({context}): {message}")]
     ProviderResponseError {
         message: String,
@@ -679,8 +681,8 @@ impl LLMError {
             Self::PluginError(_) => true, // may be a transient WASM/HTTP issue
             Self::IoError { .. } => true,
 
-            // Structured provider failure: unified kind policy, transient
-            // hint for unclassified failures.
+            // Structured provider failure: unified kind policy, including
+            // explicit UnknownTransient / UnknownPermanent fallback kinds.
             Self::ProviderResponseError { context, .. } => context.is_retryable(),
 
             // Never retry: semantic errors
@@ -1292,6 +1294,33 @@ mod tests {
     }
 
     #[test]
+    fn terminal_structured_payload_without_provider_is_restamped() {
+        let payload: LLMErrorPayload = serde_json::from_value(serde_json::json!({
+            "type": "provider_error",
+            "message": "plugin busy",
+            "context": {
+                "kind": "server_overloaded",
+                "code": "server_is_overloaded",
+                "request_id": "req-plugin"
+            }
+        }))
+        .expect("legacy plugin payload should deserialize without provider");
+
+        let error = ProviderDecodeError::terminal(LLMError::from_payload(payload))
+            .attribute("host-registry-name");
+        match error {
+            LLMError::ProviderResponseError { message, context } => {
+                assert_eq!(message, "plugin busy");
+                assert_eq!(context.provider, "host-registry-name");
+                assert_eq!(context.kind, ProviderErrorKind::ServerOverloaded);
+                assert_eq!(context.code.as_deref(), Some("server_is_overloaded"));
+                assert_eq!(context.request_id.as_deref(), Some("req-plugin"));
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    #[test]
     fn decode_error_classified_attributes_provider() {
         let error = ProviderDecodeError::from(
             ProviderFailure::new("busy").kind(ProviderErrorKind::RateLimited),
@@ -1425,19 +1454,13 @@ mod tests {
             .kind(ProviderErrorKind::UnknownTransient)
             .code(Some("unknown".into()));
         assert!(transient.is_retryable());
-        assert_eq!(
-            transient.context.kind,
-            ProviderErrorKind::UnknownTransient
-        );
+        assert_eq!(transient.context.kind, ProviderErrorKind::UnknownTransient);
 
         let permanent = ProviderFailure::new("nope")
             .kind(ProviderErrorKind::UnknownPermanent)
             .code(Some("unknown".into()));
         assert!(!permanent.is_retryable());
-        assert_eq!(
-            permanent.context.kind,
-            ProviderErrorKind::UnknownPermanent
-        );
+        assert_eq!(permanent.context.kind, ProviderErrorKind::UnknownPermanent);
 
         // Concrete kind replaces Unknown.
         let locked = ProviderFailure::new("busy")
@@ -1591,10 +1614,7 @@ mod tests {
 
         // Unknown 5xx: unclassified but transient.
         let overloaded = classify_status_only(503, &headers, b"Server Error");
-        assert_eq!(
-            overloaded.context.kind,
-            ProviderErrorKind::UnknownTransient
-        );
+        assert_eq!(overloaded.context.kind, ProviderErrorKind::UnknownTransient);
         assert!(overloaded.attribute("x").is_retryable());
 
         // Unknown 4xx: unclassified and permanent.

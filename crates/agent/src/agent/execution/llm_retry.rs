@@ -1,6 +1,6 @@
 //! LLM retry logic with rate limit handling
 //!
-//! This module handles retrying LLM calls with exponential backoff when rate limits are hit.
+//! This module handles retrying transient LLM failures with configurable backoff.
 
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::utils::u32_from_usize;
@@ -14,10 +14,9 @@ use std::pin::Pin;
 use tokio_util::sync::CancellationToken;
 use tracing::{Span, instrument};
 
-/// Call an LLM with automatic retry on rate limit errors.
+/// Call an LLM with automatic retry for transient provider and transport errors.
 ///
-/// This function wraps any LLM call and automatically retries with exponential backoff
-/// when rate limit errors are detected. It respects cancellation via the `cancel_rx` channel.
+/// Uses provider hints or exponential backoff and respects cancellation via the token.
 #[instrument(
     name = "agent.llm.call_with_retry",
     skip(config, cancel_token, call_fn),
@@ -51,13 +50,13 @@ where
             }
             Err(e) => {
                 Span::current().record("attempt", attempt);
-                // Span field keeps the historical name; event is emitted for any retry wait.
-                Span::current().record("rate_limited", true);
 
                 if !e.is_retryable() || attempt >= max_attempts {
                     return Err(e);
                 }
 
+                // Span field keeps the historical name; true means a retry wait occurred.
+                Span::current().record("rate_limited", true);
                 let wait_secs = retry_delay_secs(config, &e, attempt);
                 emit_retry_wait(
                     config,
@@ -337,6 +336,7 @@ mod tests {
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
     use crate::config::RuntimeExecutionPolicy;
+    use crate::events::AgentEventKind;
     use crate::test_utils::{
         MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
         mock_plugin_registry, mock_session,
@@ -346,7 +346,7 @@ mod tests {
     use querymt::error::{LLMError, ProviderErrorContext, ProviderErrorKind};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, broadcast};
     use tokio_util::sync::CancellationToken;
 
     // ── Fixture ──────────────────────────────────────────────────────────────
@@ -395,6 +395,24 @@ mod tests {
         );
 
         (config, temp_dir)
+    }
+
+    async fn recv_event(
+        rx: &mut broadcast::Receiver<crate::events::EventEnvelope>,
+    ) -> crate::events::EventEnvelope {
+        tokio::time::timeout(tokio::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for retry event")
+            .expect("retry event channel closed")
+    }
+
+    async fn assert_no_event(rx: &mut broadcast::Receiver<crate::events::EventEnvelope>) {
+        assert!(
+            tokio::time::timeout(tokio::time::Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "unexpected retry event"
+        );
     }
 
     // ── rate_limit_info (dual-form) tests ────────────────────────────────────
@@ -739,6 +757,98 @@ mod tests {
 
         assert!(matches!(result, Err(LLMError::Cancelled)));
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_retryable_overload_emits_wait_and_resume_events() {
+        let (config, _temp) = make_config().await;
+        let mut events = config.subscribe_events();
+        let token = CancellationToken::new();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count2 = call_count.clone();
+
+        let result = call_llm_with_retry(&config, "test-session", &token, || {
+            let count = call_count2.clone();
+            async move {
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err::<Box<dyn ChatResponse>, _>(LLMError::ProviderResponseError {
+                        message: "busy".into(),
+                        context: Box::new(ProviderErrorContext {
+                            provider: "test".into(),
+                            kind: ProviderErrorKind::ServerOverloaded,
+                            code: None,
+                            error_type: None,
+                            request_id: None,
+                            retry_after_secs: Some(0),
+                        }),
+                    })
+                } else {
+                    Ok::<Box<dyn ChatResponse>, _>(Box::new(
+                        crate::test_utils::MockChatResponse::text_only("ok"),
+                    ) as Box<dyn ChatResponse>)
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        let wait = recv_event(&mut events).await;
+        assert!(matches!(
+            wait.kind(),
+            AgentEventKind::RateLimited {
+                wait_secs: 0,
+                attempt: 1,
+                max_attempts: 3,
+                ..
+            }
+        ));
+        let resume = recv_event(&mut events).await;
+        assert!(matches!(
+            resume.kind(),
+            AgentEventKind::RateLimitResume { attempt: 2 }
+        ));
+        assert_no_event(&mut events).await;
+    }
+
+    #[tokio::test]
+    async fn permanent_error_emits_no_retry_events() {
+        let (config, _temp) = make_config().await;
+        let mut events = config.subscribe_events();
+        let token = CancellationToken::new();
+
+        let result = call_llm_with_retry(&config, "test-session", &token, || async {
+            Err::<Box<dyn ChatResponse>, _>(LLMError::AuthError("bad key".into()))
+        })
+        .await;
+
+        assert!(matches!(result, Err(LLMError::AuthError(_))));
+        assert_no_event(&mut events).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_retry_wait_emits_no_resume_event() {
+        let (config, _temp) = make_config().await;
+        let mut events = config.subscribe_events();
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            token_clone.cancel();
+        });
+        let result = call_llm_with_retry(&config, "test-session", &token, || async {
+            Err::<Box<dyn ChatResponse>, _>(LLMError::HttpStatus {
+                status_code: 503,
+                message: "unavailable".into(),
+                retry_after_secs: Some(60),
+            })
+        })
+        .await;
+
+        assert!(matches!(result, Err(LLMError::Cancelled)));
+        let wait = recv_event(&mut events).await;
+        assert!(matches!(wait.kind(), AgentEventKind::RateLimited { .. }));
+        assert_no_event(&mut events).await;
     }
 
     #[tokio::test]

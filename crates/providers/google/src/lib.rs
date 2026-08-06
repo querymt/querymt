@@ -45,7 +45,7 @@ use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort, StreamChunk,
+        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort,
         StructuredOutputFormat, Tool, ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider},
     },
@@ -719,6 +719,10 @@ impl Google {
 }
 
 impl HTTPChatProvider for Google {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> ProviderDecodeError {
+        classify_google_http_error(response).into()
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
@@ -1113,7 +1117,7 @@ fn try_parse_json_objects(
                 total_consumed = initial_offset + byte_offset;
 
                 if value.get("error").is_some() {
-                    return Err(map_google_error_value(&value, None, false).into());
+                    return Err(map_google_error_value(&value, None, true).into());
                 }
 
                 match serde_json::from_value::<GoogleChatResponse>(value) {
@@ -1158,7 +1162,7 @@ fn google_error_kind(status: &str) -> Option<ProviderErrorKind> {
             Some(ProviderErrorKind::InvalidRequest)
         }
         "UNAVAILABLE" => Some(ProviderErrorKind::ServerOverloaded),
-        // DEADLINE_EXCEEDED / INTERNAL / UNKNOWN → Unknown* via caller
+        "DEADLINE_EXCEEDED" | "INTERNAL" | "UNKNOWN" => Some(ProviderErrorKind::UnknownTransient),
         _ => None,
     }
 }
@@ -1186,9 +1190,11 @@ fn map_google_error_value(
         .and_then(|e| e.get("status"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let code = error
-        .and_then(|e| e.get("code"))
-        .and_then(|c| c.as_i64().map(|n| n.to_string()).or_else(|| c.as_str().map(str::to_owned)));
+    let code = error.and_then(|e| e.get("code")).and_then(|c| {
+        c.as_i64()
+            .map(|n| n.to_string())
+            .or_else(|| c.as_str().map(str::to_owned))
+    });
 
     // RESOURCE_EXHAUSTED covers both rate-limit and quota; message disambiguates.
     // Context-window failures often arrive as INVALID_ARGUMENT with a token message.
@@ -1457,10 +1463,11 @@ mod extism_exports {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use querymt::chat::http::{ChatStreamParser, HTTPChatProvider};
+    use querymt::chat::http::HTTPChatProvider;
 
     #[test]
     fn classify_http_resource_exhausted_is_rate_limited() {
+        let google = test_google();
         let response = Response::builder()
             .status(429)
             .header(http::header::RETRY_AFTER, "15")
@@ -1469,7 +1476,9 @@ mod tests {
                     .to_vec(),
             )
             .unwrap();
-        let error = classify_google_http_error(&response).attribute(PROVIDER_NAME);
+        let error = google
+            .classify_chat_error(&response)
+            .attribute(PROVIDER_NAME);
         assert!(error.is_retryable());
         assert_eq!(error.retry_after_secs(), Some(15));
         match &error {
@@ -1480,6 +1489,27 @@ mod tests {
                 assert_eq!(context.code.as_deref(), Some("429"));
             }
             other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    fn test_google() -> Google {
+        Google {
+            api_key: "test".into(),
+            model: "gemini-2.0-flash".into(),
+            max_tokens: None,
+            temperature: None,
+            system: None,
+            timeout_seconds: None,
+            stream: Some(true),
+            top_p: None,
+            top_k: None,
+            json_schema: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            thinking_budget: None,
+            cached_content: None,
+            key_resolver: None,
         }
     }
 
@@ -1561,24 +1591,7 @@ mod tests {
 
     #[test]
     fn stream_parser_classifies_mid_stream_error_object() {
-        let google = Google {
-            api_key: "test".into(),
-            model: "gemini-2.0-flash".into(),
-            max_tokens: None,
-            temperature: None,
-            system: None,
-            timeout_seconds: None,
-            stream: Some(true),
-            top_p: None,
-            top_k: None,
-            json_schema: None,
-            tools: None,
-            tool_choice: None,
-            reasoning_effort: None,
-            thinking_budget: None,
-            cached_content: None,
-            key_resolver: None,
-        };
+        let google = test_google();
         let mut parser = google.chat_stream_parser().unwrap();
         let chunk = br#"{"error":{"code":429,"message":"Resource exhausted","status":"RESOURCE_EXHAUSTED"}}"#;
         let err = parser
@@ -1589,6 +1602,26 @@ mod tests {
         match &attributed {
             LLMError::ProviderResponseError { context, .. } => {
                 assert_eq!(context.kind, ProviderErrorKind::RateLimited);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    #[test]
+    fn stream_parser_keeps_unknown_google_server_error_retryable() {
+        let google = test_google();
+        let mut parser = google.chat_stream_parser().unwrap();
+        let chunk =
+            br#"{"error":{"code":500,"message":"Internal server error","status":"INTERNAL"}}"#;
+        let error = parser
+            .parse_chunk(chunk)
+            .expect_err("mid-stream server error must classify")
+            .attribute(PROVIDER_NAME);
+
+        assert!(error.is_retryable());
+        match error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.kind, ProviderErrorKind::UnknownTransient);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }

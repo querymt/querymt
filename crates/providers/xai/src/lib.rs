@@ -1020,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_parser_attaches_xai_provider_to_codex_errors() {
+    fn stream_parser_returns_classified_codex_error_for_adapter_attribution() {
         let mut xai = test_xai("xai-key");
         xai.conversation_id = Some("conversation-id".to_string());
         let mut parser = xai.chat_stream_parser().unwrap();
@@ -1028,7 +1028,8 @@ mod tests {
 
 "#;
 
-        // Parser returns unattributed decode errors; adapter stamps identity.
+        // Parser returns an unattributed error; production adapter attribution is
+        // covered in querymt's adapter tests.
         let error = parser
             .parse_chunk(chunk)
             .unwrap_err()

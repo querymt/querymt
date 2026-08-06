@@ -353,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_parser_attaches_openai_provider_to_classified_errors() {
+    fn stream_parser_returns_classified_error_for_adapter_attribution() {
         let cfg = serde_json::json!({
             "api_key": "test-key",
             "model": "gpt-4o-mini"
@@ -364,6 +364,8 @@ mod tests {
 
 "#;
 
+        // Parser returns an unattributed error; production adapter attribution is
+        // covered in querymt's adapter tests.
         let error = parser
             .parse_chunk(chunk)
             .unwrap_err()
