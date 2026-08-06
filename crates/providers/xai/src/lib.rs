@@ -1038,7 +1038,7 @@ mod tests {
                 assert_eq!(context.provider, PROVIDER_NAME);
                 assert_eq!(
                     context.kind,
-                    Some(querymt::error::ProviderErrorKind::ServerOverloaded)
+                    querymt::error::ProviderErrorKind::ServerOverloaded
                 );
             }
             other => panic!("expected ProviderResponseError, got {other}"),

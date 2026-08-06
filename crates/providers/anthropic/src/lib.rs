@@ -1273,26 +1273,28 @@ fn map_anthropic_api_error(
         });
 
     let type_norm = error_type.as_deref().map(normalize_anthropic_error_token);
-    let kind = type_norm.as_deref().and_then(anthropic_error_kind);
+    let kind = type_norm
+        .as_deref()
+        .and_then(anthropic_error_kind)
+        .unwrap_or(if unknown_transient {
+            ProviderErrorKind::UnknownTransient
+        } else {
+            ProviderErrorKind::UnknownPermanent
+        });
 
-    let transient = kind.map_or(unknown_transient, ProviderErrorKind::is_retryable);
     let retry_after_secs = match kind {
-        Some(ProviderErrorKind::RateLimited) => {
+        ProviderErrorKind::RateLimited => {
             header_retry_after.or_else(|| parse_retry_after_from_message(&message))
         }
-        Some(k) if !k.is_retryable() => None,
+        k if !k.is_retryable() => None,
         _ => header_retry_after,
     };
 
-    let mut classified = ProviderFailure::new(message)
+    ProviderFailure::new(message)
+        .kind(kind)
         .error_type(error_type)
         .code(type_norm)
         .retry_after_secs(retry_after_secs)
-        .transient(transient);
-    if let Some(kind) = kind {
-        classified = classified.kind(kind);
-    }
-    classified
 }
 
 /// Classify an Anthropic HTTP error body before provider attribution.
@@ -2022,7 +2024,7 @@ mod tests {
         match &error {
             LLMError::ProviderResponseError { context, .. } => {
                 assert_eq!(context.provider, PROVIDER_NAME);
-                assert_eq!(context.kind, Some(ProviderErrorKind::ServerOverloaded));
+                assert_eq!(context.kind, ProviderErrorKind::ServerOverloaded);
                 assert_eq!(context.error_type.as_deref(), Some("overloaded_error"));
             }
             other => panic!("expected ProviderResponseError, got {other}"),
@@ -2042,7 +2044,7 @@ mod tests {
         assert!(!error.is_retryable());
         match &error {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind, Some(ProviderErrorKind::InvalidRequest));
+                assert_eq!(context.kind, ProviderErrorKind::InvalidRequest);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -2063,7 +2065,7 @@ mod tests {
         assert_eq!(error.retry_after_secs(), Some(12));
         match &error {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind, Some(ProviderErrorKind::RateLimited));
+                assert_eq!(context.kind, ProviderErrorKind::RateLimited);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -2083,7 +2085,7 @@ mod tests {
         assert!(err.is_retryable());
         match err {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind, Some(ProviderErrorKind::ServerOverloaded));
+                assert_eq!(context.kind, ProviderErrorKind::ServerOverloaded);
                 assert_eq!(context.provider, PROVIDER_NAME);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
@@ -2103,7 +2105,7 @@ mod tests {
         assert!(!err.is_retryable());
         match err {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind, Some(ProviderErrorKind::InvalidRequest));
+                assert_eq!(context.kind, ProviderErrorKind::InvalidRequest);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }

@@ -1068,32 +1068,32 @@ fn map_codex_response_failed(
         extract_retry_after_from_json(error).or_else(|| extract_retry_after_from_json(response));
     let code_norm = code.as_deref().map(normalize_error_token);
     let type_norm = error_type.as_deref().map(normalize_error_token);
-    let kind = code_norm
+    let mapped = code_norm
         .as_deref()
         .and_then(codex_error_kind)
         .or_else(|| type_norm.as_deref().and_then(codex_error_kind));
 
     // Upstream: unmapped response.failed → Retryable. Known kinds own policy.
-    let transient = kind.map_or(unknown_transient, ProviderErrorKind::is_retryable);
+    let kind = mapped.unwrap_or(if unknown_transient {
+        ProviderErrorKind::UnknownTransient
+    } else {
+        ProviderErrorKind::UnknownPermanent
+    });
     // Only rate_limit_exceeded parses "try again in Xs" (upstream try_parse_retry_after).
     let retry_after_secs = match kind {
-        Some(ProviderErrorKind::RateLimited) => {
+        ProviderErrorKind::RateLimited => {
             retry_after_secs.or_else(|| parse_retry_after_from_message(&message))
         }
-        Some(kind) if !kind.is_retryable() => None,
+        k if !k.is_retryable() => None,
         _ => retry_after_secs,
     };
 
-    let mut classified = ProviderFailure::new(message)
+    ProviderFailure::new(message)
+        .kind(kind)
         .code(code)
         .error_type(error_type)
         .request_id(request_id)
         .retry_after_secs(retry_after_secs)
-        .transient(transient);
-    if let Some(kind) = kind {
-        classified = classified.kind(kind);
-    }
-    classified
 }
 
 fn mark_streamed_thinking_emitted(
@@ -1916,7 +1916,7 @@ mod tests {
         match error {
             LLMError::ProviderResponseError { message, context } => {
                 assert_eq!(message, "busy");
-                assert_eq!(context.kind, Some(ProviderErrorKind::ServerOverloaded));
+                assert_eq!(context.kind, ProviderErrorKind::ServerOverloaded);
                 assert_eq!(context.provider, "xai");
                 assert_eq!(context.request_id.as_deref(), Some("req-http"));
                 assert_eq!(context.retry_after_secs, Some(3));
@@ -1957,7 +1957,7 @@ mod tests {
         match &error {
             LLMError::ProviderResponseError { message, context } => {
                 assert_eq!(message, "You have hit your usage limit.");
-                assert_eq!(context.kind, Some(ProviderErrorKind::QuotaExceeded));
+                assert_eq!(context.kind, ProviderErrorKind::QuotaExceeded);
                 assert_eq!(context.error_type.as_deref(), Some("usage_limit_reached"));
                 // Permanent kinds drop retry hints — do not sleep on plan caps.
                 assert_eq!(context.retry_after_secs, None);
@@ -1981,7 +1981,7 @@ mod tests {
         let error = classify_codex_http_error(&response).attribute(PROVIDER_NAME);
         match &error {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind, Some(ProviderErrorKind::RateLimited));
+                assert_eq!(context.kind, ProviderErrorKind::RateLimited);
                 assert_eq!(context.retry_after_secs, Some(5));
             }
             other => panic!("expected ProviderResponseError, got {other}"),
@@ -2001,7 +2001,7 @@ mod tests {
                     message,
                     "Our servers are currently overloaded. Please try again later."
                 );
-                assert_eq!(context.kind, Some(ProviderErrorKind::ServerOverloaded));
+                assert_eq!(context.kind, ProviderErrorKind::ServerOverloaded);
                 assert_eq!(context.provider, PROVIDER_NAME);
                 assert_eq!(context.code.as_deref(), Some("server_is_overloaded"));
                 assert!(error.is_retryable());
@@ -2019,7 +2019,7 @@ mod tests {
         assert!(matches!(
             error,
             LLMError::ProviderResponseError { ref context, .. }
-                if context.kind == Some(ProviderErrorKind::ServerOverloaded)
+                if context.kind == ProviderErrorKind::ServerOverloaded
         ));
         assert!(error.is_retryable());
     }
@@ -2038,7 +2038,7 @@ mod tests {
             let (error, _) = parse_failed_event(&payload);
             assert!(
                 matches!(error, LLMError::ProviderResponseError { ref message, ref context }
-                    if message == "bad" && context.kind == Some(ProviderErrorKind::InvalidRequest)),
+                    if message == "bad" && context.kind == ProviderErrorKind::InvalidRequest),
                 "code={code}, got {error}"
             );
             assert!(!error.is_retryable());
@@ -2053,7 +2053,7 @@ mod tests {
         assert!(matches!(
             ctx_err,
             LLMError::ProviderResponseError { ref context, .. }
-                if context.kind == Some(ProviderErrorKind::ContextWindowExceeded)
+                if context.kind == ProviderErrorKind::ContextWindowExceeded
         ));
         assert!(!ctx_err.is_retryable());
 
@@ -2063,7 +2063,7 @@ mod tests {
         assert!(matches!(
             quota_err,
             LLMError::ProviderResponseError { ref context, .. }
-                if context.kind == Some(ProviderErrorKind::QuotaExceeded)
+                if context.kind == ProviderErrorKind::QuotaExceeded
         ));
         assert!(!quota_err.is_retryable());
     }
@@ -2077,7 +2077,7 @@ mod tests {
             LLMError::ProviderResponseError { message, context } => {
                 assert!(message.contains("Rate limit reached"));
                 assert_eq!(context.retry_after_secs, Some(12));
-                assert_eq!(context.kind, Some(ProviderErrorKind::RateLimited));
+                assert_eq!(context.kind, ProviderErrorKind::RateLimited);
             }
             other => panic!("expected rate limit, got {other}"),
         }
@@ -2091,7 +2091,7 @@ mod tests {
         );
         match &error {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind, Some(ProviderErrorKind::ServerOverloaded));
+                assert_eq!(context.kind, ProviderErrorKind::ServerOverloaded);
                 assert_eq!(context.request_id.as_deref(), Some("req_event"));
                 assert_eq!(context.retry_after_secs, Some(2));
             }
@@ -2107,7 +2107,7 @@ mod tests {
         assert!(matches!(
             error,
             LLMError::ProviderResponseError { ref context, .. }
-                if context.kind == Some(ProviderErrorKind::RateLimited)
+                if context.kind == ProviderErrorKind::RateLimited
         ));
         assert!(error.is_retryable());
     }
@@ -2120,7 +2120,7 @@ mod tests {
         assert!(matches!(
             error,
             LLMError::ProviderResponseError { ref message, ref context }
-                if message == "bad key" && context.kind == Some(ProviderErrorKind::Authentication)
+                if message == "bad key" && context.kind == ProviderErrorKind::Authentication
         ));
         assert!(!error.is_retryable());
     }
@@ -2133,7 +2133,11 @@ mod tests {
         match &error {
             LLMError::ProviderResponseError { context, .. } => {
                 assert_eq!(context.code.as_deref(), Some("unrecognized"));
-                assert!(context.transient);
+                assert!(context.is_retryable());
+                assert_eq!(
+                    context.kind,
+                    ProviderErrorKind::UnknownTransient
+                );
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -2149,7 +2153,11 @@ mod tests {
             LLMError::ProviderResponseError { message, context } => {
                 assert_eq!(message, "codex response failed");
                 assert_eq!(context.request_id, None);
-                assert!(context.transient);
+                assert!(context.is_retryable());
+                assert_eq!(
+                    context.kind,
+                    ProviderErrorKind::UnknownTransient
+                );
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }

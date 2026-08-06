@@ -2117,7 +2117,7 @@ mod tests {
     };
     use kameo::actor::Spawn;
     use querymt::LLMParams;
-    use querymt::error::{LLMError, LLMErrorPayload, ProviderErrorContext};
+    use querymt::error::{LLMError, LLMErrorPayload, ProviderErrorContext, ProviderErrorKind};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -2230,12 +2230,11 @@ mod tests {
     fn prompt_error_preserves_wrapped_llm_payload() {
         let context = ProviderErrorContext {
             provider: "openai".to_string(),
-            kind: None,
+            kind: ProviderErrorKind::UnknownTransient,
             code: Some("server_error".to_string()),
             error_type: Some("api_error".to_string()),
             request_id: Some("req-456".to_string()),
             retry_after_secs: Some(1),
-            transient: true,
         };
         let error = anyhow::Error::new(crate::agent::execution::PromptLlmError::new(
             crate::agent::execution::LlmOperation::ChatStream,

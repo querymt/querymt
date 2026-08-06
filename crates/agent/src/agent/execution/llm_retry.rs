@@ -336,7 +336,7 @@ mod tests {
     };
     use querymt::LLMParams;
     use querymt::chat::{ChatResponse, FinishReason, StreamChunk};
-    use querymt::error::{LLMError, ProviderErrorContext};
+    use querymt::error::{LLMError, ProviderErrorContext, ProviderErrorKind};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
@@ -442,12 +442,11 @@ mod tests {
             message: "server broke".to_string(),
             context: Box::new(ProviderErrorContext {
                 provider: "openai".to_string(),
-                kind: None,
+                kind: ProviderErrorKind::UnknownTransient,
                 code: Some("server_error".to_string()),
                 error_type: Some("api_error".to_string()),
                 request_id: None,
                 retry_after_secs: None,
-                transient: true,
             }),
         };
         assert!(non_rate.rate_limit_info().is_none());
@@ -456,12 +455,11 @@ mod tests {
             message: "busy".into(),
             context: Box::new(ProviderErrorContext {
                 provider: "codex".into(),
-                kind: Some(querymt::error::ProviderErrorKind::ServerOverloaded),
+                kind: querymt::error::ProviderErrorKind::ServerOverloaded,
                 code: Some("server_is_overloaded".into()),
                 error_type: None,
                 request_id: None,
                 retry_after_secs: None,
-                transient: true,
             }),
         };
         assert!(overloaded.rate_limit_info().is_none());
@@ -784,12 +782,11 @@ mod tests {
                         message: "overloaded".into(),
                         context: Box::new(ProviderErrorContext {
                             provider: "test".into(),
-                            kind: Some(querymt::error::ProviderErrorKind::ServerOverloaded),
+                            kind: querymt::error::ProviderErrorKind::ServerOverloaded,
                             code: Some("server_is_overloaded".into()),
                             error_type: None,
                             request_id: Some("request-3".into()),
                             retry_after_secs: Some(0),
-                            transient: true,
                         }),
                     })
                 }
@@ -800,7 +797,7 @@ mod tests {
             result,
             Err(LLMError::ProviderResponseError { message, context })
                 if message == "overloaded"
-                    && context.kind == Some(querymt::error::ProviderErrorKind::ServerOverloaded)
+                    && context.kind == querymt::error::ProviderErrorKind::ServerOverloaded
                     && context.request_id.as_deref() == Some("request-3")
         ));
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
@@ -860,12 +857,11 @@ mod tests {
                     message: "You have hit your usage limit.".into(),
                     context: Box::new(ProviderErrorContext {
                         provider: "codex".into(),
-                        kind: Some(querymt::error::ProviderErrorKind::QuotaExceeded),
+                        kind: querymt::error::ProviderErrorKind::QuotaExceeded,
                         code: Some("usage_limit_reached".into()),
                         error_type: Some("usage_limit_reached".into()),
                         request_id: None,
                         retry_after_secs: None,
-                        transient: false,
                     }),
                 })
             }
@@ -875,7 +871,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(LLMError::ProviderResponseError { context, .. })
-                if context.kind == Some(querymt::error::ProviderErrorKind::QuotaExceeded)
+                if context.kind == querymt::error::ProviderErrorKind::QuotaExceeded
         ));
         assert_eq!(
             call_count.load(Ordering::SeqCst),

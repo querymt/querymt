@@ -912,7 +912,7 @@ impl SessionActorRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use querymt::error::{LLMErrorPayload, ProviderErrorContext};
+    use querymt::error::{LLMErrorPayload, ProviderErrorContext, ProviderErrorKind};
 
     #[test]
     fn local_prompt_handler_error_preserves_structured_acp_data() {
@@ -924,12 +924,11 @@ mod tests {
                     message: "provider overloaded".to_string(),
                     context: Some(ProviderErrorContext {
                         provider: "openai".to_string(),
-                        kind: None,
+                        kind: ProviderErrorKind::UnknownTransient,
                         code: Some("server_error".to_string()),
                         error_type: None,
                         request_id: None,
                         retry_after_secs: None,
-                        transient: true,
                     }),
                 }),
             });

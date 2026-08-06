@@ -171,7 +171,7 @@ impl From<crate::middleware::error::MiddlewareError> for AgentError {
 mod tests {
     use super::*;
     use agent_client_protocol::ErrorCode;
-    use querymt::error::ProviderErrorContext;
+    use querymt::error::{ProviderErrorContext, ProviderErrorKind};
 
     // ── From<AgentError> for AcpError ──────────────────────────────────────
 
@@ -250,12 +250,11 @@ mod tests {
             message: "capacity exhausted".to_string(),
             context: Some(ProviderErrorContext {
                 provider: "openai".to_string(),
-                kind: None,
+                kind: ProviderErrorKind::UnknownPermanent,
                 code: Some("server_error".to_string()),
                 error_type: Some("api_error".to_string()),
                 request_id: Some("req-123".to_string()),
                 retry_after_secs: Some(2),
-                transient: false,
             }),
         };
         let acp: AcpError = AgentError::ProviderChat {
@@ -278,11 +277,11 @@ mod tests {
                     "message": "capacity exhausted",
                     "context": {
                         "provider": "openai",
+                        "kind": "unknown_permanent",
                         "code": "server_error",
                         "error_type": "api_error",
                         "request_id": "req-123",
-                        "retry_after_secs": 2,
-                        "transient": false
+                        "retry_after_secs": 2
                     }
                 }
             }))
@@ -343,12 +342,11 @@ mod tests {
                     message: "overloaded".to_string(),
                     context: Box::new(ProviderErrorContext {
                         provider: "codex".to_string(),
-                        kind: Some(querymt::error::ProviderErrorKind::ServerOverloaded),
+                        kind: querymt::error::ProviderErrorKind::ServerOverloaded,
                         code: Some("server_is_overloaded".to_string()),
                         error_type: None,
                         request_id: Some("req-1".to_string()),
                         retry_after_secs: None,
-                        transient: true,
                     }),
                 }
                 .to_payload(),
