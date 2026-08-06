@@ -6,7 +6,7 @@ use crate::agent::agent_config::AgentConfig;
 use crate::agent::utils::u32_from_usize;
 use crate::events::AgentEventKind;
 use futures_util::{Stream, StreamExt};
-use log::{debug, info};
+use log::info;
 use querymt::chat::StreamChunk;
 use querymt::error::LLMError;
 use std::future::Future;
@@ -51,83 +51,120 @@ where
             }
             Err(e) => {
                 Span::current().record("attempt", attempt);
-                let rate_limit_info = e.rate_limit_info();
-                Span::current().record("rate_limited", rate_limit_info.is_some());
+                // Span field keeps the historical name; event is emitted for any retry wait.
+                Span::current().record("rate_limited", true);
 
                 if !e.is_retryable() || attempt >= max_attempts {
                     return Err(e);
                 }
 
                 let wait_secs = retry_delay_secs(config, &e, attempt);
-                let is_rate_limited = rate_limit_info.is_some();
-                if let Some((message, _)) = rate_limit_info {
-                    let started_at = time::OffsetDateTime::now_utc().unix_timestamp();
-                    info!(
-                        "Session {} rate limited, attempt {}/{}, waiting {}s",
-                        session_id, attempt, max_attempts, wait_secs
-                    );
-                    config.emit_event(
-                        session_id,
-                        AgentEventKind::RateLimited {
-                            message,
-                            wait_secs,
-                            started_at,
-                            attempt: u32_from_usize(attempt, "attempt", Some(session_id)),
-                            max_attempts: u32_from_usize(
-                                max_attempts,
-                                "max_attempts",
-                                Some(session_id),
-                            ),
-                        },
-                    );
-                } else {
-                    debug!(
-                        "Session {} transient setup error on attempt {}, retrying in {}s: {}",
-                        session_id, attempt, wait_secs, e
-                    );
-                }
+                emit_retry_wait(
+                    config,
+                    session_id,
+                    &e,
+                    attempt,
+                    max_attempts,
+                    wait_secs,
+                    false,
+                );
 
                 wait_for_retry_delay(wait_secs, cancel_token).await?;
 
-                if is_rate_limited {
-                    info!(
-                        "Session {} resuming after rate limit wait, attempt {}",
-                        session_id,
-                        attempt + 1
-                    );
-                    config.emit_event(
-                        session_id,
-                        AgentEventKind::RateLimitResume {
-                            attempt: u32_from_usize(
-                                attempt.saturating_add(1),
-                                "attempt + 1",
-                                Some(session_id),
-                            ),
-                        },
-                    );
-                }
+                emit_retry_resume(config, session_id, attempt.saturating_add(1), false);
             }
         }
     }
 }
 
 /// Calculate the delay for a retry, preferring the provider's retry hint.
+///
+/// Policy:
+/// - Calculated delays (no vendor hint) are jittered and capped by
+///   `rate_limit.max_wait_secs`.
+/// - Provider `Retry-After` / message hints are **authoritative and uncapped**.
+///   A vendor sending `7200` will sleep two hours. That is intentional until we
+///   choose an absolute ceiling or a separate `max_provider_wait_secs` knob.
 pub(super) fn retry_delay_secs(
     config: &AgentConfig,
     error: &LLMError,
     retry_ordinal: usize,
 ) -> u64 {
+    let policy = &config.execution_policy.rate_limit;
     if let Some(secs) = error.retry_after_secs() {
+        if secs > policy.max_wait_secs {
+            // Visible when a vendor hint exceeds our calculated-delay cap so
+            // long hangs are diagnosable without changing the sleep policy.
+            info!(
+                "provider retry hint {}s exceeds rate_limit.max_wait_secs={} (hint is authoritative; calculated delays only are capped)",
+                secs, policy.max_wait_secs
+            );
+        }
         return secs;
     }
 
-    let policy = &config.execution_policy.rate_limit;
     let base = policy.default_wait_secs as f64;
     let multiplier = policy.backoff_multiplier;
     let calculated = base * multiplier.powi(retry_ordinal.saturating_sub(1) as i32);
     apply_jitter(calculated, policy.jitter_ratio, jitter_sample()).min(policy.max_wait_secs)
 }
 
+/// Log and emit UI events before a retry wait.
+///
+/// **Event reuse (deliberate, may change):** every retryable wait — rate-limit,
+/// `ServerOverloaded`, bare transient 5xx, etc. — emits
+/// [`AgentEventKind::RateLimited`] then later [`AgentEventKind::RateLimitResume`].
+///
+/// The variant name is historical (rate-limit was the first case). Treat the
+/// event as “provider backoff before retry”, not strictly HTTP 429. A future
+/// change may introduce a generic `LlmRetrying` / reason-tagged event or a
+/// dedicated overload variant; until then reuse keeps the UI from looking stuck
+/// without a protocol bump.
+fn emit_retry_wait(
+    config: &AgentConfig,
+    session_id: &str,
+    error: &LLMError,
+    attempt: usize,
+    max_attempts: usize,
+    wait_secs: u64,
+    streaming: bool,
+) {
+    let stream_tag = if streaming { " (streaming)" } else { "" };
+    let message = error
+        .rate_limit_info()
+        .map(|(m, _)| m)
+        .unwrap_or_else(|| error.to_string());
+    let started_at = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    info!(
+        "Session {} LLM retry wait{}, attempt {}/{}, waiting {}s: {}",
+        session_id, stream_tag, attempt, max_attempts, wait_secs, message
+    );
+    config.emit_event(
+        session_id,
+        AgentEventKind::RateLimited {
+            message,
+            wait_secs,
+            started_at,
+            attempt: u32_from_usize(attempt, "attempt", Some(session_id)),
+            max_attempts: u32_from_usize(max_attempts, "max_attempts", Some(session_id)),
+        },
+    );
+}
+
+fn emit_retry_resume(config: &AgentConfig, session_id: &str, next_attempt: usize, streaming: bool) {
+    let stream_tag = if streaming { " (streaming)" } else { "" };
+    info!(
+        "Session {} resuming after LLM retry wait{}, attempt {}",
+        session_id, stream_tag, next_attempt
+    );
+    config.emit_event(
+        session_id,
+        AgentEventKind::RateLimitResume {
+            attempt: u32_from_usize(next_attempt, "attempt + 1", Some(session_id)),
+        },
+    );
+}
 fn apply_jitter(delay_secs: f64, ratio: f64, sample: f64) -> u64 {
     let ratio = ratio.clamp(0.0, 1.0);
     let sample = sample.clamp(0.0, 1.0);
@@ -201,54 +238,24 @@ where
         match create_stream().await {
             Ok(stream) => return Ok(stream),
             Err(e) => {
-                let rate_limit_info = e.rate_limit_info();
                 if !e.is_retryable() || attempt >= max_attempts {
                     return Err(e);
                 }
 
                 let wait_secs = retry_delay_secs(config, &e, attempt);
-                let is_rate_limited = rate_limit_info.is_some();
-                if let Some((message, _)) = rate_limit_info {
-                    let started_at = time::OffsetDateTime::now_utc().unix_timestamp();
-                    info!(
-                        "Session {} rate limited (streaming), attempt {}/{}, waiting {}s",
-                        session_id, attempt, max_attempts, wait_secs
-                    );
-                    config.emit_event(
-                        session_id,
-                        AgentEventKind::RateLimited {
-                            message,
-                            wait_secs,
-                            started_at,
-                            attempt: u32_from_usize(attempt, "attempt", Some(session_id)),
-                            max_attempts: u32_from_usize(
-                                max_attempts,
-                                "max_attempts",
-                                Some(session_id),
-                            ),
-                        },
-                    );
-                } else {
-                    debug!(
-                        "Session {} transient stream setup error on attempt {}, retrying in {}s: {}",
-                        session_id, attempt, wait_secs, e
-                    );
-                }
+                emit_retry_wait(
+                    config,
+                    session_id,
+                    &e,
+                    attempt,
+                    max_attempts,
+                    wait_secs,
+                    true,
+                );
 
                 wait_for_retry_delay(wait_secs, cancel_token).await?;
 
-                if is_rate_limited {
-                    config.emit_event(
-                        session_id,
-                        AgentEventKind::RateLimitResume {
-                            attempt: u32_from_usize(
-                                attempt.saturating_add(1),
-                                "attempt + 1",
-                                Some(session_id),
-                            ),
-                        },
-                    );
-                }
+                emit_retry_resume(config, session_id, attempt.saturating_add(1), true);
             }
         }
     }

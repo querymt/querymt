@@ -280,8 +280,11 @@ pub struct RateLimitConfig {
     )]
     pub jitter_ratio: f64,
 
-    /// Upper bound for calculated delays (`>= 1`). Provider retry hints remain
-    /// authoritative.
+    /// Upper bound for **calculated** delays (`>= 1`).
+    ///
+    /// Provider `Retry-After` / message hints are **not** clamped by this field
+    /// (see `llm_retry::retry_delay_secs`). A long vendor hint can exceed this
+    /// value intentionally.
     ///
     /// Runtime-only for now — same session-compat rationale as `jitter_ratio`.
     /// TODO(session-compat): persist with `jitter_ratio` when ready.
