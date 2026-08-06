@@ -154,9 +154,11 @@ max_stream_retries = 1
 default_wait_secs = 60
 backoff_multiplier = 2.0
 # Applied only to calculated delays; provider retry hints are used as-is.
+# Must be in 0.0..=1.0 (rejected at config load if out of range).
 jitter_ratio = 0.2
-# Caps calculated delays; provider retry hints remain authoritative.
+# Caps calculated delays (>= 1); provider retry hints remain authoritative.
 max_wait_secs = 300
+# backoff_multiplier must be finite and > 0.
 ```
 
 ### Skills Configuration
