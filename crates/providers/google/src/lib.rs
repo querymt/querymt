@@ -52,7 +52,6 @@ use querymt::{
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
-    handle_http_error,
     plugin::HTTPLLMProviderFactory,
 };
 use schemars::{JsonSchema, schema_for};
@@ -915,7 +914,11 @@ impl HTTPChatProvider for Google {
     }
 
     fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
-        handle_http_error!(resp);
+        // Success-only: HTTP adapter classifies non-success via classify_chat_error.
+        debug_assert!(
+            resp.status().is_success(),
+            "parse_chat is success-only; adapter must classify non-success first"
+        );
 
         let json_resp: Result<GoogleChatResponse, serde_json::Error> =
             serde_json::from_slice(resp.body());

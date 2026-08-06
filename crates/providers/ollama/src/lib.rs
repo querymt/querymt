@@ -13,7 +13,7 @@ use querymt::{
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::LLMError,
-    get_env_var, handle_http_error,
+    get_env_var,
     plugin::HTTPLLMProviderFactory,
 };
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema, schema_for};
@@ -575,7 +575,11 @@ impl HTTPChatProvider for Ollama {
     }
 
     fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
-        handle_http_error!(resp);
+        // Success-only: HTTP adapter classifies non-success via classify_chat_error.
+        debug_assert!(
+            resp.status().is_success(),
+            "parse_chat is success-only; adapter must classify non-success first"
+        );
 
         let json_resp: OllamaResponse = serde_json::from_slice(resp.body())?;
         Ok(Box::new(json_resp))

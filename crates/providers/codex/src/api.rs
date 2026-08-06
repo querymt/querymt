@@ -754,11 +754,19 @@ fn to_codex_tools(tools: &[Tool]) -> Vec<CodexTool<'_>> {
         .collect()
 }
 
+/// Parse a **successful** Codex chat/responses HTTP body.
+///
+/// Non-success statuses are classified by the HTTP adapter via
+/// [`classify_codex_http_error`] / `classify_chat_error` before this is called.
+/// Do not reintroduce status checks here.
 pub fn codex_parse_chat_with_state(
     response: Response<Vec<u8>>,
     tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
 ) -> Result<Box<dyn ChatResponse>, LLMError> {
-    handle_http_error!(response);
+    debug_assert!(
+        response.status().is_success(),
+        "codex_parse_chat_with_state is success-only; adapter must classify non-success first"
+    );
 
     let body = response.body();
     let raw = String::from_utf8_lossy(body);

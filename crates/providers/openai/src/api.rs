@@ -884,14 +884,21 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
     Ok(builder.body(json_body)?)
 }
 
+/// Parse a **successful** OpenAI-compatible chat HTTP body.
+///
+/// Non-success statuses are classified by the HTTP adapter via
+/// [`querymt::chat::http::HTTPChatProvider::classify_chat_error`] before this
+/// is called. Do not reintroduce status checks here — that splits ownership
+/// and can emit unattributed legacy error variants.
 pub fn openai_parse_chat<C: OpenAIProviderConfig>(
     _cfg: &C,
     response: Response<Vec<u8>>,
 ) -> Result<Box<dyn ChatResponse>, LLMError> {
-    // If we got a non-200 response, let's get the error details
-    handle_http_error!(response);
+    debug_assert!(
+        response.status().is_success(),
+        "openai_parse_chat is success-only; adapter must classify non-success first"
+    );
 
-    // Parse the successful response
     let json_resp: Result<OpenAIChatResponse, serde_json::Error> =
         serde_json::from_slice(response.body());
 
