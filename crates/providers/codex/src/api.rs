@@ -1024,7 +1024,10 @@ fn codex_error_kind(code: &str) -> Option<ProviderErrorKind> {
             Some(ProviderErrorKind::QuotaExceeded)
         }
         // Upstream codex: cyber_policy / invalid_prompt / bio_policy → fatal request
-        "cyber_policy" | "invalid_prompt" | "bio_policy" | "invalid_request"
+        "cyber_policy"
+        | "invalid_prompt"
+        | "bio_policy"
+        | "invalid_request"
         | "invalid_request_error" => Some(ProviderErrorKind::InvalidRequest),
         "authentication_error" | "invalid_api_key" | "unauthorized" => {
             Some(ProviderErrorKind::Authentication)

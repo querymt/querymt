@@ -560,7 +560,9 @@ impl LLMError {
     pub fn is_rate_limited(&self) -> bool {
         match self {
             Self::RateLimited { .. } => true,
-            Self::HttpStatus { status_code: 429, .. } => true,
+            Self::HttpStatus {
+                status_code: 429, ..
+            } => true,
             Self::ProviderResponseError { context, .. } => {
                 context.kind == Some(ProviderErrorKind::RateLimited)
             }
@@ -1446,10 +1448,7 @@ mod tests {
             .retry_after_secs(Some(4))
             .attribute("openai");
         assert!(structured.is_rate_limited());
-        assert_eq!(
-            structured.rate_limit_info(),
-            Some(("slow".into(), Some(4)))
-        );
+        assert_eq!(structured.rate_limit_info(), Some(("slow".into(), Some(4))));
 
         let http_429 = LLMError::HttpStatus {
             status_code: 429,

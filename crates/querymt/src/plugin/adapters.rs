@@ -1,10 +1,5 @@
 use super::{Fut, LLMProviderFactory, http::HTTPLLMProviderFactory};
-use crate::{
-    LLMProvider,
-    adapters::LLMProviderFromHTTP,
-    error::LLMError,
-    outbound::call_outbound,
-};
+use crate::{LLMProvider, adapters::LLMProviderFromHTTP, error::LLMError, outbound::call_outbound};
 use futures::future::FutureExt;
 use http::{Request, Response};
 use std::{ops::Deref, sync::Arc};
