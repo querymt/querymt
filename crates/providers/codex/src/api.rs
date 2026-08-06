@@ -14,7 +14,7 @@ use querymt::{
         Tool, ToolChoice,
     },
     error::{
-        ClassifiedProviderError, LLMError, ProviderDecodeError, ProviderErrorKind,
+        ProviderFailure, LLMError, ProviderDecodeError, ProviderErrorKind,
         extract_retry_after_from_json, parse_retry_after, parse_retry_after_from_message,
     },
     handle_http_error,
@@ -1043,7 +1043,7 @@ fn map_codex_response_failed(
     response: &Value,
     explicit_request_id: Option<&str>,
     unknown_transient: bool,
-) -> ClassifiedProviderError {
+) -> ProviderFailure {
     let message = error
         .get("message")
         .and_then(Value::as_str)
@@ -1084,7 +1084,7 @@ fn map_codex_response_failed(
         _ => retry_after_secs,
     };
 
-    let mut classified = ClassifiedProviderError::new(message)
+    let mut classified = ProviderFailure::new(message)
         .code(code)
         .error_type(error_type)
         .request_id(request_id)

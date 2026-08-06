@@ -26,7 +26,7 @@ use querymt::{
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::{
-        ClassifiedProviderError, LLMError, ProviderErrorKind, classify_status_only,
+        ProviderFailure, LLMError, ProviderErrorKind, classify_status_only,
         parse_retry_after, parse_retry_after_from_message,
     },
 };
@@ -1257,7 +1257,7 @@ fn map_anthropic_api_error(
     raw_body: &str,
     header_retry_after: Option<u64>,
     unknown_transient: bool,
-) -> ClassifiedProviderError {
+) -> ProviderFailure {
     let error_type = error.and_then(|e| e.error_type.clone());
     let message = error
         .and_then(|e| e.message.as_deref())
@@ -1284,7 +1284,7 @@ fn map_anthropic_api_error(
         _ => header_retry_after,
     };
 
-    let mut classified = ClassifiedProviderError::new(message)
+    let mut classified = ProviderFailure::new(message)
         .error_type(error_type)
         .code(type_norm)
         .retry_after_secs(retry_after_secs)
@@ -1296,7 +1296,7 @@ fn map_anthropic_api_error(
 }
 
 /// Classify an Anthropic HTTP error body before provider attribution.
-fn classify_anthropic_http_error(response: &Response<Vec<u8>>) -> ClassifiedProviderError {
+fn classify_anthropic_http_error(response: &Response<Vec<u8>>) -> ProviderFailure {
     let status = response.status().as_u16();
     let retry_after_secs = parse_retry_after(response.headers());
     let body = String::from_utf8_lossy(response.body());

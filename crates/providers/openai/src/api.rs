@@ -10,7 +10,7 @@ use querymt::{
         StructuredOutputFormat, Tool, ToolChoice,
     },
     error::{
-        ClassifiedProviderError, LLMError, ProviderDecodeError, ProviderErrorKind,
+        ProviderFailure, LLMError, ProviderDecodeError, ProviderErrorKind,
         extract_retry_after_from_json, parse_retry_after, parse_retry_after_from_message,
     },
     handle_http_error,
@@ -1243,13 +1243,13 @@ fn openai_error_kind(code: &str) -> Option<ProviderErrorKind> {
 }
 
 /// Map an OpenAI-compatible SSE/HTTP `{ "error": ... }` envelope into unified
-/// [`ClassifiedProviderError`] kinds. Vendor `code`/`type` dialect stays here.
+/// [`ProviderFailure`] kinds. Vendor `code`/`type` dialect stays here.
 fn map_openai_error_envelope(
     error: &Value,
     envelope: &Value,
     explicit_request_id: Option<&str>,
     unknown_transient: bool,
-) -> ClassifiedProviderError {
+) -> ProviderFailure {
     let message = error
         .as_str()
         .map(str::to_owned)
@@ -1312,7 +1312,7 @@ fn map_openai_error_envelope(
         _ => retry_after_secs,
     };
 
-    let mut classified = ClassifiedProviderError::new(message)
+    let mut classified = ProviderFailure::new(message)
         .code(code)
         .error_type(error_type)
         .request_id(request_id)
