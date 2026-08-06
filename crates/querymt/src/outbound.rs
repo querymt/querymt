@@ -2,7 +2,6 @@ mod http_client {
     #[cfg(not(target_arch = "wasm32"))]
     pub mod imp {
         use crate::error::{LLMError, classify_http_status};
-        use futures::StreamExt;
         use http::{Request, Response};
         use once_cell::sync::Lazy;
         use reqwest::Client;
@@ -303,28 +302,6 @@ mod http_client {
             ))
         }
 
-        /// Send a streaming HTTP request using the generic status classifier.
-        pub async fn call_outbound_stream(
-            req: Request<Vec<u8>>,
-        ) -> Result<
-            std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
-            LLMError,
-        > {
-            let (response, mut stream) = call_outbound_stream_raw(req).await?;
-            if response.status().is_success() {
-                return Ok(stream);
-            }
-
-            let mut body = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                body.extend_from_slice(&chunk?);
-            }
-            Err(classify_http_status(
-                response.status().as_u16(),
-                response.headers(),
-                &body,
-            ))
-        }
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -355,54 +332,7 @@ mod http_client {
         pub async fn call_outbound(_req: Request<Vec<u8>>) -> Result<Response<Vec<u8>>, LLMError> {
             Err(LLMError::InvalidRequest("".into()))
         }
-
-        pub async fn call_outbound_stream(
-            _req: Request<Vec<u8>>,
-        ) -> Result<futures::stream::Empty<reqwest::Result<bytes::Bytes>>, LLMError> {
-            Err(LLMError::InvalidRequest("".into()))
-        }
     }
 }
 
-use crate::error::LLMError;
-use http::Response;
-pub use http_client::imp::{
-    call_outbound, call_outbound_raw, call_outbound_stream, call_outbound_stream_raw,
-};
-
-/// Apply the generic HTTP status policy to a raw response.
-pub fn ensure_success(response: Response<Vec<u8>>) -> Result<Response<Vec<u8>>, LLMError> {
-    if response.status().is_success() {
-        return Ok(response);
-    }
-
-    Err(crate::error::classify_http_status(
-        response.status().as_u16(),
-        response.headers(),
-        response.body(),
-    ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ensure_success_classifies_non_success_response() {
-        let response = Response::builder()
-            .status(429)
-            .header(http::header::RETRY_AFTER, "7")
-            .body(br#"{"error":{"message":"slow down"}}"#.to_vec())
-            .unwrap();
-
-        let error = ensure_success(response).unwrap_err();
-        assert!(matches!(error, LLMError::RateLimited { .. }));
-        assert_eq!(error.retry_after_secs(), Some(7));
-    }
-
-    #[test]
-    fn ensure_success_preserves_success_response() {
-        let response = Response::builder().status(200).body(vec![1, 2, 3]).unwrap();
-        assert_eq!(ensure_success(response).unwrap().body(), &[1, 2, 3]);
-    }
-}
+pub use http_client::imp::{call_outbound, call_outbound_raw, call_outbound_stream_raw};

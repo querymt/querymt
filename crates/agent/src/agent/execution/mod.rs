@@ -116,7 +116,7 @@ impl std::fmt::Display for PromptLlmError {
             LlmOperation::Chat => "LLM chat error",
             LlmOperation::ChatStream => "LLM streaming error",
         };
-        f.write_str(label)
+        write!(f, "{label}: {}", self.source)
     }
 }
 

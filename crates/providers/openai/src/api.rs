@@ -1224,7 +1224,12 @@ fn openai_error_kind(code: &str) -> Option<ProviderErrorKind> {
         "context_length_exceeded" | "context_length_error" | "context_length" => {
             Some(ProviderErrorKind::ContextWindowExceeded)
         }
-        "insufficient_quota" | "usage_not_included" => Some(ProviderErrorKind::QuotaExceeded),
+        // usage_limit_reached: account/plan cap (chatgpt-style); same permanent
+        // bucket as insufficient_quota so openai-compatible paths (incl. xai chat)
+        // do not retry plan caps as TPM rate limits.
+        "insufficient_quota" | "usage_not_included" | "usage_limit_reached" => {
+            Some(ProviderErrorKind::QuotaExceeded)
+        }
         "invalid_request"
         | "invalid_request_error"
         | "invalid_prompt"
@@ -1338,7 +1343,15 @@ pub fn classify_openai_http_error(response: &Response<Vec<u8>>) -> ProviderDecod
             request_id,
             matches!(status, 429 | 500..=599),
         );
-        mapped.set_retry_after_if_missing(retry_after_secs);
+        // Header Retry-After only for failures we actually retry.
+        // Permanent kinds (e.g. usage_limit_reached) must not sleep on a
+        // plan-cap header.
+        if mapped
+            .kind
+            .map_or(mapped.transient, ProviderErrorKind::is_retryable)
+        {
+            mapped.set_retry_after_if_missing(retry_after_secs);
+        }
         return mapped.into();
     }
 
@@ -1985,6 +1998,30 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
             other => panic!("expected QuotaExceeded, got {other}"),
         }
         assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn classify_http_429_usage_limit_reached_is_permanent_quota() {
+        // Same permanent bucket as codex: plan/account caps must not retry.
+        let response = Response::builder()
+            .status(429)
+            .header(http::header::RETRY_AFTER, "60")
+            .body(
+                br#"{"error":{"message":"You have hit your usage limit.","type":"usage_limit_reached"}}"#
+                    .to_vec(),
+            )
+            .unwrap();
+        let error = classify_openai_http_error(&response).attribute(PROVIDER_NAME);
+        assert!(!error.is_retryable());
+        assert!(!error.is_rate_limited());
+        assert_eq!(error.retry_after_secs(), None);
+        match &error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.kind, Some(ProviderErrorKind::QuotaExceeded));
+                assert_eq!(context.error_type.as_deref(), Some("usage_limit_reached"));
+            }
+            other => panic!("expected QuotaExceeded, got {other}"),
+        }
     }
 
     #[test]

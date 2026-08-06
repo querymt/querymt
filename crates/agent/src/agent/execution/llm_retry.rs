@@ -51,7 +51,7 @@ where
             }
             Err(e) => {
                 Span::current().record("attempt", attempt);
-                let rate_limit_info = extract_rate_limit_info(&e);
+                let rate_limit_info = e.rate_limit_info();
                 Span::current().record("rate_limited", rate_limit_info.is_some());
 
                 if !e.is_retryable() || attempt >= max_attempts {
@@ -158,13 +158,6 @@ pub(super) async fn wait_for_retry_delay(
     }
 }
 
-/// Extract rate limit information from an error.
-///
-/// Thin wrapper over [`LLMError::rate_limit_info`] — the single dual-form matcher.
-fn extract_rate_limit_info(error: &LLMError) -> Option<(String, Option<u64>)> {
-    error.rate_limit_info()
-}
-
 /// Create a streaming connection with retry logic for rate limits and transient errors.
 ///
 /// This retries stream creation only. Mid-stream recovery is handled by the consumer,
@@ -195,8 +188,10 @@ where
         // Shared request budget is enforced here, not via debug_assert.
         // Callers should also refuse re-entry via StreamRetryBudget, but a
         // broken invariant must still return a real error in release builds.
+        // GenericError is intentionally non-retryable — a blown internal
+        // budget must not look like transient transport failure.
         if *attempts_used >= max_attempts {
-            return Err(LLMError::HttpError(format!(
+            return Err(LLMError::GenericError(format!(
                 "stream request attempt budget exhausted ({attempts_used}/{max_attempts})"
             )));
         }
@@ -206,7 +201,7 @@ where
         match create_stream().await {
             Ok(stream) => return Ok(stream),
             Err(e) => {
-                let rate_limit_info = extract_rate_limit_info(&e);
+                let rate_limit_info = e.rate_limit_info();
                 if !e.is_retryable() || attempt >= max_attempts {
                     return Err(e);
                 }
@@ -395,15 +390,15 @@ mod tests {
         (config, temp_dir)
     }
 
-    // ── extract_rate_limit_info tests ────────────────────────────────────────
+    // ── rate_limit_info (dual-form) tests ────────────────────────────────────
 
     #[test]
-    fn test_extract_rate_limit_info_rate_limited_with_retry_after() {
+    fn test_rate_limit_info_rate_limited_with_retry_after() {
         let err = LLMError::RateLimited {
             message: "Too many requests".to_string(),
             retry_after_secs: Some(30),
         };
-        let info = extract_rate_limit_info(&err);
+        let info = err.rate_limit_info();
         assert!(info.is_some());
         let (msg, retry_after) = info.unwrap();
         assert_eq!(msg, "Too many requests");
@@ -411,12 +406,12 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_rate_limit_info_rate_limited_no_retry_after() {
+    fn test_rate_limit_info_rate_limited_no_retry_after() {
         let err = LLMError::RateLimited {
             message: "Quota exceeded".to_string(),
             retry_after_secs: None,
         };
-        let info = extract_rate_limit_info(&err);
+        let info = err.rate_limit_info();
         assert!(info.is_some());
         let (msg, retry_after) = info.unwrap();
         assert_eq!(msg, "Quota exceeded");
@@ -424,21 +419,21 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_rate_limit_info_non_rate_limit_returns_none() {
+    fn test_rate_limit_info_non_rate_limit_returns_none() {
         let err = LLMError::GenericError("something broke".to_string());
-        assert!(extract_rate_limit_info(&err).is_none());
+        assert!(err.rate_limit_info().is_none());
 
         let err = LLMError::HttpError("connection refused".to_string());
-        assert!(extract_rate_limit_info(&err).is_none());
+        assert!(err.rate_limit_info().is_none());
     }
 
     #[test]
-    fn test_extract_rate_limit_info_unified_rate_limited_kind() {
+    fn test_rate_limit_info_unified_rate_limited_kind() {
         let err = LLMError::RateLimited {
             message: "Rate limit reached".to_string(),
             retry_after_secs: Some(12),
         };
-        let info = extract_rate_limit_info(&err).expect("RateLimited should extract");
+        let info = err.rate_limit_info().expect("RateLimited should extract");
         assert_eq!(info.0, "Rate limit reached");
         assert_eq!(info.1, Some(12));
 
@@ -455,7 +450,7 @@ mod tests {
                 transient: true,
             }),
         };
-        assert!(extract_rate_limit_info(&non_rate).is_none());
+        assert!(non_rate.rate_limit_info().is_none());
 
         let overloaded = LLMError::ProviderResponseError {
             message: "busy".into(),
@@ -469,7 +464,7 @@ mod tests {
                 transient: true,
             }),
         };
-        assert!(extract_rate_limit_info(&overloaded).is_none());
+        assert!(overloaded.rate_limit_info().is_none());
         assert!(overloaded.is_retryable());
     }
 
@@ -649,14 +644,21 @@ mod tests {
     async fn test_call_llm_with_retry_fails_non_rate_limit() {
         let (config, _temp) = make_config().await;
         let token = CancellationToken::new();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count2 = call_count.clone();
 
-        let result = call_llm_with_retry(&config, "test-session", &token, || async {
-            Err::<Box<dyn ChatResponse>, _>(LLMError::GenericError("fatal error".to_string()))
+        let result = call_llm_with_retry(&config, "test-session", &token, || {
+            let count = call_count2.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Err::<Box<dyn ChatResponse>, _>(LLMError::GenericError("fatal error".to_string()))
+            }
         })
         .await;
 
         // Non-rate-limit errors should fail immediately without retrying
         assert!(result.is_err());
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -828,16 +830,78 @@ mod tests {
             })
             .await;
 
-        assert!(matches!(
-            result,
-            Err(LLMError::HttpError(message))
-                if message.contains("attempt budget exhausted")
-        ));
+        let err = result.err().expect("budget exhaust must error");
+        match &err {
+            LLMError::GenericError(message) => {
+                assert!(message.contains("attempt budget exhausted"));
+            }
+            other => panic!("expected GenericError, got {other}"),
+        }
+        assert!(!err.is_retryable());
         assert_eq!(call_count.load(Ordering::SeqCst), 0);
         assert_eq!(
             attempts_used,
             config.execution_policy.rate_limit.max_attempts()
         );
+    }
+
+    #[tokio::test]
+    async fn test_call_llm_with_retry_permanent_quota_is_called_exactly_once() {
+        let (config, _temp) = make_config().await;
+        let token = CancellationToken::new();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count2 = call_count.clone();
+
+        let result = call_llm_with_retry(&config, "test-session", &token, || {
+            let count = call_count2.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Err::<Box<dyn ChatResponse>, _>(LLMError::ProviderResponseError {
+                    message: "You have hit your usage limit.".into(),
+                    context: Box::new(ProviderErrorContext {
+                        provider: "codex".into(),
+                        kind: Some(querymt::error::ProviderErrorKind::QuotaExceeded),
+                        code: Some("usage_limit_reached".into()),
+                        error_type: Some("usage_limit_reached".into()),
+                        request_id: None,
+                        retry_after_secs: None,
+                        transient: false,
+                    }),
+                })
+            }
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(LLMError::ProviderResponseError { context, .. })
+                if context.kind == Some(querymt::error::ProviderErrorKind::QuotaExceeded)
+        ));
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "permanent quota must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_call_llm_with_retry_auth_error_is_called_exactly_once() {
+        let (config, _temp) = make_config().await;
+        let token = CancellationToken::new();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count2 = call_count.clone();
+
+        let result = call_llm_with_retry(&config, "test-session", &token, || {
+            let count = call_count2.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Err::<Box<dyn ChatResponse>, _>(LLMError::AuthError("bad key".into()))
+            }
+        })
+        .await;
+
+        assert!(matches!(result, Err(LLMError::AuthError(_))));
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

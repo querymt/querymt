@@ -254,7 +254,7 @@ impl HTTPCompletionProvider for Groq {
             Ok(completion_response) => Ok(CompletionResponse {
                 text: completion_response.choices[0].message.content.clone(), // FIXME
             }),
-            Err(e) => Err(LLMError::JsonError(e)),
+            Err(e) => Err(LLMError::from(e)),
         }
     }
 }

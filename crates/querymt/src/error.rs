@@ -28,8 +28,7 @@ pub enum ProviderErrorKind {
 
 impl ProviderErrorKind {
     /// Unified retry policy for provider failures. This is the single source
-    /// of truth — both [`LLMError::is_retryable`] and
-    /// [`LLMErrorPayload::is_retryable`] defer to it.
+    /// of truth — [`LLMErrorPayload::is_retryable`] reconstructs then defers here.
     ///
     /// QueryMT product choice: overload is retried (upstream Codex marks it
     /// non-retryable). Quota/context/auth/request failures never are.
@@ -273,31 +272,11 @@ pub enum LLMErrorPayload {
 
 impl LLMErrorPayload {
     /// Whether this serialized error represents a transient failure worth retrying.
+    ///
+    /// Single source of truth: reconstruct then ask [`LLMError::is_retryable`].
+    /// `from_payload` must stay lossless for retry semantics (see tests).
     pub fn is_retryable(&self) -> bool {
-        match self {
-            Self::ProviderError {
-                context: Some(context),
-                ..
-            } => context.is_retryable(),
-            Self::RateLimited { .. }
-            | Self::HttpError { .. }
-            | Self::Transport { .. }
-            | Self::PluginError { .. }
-            | Self::IoError { .. } => true,
-            Self::HttpStatus { status_code, .. } => matches!(status_code, 429 | 500..=599),
-            Self::GenericError { .. }
-            | Self::ProviderError { context: None, .. }
-            | Self::AuthError { .. }
-            | Self::ToolConfigError { .. }
-            | Self::InvalidRequest { .. }
-            | Self::ResponseFormatError { .. }
-            | Self::Cancelled
-            | Self::RemoteStreamDisconnected { .. }
-            | Self::RemoteStreamReconnected { .. }
-            | Self::NotImplemented { .. }
-            | Self::JsonError { .. }
-            | Self::InvalidUrl { .. } => false,
-        }
+        LLMError::from_payload(self.clone()).is_retryable()
     }
 }
 
@@ -388,12 +367,16 @@ pub enum LLMError {
     NotImplemented(String),
 
     /// Handles JSON serialization and deserialization errors.
+    ///
+    /// Stored as a string so wire payloads round-trip without changing retryability.
     #[error("JSON Error: {0}")]
-    JsonError(#[from] serde_json::Error),
+    JsonError(String),
 
     /// Handles errors from parsing URLs.
-    #[error("Invalid URL")]
-    InvalidUrl(#[from] url::ParseError),
+    ///
+    /// Stored as a string so wire payloads round-trip without changing retryability.
+    #[error("Invalid URL: {0}")]
+    InvalidUrl(String),
 
     /// Handles standard I/O errors.
     #[error("I/O Error")]
@@ -468,11 +451,11 @@ impl LLMError {
             Self::NotImplemented(message) => LLMErrorPayload::NotImplemented {
                 message: message.clone(),
             },
-            Self::JsonError(err) => LLMErrorPayload::JsonError {
-                message: err.to_string(),
+            Self::JsonError(message) => LLMErrorPayload::JsonError {
+                message: message.clone(),
             },
-            Self::InvalidUrl(err) => LLMErrorPayload::InvalidUrl {
-                message: err.to_string(),
+            Self::InvalidUrl(message) => LLMErrorPayload::InvalidUrl {
+                message: message.clone(),
             },
             Self::IoError(err) => LLMErrorPayload::IoError {
                 message: err.to_string(),
@@ -527,8 +510,12 @@ impl LLMError {
                 Self::RemoteStreamReconnected { message }
             }
             LLMErrorPayload::NotImplemented { message } => Self::NotImplemented(message),
-            LLMErrorPayload::JsonError { message } => Self::PluginError(message),
-            LLMErrorPayload::InvalidUrl { message } => Self::HttpError(message),
+            // Lossless: keep payload tags as distinct runtime variants so
+            // payload.is_retryable() == from_payload(p).is_retryable().
+            LLMErrorPayload::JsonError { message } => Self::JsonError(message),
+            LLMErrorPayload::InvalidUrl { message } => Self::InvalidUrl(message),
+            // Io has no dedicated runtime variant; Transport is the stable
+            // retryable home and matches payload IoError retryability.
             LLMErrorPayload::IoError { message } => Self::Transport {
                 kind: TransportErrorKind::Other,
                 message,
@@ -591,10 +578,6 @@ impl LLMError {
         }
     }
 
-    pub fn is_retryable_setup_failure(&self) -> bool {
-        self.is_retryable()
-    }
-
     /// Whether this error is worth retrying (transient infrastructure error).
     ///
     /// Strategy: most transport/infrastructure errors are transient and succeed
@@ -628,8 +611,8 @@ impl LLMError {
             Self::ResponseFormatError { .. } => false,
             Self::GenericError(_) => false,
             Self::Cancelled => false,
-            Self::JsonError { .. } => false,
-            Self::InvalidUrl { .. } => false,
+            Self::JsonError(_) => false,
+            Self::InvalidUrl(_) => false,
             Self::NotImplemented(_) => false,
 
             // Mesh transport events — handled by the existing continue logic
@@ -899,6 +882,18 @@ pub fn transport_error(kind: TransportErrorKind, message: impl Into<String>) -> 
     LLMError::Transport {
         kind,
         message: message.into(),
+    }
+}
+
+impl From<serde_json::Error> for LLMError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::JsonError(err.to_string())
+    }
+}
+
+impl From<url::ParseError> for LLMError {
+    fn from(err: url::ParseError) -> Self {
+        Self::InvalidUrl(err.to_string())
     }
 }
 
@@ -1365,26 +1360,17 @@ mod tests {
     }
 
     #[test]
-    fn payload_retryability_is_stable_without_reconstruction() {
-        assert!(
-            !LLMErrorPayload::JsonError {
+    fn payload_retryability_matches_reconstructed_error() {
+        let cases: Vec<LLMErrorPayload> = vec![
+            LLMErrorPayload::JsonError {
                 message: "bad JSON".into(),
-            }
-            .is_retryable()
-        );
-        assert!(
-            !LLMErrorPayload::InvalidUrl {
+            },
+            LLMErrorPayload::InvalidUrl {
                 message: "bad URL".into(),
-            }
-            .is_retryable()
-        );
-        assert!(
+            },
             LLMErrorPayload::IoError {
                 message: "connection reset".into(),
-            }
-            .is_retryable()
-        );
-        assert!(
+            },
             LLMErrorPayload::ProviderError {
                 message: "temporary".into(),
                 context: Some(
@@ -1392,16 +1378,54 @@ mod tests {
                         .transient(true)
                         .into_context("test"),
                 ),
-            }
-            .is_retryable()
-        );
-        assert!(
-            !LLMErrorPayload::ProviderError {
+            },
+            LLMErrorPayload::ProviderError {
                 message: "permanent".into(),
                 context: None,
-            }
-            .is_retryable()
-        );
+            },
+            LLMErrorPayload::RateLimited {
+                message: "slow".into(),
+                retry_after_secs: Some(1),
+            },
+            LLMErrorPayload::HttpStatus {
+                status_code: 503,
+                message: "unavailable".into(),
+                retry_after_secs: None,
+            },
+            LLMErrorPayload::AuthError {
+                message: "nope".into(),
+            },
+        ];
+        for payload in cases {
+            let reconstructed = LLMError::from_payload(payload.clone());
+            assert_eq!(
+                payload.is_retryable(),
+                reconstructed.is_retryable(),
+                "retryability diverged for {payload:?} → {reconstructed:?}"
+            );
+        }
+
+        // Json/InvalidUrl round-trip keeps the same variant family.
+        assert!(matches!(
+            LLMError::from_payload(LLMErrorPayload::JsonError {
+                message: "x".into()
+            }),
+            LLMError::JsonError(_)
+        ));
+        assert!(matches!(
+            LLMError::from_payload(LLMErrorPayload::InvalidUrl {
+                message: "x".into()
+            }),
+            LLMError::InvalidUrl(_)
+        ));
+        assert!(!LLMErrorPayload::JsonError {
+            message: "x".into()
+        }
+        .is_retryable());
+        assert!(!LLMErrorPayload::InvalidUrl {
+            message: "x".into()
+        }
+        .is_retryable());
     }
 
     #[test]
