@@ -386,7 +386,7 @@ impl LLMProviderFactory for ExtismFactory {
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
         let cfg_value: Value = serde_json::from_str(cfg)
-            .map_err(|e| LLMError::PluginError(format!("Invalid JSON config: {:#}", e)))?;
+            .map_err(|e| LLMError::InvalidRequest(format!("Invalid JSON config: {:#}", e)))?;
         self.validate_runtime_base_url(&cfg_value)?;
 
         let _from_cfg = self
@@ -419,7 +419,7 @@ impl LLMProviderFactory for ExtismFactory {
             Ok(v) => v,
             Err(e) => {
                 return Box::pin(async move {
-                    Err(LLMError::PluginError(format!(
+                    Err(LLMError::InvalidRequest(format!(
                         "Invalid JSON config: {:#}",
                         e
                     )))
@@ -507,7 +507,7 @@ impl HTTPLLMProviderFactory for ExtismFactory {
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn crate::HTTPLLMProvider>, LLMError> {
         let cfg_value: Value = serde_json::from_str(cfg)
-            .map_err(|e| LLMError::PluginError(format!("Invalid JSON config: {:#}", e)))?;
+            .map_err(|e| LLMError::InvalidRequest(format!("Invalid JSON config: {:#}", e)))?;
         self.validate_runtime_base_url(&cfg_value)?;
 
         let _from_cfg = self
@@ -527,7 +527,7 @@ impl HTTPLLMProviderFactory for ExtismFactory {
         let cfg_value: Value = match serde_json::from_str(cfg) {
             Ok(v) => v,
             Err(e) => {
-                return Some(Err(LLMError::PluginError(format!(
+                return Some(Err(LLMError::InvalidRequest(format!(
                     "Invalid JSON config: {:#}",
                     e
                 ))));
@@ -554,7 +554,7 @@ impl HTTPLLMProviderFactory for ExtismFactory {
 
     fn list_models_request(&self, cfg: &str) -> Result<http::Request<Vec<u8>>, LLMError> {
         let cfg_value: Value = serde_json::from_str(cfg)
-            .map_err(|e| LLMError::PluginError(format!("Invalid JSON config: {:#}", e)))?;
+            .map_err(|e| LLMError::InvalidRequest(format!("Invalid JSON config: {:#}", e)))?;
         self.validate_runtime_base_url(&cfg_value)?;
 
         let mut plug = self.plugin.lock().unwrap();
@@ -598,7 +598,7 @@ impl ExtismProvider {
     fn user_data_required(&self) -> Result<extism::UserData<functions::HostState>, LLMError> {
         self.user_data
             .clone()
-            .ok_or_else(|| LLMError::PluginError("No UserData found for Extism provider".into()))
+            .ok_or_else(|| LLMError::GenericError("No UserData found for Extism provider".into()))
     }
 
     fn effective_config(&self) -> Result<Value, LLMError> {
@@ -795,7 +795,7 @@ impl ChatProvider for ExtismProvider {
             let _ = state_guard.cancel_watch_tx.send(false);
             state_guard.yield_tx = Some(tx);
         } else {
-            return Err(LLMError::PluginError(
+            return Err(LLMError::GenericError(
                 "No UserData found for streaming".into(),
             ));
         }

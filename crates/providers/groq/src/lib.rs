@@ -159,7 +159,10 @@ impl OpenAIProviderConfig for Groq {
 }
 
 impl HTTPChatProvider for Groq {
-    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> querymt::error::ProviderDecodeError {
+    fn classify_chat_error(
+        &self,
+        response: &Response<Vec<u8>>,
+    ) -> querymt::error::ProviderDecodeError {
         classify_openai_http_error(response)
     }
 
@@ -200,7 +203,10 @@ struct GroqStreamParser {
 }
 
 impl ChatStreamParser for GroqStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
+    fn parse_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
         parse_openai_sse_chunk(chunk, &mut self.tool_states)
     }
 }
@@ -234,7 +240,7 @@ impl HTTPCompletionProvider for Groq {
         let url = self
             .base_url()
             .join("fim/completions")
-            .map_err(|e| LLMError::HttpError(e.to_string()))?;
+            .map_err(LLMError::from)?;
 
         Ok(Request::builder()
             .method(Method::POST)

@@ -906,8 +906,8 @@ mod tests {
         match &error {
             LLMError::ProviderResponseError { message, context } => {
                 assert!(message.contains("not found"));
-                assert_eq!(context.provider, PROVIDER_NAME);
-                assert_eq!(context.kind, ProviderErrorKind::InvalidRequest);
+                assert_eq!(context.provider(), PROVIDER_NAME);
+                assert_eq!(context.kind(), ProviderErrorKind::InvalidRequest);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -923,7 +923,7 @@ mod tests {
         assert!(!error.is_retryable());
         match &error {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind, ProviderErrorKind::ContextWindowExceeded);
+                assert_eq!(context.kind(), ProviderErrorKind::ContextWindowExceeded);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -939,7 +939,7 @@ mod tests {
         assert!(error.is_retryable());
         match &error {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind, ProviderErrorKind::ServerOverloaded);
+                assert_eq!(context.kind(), ProviderErrorKind::ServerOverloaded);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -957,7 +957,7 @@ mod tests {
         assert_eq!(error.retry_after_secs(), Some(7));
         match &error {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind, ProviderErrorKind::RateLimited);
+                assert_eq!(context.kind(), ProviderErrorKind::RateLimited);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -1016,13 +1016,13 @@ fn classify_ollama_http_error(response: &Response<Vec<u8>>) -> ProviderFailure {
         ProviderErrorKind::ServerOverloaded
     } else {
         // Fall through to status-only for bare 4xx/5xx without a useful message.
-        let mut classified = classify_status_only(status, response.headers(), response.body());
-        classified.set_retry_after_if_missing(retry_after_secs);
+        let classified = classify_status_only(status, response.headers(), response.body());
+        let retry_after_secs = classified.context.retry_after_secs().or(retry_after_secs);
+        let classified = classified.retry_after_secs(retry_after_secs);
         // Prefer the extracted message when present.
         if !message.is_empty() && message != String::from_utf8_lossy(response.body()) {
-            return ProviderFailure::new(message)
-                .kind(classified.context.kind)
-                .retry_after_secs(classified.context.retry_after_secs);
+            return ProviderFailure::new(classified.context.kind(), message)
+                .retry_after_secs(classified.context.retry_after_secs());
         }
         return classified;
     };
@@ -1033,7 +1033,5 @@ fn classify_ollama_http_error(response: &Response<Vec<u8>>) -> ProviderFailure {
         _ => retry_after_secs,
     };
 
-    ProviderFailure::new(message)
-        .kind(kind)
-        .retry_after_secs(retry_after_secs)
+    ProviderFailure::new(kind, message).retry_after_secs(retry_after_secs)
 }

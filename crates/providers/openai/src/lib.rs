@@ -372,7 +372,7 @@ mod tests {
             .attribute(PROVIDER_NAME);
         match error {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.provider, PROVIDER_NAME);
+                assert_eq!(context.provider(), PROVIDER_NAME);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }

@@ -54,11 +54,27 @@ pub(super) async fn transition_before_llm_call(
         return Ok(ExecutionState::Cancelled);
     }
 
-    let provider = exec_ctx
-        .session_handle
-        .provider()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to build provider: {}", e))?;
+    let provider = match super::llm_retry::call_with_retry(
+        config,
+        &exec_ctx.session_id,
+        &exec_ctx.cancellation_token,
+        || {
+            let session_handle = exec_ctx.session_handle.clone();
+            let cancel = exec_ctx.cancellation_token.clone();
+            async move {
+                tokio::select! {
+                    result = session_handle.provider() => result.map_err(LLMError::from),
+                    _ = cancel.cancelled() => Err(LLMError::Cancelled),
+                }
+            }
+        },
+    )
+    .await
+    {
+        Ok(provider) => provider,
+        Err(LLMError::Cancelled) => return Ok(ExecutionState::Cancelled),
+        Err(error) => return Err(PromptLlmError::new(LlmOperation::ProviderInit, error).into()),
+    };
 
     let tools = config.collect_tools(
         provider,
@@ -197,7 +213,7 @@ pub(super) async fn transition_call_llm(
     ) = if tools.is_empty() {
         // No tools — always use the non-streaming simple submit path.
         let cancel = exec_ctx.cancellation_token.clone();
-        let resp = match super::llm_retry::call_llm_with_retry(
+        let resp = match super::llm_retry::call_with_retry(
             config,
             session_id,
             &exec_ctx.cancellation_token,
@@ -421,8 +437,14 @@ pub(super) async fn transition_call_llm(
                                 },
                             );
 
-                            if super::llm_retry::wait_for_retry_delay(
+                            if super::llm_retry::wait_for_retry(
+                                config,
+                                session_id,
+                                &e,
+                                retry_number,
+                                max_stream_retries.saturating_add(1),
                                 wait_secs,
+                                true,
                                 &exec_ctx.cancellation_token,
                             )
                             .await
@@ -605,7 +627,7 @@ pub(super) async fn transition_call_llm(
         } else {
             // === NON-STREAMING FALLBACK ===
             let cancel = exec_ctx.cancellation_token.clone();
-            let resp = match super::llm_retry::call_llm_with_retry(
+            let resp = match super::llm_retry::call_with_retry(
                 config,
                 session_id,
                 &exec_ctx.cancellation_token,

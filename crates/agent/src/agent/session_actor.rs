@@ -2228,14 +2228,11 @@ mod tests {
 
     #[test]
     fn prompt_error_preserves_wrapped_llm_payload() {
-        let context = ProviderErrorContext {
-            provider: "openai".to_string(),
-            kind: ProviderErrorKind::UnknownTransient,
-            code: Some("server_error".to_string()),
-            error_type: Some("api_error".to_string()),
-            request_id: Some("req-456".to_string()),
-            retry_after_secs: Some(1),
-        };
+        let context = ProviderErrorContext::new("openai", ProviderErrorKind::UnknownTransient)
+            .with_code(Some("server_error".to_string()))
+            .with_error_type(Some("api_error".to_string()))
+            .with_request_id(Some("req-456".to_string()))
+            .with_retry_after_secs(Some(1));
         let error = anyhow::Error::new(crate::agent::execution::PromptLlmError::new(
             crate::agent::execution::LlmOperation::ChatStream,
             LLMError::ProviderResponseError {

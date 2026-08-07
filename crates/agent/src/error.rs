@@ -248,14 +248,13 @@ mod tests {
     fn provider_chat_maps_to_structured_internal_error() {
         let llm_error = LLMErrorPayload::ProviderError {
             message: "capacity exhausted".to_string(),
-            context: Some(ProviderErrorContext {
-                provider: "openai".to_string(),
-                kind: ProviderErrorKind::UnknownPermanent,
-                code: Some("server_error".to_string()),
-                error_type: Some("api_error".to_string()),
-                request_id: Some("req-123".to_string()),
-                retry_after_secs: Some(2),
-            }),
+            context: Some(
+                ProviderErrorContext::new("openai", ProviderErrorKind::UnknownPermanent)
+                    .with_code(Some("server_error".to_string()))
+                    .with_error_type(Some("api_error".to_string()))
+                    .with_request_id(Some("req-123".to_string()))
+                    .with_retry_after_secs(Some(2)),
+            ),
         };
         let acp: AcpError = AgentError::ProviderChat {
             operation: "chat_stream".to_string(),
@@ -280,8 +279,7 @@ mod tests {
                         "kind": "unknown_permanent",
                         "code": "server_error",
                         "error_type": "api_error",
-                        "request_id": "req-123",
-                        "retry_after_secs": 2
+                        "request_id": "req-123"
                     }
                 }
             }))
@@ -340,14 +338,11 @@ mod tests {
             llm_error: Some(
                 querymt::error::LLMError::ProviderResponseError {
                     message: "overloaded".to_string(),
-                    context: Box::new(ProviderErrorContext {
-                        provider: "codex".to_string(),
-                        kind: querymt::error::ProviderErrorKind::ServerOverloaded,
-                        code: Some("server_is_overloaded".to_string()),
-                        error_type: None,
-                        request_id: Some("req-1".to_string()),
-                        retry_after_secs: None,
-                    }),
+                    context: Box::new(
+                        ProviderErrorContext::new("codex", ProviderErrorKind::ServerOverloaded)
+                            .with_code(Some("server_is_overloaded".to_string()))
+                            .with_request_id(Some("req-1".to_string())),
+                    ),
                 }
                 .to_payload(),
             ),

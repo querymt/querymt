@@ -26,8 +26,8 @@ use querymt::{
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::{
-        ProviderFailure, LLMError, ProviderErrorKind, classify_status_only,
-        parse_retry_after, parse_retry_after_from_message,
+        LLMError, ProviderErrorKind, ProviderFailure, classify_status_only, parse_retry_after,
+        parse_retry_after_from_message,
     },
 };
 use schemars::JsonSchema;
@@ -1049,7 +1049,10 @@ impl HTTPChatProvider for Anthropic {
         // This path is success-only for the chat adapter.
 
         let mut json_resp: AnthropicCompleteResponse = serde_json::from_slice(resp.body())
-            .map_err(|e| LLMError::HttpError(format!("Failed to parse JSON: {}", e)))?;
+            .map_err(|e| LLMError::ResponseFormatError {
+                message: format!("Failed to parse Anthropic response JSON: {e}"),
+                raw_response: String::from_utf8_lossy(resp.body()).into_owned(),
+            })?;
 
         // Strip tool prefix from tool names in response (for OAuth)
         if self.is_oauth() {
@@ -1112,6 +1115,7 @@ impl ChatStreamParser for AnthropicStreamParser {
                         return Err(map_anthropic_api_error(
                             stream_resp.error.as_ref(),
                             data,
+                            None,
                             None,
                             false,
                         )
@@ -1246,8 +1250,7 @@ fn anthropic_error_kind(error_type: &str) -> Option<ProviderErrorKind> {
         "invalid_request_error" | "invalid_request" | "not_found_error" | "request_too_large" => {
             Some(ProviderErrorKind::InvalidRequest)
         }
-        // api_error is a generic server failure — leave kind unset; caller sets
-        // transient from HTTP status / stream context.
+        "api_error" => Some(ProviderErrorKind::UnknownTransient),
         _ => None,
     }
 }
@@ -1256,6 +1259,7 @@ fn map_anthropic_api_error(
     error: Option<&AnthropicApiErrorBody>,
     raw_body: &str,
     header_retry_after: Option<u64>,
+    request_id: Option<&str>,
     unknown_transient: bool,
 ) -> ProviderFailure {
     let error_type = error.and_then(|e| e.error_type.clone());
@@ -1290,10 +1294,10 @@ fn map_anthropic_api_error(
         _ => header_retry_after,
     };
 
-    ProviderFailure::new(message)
-        .kind(kind)
+    ProviderFailure::new(kind, message)
         .error_type(error_type)
         .code(type_norm)
+        .request_id(request_id.map(str::to_owned))
         .retry_after_secs(retry_after_secs)
 }
 
@@ -1301,6 +1305,11 @@ fn map_anthropic_api_error(
 fn classify_anthropic_http_error(response: &Response<Vec<u8>>) -> ProviderFailure {
     let status = response.status().as_u16();
     let retry_after_secs = parse_retry_after(response.headers());
+    let request_id = response
+        .headers()
+        .get("request-id")
+        .or_else(|| response.headers().get("x-request-id"))
+        .and_then(|value| value.to_str().ok());
     let body = String::from_utf8_lossy(response.body());
 
     // Prefer structured `{"type":"error","error":{...}}` or bare `{"error":{...}}`.
@@ -1327,6 +1336,7 @@ fn classify_anthropic_http_error(response: &Response<Vec<u8>>) -> ProviderFailur
                     parsed.as_ref(),
                     &body,
                     retry_after_secs,
+                    request_id,
                     status_guess_transient,
                 );
             }
@@ -1334,9 +1344,9 @@ fn classify_anthropic_http_error(response: &Response<Vec<u8>>) -> ProviderFailur
     }
 
     // Fall back to status-only classification (still attributed by caller).
-    let mut classified = classify_status_only(status, response.headers(), response.body());
-    classified.set_retry_after_if_missing(retry_after_secs);
-    classified
+    let classified = classify_status_only(status, response.headers(), response.body());
+    let retry_after_secs = classified.context.retry_after_secs().or(retry_after_secs);
+    classified.retry_after_secs(retry_after_secs)
 }
 
 impl HTTPCompletionProvider for Anthropic {
@@ -2023,9 +2033,9 @@ mod tests {
         assert!(error.is_retryable());
         match &error {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.provider, PROVIDER_NAME);
-                assert_eq!(context.kind, ProviderErrorKind::ServerOverloaded);
-                assert_eq!(context.error_type.as_deref(), Some("overloaded_error"));
+                assert_eq!(context.provider(), PROVIDER_NAME);
+                assert_eq!(context.kind(), ProviderErrorKind::ServerOverloaded);
+                assert_eq!(context.error_type(), Some("overloaded_error"));
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -2044,7 +2054,7 @@ mod tests {
         assert!(!error.is_retryable());
         match &error {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind, ProviderErrorKind::InvalidRequest);
+                assert_eq!(context.kind(), ProviderErrorKind::InvalidRequest);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -2055,6 +2065,7 @@ mod tests {
         let response = Response::builder()
             .status(429)
             .header(http::header::RETRY_AFTER, "12")
+            .header("request-id", "req-ant-http")
             .body(
                 br#"{"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}"#
                     .to_vec(),
@@ -2065,7 +2076,8 @@ mod tests {
         assert_eq!(error.retry_after_secs(), Some(12));
         match &error {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind, ProviderErrorKind::RateLimited);
+                assert_eq!(context.kind(), ProviderErrorKind::RateLimited);
+                assert_eq!(context.request_id(), Some("req-ant-http"));
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -2085,8 +2097,28 @@ mod tests {
         assert!(err.is_retryable());
         match err {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind, ProviderErrorKind::ServerOverloaded);
-                assert_eq!(context.provider, PROVIDER_NAME);
+                assert_eq!(context.kind(), ProviderErrorKind::ServerOverloaded);
+                assert_eq!(context.provider(), PROVIDER_NAME);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    #[test]
+    fn streaming_api_error_is_transient() {
+        let anthropic = test_anthropic("sk-ant-api03-test");
+        let mut parser = anthropic.chat_stream_parser().unwrap();
+        let line = br#"data: {"type":"error","error":{"type":"api_error","message":"Internal server error"}}
+"#;
+        let error = parser
+            .parse_chunk(line)
+            .expect_err("api error event must fail the stream")
+            .attribute(PROVIDER_NAME);
+
+        assert!(error.is_retryable());
+        match error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.kind(), ProviderErrorKind::UnknownTransient);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -2105,7 +2137,7 @@ mod tests {
         assert!(!err.is_retryable());
         match err {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind, ProviderErrorKind::InvalidRequest);
+                assert_eq!(context.kind(), ProviderErrorKind::InvalidRequest);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }

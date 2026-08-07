@@ -130,7 +130,7 @@ mod http_client {
                 .method()
                 .as_str()
                 .parse::<reqwest::Method>()
-                .map_err(|e| LLMError::HttpError(e.to_string()))?;
+                .map_err(|e| LLMError::InvalidRequest(e.to_string()))?;
 
             #[cfg(debug_assertions)]
             {
@@ -155,7 +155,7 @@ mod http_client {
             for (name, value) in req.headers().iter() {
                 let val_str = value
                     .to_str()
-                    .map_err(|e| LLMError::HttpError(e.to_string()))?;
+                    .map_err(|e| LLMError::InvalidRequest(e.to_string()))?;
                 rb = rb.header(name.as_str(), val_str);
             }
 
@@ -214,7 +214,7 @@ mod http_client {
                 .method()
                 .as_str()
                 .parse::<reqwest::Method>()
-                .map_err(|e| LLMError::HttpError(e.to_string()))?;
+                .map_err(|e| LLMError::InvalidRequest(e.to_string()))?;
 
             #[cfg(debug_assertions)]
             {
@@ -239,7 +239,7 @@ mod http_client {
             for (name, value) in req.headers().iter() {
                 let val_str = value
                     .to_str()
-                    .map_err(|e| LLMError::HttpError(e.to_string()))?;
+                    .map_err(|e| LLMError::InvalidRequest(e.to_string()))?;
                 rb = rb.header(name.as_str(), val_str);
             }
 

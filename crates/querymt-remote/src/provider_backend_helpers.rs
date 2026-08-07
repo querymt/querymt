@@ -194,10 +194,14 @@ impl RemoteProviderBackend for RegistryProviderBackend {
         if let Some(params) = request.params.as_ref() {
             builder = builder.parameters_from_value(params);
         }
-        let provider = builder
-            .build_with(&self.registry)
-            .await
-            .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))?;
+        let provider = builder.build_with(&self.registry).await.map_err(|e| {
+            let reason = e.to_string();
+            RemoteProviderHostError::ProviderChat {
+                operation: "provider_init".to_string(),
+                reason,
+                error: Some(e.to_payload()),
+            }
+        })?;
         Ok(Arc::from(provider))
     }
 }

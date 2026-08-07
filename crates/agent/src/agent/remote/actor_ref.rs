@@ -922,14 +922,10 @@ mod tests {
                 reason: "LLM streaming error: provider overloaded".to_string(),
                 llm_error: Some(LLMErrorPayload::ProviderError {
                     message: "provider overloaded".to_string(),
-                    context: Some(ProviderErrorContext {
-                        provider: "openai".to_string(),
-                        kind: ProviderErrorKind::UnknownTransient,
-                        code: Some("server_error".to_string()),
-                        error_type: None,
-                        request_id: None,
-                        retry_after_secs: None,
-                    }),
+                    context: Some(
+                        ProviderErrorContext::new("openai", ProviderErrorKind::UnknownTransient)
+                            .with_code(Some("server_error".to_string())),
+                    ),
                 }),
             });
 

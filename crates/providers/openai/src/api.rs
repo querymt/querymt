@@ -545,7 +545,7 @@ pub fn openai_stt_request<C: OpenAIProviderConfig>(
     let url = cfg
         .base_url()
         .join("audio/transcriptions")
-        .map_err(|e| LLMError::HttpError(e.to_string()))?;
+        .map_err(LLMError::from)?;
 
     let model = req.model.as_deref().unwrap_or(cfg.model());
     let filename = req.filename.as_deref().unwrap_or("audio.wav");
@@ -616,7 +616,7 @@ pub fn openai_tts_request<C: OpenAIProviderConfig>(
     let url = cfg
         .base_url()
         .join("audio/speech")
-        .map_err(|e| LLMError::HttpError(e.to_string()))?;
+        .map_err(LLMError::from)?;
 
     let model = req.model.as_deref().unwrap_or(cfg.model());
 
@@ -771,10 +771,7 @@ pub fn openai_embed_request<C: OpenAIProviderConfig>(
         dimensions: cfg.embedding_dimensions().copied(),
     };
 
-    let url = cfg
-        .base_url()
-        .join("embeddings")
-        .map_err(|e| LLMError::HttpError(e.to_string()))?;
+    let url = cfg.base_url().join("embeddings").map_err(LLMError::from)?;
     let json_body = serde_json::to_vec(&body).unwrap();
     let builder = Request::builder()
         .method(Method::POST)
@@ -874,7 +871,7 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
     let url = cfg
         .base_url()
         .join("chat/completions")
-        .map_err(|e| LLMError::HttpError(e.to_string()))?;
+        .map_err(LLMError::from)?;
 
     let builder = Request::builder()
         .method(Method::POST)
@@ -1322,8 +1319,7 @@ fn map_openai_error_envelope(
         _ => retry_after_secs,
     };
 
-    ProviderFailure::new(message)
-        .kind(kind)
+    ProviderFailure::new(kind, message)
         .code(code)
         .error_type(error_type)
         .request_id(request_id)
@@ -1343,19 +1339,14 @@ pub fn classify_openai_http_error(response: &Response<Vec<u8>>) -> ProviderDecod
     if let Some(envelope) = envelope.as_ref()
         && let Some(error) = envelope.get("error")
     {
-        let mut mapped = map_openai_error_envelope(
+        let mapped = map_openai_error_envelope(
             error,
             envelope,
             request_id,
             matches!(status, 429 | 500..=599),
         );
-        // Header Retry-After only for failures we actually retry.
-        // Permanent kinds (e.g. usage_limit_reached) must not sleep on a
-        // plan-cap header.
-        if mapped.is_retryable() {
-            mapped.set_retry_after_if_missing(retry_after_secs);
-        }
-        return mapped.into();
+        let retry_after_secs = mapped.context.retry_after_secs().or(retry_after_secs);
+        return mapped.retry_after_secs(retry_after_secs).into();
     }
 
     // No vendor envelope: classify from the status alone so the failure is
@@ -1876,10 +1867,10 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         match error {
             LLMError::ProviderResponseError { message, context } => {
                 assert_eq!(message, "slow down");
-                assert_eq!(context.kind, ProviderErrorKind::RateLimited);
-                assert_eq!(context.provider, "openrouter");
-                assert_eq!(context.request_id.as_deref(), Some("req-http"));
-                assert_eq!(context.retry_after_secs, Some(4));
+                assert_eq!(context.kind(), ProviderErrorKind::RateLimited);
+                assert_eq!(context.provider(), "openrouter");
+                assert_eq!(context.request_id(), Some("req-http"));
+                assert_eq!(context.retry_after_secs(), Some(4));
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -1911,7 +1902,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
             .attribute("groq");
         match error {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.provider, "groq");
+                assert_eq!(context.provider(), "groq");
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -1930,13 +1921,13 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         match &error {
             LLMError::ProviderResponseError { message, context } => {
                 assert_eq!(message, "backend unavailable");
-                assert_eq!(context.provider, PROVIDER_NAME);
-                assert_eq!(context.code.as_deref(), Some("server_error"));
-                assert_eq!(context.error_type.as_deref(), Some("server_error"));
-                assert_eq!(context.request_id.as_deref(), Some("req_123"));
-                assert_eq!(context.retry_after_secs, Some(3));
+                assert_eq!(context.provider(), PROVIDER_NAME);
+                assert_eq!(context.code(), Some("server_error"));
+                assert_eq!(context.error_type(), Some("server_error"));
+                assert_eq!(context.request_id(), Some("req_123"));
+                assert_eq!(context.retry_after_secs(), Some(3));
                 assert!(context.is_retryable());
-                assert_eq!(context.kind, ProviderErrorKind::UnknownTransient);
+                assert_eq!(context.kind(), ProviderErrorKind::UnknownTransient);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -1957,7 +1948,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
             error,
             LLMError::ProviderResponseError { ref message, ref context }
                 if message == "unsupported field"
-                    && context.kind == ProviderErrorKind::InvalidRequest
+                    && context.kind() == ProviderErrorKind::InvalidRequest
         ));
         assert!(!error.is_retryable());
     }
@@ -1975,8 +1966,8 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         match &error {
             LLMError::ProviderResponseError { message, context } => {
                 assert!(message.contains("Rate limit"));
-                assert_eq!(context.retry_after_secs, Some(2));
-                assert_eq!(context.kind, ProviderErrorKind::RateLimited);
+                assert_eq!(context.retry_after_secs(), Some(2));
+                assert_eq!(context.kind(), ProviderErrorKind::RateLimited);
             }
             other => panic!("expected rate limit, got {other}"),
         }
@@ -1996,8 +1987,8 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         match &error {
             LLMError::ProviderResponseError { message, context } => {
                 assert!(message.contains("quota"));
-                assert_eq!(context.kind, ProviderErrorKind::QuotaExceeded);
-                assert_eq!(context.code.as_deref(), Some("insufficient_quota"));
+                assert_eq!(context.kind(), ProviderErrorKind::QuotaExceeded);
+                assert_eq!(context.code(), Some("insufficient_quota"));
             }
             other => panic!("expected QuotaExceeded, got {other}"),
         }
@@ -2021,8 +2012,8 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         assert_eq!(error.retry_after_secs(), None);
         match &error {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind, ProviderErrorKind::QuotaExceeded);
-                assert_eq!(context.error_type.as_deref(), Some("usage_limit_reached"));
+                assert_eq!(context.kind(), ProviderErrorKind::QuotaExceeded);
+                assert_eq!(context.error_type(), Some("usage_limit_reached"));
             }
             other => panic!("expected QuotaExceeded, got {other}"),
         }
@@ -2040,7 +2031,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         assert!(matches!(
             error,
             LLMError::ProviderResponseError { ref context, .. }
-                if context.kind == ProviderErrorKind::ServerOverloaded
+                if context.kind() == ProviderErrorKind::ServerOverloaded
         ));
         assert!(error.is_retryable());
     }
@@ -2057,7 +2048,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         assert!(matches!(
             error,
             LLMError::ProviderResponseError { ref context, .. }
-                if context.kind == ProviderErrorKind::RateLimited
+                if context.kind() == ProviderErrorKind::RateLimited
         ));
         assert!(error.is_retryable());
     }
@@ -2074,7 +2065,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         assert!(matches!(
             error,
             LLMError::ProviderResponseError { ref context, .. }
-                if context.kind == ProviderErrorKind::ContextWindowExceeded
+                if context.kind() == ProviderErrorKind::ContextWindowExceeded
         ));
         assert!(!error.is_retryable());
     }

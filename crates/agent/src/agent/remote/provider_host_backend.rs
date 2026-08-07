@@ -32,10 +32,15 @@ impl RemoteProviderBackend for AgentConfigProviderBackend {
             )
             .await
             .map_err(|e| {
-                RemoteProviderHostError::Internal(format!(
-                    "ProviderHostActor: failed to build provider '{}' model '{}': {}",
-                    request.provider_name, request.model, e
-                ))
+                let error = querymt::error::LLMError::from(e);
+                RemoteProviderHostError::ProviderChat {
+                    operation: "provider_init".to_string(),
+                    reason: format!(
+                        "ProviderHostActor: failed to build provider '{}' model '{}': {}",
+                        request.provider_name, request.model, error
+                    ),
+                    error: Some(error.to_payload()),
+                }
             })
     }
 }

@@ -315,7 +315,7 @@ impl HTTPCompletionProvider for Xai {
         let url = self
             .base_url()
             .join("fim/completions")
-            .map_err(|e| LLMError::HttpError(e.to_string()))?;
+            .map_err(LLMError::from)?;
 
         let mut builder = Request::builder()
             .method(Method::POST)
@@ -801,10 +801,7 @@ fn xai_responses_chat_request<C: qmt_openai::api::OpenAIProviderConfig>(
         reasoning,
     };
     let json_body = serde_json::to_vec(&body)?;
-    let url = cfg
-        .base_url()
-        .join("responses")
-        .map_err(|e| LLMError::HttpError(e.to_string()))?;
+    let url = cfg.base_url().join("responses").map_err(LLMError::from)?;
 
     Ok(Request::builder()
         .method(Method::POST)
@@ -1036,9 +1033,9 @@ mod tests {
             .attribute(PROVIDER_NAME);
         match error {
             LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.provider, PROVIDER_NAME);
+                assert_eq!(context.provider(), PROVIDER_NAME);
                 assert_eq!(
-                    context.kind,
+                    context.kind(),
                     querymt::error::ProviderErrorKind::ServerOverloaded
                 );
             }

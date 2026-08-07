@@ -151,7 +151,10 @@ impl OpenAIProviderConfig for Mistral {
 }
 
 impl HTTPChatProvider for Mistral {
-    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> querymt::error::ProviderDecodeError {
+    fn classify_chat_error(
+        &self,
+        response: &Response<Vec<u8>>,
+    ) -> querymt::error::ProviderDecodeError {
         classify_openai_http_error(response)
     }
 
@@ -197,7 +200,7 @@ impl HTTPCompletionProvider for Mistral {
         let url = self
             .base_url()
             .join("fim/completions")
-            .map_err(|e| LLMError::HttpError(e.to_string()))?;
+            .map_err(LLMError::from)?;
 
         Ok(Request::builder()
             .method(Method::POST)

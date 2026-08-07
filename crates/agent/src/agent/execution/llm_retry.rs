@@ -22,15 +22,15 @@ use tracing::{Span, instrument};
     skip(config, cancel_token, call_fn),
     fields(session_id = %session_id, attempt = tracing::field::Empty, rate_limited = tracing::field::Empty)
 )]
-pub(super) async fn call_llm_with_retry<F, Fut>(
+pub(super) async fn call_with_retry<T, F, Fut>(
     config: &AgentConfig,
     session_id: &str,
     cancel_token: &CancellationToken,
     mut call_fn: F,
-) -> Result<Box<dyn querymt::chat::ChatResponse>, LLMError>
+) -> Result<T, LLMError>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<Box<dyn querymt::chat::ChatResponse>, LLMError>>,
+    Fut: std::future::Future<Output = Result<T, LLMError>>,
 {
     let max_attempts = config.execution_policy.rate_limit.max_attempts();
     let mut attempt = 0;
@@ -57,20 +57,17 @@ where
 
                 // Span field keeps the historical name; true means a retry wait occurred.
                 Span::current().record("rate_limited", true);
-                let wait_secs = retry_delay_secs(config, &e, attempt);
-                emit_retry_wait(
+                wait_for_retry(
                     config,
                     session_id,
                     &e,
                     attempt,
                     max_attempts,
-                    wait_secs,
+                    retry_delay_secs(config, &e, attempt),
                     false,
-                );
-
-                wait_for_retry_delay(wait_secs, cancel_token).await?;
-
-                emit_retry_resume(config, session_id, attempt.saturating_add(1), false);
+                    cancel_token,
+                )
+                .await?;
             }
         }
     }
@@ -164,6 +161,32 @@ fn emit_retry_resume(config: &AgentConfig, session_id: &str, next_attempt: usize
         },
     );
 }
+
+/// Emit the shared retry events around a cancellation-aware delay.
+pub(super) async fn wait_for_retry(
+    config: &AgentConfig,
+    session_id: &str,
+    error: &LLMError,
+    attempt: usize,
+    max_attempts: usize,
+    wait_secs: u64,
+    streaming: bool,
+    cancel_token: &CancellationToken,
+) -> Result<(), LLMError> {
+    emit_retry_wait(
+        config,
+        session_id,
+        error,
+        attempt,
+        max_attempts,
+        wait_secs,
+        streaming,
+    );
+    wait_for_retry_delay(wait_secs, cancel_token).await?;
+    emit_retry_resume(config, session_id, attempt.saturating_add(1), streaming);
+    Ok(())
+}
+
 fn apply_jitter(delay_secs: f64, ratio: f64, sample: f64) -> u64 {
     let ratio = ratio.clamp(0.0, 1.0);
     let sample = sample.clamp(0.0, 1.0);
@@ -241,20 +264,17 @@ where
                     return Err(e);
                 }
 
-                let wait_secs = retry_delay_secs(config, &e, attempt);
-                emit_retry_wait(
+                wait_for_retry(
                     config,
                     session_id,
                     &e,
                     attempt,
                     max_attempts,
-                    wait_secs,
+                    retry_delay_secs(config, &e, attempt),
                     true,
-                );
-
-                wait_for_retry_delay(wait_secs, cancel_token).await?;
-
-                emit_retry_resume(config, session_id, attempt.saturating_add(1), true);
+                    cancel_token,
+                )
+                .await?;
             }
         }
     }
@@ -465,27 +485,20 @@ mod tests {
         // Catch-all provider errors are not rate-limit UI events even if retryable.
         let non_rate = LLMError::ProviderResponseError {
             message: "server broke".to_string(),
-            context: Box::new(ProviderErrorContext {
-                provider: "openai".to_string(),
-                kind: ProviderErrorKind::UnknownTransient,
-                code: Some("server_error".to_string()),
-                error_type: Some("api_error".to_string()),
-                request_id: None,
-                retry_after_secs: None,
-            }),
+            context: Box::new(
+                ProviderErrorContext::new("openai", ProviderErrorKind::UnknownTransient)
+                    .with_code(Some("server_error".to_string()))
+                    .with_error_type(Some("api_error".to_string())),
+            ),
         };
         assert!(non_rate.rate_limit_info().is_none());
 
         let overloaded = LLMError::ProviderResponseError {
             message: "busy".into(),
-            context: Box::new(ProviderErrorContext {
-                provider: "codex".into(),
-                kind: querymt::error::ProviderErrorKind::ServerOverloaded,
-                code: Some("server_is_overloaded".into()),
-                error_type: None,
-                request_id: None,
-                retry_after_secs: None,
-            }),
+            context: Box::new(
+                ProviderErrorContext::new("codex", ProviderErrorKind::ServerOverloaded)
+                    .with_code(Some("server_is_overloaded".into())),
+            ),
         };
         assert!(overloaded.rate_limit_info().is_none());
         assert!(overloaded.is_retryable());
@@ -578,8 +591,21 @@ mod tests {
 
     #[test]
     fn test_is_retryable_plugin_error() {
-        let err = LLMError::PluginError("wasm stream failed".to_string());
+        let err = LLMError::PluginError("WASM runtime temporary failure".to_string());
         assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn deterministic_request_errors_are_not_retryable() {
+        assert!(!LLMError::InvalidUrl("bad base url".into()).is_retryable());
+        assert!(!LLMError::InvalidRequest("invalid header".into()).is_retryable());
+        assert!(
+            !LLMError::ResponseFormatError {
+                message: "invalid json".into(),
+                raw_response: "not json".into(),
+            }
+            .is_retryable()
+        );
     }
 
     #[test]
@@ -639,16 +665,16 @@ mod tests {
         ));
     }
 
-    // ── call_llm_with_retry tests ────────────────────────────────────────────
+    // ── call_with_retry tests ───────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_call_llm_with_retry_succeeds_first_attempt() {
+    async fn test_call_with_retry_succeeds_first_attempt() {
         let (config, _temp) = make_config().await;
         let token = CancellationToken::new();
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count2 = call_count.clone();
 
-        let result = call_llm_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", &token, || {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -664,13 +690,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_call_llm_with_retry_fails_non_rate_limit() {
+    async fn generic_call_with_retry_supports_provider_initialization() {
+        let (config, _temp) = make_config().await;
+        let token = CancellationToken::new();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count2 = call_count.clone();
+        let provider: Arc<dyn querymt::LLMProvider> = Arc::new(MockLlmProvider::new());
+
+        let result = call_with_retry(&config, "test-session", &token, || {
+            let count = call_count2.clone();
+            let provider = Arc::clone(&provider);
+            async move {
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(LLMError::Transport {
+                        kind: querymt::error::TransportErrorKind::ConnectionRefused,
+                        message: "registry temporarily unavailable".into(),
+                    })
+                } else {
+                    Ok(provider)
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_call_with_retry_fails_non_rate_limit() {
         let (config, _temp) = make_config().await;
         let token = CancellationToken::new();
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count2 = call_count.clone();
 
-        let result = call_llm_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", &token, || {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -685,13 +739,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_call_llm_with_retry_retries_transient_setup_errors() {
+    async fn test_call_with_retry_retries_transient_setup_errors() {
         let (config, _temp) = make_config().await;
         let token = CancellationToken::new();
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count2 = call_count.clone();
 
-        let result = call_llm_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", &token, || {
             let count = call_count2.clone();
             async move {
                 let attempt = count.fetch_add(1, Ordering::SeqCst);
@@ -715,12 +769,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_call_llm_with_retry_cancelled_before_start() {
+    async fn test_call_with_retry_cancelled_before_start() {
         let (config, _temp) = make_config().await;
         let token = CancellationToken::new();
         token.cancel();
 
-        let result = call_llm_with_retry(&config, "test-session", &token, || async {
+        let result = call_with_retry(&config, "test-session", &token, || async {
             Ok::<Box<dyn ChatResponse>, _>(Box::new(crate::test_utils::MockChatResponse::text_only(
                 "should not get here",
             )) as Box<dyn ChatResponse>)
@@ -731,7 +785,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_call_llm_with_retry_cancellation_during_delay_starts_no_retry() {
+    async fn test_call_with_retry_cancellation_during_delay_starts_no_retry() {
         let (config, _temp) = make_config().await;
         let token = CancellationToken::new();
         let token_clone = token.clone();
@@ -742,7 +796,7 @@ mod tests {
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             token_clone.cancel();
         });
-        let result = call_llm_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", &token, || {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -767,20 +821,16 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count2 = call_count.clone();
 
-        let result = call_llm_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", &token, || {
             let count = call_count2.clone();
             async move {
                 if count.fetch_add(1, Ordering::SeqCst) == 0 {
                     Err::<Box<dyn ChatResponse>, _>(LLMError::ProviderResponseError {
                         message: "busy".into(),
-                        context: Box::new(ProviderErrorContext {
-                            provider: "test".into(),
-                            kind: ProviderErrorKind::ServerOverloaded,
-                            code: None,
-                            error_type: None,
-                            request_id: None,
-                            retry_after_secs: Some(0),
-                        }),
+                        context: Box::new(
+                            ProviderErrorContext::new("test", ProviderErrorKind::ServerOverloaded)
+                                .with_retry_after_secs(Some(0)),
+                        ),
                     })
                 } else {
                     Ok::<Box<dyn ChatResponse>, _>(Box::new(
@@ -816,7 +866,7 @@ mod tests {
         let mut events = config.subscribe_events();
         let token = CancellationToken::new();
 
-        let result = call_llm_with_retry(&config, "test-session", &token, || async {
+        let result = call_with_retry(&config, "test-session", &token, || async {
             Err::<Box<dyn ChatResponse>, _>(LLMError::AuthError("bad key".into()))
         })
         .await;
@@ -836,7 +886,7 @@ mod tests {
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             token_clone.cancel();
         });
-        let result = call_llm_with_retry(&config, "test-session", &token, || async {
+        let result = call_with_retry(&config, "test-session", &token, || async {
             Err::<Box<dyn ChatResponse>, _>(LLMError::HttpStatus {
                 status_code: 503,
                 message: "unavailable".into(),
@@ -852,14 +902,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_call_llm_with_retry_rate_limit_exhausted() {
+    async fn test_call_with_retry_rate_limit_exhausted() {
         let (config, _temp) = make_config().await;
         // max_retries = 3
         let token = CancellationToken::new();
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count2 = call_count.clone();
 
-        let result = call_llm_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", &token, || {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -897,14 +947,12 @@ mod tests {
                     count.fetch_add(1, Ordering::SeqCst);
                     Err(LLMError::ProviderResponseError {
                         message: "overloaded".into(),
-                        context: Box::new(ProviderErrorContext {
-                            provider: "test".into(),
-                            kind: querymt::error::ProviderErrorKind::ServerOverloaded,
-                            code: Some("server_is_overloaded".into()),
-                            error_type: None,
-                            request_id: Some("request-3".into()),
-                            retry_after_secs: Some(0),
-                        }),
+                        context: Box::new(
+                            ProviderErrorContext::new("test", ProviderErrorKind::ServerOverloaded)
+                                .with_code(Some("server_is_overloaded".into()))
+                                .with_request_id(Some("request-3".into()))
+                                .with_retry_after_secs(Some(0)),
+                        ),
                     })
                 }
             })
@@ -914,8 +962,8 @@ mod tests {
             result,
             Err(LLMError::ProviderResponseError { message, context })
                 if message == "overloaded"
-                    && context.kind == querymt::error::ProviderErrorKind::ServerOverloaded
-                    && context.request_id.as_deref() == Some("request-3")
+                    && context.kind() == querymt::error::ProviderErrorKind::ServerOverloaded
+                    && context.request_id() == Some("request-3")
         ));
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
         assert_eq!(attempts_used, 3);
@@ -960,26 +1008,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_call_llm_with_retry_permanent_quota_is_called_exactly_once() {
+    async fn test_call_with_retry_permanent_quota_is_called_exactly_once() {
         let (config, _temp) = make_config().await;
         let token = CancellationToken::new();
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count2 = call_count.clone();
 
-        let result = call_llm_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", &token, || {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
                 Err::<Box<dyn ChatResponse>, _>(LLMError::ProviderResponseError {
                     message: "You have hit your usage limit.".into(),
-                    context: Box::new(ProviderErrorContext {
-                        provider: "codex".into(),
-                        kind: querymt::error::ProviderErrorKind::QuotaExceeded,
-                        code: Some("usage_limit_reached".into()),
-                        error_type: Some("usage_limit_reached".into()),
-                        request_id: None,
-                        retry_after_secs: None,
-                    }),
+                    context: Box::new(
+                        ProviderErrorContext::new("codex", ProviderErrorKind::QuotaExceeded)
+                            .with_code(Some("usage_limit_reached".into()))
+                            .with_error_type(Some("usage_limit_reached".into())),
+                    ),
                 })
             }
         })
@@ -988,7 +1033,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(LLMError::ProviderResponseError { context, .. })
-                if context.kind == querymt::error::ProviderErrorKind::QuotaExceeded
+                if context.kind() == querymt::error::ProviderErrorKind::QuotaExceeded
         ));
         assert_eq!(
             call_count.load(Ordering::SeqCst),
@@ -998,13 +1043,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_call_llm_with_retry_auth_error_is_called_exactly_once() {
+    async fn test_call_with_retry_auth_error_is_called_exactly_once() {
         let (config, _temp) = make_config().await;
         let token = CancellationToken::new();
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count2 = call_count.clone();
 
-        let result = call_llm_with_retry(&config, "test-session", &token, || {
+        let result = call_with_retry(&config, "test-session", &token, || {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);

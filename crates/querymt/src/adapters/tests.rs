@@ -271,11 +271,15 @@ impl ChatStreamParser for StreamTestParser {
         chunk: &[u8],
     ) -> Result<Vec<StreamChunk>, crate::error::ProviderDecodeError> {
         match self.mode {
-            StreamTestParserMode::ChunkClassified if !chunk.iter().all(|b| b.is_ascii_whitespace()) => {
-                Err(crate::error::ProviderFailure::new("mid-stream boom")
-                    .kind(crate::error::ProviderErrorKind::RateLimited)
-                    .retry_after_secs(Some(3))
-                    .into())
+            StreamTestParserMode::ChunkClassified
+                if !chunk.iter().all(|b| b.is_ascii_whitespace()) =>
+            {
+                Err(crate::error::ProviderFailure::new(
+                    crate::error::ProviderErrorKind::RateLimited,
+                    "mid-stream boom",
+                )
+                .retry_after_secs(Some(3))
+                .into())
             }
             _ => Ok(Vec::new()),
         }
@@ -284,9 +288,9 @@ impl ChatStreamParser for StreamTestParser {
     fn finish(&mut self) -> Result<Vec<StreamChunk>, crate::error::ProviderDecodeError> {
         match self.mode {
             StreamTestParserMode::FinishClassified => Err(crate::error::ProviderFailure::new(
+                crate::error::ProviderErrorKind::QuotaExceeded,
                 "finish boom",
             )
-            .kind(crate::error::ProviderErrorKind::QuotaExceeded)
             .into()),
             _ => Ok(Vec::new()),
         }
@@ -300,11 +304,13 @@ impl HTTPChatProvider for StreamTestProvider {
     ) -> crate::error::ProviderDecodeError {
         // Prove the adapter calls the provider classifier (not only status-only).
         let body = String::from_utf8_lossy(response.body());
-        crate::error::ProviderFailure::new(format!("classified:{body}"))
-            .kind(crate::error::ProviderErrorKind::RateLimited)
-            .retry_after_secs(Some(9))
-            .code(Some("vendor_rate".into()))
-            .into()
+        crate::error::ProviderFailure::new(
+            crate::error::ProviderErrorKind::RateLimited,
+            format!("classified:{body}"),
+        )
+        .retry_after_secs(Some(9))
+        .code(Some("vendor_rate".into()))
+        .into()
     }
 
     fn chat_request(
@@ -336,9 +342,7 @@ impl HTTPChatProvider for StreamTestProvider {
     }
 
     fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
-        Ok(Box::new(StreamTestParser {
-            mode: self.parser,
-        }))
+        Ok(Box::new(StreamTestParser { mode: self.parser }))
     }
 }
 
@@ -391,12 +395,13 @@ async fn stream_open_non_success_classifies_and_stamps_factory_name() {
                 "adapter must use provider classify_chat_error, got message={message}"
             );
             assert_eq!(
-                context.provider, "factory-openai",
+                context.provider(),
+                "factory-openai",
                 "factory/registry name must be stamped by the adapter"
             );
-            assert_eq!(context.kind, crate::error::ProviderErrorKind::RateLimited);
-            assert_eq!(context.code.as_deref(), Some("vendor_rate"));
-            assert_eq!(context.retry_after_secs, Some(9));
+            assert_eq!(context.kind(), crate::error::ProviderErrorKind::RateLimited);
+            assert_eq!(context.code(), Some("vendor_rate"));
+            assert_eq!(context.retry_after_secs(), Some(9));
         }
         other => panic!("expected ProviderResponseError, got {other}"),
     }
@@ -435,8 +440,11 @@ async fn stream_parser_finish_failure_stamps_factory_name() {
     match &err {
         LLMError::ProviderResponseError { message, context } => {
             assert_eq!(message, "finish boom");
-            assert_eq!(context.provider, "factory-codex");
-            assert_eq!(context.kind, crate::error::ProviderErrorKind::QuotaExceeded);
+            assert_eq!(context.provider(), "factory-codex");
+            assert_eq!(
+                context.kind(),
+                crate::error::ProviderErrorKind::QuotaExceeded
+            );
         }
         other => panic!("expected ProviderResponseError, got {other}"),
     }
@@ -474,9 +482,9 @@ async fn stream_parser_chunk_failure_stamps_factory_name() {
     match &err {
         LLMError::ProviderResponseError { message, context } => {
             assert_eq!(message, "mid-stream boom");
-            assert_eq!(context.provider, "factory-xai");
-            assert_eq!(context.kind, crate::error::ProviderErrorKind::RateLimited);
-            assert_eq!(context.retry_after_secs, Some(3));
+            assert_eq!(context.provider(), "factory-xai");
+            assert_eq!(context.kind(), crate::error::ProviderErrorKind::RateLimited);
+            assert_eq!(context.retry_after_secs(), Some(3));
         }
         other => panic!("expected ProviderResponseError, got {other}"),
     }

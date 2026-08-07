@@ -178,7 +178,11 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
                 msg.params.as_ref(),
             )
             .await
-            .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))?;
+            .map_err(|e| RemoteProviderHostError::ProviderChat {
+                operation: "provider_init".to_string(),
+                reason: e.to_string(),
+                error: Some(e.to_payload()),
+            })?;
 
             let tools_slice = msg.tools.as_deref();
             let response = provider
@@ -186,8 +190,8 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
                 .await
                 .map_err(|e| RemoteProviderHostError::ProviderChat {
                     operation: "chat_with_tools".to_string(),
-                    reason: serde_json::to_string(&e.to_payload())
-                        .unwrap_or_else(|_| e.to_string()),
+                    reason: e.to_string(),
+                    error: Some(e.to_payload()),
                 })?;
 
             let tool_calls = response.tool_calls().unwrap_or_default();
@@ -288,7 +292,11 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                     msg.params.as_ref(),
                 )
                 .await
-                .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))?;
+                .map_err(|e| RemoteProviderHostError::ProviderChat {
+                    operation: "provider_init".to_string(),
+                    reason: e.to_string(),
+                    error: Some(e.to_payload()),
+                })?;
 
                 let tools_slice = msg.tools.as_deref();
                 let stream = provider
@@ -296,8 +304,8 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                     .await
                     .map_err(|e| RemoteProviderHostError::ProviderChat {
                         operation: "chat_stream_with_tools".to_string(),
-                        reason: serde_json::to_string(&e.to_payload())
-                            .unwrap_or_else(|_| e.to_string()),
+                        reason: e.to_string(),
+                        error: Some(e.to_payload()),
                     })?;
 
                 Ok::<_, RemoteProviderHostError>((provider, stream))

@@ -3,11 +3,7 @@ use http::Request;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// One-shot HTTP/1.1 responder on a random localhost port.
-async fn serve_once(
-    status_line: &str,
-    headers: &[(&str, &str)],
-    body: &[u8],
-) -> String {
+async fn serve_once(status_line: &str, headers: &[(&str, &str)], body: &[u8]) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind test listener");
@@ -28,7 +24,10 @@ async fn serve_once(
             response.push_str(&format!("{k}: {v}\r\n"));
         }
         response.push_str("Connection: close\r\n\r\n");
-        socket.write_all(response.as_bytes()).await.expect("write hdr");
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write hdr");
         socket.write_all(&body).await.expect("write body");
     });
 
@@ -109,14 +108,14 @@ async fn stream_raw_success_returns_stream_variant() {
         .expect("transport should succeed");
 
     match result {
-        OutboundStreamResult::Success { response, stream: _ } => {
+        OutboundStreamResult::Success {
+            response,
+            stream: _,
+        } => {
             assert_eq!(response.status().as_u16(), 200);
         }
         OutboundStreamResult::Failure { response } => {
-            panic!(
-                "expected Success, got Failure status={}",
-                response.status()
-            )
+            panic!("expected Success, got Failure status={}", response.status())
         }
     }
 }
