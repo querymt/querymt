@@ -1061,8 +1061,13 @@ struct AnthropicStreamParser {
 }
 
 impl ChatStreamParser for AnthropicStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<querymt::chat::StreamChunk>, LLMError> {
-        let text = std::str::from_utf8(chunk).map_err(|e| LLMError::GenericError(e.to_string()))?;
+    fn parse_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<querymt::chat::StreamChunk>, querymt::error::ProviderDecodeError> {
+        let text = std::str::from_utf8(chunk).map_err(|e| {
+            querymt::error::ProviderDecodeError::terminal(LLMError::GenericError(e.to_string()))
+        })?;
         let mut chunks = Vec::new();
 
         for line in text.lines() {
@@ -1073,9 +1078,11 @@ impl ChatStreamParser for AnthropicStreamParser {
                 }
 
                 let stream_resp: AnthropicStreamResponse =
-                    serde_json::from_str(data).map_err(|e| LLMError::ResponseFormatError {
-                        message: format!("Failed to parse Anthropic stream data: {}", e),
-                        raw_response: data.to_string(),
+                    serde_json::from_str(data).map_err(|e| {
+                        querymt::error::ProviderDecodeError::response_format(
+                            format!("Failed to parse Anthropic stream data: {}", e),
+                            data.to_string(),
+                        )
                     })?;
 
                 match stream_resp.response_type.as_str() {

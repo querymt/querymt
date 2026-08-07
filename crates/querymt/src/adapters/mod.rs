@@ -1,0 +1,256 @@
+use crate::{
+    HTTPLLMProvider, LLMProvider, Tool,
+    chat::{ChatMessage, ChatProvider, ChatResponse, StreamChunk},
+    completion::{CompletionProvider, CompletionRequest, CompletionResponse},
+    embedding::EmbeddingProvider,
+    error::LLMError,
+    outbound::{OutboundStreamResult, call_outbound, call_outbound_raw, call_outbound_stream_raw},
+    stt, tts,
+};
+use async_trait::async_trait;
+use futures::StreamExt;
+use std::pin::Pin;
+use std::sync::Arc;
+#[cfg(feature = "tracing")]
+use tracing::instrument;
+
+pub struct LLMProviderFromHTTP {
+    /// Registry / factory identity. Stamped onto structured errors once.
+    name: String,
+    inner: Box<dyn HTTPLLMProvider>,
+}
+
+impl LLMProviderFromHTTP {
+    /// Wrap an HTTP provider. `name` should be [`crate::plugin::HTTPLLMProviderFactory::name`].
+    pub fn new(name: impl Into<String>, inner: Box<dyn HTTPLLMProvider>) -> Self {
+        Self {
+            name: name.into(),
+            inner,
+        }
+    }
+
+    /// Stamp factory identity onto a decode/classify failure.
+    fn attribute(&self, error: crate::error::ProviderDecodeError) -> LLMError {
+        error.attribute(self.name.as_str())
+    }
+
+    /// Ensure the provider's credential is fresh before building a request.
+    ///
+    /// If the provider has an [`ApiKeyResolver`](crate::auth::ApiKeyResolver),
+    /// this calls `resolve()` so that subsequent sync calls to `current()`
+    /// in the provider's request builders return a valid credential.
+    async fn ensure_credential_fresh(&self) -> Result<(), LLMError> {
+        if let Some(resolver) = self.inner.key_resolver() {
+            resolver.resolve().await?;
+        }
+        Ok(())
+    }
+
+    async fn do_chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        self.ensure_credential_fresh().await?;
+
+        let req = self.inner.chat_request(messages, tools)?;
+
+        let resp = call_outbound_raw(req).await?;
+        if !resp.status().is_success() {
+            return Err(self.attribute(self.inner.classify_chat_error(&resp)));
+        }
+
+        self.inner.parse_chat(resp)
+    }
+}
+
+#[async_trait]
+impl ChatProvider for LLMProviderFromHTTP {
+    fn supports_streaming(&self) -> bool {
+        self.inner.supports_streaming()
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "http_adapter.chat_with_tools", skip_all)
+    )]
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        self.do_chat(messages, tools).await
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "http_adapter.chat_stream_with_tools", skip_all)
+    )]
+    async fn chat_stream_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
+    {
+        if !self.inner.supports_streaming() {
+            return Err(LLMError::NotImplemented(
+                "Streaming not supported by underlying HTTP provider".into(),
+            ));
+        }
+
+        self.ensure_credential_fresh().await?;
+
+        let req = self.inner.chat_stream_request(messages, tools)?;
+
+        let stream = match call_outbound_stream_raw(req).await? {
+            OutboundStreamResult::Failure { response } => {
+                return Err(self.attribute(self.inner.classify_chat_error(&response)));
+            }
+            OutboundStreamResult::Success { stream, .. } => stream,
+        };
+
+        let mut parser = self.inner.chat_stream_parser()?;
+        let provider_name = self.name.clone();
+        let s = stream
+            .map(move |res: reqwest::Result<bytes::Bytes>| res.map_err(LLMError::from))
+            .chain(futures::stream::iter([
+                Ok(bytes::Bytes::from_static(b"\n")),
+                Ok(bytes::Bytes::new()),
+            ]))
+            .scan(
+                (Vec::new(), false, provider_name),
+                move |(buffer, done, provider_name), res| {
+                    if *done {
+                        return futures::future::ready(None);
+                    }
+
+                    let res = match res {
+                        Ok(bytes) => {
+                            if !bytes.is_empty() {
+                                log::trace!("Received chunk: {} bytes", bytes.len());
+                            }
+                            buffer.extend_from_slice(&bytes);
+                            let mut chunks = Vec::new();
+                            let mut start = 0;
+                            for i in 0..buffer.len() {
+                                if buffer[i] == b'\n' {
+                                    let line = &buffer[start..i + 1];
+                                    match parser.parse_chunk(line) {
+                                        Ok(mut parsed_chunks) => {
+                                            chunks.append(&mut parsed_chunks);
+                                        }
+                                        Err(e) => {
+                                            let e = e.attribute(provider_name.as_str());
+                                            log::debug!(
+                                                "Failed to parse SSE line: {:?}, error: {}",
+                                                String::from_utf8_lossy(line),
+                                                e
+                                            );
+                                            *done = true;
+                                            return futures::future::ready(Some(Err(e)));
+                                        }
+                                    }
+                                    start = i + 1;
+                                }
+                            }
+                            *buffer = buffer[start..].to_vec();
+
+                            if bytes.is_empty() {
+                                *done = true;
+                                match parser.finish() {
+                                    Ok(mut tail) => chunks.append(&mut tail),
+                                    Err(e) => {
+                                        return futures::future::ready(Some(Err(
+                                            e.attribute(provider_name.as_str())
+                                        )));
+                                    }
+                                }
+                            }
+
+                            Ok(chunks)
+                        }
+                        Err(e) => {
+                            *done = true;
+                            Err(e)
+                        }
+                    };
+                    futures::future::ready(Some(res))
+                },
+            )
+            .flat_map(|res: Result<Vec<StreamChunk>, LLMError>| {
+                let v: Vec<Result<StreamChunk, LLMError>> = match res {
+                    Ok(chunks) => chunks.into_iter().map(Ok).collect(),
+                    Err(e) => vec![Err(e)],
+                };
+                futures::stream::iter(v)
+            });
+
+        Ok(Box::pin(s))
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for LLMProviderFromHTTP {
+    #[cfg_attr(feature = "tracing", instrument(name = "http_adapter.embed", skip_all))]
+    async fn embed(&self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+        self.ensure_credential_fresh().await?;
+        let req = self.inner.embed_request(&inputs)?;
+        // call_outbound already classifies non-success statuses.
+        let resp = call_outbound(req).await?;
+        self.inner.parse_embed(resp)
+    }
+}
+
+#[async_trait]
+impl CompletionProvider for LLMProviderFromHTTP {
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "http_adapter.complete", skip_all)
+    )]
+    async fn complete(&self, req_obj: &CompletionRequest) -> Result<CompletionResponse, LLMError> {
+        self.ensure_credential_fresh().await?;
+        let req = self.inner.complete_request(req_obj)?;
+        let resp = call_outbound(req).await?;
+        self.inner.parse_complete(resp)
+    }
+}
+
+#[async_trait]
+impl LLMProvider for LLMProviderFromHTTP {
+    fn tools(&self) -> Option<&[Tool]> {
+        self.inner.tools()
+    }
+
+    fn set_key_resolver(&mut self, resolver: Arc<dyn crate::auth::ApiKeyResolver>) {
+        self.inner.set_key_resolver(resolver);
+    }
+
+    fn key_resolver(&self) -> Option<&Arc<dyn crate::auth::ApiKeyResolver>> {
+        self.inner.key_resolver()
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "http_adapter.transcribe", skip_all)
+    )]
+    async fn transcribe(&self, req_obj: &stt::SttRequest) -> Result<stt::SttResponse, LLMError> {
+        self.ensure_credential_fresh().await?;
+        let req = self.inner.stt_request(req_obj)?;
+        let resp = call_outbound(req).await?;
+        self.inner.parse_stt(resp)
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "http_adapter.speech", skip_all)
+    )]
+    async fn speech(&self, req_obj: &tts::TtsRequest) -> Result<tts::TtsResponse, LLMError> {
+        self.ensure_credential_fresh().await?;
+        let req = self.inner.tts_request(req_obj)?;
+        let resp = call_outbound(req).await?;
+        self.inner.parse_tts(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests;

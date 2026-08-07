@@ -194,8 +194,12 @@ struct GroqStreamParser {
 }
 
 impl ChatStreamParser for GroqStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+    fn parse_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
         parse_openai_sse_chunk(chunk, &mut self.tool_states)
+            .map_err(querymt::error::ProviderDecodeError::terminal)
     }
 }
 

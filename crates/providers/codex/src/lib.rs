@@ -173,8 +173,12 @@ struct CodexStreamParser {
 }
 
 impl ChatStreamParser for CodexStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+    fn parse_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
         api::codex_parse_stream_chunk_with_state(chunk, &self.tool_states)
+            .map_err(querymt::error::ProviderDecodeError::terminal)
     }
 }
 

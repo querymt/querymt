@@ -354,12 +354,16 @@ impl XaiStreamParser {
 }
 
 impl ChatStreamParser for XaiStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+    fn parse_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
         if self.use_responses_api {
             codex_parse_stream_chunk_with_state(chunk, &self.codex_tool_state)
         } else {
             parse_openai_sse_chunk(chunk, &mut self.openai_tool_state)
         }
+        .map_err(querymt::error::ProviderDecodeError::terminal)
     }
 }
 

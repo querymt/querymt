@@ -402,7 +402,11 @@ impl LLMProviderFactory for ExtismFactory {
 
         if self.supports_http_adapter_abi() {
             let http_provider: Box<dyn HTTPLLMProvider> = Box::new(provider);
-            return Ok(Box::new(LLMProviderFromHTTP::new(http_provider)));
+            // Factory name is the registry identity; adapter stamps errors.
+            return Ok(Box::new(LLMProviderFromHTTP::new(
+                self.name.as_str(),
+                http_provider,
+            )));
         }
 
         Ok(Box::new(provider))
@@ -1151,7 +1155,10 @@ impl Drop for ExtismStreamParser {
 }
 
 impl ChatStreamParser for ExtismStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+    fn parse_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<StreamChunk>, crate::error::ProviderDecodeError> {
         let mut plug = self.plugin.lock().unwrap();
         let out: Json<Vec<ExtismChatChunk>> = plug
             .call_get_error_code(
@@ -1161,22 +1168,64 @@ impl ChatStreamParser for ExtismStreamParser {
                     chunk: chunk.to_vec(),
                 }),
             )
-            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            .map_err(|(e, code)| {
+                crate::error::ProviderDecodeError::terminal(decode_plugin_error(e, code))
+            })?;
         Ok(out.0.into_iter().map(|item| item.chunk).collect())
     }
 
-    fn finish(&mut self) -> Result<Vec<StreamChunk>, LLMError> {
+    fn finish(&mut self) -> Result<Vec<StreamChunk>, crate::error::ProviderDecodeError> {
         let mut plug = self.plugin.lock().unwrap();
         let out: Json<Vec<ExtismChatChunk>> = plug
             .call_get_error_code("chat_stream_parser_finish", Json(self.parser_id))
-            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            .map_err(|(e, code)| {
+                crate::error::ProviderDecodeError::terminal(decode_plugin_error(e, code))
+            })?;
         drop(plug);
-        self.close()?;
+        self.close()
+            .map_err(crate::error::ProviderDecodeError::terminal)?;
         Ok(out.0.into_iter().map(|item| item.chunk).collect())
     }
 }
 
 impl HTTPChatProvider for ExtismProvider {
+    fn classify_chat_error(
+        &self,
+        response: &http::Response<Vec<u8>>,
+    ) -> crate::error::ProviderDecodeError {
+        let cfg = match self.effective_config() {
+            Ok(cfg) => cfg,
+            Err(error) => return crate::error::ProviderDecodeError::terminal(error),
+        };
+        let mut plug = self.plugin.lock().unwrap();
+        if !plug.function_exists("classify_chat_error") {
+            return crate::error::classify_status_only(
+                response.status().as_u16(),
+                response.headers(),
+                response.body(),
+            )
+            .into();
+        }
+
+        let response = response.clone();
+        let result: Result<Json<PluginError>, (extism::Error, i32)> = plug.call_get_error_code(
+            "classify_chat_error",
+            Json(ExtismChatParseRequest {
+                cfg,
+                resp: SerializableHttpResponse { resp: response },
+            }),
+        );
+        match result {
+            // Plugin may already stamp identity; adapter will re-stamp with host name.
+            Ok(Json(error)) => {
+                crate::error::ProviderDecodeError::terminal(LLMError::from_payload(error.payload))
+            }
+            Err((error, code)) => {
+                crate::error::ProviderDecodeError::terminal(decode_plugin_error(error, code))
+            }
+        }
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],

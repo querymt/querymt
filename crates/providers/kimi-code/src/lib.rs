@@ -188,7 +188,10 @@ struct KimiCodeStreamParser {
 }
 
 impl ChatStreamParser for KimiCodeStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+    fn parse_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
         log::trace!(
             "kimi-code SSE chunk ({} bytes): {:?}",
             chunk.len(),
@@ -196,6 +199,7 @@ impl ChatStreamParser for KimiCodeStreamParser {
         );
         let normalized = KimiCode::normalize_sse_data_prefix(chunk);
         parse_openai_sse_chunk(&normalized, &mut self.tool_states)
+            .map_err(querymt::error::ProviderDecodeError::terminal)
     }
 }
 

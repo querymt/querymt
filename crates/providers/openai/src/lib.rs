@@ -216,8 +216,12 @@ struct OpenAIStreamParser {
 }
 
 impl ChatStreamParser for OpenAIStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
+    fn parse_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
         api::parse_openai_sse_chunk(chunk, &mut self.tool_states)
+            .map_err(querymt::error::ProviderDecodeError::terminal)
     }
 }
 

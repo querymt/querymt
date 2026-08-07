@@ -1026,13 +1026,21 @@ struct GoogleStreamParser {
 }
 
 impl ChatStreamParser for GoogleStreamParser {
-    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<querymt::chat::StreamChunk>, LLMError> {
-        let text =
-            std::str::from_utf8(chunk).map_err(|e| LLMError::GenericError(format!("{:#}", e)))?;
+    fn parse_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<Vec<querymt::chat::StreamChunk>, querymt::error::ProviderDecodeError> {
+        let text = std::str::from_utf8(chunk).map_err(|e| {
+            querymt::error::ProviderDecodeError::terminal(LLMError::GenericError(format!(
+                "{:#}",
+                e
+            )))
+        })?;
 
         self.buffer.push_str(text);
 
-        let (extracted_chunks, bytes_consumed) = extract_complete_json_objects(&self.buffer)?;
+        let (extracted_chunks, bytes_consumed) = extract_complete_json_objects(&self.buffer)
+            .map_err(querymt::error::ProviderDecodeError::terminal)?;
 
         if bytes_consumed > 0 {
             self.buffer.drain(..bytes_consumed);
