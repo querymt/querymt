@@ -671,7 +671,7 @@ impl LLMError {
             let kind = context.kind();
             let previous =
                 std::mem::replace(context, Box::new(ProviderErrorContext::unattributed(kind)));
-            *context = Box::new(previous.with_provider(provider));
+            **context = previous.with_provider(provider);
         }
         self
     }
