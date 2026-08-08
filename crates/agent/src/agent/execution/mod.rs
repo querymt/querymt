@@ -66,6 +66,48 @@ pub enum CycleOutcome {
     Stopped(StopReason),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LlmOperation {
+    ProviderInit,
+    Chat,
+    ChatStream,
+}
+
+#[derive(Debug)]
+pub(crate) struct PromptLlmError {
+    operation: LlmOperation,
+    source: querymt::error::LLMError,
+}
+
+impl PromptLlmError {
+    pub(crate) fn new(operation: LlmOperation, source: querymt::error::LLMError) -> Self {
+        // Cancellation is a control-flow outcome (`ExecutionState::Cancelled`),
+        // not an error. `map_failed_llm_call` intercepts it before wrapping.
+        debug_assert!(
+            !matches!(source, querymt::error::LLMError::Cancelled),
+            "LLMError::Cancelled must not be wrapped in PromptLlmError"
+        );
+        Self { operation, source }
+    }
+}
+
+impl std::fmt::Display for PromptLlmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self.operation {
+            LlmOperation::ProviderInit => "LLM provider initialization error",
+            LlmOperation::Chat => "LLM chat error",
+            LlmOperation::ChatStream => "LLM streaming error",
+        };
+        write!(f, "{label}: {}", self.source)
+    }
+}
+
+impl std::error::Error for PromptLlmError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 //  State machine implementation
 // ══════════════════════════════════════════════════════════════════════════
