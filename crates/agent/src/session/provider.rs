@@ -575,9 +575,7 @@ impl SessionProvider {
             ));
 
             // Generic path — works for Extism providers that implement set_key_resolver.
-            let mut provider = factory.from_config(&pruned_config_str).map_err(|e| {
-                LLMError::PluginError(format!("provider '{}': {}", provider_name, e))
-            })?;
+            let mut provider = factory.from_config(&pruned_config_str)?;
             provider.set_key_resolver(resolver.clone());
 
             if provider.key_resolver().is_some() {
@@ -592,10 +590,7 @@ impl SessionProvider {
             // Fallback for native HTTP providers: set the resolver on the inner
             // HTTPLLMProvider before it gets wrapped in Arc by the adapter.
             if let Some(http_factory) = factory.as_http() {
-                let mut http_provider =
-                    http_factory.from_config(&pruned_config_str).map_err(|e| {
-                        LLMError::PluginError(format!("provider '{}': {}", provider_name, e))
-                    })?;
+                let mut http_provider = http_factory.from_config(&pruned_config_str)?;
                 http_provider.set_key_resolver(resolver);
 
                 log::debug!(
@@ -618,9 +613,7 @@ impl SessionProvider {
             return Ok(Arc::from(provider));
         }
 
-        let provider = factory
-            .from_config(&pruned_config_str)
-            .map_err(|e| LLMError::PluginError(format!("provider '{}': {}", provider_name, e)))?;
+        let provider = factory.from_config(&pruned_config_str)?;
         Ok(Arc::from(provider))
     }
 }
@@ -1124,6 +1117,7 @@ pub mod tests {
     use querymt::chat::{ChatMessage, ChatResponse, FinishReason, StreamChunk};
     use querymt::completion::{CompletionRequest, CompletionResponse};
     use querymt::error::LLMError;
+    use querymt::plugin::LLMProviderFactory;
     use std::pin::Pin;
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
@@ -1228,6 +1222,57 @@ pub mod tests {
     }
 
     impl LLMProvider for MockProvider {}
+
+    struct InvalidConfigFactory;
+
+    impl LLMProviderFactory for InvalidConfigFactory {
+        fn name(&self) -> &str {
+            "invalid-config"
+        }
+
+        fn config_schema(&self) -> String {
+            "{}".into()
+        }
+
+        fn from_config(&self, _cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
+            Err(LLMError::InvalidRequest("bad provider config".into()))
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            _cfg: &str,
+        ) -> querymt::plugin::Fut<'a, Result<Vec<String>, LLMError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn build_provider_preserves_typed_factory_error() {
+        use crate::session::sqlite_storage::SqliteStorage;
+
+        let registry = Arc::new(PluginRegistry::empty());
+        registry.register_static(Arc::new(InvalidConfigFactory));
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("connect test storage"),
+        );
+        let provider = SessionProvider::new(registry, storage, LLMParams::new());
+
+        let error = match provider
+            .build_provider(ProviderRequest::new("invalid-config", "test-model"))
+            .await
+        {
+            Ok(_) => panic!("factory construction should fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            SessionError::ProviderError(LLMError::InvalidRequest(message))
+                if message == "bad provider config"
+        ));
+    }
 
     // ── resolve_api_key_with_preference tests ─────────────────────────────────
 
