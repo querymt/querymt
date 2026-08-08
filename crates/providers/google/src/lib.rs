@@ -45,14 +45,16 @@ use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort, StreamChunk,
+        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort,
         StructuredOutputFormat, Tool, ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
-    error::LLMError,
-    handle_http_error,
+    error::{
+        LLMError, ProviderDecodeError, ProviderErrorKind, ProviderFailure, classify_status_only,
+        parse_retry_after,
+    },
     plugin::HTTPLLMProviderFactory,
 };
 use schemars::{JsonSchema, schema_for};
@@ -715,6 +717,10 @@ impl Google {
 }
 
 impl HTTPChatProvider for Google {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> ProviderDecodeError {
+        classify_google_http_error(response).into()
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
@@ -913,7 +919,10 @@ impl HTTPChatProvider for Google {
     }
 
     fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
-        handle_http_error!(resp);
+        debug_assert!(
+            resp.status().is_success(),
+            "parse_chat is success-only; adapter must classify non-success first"
+        );
 
         let json_resp: Result<GoogleChatResponse, serde_json::Error> =
             serde_json::from_slice(resp.body());
@@ -1029,18 +1038,14 @@ impl ChatStreamParser for GoogleStreamParser {
     fn parse_chunk(
         &mut self,
         chunk: &[u8],
-    ) -> Result<Vec<querymt::chat::StreamChunk>, querymt::error::ProviderDecodeError> {
+    ) -> Result<Vec<querymt::chat::StreamChunk>, ProviderDecodeError> {
         let text = std::str::from_utf8(chunk).map_err(|e| {
-            querymt::error::ProviderDecodeError::terminal(LLMError::GenericError(format!(
-                "{:#}",
-                e
-            )))
+            ProviderDecodeError::terminal(LLMError::GenericError(format!("{:#}", e)))
         })?;
 
         self.buffer.push_str(text);
 
-        let (extracted_chunks, bytes_consumed) = extract_complete_json_objects(&self.buffer)
-            .map_err(querymt::error::ProviderDecodeError::terminal)?;
+        let (extracted_chunks, bytes_consumed) = extract_complete_json_objects(&self.buffer)?;
 
         if bytes_consumed > 0 {
             self.buffer.drain(..bytes_consumed);
@@ -1061,8 +1066,7 @@ impl ChatStreamParser for GoogleStreamParser {
 /// Returns (extracted StreamChunks, number of bytes consumed from buffer)
 fn extract_complete_json_objects(
     buffer: &str,
-) -> Result<(Vec<querymt::chat::StreamChunk>, usize), LLMError> {
-    let _result_chunks: Vec<querymt::chat::StreamChunk> = Vec::new();
+) -> Result<(Vec<querymt::chat::StreamChunk>, usize), ProviderDecodeError> {
     let mut bytes_consumed = 0;
 
     // Strip leading whitespace and array opening bracket
@@ -1093,29 +1097,39 @@ fn try_parse_json_objects(
     original_buffer: &str,
     initial_offset: usize,
     text: &str,
-) -> Result<(Vec<querymt::chat::StreamChunk>, usize), LLMError> {
+) -> Result<(Vec<querymt::chat::StreamChunk>, usize), ProviderDecodeError> {
     use serde_json::Deserializer;
 
     let mut result_chunks = Vec::new();
     let mut total_consumed = initial_offset;
 
-    // Try to parse JSON objects using StreamDeserializer
-    let mut deserializer = Deserializer::from_str(text).into_iter::<GoogleChatResponse>();
+    // Value first so mid-stream `{"error":{...}}` objects are classified, not
+    // left as incomplete GoogleChatResponse parse failures.
+    let mut deserializer = Deserializer::from_str(text).into_iter::<Value>();
 
     while let Some(result) = deserializer.next() {
         match result {
-            Ok(response) => {
-                // Track how many bytes we consumed
+            Ok(value) => {
                 let byte_offset = deserializer.byte_offset();
                 total_consumed = initial_offset + byte_offset;
 
-                // Extract StreamChunks from this response
-                let chunks = extract_google_stream_chunks(response);
-                result_chunks.extend(chunks);
+                if value.get("error").is_some() {
+                    return Err(map_google_error_value(&value, None, None, true).into());
+                }
+
+                match serde_json::from_value::<GoogleChatResponse>(value) {
+                    Ok(response) => {
+                        let chunks = extract_google_stream_chunks(response);
+                        result_chunks.extend(chunks);
+                    }
+                    Err(_) => {
+                        // Complete JSON that is neither a chat chunk nor an error —
+                        // skip it rather than stalling the stream.
+                    }
+                }
             }
             Err(_e) => {
-                // Parse error - likely incomplete JSON
-                // Don't consume any more bytes - leave the rest in the buffer
+                // Incomplete JSON — leave the rest in the buffer.
                 break;
             }
         }
@@ -1132,6 +1146,162 @@ fn try_parse_json_objects(
     }
 
     Ok((result_chunks, total_consumed))
+}
+
+/// Map Google Generative Language API error `status` strings to kinds.
+fn google_error_kind(status: &str) -> Option<ProviderErrorKind> {
+    match status {
+        "RESOURCE_EXHAUSTED" | "RESOURCE_EXHAUSTED_ERROR" => Some(ProviderErrorKind::RateLimited),
+        "UNAUTHENTICATED" | "PERMISSION_DENIED" => Some(ProviderErrorKind::Authentication),
+        "INVALID_ARGUMENT" | "FAILED_PRECONDITION" | "NOT_FOUND" | "OUT_OF_RANGE" => {
+            Some(ProviderErrorKind::InvalidRequest)
+        }
+        "UNAVAILABLE" => Some(ProviderErrorKind::ServerOverloaded),
+        "DEADLINE_EXCEEDED" | "INTERNAL" | "UNKNOWN" => Some(ProviderErrorKind::UnknownTransient),
+        _ => None,
+    }
+}
+
+fn parse_google_duration(value: &str) -> Option<std::time::Duration> {
+    let value = value.trim().strip_suffix('s')?;
+    let seconds = value.parse::<f64>().ok()?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs_f64(seconds))
+}
+
+fn google_retry_after_secs(error: Option<&Value>, header_retry_after: Option<u64>) -> Option<u64> {
+    header_retry_after.or_else(|| {
+        error?
+            .get("details")?
+            .as_array()?
+            .iter()
+            .find_map(|detail| {
+                let is_retry_info = detail
+                    .get("@type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|ty| {
+                        ty.ends_with("google.rpc.RetryInfo") || ty.ends_with("RetryInfo")
+                    });
+                is_retry_info
+                    .then(|| detail.get("retryDelay"))
+                    .flatten()
+                    .and_then(|delay| match delay {
+                        Value::String(value) => parse_google_duration(value),
+                        Value::Object(value) => {
+                            let seconds = value.get("seconds").and_then(|v| {
+                                v.as_u64()
+                                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                            })?;
+                            let nanos = value.get("nanos").and_then(Value::as_u64).unwrap_or(0);
+                            Some(std::time::Duration::new(
+                                seconds,
+                                nanos.min(999_999_999) as u32,
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .map(|duration| duration.as_secs() + u64::from(duration.subsec_nanos() > 0))
+            })
+    })
+}
+
+fn map_google_error_value(
+    envelope: &Value,
+    header_retry_after: Option<u64>,
+    request_id: Option<&str>,
+    unknown_transient: bool,
+) -> ProviderFailure {
+    let error = envelope.get("error");
+    let retry_after_secs = google_retry_after_secs(error, header_retry_after);
+    let message = error
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            error
+                .and_then(|e| e.get("status"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| envelope.to_string());
+
+    let status_str = error
+        .and_then(|e| e.get("status"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let code = error.and_then(|e| e.get("code")).and_then(|c| {
+        c.as_i64()
+            .map(|n| n.to_string())
+            .or_else(|| c.as_str().map(str::to_owned))
+    });
+
+    // RESOURCE_EXHAUSTED commonly names rate-limit quota metrics. Only explicit
+    // account/billing exhaustion is a permanent quota failure.
+    let message_lower = message.to_ascii_lowercase();
+    let hard_quota = message_lower.contains("billing")
+        || message_lower.contains("payment")
+        || message_lower.contains("account quota")
+        || message_lower.contains("current quota")
+        || message_lower.contains("quota has been exhausted")
+        || message_lower.contains("quota is exhausted")
+        || message_lower.contains("upgrade your plan");
+    let kind = if hard_quota {
+        ProviderErrorKind::QuotaExceeded
+    } else if message_lower.contains("token")
+        && (message_lower.contains("limit")
+            || message_lower.contains("context")
+            || message_lower.contains("too long")
+            || message_lower.contains("maximum")
+            || message_lower.contains("input"))
+    {
+        ProviderErrorKind::ContextWindowExceeded
+    } else {
+        status_str
+            .as_deref()
+            .and_then(google_error_kind)
+            .unwrap_or(if unknown_transient {
+                ProviderErrorKind::UnknownTransient
+            } else {
+                ProviderErrorKind::UnknownPermanent
+            })
+    };
+
+    let retry_after_secs = kind.is_retryable().then_some(retry_after_secs).flatten();
+
+    ProviderFailure::new(kind, message)
+        .error_type(status_str)
+        .code(code)
+        .request_id(request_id.map(str::to_owned))
+        .retry_after_secs(retry_after_secs)
+}
+
+fn classify_google_http_error(response: &Response<Vec<u8>>) -> ProviderFailure {
+    let status = response.status().as_u16();
+    let retry_after_secs = parse_retry_after(response.headers());
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .or_else(|| response.headers().get("request-id"))
+        .and_then(|value| value.to_str().ok());
+    let status_guess_transient = matches!(status, 408 | 425 | 429 | 500..=599);
+
+    if let Ok(envelope) = serde_json::from_slice::<Value>(response.body())
+        && envelope.get("error").is_some()
+    {
+        return map_google_error_value(
+            &envelope,
+            retry_after_secs,
+            request_id,
+            status_guess_transient,
+        );
+    }
+
+    let classified = classify_status_only(status, response.headers(), response.body());
+    let retry_after_secs = classified.context.retry_after_secs().or(retry_after_secs);
+    classified.retry_after_secs(retry_after_secs)
 }
 
 /// Extract StreamChunks from a GoogleChatResponse
@@ -1342,5 +1512,208 @@ mod extism_exports {
         config = Google,
         factory = GoogleFactory,
         name   = "google",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use querymt::chat::http::HTTPChatProvider;
+
+    #[test]
+    fn classify_http_resource_exhausted_is_rate_limited() {
+        let google = test_google();
+        let response = Response::builder()
+            .status(429)
+            .header(http::header::RETRY_AFTER, "15")
+            .header("x-request-id", "req-google-http")
+            .body(
+                br#"{"error":{"code":429,"message":"Resource exhausted","status":"RESOURCE_EXHAUSTED"}}"#
+                    .to_vec(),
+            )
+            .unwrap();
+        let error = google.classify_chat_error(&response).attribute("google");
+        assert!(error.is_retryable());
+        assert_eq!(error.retry_after_secs(), Some(15));
+        match &error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.provider(), "google");
+                assert_eq!(context.kind(), ProviderErrorKind::RateLimited);
+                assert_eq!(context.error_type(), Some("RESOURCE_EXHAUSTED"));
+                assert_eq!(context.code(), Some("429"));
+                assert_eq!(context.request_id(), Some("req-google-http"));
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    fn test_google() -> Google {
+        Google {
+            api_key: "test".into(),
+            model: "gemini-2.0-flash".into(),
+            max_tokens: None,
+            temperature: None,
+            system: None,
+            timeout_seconds: None,
+            stream: Some(true),
+            top_p: None,
+            top_k: None,
+            json_schema: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            thinking_budget: None,
+            cached_content: None,
+            key_resolver: None,
+        }
+    }
+
+    #[test]
+    fn classify_http_google_retry_info_is_preserved() {
+        let response = Response::builder()
+            .status(429)
+            .body(
+                br#"{"error":{"code":429,"message":"Quota metric exhausted","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1.5s"}]}}"#
+                    .to_vec(),
+            )
+            .unwrap();
+        let error = classify_google_http_error(&response).attribute("google");
+        assert!(error.is_retryable());
+        assert_eq!(error.retry_after_secs(), Some(2));
+    }
+
+    #[test]
+    fn classify_http_quota_metric_message_remains_rate_limited() {
+        let response = Response::builder()
+            .status(429)
+            .header(http::header::RETRY_AFTER, "9")
+            .body(
+                br#"{"error":{"code":429,"message":"Quota exceeded for quota metric 'GenerateContent requests per minute'","status":"RESOURCE_EXHAUSTED"}}"#
+                    .to_vec(),
+            )
+            .unwrap();
+        let error = classify_google_http_error(&response).attribute("google");
+        assert!(error.is_retryable());
+        assert_eq!(error.retry_after_secs(), Some(9));
+        match &error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.kind(), ProviderErrorKind::RateLimited);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    #[test]
+    fn classify_http_quota_message_is_permanent() {
+        let response = Response::builder()
+            .status(429)
+            .body(
+                br#"{"error":{"code":429,"message":"You exceeded your current quota","status":"RESOURCE_EXHAUSTED"}}"#
+                    .to_vec(),
+            )
+            .unwrap();
+        let error = classify_google_http_error(&response).attribute("google");
+        assert!(!error.is_retryable());
+        match &error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.kind(), ProviderErrorKind::QuotaExceeded);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    #[test]
+    fn classify_http_unauthenticated_is_permanent() {
+        let response = Response::builder()
+            .status(401)
+            .body(
+                br#"{"error":{"code":401,"message":"API key not valid","status":"UNAUTHENTICATED"}}"#
+                    .to_vec(),
+            )
+            .unwrap();
+        let error = classify_google_http_error(&response).attribute("google");
+        assert!(!error.is_retryable());
+        match &error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.kind(), ProviderErrorKind::Authentication);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    #[test]
+    fn classify_http_unavailable_is_overloaded() {
+        let response = Response::builder()
+            .status(503)
+            .body(
+                br#"{"error":{"code":503,"message":"The service is currently unavailable","status":"UNAVAILABLE"}}"#
+                    .to_vec(),
+            )
+            .unwrap();
+        let error = classify_google_http_error(&response).attribute("google");
+        assert!(error.is_retryable());
+        match &error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.kind(), ProviderErrorKind::ServerOverloaded);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    #[test]
+    fn classify_http_invalid_argument_is_permanent() {
+        let response = Response::builder()
+            .status(400)
+            .body(
+                br#"{"error":{"code":400,"message":"Invalid value at 'contents'","status":"INVALID_ARGUMENT"}}"#
+                    .to_vec(),
+            )
+            .unwrap();
+        let error = classify_google_http_error(&response).attribute("google");
+        assert!(!error.is_retryable());
+        match &error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.kind(), ProviderErrorKind::InvalidRequest);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    #[test]
+    fn stream_parser_classifies_mid_stream_error_object() {
+        let google = test_google();
+        let mut parser = google.chat_stream_parser().unwrap();
+        let chunk = br#"{"error":{"code":429,"message":"Resource exhausted","status":"RESOURCE_EXHAUSTED"}}"#;
+        let err = parser
+            .parse_chunk(chunk)
+            .expect_err("mid-stream error object must classify");
+        let attributed = err.attribute("google");
+        assert!(attributed.is_retryable());
+        match &attributed {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.kind(), ProviderErrorKind::RateLimited);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    #[test]
+    fn stream_parser_keeps_unknown_google_server_error_retryable() {
+        let google = test_google();
+        let mut parser = google.chat_stream_parser().unwrap();
+        let chunk =
+            br#"{"error":{"code":500,"message":"Internal server error","status":"INTERNAL"}}"#;
+        let error = parser
+            .parse_chunk(chunk)
+            .expect_err("mid-stream server error must classify")
+            .attribute("google");
+
+        assert!(error.is_retryable());
+        match error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.kind(), ProviderErrorKind::UnknownTransient);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
     }
 }
