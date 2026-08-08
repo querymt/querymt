@@ -1193,37 +1193,12 @@ impl HTTPChatProvider for ExtismProvider {
         &self,
         response: &http::Response<Vec<u8>>,
     ) -> crate::error::ProviderDecodeError {
-        let cfg = match self.effective_config() {
-            Ok(cfg) => cfg,
-            Err(error) => return crate::error::ProviderDecodeError::terminal(error),
-        };
-        let mut plug = self.plugin.lock().unwrap();
-        if !plug.function_exists("classify_chat_error") {
-            return crate::error::classify_status_only(
-                response.status().as_u16(),
-                response.headers(),
-                response.body(),
-            )
-            .into();
-        }
-
-        let response = response.clone();
-        let result: Result<Json<PluginError>, (extism::Error, i32)> = plug.call_get_error_code(
-            "classify_chat_error",
-            Json(ExtismChatParseRequest {
-                cfg,
-                resp: SerializableHttpResponse { resp: response },
-            }),
-        );
-        match result {
-            // Plugin may already stamp identity; adapter will re-stamp with host name.
-            Ok(Json(error)) => {
-                crate::error::ProviderDecodeError::terminal(LLMError::from_payload(error.payload))
-            }
-            Err((error, code)) => {
-                crate::error::ProviderDecodeError::terminal(decode_plugin_error(error, code))
-            }
-        }
+        crate::error::classify_status_only(
+            response.status().as_u16(),
+            response.headers(),
+            response.body(),
+        )
+        .into()
     }
 
     fn chat_request(
