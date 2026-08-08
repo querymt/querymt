@@ -9,6 +9,7 @@ use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
 use anyhow::Result;
 use futures_util::StreamExt;
 use querymt::chat::{ChatRole, StreamChunk};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -381,7 +382,105 @@ pub fn filter_to_effective_history(messages: Vec<AgentMessage>) -> Vec<AgentMess
     // tool_result part.  Legacy sessions stored one message per tool result
     // which violates the LLM API contract that all tool_results for a batch
     // of tool_use calls appear in a single user message.
-    merge_consecutive_tool_result_messages(without_snapshots)
+    let merged = merge_consecutive_tool_result_messages(without_snapshots);
+
+    // A process or transport can disappear after tool_use is persisted but before
+    // its result is stored. Repair the LLM projection so those sessions remain usable.
+    repair_dangling_tool_uses(merged)
+}
+
+/// Add synthetic error results for persisted tool calls that never completed.
+///
+/// This only repairs the effective history sent to providers; it deliberately does
+/// not rewrite the raw session transcript.
+///
+/// TODO(raw-history-tool-invariant): To guarantee the raw database never contains a
+/// dangling tool use, persist the assistant tool-use message and pending error result
+/// atomically, then replace that placeholder with the real result on completion. That
+/// requires a transactional store API and durable tool-execution state, rather than a
+/// projection-level repair.
+fn repair_dangling_tool_uses(messages: Vec<AgentMessage>) -> Vec<AgentMessage> {
+    let mut result_ids: HashSet<String> = messages
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .filter_map(|part| match part {
+            MessagePart::ToolResult { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let mut input = messages.into_iter().peekable();
+    let mut repaired = Vec::with_capacity(input.len());
+
+    while let Some(message) = input.next() {
+        let mut missing_results = Vec::new();
+        if message.role == ChatRole::Assistant {
+            for part in &message.parts {
+                if let MessagePart::ToolUse(call) = part
+                    && result_ids.insert(call.id.clone())
+                {
+                    missing_results.push(MessagePart::ToolResult {
+                        call_id: call.id.clone(),
+                        content: vec![querymt::chat::Content::text(
+                            "Error: tool execution was interrupted before a result was stored",
+                        )],
+                        is_error: true,
+                        tool_name: Some(call.function.name.clone()),
+                        tool_arguments: Some(call.function.arguments.clone()),
+                        compacted_at: None,
+                    });
+                }
+            }
+        }
+
+        let session_id = message.session_id.clone();
+        let created_at = message.created_at;
+        repaired.push(message);
+
+        if missing_results.is_empty() {
+            continue;
+        }
+
+        log::warn!(
+            "Repairing dangling tool calls in effective history: session_id={} call_ids={:?}",
+            session_id,
+            missing_results
+                .iter()
+                .filter_map(|part| match part {
+                    MessagePart::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
+
+        let next_is_tool_result = input.peek().is_some_and(|next| {
+            next.role == ChatRole::User
+                && next
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, MessagePart::ToolResult { .. }))
+        });
+        if next_is_tool_result {
+            input
+                .peek_mut()
+                .expect("peeked tool-result message must exist")
+                .parts
+                .extend(missing_results);
+        } else {
+            repaired.push(AgentMessage {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id,
+                role: ChatRole::User,
+                parts: missing_results,
+                created_at,
+                parent_message_id: None,
+                source_provider: None,
+                source_model: None,
+            });
+        }
+    }
+
+    repaired
 }
 
 /// Merge runs of consecutive `User` messages where **every** message in the
@@ -1253,24 +1352,37 @@ mod tests {
     }
 
     /// Helper: an Assistant message with tool_use parts.
-    fn make_assistant_tool_use(id: &str, session_id: &str) -> AgentMessage {
+    fn make_assistant_tool_uses(
+        id: &str,
+        session_id: &str,
+        calls: &[(&str, &str, &str)],
+    ) -> AgentMessage {
         AgentMessage {
             id: id.to_string(),
             session_id: session_id.to_string(),
             role: ChatRole::Assistant,
-            parts: vec![MessagePart::ToolUse(querymt::ToolCall {
-                id: "tu-1".to_string(),
-                call_type: "function".to_string(),
-                function: querymt::FunctionCall {
-                    name: "tool".to_string(),
-                    arguments: "{}".to_string(),
-                },
-            })],
+            parts: calls
+                .iter()
+                .map(|(call_id, name, arguments)| {
+                    MessagePart::ToolUse(querymt::ToolCall {
+                        id: (*call_id).to_string(),
+                        call_type: "function".to_string(),
+                        function: querymt::FunctionCall {
+                            name: (*name).to_string(),
+                            arguments: (*arguments).to_string(),
+                        },
+                    })
+                })
+                .collect(),
             created_at: 0,
             parent_message_id: None,
             source_provider: None,
             source_model: None,
         }
+    }
+
+    fn make_assistant_tool_use(id: &str, session_id: &str) -> AgentMessage {
+        make_assistant_tool_uses(id, session_id, &[("tu-1", "tool", "{}")])
     }
 
     #[test]
@@ -1350,5 +1462,113 @@ mod tests {
             4,
             "2 split tool_result msgs should be merged into 1"
         );
+    }
+
+    #[test]
+    fn test_effective_history_repairs_dangling_tool_use_before_follow_up_prompt() {
+        let messages = vec![
+            MessageFixture::user_message("1", "s1", "ask me"),
+            make_assistant_tool_uses(
+                "2",
+                "s1",
+                &[("call-question", "question", r#"{"questions":[]}"#)],
+            ),
+            MessageFixture::user_message("3", "s1", "continue"),
+        ];
+
+        let repaired = filter_to_effective_history(messages);
+
+        assert_eq!(repaired.len(), 4);
+        assert_eq!(repaired[2].role, ChatRole::User);
+        assert_eq!(repaired[3].id, "3", "repair must precede the follow-up");
+        assert!(matches!(
+            &repaired[2].parts[..],
+            [MessagePart::ToolResult {
+                call_id,
+                is_error: true,
+                tool_name: Some(tool_name),
+                tool_arguments: Some(arguments),
+                ..
+            }] if call_id == "call-question"
+                && tool_name == "question"
+                && arguments == r#"{"questions":[]}"#
+        ));
+    }
+
+    #[test]
+    fn test_effective_history_completes_partial_parallel_result_batch() {
+        let messages = vec![
+            MessageFixture::user_message("1", "s1", "run both"),
+            make_assistant_tool_uses(
+                "2",
+                "s1",
+                &[("call-a", "tool_a", "{}"), ("call-b", "tool_b", "{}")],
+            ),
+            make_user_tool_result("3", "s1", "call-a"),
+            MessageFixture::assistant_message("4", "s1", "done"),
+        ];
+
+        let repaired = filter_to_effective_history(messages);
+
+        assert_eq!(repaired.len(), 4, "repair should reuse the result message");
+        let result_ids = repaired[2]
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::ToolResult {
+                    call_id, is_error, ..
+                } => Some((call_id.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(result_ids, vec![("call-a", false), ("call-b", true)]);
+    }
+
+    #[test]
+    fn test_effective_history_leaves_balanced_history_unchanged() {
+        let messages = vec![
+            MessageFixture::user_message("1", "s1", "run it"),
+            make_assistant_tool_uses("2", "s1", &[("call-a", "tool", "{}")]),
+            make_user_tool_result("3", "s1", "call-a"),
+            MessageFixture::assistant_message("4", "s1", "done"),
+        ];
+        let expected = serde_json::to_value(&messages).unwrap();
+
+        let repaired = filter_to_effective_history(messages);
+
+        assert_eq!(serde_json::to_value(repaired).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_effective_history_dangling_tool_repair_is_idempotent() {
+        let messages = vec![
+            MessageFixture::user_message("1", "s1", "run it"),
+            make_assistant_tool_uses("2", "s1", &[("call-a", "tool", "{}")]),
+            MessageFixture::user_message("3", "s1", "continue"),
+        ];
+
+        let repaired_once = filter_to_effective_history(messages);
+        let expected = serde_json::to_value(&repaired_once).unwrap();
+        let repaired_twice = filter_to_effective_history(repaired_once);
+
+        assert_eq!(serde_json::to_value(repaired_twice).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_effective_history_does_not_repair_tool_use_before_compaction() {
+        let messages = vec![
+            MessageFixture::user_message("1", "s1", "old prompt"),
+            make_assistant_tool_uses("2", "s1", &[("old-call", "tool", "{}")]),
+            MessageFixture::compaction_request_message("3", "s1"),
+            MessageFixture::compaction_message("4", "s1", "summary"),
+            MessageFixture::user_message("5", "s1", "new prompt"),
+        ];
+
+        let repaired = filter_to_effective_history(messages);
+
+        assert_eq!(repaired.len(), 3);
+        assert!(repaired.iter().all(|message| message.parts.iter().all(
+            |part| !matches!(part, MessagePart::ToolResult { call_id, .. } if call_id == "old-call")
+        )));
     }
 }
