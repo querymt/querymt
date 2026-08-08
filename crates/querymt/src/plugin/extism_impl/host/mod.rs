@@ -57,6 +57,10 @@ fn decode_plugin_error(e: extism::Error, code: i32) -> LLMError {
     PluginError::decode(code, &raw)
 }
 
+fn parse_config_json(cfg: &str) -> Result<Value, LLMError> {
+    serde_json::from_str(cfg).map_err(LLMError::from)
+}
+
 #[cfg(debug_assertions)]
 fn header_token_hint(value: Option<&http::HeaderValue>) -> String {
     let Some(value) = value else {
@@ -341,6 +345,14 @@ impl ExtismFactory {
     fn validate_runtime_base_url(&self, cfg: &Value) -> Result<(), LLMError> {
         validate_runtime_base_url(&self.name, &self.allowed_hosts, cfg)
     }
+
+    fn validate_plugin_config(&self, cfg: &Value) -> Result<(), LLMError> {
+        let mut plug = self.plugin.lock().unwrap();
+        let _: Json<Value> = plug
+            .call_get_error_code("from_config", Json(cfg.clone()))
+            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+        Ok(())
+    }
 }
 
 fn validate_runtime_base_url(
@@ -389,13 +401,10 @@ impl LLMProviderFactory for ExtismFactory {
     }
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
-        let cfg_value: Value = serde_json::from_str(cfg)
-            .map_err(|e| LLMError::PluginError(format!("Invalid JSON config: {:#}", e)))?;
+        let cfg_value = parse_config_json(cfg)?;
         self.validate_runtime_base_url(&cfg_value)?;
 
-        let _from_cfg = self
-            .call("from_config", &cfg_value)
-            .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
+        self.validate_plugin_config(&cfg_value)?;
 
         let provider = ExtismProvider {
             plugin: self.plugin.clone(),
@@ -418,16 +427,9 @@ impl LLMProviderFactory for ExtismFactory {
     fn list_models<'a>(&'a self, cfg: &str) -> Fut<'a, Result<Vec<String>, LLMError>> {
         // list_models can do host HTTP calls, so run the Extism VM call off the Tokio runtime
         // thread to avoid deadlocks on current-thread runtimes.
-        let cfg_value: Value = match serde_json::from_str(cfg) {
-            Ok(v) => v,
-            Err(e) => {
-                return Box::pin(async move {
-                    Err(LLMError::PluginError(format!(
-                        "Invalid JSON config: {:#}",
-                        e
-                    )))
-                });
-            }
+        let cfg_value = match parse_config_json(cfg) {
+            Ok(value) => value,
+            Err(error) => return Box::pin(async move { Err(error) }),
         };
 
         if self.supports_http_adapter_abi() {
@@ -508,13 +510,10 @@ impl HTTPLLMProviderFactory for ExtismFactory {
     }
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn crate::HTTPLLMProvider>, LLMError> {
-        let cfg_value: Value = serde_json::from_str(cfg)
-            .map_err(|e| LLMError::PluginError(format!("Invalid JSON config: {:#}", e)))?;
+        let cfg_value = parse_config_json(cfg)?;
         self.validate_runtime_base_url(&cfg_value)?;
 
-        let _from_cfg = self
-            .call("from_config", &cfg_value)
-            .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
+        self.validate_plugin_config(&cfg_value)?;
 
         let provider = ExtismProvider {
             plugin: self.plugin.clone(),
@@ -526,14 +525,9 @@ impl HTTPLLMProviderFactory for ExtismFactory {
     }
 
     fn list_models_static(&self, cfg: &str) -> Option<Result<Vec<String>, LLMError>> {
-        let cfg_value: Value = match serde_json::from_str(cfg) {
-            Ok(v) => v,
-            Err(e) => {
-                return Some(Err(LLMError::PluginError(format!(
-                    "Invalid JSON config: {:#}",
-                    e
-                ))));
-            }
+        let cfg_value = match parse_config_json(cfg) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(error)),
         };
 
         let mut plug = self.plugin.lock().unwrap();
@@ -555,8 +549,7 @@ impl HTTPLLMProviderFactory for ExtismFactory {
     }
 
     fn list_models_request(&self, cfg: &str) -> Result<http::Request<Vec<u8>>, LLMError> {
-        let cfg_value: Value = serde_json::from_str(cfg)
-            .map_err(|e| LLMError::PluginError(format!("Invalid JSON config: {:#}", e)))?;
+        let cfg_value = parse_config_json(cfg)?;
         self.validate_runtime_base_url(&cfg_value)?;
 
         let mut plug = self.plugin.lock().unwrap();
@@ -1433,6 +1426,14 @@ impl HTTPLLMProvider for ExtismProvider {
 mod tests {
     use super::*;
     use crate::chat::StreamChunk;
+
+    #[test]
+    fn malformed_config_is_json_error() {
+        let error = parse_config_json("{").expect_err("config should be rejected");
+
+        assert!(!error.is_retryable());
+        assert!(matches!(error, LLMError::JsonError(_)));
+    }
 
     #[test]
     fn build_allowed_hosts_prefers_configured_base_url_over_plugin_default() {
