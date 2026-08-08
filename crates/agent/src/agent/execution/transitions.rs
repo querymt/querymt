@@ -441,10 +441,12 @@ pub(super) async fn transition_call_llm(
                                 config,
                                 session_id,
                                 &e,
-                                retry_number,
-                                max_stream_retries.saturating_add(1),
-                                wait_secs,
-                                true,
+                                super::llm_retry::RetryWait {
+                                    attempt: retry_number,
+                                    max_attempts: max_stream_retries.saturating_add(1),
+                                    wait_secs,
+                                    streaming: true,
+                                },
                                 &exec_ctx.cancellation_token,
                             )
                             .await

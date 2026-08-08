@@ -574,9 +574,11 @@ mod tests {
 
     #[test]
     fn rate_limit_config_omits_runtime_only_fields_on_serialize() {
-        let mut cfg = RateLimitConfig::default();
-        cfg.jitter_ratio = 0.9;
-        cfg.max_wait_secs = 42;
+        let cfg = RateLimitConfig {
+            jitter_ratio: 0.9,
+            max_wait_secs: 42,
+            ..Default::default()
+        };
 
         let value = serde_json::to_value(&cfg).expect("serialize");
         let obj = value.as_object().expect("object");

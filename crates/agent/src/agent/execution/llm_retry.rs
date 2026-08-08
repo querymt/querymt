@@ -61,10 +61,12 @@ where
                     config,
                     session_id,
                     &e,
-                    attempt,
-                    max_attempts,
-                    retry_delay_secs(config, &e, attempt),
-                    false,
+                    RetryWait {
+                        attempt,
+                        max_attempts,
+                        wait_secs: retry_delay_secs(config, &e, attempt),
+                        streaming: false,
+                    },
                     cancel_token,
                 )
                 .await?;
@@ -162,28 +164,38 @@ fn emit_retry_resume(config: &AgentConfig, session_id: &str, next_attempt: usize
     );
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct RetryWait {
+    pub(super) attempt: usize,
+    pub(super) max_attempts: usize,
+    pub(super) wait_secs: u64,
+    pub(super) streaming: bool,
+}
+
 /// Emit the shared retry events around a cancellation-aware delay.
 pub(super) async fn wait_for_retry(
     config: &AgentConfig,
     session_id: &str,
     error: &LLMError,
-    attempt: usize,
-    max_attempts: usize,
-    wait_secs: u64,
-    streaming: bool,
+    retry: RetryWait,
     cancel_token: &CancellationToken,
 ) -> Result<(), LLMError> {
     emit_retry_wait(
         config,
         session_id,
         error,
-        attempt,
-        max_attempts,
-        wait_secs,
-        streaming,
+        retry.attempt,
+        retry.max_attempts,
+        retry.wait_secs,
+        retry.streaming,
     );
-    wait_for_retry_delay(wait_secs, cancel_token).await?;
-    emit_retry_resume(config, session_id, attempt.saturating_add(1), streaming);
+    wait_for_retry_delay(retry.wait_secs, cancel_token).await?;
+    emit_retry_resume(
+        config,
+        session_id,
+        retry.attempt.saturating_add(1),
+        retry.streaming,
+    );
     Ok(())
 }
 
@@ -268,10 +280,12 @@ where
                     config,
                     session_id,
                     &e,
-                    attempt,
-                    max_attempts,
-                    retry_delay_secs(config, &e, attempt),
-                    true,
+                    RetryWait {
+                        attempt,
+                        max_attempts,
+                        wait_secs: retry_delay_secs(config, &e, attempt),
+                        streaming: true,
+                    },
                     cancel_token,
                 )
                 .await?;
