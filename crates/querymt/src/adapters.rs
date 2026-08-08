@@ -253,4 +253,5 @@ impl LLMProvider for LLMProviderFromHTTP {
 }
 
 #[cfg(test)]
+#[path = "adapters/tests.rs"]
 mod tests;
