@@ -261,9 +261,9 @@ pub struct RateLimitConfig {
     #[serde(default = "default_rate_limit_backoff_multiplier")]
     pub backoff_multiplier: f64,
 
-    /// Maximum stream recreations after a pre-output failure (default: 1).
-    /// This is additionally bounded by `max_retries`, the shared request-attempt budget.
-    /// Once text, thinking, or tool output is observed, the stream is not recreated.
+    /// Maximum stream recreations after retryable mid-stream failures (default: 1).
+    /// On each recreation, accumulated server-side state is discarded and a fresh
+    /// stream-creation retry budget is used, preserving the historical behavior.
     #[serde(default = "default_stream_max_retries")]
     pub max_stream_retries: usize,
 

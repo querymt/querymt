@@ -267,7 +267,7 @@ pub(super) async fn transition_call_llm(
 
             // Accumulators live outside the retry loop so the post-stream
             // processing below can read them regardless of how many attempts
-            // were needed. Retries are allowed only before semantic output.
+            // were needed. On each retry they are reset to empty.
             let mut text = String::new();
             let mut thinking = String::new();
             // Initial values are always overwritten inside the retry loop below
@@ -334,20 +334,34 @@ pub(super) async fn transition_call_llm(
             }
 
             // ── Outer retry loop ─────────────────────────────────────────────
-            // A retry is safe only while the failed attempt has produced no
-            // semantic output, so no user-visible content can be rolled back.
-            let mut retry_budget = super::llm_retry::StreamRetryBudget::new(
-                max_stream_retries,
-                config.execution_policy.rate_limit.max_attempts(),
-            );
+            // Preserve the established behavior: retryable mid-stream failures
+            // recreate the request and discard this attempt's accumulated state,
+            // even if deltas were already emitted.
+            //
+            // TODO(stream-retry-safety): once clients can atomically replace or
+            // roll back emitted deltas, restrict transparent recreation to
+            // failures before text, thinking, or tool output. Changing that
+            // boundary before rollback support would break existing recovery.
+            let mut stream_attempt = 0;
             'stream: loop {
-                let mut semantic_output_seen = false;
+                stream_attempt += 1;
+
+                // Reset accumulators on retry so we start fresh.
+                text.clear();
+                thinking.clear();
+                thinking_signature = None;
+                stream_tool_calls.clear();
+                tool_call_ids.clear();
+                usage = None;
+                stream_finish_reason = None;
+                text_buffer.clear();
+                thinking_buffer.clear();
+                last_flush = Instant::now();
 
                 let mut stream = match super::llm_retry::create_stream_with_retry(
                     config,
                     session_id,
                     &exec_ctx.cancellation_token,
-                    retry_budget.attempts_used_mut(),
                     || {
                         let provider = &provider;
                         let messages_with_cache = &messages_with_cache;
@@ -367,11 +381,16 @@ pub(super) async fn transition_call_llm(
 
                 // ── Inner consume loop ───────────────────────────────────────
                 loop {
-                    let item = super::llm_retry::next_stream_chunk(
-                        &mut stream,
-                        &exec_ctx.cancellation_token,
-                    )
-                    .await;
+                    let item = tokio::select! {
+                        item = stream.next() => item,
+                        _ = exec_ctx.cancellation_token.cancelled() => {
+                            return Ok(ExecutionState::Cancelled);
+                        }
+                    };
+
+                    let Some(item) = item else {
+                        break 'stream;
+                    };
 
                     let chunk = match item {
                         Ok(chunk) => chunk,
@@ -397,35 +416,25 @@ pub(super) async fn transition_call_llm(
                             continue;
                         }
                         Err(LLMError::Cancelled) => return Ok(ExecutionState::Cancelled),
-                        Err(e) => {
-                            let retry_number = retry_budget.begin_retry(
+                        Err(e)
+                            if super::llm_retry::should_recreate_stream(
                                 &e,
-                                semantic_output_seen,
-                                exec_ctx.cancellation_token.is_cancelled(),
-                            );
-                            let Some(retry_number) = retry_number else {
-                                if exec_ctx.cancellation_token.is_cancelled() {
-                                    return Ok(ExecutionState::Cancelled);
-                                }
-                                if semantic_output_seen {
-                                    flush_buffers!(false);
-                                }
-                                return Err(PromptLlmError::new(LlmOperation::ChatStream, e).into());
-                            };
-
-                            let wait_secs =
-                                super::llm_retry::retry_delay_secs(config, &e, retry_number);
+                                stream_attempt,
+                                max_stream_retries,
+                            ) =>
+                        {
                             debug!(
-                                "Session {}: retryable pre-output stream error, retry {}/{}, waiting {}s: {}",
-                                session_id, retry_number, max_stream_retries, wait_secs, e
+                                "Session {}: retryable mid-stream error on attempt {}/{}; recreating stream: {}",
+                                session_id, stream_attempt, max_stream_retries, e
                             );
+                            flush_buffers!(true);
                             config.emit_event(
                                 session_id,
                                 AgentEventKind::StreamRecovering {
                                     message: e.to_string(),
                                     attempt: u32_from_usize(
-                                        retry_number,
-                                        "stream_retries_used",
+                                        stream_attempt,
+                                        "stream_attempt",
                                         Some(session_id),
                                     ),
                                     max_attempts: u32_from_usize(
@@ -436,41 +445,12 @@ pub(super) async fn transition_call_llm(
                                     message_id: Some(message_id.clone()),
                                 },
                             );
-
-                            if super::llm_retry::wait_for_retry(
-                                config,
-                                session_id,
-                                &e,
-                                super::llm_retry::RetryWait {
-                                    attempt: retry_number,
-                                    max_attempts: max_stream_retries.saturating_add(1),
-                                    wait_secs,
-                                    streaming: true,
-                                },
-                                &exec_ctx.cancellation_token,
-                            )
-                            .await
-                            .is_err()
-                            {
-                                return Ok(ExecutionState::Cancelled);
-                            }
-
-                            // The failed attempt had no semantic output. Clear
-                            // metadata only after the cancellation-aware delay.
-                            text.clear();
-                            thinking.clear();
-                            thinking_signature = None;
-                            stream_tool_calls.clear();
-                            tool_call_ids.clear();
-                            usage = None;
-                            text_buffer.clear();
-                            thinking_buffer.clear();
-                            last_flush = Instant::now();
                             continue 'stream;
                         }
+                        Err(e) => {
+                            return Err(PromptLlmError::new(LlmOperation::ChatStream, e).into());
+                        }
                     };
-
-                    semantic_output_seen |= super::llm_retry::stream_chunk_commits_output(&chunk);
 
                     match chunk {
                         StreamChunk::Text(delta) => {

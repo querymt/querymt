@@ -197,8 +197,8 @@ pub enum AgentEventKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
     },
-    /// Ephemeral signal emitted when a pre-output stream error is retried.
-    /// This event is never emitted after text, thinking, or tool output is observed.
+    /// Ephemeral signal emitted when a retryable mid-stream error recreates the stream.
+    /// Accumulated server-side state is discarded before the fresh request.
     StreamRecovering {
         /// Human-readable error message that triggered the retry
         message: String,

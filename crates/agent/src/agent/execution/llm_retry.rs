@@ -5,7 +5,7 @@
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::utils::u32_from_usize;
 use crate::events::AgentEventKind;
-use futures_util::{Stream, StreamExt};
+use futures_util::Stream;
 use log::info;
 use querymt::chat::StreamChunk;
 use querymt::error::LLMError;
@@ -231,13 +231,13 @@ pub(super) async fn wait_for_retry_delay(
 
 /// Create a streaming connection with retry logic for rate limits and transient errors.
 ///
-/// This retries stream creation only. Mid-stream recovery is handled by the consumer,
-/// which may recreate a stream only before it observes semantic output.
+/// This budget applies to one stream-creation call. If the consumer later
+/// recreates the stream after a mid-stream failure, that recreation receives a
+/// fresh setup budget, matching the historical behavior.
 pub(super) async fn create_stream_with_retry<F, Fut>(
     config: &AgentConfig,
     session_id: &str,
     cancel_token: &CancellationToken,
-    attempts_used: &mut usize,
     create_stream: F,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
 where
@@ -250,24 +250,14 @@ where
     >,
 {
     let max_attempts = config.execution_policy.rate_limit.max_attempts();
+    let mut attempt = 0;
 
     loop {
+        attempt += 1;
+
         if cancel_token.is_cancelled() {
             return Err(LLMError::Cancelled);
         }
-
-        // Shared request budget is enforced here, not via debug_assert.
-        // Callers should also refuse re-entry via StreamRetryBudget, but a
-        // broken invariant must still return a real error in release builds.
-        // GenericError is intentionally non-retryable — a blown internal
-        // budget must not look like transient transport failure.
-        if *attempts_used >= max_attempts {
-            return Err(LLMError::GenericError(format!(
-                "stream request attempt budget exhausted ({attempts_used}/{max_attempts})"
-            )));
-        }
-        *attempts_used += 1;
-        let attempt = *attempts_used;
 
         match create_stream().await {
             Ok(stream) => return Ok(stream),
@@ -294,69 +284,12 @@ where
     }
 }
 
-/// Read the next chunk, mapping stream EOF and cancellation to typed errors.
-pub(super) async fn next_stream_chunk(
-    stream: &mut Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
-    cancel_token: &CancellationToken,
-) -> Result<StreamChunk, LLMError> {
-    tokio::select! {
-        item = stream.next() => item.unwrap_or_else(|| Err(LLMError::Transport {
-            kind: querymt::error::TransportErrorKind::ConnectionClosed,
-            message: "LLM stream ended before a completion marker".to_string(),
-        })),
-        _ = cancel_token.cancelled() => Err(LLMError::Cancelled),
-    }
-}
-
-pub(super) fn stream_chunk_commits_output(chunk: &StreamChunk) -> bool {
-    match chunk {
-        StreamChunk::Text(text) | StreamChunk::Thinking(text) => !text.is_empty(),
-        StreamChunk::ThinkingSignature(_) => true,
-        StreamChunk::ToolUseStart { .. } | StreamChunk::ToolUseComplete { .. } => true,
-        StreamChunk::ToolUseInputDelta { partial_json, .. } => !partial_json.is_empty(),
-        StreamChunk::Usage(_) | StreamChunk::Done { .. } => false,
-    }
-}
-
-pub(super) struct StreamRetryBudget {
-    retries_used: usize,
-    max_retries: usize,
-    attempts_used: usize,
-    max_attempts: usize,
-}
-
-impl StreamRetryBudget {
-    pub(super) fn new(max_retries: usize, max_attempts: usize) -> Self {
-        Self {
-            retries_used: 0,
-            max_retries,
-            attempts_used: 0,
-            max_attempts: max_attempts.max(1),
-        }
-    }
-
-    pub(super) fn attempts_used_mut(&mut self) -> &mut usize {
-        &mut self.attempts_used
-    }
-
-    pub(super) fn begin_retry(
-        &mut self,
-        error: &LLMError,
-        semantic_output_seen: bool,
-        cancelled: bool,
-    ) -> Option<usize> {
-        if cancelled
-            || semantic_output_seen
-            || !error.is_retryable()
-            || self.retries_used >= self.max_retries
-            || self.attempts_used >= self.max_attempts
-        {
-            return None;
-        }
-
-        self.retries_used += 1;
-        Some(self.retries_used)
-    }
+pub(super) fn should_recreate_stream(
+    error: &LLMError,
+    stream_attempt: usize,
+    max_stream_retries: usize,
+) -> bool {
+    error.is_retryable() && stream_attempt <= max_stream_retries
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -376,7 +309,7 @@ mod tests {
         mock_plugin_registry, mock_session,
     };
     use querymt::LLMParams;
-    use querymt::chat::{ChatResponse, FinishReason, StreamChunk};
+    use querymt::chat::ChatResponse;
     use querymt::error::{LLMError, ProviderErrorContext, ProviderErrorKind};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -952,25 +885,23 @@ mod tests {
         let token = CancellationToken::new();
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count2 = call_count.clone();
-        let mut attempts_used = 0;
 
-        let result =
-            create_stream_with_retry(&config, "test-session", &token, &mut attempts_used, || {
-                let count = call_count2.clone();
-                async move {
-                    count.fetch_add(1, Ordering::SeqCst);
-                    Err(LLMError::ProviderResponseError {
-                        message: "overloaded".into(),
-                        context: Box::new(
-                            ProviderErrorContext::new("test", ProviderErrorKind::ServerOverloaded)
-                                .with_code(Some("server_is_overloaded".into()))
-                                .with_request_id(Some("request-3".into()))
-                                .with_retry_after_secs(Some(0)),
-                        ),
-                    })
-                }
-            })
-            .await;
+        let result = create_stream_with_retry(&config, "test-session", &token, || {
+            let count = call_count2.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Err(LLMError::ProviderResponseError {
+                    message: "overloaded".into(),
+                    context: Box::new(
+                        ProviderErrorContext::new("test", ProviderErrorKind::ServerOverloaded)
+                            .with_code(Some("server_is_overloaded".into()))
+                            .with_request_id(Some("request-3".into()))
+                            .with_retry_after_secs(Some(0)),
+                    ),
+                })
+            }
+        })
+        .await;
 
         assert!(matches!(
             result,
@@ -980,45 +911,6 @@ mod tests {
                     && context.request_id() == Some("request-3")
         ));
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
-        assert_eq!(attempts_used, 3);
-    }
-
-    #[tokio::test]
-    async fn test_create_stream_with_retry_hard_errors_when_budget_already_exhausted() {
-        let (config, _temp) = make_config().await;
-        let token = CancellationToken::new();
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let call_count2 = call_count.clone();
-        // max_attempts defaults to 3; start already exhausted.
-        let mut attempts_used = config.execution_policy.rate_limit.max_attempts();
-
-        let result =
-            create_stream_with_retry(&config, "test-session", &token, &mut attempts_used, || {
-                let count = call_count2.clone();
-                async move {
-                    count.fetch_add(1, Ordering::SeqCst);
-                    Err(LLMError::HttpStatus {
-                        status_code: 503,
-                        message: "should not be called".into(),
-                        retry_after_secs: None,
-                    })
-                }
-            })
-            .await;
-
-        let err = result.err().expect("budget exhaust must error");
-        match &err {
-            LLMError::GenericError(message) => {
-                assert!(message.contains("attempt budget exhausted"));
-            }
-            other => panic!("expected GenericError, got {other}"),
-        }
-        assert!(!err.is_retryable());
-        assert_eq!(call_count.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            attempts_used,
-            config.execution_policy.rate_limit.max_attempts()
-        );
     }
 
     #[tokio::test]
@@ -1076,129 +968,17 @@ mod tests {
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
-    async fn test_next_stream_chunk_maps_eof_and_cancellation() {
-        let mut empty: Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>> =
-            Box::pin(futures_util::stream::empty());
-        let error = next_stream_chunk(&mut empty, &CancellationToken::new())
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            LLMError::Transport {
-                kind: querymt::error::TransportErrorKind::ConnectionClosed,
-                ..
-            }
-        ));
-
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        let mut pending: Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>> =
-            Box::pin(futures_util::stream::pending());
-        assert!(matches!(
-            next_stream_chunk(&mut pending, &cancel).await,
-            Err(LLMError::Cancelled)
-        ));
-    }
-
     #[test]
-    fn test_stream_chunk_commit_policy_covers_semantic_variants() {
-        assert!(!stream_chunk_commits_output(&StreamChunk::Text(
-            String::new()
-        )));
-        assert!(stream_chunk_commits_output(&StreamChunk::Text("x".into())));
-        assert!(!stream_chunk_commits_output(&StreamChunk::Thinking(
-            String::new()
-        )));
-        assert!(stream_chunk_commits_output(&StreamChunk::Thinking(
-            "x".into()
-        )));
-        assert!(stream_chunk_commits_output(
-            &StreamChunk::ThinkingSignature(String::new())
-        ));
-        assert!(stream_chunk_commits_output(&StreamChunk::ToolUseStart {
-            index: 0,
-            id: "call-1".into(),
-            name: "read".into(),
-        }));
-        assert!(!stream_chunk_commits_output(
-            &StreamChunk::ToolUseInputDelta {
-                index: 0,
-                partial_json: String::new(),
-            }
-        ));
-        assert!(stream_chunk_commits_output(
-            &StreamChunk::ToolUseInputDelta {
-                index: 0,
-                partial_json: "{".into(),
-            }
-        ));
-        assert!(!stream_chunk_commits_output(&StreamChunk::Done {
-            finish_reason: FinishReason::Stop,
-        }));
-    }
-
-    #[test]
-    fn test_thinking_and_tool_output_prevent_stream_retry() {
-        let error = LLMError::HttpStatus {
+    fn stream_recreation_preserves_historical_retry_boundary() {
+        let retryable = LLMError::HttpStatus {
             status_code: 503,
             message: "unavailable".into(),
             retry_after_secs: None,
         };
-        for chunk in [
-            StreamChunk::Thinking("reasoning".into()),
-            StreamChunk::ThinkingSignature("signature".into()),
-            StreamChunk::ToolUseStart {
-                index: 0,
-                id: "call-1".into(),
-                name: "read".into(),
-            },
-            StreamChunk::ToolUseInputDelta {
-                index: 0,
-                partial_json: "{".into(),
-            },
-        ] {
-            let mut budget = StreamRetryBudget::new(1, 3);
-            *budget.attempts_used_mut() = 1;
-            assert_eq!(
-                budget.begin_retry(&error, stream_chunk_commits_output(&chunk), false),
-                None,
-            );
-            assert_eq!(budget.retries_used, 0);
-        }
-    }
+        let permanent = LLMError::AuthError("bad key".into());
 
-    #[test]
-    fn test_stream_retry_policy_stops_when_shared_request_budget_is_exhausted() {
-        let error = LLMError::HttpStatus {
-            status_code: 503,
-            message: "unavailable".into(),
-            retry_after_secs: None,
-        };
-        let mut budget = StreamRetryBudget::new(5, 3);
-        *budget.attempts_used_mut() = 3;
-
-        assert_eq!(budget.begin_retry(&error, false, false), None);
-        assert_eq!(budget.retries_used, 0);
-    }
-
-    #[test]
-    fn test_stream_retry_policy_counts_retries_and_stops_after_output_or_exhaustion() {
-        let error = LLMError::HttpStatus {
-            status_code: 503,
-            message: "unavailable".into(),
-            retry_after_secs: None,
-        };
-        let mut budget = StreamRetryBudget::new(1, 3);
-        *budget.attempts_used_mut() = 1;
-
-        assert_eq!(budget.begin_retry(&error, false, false), Some(1));
-        assert_eq!(budget.retries_used, 1);
-        assert_eq!(budget.begin_retry(&error, false, false), None);
-
-        let mut output_budget = StreamRetryBudget::new(2, 3);
-        *output_budget.attempts_used_mut() = 1;
-        assert_eq!(output_budget.begin_retry(&error, true, false), None);
-        assert_eq!(output_budget.begin_retry(&error, false, true), None);
+        assert!(should_recreate_stream(&retryable, 1, 1));
+        assert!(!should_recreate_stream(&retryable, 2, 1));
+        assert!(!should_recreate_stream(&permanent, 1, 1));
     }
 }
