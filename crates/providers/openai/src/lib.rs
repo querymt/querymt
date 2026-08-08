@@ -179,6 +179,13 @@ impl api::OpenAIProviderConfig for OpenAI {
 }
 
 impl HTTPChatProvider for OpenAI {
+    fn classify_chat_error(
+        &self,
+        response: &Response<Vec<u8>>,
+    ) -> querymt::error::ProviderDecodeError {
+        api::classify_openai_http_error(response)
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
@@ -221,7 +228,6 @@ impl ChatStreamParser for OpenAIStreamParser {
         chunk: &[u8],
     ) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
         api::parse_openai_sse_chunk(chunk, &mut self.tool_states)
-            .map_err(querymt::error::ProviderDecodeError::terminal)
     }
 }
 
@@ -306,7 +312,10 @@ impl HTTPLLMProviderFactory for OpenAIFactory {
 #[cfg(test)]
 mod tests {
     use super::OpenAI;
-    use querymt::chat::{StreamChunk, http::HTTPChatProvider};
+    use querymt::{
+        chat::{StreamChunk, http::HTTPChatProvider},
+        error::LLMError,
+    };
     use serde_json::Value;
 
     #[test]
@@ -339,6 +348,27 @@ mod tests {
             .expect("stream request should build");
         let body: Value = serde_json::from_slice(req.body()).expect("body should be valid json");
         assert_eq!(body.get("stream"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn stream_parser_returns_classified_error_for_adapter_attribution() {
+        let cfg = serde_json::json!({
+            "api_key": "test-key",
+            "model": "gpt-4o-mini"
+        });
+        let provider: OpenAI = serde_json::from_value(cfg).unwrap();
+        let mut parser = provider.chat_stream_parser().unwrap();
+        let chunk = br#"data: {"error":{"message":"busy","code":"server_error"}}
+
+"#;
+
+        let error = parser.parse_chunk(chunk).unwrap_err().attribute("openai");
+        match error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.provider(), "openai");
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
     }
 
     #[test]

@@ -137,6 +137,13 @@ impl api::CodexProviderConfig for Codex {
 }
 
 impl HTTPChatProvider for Codex {
+    fn classify_chat_error(
+        &self,
+        response: &Response<Vec<u8>>,
+    ) -> querymt::error::ProviderDecodeError {
+        api::classify_codex_http_error(response)
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
@@ -178,7 +185,6 @@ impl ChatStreamParser for CodexStreamParser {
         chunk: &[u8],
     ) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
         api::codex_parse_stream_chunk_with_state(chunk, &self.tool_states)
-            .map_err(querymt::error::ProviderDecodeError::terminal)
     }
 }
 

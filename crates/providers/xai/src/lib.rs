@@ -4,13 +4,14 @@ use http::{
     header::{AUTHORIZATION, CONTENT_TYPE},
 };
 use qmt_codex::api::{
-    CodexToolUseState, codex_parse_chat_with_state, codex_parse_stream_chunk_with_state,
+    CodexToolUseState, classify_codex_http_error, codex_parse_chat_with_state,
+    codex_parse_stream_chunk_with_state,
 };
 use qmt_openai::{
     AuthType,
     api::{
-        OpenAIProviderConfig, openai_chat_request, openai_embed_request,
-        openai_list_models_request, openai_parse_chat, openai_parse_embed,
+        OpenAIProviderConfig, classify_openai_http_error, openai_chat_request,
+        openai_embed_request, openai_list_models_request, openai_parse_chat, openai_parse_embed,
         openai_parse_list_models, parse_openai_sse_chunk, url_schema,
     },
 };
@@ -35,7 +36,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use url::Url;
-
 const XAI_ADDITIONAL_LIST_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5"];
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
@@ -176,6 +176,17 @@ impl OpenAIProviderConfig for Xai {
 }
 
 impl HTTPChatProvider for Xai {
+    fn classify_chat_error(
+        &self,
+        response: &Response<Vec<u8>>,
+    ) -> querymt::error::ProviderDecodeError {
+        if self.should_use_responses_api() {
+            classify_codex_http_error(response)
+        } else {
+            classify_openai_http_error(response)
+        }
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
@@ -363,7 +374,6 @@ impl ChatStreamParser for XaiStreamParser {
         } else {
             parse_openai_sse_chunk(chunk, &mut self.openai_tool_state)
         }
-        .map_err(querymt::error::ProviderDecodeError::terminal)
     }
 }
 
@@ -1005,6 +1015,28 @@ mod tests {
         let body: Value = serde_json::from_slice(req.body()).expect("body should be JSON");
 
         assert_eq!(body["stream"], Value::Bool(true));
+    }
+
+    #[test]
+    fn stream_parser_returns_classified_codex_error_for_adapter_attribution() {
+        let mut xai = test_xai("xai-key");
+        xai.conversation_id = Some("conversation-id".to_string());
+        let mut parser = xai.chat_stream_parser().unwrap();
+        let chunk = br#"data: {"type":"response.failed","response":{"error":{"message":"busy","code":"server_is_overloaded"}}}
+
+"#;
+
+        let error = parser.parse_chunk(chunk).unwrap_err().attribute("xai");
+        match error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.provider(), "xai");
+                assert_eq!(
+                    context.kind(),
+                    querymt::error::ProviderErrorKind::ServerOverloaded
+                );
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
     }
 
     #[test]
