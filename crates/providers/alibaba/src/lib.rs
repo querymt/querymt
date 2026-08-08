@@ -1,7 +1,7 @@
 use http::{Request, Response};
 use qmt_openai::api::{
-    OpenAIProviderConfig, openai_chat_request, openai_embed_request, openai_parse_chat,
-    openai_parse_embed, url_schema,
+    OpenAIProviderConfig, classify_openai_http_error, openai_chat_request, openai_embed_request,
+    openai_parse_chat, openai_parse_embed, url_schema,
 };
 use querymt::{
     HTTPLLMProvider,
@@ -123,6 +123,13 @@ impl OpenAIProviderConfig for Alibaba {
 }
 
 impl HTTPChatProvider for Alibaba {
+    fn classify_chat_error(
+        &self,
+        response: &Response<Vec<u8>>,
+    ) -> querymt::error::ProviderDecodeError {
+        classify_openai_http_error(response)
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
