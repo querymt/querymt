@@ -241,8 +241,7 @@ impl HTTPLLMProviderFactory for OpenRouterFactory {
     }
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
-        let provider: OpenRouter = serde_json::from_str(cfg)
-            .map_err(|e| LLMError::PluginError(format!("OpenRouter config error: {}", e)))?;
+        let provider: OpenRouter = serde_json::from_str(cfg)?;
 
         // 2) Done—our OpenAI::send/chat/etc methods will lazily build the Client
         Ok(Box::new(provider))
@@ -274,8 +273,9 @@ mod extism_exports {
 
 #[cfg(test)]
 mod tests {
-    use super::OpenRouter;
+    use super::{OpenRouter, OpenRouterFactory};
     use querymt::chat::{StreamChunk, http::HTTPChatProvider};
+    use querymt::{error::LLMError, plugin::HTTPLLMProviderFactory};
     use serde_json::Value;
 
     fn test_provider() -> OpenRouter {
@@ -284,6 +284,17 @@ mod tests {
             "model": "openai/gpt-4o-mini"
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn malformed_config_is_non_retryable_json_error() {
+        let error = OpenRouterFactory
+            .from_config("{")
+            .err()
+            .expect("config should be rejected");
+
+        assert!(!error.is_retryable());
+        assert!(matches!(error, LLMError::JsonError(_)));
     }
 
     #[test]
