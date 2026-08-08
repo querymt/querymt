@@ -89,6 +89,14 @@ macro_rules! with_host_functions {
             .with_wasi(true)
             .with_function_in_namespace(
                 "extism:host/user",
+                "qmt_classify_chat_error",
+                [extism::PTR],
+                [],
+                $user_data.clone(),
+                functions::qmt_classify_chat_error,
+            )
+            .with_function_in_namespace(
+                "extism:host/user",
                 "qmt_http_request",
                 [extism::PTR],
                 [extism::PTR],
@@ -402,7 +410,6 @@ impl LLMProviderFactory for ExtismFactory {
 
         if self.supports_http_adapter_abi() {
             let http_provider: Box<dyn HTTPLLMProvider> = Box::new(provider);
-            // Factory name is the registry identity; adapter stamps errors.
             return Ok(Box::new(LLMProviderFromHTTP::new(
                 self.name.as_str(),
                 http_provider,
@@ -1193,12 +1200,54 @@ impl HTTPChatProvider for ExtismProvider {
         &self,
         response: &http::Response<Vec<u8>>,
     ) -> crate::error::ProviderDecodeError {
-        crate::error::classify_status_only(
-            response.status().as_u16(),
-            response.headers(),
-            response.body(),
-        )
-        .into()
+        let fallback = || {
+            crate::error::classify_status_only(
+                response.status().as_u16(),
+                response.headers(),
+                response.body(),
+            )
+            .into()
+        };
+        let mut plug = self.plugin.lock().unwrap();
+        if !plug.function_exists("classify_chat_error") {
+            return fallback();
+        }
+
+        let Some(user_data) = &self.user_data else {
+            return fallback();
+        };
+        let Ok(state) = user_data.get() else {
+            return fallback();
+        };
+        let Ok(mut state_guard) = state.lock() else {
+            return fallback();
+        };
+        state_guard.classified_error = None;
+        drop(state_guard);
+
+        let cfg = match self.effective_config() {
+            Ok(cfg) => cfg,
+            Err(error) => return crate::error::ProviderDecodeError::terminal(error),
+        };
+        let response = response.clone();
+        let result: Result<(), (extism::Error, i32)> = plug.call_get_error_code(
+            "classify_chat_error",
+            Json(ExtismChatParseRequest {
+                cfg,
+                resp: SerializableHttpResponse { resp: response },
+            }),
+        );
+        if result.is_err() {
+            return fallback();
+        }
+
+        let Ok(state) = user_data.get() else {
+            return fallback();
+        };
+        let Ok(mut state) = state.lock() else {
+            return fallback();
+        };
+        state.classified_error.take().unwrap_or_else(fallback)
     }
 
     fn chat_request(

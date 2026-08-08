@@ -31,6 +31,7 @@ pub(crate) struct HostState {
     pub next_stream_id: u64,
     pub yield_tx:
         Option<tokio::sync::mpsc::UnboundedSender<Result<Vec<u8>, crate::error::LLMError>>>,
+    pub classified_error: Option<crate::error::ProviderDecodeError>,
     pub tokio_handle: tokio::runtime::Handle,
 }
 
@@ -53,9 +54,24 @@ impl HostState {
             http_client: reqwest::Client::new(),
             next_stream_id: 1,
             yield_tx: None,
+            classified_error: None,
             tokio_handle,
         }
     }
+}
+
+pub(crate) fn qmt_classify_chat_error(
+    plugin: &mut CurrentPlugin,
+    inputs: &[Val],
+    _outputs: &mut [Val],
+    user_data: UserData<HostState>,
+) -> Result<(), extism::Error> {
+    let extism::convert::Json(payload): extism::convert::Json<crate::error::LLMErrorPayload> =
+        plugin.memory_get_val(&inputs[0])?;
+    let error =
+        crate::error::ProviderDecodeError::terminal(crate::error::LLMError::from_payload(payload));
+    user_data.get()?.lock().unwrap().classified_error = Some(error);
+    Ok(())
 }
 
 pub(crate) fn qmt_http_request(
