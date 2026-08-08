@@ -12,8 +12,11 @@ use querymt::{
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
-    error::LLMError,
-    get_env_var, handle_http_error,
+    error::{
+        LLMError, ProviderDecodeError, ProviderErrorKind, ProviderFailure, classify_status_only,
+        parse_retry_after,
+    },
+    get_env_var,
     plugin::HTTPLLMProviderFactory,
 };
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema, schema_for};
@@ -439,6 +442,10 @@ impl Ollama {
 }
 
 impl HTTPChatProvider for Ollama {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> ProviderDecodeError {
+        classify_ollama_http_error(response).into()
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
@@ -573,7 +580,10 @@ impl HTTPChatProvider for Ollama {
     }
 
     fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
-        handle_http_error!(resp);
+        debug_assert!(
+            resp.status().is_success(),
+            "parse_chat is success-only; adapter must classify non-success first"
+        );
 
         let json_resp: OllamaResponse = serde_json::from_slice(resp.body())?;
         Ok(Box::new(json_resp))
@@ -881,4 +891,144 @@ mod tests {
             .expect("list_models_request should succeed");
         assert!(req.headers().get("authorization").is_none());
     }
+
+    #[test]
+    fn classify_http_model_not_found_is_permanent() {
+        let response = Response::builder()
+            .status(404)
+            .body(br#"{"error":"model 'nope' not found"}"#.to_vec())
+            .unwrap();
+        let error = classify_ollama_http_error(&response).attribute("ollama");
+        assert!(!error.is_retryable());
+        match &error {
+            LLMError::ProviderResponseError { message, context } => {
+                assert!(message.contains("not found"));
+                assert_eq!(context.provider(), "ollama");
+                assert_eq!(context.kind(), ProviderErrorKind::InvalidRequest);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    #[test]
+    fn classify_http_context_length_is_permanent() {
+        let response = Response::builder()
+            .status(500)
+            .body(br#"{"error":"the input length exceeds the context length"}"#.to_vec())
+            .unwrap();
+        let error = classify_ollama_http_error(&response).attribute("ollama");
+        assert!(!error.is_retryable());
+        match &error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.kind(), ProviderErrorKind::ContextWindowExceeded);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    #[test]
+    fn classify_http_runner_busy_is_transient() {
+        let response = Response::builder()
+            .status(500)
+            .body(br#"{"error":"server busy, try again"}"#.to_vec())
+            .unwrap();
+        let error = classify_ollama_http_error(&response).attribute("ollama");
+        assert!(error.is_retryable());
+        match &error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.kind(), ProviderErrorKind::ServerOverloaded);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    #[test]
+    fn classify_http_plain_text_falls_back_to_status() {
+        let response = Response::builder()
+            .status(429)
+            .header(http::header::RETRY_AFTER, "7")
+            .body(b"too many requests".to_vec())
+            .unwrap();
+        let error = classify_ollama_http_error(&response).attribute("ollama");
+        assert!(error.is_retryable());
+        assert_eq!(error.retry_after_secs(), Some(7));
+        match &error {
+            LLMError::ProviderResponseError { context, .. } => {
+                assert_eq!(context.kind(), ProviderErrorKind::RateLimited);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+}
+
+/// Classify an Ollama non-success chat response from its JSON (or plain) body.
+///
+/// Ollama typically returns `{"error":"..."}` (string) rather than a typed code table.
+/// Message heuristics map the common permanent/transient cases; otherwise status-only.
+fn classify_ollama_http_error(response: &Response<Vec<u8>>) -> ProviderFailure {
+    let status = response.status().as_u16();
+    let retry_after_secs = parse_retry_after(response.headers());
+    let body = String::from_utf8_lossy(response.body());
+
+    let message = if let Ok(v) = serde_json::from_slice::<Value>(response.body()) {
+        v.get("error")
+            .and_then(|e| {
+                e.as_str()
+                    .map(str::to_owned)
+                    .or_else(|| e.get("message").and_then(Value::as_str).map(str::to_owned))
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| body.into_owned())
+    } else {
+        body.into_owned()
+    };
+
+    let lower = message.to_ascii_lowercase();
+    let kind = if lower.contains("not found")
+        || lower.contains("does not support")
+        || lower.contains("invalid")
+        || lower.contains("unknown model")
+        || lower.contains("pull model")
+    {
+        ProviderErrorKind::InvalidRequest
+    } else if lower.contains("unauthorized")
+        || lower.contains("authentication")
+        || lower.contains("api key")
+        || lower.contains("access denied")
+    {
+        ProviderErrorKind::Authentication
+    } else if (lower.contains("context") && (lower.contains("length") || lower.contains("window")))
+        || lower.contains("exceeds the context")
+        || (lower.contains("token") && lower.contains("limit"))
+        || lower.contains("too many tokens")
+    {
+        ProviderErrorKind::ContextWindowExceeded
+    } else if lower.contains("rate limit") || lower.contains("too many requests") {
+        ProviderErrorKind::RateLimited
+    } else if lower.contains("busy")
+        || lower.contains("try again")
+        || lower.contains("overloaded")
+        || lower.contains("temporarily unavailable")
+    {
+        ProviderErrorKind::ServerOverloaded
+    } else {
+        // Fall through to status-only for bare 4xx/5xx without a useful message.
+        let classified = classify_status_only(status, response.headers(), response.body());
+        let retry_after_secs = classified.context.retry_after_secs().or(retry_after_secs);
+        let classified = classified.retry_after_secs(retry_after_secs);
+        // Prefer the extracted message when present.
+        if !message.is_empty() && message != String::from_utf8_lossy(response.body()) {
+            return ProviderFailure::new(classified.context.kind(), message)
+                .retry_after_secs(classified.context.retry_after_secs());
+        }
+        return classified;
+    };
+
+    let retry_after_secs = match kind {
+        ProviderErrorKind::RateLimited => retry_after_secs,
+        k if !k.is_retryable() => None,
+        _ => retry_after_secs,
+    };
+
+    ProviderFailure::new(kind, message).retry_after_secs(retry_after_secs)
 }
