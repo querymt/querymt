@@ -277,34 +277,34 @@ impl ProviderFailure {
 /// accidental double-attribution is not a silent footgun.
 #[derive(Debug)]
 pub enum ProviderDecodeError {
-    Classified(ProviderFailure),
-    Terminal(LLMError),
+    Classified(Box<ProviderFailure>),
+    Terminal(Box<LLMError>),
 }
 
 impl ProviderDecodeError {
     pub fn response_format(message: impl Into<String>, raw_response: impl Into<String>) -> Self {
-        Self::Terminal(LLMError::ResponseFormatError {
+        Self::Terminal(Box::new(LLMError::ResponseFormatError {
             message: message.into(),
             raw_response: raw_response.into(),
-        })
+        }))
     }
 
     pub fn terminal(error: LLMError) -> Self {
-        Self::Terminal(error)
+        Self::Terminal(Box::new(error))
     }
 
     /// Stamp provider identity onto classified failures and any structured terminal error.
     pub fn attribute(self, provider: impl Into<String>) -> LLMError {
         match self {
-            Self::Classified(error) => error.attribute(provider),
-            Self::Terminal(error) => error.with_provider(provider),
+            Self::Classified(error) => (*error).attribute(provider),
+            Self::Terminal(error) => (*error).with_provider(provider),
         }
     }
 }
 
 impl From<ProviderFailure> for ProviderDecodeError {
     fn from(error: ProviderFailure) -> Self {
-        Self::Classified(error)
+        Self::Classified(Box::new(error))
     }
 }
 
