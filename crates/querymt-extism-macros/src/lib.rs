@@ -76,7 +76,6 @@ pub struct HttpResponse(pub BaseHttpResponse);
 // Declare the custom host function
 #[host_fn("extism:host/user")]
 extern "ExtismHost" {
-    pub fn qmt_classify_chat_error(error: Json<querymt::error::LLMErrorPayload>);
     fn qmt_http_request(req: HttpRequest) -> HttpResponse;
     fn qmt_http_stream_open(
         req: HttpRequest,
@@ -274,13 +273,13 @@ macro_rules! impl_extism_http_plugin {
         #[plugin_fn]
         pub fn classify_chat_error(
             Json(input): Json<querymt::plugin::extism_impl::ExtismChatParseRequest<$Config>>,
-        ) -> FnResult<()> {
+        ) -> FnResult<Json<querymt::plugin::extism_impl::PluginError>> {
+            // Returning the payload keeps this optional export compatible with older hosts.
             let error = input
                 .cfg
                 .classify_chat_error(&input.resp.resp)
                 .attribute($name);
-            unsafe { $crate::qmt_classify_chat_error(Json(error.to_payload()))? };
-            Ok(())
+            Ok(Json(PluginError::from_llm_error(&error)))
         }
 
         #[plugin_fn]

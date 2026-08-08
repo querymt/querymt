@@ -83,18 +83,14 @@ fn decode_stream_item(item: Result<Vec<u8>, LLMError>) -> Result<StreamChunk, LL
     }
 }
 
+fn decode_classified_plugin_error(error: PluginError) -> crate::error::ProviderDecodeError {
+    crate::error::ProviderDecodeError::terminal(LLMError::from_payload(error.payload))
+}
+
 macro_rules! with_host_functions {
     ($builder:expr, $user_data:expr) => {
         $builder
             .with_wasi(true)
-            .with_function_in_namespace(
-                "extism:host/user",
-                "qmt_classify_chat_error",
-                [extism::PTR],
-                [],
-                $user_data.clone(),
-                functions::qmt_classify_chat_error,
-            )
             .with_function_in_namespace(
                 "extism:host/user",
                 "qmt_http_request",
@@ -1213,41 +1209,23 @@ impl HTTPChatProvider for ExtismProvider {
             return fallback();
         }
 
-        let Some(user_data) = &self.user_data else {
-            return fallback();
-        };
-        let Ok(state) = user_data.get() else {
-            return fallback();
-        };
-        let Ok(mut state_guard) = state.lock() else {
-            return fallback();
-        };
-        state_guard.classified_error = None;
-        drop(state_guard);
-
         let cfg = match self.effective_config() {
             Ok(cfg) => cfg,
             Err(error) => return crate::error::ProviderDecodeError::terminal(error),
         };
         let response = response.clone();
-        let result: Result<(), (extism::Error, i32)> = plug.call_get_error_code(
+        let result: Result<Json<PluginError>, (extism::Error, i32)> = plug.call_get_error_code(
             "classify_chat_error",
             Json(ExtismChatParseRequest {
                 cfg,
                 resp: SerializableHttpResponse { resp: response },
             }),
         );
-        if result.is_err() {
-            return fallback();
+        match result {
+            // Plugin may already stamp identity; adapter will re-stamp with host name.
+            Ok(Json(error)) => decode_classified_plugin_error(error),
+            Err(_) => fallback(),
         }
-
-        let Ok(state) = user_data.get() else {
-            return fallback();
-        };
-        let Ok(mut state) = state.lock() else {
-            return fallback();
-        };
-        state.classified_error.take().unwrap_or_else(fallback)
     }
 
     fn chat_request(
@@ -1548,5 +1526,35 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn decode_classified_plugin_error_preserves_structured_context() {
+        let error = crate::error::ProviderFailure::new(
+            crate::error::ProviderErrorKind::ServerOverloaded,
+            "plugin busy",
+        )
+        .code(Some("server_is_overloaded".into()))
+        .request_id(Some("req-plugin".into()))
+        .retry_after_secs(Some(2))
+        .attribute("plugin-name");
+
+        let decoded = decode_classified_plugin_error(PluginError::from_llm_error(&error))
+            .attribute("host-registry-name");
+
+        match decoded {
+            LLMError::ProviderResponseError { message, context } => {
+                assert_eq!(message, "plugin busy");
+                assert_eq!(context.provider(), "host-registry-name");
+                assert_eq!(
+                    context.kind(),
+                    crate::error::ProviderErrorKind::ServerOverloaded
+                );
+                assert_eq!(context.code(), Some("server_is_overloaded"));
+                assert_eq!(context.request_id(), Some("req-plugin"));
+                assert_eq!(context.retry_after_secs(), Some(2));
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
     }
 }
