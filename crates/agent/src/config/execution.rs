@@ -201,7 +201,7 @@ impl Default for CompactionConfig {
 // Rate Limit Configuration
 // ============================================================================
 
-/// Default maximum retry attempts for rate limiting
+/// Default total request-attempt budget, including the initial request
 pub const DEFAULT_RATE_LIMIT_MAX_RETRIES: usize = 3;
 
 /// Default wait time in seconds if no retry-after header
@@ -210,8 +210,14 @@ pub const DEFAULT_RATE_LIMIT_WAIT_SECS: u64 = 60;
 /// Default backoff multiplier for rate limiting
 pub const DEFAULT_RATE_LIMIT_BACKOFF_MULTIPLIER: f64 = 2.0;
 
-/// Default max retries for mid-stream transport failures
-pub const DEFAULT_STREAM_MAX_RETRIES: usize = 1;
+/// Default stream-recreation cap within the shared request-attempt budget.
+pub const DEFAULT_STREAM_MAX_RETRIES: usize = 2;
+
+/// Default proportional jitter applied to calculated backoff delays
+pub const DEFAULT_RATE_LIMIT_JITTER_RATIO: f64 = 0.2;
+
+/// Default upper bound for calculated retry delays
+pub const DEFAULT_RATE_LIMIT_MAX_WAIT_SECS: u64 = 300;
 
 fn default_rate_limit_max_retries() -> usize {
     DEFAULT_RATE_LIMIT_MAX_RETRIES
@@ -229,11 +235,19 @@ fn default_stream_max_retries() -> usize {
     DEFAULT_STREAM_MAX_RETRIES
 }
 
+fn default_rate_limit_jitter_ratio() -> f64 {
+    DEFAULT_RATE_LIMIT_JITTER_RATIO
+}
+
+fn default_rate_limit_max_wait_secs() -> u64 {
+    DEFAULT_RATE_LIMIT_MAX_WAIT_SECS
+}
+
 /// Configuration for rate limit retry behavior
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
-    /// Maximum number of retry attempts (default: 3)
+    /// Total request-attempt budget, including the initial request (default: 3)
     #[serde(default = "default_rate_limit_max_retries")]
     pub max_retries: usize,
 
@@ -243,13 +257,63 @@ pub struct RateLimitConfig {
 
     /// Backoff multiplier when no retry-after header (default: 2.0)
     /// Wait time increases exponentially: default_wait_secs * multiplier^(attempt-1)
+    /// Must be finite and `> 0`.
     #[serde(default = "default_rate_limit_backoff_multiplier")]
     pub backoff_multiplier: f64,
 
-    /// Max retries for mid-stream transport failures (default: 1).
-    /// On each retry, accumulated text is discarded and the stream is re-created.
+    /// Maximum stream recreations within the shared request-attempt budget (default: 2).
+    /// Each recreation restarts the provider request and also consumes `max_retries`.
     #[serde(default = "default_stream_max_retries")]
     pub max_stream_retries: usize,
+
+    /// Proportional jitter for calculated delays (`0.0..=1.0`). Provider retry
+    /// hints are not jittered.
+    ///
+    /// Runtime-only for now: not written into `session_execution_configs` so older
+    /// qmtcode builds (strict `deny_unknown_fields`) can still open sessions.
+    /// TODO(session-compat): drop `skip_serializing` and persist once older readers
+    /// are retired, or gate behind a session config migration.
+    #[serde(default = "default_rate_limit_jitter_ratio", skip_serializing)]
+    pub jitter_ratio: f64,
+
+    /// Upper bound for every retry delay (`>= 1`).
+    ///
+    /// Provider `Retry-After` / message hints are clamped by this field before
+    /// sleeping or emitting retry-wait events.
+    ///
+    /// Runtime-only for now — same session-compat rationale as `jitter_ratio`.
+    /// TODO(session-compat): persist with `jitter_ratio` when ready.
+    #[serde(default = "default_rate_limit_max_wait_secs", skip_serializing)]
+    pub max_wait_secs: u64,
+}
+
+impl RateLimitConfig {
+    /// Total request-attempt budget, clamped to at least one attempt.
+    /// This is the single clamp site — call `max_attempts()`, never
+    /// `max_retries.max(1)` inline.
+    pub fn max_attempts(&self) -> usize {
+        self.max_retries.max(1)
+    }
+
+    /// Validate numeric ranges. Used by deserialize and for programmatic configs.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.backoff_multiplier.is_finite() || self.backoff_multiplier <= 0.0 {
+            return Err(format!(
+                "rate_limit.backoff_multiplier must be finite and > 0, got {}",
+                self.backoff_multiplier
+            ));
+        }
+        if !self.jitter_ratio.is_finite() || !(0.0..=1.0).contains(&self.jitter_ratio) {
+            return Err(format!(
+                "rate_limit.jitter_ratio must be finite and in 0.0..=1.0, got {}",
+                self.jitter_ratio
+            ));
+        }
+        if self.max_wait_secs == 0 {
+            return Err("rate_limit.max_wait_secs must be >= 1".into());
+        }
+        Ok(())
+    }
 }
 
 impl Default for RateLimitConfig {
@@ -259,7 +323,45 @@ impl Default for RateLimitConfig {
             default_wait_secs: DEFAULT_RATE_LIMIT_WAIT_SECS,
             backoff_multiplier: DEFAULT_RATE_LIMIT_BACKOFF_MULTIPLIER,
             max_stream_retries: DEFAULT_STREAM_MAX_RETRIES,
+            jitter_ratio: DEFAULT_RATE_LIMIT_JITTER_RATIO,
+            max_wait_secs: DEFAULT_RATE_LIMIT_MAX_WAIT_SECS,
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for RateLimitConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            #[serde(default = "default_rate_limit_max_retries")]
+            max_retries: usize,
+            #[serde(default = "default_rate_limit_wait_secs")]
+            default_wait_secs: u64,
+            #[serde(default = "default_rate_limit_backoff_multiplier")]
+            backoff_multiplier: f64,
+            #[serde(default = "default_stream_max_retries")]
+            max_stream_retries: usize,
+            #[serde(default = "default_rate_limit_jitter_ratio")]
+            jitter_ratio: f64,
+            #[serde(default = "default_rate_limit_max_wait_secs")]
+            max_wait_secs: u64,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let cfg = Self {
+            max_retries: raw.max_retries,
+            default_wait_secs: raw.default_wait_secs,
+            backoff_multiplier: raw.backoff_multiplier,
+            max_stream_retries: raw.max_stream_retries,
+            jitter_ratio: raw.jitter_ratio,
+            max_wait_secs: raw.max_wait_secs,
+        };
+        cfg.validate().map_err(serde::de::Error::custom)?;
+        Ok(cfg)
     }
 }
 
@@ -462,3 +564,127 @@ impl From<&ExecutionPolicy> for RuntimeExecutionPolicy {
 }
 
 // ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rate_limit_default_allows_two_stream_recreations() {
+        let config = RateLimitConfig::default();
+        assert_eq!(config.max_attempts(), 3);
+        assert_eq!(config.max_stream_retries, 2);
+    }
+
+    #[test]
+    fn rate_limit_config_omits_runtime_only_fields_on_serialize() {
+        let cfg = RateLimitConfig {
+            jitter_ratio: 0.9,
+            max_wait_secs: 42,
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&cfg).expect("serialize");
+        let obj = value.as_object().expect("object");
+
+        assert!(
+            !obj.contains_key("jitter_ratio"),
+            "jitter_ratio must stay runtime-only until session-compat is ready: {value}"
+        );
+        assert!(
+            !obj.contains_key("max_wait_secs"),
+            "max_wait_secs must stay runtime-only until session-compat is ready: {value}"
+        );
+
+        // Stable keys older qmtcode already understands.
+        for key in [
+            "max_retries",
+            "default_wait_secs",
+            "backoff_multiplier",
+            "max_stream_retries",
+        ] {
+            assert!(obj.contains_key(key), "missing expected key {key}: {value}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_config_deserializes_missing_runtime_only_fields_to_defaults() {
+        let cfg: RateLimitConfig = serde_json::from_value(json!({
+            "max_retries": 5,
+            "default_wait_secs": 30,
+            "backoff_multiplier": 1.5,
+            "max_stream_retries": 2,
+        }))
+        .expect("deserialize without runtime-only fields");
+        assert!((cfg.jitter_ratio - DEFAULT_RATE_LIMIT_JITTER_RATIO).abs() < f64::EPSILON);
+        assert_eq!(cfg.max_wait_secs, DEFAULT_RATE_LIMIT_MAX_WAIT_SECS);
+    }
+
+    #[test]
+    fn rate_limit_config_still_deserializes_runtime_only_fields_when_present() {
+        // Blobs already written by earlier builds of this branch should still load.
+        let cfg: RateLimitConfig = serde_json::from_value(json!({
+            "max_retries": 5,
+            "default_wait_secs": 30,
+            "backoff_multiplier": 2.0,
+            "max_stream_retries": 2,
+            "jitter_ratio": 0.5,
+            "max_wait_secs": 120,
+        }))
+        .expect("deserialize with runtime-only fields");
+        assert!((cfg.jitter_ratio - 0.5).abs() < f64::EPSILON);
+        assert_eq!(cfg.max_wait_secs, 120);
+    }
+
+    #[test]
+    fn rate_limit_config_rejects_jitter_ratio_out_of_range() {
+        let err = serde_json::from_value::<RateLimitConfig>(json!({
+            "jitter_ratio": 20.0,
+        }))
+        .expect_err("jitter_ratio > 1 must fail at parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("jitter_ratio"),
+            "error should name the field: {msg}"
+        );
+    }
+
+    #[test]
+    fn rate_limit_config_rejects_negative_jitter_ratio() {
+        let err = serde_json::from_value::<RateLimitConfig>(json!({
+            "jitter_ratio": -0.1,
+        }))
+        .expect_err("negative jitter_ratio must fail at parse");
+        assert!(err.to_string().contains("jitter_ratio"));
+    }
+
+    #[test]
+    fn rate_limit_config_rejects_non_positive_backoff_multiplier() {
+        let err = serde_json::from_value::<RateLimitConfig>(json!({
+            "backoff_multiplier": 0.0,
+        }))
+        .expect_err("backoff_multiplier <= 0 must fail at parse");
+        assert!(err.to_string().contains("backoff_multiplier"));
+    }
+
+    #[test]
+    fn rate_limit_config_rejects_zero_max_wait_secs() {
+        let err = serde_json::from_value::<RateLimitConfig>(json!({
+            "max_wait_secs": 0,
+        }))
+        .expect_err("max_wait_secs == 0 must fail at parse");
+        assert!(err.to_string().contains("max_wait_secs"));
+    }
+
+    #[test]
+    fn rate_limit_config_accepts_boundary_jitter_ratio() {
+        for ratio in [0.0, 1.0] {
+            let cfg: RateLimitConfig = serde_json::from_value(json!({
+                "jitter_ratio": ratio,
+            }))
+            .unwrap_or_else(|e| panic!("jitter_ratio={ratio} should be valid: {e}"));
+            assert!((cfg.jitter_ratio - ratio).abs() < f64::EPSILON);
+        }
+    }
+}

@@ -53,11 +53,27 @@ pub(super) async fn transition_before_llm_call(
         return Ok(ExecutionState::Cancelled);
     }
 
-    let provider = exec_ctx
-        .session_handle
-        .provider()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to build provider: {}", e))?;
+    let provider = match super::llm_retry::call_with_retry(
+        config,
+        &exec_ctx.session_id,
+        &exec_ctx.cancellation_token,
+        || {
+            let session_handle = exec_ctx.session_handle.clone();
+            let cancel = exec_ctx.cancellation_token.clone();
+            async move {
+                tokio::select! {
+                    result = session_handle.provider() => result.map_err(LLMError::from),
+                    _ = cancel.cancelled() => Err(LLMError::Cancelled),
+                }
+            }
+        },
+    )
+    .await
+    {
+        Ok(provider) => provider,
+        Err(LLMError::Cancelled) => return Ok(ExecutionState::Cancelled),
+        Err(error) => return Err(contextualize_llm_error(error, "provider initialization")),
+    };
 
     let tools = config.collect_tools(
         provider,
@@ -111,6 +127,41 @@ pub(super) fn apply_cache_breakpoints(messages: &[ChatMessage]) -> Vec<ChatMessa
             m
         })
         .collect()
+}
+
+fn contextualize_llm_error(error: LLMError, operation: &'static str) -> anyhow::Error {
+    let source_message = error.to_string();
+    anyhow::Error::new(error).context(format!("LLM {operation} error: {source_message}"))
+}
+
+/// Map a failed LLM setup/call into either `Cancelled` or a contextualized error.
+///
+/// Cancel must never bubble as `Err`; it is an execution state, not a provider failure.
+fn map_failed_llm_call(error: LLMError, streaming: bool) -> Result<ExecutionState, anyhow::Error> {
+    match error {
+        LLMError::Cancelled => Ok(ExecutionState::Cancelled),
+        error => Err(contextualize_llm_error(
+            error,
+            if streaming { "streaming" } else { "chat" },
+        )),
+    }
+}
+
+fn validate_stream_terminal(
+    finish_reason: FinishReason,
+    tool_calls: &[ToolCall],
+) -> Result<FinishReason, LLMError> {
+    if finish_reason == FinishReason::ToolCalls && tool_calls.is_empty() {
+        return Err(LLMError::from(
+            querymt::error::ProviderFailure::new(
+                querymt::error::ProviderErrorKind::UnknownTransient,
+                "provider ended with tool_calls but emitted no completed tool calls",
+            )
+            .with_code(Some("empty_tool_calls_terminal".into())),
+        ));
+    }
+
+    Ok(finish_reason)
 }
 
 /// Transition from CallLlm to AfterLlm.
@@ -175,7 +226,7 @@ pub(super) async fn transition_call_llm(
     ) = if tools.is_empty() {
         // No tools — always use the non-streaming simple submit path.
         let cancel = exec_ctx.cancellation_token.clone();
-        let resp = super::llm_retry::call_llm_with_retry(
+        let resp = match super::llm_retry::call_with_retry(
             config,
             session_id,
             &exec_ctx.cancellation_token,
@@ -194,7 +245,11 @@ pub(super) async fn transition_call_llm(
                 }
             },
         )
-        .await?;
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) => return map_failed_llm_call(e, false),
+        };
 
         (
             resp.text().unwrap_or_default(),
@@ -205,10 +260,29 @@ pub(super) async fn transition_call_llm(
             resp.finish_reason(),
         )
     } else {
-        let provider = session_handle
-            .provider()
-            .await
-            .map_err(|e| anyhow::Error::from(e).context("Failed to build provider"))?;
+        let provider = match super::llm_retry::call_with_retry(
+            config,
+            session_id,
+            &exec_ctx.cancellation_token,
+            || {
+                let session_handle = session_handle.clone();
+                let cancel = exec_ctx.cancellation_token.clone();
+                async move {
+                    tokio::select! {
+                        result = session_handle.provider() => result.map_err(LLMError::from),
+                        _ = cancel.cancelled() => Err(LLMError::Cancelled),
+                    }
+                }
+            },
+        )
+        .await
+        {
+            Ok(provider) => provider,
+            Err(LLMError::Cancelled) => return Ok(ExecutionState::Cancelled),
+            Err(error) => {
+                return Err(contextualize_llm_error(error, "provider initialization"));
+            }
+        };
 
         if provider.supports_streaming() {
             // === STREAMING PATH (all capable providers) ===
@@ -219,7 +293,7 @@ pub(super) async fn transition_call_llm(
 
             // Accumulators live outside the retry loop so the post-stream
             // processing below can read them regardless of how many attempts
-            // were needed.  On each retry they are reset to empty.
+            // were needed. On each retry they are reset to empty.
             let mut text = String::new();
             let mut thinking = String::new();
             // Initial values are always overwritten inside the retry loop below
@@ -286,11 +360,16 @@ pub(super) async fn transition_call_llm(
             }
 
             // ── Outer retry loop ─────────────────────────────────────────────
-            // On transient mid-stream errors we discard accumulated text and
-            // re-create the stream.  The provider treats it as a fresh request.
-            let mut stream_attempt = 0;
+            // Preserve main's any-stage recreation behavior while enforcing one
+            // shared physical-request budget across setup and parser failures.
+            // TODO(stream-retry-safety): once clients can atomically replace or
+            // roll back attempt-scoped deltas, eliminate possible duplicate output.
+            let mut retry_budget = super::llm_retry::StreamRetryBudget::new(
+                max_stream_retries,
+                config.execution_policy.rate_limit.max_attempts(),
+            );
             'stream: loop {
-                stream_attempt += 1;
+                let mut semantic_output_seen = false;
 
                 // Reset accumulators on retry so we start fresh.
                 text.clear();
@@ -299,40 +378,56 @@ pub(super) async fn transition_call_llm(
                 stream_tool_calls.clear();
                 tool_call_ids.clear();
                 usage = None;
-                stream_finish_reason = None;
                 text_buffer.clear();
                 thinking_buffer.clear();
                 last_flush = Instant::now();
 
-                let mut stream = super::llm_retry::create_stream_with_retry(
-                    config,
+                let attempt = retry_budget
+                    .reserve_attempt()
+                    .expect("a retry is accepted only when another attempt is available");
+                debug!(
+                    "Session {}: starting physical stream request attempt {}/{}",
                     session_id,
-                    &exec_ctx.cancellation_token,
-                    || {
-                        let provider = &provider;
-                        let messages_with_cache = &messages_with_cache;
-                        let tools_slice = tools.as_ref();
-                        async move {
-                            provider
-                                .chat_stream_with_tools(messages_with_cache, Some(tools_slice))
-                                .await
+                    attempt,
+                    config.execution_policy.rate_limit.max_attempts(),
+                );
+                if exec_ctx.cancellation_token.is_cancelled() {
+                    return Ok(ExecutionState::Cancelled);
+                }
+
+                let mut stream = match provider
+                    .chat_stream_with_tools(&messages_with_cache, Some(tools.as_ref()))
+                    .await
+                {
+                    Ok(stream) => stream,
+                    Err(error) => match super::llm_retry::handle_stream_failure(
+                        config,
+                        session_id,
+                        error,
+                        &mut retry_budget,
+                        false,
+                        Some(message_id.clone()),
+                        &exec_ctx.cancellation_token,
+                    )
+                    .await
+                    {
+                        super::llm_retry::StreamFailureAction::Retry => continue 'stream,
+                        super::llm_retry::StreamFailureAction::Cancelled => {
+                            return Ok(ExecutionState::Cancelled);
+                        }
+                        super::llm_retry::StreamFailureAction::Terminal(error) => {
+                            return map_failed_llm_call(error, true);
                         }
                     },
-                )
-                .await?;
+                };
 
                 // ── Inner consume loop ───────────────────────────────────────
                 loop {
-                    let item = tokio::select! {
-                        item = stream.next() => item,
-                        _ = exec_ctx.cancellation_token.cancelled() => {
-                            return Ok(ExecutionState::Cancelled);
-                        }
-                    };
-
-                    let Some(item) = item else {
-                        break 'stream;
-                    };
+                    let item = super::llm_retry::next_stream_chunk(
+                        &mut stream,
+                        &exec_ctx.cancellation_token,
+                    )
+                    .await;
 
                     let chunk = match item {
                         Ok(chunk) => chunk,
@@ -357,33 +452,28 @@ pub(super) async fn transition_call_llm(
                             );
                             continue;
                         }
-                        Err(e) if e.is_retryable() && stream_attempt <= max_stream_retries => {
-                            debug!(
-                                "Session {}: retryable mid-stream error on attempt {}/{}: {}",
-                                session_id, stream_attempt, max_stream_retries, e
-                            );
-                            flush_buffers!(true);
-                            config.emit_event(
-                                session_id,
-                                AgentEventKind::StreamRecovering {
-                                    message: e.to_string(),
-                                    attempt: u32_from_usize(
-                                        stream_attempt,
-                                        "stream_attempt",
-                                        Some(session_id),
-                                    ),
-                                    max_attempts: u32_from_usize(
-                                        max_stream_retries,
-                                        "max_stream_retries",
-                                        Some(session_id),
-                                    ),
-                                    message_id: Some(message_id.clone()),
-                                },
-                            );
-                            continue 'stream; // retry with fresh stream + accumulators
-                        }
-                        Err(e) => return Err(anyhow::Error::from(e).context("LLM streaming error")),
+                        Err(error) => match super::llm_retry::handle_stream_failure(
+                            config,
+                            session_id,
+                            error,
+                            &mut retry_budget,
+                            semantic_output_seen,
+                            Some(message_id.clone()),
+                            &exec_ctx.cancellation_token,
+                        )
+                        .await
+                        {
+                            super::llm_retry::StreamFailureAction::Retry => continue 'stream,
+                            super::llm_retry::StreamFailureAction::Cancelled => {
+                                return Ok(ExecutionState::Cancelled);
+                            }
+                            super::llm_retry::StreamFailureAction::Terminal(error) => {
+                                return Err(contextualize_llm_error(error, "streaming"));
+                            }
+                        },
                     };
+
+                    semantic_output_seen |= super::llm_retry::stream_chunk_commits_output(&chunk);
 
                     match chunk {
                         StreamChunk::Text(delta) => {
@@ -446,7 +536,6 @@ pub(super) async fn transition_call_llm(
                             });
                         }
                         StreamChunk::Done { finish_reason } => {
-                            stream_finish_reason = Some(finish_reason);
                             trace!(
                                 "stream chunk: session={} message_id={} type=done finish_reason={:?}",
                                 session_id, message_id, finish_reason
@@ -478,7 +567,34 @@ pub(super) async fn transition_call_llm(
                                     Err(_) | Ok(_) => break,
                                 }
                             }
-                            break 'stream;
+
+                            match validate_stream_terminal(finish_reason, &stream_tool_calls) {
+                                Ok(finish_reason) => {
+                                    stream_finish_reason = Some(finish_reason);
+                                    break 'stream;
+                                }
+                                Err(error) => match super::llm_retry::handle_stream_failure(
+                                    config,
+                                    session_id,
+                                    error,
+                                    &mut retry_budget,
+                                    semantic_output_seen,
+                                    Some(message_id.clone()),
+                                    &exec_ctx.cancellation_token,
+                                )
+                                .await
+                                {
+                                    super::llm_retry::StreamFailureAction::Retry => {
+                                        continue 'stream;
+                                    }
+                                    super::llm_retry::StreamFailureAction::Cancelled => {
+                                        return Ok(ExecutionState::Cancelled);
+                                    }
+                                    super::llm_retry::StreamFailureAction::Terminal(error) => {
+                                        return Err(contextualize_llm_error(error, "streaming"));
+                                    }
+                                },
+                            }
                         }
                         _ => {}
                     }
@@ -512,16 +628,10 @@ pub(super) async fn transition_call_llm(
                 return Ok(ExecutionState::Cancelled);
             }
 
-            // Use the provider-mapped finish_reason from the Done chunk.
-            // Fall back to a tool-call heuristic when the stream ended
-            // without a Done chunk (e.g. unexpected EOF).
-            let finish_reason = stream_finish_reason.or({
-                if stream_tool_calls.is_empty() {
-                    Some(FinishReason::Stop)
-                } else {
-                    Some(FinishReason::ToolCalls)
-                }
-            });
+            let finish_reason = Some(
+                stream_finish_reason
+                    .expect("successful stream loop exits only after an explicit Done chunk"),
+            );
 
             // Stash message_id in response so transition_after_llm reuses it
             // (see LlmResponse::with_message_id)
@@ -542,7 +652,7 @@ pub(super) async fn transition_call_llm(
         } else {
             // === NON-STREAMING FALLBACK ===
             let cancel = exec_ctx.cancellation_token.clone();
-            let resp = super::llm_retry::call_llm_with_retry(
+            let resp = match super::llm_retry::call_with_retry(
                 config,
                 session_id,
                 &exec_ctx.cancellation_token,
@@ -563,7 +673,11 @@ pub(super) async fn transition_call_llm(
                     }
                 },
             )
-            .await?;
+            .await
+            {
+                Ok(resp) => resp,
+                Err(e) => return map_failed_llm_call(e, false),
+            };
 
             (
                 resp.text().unwrap_or_default(),
@@ -1042,6 +1156,56 @@ mod tests {
             content: vec![Content::text(content)],
             cache: None,
         }
+    }
+
+    // ── map_failed_llm_call ───────────────────────────────────────────────────
+
+    #[test]
+    fn setup_cancel_maps_to_cancelled_not_error() {
+        let non_stream =
+            map_failed_llm_call(LLMError::Cancelled, false).expect("cancel must be Ok(Cancelled)");
+        assert!(matches!(non_stream, ExecutionState::Cancelled));
+
+        let stream = map_failed_llm_call(LLMError::Cancelled, true)
+            .expect("stream setup cancel must be Ok(Cancelled)");
+        assert!(matches!(stream, ExecutionState::Cancelled));
+    }
+
+    #[test]
+    fn tool_calls_finish_without_completed_calls_is_rejected() {
+        let error = validate_stream_terminal(FinishReason::ToolCalls, &[])
+            .expect_err("tool_calls without completed calls must not become success");
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == querymt::error::ProviderErrorKind::UnknownTransient
+        ));
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn setup_failures_add_operation_context_without_erasing_source() {
+        let chat_err =
+            map_failed_llm_call(LLMError::InvalidRequest("missing api_key".into()), false)
+                .expect_err("non-stream failure is Err");
+        assert!(chat_err.to_string().contains("LLM chat error"));
+        assert!(
+            chat_err
+                .to_string()
+                .contains("Invalid Request: missing api_key")
+        );
+        assert!(matches!(
+            chat_err.downcast_ref::<LLMError>(),
+            Some(LLMError::InvalidRequest(message)) if message == "missing api_key"
+        ));
+
+        let stream_err = map_failed_llm_call(LLMError::GenericError("boom".into()), true)
+            .expect_err("stream failure is Err");
+        assert!(stream_err.to_string().contains("LLM streaming error"));
+        assert!(matches!(
+            stream_err.downcast_ref::<LLMError>(),
+            Some(LLMError::GenericError(message)) if message == "boom"
+        ));
     }
 
     // ── apply_cache_breakpoints ───────────────────────────────────────────────

@@ -67,8 +67,8 @@ export type AgentEventKind =
 	message_id?: string;
 }}
 	/**
-	 * Ephemeral signal emitted when mid-stream transport error is detected.
-	 * Accumulated text is discarded and a new stream is being created.
+	 * Ephemeral signal emitted when a retryable mid-stream error recreates the stream.
+	 * Accumulated server-side state is discarded before the fresh request.
 	 */
 	| { type: "stream_recovering", data: {
 	/** Human-readable error message that triggered the retry */
@@ -265,7 +265,10 @@ export type AgentEventKind =
 	| { type: "session_mode_changed", data: {
 	mode: string;
 }}
-	/** LLM request was rate limited, execution is paused and waiting */
+	/**
+	 * LLM request was rate limited, execution is paused and waiting.
+	 * Retained as a stable wire event for rate-limit-specific UI behavior.
+	 */
 	| { type: "rate_limited", data: {
 	/** Human-readable message from the provider */
 	message: string;
@@ -278,8 +281,26 @@ export type AgentEventKind =
 	/** Maximum retry attempts configured */
 	max_attempts: number;
 }}
-	/** Rate limit wait completed, resuming execution */
+	/** Rate limit wait completed, resuming execution. */
 	| { type: "rate_limit_resume", data: {
+	/** Which attempt is now being made */
+	attempt: number;
+}}
+	/** A non-rate-limit retryable LLM failure is waiting before the next attempt. */
+	| { type: "llm_retry_wait", data: {
+	/** Human-readable error that triggered the retry */
+	message: string;
+	/** Seconds until retry will be attempted */
+	wait_secs: number;
+	/** When the wait started (Unix timestamp in seconds) */
+	started_at: number;
+	/** Current retry attempt (1-indexed) */
+	attempt: number;
+	/** Maximum retry attempts configured */
+	max_attempts: number;
+}}
+	/** Non-rate-limit LLM retry wait completed, resuming execution. */
+	| { type: "llm_retry_resume", data: {
 	/** Which attempt is now being made */
 	attempt: number;
 }}
