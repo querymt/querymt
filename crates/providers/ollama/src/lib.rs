@@ -901,7 +901,7 @@ mod tests {
         assert!(!error.is_retryable());
         match &error {
             LLMError::ProviderResponseError(failure) => {
-                assert!(message.contains("not found"));
+                assert!(failure.message().contains("not found"));
                 assert_eq!(failure.kind(), ProviderErrorKind::InvalidRequest);
             }
             other => panic!("expected ProviderResponseError, got {other}"),

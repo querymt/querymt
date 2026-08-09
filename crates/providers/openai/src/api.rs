@@ -1856,7 +1856,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         let error = classify_openai_http_error(&response);
         match error {
             LLMError::ProviderResponseError(failure) => {
-                assert_eq!(message, "slow down");
+                assert_eq!(failure.message(), "slow down");
                 assert_eq!(failure.kind(), ProviderErrorKind::RateLimited);
                 assert_eq!(failure.request_id(), Some("req-http"));
                 assert_eq!(failure.retry_after_secs(), Some(4));
@@ -1905,7 +1905,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
             .expect_err("error envelope should return an error");
         match &error {
             LLMError::ProviderResponseError(failure) => {
-                assert_eq!(message, "backend unavailable");
+                assert_eq!(failure.message(), "backend unavailable");
                 assert_eq!(failure.code(), Some("server_error"));
                 assert_eq!(failure.error_type(), Some("server_error"));
                 assert_eq!(failure.request_id(), Some("req_123"));
@@ -1947,7 +1947,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
             .expect_err("rate limit envelope should return an error");
         match &error {
             LLMError::ProviderResponseError(failure) => {
-                assert!(message.contains("Rate limit"));
+                assert!(failure.message().contains("Rate limit"));
                 assert_eq!(failure.retry_after_secs(), Some(2));
                 assert_eq!(failure.kind(), ProviderErrorKind::RateLimited);
             }
@@ -1967,7 +1967,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
             .expect_err("quota envelope should return an error");
         match &error {
             LLMError::ProviderResponseError(failure) => {
-                assert!(message.contains("quota"));
+                assert!(failure.message().contains("quota"));
                 assert_eq!(failure.kind(), ProviderErrorKind::QuotaExceeded);
                 assert_eq!(failure.code(), Some("insufficient_quota"));
             }
