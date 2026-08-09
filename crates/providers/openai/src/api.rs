@@ -1890,7 +1890,7 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         assert!(matches!(
             error,
             LLMError::ProviderResponseError(ref failure)
-                if failure.kind() == ProviderErrorKind::UnknownPermanent
+                if failure.kind() == ProviderErrorKind::UnknownTransient
         ));
     }
 
