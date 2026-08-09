@@ -1,7 +1,8 @@
 use http::{Method, Request, Response, header::CONTENT_TYPE};
 use qmt_openai::api::{
-    OpenAIProviderConfig, OpenAIToolUseState, openai_chat_request, openai_embed_request,
-    openai_parse_chat, openai_parse_embed, parse_openai_sse_chunk, url_schema,
+    OpenAIProviderConfig, OpenAIToolUseState, classify_openai_http_error, openai_chat_request,
+    openai_embed_request, openai_parse_chat, openai_parse_embed, parse_openai_sse_chunk,
+    url_schema,
 };
 use querymt::{
     HTTPLLMProvider,
@@ -114,6 +115,10 @@ impl OpenAIProviderConfig for OpenRouter {
 }
 
 impl HTTPChatProvider for OpenRouter {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
+        classify_openai_http_error(response)
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
@@ -237,8 +242,7 @@ impl HTTPLLMProviderFactory for OpenRouterFactory {
     }
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn HTTPLLMProvider>, LLMError> {
-        let provider: OpenRouter = serde_json::from_str(cfg)
-            .map_err(|e| LLMError::PluginError(format!("OpenRouter config error: {}", e)))?;
+        let provider: OpenRouter = serde_json::from_str(cfg)?;
 
         // 2) Done—our OpenAI::send/chat/etc methods will lazily build the Client
         Ok(Box::new(provider))
@@ -270,8 +274,9 @@ mod extism_exports {
 
 #[cfg(test)]
 mod tests {
-    use super::OpenRouter;
+    use super::{OpenRouter, OpenRouterFactory};
     use querymt::chat::{StreamChunk, http::HTTPChatProvider};
+    use querymt::{error::LLMError, plugin::HTTPLLMProviderFactory};
     use serde_json::Value;
 
     fn test_provider() -> OpenRouter {
@@ -280,6 +285,17 @@ mod tests {
             "model": "openai/gpt-4o-mini"
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn malformed_config_is_non_retryable_json_error() {
+        let error = OpenRouterFactory
+            .from_config("{")
+            .err()
+            .expect("config should be rejected");
+
+        assert!(!error.is_retryable());
+        assert!(matches!(error, LLMError::JsonError(_)));
     }
 
     #[test]

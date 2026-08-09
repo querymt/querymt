@@ -4,8 +4,8 @@ use http::{
 };
 use kimi_auth::kimi_cli_oauth_config;
 use qmt_openai::api::{
-    OpenAIProviderConfig, OpenAIToolUseState, openai_chat_request, openai_parse_chat,
-    parse_openai_sse_chunk, url_schema,
+    OpenAIProviderConfig, OpenAIToolUseState, classify_openai_http_error, openai_chat_request,
+    openai_parse_chat, parse_openai_sse_chunk, url_schema,
 };
 use querymt::{
     HTTPLLMProvider,
@@ -142,6 +142,10 @@ impl OpenAIProviderConfig for KimiCode {
 }
 
 impl HTTPChatProvider for KimiCode {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
+        classify_openai_http_error(response)
+    }
+
     fn supports_streaming(&self) -> bool {
         self.stream.unwrap_or(false)
     }
