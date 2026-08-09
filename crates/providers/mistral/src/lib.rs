@@ -3,8 +3,9 @@ use http::{
     header::{AUTHORIZATION, CONTENT_TYPE},
 };
 use qmt_openai::api::{
-    OpenAIProviderConfig, openai_chat_request, openai_embed_request, openai_list_models_request,
-    openai_parse_chat, openai_parse_embed, openai_parse_list_models, url_schema,
+    OpenAIProviderConfig, classify_openai_http_error, openai_chat_request, openai_embed_request,
+    openai_list_models_request, openai_parse_chat, openai_parse_embed, openai_parse_list_models,
+    url_schema,
 };
 use querymt::{
     HTTPLLMProvider, ToolCall,
@@ -148,6 +149,10 @@ impl OpenAIProviderConfig for Mistral {
 }
 
 impl HTTPChatProvider for Mistral {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
+        classify_openai_http_error(response)
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
@@ -210,7 +215,7 @@ impl HTTPCompletionProvider for Mistral {
             Ok(completion_response) => Ok(CompletionResponse {
                 text: completion_response.choices[0].message.content.clone(), // FIXME
             }),
-            Err(e) => Err(LLMError::JsonError(e)),
+            Err(e) => Err(LLMError::from(e)),
         }
     }
 }

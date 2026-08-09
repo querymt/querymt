@@ -4,13 +4,14 @@ use http::{
     header::{AUTHORIZATION, CONTENT_TYPE},
 };
 use qmt_codex::api::{
-    CodexToolUseState, codex_parse_chat_with_state, codex_parse_stream_chunk_with_state,
+    CodexToolUseState, classify_codex_http_error, codex_parse_chat_with_state,
+    codex_parse_stream_chunk_with_state,
 };
 use qmt_openai::{
     AuthType,
     api::{
-        OpenAIProviderConfig, openai_chat_request, openai_embed_request,
-        openai_list_models_request, openai_parse_chat, openai_parse_embed,
+        OpenAIProviderConfig, classify_openai_http_error, openai_chat_request,
+        openai_embed_request, openai_list_models_request, openai_parse_chat, openai_parse_embed,
         openai_parse_list_models, parse_openai_sse_chunk, url_schema,
     },
 };
@@ -35,7 +36,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use url::Url;
-
 const XAI_ADDITIONAL_LIST_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5"];
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
@@ -176,6 +176,14 @@ impl OpenAIProviderConfig for Xai {
 }
 
 impl HTTPChatProvider for Xai {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
+        if self.should_use_responses_api() {
+            classify_codex_http_error(response)
+        } else {
+            classify_openai_http_error(response)
+        }
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
@@ -332,13 +340,14 @@ impl HTTPCompletionProvider for Xai {
             Ok(completion_response) => Ok(CompletionResponse {
                 text: completion_response.choices[0].message.content.clone(), // FIXME
             }),
-            Err(e) => Err(LLMError::JsonError(e)),
+            Err(e) => Err(LLMError::from(e)),
         }
     }
 }
 
 struct XaiStreamParser {
     use_responses_api: bool,
+    responses_completed: bool,
     codex_tool_state: Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
     openai_tool_state: HashMap<usize, qmt_openai::api::OpenAIToolUseState>,
 }
@@ -347,6 +356,7 @@ impl XaiStreamParser {
     fn new(use_responses_api: bool) -> Self {
         Self {
             use_responses_api,
+            responses_completed: false,
             codex_tool_state: Arc::new(Mutex::new(HashMap::new())),
             openai_tool_state: HashMap::new(),
         }
@@ -356,9 +366,24 @@ impl XaiStreamParser {
 impl ChatStreamParser for XaiStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
         if self.use_responses_api {
-            codex_parse_stream_chunk_with_state(chunk, &self.codex_tool_state)
+            let chunks = codex_parse_stream_chunk_with_state(chunk, &self.codex_tool_state)?;
+            if chunks
+                .iter()
+                .any(|chunk| matches!(chunk, StreamChunk::Done { .. }))
+            {
+                self.responses_completed = true;
+            }
+            Ok(chunks)
         } else {
             parse_openai_sse_chunk(chunk, &mut self.openai_tool_state)
+        }
+    }
+
+    fn finish(&mut self) -> Result<Vec<StreamChunk>, LLMError> {
+        if !self.use_responses_api || self.responses_completed {
+            Ok(Vec::new())
+        } else {
+            Err(qmt_codex::api::codex_stream_closed_error())
         }
     }
 }
@@ -1001,6 +1026,63 @@ mod tests {
         let body: Value = serde_json::from_slice(req.body()).expect("body should be JSON");
 
         assert_eq!(body["stream"], Value::Bool(true));
+    }
+
+    #[test]
+    fn responses_stream_eof_before_response_completed_is_retryable() {
+        let mut parser = XaiStreamParser::new(true);
+        assert!(parser.parse_chunk(b"data: [DONE]\n\n").unwrap().is_empty());
+
+        let error = parser
+            .finish()
+            .expect_err("responses EOF before response.completed must fail");
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == querymt::error::ProviderErrorKind::UnknownTransient
+                    && failure.message() == "stream closed before response.completed"
+        ));
+    }
+
+    #[test]
+    fn responses_stream_response_completed_finishes_cleanly() {
+        let mut parser = XaiStreamParser::new(true);
+        let chunks = parser
+            .parse_chunk(
+                br#"data: {"type":"response.completed","response":{"id":"resp_1"}}
+
+"#,
+            )
+            .unwrap();
+        assert!(matches!(chunks.as_slice(), [StreamChunk::Done { .. }]));
+        assert!(parser.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn openai_stream_finish_behavior_is_unchanged() {
+        let mut parser = XaiStreamParser::new(false);
+        assert!(parser.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stream_parser_returns_classified_codex_error() {
+        let mut xai = test_xai("xai-key");
+        xai.conversation_id = Some("conversation-id".to_string());
+        let mut parser = xai.chat_stream_parser().unwrap();
+        let chunk = br#"data: {"type":"response.failed","response":{"error":{"message":"busy","code":"server_is_overloaded"}}}
+
+"#;
+
+        let error = parser.parse_chunk(chunk).unwrap_err();
+        match error {
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(
+                    failure.kind(),
+                    querymt::error::ProviderErrorKind::ServerOverloaded
+                );
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
     }
 
     #[test]

@@ -137,6 +137,10 @@ impl api::CodexProviderConfig for Codex {
 }
 
 impl HTTPChatProvider for Codex {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
+        api::classify_codex_http_error(response)
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
@@ -170,11 +174,27 @@ impl HTTPChatProvider for Codex {
 #[derive(Default)]
 struct CodexStreamParser {
     tool_states: Arc<Mutex<HashMap<usize, api::CodexToolUseState>>>,
+    completed: bool,
 }
 
 impl ChatStreamParser for CodexStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        api::codex_parse_stream_chunk_with_state(chunk, &self.tool_states)
+        let chunks = api::codex_parse_stream_chunk_with_state(chunk, &self.tool_states)?;
+        if chunks
+            .iter()
+            .any(|chunk| matches!(chunk, StreamChunk::Done { .. }))
+        {
+            self.completed = true;
+        }
+        Ok(chunks)
+    }
+
+    fn finish(&mut self) -> Result<Vec<StreamChunk>, LLMError> {
+        if self.completed {
+            Ok(Vec::new())
+        } else {
+            Err(api::codex_stream_closed_error())
+        }
     }
 }
 
@@ -288,5 +308,40 @@ mod extism_exports {
         config = Codex,
         factory = CodexFactory,
         name   = "codex",
+    }
+}
+
+#[cfg(test)]
+mod stream_parser_tests {
+    use super::{ChatStreamParser, CodexStreamParser, LLMError, StreamChunk};
+    use querymt::error::ProviderErrorKind;
+
+    #[test]
+    fn premature_eof_before_response_completed_is_retryable() {
+        let mut parser = CodexStreamParser::default();
+        let events = parser.parse_chunk(b"data: [DONE]\n\n").unwrap();
+        assert!(events.is_empty());
+
+        let error = parser.finish().unwrap_err();
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::UnknownTransient
+                    && failure.message() == "stream closed before response.completed"
+        ));
+    }
+
+    #[test]
+    fn eof_after_response_completed_is_clean() {
+        let mut parser = CodexStreamParser::default();
+        let events = parser
+            .parse_chunk(
+                br#"data: {"type":"response.completed","response":{"id":"resp_1"}}
+
+"#,
+            )
+            .unwrap();
+        assert!(matches!(events.as_slice(), [StreamChunk::Done { .. }]));
+        assert!(parser.finish().unwrap().is_empty());
     }
 }

@@ -13,7 +13,10 @@ use querymt::{
         ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort, StreamChunk,
         Tool, ToolChoice,
     },
-    error::LLMError,
+    error::{
+        LLMError, ProviderErrorKind, ProviderFailure, extract_retry_after_from_json,
+        parse_retry_after, parse_retry_after_from_message,
+    },
     handle_http_error,
 };
 use schemars::{Schema, SchemaGenerator, json_schema};
@@ -95,13 +98,15 @@ pub trait CodexProviderConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct CodexToolUseState {
-    /// The Responses API item id (e.g. `fc_...`), used to correlate argument delta/done events.
+    /// The Responses API item id (e.g. `fc_...`), used to correlate streamed argument events.
     pub item_id: Option<String>,
     /// The tool call id (e.g. `call_...`), which we surface as `ToolCall.id`.
     pub id: Option<String>,
     pub name: Option<String>,
     pub arguments: String,
     pub started: bool,
+    /// Set only after the authoritative `response.output_item.done` event is parsed.
+    pub completed: bool,
     pub emitted_thinking: Vec<String>,
     pub emitted_thinking_text: String,
     pub streamed_thinking_seen: bool,
@@ -309,11 +314,13 @@ struct CodexSseEvent {
     #[serde(rename = "type")]
     kind: String,
     delta: Option<String>,
-    arguments: Option<String>,
     response: Option<Value>,
+    #[serde(alias = "requestId")]
+    request_id: Option<String>,
     item: Option<Value>,
     output_index: Option<usize>,
     item_id: Option<String>,
+    end_turn: Option<bool>,
 }
 
 fn joined_non_empty(pieces: Vec<String>) -> Option<String> {
@@ -750,7 +757,9 @@ pub fn codex_parse_chat_with_state(
     response: Response<Vec<u8>>,
     tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
 ) -> Result<Box<dyn ChatResponse>, LLMError> {
-    handle_http_error!(response);
+    if !response.status().is_success() {
+        return Err(classify_codex_http_error(&response));
+    }
 
     let body = response.body();
     let raw = String::from_utf8_lossy(body);
@@ -776,6 +785,36 @@ pub fn codex_parse_chat_with_state(
     }
 }
 
+pub fn classify_codex_http_error(response: &Response<Vec<u8>>) -> LLMError {
+    let status = response.status().as_u16();
+    let retry_after_secs = parse_retry_after(response.headers());
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .or_else(|| response.headers().get("request-id"))
+        .and_then(|value| value.to_str().ok());
+    let envelope = serde_json::from_slice::<Value>(response.body()).ok();
+    if let Some(envelope) = envelope.as_ref() {
+        let response_value = envelope.get("response").unwrap_or(envelope);
+        if let Some(error) = response_value
+            .get("error")
+            .or_else(|| envelope.get("error"))
+        {
+            let mapped = map_codex_response_failed(
+                error,
+                response_value,
+                request_id,
+                matches!(status, 429 | 500..=599),
+            );
+            let retry_after_secs = retry_after_secs.or(mapped.retry_after_secs());
+            return mapped.with_retry_after_secs(retry_after_secs).into();
+        }
+    }
+
+    // No vendor envelope: classify from the status alone.
+    querymt::error::classify_status_only(status, response.headers(), response.body())
+}
+
 pub fn codex_parse_stream_chunk_with_state(
     chunk: &[u8],
     tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
@@ -798,20 +837,9 @@ pub fn codex_parse_stream_chunk_with_state(
             None => continue,
         };
 
+        // The Responses API is complete only after `response.completed`.
+        // `[DONE]` is transport framing and does not describe response semantics.
         if data == "[DONE]" {
-            let has_tool_calls = tool_state_buffer
-                .lock()
-                .unwrap()
-                .values()
-                .any(|s| s.started);
-            clear_thinking_state(tool_state_buffer);
-            results.push(StreamChunk::Done {
-                finish_reason: if has_tool_calls {
-                    FinishReason::ToolCalls
-                } else {
-                    FinishReason::Stop
-                },
-            });
             continue;
         }
 
@@ -857,27 +885,31 @@ pub fn codex_parse_stream_chunk_with_state(
                 }
             }
             "response.output_item.done" => {
-                if let Some(item) = event.item {
-                    if item.get("type").and_then(Value::as_str) == Some("reasoning") {
-                        if let Some(text) = extract_reasoning_text_from_value(&item)
-                            && let Some(text) =
-                                mark_final_thinking_emitted(tool_state_buffer, &text)
-                        {
-                            results.push(StreamChunk::Thinking(text));
-                        }
-                    } else {
-                        handle_output_item_event(
-                            &item,
-                            event.output_index,
-                            &mut results,
-                            tool_state_buffer,
-                        );
+                let Some(item) = event.item else {
+                    tool_state_buffer.lock().unwrap().clear();
+                    return Err(codex_stream_format_error(
+                        "response.output_item.done missing item payload",
+                        &Value::Null,
+                    ));
+                };
+                if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                    if let Some(text) = extract_reasoning_text_from_value(&item)
+                        && let Some(text) = mark_final_thinking_emitted(tool_state_buffer, &text)
+                    {
+                        results.push(StreamChunk::Thinking(text));
                     }
+                } else {
+                    handle_output_item_done(
+                        &item,
+                        event.output_index,
+                        &mut results,
+                        tool_state_buffer,
+                    )?;
                 }
             }
             "response.output_item.added" => {
                 if let Some(item) = event.item {
-                    handle_output_item_event(
+                    handle_output_item_added(
                         &item,
                         event.output_index,
                         &mut results,
@@ -896,19 +928,19 @@ pub fn codex_parse_stream_chunk_with_state(
                     );
                 }
             }
-            "response.function_call_arguments.done" => {
-                handle_function_call_arguments_done(
-                    event.output_index,
-                    event.item_id.as_deref(),
-                    event.arguments.as_deref(),
-                    &mut results,
-                    tool_state_buffer,
-                );
-            }
+            // `response.output_item.done` contains the authoritative function call.
+            "response.function_call_arguments.done" => {}
             "response.completed" => {
                 debug!("codex stream: response.completed received");
+                if response_end_turn(&event) == Some(false) {
+                    tool_state_buffer.lock().unwrap().clear();
+                    return Err(codex_stream_format_error(
+                        "response.completed with end_turn=false is not supported",
+                        event.response.as_ref().unwrap_or(&Value::Null),
+                    ));
+                }
+                ensure_no_incomplete_tool_calls(tool_state_buffer)?;
                 if let Some(response) = event.response {
-                    emit_tool_calls_from_response(&response, &mut results, tool_state_buffer);
                     if let Some(text) = extract_reasoning_text_from_response(&response)
                         && let Some(text) = mark_final_thinking_emitted(tool_state_buffer, &text)
                     {
@@ -925,31 +957,138 @@ pub fn codex_parse_stream_chunk_with_state(
                     .lock()
                     .unwrap()
                     .values()
-                    .any(|s| s.started)
+                    .any(|state| state.completed)
                 {
                     FinishReason::ToolCalls
                 } else {
                     FinishReason::Stop
                 };
-                clear_thinking_state(tool_state_buffer);
+                clear_stream_state(tool_state_buffer);
                 results.push(StreamChunk::Done { finish_reason });
             }
-            "response.failed" => {
-                let message = event
-                    .response
-                    .as_ref()
-                    .and_then(|r| r.get("error"))
-                    .and_then(|e| e.get("message"))
+            "response.incomplete" => {
+                let response = event.response.unwrap_or(Value::Null);
+                let reason = response
+                    .get("incomplete_details")
+                    .and_then(|details| details.get("reason"))
                     .and_then(Value::as_str)
-                    .unwrap_or("Codex response failed");
-                clear_thinking_state(tool_state_buffer);
-                return Err(LLMError::ProviderError(message.to_string()));
+                    .unwrap_or("unknown");
+                tool_state_buffer.lock().unwrap().clear();
+                return Err(retryable_codex_stream_error(format!(
+                    "incomplete response returned, reason: {reason}"
+                )));
+            }
+            "response.failed" => {
+                let response = event.response.unwrap_or(Value::Null);
+                let error = response.get("error").unwrap_or(&Value::Null);
+                let provider_error =
+                    map_codex_response_failed(error, &response, event.request_id.as_deref(), true);
+                tool_state_buffer.lock().unwrap().clear();
+                return Err(provider_error.into());
             }
             _ => {}
         }
     }
 
     Ok(results)
+}
+
+/// Normalize a Codex/Responses API error `code`/`type` token for table lookup.
+fn normalize_error_token(token: &str) -> String {
+    token.trim().to_ascii_lowercase().replace(['-', ' '], "_")
+}
+
+/// Map a normalized Codex Responses API error `code`/`type` to a unified kind.
+///
+/// Mirrors Codex Responses API `response.failed` and HTTP bridge handlers.
+/// Kept provider-local in this stack; classifier deduplication is a separate refactor.
+fn codex_error_kind(code: &str) -> Option<ProviderErrorKind> {
+    match code {
+        // Upstream codex: is_server_overloaded_error
+        "server_is_overloaded" | "slow_down" => Some(ProviderErrorKind::ServerOverloaded),
+        // Upstream: rate_limit_exceeded (code). `rate_limit_error` is the common
+        // OpenAI `type` field — accepted on type-fallback only for HTTP bodies.
+        "rate_limit_exceeded" | "rate_limit_error" => Some(ProviderErrorKind::RateLimited),
+        // Upstream codex: context_length_exceeded → ContextWindowExceeded
+        "context_length_exceeded" => Some(ProviderErrorKind::ContextWindowExceeded),
+        // Upstream codex http 429 bridge: usage_limit_reached is a plan/account
+        // cap (UsageLimitReached), not a transient TPM rate limit — permanent.
+        // Also insufficient_quota / usage_not_included.
+        "usage_limit_reached" | "insufficient_quota" | "usage_not_included" => {
+            Some(ProviderErrorKind::QuotaExceeded)
+        }
+        // Upstream codex: cyber_policy / invalid_prompt / bio_policy → fatal request
+        "cyber_policy"
+        | "invalid_prompt"
+        | "bio_policy"
+        | "invalid_request"
+        | "invalid_request_error" => Some(ProviderErrorKind::InvalidRequest),
+        "authentication_error" | "invalid_api_key" | "unauthorized" => {
+            Some(ProviderErrorKind::Authentication)
+        }
+        _ => None,
+    }
+}
+
+/// Map Codex `response.failed` error objects into unified kinds.
+///
+/// Unknown structured codes stay retryable before semantic output
+/// (`unknown_transient: true` from the SSE path), matching upstream codex's
+/// catch-all `ApiError::Retryable` for unmapped response.failed codes.
+fn map_codex_response_failed(
+    error: &Value,
+    response: &Value,
+    explicit_request_id: Option<&str>,
+    unknown_transient: bool,
+) -> ProviderFailure {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "codex response failed".to_owned());
+    let code = error.get("code").and_then(Value::as_str).map(str::to_owned);
+    let error_type = error
+        .get("type")
+        .or_else(|| error.get("error_type"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let request_id = explicit_request_id.map(str::to_owned).or_else(|| {
+        error
+            .get("request_id")
+            .or_else(|| error.get("requestId"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    let retry_after_secs =
+        extract_retry_after_from_json(error).or_else(|| extract_retry_after_from_json(response));
+    let code_norm = code.as_deref().map(normalize_error_token);
+    let type_norm = error_type.as_deref().map(normalize_error_token);
+    let mapped = code_norm
+        .as_deref()
+        .and_then(codex_error_kind)
+        .or_else(|| type_norm.as_deref().and_then(codex_error_kind));
+
+    // Upstream: unmapped response.failed → Retryable. Known kinds own policy.
+    let kind = mapped.unwrap_or(if unknown_transient {
+        ProviderErrorKind::UnknownTransient
+    } else {
+        ProviderErrorKind::UnknownPermanent
+    });
+    // Structured payload hints are authoritative. Message parsing is only a fallback
+    // for rate_limit_exceeded envelopes without machine-readable delay metadata.
+    let retry_after_secs = if kind == ProviderErrorKind::RateLimited {
+        retry_after_secs.or_else(|| parse_retry_after_from_message(&message))
+    } else {
+        retry_after_secs
+    };
+
+    ProviderFailure::new(kind, message)
+        .with_code(code)
+        .with_error_type(error_type)
+        .with_request_id(request_id)
+        .with_retry_after_secs(retry_after_secs)
 }
 
 fn mark_streamed_thinking_emitted(
@@ -986,18 +1125,27 @@ fn mark_final_thinking_emitted(
     Some(text_to_emit)
 }
 
-fn clear_thinking_state(tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>) {
-    tool_state_buffer.lock().unwrap().remove(&usize::MAX);
+fn clear_stream_state(tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>) {
+    tool_state_buffer.lock().unwrap().clear();
 }
 
-fn handle_output_item_event(
+fn response_end_turn(event: &CodexSseEvent) -> Option<bool> {
+    event.end_turn.or_else(|| {
+        event
+            .response
+            .as_ref()
+            .and_then(|response| response.get("end_turn"))
+            .and_then(Value::as_bool)
+    })
+}
+
+fn handle_output_item_added(
     item: &Value,
     output_index: Option<usize>,
     results: &mut Vec<StreamChunk>,
     tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
 ) {
-    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-    if item_type != "function_call" {
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
         return;
     }
 
@@ -1007,10 +1155,6 @@ fn handle_output_item_event(
         .and_then(Value::as_str)
         .map(str::to_string);
     let name = item.get("name").and_then(Value::as_str).map(str::to_string);
-    let arguments = item
-        .get("arguments")
-        .and_then(Value::as_str)
-        .map(str::to_string);
 
     let index = resolve_tool_index(output_index, tool_state_buffer);
     let mut buffer = tool_state_buffer.lock().unwrap();
@@ -1024,21 +1168,7 @@ fn handle_output_item_event(
     if let Some(name) = name {
         state.name = Some(name);
     }
-    if !state.started
-        && let (Some(id), Some(name)) = (state.id.clone(), state.name.clone())
-    {
-        state.started = true;
-        results.push(StreamChunk::ToolUseStart { index, id, name });
-    }
-
-    // `response.output_item.added` typically includes empty arguments; only complete when
-    // the backend provides non-empty JSON arguments (e.g. `response.output_item.done`).
-    if let Some(arguments) = arguments
-        && !arguments.trim().is_empty()
-    {
-        emit_arguments_delta(index, &arguments, state, results);
-        emit_tool_complete(index, state, results);
-    }
+    emit_tool_start(index, state, results);
 }
 
 fn handle_function_call_arguments_delta(
@@ -1051,12 +1181,10 @@ fn handle_function_call_arguments_delta(
     let index = resolve_tool_index_with_item(output_index, item_id, tool_state_buffer);
     let mut buffer = tool_state_buffer.lock().unwrap();
     let state = buffer.entry(index).or_default();
-    if !state.started
-        && let (Some(id), Some(name)) = (state.id.clone(), state.name.clone())
-    {
-        state.started = true;
-        results.push(StreamChunk::ToolUseStart { index, id, name });
+    if let Some(item_id) = item_id {
+        state.item_id = Some(item_id.to_string());
     }
+    emit_tool_start(index, state, results);
     state.arguments.push_str(delta);
     results.push(StreamChunk::ToolUseInputDelta {
         index,
@@ -1064,93 +1192,105 @@ fn handle_function_call_arguments_delta(
     });
 }
 
-fn handle_function_call_arguments_done(
+fn handle_output_item_done(
+    item: &Value,
     output_index: Option<usize>,
-    item_id: Option<&str>,
-    arguments: Option<&str>,
     results: &mut Vec<StreamChunk>,
     tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
-) {
-    let index = resolve_tool_index_with_item(output_index, item_id, tool_state_buffer);
-    let mut buffer = tool_state_buffer.lock().unwrap();
-    if let Some(state) = buffer.get_mut(&index) {
-        if !state.started
-            && let (Some(id), Some(name)) = (state.id.clone(), state.name.clone())
-        {
-            state.started = true;
-            results.push(StreamChunk::ToolUseStart { index, id, name });
-        }
-        if let Some(arguments) = arguments
-            && !arguments.trim().is_empty()
-        {
-            emit_arguments_delta(index, arguments, state, results);
-        }
-        emit_tool_complete(index, state, results);
+) -> Result<(), LLMError> {
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return Ok(());
     }
-}
 
-fn emit_tool_calls_from_response(
-    response: &Value,
-    results: &mut Vec<StreamChunk>,
-    tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
-) {
-    let Some(items) = response.get("output").and_then(Value::as_array) else {
-        return;
+    let item_id = item.get("id").and_then(Value::as_str);
+    let index = resolve_tool_index_with_item(output_index, item_id, tool_state_buffer);
+    let call_id = item.get("call_id").and_then(Value::as_str);
+    let name = item.get("name").and_then(Value::as_str);
+    let arguments = item.get("arguments").and_then(Value::as_str);
+    let (Some(call_id), Some(name), Some(arguments)) = (call_id, name, arguments) else {
+        return Err(codex_stream_format_error(
+            "response.output_item.done contained an incomplete function call",
+            item,
+        ));
     };
 
-    for (idx, item) in items.iter().enumerate() {
-        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-        if item_type != "function_call" {
-            continue;
-        }
+    let mut buffer = tool_state_buffer.lock().unwrap();
+    let state = buffer.entry(index).or_default();
+    if state.completed {
+        return Ok(());
+    }
+    if let Some(item_id) = item_id {
+        state.item_id = Some(item_id.to_string());
+    }
+    state.id = Some(call_id.to_string());
+    state.name = Some(name.to_string());
+    emit_tool_start(index, state, results);
+    emit_arguments_delta(index, arguments, state, results);
+    state.completed = true;
+    results.push(StreamChunk::ToolUseComplete {
+        index,
+        tool_call: ToolCall {
+            id: call_id.to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        },
+    });
+    Ok(())
+}
 
-        let item_id = item.get("id").and_then(Value::as_str).map(str::to_string);
-        let id = item
-            .get("call_id")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let name = item.get("name").and_then(Value::as_str).map(str::to_string);
-        let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("");
-
-        let index = resolve_tool_index(Some(idx), tool_state_buffer);
-        let mut buffer = tool_state_buffer.lock().unwrap();
-        let state = buffer.entry(index).or_default();
-        if let Some(item_id) = item_id {
-            state.item_id = Some(item_id);
-        }
-        if let Some(id) = id {
-            state.id = Some(id);
-        }
-        if let Some(name) = name {
-            state.name = Some(name);
-        }
-        if !state.started
-            && let (Some(id), Some(name)) = (state.id.clone(), state.name.clone())
-        {
-            state.started = true;
-            results.push(StreamChunk::ToolUseStart { index, id, name });
-        }
-        if !arguments.is_empty() {
-            emit_arguments_delta(index, arguments, state, results);
-        }
-        emit_tool_complete(index, state, results);
+fn emit_tool_start(index: usize, state: &mut CodexToolUseState, results: &mut Vec<StreamChunk>) {
+    if !state.started
+        && let (Some(id), Some(name)) = (state.id.clone(), state.name.clone())
+    {
+        state.started = true;
+        results.push(StreamChunk::ToolUseStart { index, id, name });
     }
 }
 
-fn emit_tool_complete(index: usize, state: &CodexToolUseState, results: &mut Vec<StreamChunk>) {
-    if let (Some(id), Some(name)) = (state.id.clone(), state.name.clone()) {
-        results.push(StreamChunk::ToolUseComplete {
-            index,
-            tool_call: ToolCall {
-                id,
-                call_type: "function".to_string(),
-                function: FunctionCall {
-                    name,
-                    arguments: state.arguments.clone(),
-                },
-            },
-        });
+fn ensure_no_incomplete_tool_calls(
+    tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
+) -> Result<(), LLMError> {
+    let buffer = tool_state_buffer.lock().unwrap();
+    let incomplete = buffer
+        .iter()
+        .filter(|(index, state)| **index != usize::MAX && !state.completed)
+        .map(|(index, state)| {
+            state
+                .item_id
+                .as_deref()
+                .or(state.id.as_deref())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("index {index}"))
+        })
+        .collect::<Vec<_>>();
+    drop(buffer);
+    if incomplete.is_empty() {
+        Ok(())
+    } else {
+        tool_state_buffer.lock().unwrap().clear();
+        Err(retryable_codex_stream_error(format!(
+            "response.completed arrived before function call item(s) completed: {}",
+            incomplete.join(", ")
+        )))
     }
+}
+
+fn codex_stream_format_error(message: impl Into<String>, raw: &Value) -> LLMError {
+    LLMError::ResponseFormatError {
+        message: message.into(),
+        raw_response: raw.to_string(),
+    }
+}
+
+fn retryable_codex_stream_error(message: impl Into<String>) -> LLMError {
+    ProviderFailure::new(ProviderErrorKind::UnknownTransient, message).into()
+}
+
+pub fn codex_stream_closed_error() -> LLMError {
+    retryable_codex_stream_error("stream closed before response.completed")
 }
 
 fn emit_arguments_delta(
@@ -1338,12 +1478,16 @@ fn codex_effort_str(e: ReasoningEffort) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodexChatResponse, CodexToolUseState, chatgpt_account_id, codex_chat_body_json,
-        codex_chat_request, codex_parse_stream_chunk_with_state,
+        CodexChatResponse, CodexToolUseState, chatgpt_account_id, classify_codex_http_error,
+        codex_chat_body_json, codex_chat_request, codex_parse_chat_with_state,
+        codex_parse_stream_chunk_with_state,
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use http::header::AUTHORIZATION;
-    use querymt::chat::{ChatMessage, ChatResponse, ChatRole, Content, FinishReason, StreamChunk};
+    use http::{Response, header::AUTHORIZATION};
+    use querymt::{
+        chat::{ChatMessage, ChatResponse, ChatRole, Content, FinishReason, StreamChunk},
+        error::{LLMError, ProviderErrorKind},
+    };
     use serde_json::Value;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -1754,6 +1898,305 @@ mod tests {
         assert_eq!(response.thinking().as_deref(), Some("why because details"));
     }
 
+    fn parse_failed_event(
+        payload: &str,
+    ) -> (LLMError, Arc<Mutex<HashMap<usize, CodexToolUseState>>>) {
+        let state = Arc::new(Mutex::new(HashMap::<usize, CodexToolUseState>::from([
+            (0, CodexToolUseState::default()),
+            (usize::MAX, CodexToolUseState::default()),
+        ])));
+        let chunk = format!("data: {payload}\n\n");
+        let error = codex_parse_stream_chunk_with_state(chunk.as_bytes(), &state)
+            .expect_err("response.failed should return an error");
+        (error, state)
+    }
+
+    #[test]
+    fn parse_chat_non_success_uses_live_classifier_guard() {
+        let state = Arc::new(Mutex::new(HashMap::new()));
+        let response = Response::builder()
+            .status(401)
+            .body(br#"{"error":{"message":"bad key","code":"invalid_api_key"}}"#.to_vec())
+            .unwrap();
+
+        let error = codex_parse_chat_with_state(response, &state).unwrap_err();
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::Authentication
+                    && failure.message() == "bad key"
+        ));
+    }
+
+    #[test]
+    fn classify_http_error_maps_codex_envelope_and_headers() {
+        let response = Response::builder()
+            .status(503)
+            .header("retry-after", "3")
+            .header("x-request-id", "req-http")
+            .body(br#"{"error":{"message":"busy","code":"server_is_overloaded"}}"#.to_vec())
+            .unwrap();
+
+        let error = classify_codex_http_error(&response);
+        match error {
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.message(), "busy");
+                assert_eq!(failure.kind(), ProviderErrorKind::ServerOverloaded);
+                assert_eq!(failure.request_id(), Some("req-http"));
+                assert_eq!(failure.retry_after_secs(), Some(3));
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    #[test]
+    fn classify_http_header_retry_hint_precedes_structured_body_hint() {
+        let response = Response::builder()
+            .status(429)
+            .header("retry-after", "30")
+            .body(
+                br#"{"error":{"message":"slow down","code":"rate_limit_exceeded","retry_after":"4s"}}"#
+                    .to_vec(),
+            )
+            .unwrap();
+
+        let error = classify_codex_http_error(&response);
+        assert_eq!(error.retry_after_secs(), Some(30));
+    }
+
+    #[test]
+    fn classify_http_unknown_error_uses_status_retryability() {
+        for (status, expected_retryable) in [(400, false), (429, true), (503, true)] {
+            let response = Response::builder()
+                .status(status)
+                .body(
+                    br#"{"error":{"message":"vendor failure","code":"vendor_specific"}}"#.to_vec(),
+                )
+                .unwrap();
+
+            let error = classify_codex_http_error(&response);
+            assert_eq!(error.is_retryable(), expected_retryable, "status={status}");
+        }
+    }
+
+    #[test]
+    fn classify_http_429_usage_limit_reached_is_permanent_quota() {
+        // Upstream api_bridge: 429 + error.type == usage_limit_reached →
+        // UsageLimitReached (not retryable). Must not look like RateLimited.
+        let response = Response::builder()
+            .status(429)
+            .header("retry-after", "60")
+            .body(
+                br#"{"error":{"message":"You have hit your usage limit.","type":"usage_limit_reached","resets_at":1710000000}}"#
+                    .to_vec(),
+            )
+            .unwrap();
+
+        let error = classify_codex_http_error(&response);
+        match &error {
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.message(), "You have hit your usage limit.");
+                assert_eq!(failure.kind(), ProviderErrorKind::QuotaExceeded);
+                assert_eq!(failure.error_type(), Some("usage_limit_reached"));
+                assert_eq!(failure.retry_after_secs(), Some(60));
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+        assert!(!error.is_retryable());
+        assert!(!error.is_rate_limited());
+    }
+
+    #[test]
+    fn classify_http_429_rate_limit_exceeded_stays_retryable() {
+        let response = Response::builder()
+            .status(429)
+            .body(
+                br#"{"error":{"message":"Rate limit reached. Please try again in 5s.","code":"rate_limit_exceeded"}}"#
+                    .to_vec(),
+            )
+            .unwrap();
+
+        let error = classify_codex_http_error(&response);
+        match &error {
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::RateLimited);
+                assert_eq!(failure.retry_after_secs(), Some(5));
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+        assert!(error.is_retryable());
+        assert!(error.is_rate_limited());
+    }
+
+    #[test]
+    fn codex_response_failed_maps_server_is_overloaded_to_unified_kind() {
+        let (error, state) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"id":"resp_086d39fcd1bd4726016a6b3477038081919b8f301082107795","object":"response","status":"failed","error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}}"#,
+        );
+        match &error {
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(
+                    failure.message(),
+                    "Our servers are currently overloaded. Please try again later."
+                );
+                assert_eq!(failure.kind(), ProviderErrorKind::ServerOverloaded);
+                assert_eq!(failure.code(), Some("server_is_overloaded"));
+                assert!(error.is_retryable());
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+        assert!(state.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn codex_response_failed_maps_slow_down_to_server_overloaded() {
+        let (error, _) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"error":{"code":"slow_down","message":"slow down"}}}"#,
+        );
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::ServerOverloaded
+        ));
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn codex_response_failed_maps_invalid_request_codes() {
+        for code in [
+            "invalid_request",
+            "invalid_prompt",
+            "bio_policy",
+            "cyber_policy",
+        ] {
+            let payload = format!(
+                r#"{{"type":"response.failed","response":{{"error":{{"message":"bad","code":"{code}"}}}}}}"#
+            );
+            let (error, _) = parse_failed_event(&payload);
+            assert!(
+                matches!(error, LLMError::ProviderResponseError(ref failure)
+                    if failure.message() == "bad"
+                        && failure.kind() == ProviderErrorKind::InvalidRequest),
+                "code={code}, got {error}"
+            );
+            assert!(!error.is_retryable());
+        }
+    }
+
+    #[test]
+    fn codex_response_failed_maps_context_and_quota() {
+        let (ctx_err, _) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"error":{"message":"too long","code":"context_length_exceeded"}}}"#,
+        );
+        assert!(matches!(
+            ctx_err,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::ContextWindowExceeded
+        ));
+        assert!(!ctx_err.is_retryable());
+
+        let (quota_err, _) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"error":{"message":"no credits","code":"insufficient_quota"}}}"#,
+        );
+        assert!(matches!(
+            quota_err,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::QuotaExceeded
+        ));
+        assert!(!quota_err.is_retryable());
+    }
+
+    #[test]
+    fn codex_response_failed_maps_rate_limit_with_message_delay() {
+        let (error, _) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"error":{"message":"Rate limit reached for gpt-5.1. Please try again in 11.054s.","type":"rate_limit_error","code":"rate_limit_exceeded"}}}"#,
+        );
+        match &error {
+            LLMError::ProviderResponseError(failure) => {
+                assert!(failure.message().contains("Rate limit reached"));
+                assert_eq!(failure.retry_after_secs(), Some(12));
+                assert_eq!(failure.kind(), ProviderErrorKind::RateLimited);
+            }
+            other => panic!("expected rate limit, got {other}"),
+        }
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn codex_response_failed_preserves_event_request_id_on_overload() {
+        let (error, _) = parse_failed_event(
+            r#"{"type":"response.failed","requestId":"req_event","response":{"id":"resp_not_request_id","error":{"message":"busy","code":"server_is_overloaded","retry_after":"2s"}}}"#,
+        );
+        match &error {
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::ServerOverloaded);
+                assert_eq!(failure.request_id(), Some("req_event"));
+                assert_eq!(failure.retry_after_secs(), Some(2));
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    #[test]
+    fn codex_response_failed_falls_back_from_unknown_code_to_known_type() {
+        let (error, _) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"error":{"message":"slow down","code":"vendor_specific","type":"rate_limit_error"}}}"#,
+        );
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::RateLimited
+        ));
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn codex_response_failed_maps_type_only_permanent_error() {
+        let (error, _) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"error":{"message":"bad key","type":"authentication_error"}}}"#,
+        );
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.message() == "bad key"
+                    && failure.kind() == ProviderErrorKind::Authentication
+        ));
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn codex_response_failed_unknown_code_is_retryable_before_output() {
+        let (error, _) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"error":{"message":"Service unavailable; try again later","code":"unrecognized"}}}"#,
+        );
+        match &error {
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.code(), Some("unrecognized"));
+                assert!(failure.is_retryable());
+                assert_eq!(failure.kind(), ProviderErrorKind::UnknownTransient);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn codex_response_failed_without_error_is_retryable_before_output() {
+        let (error, _) = parse_failed_event(
+            r#"{"type":"response.failed","response":{"id":"resp_not_request_id"}}"#,
+        );
+        match &error {
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.message(), "codex response failed");
+                assert_eq!(failure.request_id(), None);
+                assert!(failure.is_retryable());
+                assert_eq!(failure.kind(), ProviderErrorKind::UnknownTransient);
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+        assert!(error.is_retryable());
+    }
+
     #[test]
     fn codex_streaming_emits_thinking_deltas() {
         let state = Arc::new(Mutex::new(HashMap::<usize, CodexToolUseState>::new()));
@@ -2036,6 +2479,185 @@ data: {"type":"response.completed","response":{"output":[{"type":"reasoning","su
             StreamChunk::Done { finish_reason } => assert_eq!(*finish_reason, FinishReason::Stop),
             other => panic!("expected done chunk, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn codex_streaming_completes_tool_only_from_output_item_done() {
+        let state = Arc::new(Mutex::new(HashMap::<usize, CodexToolUseState>::new()));
+        let added = br#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":""}}
+
+"#;
+        let arguments_done = br#"data: {"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_1","arguments":"{\"command\":\"pwd\"}"}
+
+"#;
+        let item_done = br#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":"{\"command\":\"pwd\"}"}}
+
+"#;
+        let completed = br#"data: {"type":"response.completed","response":{"id":"resp_1"}}
+
+"#;
+
+        let added_events = codex_parse_stream_chunk_with_state(added, &state).unwrap();
+        assert_eq!(added_events.len(), 1);
+        assert!(matches!(
+            &added_events[0],
+            StreamChunk::ToolUseStart { index: 0, id, name }
+                if id == "call_1" && name == "shell"
+        ));
+        assert!(
+            codex_parse_stream_chunk_with_state(arguments_done, &state)
+                .unwrap()
+                .is_empty()
+        );
+
+        let item_events = codex_parse_stream_chunk_with_state(item_done, &state).unwrap();
+        assert_eq!(item_events.len(), 2);
+        assert!(matches!(
+            &item_events[0],
+            StreamChunk::ToolUseInputDelta { index: 0, partial_json }
+                if partial_json == r#"{"command":"pwd"}"#
+        ));
+        assert!(matches!(
+            &item_events[1],
+            StreamChunk::ToolUseComplete { index: 0, tool_call }
+                if tool_call.id == "call_1"
+                    && tool_call.function.name == "shell"
+                    && tool_call.function.arguments == r#"{"command":"pwd"}"#
+        ));
+
+        let completed_events = codex_parse_stream_chunk_with_state(completed, &state).unwrap();
+        assert!(matches!(
+            completed_events.as_slice(),
+            [StreamChunk::Done {
+                finish_reason: FinishReason::ToolCalls
+            }]
+        ));
+        assert!(state.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn codex_streaming_ignores_done_framing() {
+        let state = Arc::new(Mutex::new(HashMap::<usize, CodexToolUseState>::new()));
+        let added_and_done = br#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":""}}
+
+data: [DONE]
+
+"#;
+
+        let events = codex_parse_stream_chunk_with_state(added_and_done, &state).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], StreamChunk::ToolUseStart { .. }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamChunk::Done { .. }))
+        );
+    }
+
+    #[test]
+    fn codex_streaming_rejects_completed_with_unfinished_tool() {
+        let state = Arc::new(Mutex::new(HashMap::<usize, CodexToolUseState>::new()));
+        let chunk = br#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":""}}
+
+data: {"type":"response.completed","response":{"id":"resp_1"}}
+
+"#;
+
+        let error = codex_parse_stream_chunk_with_state(chunk, &state).unwrap_err();
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::UnknownTransient
+                    && failure.message().contains("fc_1")
+        ));
+        assert!(state.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn codex_streaming_rejects_unresolved_argument_delta() {
+        let state = Arc::new(Mutex::new(HashMap::<usize, CodexToolUseState>::new()));
+        let chunk = br#"data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"{\"command\":"}
+
+data: {"type":"response.completed","response":{"id":"resp_1"}}
+
+"#;
+
+        let error = codex_parse_stream_chunk_with_state(chunk, &state).unwrap_err();
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::UnknownTransient
+                    && failure.message().contains("fc_1")
+        ));
+        assert!(state.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn codex_streaming_rejects_output_item_done_without_item() {
+        let state = Arc::new(Mutex::new(HashMap::<usize, CodexToolUseState>::new()));
+        let chunk = br#"data: {"type":"response.output_item.done","output_index":0}
+
+"#;
+
+        let error = codex_parse_stream_chunk_with_state(chunk, &state).unwrap_err();
+        assert!(matches!(
+            error,
+            LLMError::ResponseFormatError { ref message, .. }
+                if message.contains("missing item payload")
+        ));
+    }
+
+    #[test]
+    fn codex_streaming_rejects_incomplete_function_call_item() {
+        let state = Arc::new(Mutex::new(HashMap::<usize, CodexToolUseState>::new()));
+        let chunk = br#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell"}}
+
+"#;
+
+        let error = codex_parse_stream_chunk_with_state(chunk, &state).unwrap_err();
+        assert!(matches!(
+            error,
+            LLMError::ResponseFormatError { ref message, ref raw_response }
+                if message.contains("incomplete function call")
+                    && raw_response.contains("call_1")
+        ));
+    }
+
+    #[test]
+    fn codex_streaming_rejects_unsupported_end_turn_false() {
+        let state = Arc::new(Mutex::new(HashMap::<usize, CodexToolUseState>::new()));
+        let chunk =
+            br#"data: {"type":"response.completed","response":{"id":"resp_1","end_turn":false}}
+
+"#;
+
+        let error = codex_parse_stream_chunk_with_state(chunk, &state).unwrap_err();
+        assert!(matches!(
+            error,
+            LLMError::ResponseFormatError { ref message, .. }
+                if message.contains("end_turn=false")
+        ));
+        assert!(state.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn codex_streaming_maps_response_incomplete_to_retryable_error() {
+        let state = Arc::new(Mutex::new(HashMap::<usize, CodexToolUseState>::from([
+            (0, CodexToolUseState::default()),
+            (usize::MAX, CodexToolUseState::default()),
+        ])));
+        let chunk = br#"data: {"type":"response.incomplete","response":{"id":"resp_1","incomplete_details":{"reason":"max_output_tokens"}}}
+
+"#;
+
+        let error = codex_parse_stream_chunk_with_state(chunk, &state).unwrap_err();
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::UnknownTransient
+                    && failure.message().contains("max_output_tokens")
+        ));
+        assert!(state.lock().unwrap().is_empty());
     }
 
     #[test]
