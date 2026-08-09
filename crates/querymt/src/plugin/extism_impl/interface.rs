@@ -67,6 +67,35 @@ impl PluginError {
     }
 }
 
+#[cfg(test)]
+mod plugin_error_tests {
+    use super::*;
+    use crate::error::{ProviderErrorKind, ProviderFailure};
+
+    #[test]
+    fn structured_provider_error_round_trips_across_plugin_boundary() {
+        let error = LLMError::from(
+            ProviderFailure::new(ProviderErrorKind::ServerOverloaded, "plugin busy")
+                .with_code(Some("server_is_overloaded".into()))
+                .with_request_id(Some("req-plugin".into()))
+                .with_retry_after_secs(Some(2)),
+        );
+
+        let (json, code) = PluginError::encode(&error);
+        let decoded = PluginError::decode(code, &json);
+
+        match decoded {
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::ServerOverloaded);
+                assert_eq!(failure.code(), Some("server_is_overloaded"));
+                assert_eq!(failure.request_id(), Some("req-plugin"));
+                assert_eq!(failure.retry_after_secs(), Some(2));
+            }
+            other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+}
+
 // ============================================================================
 // HTTP streaming result type
 // ============================================================================
