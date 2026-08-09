@@ -192,8 +192,6 @@ struct CodexChatRequest<'a> {
     input: Vec<CodexInputItem<'a>>,
     instructions: &'a str,
     store: bool,
-    #[serde(rename = "max_output_tokens", skip_serializing_if = "Option::is_none")]
-    max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     stream: bool,
@@ -698,7 +696,6 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
         input: inputs,
         instructions,
         store: false,
-        max_output_tokens: cfg.max_tokens().copied(),
         temperature: cfg.temperature().copied(),
         // Codex backend requires streaming.
         stream: true,
@@ -1405,6 +1402,19 @@ mod tests {
                 .get("ChatGPT-Account-ID")
                 .and_then(|v| v.to_str().ok()),
             Some("test-account-id")
+        );
+    }
+
+    #[test]
+    fn codex_chat_request_omits_max_output_tokens() {
+        let mut codex = test_codex("test-token");
+        codex.max_tokens = Some(2_000);
+
+        let body = codex_body(&codex);
+
+        assert!(
+            body.get("max_output_tokens").is_none(),
+            "Codex backend does not support max_output_tokens"
         );
     }
 
