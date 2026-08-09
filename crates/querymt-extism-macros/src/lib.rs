@@ -207,13 +207,13 @@ macro_rules! impl_extism_http_plugin {
             Ok(s)
         }
 
-        // Validate the config inside WASM
+        // Validate the config inside WASM while preserving typed errors for the host.
         #[plugin_fn]
-        pub fn from_config(cfg: Json<$Config>) -> FnResult<Json<$Config>> {
-            // Try to deserialize into the config type
-            let native_cfg: $Config = cfg.0;
-
-            Ok(Json(native_cfg))
+        pub fn from_config(Json(cfg): Json<Value>) -> FnResult<Json<Value>> {
+            serde_json::from_value::<$Config>(cfg.clone())
+                .map_err(querymt::error::LLMError::from)
+                .map_err(llm_err_to_pdk)?;
+            Ok(Json(cfg))
         }
 
         // list models (new request/parse split)
@@ -268,6 +268,15 @@ macro_rules! impl_extism_http_plugin {
                 .chat_stream_request(&input.messages, input.tools.as_deref())
                 .map_err(llm_err_to_pdk)?;
             Ok(Json(querymt::plugin::extism_impl::SerializableHttpRequest { req }))
+        }
+
+        #[plugin_fn]
+        pub fn classify_chat_error(
+            Json(input): Json<querymt::plugin::extism_impl::ExtismChatParseRequest<$Config>>,
+        ) -> FnResult<Json<querymt::plugin::extism_impl::PluginError>> {
+            // Returning the payload keeps this optional export compatible with older hosts.
+            let error = input.cfg.classify_chat_error(&input.resp.resp);
+            Ok(Json(PluginError::from_llm_error(&error)))
         }
 
         #[plugin_fn]

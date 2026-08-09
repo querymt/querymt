@@ -47,8 +47,7 @@ impl LLMProviderFactory for MistralRSFactory {
     }
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn querymt::LLMProvider>, LLMError> {
-        let cfg: MistralRSConfig = serde_json::from_str(cfg)
-            .map_err(|e| LLMError::PluginError(format!("mistral.rs config error: {}", e)))?;
+        let cfg: MistralRSConfig = serde_json::from_str(cfg)?;
 
         let provider = MistralRS::new_with_cache(cfg, &self.model_cache)?;
         Ok(Box::new(provider))

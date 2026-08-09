@@ -38,6 +38,14 @@ pub trait HTTPLLMProviderFactory: Send + Sync {
 #[allow(improper_ctypes_definitions)]
 pub type HTTPFactoryCtor = unsafe extern "C" fn() -> *mut dyn HTTPLLMProviderFactory;
 
+/// Classify a non-success HTTP response with the **generic** status classifier
+/// (legacy [`crate::error::LLMError`] variants).
+///
+/// Use this on paths the HTTP adapter does **not** pre-classify — e.g.
+/// completions, embeddings, STT/TTS, list-models.
+///
+/// **Do not** use on chat `parse_chat` / stream parsers. Chat non-success is
+/// owned by [`crate::chat::http::HTTPChatProvider::classify_chat_error`].
 #[macro_export]
 macro_rules! handle_http_error {
     ($resp:expr) => {{

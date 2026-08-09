@@ -1,7 +1,22 @@
+/// Outcome of a streaming outbound HTTP call before provider classification.
+///
+/// Success and failure are distinct variants so callers cannot treat an HTTP
+/// error status as a normal byte stream (the old `(Response<()>, stream)` pair
+/// returned `Ok` for both).
+pub enum OutboundStreamResult {
+    Success {
+        stream:
+            std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
+    },
+    /// Non-success status with the full error body already buffered.
+    Failure { response: http::Response<Vec<u8>> },
+}
+
 mod http_client {
     #[cfg(not(target_arch = "wasm32"))]
     pub mod imp {
         use crate::error::{LLMError, classify_http_status};
+        use crate::outbound::OutboundStreamResult;
         use http::{Request, Response};
         use once_cell::sync::Lazy;
         use reqwest::Client;
@@ -102,14 +117,19 @@ mod http_client {
             truncate_preview(value.to_string(), max_len)
         }
 
-        pub async fn call_outbound(req: Request<Vec<u8>>) -> Result<Response<Vec<u8>>, LLMError> {
+        /// Send an HTTP request and preserve the response status, headers, and body.
+        ///
+        /// Provider adapters use this to apply provider-specific error classification.
+        pub async fn call_outbound_raw(
+            req: Request<Vec<u8>>,
+        ) -> Result<Response<Vec<u8>>, LLMError> {
             let client = &*CLIENT;
 
             let method = req
                 .method()
                 .as_str()
                 .parse::<reqwest::Method>()
-                .map_err(|e| LLMError::HttpError(e.to_string()))?;
+                .map_err(|e| LLMError::InvalidRequest(e.to_string()))?;
 
             #[cfg(debug_assertions)]
             {
@@ -134,7 +154,7 @@ mod http_client {
             for (name, value) in req.headers().iter() {
                 let val_str = value
                     .to_str()
-                    .map_err(|e| LLMError::HttpError(e.to_string()))?;
+                    .map_err(|e| LLMError::InvalidRequest(e.to_string()))?;
                 rb = rb.header(name.as_str(), val_str);
             }
 
@@ -171,7 +191,6 @@ mod http_client {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("<missing>")
                 );
-                return Err(classify_http_status(status.as_u16(), &headers, &bytes));
             }
 
             let mut builder = Response::builder().status(status.as_u16());
@@ -181,16 +200,20 @@ mod http_client {
             Ok(builder.body(bytes).unwrap())
         }
 
-        pub async fn call_outbound_stream(
+        /// Send a streaming HTTP request.
+        ///
+        /// Returns [`OutboundStreamResult`] so callers cannot mistake an HTTP
+        /// error body for a successful byte stream.
+        pub async fn call_outbound_stream_raw(
             req: Request<Vec<u8>>,
-        ) -> Result<impl futures::Stream<Item = reqwest::Result<bytes::Bytes>>, LLMError> {
+        ) -> Result<OutboundStreamResult, LLMError> {
             let client = &*CLIENT;
 
             let method = req
                 .method()
                 .as_str()
                 .parse::<reqwest::Method>()
-                .map_err(|e| LLMError::HttpError(e.to_string()))?;
+                .map_err(|e| LLMError::InvalidRequest(e.to_string()))?;
 
             #[cfg(debug_assertions)]
             {
@@ -215,7 +238,7 @@ mod http_client {
             for (name, value) in req.headers().iter() {
                 let val_str = value
                     .to_str()
-                    .map_err(|e| LLMError::HttpError(e.to_string()))?;
+                    .map_err(|e| LLMError::InvalidRequest(e.to_string()))?;
                 rb = rb.header(name.as_str(), val_str);
             }
 
@@ -251,9 +274,32 @@ mod http_client {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("<missing>")
                 );
-                return Err(classify_http_status(status.as_u16(), &headers, &bytes));
+                let mut builder = Response::builder().status(status.as_u16());
+                for (name, value) in headers.iter() {
+                    builder = builder.header(name.as_str(), value.as_bytes());
+                }
+                return Ok(OutboundStreamResult::Failure {
+                    response: builder.body(bytes).unwrap(),
+                });
             }
-            Ok(resp.bytes_stream())
+
+            Ok(OutboundStreamResult::Success {
+                stream: Box::pin(resp.bytes_stream()),
+            })
+        }
+
+        /// Send an HTTP request using the generic status classifier.
+        pub async fn call_outbound(req: Request<Vec<u8>>) -> Result<Response<Vec<u8>>, LLMError> {
+            let response = call_outbound_raw(req).await?;
+            if response.status().is_success() {
+                return Ok(response);
+            }
+
+            Err(classify_http_status(
+                response.status().as_u16(),
+                response.headers(),
+                response.body(),
+            ))
         }
     }
 
@@ -262,16 +308,26 @@ mod http_client {
         use crate::error::LLMError;
         use http::{Request, Response};
 
-        pub async fn call_outbound(_req: Request<Vec<u8>>) -> Result<Response<Vec<u8>>, LLMError> {
+        pub async fn call_outbound_raw(
+            _req: Request<Vec<u8>>,
+        ) -> Result<Response<Vec<u8>>, LLMError> {
             Err(LLMError::InvalidRequest("".into()))
         }
 
-        pub async fn call_outbound_stream(
+        pub async fn call_outbound_stream_raw(
             _req: Request<Vec<u8>>,
-        ) -> Result<futures::stream::Empty<reqwest::Result<bytes::Bytes>>, LLMError> {
+        ) -> Result<crate::outbound::OutboundStreamResult, LLMError> {
+            Err(LLMError::InvalidRequest("".into()))
+        }
+
+        pub async fn call_outbound(_req: Request<Vec<u8>>) -> Result<Response<Vec<u8>>, LLMError> {
             Err(LLMError::InvalidRequest("".into()))
         }
     }
 }
 
-pub use http_client::imp::{call_outbound, call_outbound_stream};
+pub use http_client::imp::{call_outbound, call_outbound_raw, call_outbound_stream_raw};
+
+#[cfg(test)]
+#[path = "outbound/tests.rs"]
+mod tests;

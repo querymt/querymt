@@ -2,13 +2,12 @@ use querymt::LLMProvider;
 use querymt::chat::{ChatMessageBuilder, ChatRole};
 use querymt::completion::CompletionRequest;
 use querymt::error::LLMError;
-use querymt::plugin::LLMProviderFactory;
 
 use crate::config::MistralRSConfig;
-use crate::factory::MistralRSFactory;
+use crate::factory::create_factory;
 
 fn get_provider() -> Box<dyn LLMProvider> {
-    let factory = MistralRSFactory {};
+    let factory = create_factory();
     let cfg = MistralRSConfig {
         model: "microsoft/Phi-3.5-mini-instruct".to_string(),
         model_kind: None,
@@ -46,6 +45,17 @@ fn get_provider() -> Box<dyn LLMProvider> {
 
     let json_cfg = serde_json::to_string(&cfg).unwrap();
     factory.from_config(&json_cfg).unwrap()
+}
+
+#[test]
+fn malformed_config_is_non_retryable_json_error() {
+    let error = create_factory()
+        .from_config("{")
+        .err()
+        .expect("config should be rejected");
+
+    assert!(!error.is_retryable());
+    assert!(matches!(error, LLMError::JsonError(_)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
