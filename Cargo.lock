@@ -10781,6 +10781,7 @@ dependencies = [
  "base64 0.22.1",
  "extism-pdk",
  "http 1.4.2",
+ "log",
  "querymt",
  "querymt-extism-macros",
  "schemars 1.2.1",
