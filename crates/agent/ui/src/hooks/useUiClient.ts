@@ -534,6 +534,17 @@ export function useUiClient() {
         const eventKind = eventEnvelope?.kind?.type;
         const kindData = eventEnvelope?.kind?.data ?? {};
 
+        if (eventKind === 'llm_retry_wait' || eventKind === 'llm_retry_resume') {
+          // TODO(ui): replace this stub with the deferred generic retry countdown UI.
+          console.info('[useUiClient] LLM retry event (UI pending)', {
+            session_id: d.session_id,
+            agent_id: d.agent_id,
+            event_kind: eventKind,
+            ...kindData,
+          });
+          break;
+        }
+
         if (
           eventKind === 'llm_request_start' ||
           eventKind === 'llm_request_end' ||

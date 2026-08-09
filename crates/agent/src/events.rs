@@ -197,8 +197,8 @@ pub enum AgentEventKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
     },
-    /// Ephemeral signal emitted when mid-stream transport error is detected.
-    /// Accumulated text is discarded and a new stream is being created.
+    /// Ephemeral signal emitted when a retryable mid-stream error recreates the stream.
+    /// Accumulated server-side state is discarded before the fresh request.
     StreamRecovering {
         /// Human-readable error message that triggered the retry
         message: String,
@@ -416,7 +416,8 @@ pub enum AgentEventKind {
         #[typeshare(serialized_as = "string")]
         mode: crate::agent::core::AgentMode,
     },
-    /// LLM request was rate limited, execution is paused and waiting
+    /// LLM request was rate limited, execution is paused and waiting.
+    /// Retained as a stable wire event for rate-limit-specific UI behavior.
     RateLimited {
         /// Human-readable message from the provider
         message: String,
@@ -431,8 +432,28 @@ pub enum AgentEventKind {
         /// Maximum retry attempts configured
         max_attempts: u32,
     },
-    /// Rate limit wait completed, resuming execution
+    /// Rate limit wait completed, resuming execution.
     RateLimitResume {
+        /// Which attempt is now being made
+        attempt: u32,
+    },
+    /// A non-rate-limit retryable LLM failure is waiting before the next attempt.
+    LlmRetryWait {
+        /// Human-readable error that triggered the retry
+        message: String,
+        /// Seconds until retry will be attempted
+        #[typeshare(serialized_as = "number")]
+        wait_secs: u64,
+        /// When the wait started (Unix timestamp in seconds)
+        #[typeshare(serialized_as = "number")]
+        started_at: i64,
+        /// Current retry attempt (1-indexed)
+        attempt: u32,
+        /// Maximum retry attempts configured
+        max_attempts: u32,
+    },
+    /// Non-rate-limit LLM retry wait completed, resuming execution.
+    LlmRetryResume {
         /// Which attempt is now being made
         attempt: u32,
     },
