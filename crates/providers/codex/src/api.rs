@@ -14,8 +14,8 @@ use querymt::{
         Tool, ToolChoice,
     },
     error::{
-        LLMError, ProviderDecodeError, ProviderErrorKind, ProviderFailure,
-        extract_retry_after_from_json, parse_retry_after, parse_retry_after_from_message,
+        LLMError, ProviderErrorKind, ProviderFailure, extract_retry_after_from_json,
+        parse_retry_after, parse_retry_after_from_message,
     },
     handle_http_error,
 };
@@ -787,7 +787,7 @@ pub fn codex_parse_chat_with_state(
     }
 }
 
-pub fn classify_codex_http_error(response: &Response<Vec<u8>>) -> ProviderDecodeError {
+pub fn classify_codex_http_error(response: &Response<Vec<u8>>) -> LLMError {
     let status = response.status().as_u16();
     let retry_after_secs = parse_retry_after(response.headers());
     let request_id = response
@@ -808,15 +808,14 @@ pub fn classify_codex_http_error(response: &Response<Vec<u8>>) -> ProviderDecode
                 request_id,
                 matches!(status, 429 | 500..=599),
             );
-            let retry_after_secs = mapped.context.retry_after_secs().or(retry_after_secs);
-            return mapped.retry_after_secs(retry_after_secs).into();
+            let retry_after_secs = mapped.retry_after_secs().or(retry_after_secs);
+            return mapped.with_retry_after_secs(retry_after_secs).into();
         }
     }
 
-    // No vendor envelope: classify from the status alone so the failure is
-    // still structured and picks up provider identity at `attribute`.
+    // No vendor envelope: classify from the status alone.
     if status == 499 {
-        return ProviderDecodeError::terminal(LLMError::Cancelled);
+        return LLMError::Cancelled;
     }
     querymt::error::classify_status_only(status, response.headers(), response.body()).into()
 }
@@ -824,7 +823,7 @@ pub fn classify_codex_http_error(response: &Response<Vec<u8>>) -> ProviderDecode
 pub fn codex_parse_stream_chunk_with_state(
     chunk: &[u8],
     tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
-) -> Result<Vec<StreamChunk>, ProviderDecodeError> {
+) -> Result<Vec<StreamChunk>, LLMError> {
     if chunk.is_empty() {
         return Ok(Vec::new());
     }
@@ -1087,10 +1086,10 @@ fn map_codex_response_failed(
     };
 
     ProviderFailure::new(kind, message)
-        .code(code)
-        .error_type(error_type)
-        .request_id(request_id)
-        .retry_after_secs(retry_after_secs)
+        .with_code(code)
+        .with_error_type(error_type)
+        .with_request_id(request_id)
+        .with_retry_after_secs(retry_after_secs)
 }
 
 fn mark_streamed_thinking_emitted(
@@ -1894,8 +1893,7 @@ mod tests {
         ])));
         let chunk = format!("data: {payload}\n\n");
         let error = codex_parse_stream_chunk_with_state(chunk.as_bytes(), &state)
-            .expect_err("response.failed should return an error")
-            .attribute("codex");
+            .expect_err("response.failed should return an error");
         (error, state)
     }
 
@@ -1908,14 +1906,13 @@ mod tests {
             .body(br#"{"error":{"message":"busy","code":"server_is_overloaded"}}"#.to_vec())
             .unwrap();
 
-        let error = classify_codex_http_error(&response).attribute("xai");
+        let error = classify_codex_http_error(&response);
         match error {
-            LLMError::ProviderResponseError { message, context } => {
-                assert_eq!(message, "busy");
-                assert_eq!(context.kind(), ProviderErrorKind::ServerOverloaded);
-                assert_eq!(context.provider(), "xai");
-                assert_eq!(context.request_id(), Some("req-http"));
-                assert_eq!(context.retry_after_secs(), Some(3));
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.message(), "busy");
+                assert_eq!(failure.kind(), ProviderErrorKind::ServerOverloaded);
+                assert_eq!(failure.request_id(), Some("req-http"));
+                assert_eq!(failure.retry_after_secs(), Some(3));
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -1931,7 +1928,7 @@ mod tests {
                 )
                 .unwrap();
 
-            let error = classify_codex_http_error(&response).attribute("codex");
+            let error = classify_codex_http_error(&response);
             assert_eq!(error.is_retryable(), expected_retryable, "status={status}");
         }
     }
@@ -1949,14 +1946,14 @@ mod tests {
             )
             .unwrap();
 
-        let error = classify_codex_http_error(&response).attribute("codex");
+        let error = classify_codex_http_error(&response);
         match &error {
-            LLMError::ProviderResponseError { message, context } => {
-                assert_eq!(message, "You have hit your usage limit.");
-                assert_eq!(context.kind(), ProviderErrorKind::QuotaExceeded);
-                assert_eq!(context.error_type(), Some("usage_limit_reached"));
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.message(), "You have hit your usage limit.");
+                assert_eq!(failure.kind(), ProviderErrorKind::QuotaExceeded);
+                assert_eq!(failure.error_type(), Some("usage_limit_reached"));
                 // Permanent kinds drop retry hints — do not sleep on plan caps.
-                assert_eq!(context.retry_after_secs(), None);
+                assert_eq!(failure.retry_after_secs(), None);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -1974,11 +1971,11 @@ mod tests {
             )
             .unwrap();
 
-        let error = classify_codex_http_error(&response).attribute("codex");
+        let error = classify_codex_http_error(&response);
         match &error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind(), ProviderErrorKind::RateLimited);
-                assert_eq!(context.retry_after_secs(), Some(5));
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::RateLimited);
+                assert_eq!(failure.retry_after_secs(), Some(5));
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -1992,14 +1989,13 @@ mod tests {
             r#"{"type":"response.failed","response":{"id":"resp_086d39fcd1bd4726016a6b3477038081919b8f301082107795","object":"response","status":"failed","error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}}"#,
         );
         match &error {
-            LLMError::ProviderResponseError { message, context } => {
+            LLMError::ProviderResponseError(failure) => {
                 assert_eq!(
-                    message,
+                    failure.message(),
                     "Our servers are currently overloaded. Please try again later."
                 );
-                assert_eq!(context.kind(), ProviderErrorKind::ServerOverloaded);
-                assert_eq!(context.provider(), "codex");
-                assert_eq!(context.code(), Some("server_is_overloaded"));
+                assert_eq!(failure.kind(), ProviderErrorKind::ServerOverloaded);
+                assert_eq!(failure.code(), Some("server_is_overloaded"));
                 assert!(error.is_retryable());
             }
             other => panic!("expected ProviderResponseError, got {other}"),
@@ -2014,8 +2010,8 @@ mod tests {
         );
         assert!(matches!(
             error,
-            LLMError::ProviderResponseError { ref context, .. }
-                if context.kind() == ProviderErrorKind::ServerOverloaded
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::ServerOverloaded
         ));
         assert!(error.is_retryable());
     }
@@ -2033,8 +2029,9 @@ mod tests {
             );
             let (error, _) = parse_failed_event(&payload);
             assert!(
-                matches!(error, LLMError::ProviderResponseError { ref message, ref context }
-                    if message == "bad" && context.kind() == ProviderErrorKind::InvalidRequest),
+                matches!(error, LLMError::ProviderResponseError(ref failure)
+                    if failure.message() == "bad"
+                        && failure.kind() == ProviderErrorKind::InvalidRequest),
                 "code={code}, got {error}"
             );
             assert!(!error.is_retryable());
@@ -2048,8 +2045,8 @@ mod tests {
         );
         assert!(matches!(
             ctx_err,
-            LLMError::ProviderResponseError { ref context, .. }
-                if context.kind() == ProviderErrorKind::ContextWindowExceeded
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::ContextWindowExceeded
         ));
         assert!(!ctx_err.is_retryable());
 
@@ -2058,8 +2055,8 @@ mod tests {
         );
         assert!(matches!(
             quota_err,
-            LLMError::ProviderResponseError { ref context, .. }
-                if context.kind() == ProviderErrorKind::QuotaExceeded
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::QuotaExceeded
         ));
         assert!(!quota_err.is_retryable());
     }
@@ -2070,10 +2067,10 @@ mod tests {
             r#"{"type":"response.failed","response":{"error":{"message":"Rate limit reached for gpt-5.1. Please try again in 11.054s.","type":"rate_limit_error","code":"rate_limit_exceeded"}}}"#,
         );
         match &error {
-            LLMError::ProviderResponseError { message, context } => {
-                assert!(message.contains("Rate limit reached"));
-                assert_eq!(context.retry_after_secs(), Some(12));
-                assert_eq!(context.kind(), ProviderErrorKind::RateLimited);
+            LLMError::ProviderResponseError(failure) => {
+                assert!(failure.message().contains("Rate limit reached"));
+                assert_eq!(failure.retry_after_secs(), Some(12));
+                assert_eq!(failure.kind(), ProviderErrorKind::RateLimited);
             }
             other => panic!("expected rate limit, got {other}"),
         }
@@ -2086,10 +2083,10 @@ mod tests {
             r#"{"type":"response.failed","requestId":"req_event","response":{"id":"resp_not_request_id","error":{"message":"busy","code":"server_is_overloaded","retry_after":"2s"}}}"#,
         );
         match &error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind(), ProviderErrorKind::ServerOverloaded);
-                assert_eq!(context.request_id(), Some("req_event"));
-                assert_eq!(context.retry_after_secs(), Some(2));
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::ServerOverloaded);
+                assert_eq!(failure.request_id(), Some("req_event"));
+                assert_eq!(failure.retry_after_secs(), Some(2));
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -2102,8 +2099,8 @@ mod tests {
         );
         assert!(matches!(
             error,
-            LLMError::ProviderResponseError { ref context, .. }
-                if context.kind() == ProviderErrorKind::RateLimited
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::RateLimited
         ));
         assert!(error.is_retryable());
     }
@@ -2115,8 +2112,9 @@ mod tests {
         );
         assert!(matches!(
             error,
-            LLMError::ProviderResponseError { ref message, ref context }
-                if message == "bad key" && context.kind() == ProviderErrorKind::Authentication
+            LLMError::ProviderResponseError(ref failure)
+                if failure.message() == "bad key"
+                    && failure.kind() == ProviderErrorKind::Authentication
         ));
         assert!(!error.is_retryable());
     }
@@ -2127,10 +2125,10 @@ mod tests {
             r#"{"type":"response.failed","response":{"error":{"message":"Service unavailable; try again later","code":"unrecognized"}}}"#,
         );
         match &error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.code(), Some("unrecognized"));
-                assert!(context.is_retryable());
-                assert_eq!(context.kind(), ProviderErrorKind::UnknownTransient);
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.code(), Some("unrecognized"));
+                assert!(failure.is_retryable());
+                assert_eq!(failure.kind(), ProviderErrorKind::UnknownTransient);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -2143,11 +2141,11 @@ mod tests {
             r#"{"type":"response.failed","response":{"id":"resp_not_request_id"}}"#,
         );
         match &error {
-            LLMError::ProviderResponseError { message, context } => {
-                assert_eq!(message, "codex response failed");
-                assert_eq!(context.request_id(), None);
-                assert!(context.is_retryable());
-                assert_eq!(context.kind(), ProviderErrorKind::UnknownTransient);
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.message(), "codex response failed");
+                assert_eq!(failure.request_id(), None);
+                assert!(failure.is_retryable());
+                assert_eq!(failure.kind(), ProviderErrorKind::UnknownTransient);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }

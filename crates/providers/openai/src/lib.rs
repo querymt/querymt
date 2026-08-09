@@ -179,10 +179,7 @@ impl api::OpenAIProviderConfig for OpenAI {
 }
 
 impl HTTPChatProvider for OpenAI {
-    fn classify_chat_error(
-        &self,
-        response: &Response<Vec<u8>>,
-    ) -> querymt::error::ProviderDecodeError {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
         api::classify_openai_http_error(response)
     }
 
@@ -223,10 +220,7 @@ struct OpenAIStreamParser {
 }
 
 impl ChatStreamParser for OpenAIStreamParser {
-    fn parse_chunk(
-        &mut self,
-        chunk: &[u8],
-    ) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
         api::parse_openai_sse_chunk(chunk, &mut self.tool_states)
     }
 }
@@ -351,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_parser_returns_classified_error_for_adapter_attribution() {
+    fn stream_parser_returns_classified_error() {
         let cfg = serde_json::json!({
             "api_key": "test-key",
             "model": "gpt-4o-mini"
@@ -362,13 +356,8 @@ mod tests {
 
 "#;
 
-        let error = parser.parse_chunk(chunk).unwrap_err().attribute("openai");
-        match error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.provider(), "openai");
-            }
-            other => panic!("expected ProviderResponseError, got {other}"),
-        }
+        let error = parser.parse_chunk(chunk).unwrap_err();
+        assert!(matches!(error, LLMError::ProviderResponseError(_)));
     }
 
     #[test]

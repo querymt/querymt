@@ -33,7 +33,7 @@ impl LLMProviderFactory for HTTPFactoryAdapter {
 
     fn from_config(&self, cfg: &str) -> Result<Box<dyn LLMProvider>, LLMError> {
         let sync_provider = self.inner.from_config(cfg)?;
-        let adapter = LLMProviderFromHTTP::new(self.inner.name(), sync_provider);
+        let adapter = LLMProviderFromHTTP::new(sync_provider);
         Ok(Box::new(adapter))
     }
 

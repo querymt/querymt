@@ -52,8 +52,7 @@ use querymt::{
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::{
-        LLMError, ProviderDecodeError, ProviderErrorKind, ProviderFailure, classify_status_only,
-        parse_retry_after,
+        LLMError, ProviderErrorKind, ProviderFailure, classify_status_only, parse_retry_after,
     },
     plugin::HTTPLLMProviderFactory,
 };
@@ -717,7 +716,7 @@ impl Google {
 }
 
 impl HTTPChatProvider for Google {
-    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> ProviderDecodeError {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
         classify_google_http_error(response).into()
     }
 
@@ -1035,13 +1034,9 @@ struct GoogleStreamParser {
 }
 
 impl ChatStreamParser for GoogleStreamParser {
-    fn parse_chunk(
-        &mut self,
-        chunk: &[u8],
-    ) -> Result<Vec<querymt::chat::StreamChunk>, ProviderDecodeError> {
-        let text = std::str::from_utf8(chunk).map_err(|e| {
-            ProviderDecodeError::terminal(LLMError::GenericError(format!("{:#}", e)))
-        })?;
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<querymt::chat::StreamChunk>, LLMError> {
+        let text =
+            std::str::from_utf8(chunk).map_err(|e| LLMError::GenericError(format!("{:#}", e)))?;
 
         self.buffer.push_str(text);
 
@@ -1066,7 +1061,7 @@ impl ChatStreamParser for GoogleStreamParser {
 /// Returns (extracted StreamChunks, number of bytes consumed from buffer)
 fn extract_complete_json_objects(
     buffer: &str,
-) -> Result<(Vec<querymt::chat::StreamChunk>, usize), ProviderDecodeError> {
+) -> Result<(Vec<querymt::chat::StreamChunk>, usize), LLMError> {
     let mut bytes_consumed = 0;
 
     // Strip leading whitespace and array opening bracket
@@ -1097,7 +1092,7 @@ fn try_parse_json_objects(
     original_buffer: &str,
     initial_offset: usize,
     text: &str,
-) -> Result<(Vec<querymt::chat::StreamChunk>, usize), ProviderDecodeError> {
+) -> Result<(Vec<querymt::chat::StreamChunk>, usize), LLMError> {
     use serde_json::Deserializer;
 
     let mut result_chunks = Vec::new();
@@ -1272,13 +1267,13 @@ fn map_google_error_value(
     let retry_after_secs = kind.is_retryable().then_some(retry_after_secs).flatten();
 
     ProviderFailure::new(kind, message)
-        .error_type(status_str)
-        .code(code)
-        .request_id(request_id.map(str::to_owned))
-        .retry_after_secs(retry_after_secs)
+        .with_error_type(status_str)
+        .with_code(code)
+        .with_request_id(request_id.map(str::to_owned))
+        .with_retry_after_secs(retry_after_secs)
 }
 
-fn classify_google_http_error(response: &Response<Vec<u8>>) -> ProviderFailure {
+fn classify_google_http_error(response: &Response<Vec<u8>>) -> LLMError {
     let status = response.status().as_u16();
     let retry_after_secs = parse_retry_after(response.headers());
     let request_id = response
@@ -1296,12 +1291,13 @@ fn classify_google_http_error(response: &Response<Vec<u8>>) -> ProviderFailure {
             retry_after_secs,
             request_id,
             status_guess_transient,
-        );
+        )
+        .into();
     }
 
     let classified = classify_status_only(status, response.headers(), response.body());
-    let retry_after_secs = classified.context.retry_after_secs().or(retry_after_secs);
-    classified.retry_after_secs(retry_after_secs)
+    let retry_after_secs = classified.retry_after_secs().or(retry_after_secs);
+    classified.with_retry_after_secs(retry_after_secs).into()
 }
 
 /// Extract StreamChunks from a GoogleChatResponse
@@ -1532,16 +1528,15 @@ mod tests {
                     .to_vec(),
             )
             .unwrap();
-        let error = google.classify_chat_error(&response).attribute("google");
+        let error = google.classify_chat_error(&response);
         assert!(error.is_retryable());
         assert_eq!(error.retry_after_secs(), Some(15));
         match &error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.provider(), "google");
-                assert_eq!(context.kind(), ProviderErrorKind::RateLimited);
-                assert_eq!(context.error_type(), Some("RESOURCE_EXHAUSTED"));
-                assert_eq!(context.code(), Some("429"));
-                assert_eq!(context.request_id(), Some("req-google-http"));
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::RateLimited);
+                assert_eq!(failure.error_type(), Some("RESOURCE_EXHAUSTED"));
+                assert_eq!(failure.code(), Some("429"));
+                assert_eq!(failure.request_id(), Some("req-google-http"));
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -1577,7 +1572,7 @@ mod tests {
                     .to_vec(),
             )
             .unwrap();
-        let error = classify_google_http_error(&response).attribute("google");
+        let error = classify_google_http_error(&response);
         assert!(error.is_retryable());
         assert_eq!(error.retry_after_secs(), Some(2));
     }
@@ -1592,12 +1587,12 @@ mod tests {
                     .to_vec(),
             )
             .unwrap();
-        let error = classify_google_http_error(&response).attribute("google");
+        let error = classify_google_http_error(&response);
         assert!(error.is_retryable());
         assert_eq!(error.retry_after_secs(), Some(9));
         match &error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind(), ProviderErrorKind::RateLimited);
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::RateLimited);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -1612,11 +1607,11 @@ mod tests {
                     .to_vec(),
             )
             .unwrap();
-        let error = classify_google_http_error(&response).attribute("google");
+        let error = classify_google_http_error(&response);
         assert!(!error.is_retryable());
         match &error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind(), ProviderErrorKind::QuotaExceeded);
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::QuotaExceeded);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -1631,11 +1626,11 @@ mod tests {
                     .to_vec(),
             )
             .unwrap();
-        let error = classify_google_http_error(&response).attribute("google");
+        let error = classify_google_http_error(&response);
         assert!(!error.is_retryable());
         match &error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind(), ProviderErrorKind::Authentication);
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::Authentication);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -1650,11 +1645,11 @@ mod tests {
                     .to_vec(),
             )
             .unwrap();
-        let error = classify_google_http_error(&response).attribute("google");
+        let error = classify_google_http_error(&response);
         assert!(error.is_retryable());
         match &error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind(), ProviderErrorKind::ServerOverloaded);
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::ServerOverloaded);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -1669,11 +1664,11 @@ mod tests {
                     .to_vec(),
             )
             .unwrap();
-        let error = classify_google_http_error(&response).attribute("google");
+        let error = classify_google_http_error(&response);
         assert!(!error.is_retryable());
         match &error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind(), ProviderErrorKind::InvalidRequest);
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::InvalidRequest);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -1687,11 +1682,10 @@ mod tests {
         let err = parser
             .parse_chunk(chunk)
             .expect_err("mid-stream error object must classify");
-        let attributed = err.attribute("google");
-        assert!(attributed.is_retryable());
-        match &attributed {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind(), ProviderErrorKind::RateLimited);
+        assert!(err.is_retryable());
+        match &err {
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::RateLimited);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -1705,13 +1699,12 @@ mod tests {
             br#"{"error":{"code":500,"message":"Internal server error","status":"INTERNAL"}}"#;
         let error = parser
             .parse_chunk(chunk)
-            .expect_err("mid-stream server error must classify")
-            .attribute("google");
+            .expect_err("mid-stream server error must classify");
 
         assert!(error.is_retryable());
         match error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind(), ProviderErrorKind::UnknownTransient);
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::UnknownTransient);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }

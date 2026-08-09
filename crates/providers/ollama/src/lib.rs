@@ -13,8 +13,7 @@ use querymt::{
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
     error::{
-        LLMError, ProviderDecodeError, ProviderErrorKind, ProviderFailure, classify_status_only,
-        parse_retry_after,
+        LLMError, ProviderErrorKind, ProviderFailure, classify_status_only, parse_retry_after,
     },
     get_env_var,
     plugin::HTTPLLMProviderFactory,
@@ -199,7 +198,7 @@ struct OllamaOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     seed: Option<u32>,
 
-    /// Number of tokens to keep in context. (Default: 4)
+    /// Number of tokens to keep in failure. (Default: 4)
     #[serde(skip_serializing_if = "Option::is_none")]
     num_keep: Option<u32>,
 
@@ -442,7 +441,7 @@ impl Ollama {
 }
 
 impl HTTPChatProvider for Ollama {
-    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> ProviderDecodeError {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
         classify_ollama_http_error(response).into()
     }
 
@@ -512,7 +511,7 @@ impl HTTPChatProvider for Ollama {
             let has_tool_result = msg.content.iter().any(|b| b.is_tool_result());
             if has_tool_result {
                 // Tool results are already emitted above.
-                // Keep non-empty text as normal role content to preserve context.
+                // Keep non-empty text as normal role content to preserve failure.
                 if !text.is_empty() {
                     chat_messages.push(OllamaChatMessage {
                         role,
@@ -898,13 +897,12 @@ mod tests {
             .status(404)
             .body(br#"{"error":"model 'nope' not found"}"#.to_vec())
             .unwrap();
-        let error = classify_ollama_http_error(&response).attribute("ollama");
+        let error = classify_ollama_http_error(&response);
         assert!(!error.is_retryable());
         match &error {
-            LLMError::ProviderResponseError { message, context } => {
+            LLMError::ProviderResponseError(failure) => {
                 assert!(message.contains("not found"));
-                assert_eq!(context.provider(), "ollama");
-                assert_eq!(context.kind(), ProviderErrorKind::InvalidRequest);
+                assert_eq!(failure.kind(), ProviderErrorKind::InvalidRequest);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -916,11 +914,11 @@ mod tests {
             .status(500)
             .body(br#"{"error":"the input length exceeds the context length"}"#.to_vec())
             .unwrap();
-        let error = classify_ollama_http_error(&response).attribute("ollama");
+        let error = classify_ollama_http_error(&response);
         assert!(!error.is_retryable());
         match &error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind(), ProviderErrorKind::ContextWindowExceeded);
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::ContextWindowExceeded);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -932,11 +930,11 @@ mod tests {
             .status(500)
             .body(br#"{"error":"server busy, try again"}"#.to_vec())
             .unwrap();
-        let error = classify_ollama_http_error(&response).attribute("ollama");
+        let error = classify_ollama_http_error(&response);
         assert!(error.is_retryable());
         match &error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind(), ProviderErrorKind::ServerOverloaded);
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::ServerOverloaded);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -949,12 +947,12 @@ mod tests {
             .header(http::header::RETRY_AFTER, "7")
             .body(b"too many requests".to_vec())
             .unwrap();
-        let error = classify_ollama_http_error(&response).attribute("ollama");
+        let error = classify_ollama_http_error(&response);
         assert!(error.is_retryable());
         assert_eq!(error.retry_after_secs(), Some(7));
         match &error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind(), ProviderErrorKind::RateLimited);
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::RateLimited);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -965,7 +963,7 @@ mod tests {
 ///
 /// Ollama typically returns `{"error":"..."}` (string) rather than a typed code table.
 /// Message heuristics map the common permanent/transient cases; otherwise status-only.
-fn classify_ollama_http_error(response: &Response<Vec<u8>>) -> ProviderFailure {
+fn classify_ollama_http_error(response: &Response<Vec<u8>>) -> LLMError {
     let status = response.status().as_u16();
     let retry_after_secs = parse_retry_after(response.headers());
     let body = String::from_utf8_lossy(response.body());
@@ -1014,14 +1012,15 @@ fn classify_ollama_http_error(response: &Response<Vec<u8>>) -> ProviderFailure {
     } else {
         // Fall through to status-only for bare 4xx/5xx without a useful message.
         let classified = classify_status_only(status, response.headers(), response.body());
-        let retry_after_secs = classified.context.retry_after_secs().or(retry_after_secs);
-        let classified = classified.retry_after_secs(retry_after_secs);
+        let retry_after_secs = classified.retry_after_secs().or(retry_after_secs);
+        let classified = classified.with_retry_after_secs(retry_after_secs);
         // Prefer the extracted message when present.
         if !message.is_empty() && message != String::from_utf8_lossy(response.body()) {
-            return ProviderFailure::new(classified.context.kind(), message)
-                .retry_after_secs(classified.context.retry_after_secs());
+            return ProviderFailure::new(classified.kind(), message)
+                .with_retry_after_secs(classified.retry_after_secs())
+                .into();
         }
-        return classified;
+        return classified.into();
     };
 
     let retry_after_secs = match kind {
@@ -1030,5 +1029,7 @@ fn classify_ollama_http_error(response: &Response<Vec<u8>>) -> ProviderFailure {
         _ => retry_after_secs,
     };
 
-    ProviderFailure::new(kind, message).retry_after_secs(retry_after_secs)
+    ProviderFailure::new(kind, message)
+        .with_retry_after_secs(retry_after_secs)
+        .into()
 }

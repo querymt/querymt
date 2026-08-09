@@ -1035,10 +1035,7 @@ impl HTTPChatProvider for Anthropic {
         cfg.chat_request(messages, tools)
     }
 
-    fn classify_chat_error(
-        &self,
-        response: &Response<Vec<u8>>,
-    ) -> querymt::error::ProviderDecodeError {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
         classify_anthropic_http_error(response).into()
     }
 
@@ -1081,13 +1078,8 @@ struct AnthropicStreamParser {
 }
 
 impl ChatStreamParser for AnthropicStreamParser {
-    fn parse_chunk(
-        &mut self,
-        chunk: &[u8],
-    ) -> Result<Vec<querymt::chat::StreamChunk>, querymt::error::ProviderDecodeError> {
-        let text = std::str::from_utf8(chunk).map_err(|e| {
-            querymt::error::ProviderDecodeError::terminal(LLMError::GenericError(e.to_string()))
-        })?;
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<querymt::chat::StreamChunk>, LLMError> {
+        let text = std::str::from_utf8(chunk).map_err(|e| LLMError::GenericError(e.to_string()))?;
         let mut chunks = Vec::new();
 
         for line in text.lines() {
@@ -1098,11 +1090,9 @@ impl ChatStreamParser for AnthropicStreamParser {
                 }
 
                 let stream_resp: AnthropicStreamResponse =
-                    serde_json::from_str(data).map_err(|e| {
-                        querymt::error::ProviderDecodeError::response_format(
-                            format!("Failed to parse Anthropic stream data: {}", e),
-                            data.to_string(),
-                        )
+                    serde_json::from_str(data).map_err(|e| LLMError::ResponseFormatError {
+                        message: format!("Failed to parse Anthropic stream data: {}", e),
+                        raw_response: data.to_string(),
                     })?;
 
                 match stream_resp.response_type.as_str() {
@@ -1290,14 +1280,14 @@ fn map_anthropic_api_error(
     };
 
     ProviderFailure::new(kind, message)
-        .error_type(error_type)
-        .code(type_norm)
-        .request_id(request_id.map(str::to_owned))
-        .retry_after_secs(retry_after_secs)
+        .with_error_type(error_type)
+        .with_code(type_norm)
+        .with_request_id(request_id.map(str::to_owned))
+        .with_retry_after_secs(retry_after_secs)
 }
 
-/// Classify an Anthropic HTTP error body before provider attribution.
-fn classify_anthropic_http_error(response: &Response<Vec<u8>>) -> ProviderFailure {
+/// Classify an Anthropic HTTP error body.
+fn classify_anthropic_http_error(response: &Response<Vec<u8>>) -> LLMError {
     let status = response.status().as_u16();
     let retry_after_secs = parse_retry_after(response.headers());
     let request_id = response
@@ -1333,15 +1323,15 @@ fn classify_anthropic_http_error(response: &Response<Vec<u8>>) -> ProviderFailur
                     retry_after_secs,
                     request_id,
                     status_guess_transient,
-                );
+                )
+                .into();
             }
         }
     }
 
-    // Fall back to status-only classification (still attributed by caller).
     let classified = classify_status_only(status, response.headers(), response.body());
-    let retry_after_secs = classified.context.retry_after_secs().or(retry_after_secs);
-    classified.retry_after_secs(retry_after_secs)
+    let retry_after_secs = classified.retry_after_secs().or(retry_after_secs);
+    classified.with_retry_after_secs(retry_after_secs).into()
 }
 
 impl HTTPCompletionProvider for Anthropic {
@@ -2024,13 +2014,12 @@ mod tests {
                     .to_vec(),
             )
             .unwrap();
-        let error = classify_anthropic_http_error(&response).attribute("anthropic");
+        let error = classify_anthropic_http_error(&response);
         assert!(error.is_retryable());
         match &error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.provider(), "anthropic");
-                assert_eq!(context.kind(), ProviderErrorKind::ServerOverloaded);
-                assert_eq!(context.error_type(), Some("overloaded_error"));
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::ServerOverloaded);
+                assert_eq!(failure.error_type(), Some("overloaded_error"));
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -2045,11 +2034,11 @@ mod tests {
                     .to_vec(),
             )
             .unwrap();
-        let error = classify_anthropic_http_error(&response).attribute("anthropic");
+        let error = classify_anthropic_http_error(&response);
         assert!(!error.is_retryable());
         match &error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind(), ProviderErrorKind::InvalidRequest);
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::InvalidRequest);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -2066,13 +2055,13 @@ mod tests {
                     .to_vec(),
             )
             .unwrap();
-        let error = classify_anthropic_http_error(&response).attribute("anthropic");
+        let error = classify_anthropic_http_error(&response);
         assert!(error.is_retryable());
         assert_eq!(error.retry_after_secs(), Some(12));
         match &error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind(), ProviderErrorKind::RateLimited);
-                assert_eq!(context.request_id(), Some("req-ant-http"));
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::RateLimited);
+                assert_eq!(failure.request_id(), Some("req-ant-http"));
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -2087,13 +2076,11 @@ mod tests {
 "#;
         let err = parser
             .parse_chunk(line)
-            .expect_err("error event must fail the stream")
-            .attribute("anthropic");
+            .expect_err("error event must fail the stream");
         assert!(err.is_retryable());
         match err {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind(), ProviderErrorKind::ServerOverloaded);
-                assert_eq!(context.provider(), "anthropic");
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::ServerOverloaded);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -2107,13 +2094,12 @@ mod tests {
 "#;
         let error = parser
             .parse_chunk(line)
-            .expect_err("api error event must fail the stream")
-            .attribute("anthropic");
+            .expect_err("api error event must fail the stream");
 
         assert!(error.is_retryable());
         match error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind(), ProviderErrorKind::UnknownTransient);
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::UnknownTransient);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
@@ -2127,12 +2113,11 @@ mod tests {
 "#;
         let err = parser
             .parse_chunk(line)
-            .expect_err("error event must fail the stream")
-            .attribute("anthropic");
+            .expect_err("error event must fail the stream");
         assert!(!err.is_retryable());
         match err {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.kind(), ProviderErrorKind::InvalidRequest);
+            LLMError::ProviderResponseError(failure) => {
+                assert_eq!(failure.kind(), ProviderErrorKind::InvalidRequest);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }

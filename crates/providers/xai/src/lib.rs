@@ -176,10 +176,7 @@ impl OpenAIProviderConfig for Xai {
 }
 
 impl HTTPChatProvider for Xai {
-    fn classify_chat_error(
-        &self,
-        response: &Response<Vec<u8>>,
-    ) -> querymt::error::ProviderDecodeError {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
         if self.should_use_responses_api() {
             classify_codex_http_error(response)
         } else {
@@ -365,10 +362,7 @@ impl XaiStreamParser {
 }
 
 impl ChatStreamParser for XaiStreamParser {
-    fn parse_chunk(
-        &mut self,
-        chunk: &[u8],
-    ) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
         if self.use_responses_api {
             codex_parse_stream_chunk_with_state(chunk, &self.codex_tool_state)
         } else {
@@ -1018,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_parser_returns_classified_codex_error_for_adapter_attribution() {
+    fn stream_parser_returns_classified_codex_error() {
         let mut xai = test_xai("xai-key");
         xai.conversation_id = Some("conversation-id".to_string());
         let mut parser = xai.chat_stream_parser().unwrap();
@@ -1026,12 +1020,11 @@ mod tests {
 
 "#;
 
-        let error = parser.parse_chunk(chunk).unwrap_err().attribute("xai");
+        let error = parser.parse_chunk(chunk).unwrap_err();
         match error {
-            LLMError::ProviderResponseError { context, .. } => {
-                assert_eq!(context.provider(), "xai");
+            LLMError::ProviderResponseError(failure) => {
                 assert_eq!(
-                    context.kind(),
+                    failure.kind(),
                     querymt::error::ProviderErrorKind::ServerOverloaded
                 );
             }

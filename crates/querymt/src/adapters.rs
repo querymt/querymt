@@ -15,23 +15,12 @@ use std::sync::Arc;
 use tracing::instrument;
 
 pub struct LLMProviderFromHTTP {
-    /// Registry / factory identity. Stamped onto structured errors once.
-    name: String,
     inner: Box<dyn HTTPLLMProvider>,
 }
 
 impl LLMProviderFromHTTP {
-    /// Wrap an HTTP provider. `name` should be [`crate::plugin::HTTPLLMProviderFactory::name`].
-    pub fn new(name: impl Into<String>, inner: Box<dyn HTTPLLMProvider>) -> Self {
-        Self {
-            name: name.into(),
-            inner,
-        }
-    }
-
-    /// Stamp factory identity onto a decode/classify failure.
-    fn attribute(&self, error: crate::error::ProviderDecodeError) -> LLMError {
-        error.attribute(self.name.as_str())
+    pub fn new(inner: Box<dyn HTTPLLMProvider>) -> Self {
+        Self { inner }
     }
 
     /// Ensure the provider's credential is fresh before building a request.
@@ -57,7 +46,7 @@ impl LLMProviderFromHTTP {
 
         let resp = call_outbound_raw(req).await?;
         if !resp.status().is_success() {
-            return Err(self.attribute(self.inner.classify_chat_error(&resp)));
+            return Err(self.inner.classify_chat_error(&resp));
         }
 
         self.inner.parse_chat(resp)
@@ -104,79 +93,72 @@ impl ChatProvider for LLMProviderFromHTTP {
 
         let stream = match call_outbound_stream_raw(req).await? {
             OutboundStreamResult::Failure { response } => {
-                return Err(self.attribute(self.inner.classify_chat_error(&response)));
+                return Err(self.inner.classify_chat_error(&response));
             }
             OutboundStreamResult::Success { stream, .. } => stream,
         };
 
         let mut parser = self.inner.chat_stream_parser()?;
-        let provider_name = self.name.clone();
         let s = stream
             .map(move |res: reqwest::Result<bytes::Bytes>| res.map_err(LLMError::from))
             .chain(futures::stream::iter([
                 Ok(bytes::Bytes::from_static(b"\n")),
                 Ok(bytes::Bytes::new()),
             ]))
-            .scan(
-                (Vec::new(), false, provider_name),
-                move |(buffer, done, provider_name), res| {
-                    if *done {
-                        return futures::future::ready(None);
-                    }
+            .scan((Vec::new(), false), move |(buffer, done), res| {
+                if *done {
+                    return futures::future::ready(None);
+                }
 
-                    let res = match res {
-                        Ok(bytes) => {
-                            if !bytes.is_empty() {
-                                log::trace!("Received chunk: {} bytes", bytes.len());
-                            }
-                            buffer.extend_from_slice(&bytes);
-                            let mut chunks = Vec::new();
-                            let mut start = 0;
-                            for i in 0..buffer.len() {
-                                if buffer[i] == b'\n' {
-                                    let line = &buffer[start..i + 1];
-                                    match parser.parse_chunk(line) {
-                                        Ok(mut parsed_chunks) => {
-                                            chunks.append(&mut parsed_chunks);
-                                        }
-                                        Err(e) => {
-                                            let e = e.attribute(provider_name.as_str());
-                                            log::debug!(
-                                                "Failed to parse SSE line: {:?}, error: {}",
-                                                String::from_utf8_lossy(line),
-                                                e
-                                            );
-                                            *done = true;
-                                            return futures::future::ready(Some(Err(e)));
-                                        }
+                let res = match res {
+                    Ok(bytes) => {
+                        if !bytes.is_empty() {
+                            log::trace!("Received chunk: {} bytes", bytes.len());
+                        }
+                        buffer.extend_from_slice(&bytes);
+                        let mut chunks = Vec::new();
+                        let mut start = 0;
+                        for i in 0..buffer.len() {
+                            if buffer[i] == b'\n' {
+                                let line = &buffer[start..i + 1];
+                                match parser.parse_chunk(line) {
+                                    Ok(mut parsed_chunks) => {
+                                        chunks.append(&mut parsed_chunks);
                                     }
-                                    start = i + 1;
-                                }
-                            }
-                            *buffer = buffer[start..].to_vec();
-
-                            if bytes.is_empty() {
-                                *done = true;
-                                match parser.finish() {
-                                    Ok(mut tail) => chunks.append(&mut tail),
                                     Err(e) => {
-                                        return futures::future::ready(Some(Err(
-                                            e.attribute(provider_name.as_str())
-                                        )));
+                                        log::debug!(
+                                            "Failed to parse SSE line: {:?}, error: {}",
+                                            String::from_utf8_lossy(line),
+                                            e
+                                        );
+                                        *done = true;
+                                        return futures::future::ready(Some(Err(e)));
                                     }
                                 }
+                                start = i + 1;
                             }
+                        }
+                        *buffer = buffer[start..].to_vec();
 
-                            Ok(chunks)
-                        }
-                        Err(e) => {
+                        if bytes.is_empty() {
                             *done = true;
-                            Err(e)
+                            match parser.finish() {
+                                Ok(mut tail) => chunks.append(&mut tail),
+                                Err(e) => {
+                                    return futures::future::ready(Some(Err(e)));
+                                }
+                            }
                         }
-                    };
-                    futures::future::ready(Some(res))
-                },
-            )
+
+                        Ok(chunks)
+                    }
+                    Err(e) => {
+                        *done = true;
+                        Err(e)
+                    }
+                };
+                futures::future::ready(Some(res))
+            })
             .flat_map(|res: Result<Vec<StreamChunk>, LLMError>| {
                 let v: Vec<Result<StreamChunk, LLMError>> = match res {
                     Ok(chunks) => chunks.into_iter().map(Ok).collect(),

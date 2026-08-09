@@ -599,8 +599,7 @@ impl SessionProvider {
                     model
                 );
 
-                let adapter =
-                    querymt::adapters::LLMProviderFromHTTP::new(provider_name, http_provider);
+                let adapter = querymt::adapters::LLMProviderFromHTTP::new(http_provider);
                 return Ok(Arc::from(Box::new(adapter) as Box<dyn LLMProvider>));
             }
 

@@ -161,7 +161,7 @@ impl HTTPLLMProvider for ResolveAwareHttpProvider {
 #[test]
 fn set_key_resolver_forwards_to_inner_provider() {
     let inner: Box<dyn HTTPLLMProvider> = Box::new(DummyHttpProvider { resolver: None });
-    let mut adapter = LLMProviderFromHTTP::new("dummy", inner);
+    let mut adapter = LLMProviderFromHTTP::new(inner);
     let resolver = static_key("resolver-token");
 
     adapter.set_key_resolver(resolver.clone());
@@ -178,7 +178,7 @@ async fn ensure_credential_fresh_resolves_before_request_building() {
     let inner: Box<dyn HTTPLLMProvider> = Box::new(ResolveAwareHttpProvider {
         resolver: resolver.clone(),
     });
-    let adapter = LLMProviderFromHTTP::new("resolve-aware", inner);
+    let adapter = LLMProviderFromHTTP::new(inner);
 
     assert_eq!(resolver.resolve_count(), 0);
     assert_eq!(
@@ -266,10 +266,7 @@ struct StreamTestParser {
 }
 
 impl ChatStreamParser for StreamTestParser {
-    fn parse_chunk(
-        &mut self,
-        chunk: &[u8],
-    ) -> Result<Vec<StreamChunk>, crate::error::ProviderDecodeError> {
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, crate::error::LLMError> {
         match self.mode {
             StreamTestParserMode::ChunkClassified
                 if !chunk.iter().all(|b| b.is_ascii_whitespace()) =>
@@ -278,14 +275,14 @@ impl ChatStreamParser for StreamTestParser {
                     crate::error::ProviderErrorKind::RateLimited,
                     "mid-stream boom",
                 )
-                .retry_after_secs(Some(3))
+                .with_retry_after_secs(Some(3))
                 .into())
             }
             _ => Ok(Vec::new()),
         }
     }
 
-    fn finish(&mut self) -> Result<Vec<StreamChunk>, crate::error::ProviderDecodeError> {
+    fn finish(&mut self) -> Result<Vec<StreamChunk>, crate::error::LLMError> {
         match self.mode {
             StreamTestParserMode::FinishClassified => Err(crate::error::ProviderFailure::new(
                 crate::error::ProviderErrorKind::QuotaExceeded,
@@ -298,18 +295,15 @@ impl ChatStreamParser for StreamTestParser {
 }
 
 impl HTTPChatProvider for StreamTestProvider {
-    fn classify_chat_error(
-        &self,
-        response: &Response<Vec<u8>>,
-    ) -> crate::error::ProviderDecodeError {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> crate::error::LLMError {
         // Prove the adapter calls the provider classifier (not only status-only).
         let body = String::from_utf8_lossy(response.body());
         crate::error::ProviderFailure::new(
             crate::error::ProviderErrorKind::RateLimited,
             format!("classified:{body}"),
         )
-        .retry_after_secs(Some(9))
-        .code(Some("vendor_rate".into()))
+        .with_retry_after_secs(Some(9))
+        .with_code(Some("vendor_rate".into()))
         .into()
     }
 
@@ -369,7 +363,7 @@ impl HTTPEmbeddingProvider for StreamTestProvider {
 impl HTTPLLMProvider for StreamTestProvider {}
 
 #[tokio::test]
-async fn stream_open_non_success_classifies_and_stamps_factory_name() {
+async fn stream_open_non_success_preserves_classification() {
     let uri = serve_once(
         "HTTP/1.1 429 Too Many Requests",
         &[("Retry-After", "5"), ("Content-Type", "application/json")],
@@ -381,7 +375,7 @@ async fn stream_open_non_success_classifies_and_stamps_factory_name() {
         uri,
         parser: StreamTestParserMode::Unused,
     });
-    let adapter = LLMProviderFromHTTP::new("factory-openai", inner);
+    let adapter = LLMProviderFromHTTP::new(inner);
 
     let err = match adapter.chat_stream_with_tools(&[], None).await {
         Ok(_) => panic!("non-success stream open must fail before yielding a stream"),
@@ -389,19 +383,16 @@ async fn stream_open_non_success_classifies_and_stamps_factory_name() {
     };
 
     match &err {
-        LLMError::ProviderResponseError { message, context } => {
+        LLMError::ProviderResponseError(failure) => {
             assert!(
-                message.contains("classified:") && message.contains("vendor body"),
-                "adapter must use provider classify_chat_error, got message={message}"
+                failure.message().contains("classified:")
+                    && failure.message().contains("vendor body"),
+                "adapter must use provider classify_chat_error, got message={}",
+                failure.message()
             );
-            assert_eq!(
-                context.provider(),
-                "factory-openai",
-                "factory/registry name must be stamped by the adapter"
-            );
-            assert_eq!(context.kind(), crate::error::ProviderErrorKind::RateLimited);
-            assert_eq!(context.code(), Some("vendor_rate"));
-            assert_eq!(context.retry_after_secs(), Some(9));
+            assert_eq!(failure.kind(), crate::error::ProviderErrorKind::RateLimited);
+            assert_eq!(failure.code(), Some("vendor_rate"));
+            assert_eq!(failure.retry_after_secs(), Some(9));
         }
         other => panic!("expected ProviderResponseError, got {other}"),
     }
@@ -410,7 +401,7 @@ async fn stream_open_non_success_classifies_and_stamps_factory_name() {
 }
 
 #[tokio::test]
-async fn stream_parser_finish_failure_stamps_factory_name() {
+async fn stream_parser_finish_failure_preserves_classification() {
     let uri = serve_once(
         "HTTP/1.1 200 OK",
         &[("Content-Type", "text/event-stream")],
@@ -422,7 +413,7 @@ async fn stream_parser_finish_failure_stamps_factory_name() {
         uri,
         parser: StreamTestParserMode::FinishClassified,
     });
-    let adapter = LLMProviderFromHTTP::new("factory-codex", inner);
+    let adapter = LLMProviderFromHTTP::new(inner);
 
     let mut stream = adapter
         .chat_stream_with_tools(&[], None)
@@ -438,11 +429,10 @@ async fn stream_parser_finish_failure_stamps_factory_name() {
     };
 
     match &err {
-        LLMError::ProviderResponseError { message, context } => {
-            assert_eq!(message, "finish boom");
-            assert_eq!(context.provider(), "factory-codex");
+        LLMError::ProviderResponseError(failure) => {
+            assert_eq!(failure.message(), "finish boom");
             assert_eq!(
-                context.kind(),
+                failure.kind(),
                 crate::error::ProviderErrorKind::QuotaExceeded
             );
         }
@@ -452,7 +442,7 @@ async fn stream_parser_finish_failure_stamps_factory_name() {
 }
 
 #[tokio::test]
-async fn stream_parser_chunk_failure_stamps_factory_name() {
+async fn stream_parser_chunk_failure_preserves_classification() {
     let uri = serve_once(
         "HTTP/1.1 200 OK",
         &[("Content-Type", "text/event-stream")],
@@ -464,7 +454,7 @@ async fn stream_parser_chunk_failure_stamps_factory_name() {
         uri,
         parser: StreamTestParserMode::ChunkClassified,
     });
-    let adapter = LLMProviderFromHTTP::new("factory-xai", inner);
+    let adapter = LLMProviderFromHTTP::new(inner);
 
     let mut stream = adapter
         .chat_stream_with_tools(&[], None)
@@ -480,11 +470,10 @@ async fn stream_parser_chunk_failure_stamps_factory_name() {
     };
 
     match &err {
-        LLMError::ProviderResponseError { message, context } => {
-            assert_eq!(message, "mid-stream boom");
-            assert_eq!(context.provider(), "factory-xai");
-            assert_eq!(context.kind(), crate::error::ProviderErrorKind::RateLimited);
-            assert_eq!(context.retry_after_secs(), Some(3));
+        LLMError::ProviderResponseError(failure) => {
+            assert_eq!(failure.message(), "mid-stream boom");
+            assert_eq!(failure.kind(), crate::error::ProviderErrorKind::RateLimited);
+            assert_eq!(failure.retry_after_secs(), Some(3));
         }
         other => panic!("expected ProviderResponseError, got {other}"),
     }

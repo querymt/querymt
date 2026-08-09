@@ -157,10 +157,7 @@ impl OpenAIProviderConfig for Groq {
 }
 
 impl HTTPChatProvider for Groq {
-    fn classify_chat_error(
-        &self,
-        response: &Response<Vec<u8>>,
-    ) -> querymt::error::ProviderDecodeError {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
         classify_openai_http_error(response)
     }
 
@@ -201,10 +198,7 @@ struct GroqStreamParser {
 }
 
 impl ChatStreamParser for GroqStreamParser {
-    fn parse_chunk(
-        &mut self,
-        chunk: &[u8],
-    ) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
         parse_openai_sse_chunk(chunk, &mut self.tool_states)
     }
 }

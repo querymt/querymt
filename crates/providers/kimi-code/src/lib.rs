@@ -142,10 +142,7 @@ impl OpenAIProviderConfig for KimiCode {
 }
 
 impl HTTPChatProvider for KimiCode {
-    fn classify_chat_error(
-        &self,
-        response: &Response<Vec<u8>>,
-    ) -> querymt::error::ProviderDecodeError {
+    fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
         classify_openai_http_error(response)
     }
 
@@ -195,10 +192,7 @@ struct KimiCodeStreamParser {
 }
 
 impl ChatStreamParser for KimiCodeStreamParser {
-    fn parse_chunk(
-        &mut self,
-        chunk: &[u8],
-    ) -> Result<Vec<StreamChunk>, querymt::error::ProviderDecodeError> {
+    fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
         log::trace!(
             "kimi-code SSE chunk ({} bytes): {:?}",
             chunk.len(),

@@ -310,7 +310,7 @@ mod tests {
     };
     use querymt::LLMParams;
     use querymt::chat::ChatResponse;
-    use querymt::error::{LLMError, ProviderErrorContext, ProviderErrorKind};
+    use querymt::error::{LLMError, ProviderErrorKind, ProviderFailure};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::{Mutex, broadcast};
@@ -430,23 +430,17 @@ mod tests {
         assert_eq!(info.1, Some(12));
 
         // Catch-all provider errors are not rate-limit UI events even if retryable.
-        let non_rate = LLMError::ProviderResponseError {
-            message: "server broke".to_string(),
-            context: Box::new(
-                ProviderErrorContext::new("openai", ProviderErrorKind::UnknownTransient)
-                    .with_code(Some("server_error".to_string()))
-                    .with_error_type(Some("api_error".to_string())),
-            ),
-        };
+        let non_rate = LLMError::from(
+            ProviderFailure::new(ProviderErrorKind::UnknownTransient, "server broke")
+                .with_code(Some("server_error".to_string()))
+                .with_error_type(Some("api_error".to_string())),
+        );
         assert!(non_rate.rate_limit_info().is_none());
 
-        let overloaded = LLMError::ProviderResponseError {
-            message: "busy".into(),
-            context: Box::new(
-                ProviderErrorContext::new("codex", ProviderErrorKind::ServerOverloaded)
-                    .with_code(Some("server_is_overloaded".into())),
-            ),
-        };
+        let overloaded = LLMError::from(
+            ProviderFailure::new(ProviderErrorKind::ServerOverloaded, "busy")
+                .with_code(Some("server_is_overloaded".into())),
+        );
         assert!(overloaded.rate_limit_info().is_none());
         assert!(overloaded.is_retryable());
     }
@@ -772,13 +766,10 @@ mod tests {
             let count = call_count2.clone();
             async move {
                 if count.fetch_add(1, Ordering::SeqCst) == 0 {
-                    Err::<Box<dyn ChatResponse>, _>(LLMError::ProviderResponseError {
-                        message: "busy".into(),
-                        context: Box::new(
-                            ProviderErrorContext::new("test", ProviderErrorKind::ServerOverloaded)
-                                .with_retry_after_secs(Some(0)),
-                        ),
-                    })
+                    Err::<Box<dyn ChatResponse>, _>(LLMError::from(
+                        ProviderFailure::new(ProviderErrorKind::ServerOverloaded, "busy")
+                            .with_retry_after_secs(Some(0)),
+                    ))
                 } else {
                     Ok::<Box<dyn ChatResponse>, _>(Box::new(
                         crate::test_utils::MockChatResponse::text_only("ok"),
@@ -890,25 +881,22 @@ mod tests {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
-                Err(LLMError::ProviderResponseError {
-                    message: "overloaded".into(),
-                    context: Box::new(
-                        ProviderErrorContext::new("test", ProviderErrorKind::ServerOverloaded)
-                            .with_code(Some("server_is_overloaded".into()))
-                            .with_request_id(Some("request-3".into()))
-                            .with_retry_after_secs(Some(0)),
-                    ),
-                })
+                Err(LLMError::from(
+                    ProviderFailure::new(ProviderErrorKind::ServerOverloaded, "overloaded")
+                        .with_code(Some("server_is_overloaded".into()))
+                        .with_request_id(Some("request-3".into()))
+                        .with_retry_after_secs(Some(0)),
+                ))
             }
         })
         .await;
 
         assert!(matches!(
             result,
-            Err(LLMError::ProviderResponseError { message, context })
-                if message == "overloaded"
-                    && context.kind() == querymt::error::ProviderErrorKind::ServerOverloaded
-                    && context.request_id() == Some("request-3")
+            Err(LLMError::ProviderResponseError(failure))
+                if failure.message() == "overloaded"
+                    && failure.kind() == querymt::error::ProviderErrorKind::ServerOverloaded
+                    && failure.request_id() == Some("request-3")
         ));
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
     }
@@ -924,22 +912,22 @@ mod tests {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
-                Err::<Box<dyn ChatResponse>, _>(LLMError::ProviderResponseError {
-                    message: "You have hit your usage limit.".into(),
-                    context: Box::new(
-                        ProviderErrorContext::new("codex", ProviderErrorKind::QuotaExceeded)
-                            .with_code(Some("usage_limit_reached".into()))
-                            .with_error_type(Some("usage_limit_reached".into())),
-                    ),
-                })
+                Err::<Box<dyn ChatResponse>, _>(LLMError::from(
+                    ProviderFailure::new(
+                        ProviderErrorKind::QuotaExceeded,
+                        "You have hit your usage limit.",
+                    )
+                    .with_code(Some("usage_limit_reached".into()))
+                    .with_error_type(Some("usage_limit_reached".into())),
+                ))
             }
         })
         .await;
 
         assert!(matches!(
             result,
-            Err(LLMError::ProviderResponseError { context, .. })
-                if context.kind() == querymt::error::ProviderErrorKind::QuotaExceeded
+            Err(LLMError::ProviderResponseError(failure))
+                if failure.kind() == querymt::error::ProviderErrorKind::QuotaExceeded
         ));
         assert_eq!(
             call_count.load(Ordering::SeqCst),
