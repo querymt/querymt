@@ -37,7 +37,12 @@ use uuid::Uuid;
 #[instrument(
     name = "agent.transition.before_llm_call",
     skip(config, context, exec_ctx),
-    fields(session_id = %exec_ctx.session_id, steps = context.stats.steps)
+    fields(
+        session_id = %exec_ctx.session_id,
+        provider = %context.provider,
+        model = %context.model,
+        steps = context.stats.steps
+    )
 )]
 pub(super) async fn transition_before_llm_call(
     config: &AgentConfig,
@@ -72,7 +77,13 @@ pub(super) async fn transition_before_llm_call(
     {
         Ok(provider) => provider,
         Err(LLMError::Cancelled) => return Ok(ExecutionState::Cancelled),
-        Err(error) => return Err(contextualize_llm_error(error, "provider initialization")),
+        Err(error) => {
+            return Err(contextualize_llm_error(
+                error,
+                "provider initialization",
+                context,
+            ));
+        }
     };
 
     let tools = config.collect_tools(
@@ -129,20 +140,32 @@ pub(super) fn apply_cache_breakpoints(messages: &[ChatMessage]) -> Vec<ChatMessa
         .collect()
 }
 
-fn contextualize_llm_error(error: LLMError, operation: &'static str) -> anyhow::Error {
+fn contextualize_llm_error(
+    error: LLMError,
+    operation: &'static str,
+    context: &crate::middleware::ConversationContext,
+) -> anyhow::Error {
     let source_message = error.to_string();
-    anyhow::Error::new(error).context(format!("LLM {operation} error: {source_message}"))
+    anyhow::Error::new(error).context(format!(
+        "LLM {operation} error (provider={}, model={}): {source_message}",
+        context.provider, context.model
+    ))
 }
 
 /// Map a failed LLM setup/call into either `Cancelled` or a contextualized error.
 ///
 /// Cancel must never bubble as `Err`; it is an execution state, not a provider failure.
-fn map_failed_llm_call(error: LLMError, streaming: bool) -> Result<ExecutionState, anyhow::Error> {
+fn map_failed_llm_call(
+    error: LLMError,
+    streaming: bool,
+    context: &crate::middleware::ConversationContext,
+) -> Result<ExecutionState, anyhow::Error> {
     match error {
         LLMError::Cancelled => Ok(ExecutionState::Cancelled),
         error => Err(contextualize_llm_error(
             error,
             if streaming { "streaming" } else { "chat" },
+            context,
         )),
     }
 }
@@ -248,7 +271,7 @@ pub(super) async fn transition_call_llm(
         .await
         {
             Ok(resp) => resp,
-            Err(e) => return map_failed_llm_call(e, false),
+            Err(e) => return map_failed_llm_call(e, false, context),
         };
 
         (
@@ -280,7 +303,11 @@ pub(super) async fn transition_call_llm(
             Ok(provider) => provider,
             Err(LLMError::Cancelled) => return Ok(ExecutionState::Cancelled),
             Err(error) => {
-                return Err(contextualize_llm_error(error, "provider initialization"));
+                return Err(contextualize_llm_error(
+                    error,
+                    "provider initialization",
+                    context,
+                ));
             }
         };
 
@@ -416,7 +443,7 @@ pub(super) async fn transition_call_llm(
                             return Ok(ExecutionState::Cancelled);
                         }
                         super::llm_retry::StreamFailureAction::Terminal(error) => {
-                            return map_failed_llm_call(error, true);
+                            return map_failed_llm_call(error, true, context);
                         }
                     },
                 };
@@ -468,7 +495,7 @@ pub(super) async fn transition_call_llm(
                                 return Ok(ExecutionState::Cancelled);
                             }
                             super::llm_retry::StreamFailureAction::Terminal(error) => {
-                                return Err(contextualize_llm_error(error, "streaming"));
+                                return Err(contextualize_llm_error(error, "streaming", context));
                             }
                         },
                     };
@@ -591,7 +618,11 @@ pub(super) async fn transition_call_llm(
                                         return Ok(ExecutionState::Cancelled);
                                     }
                                     super::llm_retry::StreamFailureAction::Terminal(error) => {
-                                        return Err(contextualize_llm_error(error, "streaming"));
+                                        return Err(contextualize_llm_error(
+                                            error,
+                                            "streaming",
+                                            context,
+                                        ));
                                     }
                                 },
                             }
@@ -676,7 +707,7 @@ pub(super) async fn transition_call_llm(
             .await
             {
                 Ok(resp) => resp,
-                Err(e) => return map_failed_llm_call(e, false),
+                Err(e) => return map_failed_llm_call(e, false, context),
             };
 
             (
@@ -1148,6 +1179,7 @@ pub(super) async fn transition_processing_tool_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::middleware::ConversationContext;
     use querymt::chat::{ChatMessage, ChatRole, Content};
 
     fn make_message(role: ChatRole, content: &str) -> ChatMessage {
@@ -1160,13 +1192,24 @@ mod tests {
 
     // ── map_failed_llm_call ───────────────────────────────────────────────────
 
+    fn llm_context() -> ConversationContext {
+        ConversationContext::new(
+            "session".into(),
+            Arc::from([]),
+            Arc::new(Default::default()),
+            "openrouter".into(),
+            "anthropic/claude".into(),
+        )
+    }
+
     #[test]
     fn setup_cancel_maps_to_cancelled_not_error() {
-        let non_stream =
-            map_failed_llm_call(LLMError::Cancelled, false).expect("cancel must be Ok(Cancelled)");
+        let context = llm_context();
+        let non_stream = map_failed_llm_call(LLMError::Cancelled, false, &context)
+            .expect("cancel must be Ok(Cancelled)");
         assert!(matches!(non_stream, ExecutionState::Cancelled));
 
-        let stream = map_failed_llm_call(LLMError::Cancelled, true)
+        let stream = map_failed_llm_call(LLMError::Cancelled, true, &context)
             .expect("stream setup cancel must be Ok(Cancelled)");
         assert!(matches!(stream, ExecutionState::Cancelled));
     }
@@ -1184,22 +1227,25 @@ mod tests {
     }
 
     #[test]
-    fn setup_failures_add_operation_context_without_erasing_source() {
-        let chat_err =
-            map_failed_llm_call(LLMError::InvalidRequest("missing api_key".into()), false)
-                .expect_err("non-stream failure is Err");
-        assert!(chat_err.to_string().contains("LLM chat error"));
-        assert!(
-            chat_err
-                .to_string()
-                .contains("Invalid Request: missing api_key")
-        );
+    fn llm_failures_add_operation_and_model_context_without_erasing_source() {
+        let context = llm_context();
+        let chat_err = map_failed_llm_call(
+            LLMError::InvalidRequest("missing api_key".into()),
+            false,
+            &context,
+        )
+        .expect_err("non-stream failure is Err");
+        let chat_context = chat_err.to_string();
+        assert!(chat_context.contains("LLM chat error"));
+        assert!(chat_context.contains("provider=openrouter"));
+        assert!(chat_context.contains("model=anthropic/claude"));
+        assert!(chat_context.contains("Invalid Request: missing api_key"));
         assert!(matches!(
             chat_err.downcast_ref::<LLMError>(),
             Some(LLMError::InvalidRequest(message)) if message == "missing api_key"
         ));
 
-        let stream_err = map_failed_llm_call(LLMError::GenericError("boom".into()), true)
+        let stream_err = map_failed_llm_call(LLMError::GenericError("boom".into()), true, &context)
             .expect_err("stream failure is Err");
         assert!(stream_err.to_string().contains("LLM streaming error"));
         assert!(matches!(
