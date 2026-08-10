@@ -11,8 +11,9 @@ use crate::model::{AgentMessage, MessagePart};
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::provider::{ProviderRequest, SessionProvider};
 use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
+use futures_util::StreamExt;
 use querymt::LLMProvider;
-use querymt::chat::{ChatMessage, ChatRole};
+use querymt::chat::{ChatMessage, ChatRole, StreamChunk};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
@@ -79,6 +80,7 @@ impl DelegationSummarizer {
             history_messages = parent_history.len(),
             estimated_tokens = tracing::field::Empty,
             strategy = tracing::field::Empty,
+            llm_transport = tracing::field::Empty,
             llm_duration_ms = tracing::field::Empty,
             output_bytes = tracing::field::Empty,
         )
@@ -127,30 +129,62 @@ impl DelegationSummarizer {
             cache: None,
         }];
 
-        let provider = self.provider.clone();
         let timeout = self.timeout;
+        let use_streaming = self.provider.supports_streaming();
+        span.record(
+            "llm_transport",
+            if use_streaming {
+                "streaming"
+            } else {
+                "non_streaming"
+            },
+        );
 
         let llm_start = std::time::Instant::now();
-        let response = tokio::time::timeout(timeout, async move { provider.chat(&messages).await })
-            .await
-            .map_err(|_| {
-                SessionError::InvalidOperation(format!(
-                    "Delegation summary generation timed out after {} seconds",
-                    timeout.as_secs()
-                ))
-            })?
-            .map_err(|e| {
-                SessionError::InvalidOperation(format!("Delegation summary LLM call failed: {}", e))
-            })?;
+        let summary = tokio::time::timeout(
+            timeout,
+            Self::call_provider(&self.provider, &messages, use_streaming),
+        )
+        .await
+        .map_err(|_| {
+            SessionError::InvalidOperation(format!(
+                "Delegation summary generation timed out after {} seconds",
+                timeout.as_secs()
+            ))
+        })?
+        .map_err(|e| {
+            SessionError::InvalidOperation(format!("Delegation summary LLM call failed: {}", e))
+        })?;
         span.record("llm_duration_ms", llm_start.elapsed().as_millis() as u64);
 
-        // 3. Extract text response
-        let summary = response
-            .text()
-            .unwrap_or_else(|| "No summary generated".to_string());
-
+        let summary = summary.unwrap_or_else(|| "No summary generated".to_string());
         span.record("output_bytes", summary.len() as u64);
         Ok(summary)
+    }
+
+    async fn call_provider(
+        provider: &Arc<dyn LLMProvider>,
+        messages: &[ChatMessage],
+        use_streaming: bool,
+    ) -> Result<Option<String>, querymt::error::LLMError> {
+        if !use_streaming {
+            return provider
+                .chat(messages)
+                .await
+                .map(|response| response.text());
+        }
+
+        let mut stream = provider.chat_stream(messages).await?;
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk? {
+                StreamChunk::Text(delta) => text.push_str(&delta),
+                StreamChunk::Done { .. } => break,
+                _ => {}
+            }
+        }
+
+        Ok((!text.is_empty()).then_some(text))
     }
 
     /// Estimate token count for a list of messages using the configured estimator
@@ -347,6 +381,137 @@ planning conversation."#
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use querymt::chat::{ChatResponse, FinishReason, Tool};
+    use querymt::completion::{CompletionRequest, CompletionResponse};
+    use querymt::error::LLMError;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    type SummaryStream =
+        Pin<Box<dyn futures_util::Stream<Item = Result<StreamChunk, LLMError>> + Send>>;
+    type SummaryChunks = Result<Vec<Result<StreamChunk, LLMError>>, LLMError>;
+
+    struct SummaryTestProvider {
+        supports_streaming: bool,
+        chat_result: Mutex<Option<Result<String, LLMError>>>,
+        stream_result: Mutex<Option<SummaryChunks>>,
+        stall_stream: bool,
+        chat_calls: AtomicUsize,
+        stream_calls: AtomicUsize,
+    }
+
+    impl SummaryTestProvider {
+        fn non_streaming_text(text: &str) -> Self {
+            Self::non_streaming(Ok(text.to_string()))
+        }
+
+        fn non_streaming_error(error: LLMError) -> Self {
+            Self::non_streaming(Err(error))
+        }
+
+        fn non_streaming(result: Result<String, LLMError>) -> Self {
+            Self {
+                supports_streaming: false,
+                chat_result: Mutex::new(Some(result)),
+                stream_result: Mutex::new(None),
+                stall_stream: false,
+                chat_calls: AtomicUsize::new(0),
+                stream_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn streaming(chunks: Vec<Result<StreamChunk, LLMError>>) -> Self {
+            Self {
+                supports_streaming: true,
+                chat_result: Mutex::new(None),
+                stream_result: Mutex::new(Some(Ok(chunks))),
+                stall_stream: false,
+                chat_calls: AtomicUsize::new(0),
+                stream_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn stalled_stream() -> Self {
+            Self {
+                supports_streaming: true,
+                chat_result: Mutex::new(None),
+                stream_result: Mutex::new(None),
+                stall_stream: true,
+                chat_calls: AtomicUsize::new(0),
+                stream_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl querymt::chat::ChatProvider for SummaryTestProvider {
+        fn supports_streaming(&self) -> bool {
+            self.supports_streaming
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&[Tool]>,
+        ) -> Result<Box<dyn ChatResponse>, LLMError> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            let result = self
+                .chat_result
+                .lock()
+                .expect("chat result lock")
+                .take()
+                .unwrap_or_else(|| {
+                    Err(LLMError::NotImplemented(
+                        "non-streaming chat was not configured".to_string(),
+                    ))
+                });
+            result.map(|text| {
+                Box::new(crate::test_utils::mocks::MockChatResponse::text_only(&text))
+                    as Box<dyn ChatResponse>
+            })
+        }
+
+        async fn chat_stream_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&[Tool]>,
+        ) -> Result<SummaryStream, LLMError> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if self.stall_stream {
+                return Ok(Box::pin(futures_util::stream::pending()));
+            }
+
+            let chunks = self
+                .stream_result
+                .lock()
+                .expect("stream result lock")
+                .take()
+                .unwrap_or_else(|| {
+                    Err(LLMError::NotImplemented(
+                        "streaming chat was not configured".to_string(),
+                    ))
+                })?;
+            Ok(Box::pin(futures_util::stream::iter(chunks)))
+        }
+    }
+
+    #[async_trait]
+    impl querymt::completion::CompletionProvider for SummaryTestProvider {
+        async fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse, LLMError> {
+            Err(LLMError::NotImplemented("completion not supported".into()))
+        }
+    }
+
+    #[async_trait]
+    impl querymt::embedding::EmbeddingProvider for SummaryTestProvider {
+        async fn embed(&self, _input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+            Err(LLMError::NotImplemented("embedding not supported".into()))
+        }
+    }
+
+    impl LLMProvider for SummaryTestProvider {}
 
     // ── summarize_tool_args ────────────────────────────────────────────────
 
@@ -480,20 +645,155 @@ mod tests {
         }
     }
 
+    fn summarizer_with_provider(
+        provider: Arc<dyn LLMProvider>,
+        timeout: Duration,
+    ) -> DelegationSummarizer {
+        DelegationSummarizer {
+            provider,
+            timeout,
+            min_history_tokens: 0,
+            estimator: Arc::new(SimpleTokenEstimator),
+        }
+    }
+
     /// Helper: build a DelegationSummarizer with dummy provider (only used for
     /// testing format_conversation / prepare_llm_input which don't call the LLM).
     fn test_summarizer() -> DelegationSummarizer {
-        use crate::session::pruning::SimpleTokenEstimator;
-        // We need a provider to satisfy the struct, but format_conversation
-        // and prepare_llm_input don't use it.
-        let provider: Arc<dyn querymt::LLMProvider> =
+        let provider: Arc<dyn LLMProvider> =
             Arc::new(crate::test_utils::mocks::MockLlmProvider::new());
-        DelegationSummarizer {
-            provider,
-            timeout: Duration::from_secs(30),
-            min_history_tokens: 500,
-            estimator: Arc::new(SimpleTokenEstimator),
-        }
+        summarizer_with_provider(provider, Duration::from_secs(30))
+    }
+
+    #[tokio::test]
+    async fn streaming_provider_collects_text_and_ignores_non_text_chunks() {
+        let provider = Arc::new(SummaryTestProvider::streaming(vec![
+            Ok(StreamChunk::Thinking("internal".to_string())),
+            Ok(StreamChunk::Text("implementation ".to_string())),
+            Ok(StreamChunk::Usage(querymt::Usage::default())),
+            Ok(StreamChunk::Text("brief".to_string())),
+            Ok(StreamChunk::Done {
+                finish_reason: FinishReason::Stop,
+            }),
+            Ok(StreamChunk::Text("ignored after done".to_string())),
+        ]));
+        let summarizer = summarizer_with_provider(provider.clone(), Duration::from_secs(1));
+
+        let summary = summarizer
+            .summarize(&[make_user_msg("plan")], "implement")
+            .await
+            .expect("streaming summary");
+
+        assert_eq!(summary, "implementation brief");
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_provider_accepts_clean_end_without_done_chunk() {
+        let provider = Arc::new(SummaryTestProvider::streaming(vec![Ok(StreamChunk::Text(
+            "complete at eof".to_string(),
+        ))]));
+        let summarizer = summarizer_with_provider(provider, Duration::from_secs(1));
+
+        let summary = summarizer
+            .summarize(&[make_user_msg("plan")], "implement")
+            .await
+            .expect("streaming summary");
+
+        assert_eq!(summary, "complete at eof");
+    }
+
+    #[tokio::test]
+    async fn non_streaming_provider_uses_chat_response() {
+        let provider = Arc::new(SummaryTestProvider::non_streaming_text(
+            "implementation brief",
+        ));
+        let summarizer = summarizer_with_provider(provider.clone(), Duration::from_secs(1));
+
+        let summary = summarizer
+            .summarize(&[make_user_msg("plan")], "implement")
+            .await
+            .expect("non-streaming summary");
+
+        assert_eq!(summary, "implementation brief");
+        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_response_uses_existing_fallback_for_both_transports() {
+        let streaming = summarizer_with_provider(
+            Arc::new(SummaryTestProvider::streaming(Vec::new())),
+            Duration::from_secs(1),
+        );
+        let non_streaming = summarizer_with_provider(
+            Arc::new(SummaryTestProvider::non_streaming_text("")),
+            Duration::from_secs(1),
+        );
+        let history = [make_user_msg("plan")];
+
+        assert_eq!(
+            streaming
+                .summarize(&history, "implement")
+                .await
+                .expect("empty streaming summary"),
+            "No summary generated"
+        );
+        assert_eq!(
+            non_streaming
+                .summarize(&history, "implement")
+                .await
+                .expect("empty non-streaming summary"),
+            "No summary generated"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_error_is_propagated_without_non_streaming_fallback() {
+        let provider = Arc::new(SummaryTestProvider::streaming(vec![Err(
+            LLMError::ProviderError("stream failed".to_string()),
+        )]));
+        let summarizer = summarizer_with_provider(provider.clone(), Duration::from_secs(1));
+
+        let error = summarizer
+            .summarize(&[make_user_msg("plan")], "implement")
+            .await
+            .expect_err("stream error");
+
+        assert!(error.to_string().contains("stream failed"));
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn non_streaming_error_is_propagated() {
+        let provider = Arc::new(SummaryTestProvider::non_streaming_error(
+            LLMError::ProviderError("chat failed".to_string()),
+        ));
+        let summarizer = summarizer_with_provider(provider, Duration::from_secs(1));
+
+        let error = summarizer
+            .summarize(&[make_user_msg("plan")], "implement")
+            .await
+            .expect_err("chat error");
+
+        assert!(error.to_string().contains("chat failed"));
+    }
+
+    #[tokio::test]
+    async fn configured_timeout_covers_stream_consumption() {
+        let provider = Arc::new(SummaryTestProvider::stalled_stream());
+        let summarizer = summarizer_with_provider(provider.clone(), Duration::from_secs(1));
+
+        let error = summarizer
+            .summarize(&[make_user_msg("plan")], "implement")
+            .await
+            .expect_err("stream timeout");
+
+        assert!(error.to_string().contains("timed out after 1 seconds"));
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
