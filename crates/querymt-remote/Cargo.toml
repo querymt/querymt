@@ -20,7 +20,7 @@ serde_json.workspace = true
 futures-util = "0.3"
 querymt = { path = "../querymt", default-features = false, features = ["runtime"] }
 querymt-utils = { path = "../querymt-utils", features = ["providers"] }
-kameo = { version = "0.21", features = ["remote"] }
+kameo = { version = "0.22", features = ["remote"] }
 tokio = { version = "1.0", features = ["macros", "rt", "sync", "time"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
