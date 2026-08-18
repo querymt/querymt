@@ -9,6 +9,29 @@ use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolEr
 
 pub struct ShellTool;
 
+#[cfg(unix)]
+fn detach_session() -> std::io::Result<()> {
+    // SAFETY: `setsid` only changes process-local session state.
+    if unsafe { libc::setsid() } == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+struct KillProcessGroup(Option<u32>);
+
+#[cfg(unix)]
+impl Drop for KillProcessGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            // SAFETY: `setsid` made the child the leader of this process group.
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        }
+    }
+}
+
 impl Default for ShellTool {
     fn default() -> Self {
         Self::new()
@@ -110,92 +133,39 @@ impl ToolTrait for ShellTool {
         cmd.stderr(std::process::Stdio::piped());
         cmd.stdin(std::process::Stdio::null());
 
-        // Place the child in its own process group so that on cancellation we
-        // can kill the entire tree (sh + any children it spawned) with a single
-        // signal rather than leaving orphaned processes behind.
+        // Detach from the controlling tty. `setsid` also creates the process
+        // group used for cancellation below.
         #[cfg(unix)]
-        cmd.process_group(0);
+        {
+            // SAFETY: the callback only performs the async-signal-safe `setsid` syscall.
+            unsafe { cmd.pre_exec(detach_session) };
+        }
 
         // Safety net: if the tokio `Child` is dropped (e.g. task abort) send
         // SIGKILL to the direct child automatically.
         cmd.kill_on_drop(true);
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| ToolError::ProviderError(format!("command failed to spawn: {}", e)))?;
 
-        // Capture the PID before moving `child` into the spawned task so we can
-        // kill the process group from the cancel branch.
-        let child_pid = child.id();
+        #[cfg(unix)]
+        let mut group_guard = KillProcessGroup(child.id());
 
         let cancel = context.cancellation_token();
-
-        // Drive the child to completion in a cancellable way.
-        //
-        // `wait_with_output` cannot be used here because it moves `child` into
-        // its future — the cancel branch would then have no way to call `kill`.
-        // Instead we spawn the wait+collect as a JoinHandle so both branches can
-        // be expressed without ownership conflicts: the handle is abortable via
-        // `abort()`, and the child PID is captured as a raw handle for killing.
-        let wait_handle = tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut stdout_buf = Vec::new();
-            let mut stderr_buf = Vec::new();
-            let mut stdout = child.stdout.take();
-            let mut stderr = child.stderr.take();
-            let (_, _) = tokio::join!(
-                async {
-                    if let Some(ref mut s) = stdout {
-                        let _ = s.read_to_end(&mut stdout_buf).await;
-                    }
-                },
-                async {
-                    if let Some(ref mut s) = stderr {
-                        let _ = s.read_to_end(&mut stderr_buf).await;
-                    }
-                },
-            );
-            let status = child.wait().await?;
-            Ok::<_, std::io::Error>((status, stdout_buf, stderr_buf))
-        });
-
-        // Race the child wait against cancellation. Both arms need access to
-        // `wait_handle` (normal path to get the result, cancel path to abort),
-        // so we pin it and use `&mut` refs in the select branches.
-        tokio::pin!(wait_handle);
-
-        let (status, stdout_buf, stderr_buf) = tokio::select! {
-            result = &mut wait_handle => {
-                result
-                    .map_err(|e| ToolError::ProviderError(format!("task join failed: {}", e)))?
-                    .map_err(|e| ToolError::ProviderError(format!("command failed: {}", e)))?
+        let output = tokio::select! {
+            result = child.wait_with_output() => {
+                let output = result
+                    .map_err(|e| ToolError::ProviderError(format!("command failed: {}", e)))?;
+                #[cfg(unix)]
+                {
+                    group_guard.0 = None;
+                }
+                output
             }
             _ = cancel.cancelled() => {
-                // Abort the spawned task — `kill_on_drop(true)` ensures the
-                // direct child receives SIGKILL when the `Child` is dropped.
-                wait_handle.abort();
-
-                // Kill the entire process group so that any grandchildren
-                // (e.g. processes spawned by the shell command) are also
-                // terminated.  The negative PID targets the process group
-                // we created with `process_group(0)` above.
-                #[cfg(unix)]
-                if let Some(pid) = child_pid {
-                    // SAFETY: We send SIGKILL to the process group whose PGID
-                    // equals `pid`.  The group was created by us moments ago
-                    // via `process_group(0)`.  If the process already exited
-                    // the call harmlessly returns ESRCH.
-                    unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
-                }
-
                 return Err(ToolError::ProviderError("Cancelled by user".to_string()));
             }
-        };
-
-        let output = std::process::Output {
-            status,
-            stdout: stdout_buf,
-            stderr: stderr_buf,
         };
 
         let result = json!({
@@ -226,6 +196,37 @@ mod tests {
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
+
+    #[cfg(unix)]
+    async fn wait_for_pid(path: &std::path::Path) -> i32 {
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(contents) = tokio::fs::read_to_string(path).await
+                    && let Ok(pid) = contents.trim().parse::<i32>()
+                {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("process did not write its PID in time")
+    }
+
+    #[cfg(unix)]
+    async fn assert_process_exits(pid: i32) {
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("process {pid} did not exit"));
+    }
 
     #[tokio::test]
     async fn test_shell_echo() {
@@ -294,8 +295,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_cancel_kills_process() {
-        use std::time::Duration;
-
         let temp_dir = TempDir::new().unwrap();
         let token = CancellationToken::new();
         let context =
@@ -321,19 +320,10 @@ mod tests {
             async move { tool.call(args, &context).await }
         });
 
-        // Wait for the PID file to appear (process has started).
-        let pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Ok(contents) = tokio::fs::read_to_string(&pid_file).await
-                    && let Ok(pid) = contents.trim().parse::<i32>()
-                {
-                    return pid;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("shell process did not write its PID in time");
+        let pid = wait_for_pid(&pid_file).await;
+
+        // SAFETY: `getsid` only queries process metadata.
+        assert_eq!(unsafe { libc::getsid(pid) }, pid);
 
         // Cancel the token — this should trigger kill.
         token.cancel();
@@ -342,12 +332,26 @@ mod tests {
         let result = handle.await.expect("task panicked");
         assert!(result.is_err(), "expected cancellation error");
 
-        // Give the OS a moment to reap the process.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_process_exits(pid).await;
+    }
 
-        // Verify the process is no longer running.
-        // kill(pid, 0) checks existence without sending a signal.
-        let alive = unsafe { libc::kill(pid, 0) };
-        assert_eq!(alive, -1, "process {pid} should be dead after cancellation");
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_dropping_tool_future_kills_process_group() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let pid_file = temp_dir.path().join("child.pid");
+        let args = json!({
+            "command": format!("sleep 300 & echo $! > {}; wait", pid_file.display())
+        });
+
+        let handle = tokio::spawn(async move { ShellTool::new().call(args, &context).await });
+        let pid = wait_for_pid(&pid_file).await;
+
+        handle.abort();
+        let _ = handle.await;
+
+        assert_process_exits(pid).await;
     }
 }
