@@ -4,7 +4,7 @@ use querymt_agent::session::store::SessionStore;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use tokio::time::{Duration, sleep};
-use uuid::Uuid;
+use uuid::{Uuid, Version};
 
 async fn create_test_store() -> (TempDir, SqliteStorage) {
     let temp_dir = TempDir::new().expect("temp dir");
@@ -23,9 +23,11 @@ async fn test_hybrid_id_scheme() {
         .expect("session");
     assert!(session.id > 0, "Should have INTEGER primary key");
     assert_eq!(session.public_id.len(), 36, "Should have UUID public_id");
-    assert!(
-        session.public_id.starts_with("019"),
-        "UUID v7 starts with timestamp"
+    let public_id = Uuid::parse_str(&session.public_id).expect("public_id must be a valid UUID");
+    assert_eq!(
+        public_id.get_version(),
+        Some(Version::SortRand),
+        "public_id must be UUID v7"
     );
 
     let retrieved = store
