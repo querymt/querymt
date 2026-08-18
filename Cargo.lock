@@ -6921,6 +6921,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kameo_actors"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "069ef0ae25f4da6f817ce7d81f7990b3d12c3ae398b59e6e16e37b5fcc92a443"
+dependencies = [
+ "futures",
+ "glob",
+ "kameo",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "kameo_macros"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11081,6 +11094,7 @@ dependencies = [
  "infer",
  "jsonschema",
  "kameo",
+ "kameo_actors",
  "libc",
  "libp2p",
  "libp2p-iroh",
