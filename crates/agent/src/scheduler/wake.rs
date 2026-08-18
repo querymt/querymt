@@ -1,14 +1,14 @@
 //! Deadline queue and event accumulator logic for `SchedulerActor`.
 //!
 //! The deadline queue is a min-heap of `(OffsetDateTime, schedule_public_id)`
-//! pairs. A single `tokio::time::sleep_until` targets the nearest deadline.
+//! pairs. A single scheduled actor message targets the nearest deadline.
 //!
 //! The event accumulator tracks per-schedule event counts with debounce.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use time::OffsetDateTime;
-use tokio::task::JoinHandle;
+use tokio::task::AbortHandle;
 
 /// Entry in the deadline queue: `(next_run_at, schedule_public_id)`.
 ///
@@ -77,8 +77,8 @@ pub(crate) struct EventAccumulator {
     pub threshold: u32,
     /// If set, the debounce window is active until this time.
     pub debounce_until: Option<OffsetDateTime>,
-    /// Handle to the debounce timer task (aborted on reset).
-    pub debounce_handle: Option<JoinHandle<()>>,
+    /// Handle to the scheduled debounce message (aborted on reset).
+    pub debounce_handle: Option<AbortHandle>,
 }
 
 impl EventAccumulator {
@@ -128,9 +128,8 @@ impl EventAccumulator {
 #[derive(Debug)]
 pub(crate) struct ActiveCycle {
     pub started_at: OffsetDateTime,
-    /// Handle to the timeout task that sends `CycleFailed` if
-    /// `max_runtime_seconds` is exceeded.
-    pub timeout_handle: JoinHandle<()>,
+    /// Handle to the scheduled `CycleFailed` message.
+    pub timeout_handle: AbortHandle,
 }
 
 /// Compute the next run time for an interval schedule with jitter.
@@ -248,6 +247,7 @@ mod tests {
         assert!(!acc.threshold_met());
         assert_eq!(acc.count, 0);
         assert!(acc.debounce_until.is_none());
+        assert!(acc.debounce_handle.is_none());
     }
 
     #[test]

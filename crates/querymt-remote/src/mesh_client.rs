@@ -135,7 +135,10 @@ impl KameoMeshClientTransport {
         }
 
         let router = ProviderStreamRouterActor::new(None, None);
-        let router_ref = ProviderStreamRouterActor::spawn(router);
+        let prepared =
+            ProviderStreamRouterActor::prepare().reply_timeout(Self::STREAM_ROUTER_TIMEOUT);
+        let router_ref = prepared.actor_ref().clone();
+        prepared.spawn(router);
 
         Self::stream_router_cache()
             .write()
@@ -184,7 +187,6 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
                 request_id: request_id.to_string(),
             })
             .mailbox_timeout(Self::STREAM_ROUTER_TIMEOUT)
-            .reply_timeout(Self::STREAM_ROUTER_TIMEOUT)
             .send()
             .await
             .map_err(|e| {
@@ -196,7 +198,6 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
                 consumer_tx,
             })
             .mailbox_timeout(Self::STREAM_ROUTER_TIMEOUT)
-            .reply_timeout(Self::STREAM_ROUTER_TIMEOUT)
             .send()
             .await
             .map_err(|e| {

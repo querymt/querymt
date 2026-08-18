@@ -23,8 +23,9 @@ use crate::session::error::SessionResult;
 use crate::session::repo_schedule::ScheduleRepository;
 use crate::session::store::SessionStore;
 use kameo::Actor;
-use kameo::actor::ActorRef;
+use kameo::actor::{ActorRef, Spawn};
 use kameo::message::{Context, Message};
+use kameo_actors::scheduler::{Scheduler as TimerScheduler, SetTimeout};
 use log::{debug, info, warn};
 use messages::*;
 use std::collections::{HashMap, HashSet};
@@ -32,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 use wake::{ActiveCycle, DeadlineQueue, EventAccumulator};
 
@@ -205,7 +206,6 @@ impl SchedulerHandle {
                 session_public_id: session_public_id.map(|s| s.to_string()),
             })
             .mailbox_timeout(Self::CONTROL_TIMEOUT)
-            .reply_timeout(Self::CONTROL_TIMEOUT)
             .send()
             .await
             .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
@@ -220,7 +220,6 @@ impl SchedulerHandle {
                 schedule_public_id: schedule_public_id.to_string(),
             })
             .mailbox_timeout(Self::CONTROL_TIMEOUT)
-            .reply_timeout(Self::CONTROL_TIMEOUT)
             .send()
             .await
             .map_err(|e| crate::session::error::SessionError::Other(e.to_string()))?;
@@ -232,7 +231,6 @@ impl SchedulerHandle {
         self.actor_ref
             .ask(GetMetrics)
             .mailbox_timeout(Self::CONTROL_TIMEOUT)
-            .reply_timeout(Self::CONTROL_TIMEOUT)
             .send()
             .await
             .unwrap_or_default()
@@ -252,7 +250,6 @@ impl SchedulerHandle {
             .actor_ref
             .ask(Shutdown)
             .mailbox_timeout(Self::CONTROL_TIMEOUT)
-            .reply_timeout(Self::CONTROL_TIMEOUT)
             .send()
             .await;
     }
@@ -283,11 +280,12 @@ pub struct SchedulerActor {
     /// Prevents double-application of completion/failure from duplicate events.
     processed_terminals: HashSet<(String, Option<String>)>,
 
-    /// Self-reference set after spawn. Used to schedule deadline wake tasks
-    /// that send `DeadlineReached` back to this actor.
+    /// Self-reference set after spawn. Used as the target for scheduled messages.
     self_ref: Option<ActorRef<Self>>,
-    /// Handle to the current deadline wake task (aborted when the queue head changes).
-    wake_handle: Option<JoinHandle<()>>,
+    /// Utility actor responsible for one-shot timer messages, started after lease acquisition.
+    timer_scheduler: Option<ActorRef<TimerScheduler>>,
+    /// Handle to the current deadline wake message (aborted when the queue head changes).
+    wake_handle: Option<AbortHandle>,
 
     /// Token cancelled during shutdown to immediately stop all background loops
     /// (lease renewal, event subscription, reconciliation).
@@ -551,7 +549,7 @@ impl Message<SetSelfRef> for SchedulerActor {
     ) -> Self::Reply {
         self.self_ref = Some(msg.actor_ref);
         // Now that we have a self-ref, schedule the first deadline wake
-        self.reschedule_wake();
+        self.reschedule_wake().await;
     }
 }
 
@@ -582,6 +580,7 @@ impl SchedulerActor {
             pending_deletes: HashSet::new(),
             processed_terminals: HashSet::new(),
             self_ref: None,
+            timer_scheduler: None,
             wake_handle: None,
             shutdown_token: CancellationToken::new(),
             metrics: SchedulerMetrics::default(),
@@ -615,6 +614,12 @@ impl SchedulerActor {
             return None;
         }
 
+        let prepared_timer =
+            TimerScheduler::prepare().reply_timeout(SchedulerHandle::CONTROL_TIMEOUT);
+        let timer_scheduler = prepared_timer.actor_ref().clone();
+        prepared_timer.spawn(TimerScheduler::new());
+        actor.timer_scheduler = Some(timer_scheduler);
+
         // Capture data needed by background loops before move into spawn.
         let agent_config = actor.config.clone();
         let sched_store = actor.schedule_store.clone();
@@ -622,8 +627,10 @@ impl SchedulerActor {
         let owner_id = actor.owner_id.clone();
         let shutdown_token = actor.shutdown_token.clone();
 
-        // Spawn as a kameo actor
-        let actor_ref = kameo::actor::Spawn::spawn(actor);
+        // Apply the common control-plane timeout to local asks by default.
+        let prepared = Self::prepare().reply_timeout(SchedulerHandle::CONTROL_TIMEOUT);
+        let actor_ref = prepared.actor_ref().clone();
+        prepared.spawn(actor);
 
         // Store self_ref in the actor so it can schedule deadline wakes.
         // We use tell() which is fine here — the actor processes it before
@@ -842,26 +849,33 @@ impl SchedulerActor {
         // Each loop selects on this token and exits immediately when cancelled.
         self.shutdown_token.cancel();
 
-        // Abort the one-shot deadline wake timer (not a long-running loop).
+        // Abort one-shot messages and active-cycle timeouts.
         if let Some(handle) = self.wake_handle.take() {
             handle.abort();
+        }
+        for (_, cycle) in self.active_cycles.drain() {
+            cycle.timeout_handle.abort();
+        }
+        for accumulator in self.event_counters.values_mut() {
+            accumulator.reset();
+        }
+        if let Some(timer_scheduler) = self.timer_scheduler.take() {
+            timer_scheduler.kill();
         }
         info!("SchedulerActor: background tasks aborted");
     }
 
     /// Schedule (or reschedule) the deadline wake task.
     ///
-    /// Aborts the current wake task and spawns a new one that sleeps until the
-    /// earliest deadline in the queue, then sends `DeadlineReached` to the actor.
+    /// Aborts the current wake message and schedules a new one for the earliest deadline.
     /// Called after any mutation to the deadline queue head.
-    fn reschedule_wake(&mut self) {
-        // Abort any existing wake task
+    async fn reschedule_wake(&mut self) {
         if let Some(handle) = self.wake_handle.take() {
             handle.abort();
         }
 
-        let Some(actor_ref) = self.self_ref.clone() else {
-            return; // self_ref not yet set (pre-spawn initialization)
+        let Some(actor_ref) = self.self_ref.as_ref() else {
+            return;
         };
 
         let Some((next_time, schedule_public_id)) = self
@@ -869,16 +883,22 @@ impl SchedulerActor {
             .peek()
             .map(|(dt, id)| (dt, id.to_string()))
         else {
-            return; // Queue is empty, nothing to schedule
+            return;
         };
 
         let delay = (next_time - OffsetDateTime::now_utc()).max(time::Duration::ZERO);
-        let std_delay = std::time::Duration::from_secs(delay.whole_seconds().max(0) as u64);
-
-        self.wake_handle = Some(tokio::spawn(async move {
-            tokio::time::sleep(std_delay).await;
-            let _ = actor_ref.tell(DeadlineReached { schedule_public_id }).await;
-        }));
+        let timeout = SetTimeout::new(
+            actor_ref.downgrade(),
+            delay.unsigned_abs(),
+            DeadlineReached { schedule_public_id },
+        );
+        let Some(timer_scheduler) = self.timer_scheduler.as_ref() else {
+            return;
+        };
+        match timer_scheduler.ask(timeout).await {
+            Ok(handle) => self.wake_handle = Some(handle),
+            Err(error) => warn!("SchedulerActor: failed to schedule deadline wake: {error}"),
+        }
     }
 
     /// Recover schedules stuck in `Running` state (from crashes/restarts).
@@ -918,7 +938,7 @@ impl SchedulerActor {
         match self.schedule_store.list_all_armed_schedules().await {
             Ok(schedules) => {
                 for schedule in schedules {
-                    self.enqueue_schedule(&schedule);
+                    self.enqueue_schedule(&schedule).await;
                 }
                 info!(
                     "SchedulerActor: rebuilt queues with {} armed schedules",
@@ -935,13 +955,13 @@ impl SchedulerActor {
     ///
     /// Automatically reschedules the deadline wake task if the queue head may
     /// have changed (interval schedules).
-    fn enqueue_schedule(&mut self, schedule: &Schedule) {
+    async fn enqueue_schedule(&mut self, schedule: &Schedule) {
         match &schedule.trigger {
             ScheduleTrigger::Interval { .. } | ScheduleTrigger::OnceAt { .. } => {
                 if let Some(next) = schedule.next_run_at {
                     self.deadline_queue.insert(next, schedule.public_id.clone());
                     // Queue head may have changed — reschedule wake
-                    self.reschedule_wake();
+                    self.reschedule_wake().await;
                 }
             }
             ScheduleTrigger::EventDriven {
@@ -1094,29 +1114,37 @@ impl SchedulerActor {
             }
         }
 
-        // Set up timeout handle — sends CycleFailed directly to this actor
+        // Schedule a timeout message for this active cycle.
         let max_runtime = schedule.config.max_runtime_seconds;
-        let schedule_id_for_timeout = schedule_public_id.to_string();
-        let timeout_handle = if let Some(actor_ref) = self.self_ref.clone() {
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(max_runtime)).await;
-                let _ = actor_ref
-                    .tell(CycleFailed {
-                        schedule_public_id: schedule_id_for_timeout,
-                        turn_id: None,
-                        error: format!("cycle exceeded max_runtime_seconds ({})", max_runtime),
-                    })
-                    .await;
-            })
-        } else {
-            // Fallback: no self_ref (should not happen in normal operation)
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(max_runtime)).await;
+        let Some(actor_ref) = self.self_ref.as_ref() else {
+            warn!(
+                "SchedulerActor: cannot schedule timeout for {} without self_ref",
+                schedule_public_id
+            );
+            return;
+        };
+        let timeout = SetTimeout::new(
+            actor_ref.downgrade(),
+            Duration::from_secs(max_runtime),
+            CycleFailed {
+                schedule_public_id: schedule_public_id.to_string(),
+                turn_id: None,
+                error: format!("cycle exceeded max_runtime_seconds ({})", max_runtime),
+            },
+        );
+        let Some(timer_scheduler) = self.timer_scheduler.as_ref() else {
+            warn!("SchedulerActor: cycle timer scheduler is not running");
+            return;
+        };
+        let timeout_handle = match timer_scheduler.ask(timeout).await {
+            Ok(handle) => handle,
+            Err(error) => {
                 warn!(
-                    "SchedulerActor: timeout for {} but no self_ref to send CycleFailed",
-                    schedule_id_for_timeout
+                    "SchedulerActor: failed to schedule cycle timeout for {}: {}",
+                    schedule_public_id, error
                 );
-            })
+                return;
+            }
         };
 
         self.active_cycles.insert(
@@ -1230,7 +1258,7 @@ impl SchedulerActor {
             }
 
             // Re-enqueue in deadline queue
-            self.enqueue_schedule(&updated);
+            self.enqueue_schedule(&updated).await;
         }
 
         // Handle pending delete
@@ -1358,7 +1386,7 @@ impl SchedulerActor {
             }
 
             // Re-enqueue with backoff delay
-            self.enqueue_schedule(&updated);
+            self.enqueue_schedule(&updated).await;
         }
 
         // Handle pending delete
@@ -1399,7 +1427,7 @@ impl SchedulerActor {
         let task_public_id = schedule.task_public_id.clone();
 
         let created = self.schedule_store.create_schedule(schedule).await?;
-        self.enqueue_schedule(&created);
+        self.enqueue_schedule(&created).await;
         info!(
             "SchedulerActor: added schedule {} for task {}",
             public_id, task_public_id
@@ -1435,7 +1463,7 @@ impl SchedulerActor {
         self.event_counters.remove(schedule_public_id);
         self.metrics.armed_interval_schedules = self.deadline_queue.len() as u64;
         self.metrics.armed_event_schedules = self.event_counters.len() as u64;
-        self.reschedule_wake();
+        self.reschedule_wake().await;
 
         self.schedule_store
             .delete_schedule(schedule_public_id)
@@ -1483,7 +1511,7 @@ impl SchedulerActor {
         if let Some(acc) = self.event_counters.get_mut(schedule_public_id) {
             acc.reset();
         }
-        self.reschedule_wake();
+        self.reschedule_wake().await;
 
         self.config.emit_event(
             "", // Session ID not easily available here; use empty for scheduler-level events
@@ -1527,9 +1555,9 @@ impl SchedulerActor {
                 ));
                 updated.updated_at = OffsetDateTime::now_utc();
                 let _ = self.schedule_store.update_schedule(updated.clone()).await;
-                self.enqueue_schedule(&updated);
+                self.enqueue_schedule(&updated).await;
             } else {
-                self.enqueue_schedule(&schedule);
+                self.enqueue_schedule(&schedule).await;
             }
         }
 
@@ -1591,20 +1619,23 @@ impl SchedulerActor {
                             + time::Duration::seconds(debounce_secs as i64);
                         acc.debounce_until = Some(debounce_until);
 
-                        // Spawn a debounce timer that sends DebounceCompleted
-                        // directly to the actor via self_ref.
-                        if let Some(actor_ref) = self.self_ref.clone() {
-                            let schedule_id = schedule_public_id.to_string();
-                            let debounce_handle = tokio::spawn(async move {
-                                tokio::time::sleep(std::time::Duration::from_secs(debounce_secs))
-                                    .await;
-                                let _ = actor_ref
-                                    .tell(DebounceCompleted {
-                                        schedule_public_id: schedule_id,
-                                    })
-                                    .await;
-                            });
-                            acc.debounce_handle = Some(debounce_handle);
+                        if let Some(actor_ref) = self.self_ref.as_ref() {
+                            let timeout = SetTimeout::new(
+                                actor_ref.downgrade(),
+                                Duration::from_secs(debounce_secs),
+                                DebounceCompleted {
+                                    schedule_public_id: schedule_public_id.to_string(),
+                                },
+                            );
+                            if let Some(timer_scheduler) = self.timer_scheduler.as_ref() {
+                                match timer_scheduler.ask(timeout).await {
+                                    Ok(handle) => acc.debounce_handle = Some(handle),
+                                    Err(error) => warn!(
+                                        "SchedulerActor: failed to schedule debounce for {}: {}",
+                                        schedule_public_id, error
+                                    ),
+                                }
+                            }
                         }
                     } else {
                         // No debounce, fire immediately
@@ -1642,14 +1673,14 @@ impl SchedulerActor {
     pub async fn handle_deadline_reached(&mut self, schedule_public_id: &str) {
         // Remove from queue (it was the top entry)
         self.deadline_queue.remove(schedule_public_id);
-        self.reschedule_wake();
+        self.reschedule_wake().await;
         self.fire_schedule(schedule_public_id).await;
     }
 
     /// Handle a TriggerNow request — fire immediately regardless of deadline.
     pub async fn handle_trigger_now(&mut self, schedule_public_id: &str) {
         self.deadline_queue.remove(schedule_public_id);
-        self.reschedule_wake();
+        self.reschedule_wake().await;
         self.fire_schedule(schedule_public_id).await;
     }
 
@@ -1821,6 +1852,49 @@ mod unit_tests {
             session_public_id: "sess-1".to_string(),
         };
         assert_eq!(event_kind_name(&kind), "schedule_fired");
+    }
+
+    #[derive(Actor)]
+    struct TimerTarget(tokio::sync::oneshot::Sender<()>);
+
+    struct TimerElapsed;
+
+    impl Message<TimerElapsed> for TimerTarget {
+        type Reply = ();
+
+        async fn handle(
+            &mut self,
+            _msg: TimerElapsed,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let (replacement, _rx) = tokio::sync::oneshot::channel();
+            let sender = std::mem::replace(&mut self.0, replacement);
+            let _ = sender.send(());
+            ctx.stop();
+        }
+    }
+
+    #[tokio::test]
+    async fn timer_scheduler_sends_timeout_message() {
+        let timer_scheduler = TimerScheduler::spawn(TimerScheduler::new());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let target = TimerTarget::spawn(TimerTarget(tx));
+
+        let handle = timer_scheduler
+            .ask(SetTimeout::new(
+                target.downgrade(),
+                Duration::from_millis(10),
+                TimerElapsed,
+            ))
+            .await
+            .expect("schedule timeout");
+
+        tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("scheduled message timeout")
+            .expect("scheduled message sender dropped");
+        assert!(handle.is_finished());
+        timer_scheduler.kill();
     }
 
     /// Verify that `abort_background_tasks()` cancels the shutdown token.
