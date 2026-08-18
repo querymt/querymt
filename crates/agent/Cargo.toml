@@ -57,7 +57,7 @@ rusqlite = { version = "0.40", features = ["bundled", "uuid", "time"] }
 time = { version = "0.3", features = ["serde", "formatting", "macros", "local-offset"] }
 uuid = { version = "1.18", features = ["v4", "v7"] }
 rapidhash = "4.2"
-rand = "0.9"
+rand = "0.10"
 ignore = "0.4.25"
 notify = "8"
 glob = "0.3"
