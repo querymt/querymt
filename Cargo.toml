@@ -27,7 +27,7 @@ serde_json = { version = "1.0", features = ["preserve_order", "raw_value"] }
 serde-value = "0.7"
 either = { version = "1.15.0", features = ["serde"] }
 http = "1.0"
-base64 = "0.22.1"
+base64 = "0.23.0"
 url = { version = "2.5", features = ["serde"] }
 schemars = "1.0"
 futures = "0.3"
