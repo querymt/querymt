@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.0.53">
+      <meta name="generator" content="zensical-0.0.55">
     
     
       
@@ -1724,22 +1724,22 @@
 <span class="normal"><a href="#__codelineno-0-13">13</a></span>
 <span class="normal"><a href="#__codelineno-0-14">14</a></span>
 <span class="normal"><a href="#__codelineno-0-15">15</a></span>
-<span class="normal"><a href="#__codelineno-0-16">16</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a><span class="c1">// Assuming &#39;llm&#39; is a Box&lt;dyn LLMProvider&gt;</span>
+<span class="normal"><a href="#__codelineno-0-16">16</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a><span class="c1">// Assuming 'llm' is a Box&lt;dyn LLMProvider&gt;</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt</span><span class="p">::</span><span class="n">chain</span><span class="p">::{</span><span class="n">PromptChain</span><span class="p">,</span><span class="w"> </span><span class="n">ChainStepBuilder</span><span class="p">,</span><span class="w"> </span><span class="n">ChainStepMode</span><span class="p">};</span>
 <a id="__codelineno-0-3" name="__codelineno-0-3"></a>
 <a id="__codelineno-0-4" name="__codelineno-0-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">chain</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">PromptChain</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;*</span><span class="n">llm</span><span class="p">)</span>
 <a id="__codelineno-0-5" name="__codelineno-0-5"></a><span class="w">    </span><span class="p">.</span><span class="n">step</span><span class="p">(</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6"></a><span class="w">        </span><span class="n">ChainStepBuilder</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="s">&quot;step1_idea&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;Generate a topic for a short story.&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">ChainStepMode</span><span class="p">::</span><span class="n">Chat</span><span class="p">)</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6"></a><span class="w">        </span><span class="n">ChainStepBuilder</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="s">"step1_idea"</span><span class="p">,</span><span class="w"> </span><span class="s">"Generate a topic for a short story."</span><span class="p">,</span><span class="w"> </span><span class="n">ChainStepMode</span><span class="p">::</span><span class="n">Chat</span><span class="p">)</span>
 <a id="__codelineno-0-7" name="__codelineno-0-7"></a><span class="w">            </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
 <a id="__codelineno-0-8" name="__codelineno-0-8"></a><span class="w">    </span><span class="p">)</span>
 <a id="__codelineno-0-9" name="__codelineno-0-9"></a><span class="w">    </span><span class="p">.</span><span class="n">step</span><span class="p">(</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10"></a><span class="w">        </span><span class="n">ChainStepBuilder</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="s">&quot;step2_plot&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;Write a brief plot for a story about: {{step1_idea}}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">ChainStepMode</span><span class="p">::</span><span class="n">Chat</span><span class="p">)</span>
+<a id="__codelineno-0-10" name="__codelineno-0-10"></a><span class="w">        </span><span class="n">ChainStepBuilder</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="s">"step2_plot"</span><span class="p">,</span><span class="w"> </span><span class="s">"Write a brief plot for a story about: {{step1_idea}}"</span><span class="p">,</span><span class="w"> </span><span class="n">ChainStepMode</span><span class="p">::</span><span class="n">Chat</span><span class="p">)</span>
 <a id="__codelineno-0-11" name="__codelineno-0-11"></a><span class="w">            </span><span class="p">.</span><span class="n">max_tokens</span><span class="p">(</span><span class="mi">200</span><span class="p">)</span>
 <a id="__codelineno-0-12" name="__codelineno-0-12"></a><span class="w">            </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
 <a id="__codelineno-0-13" name="__codelineno-0-13"></a><span class="w">    </span><span class="p">);</span>
 <a id="__codelineno-0-14" name="__codelineno-0-14"></a>
 <a id="__codelineno-0-15" name="__codelineno-0-15"></a><span class="kd">let</span><span class="w"> </span><span class="n">results</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">chain</span><span class="p">.</span><span class="n">run</span><span class="p">().</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-0-16" name="__codelineno-0-16"></a><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;Generated Plot: {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">results</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="s">&quot;step2_plot&quot;</span><span class="p">).</span><span class="n">unwrap_or_default</span><span class="p">());</span>
+<a id="__codelineno-0-16" name="__codelineno-0-16"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"Generated Plot: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">results</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="s">"step2_plot"</span><span class="p">).</span><span class="n">unwrap_or_default</span><span class="p">());</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="multipromptchain-multiple-providers"><code>MultiPromptChain</code> (Multiple Providers)</h2>
 <p>A <code>querymt::chain::MultiPromptChain</code> allows you to define steps that can be executed by different LLM providers, registered in an <code>querymt::chain::LLMRegistry</code>. It also supports complex, iterative tool-calling within each step.</p>
@@ -1790,34 +1790,34 @@
 <span class="normal"><a href="#__codelineno-1-25">25</a></span>
 <span class="normal"><a href="#__codelineno-1-26">26</a></span>
 <span class="normal"><a href="#__codelineno-1-27">27</a></span>
-<span class="normal"><a href="#__codelineno-1-28">28</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1"></a><span class="c1">// Assuming &#39;registry&#39; is an LLMRegistry with providers &quot;fast_model&quot; and &quot;creative_model&quot;</span>
+<span class="normal"><a href="#__codelineno-1-28">28</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1"></a><span class="c1">// Assuming 'registry' is an LLMRegistry with providers "fast_model" and "creative_model"</span>
 <a id="__codelineno-1-2" name="__codelineno-1-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt</span><span class="p">::</span><span class="n">chain</span><span class="p">::{</span><span class="n">MultiPromptChain</span><span class="p">,</span><span class="w"> </span><span class="n">multi</span><span class="p">::{</span><span class="n">MultiChainStepBuilder</span><span class="p">,</span><span class="w"> </span><span class="n">MultiChainStepMode</span><span class="p">},</span><span class="w"> </span><span class="n">LLMRegistryBuilder</span><span class="p">};</span>
 <a id="__codelineno-1-3" name="__codelineno-1-3"></a>
 <a id="__codelineno-1-4" name="__codelineno-1-4"></a><span class="c1">// let registry = LLMRegistryBuilder::new()</span>
-<a id="__codelineno-1-5" name="__codelineno-1-5"></a><span class="c1">//     .register(&quot;fast_model&quot;, fast_llm_provider)</span>
-<a id="__codelineno-1-6" name="__codelineno-1-6"></a><span class="c1">//     .register(&quot;creative_model&quot;, creative_llm_provider)</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5"></a><span class="c1">//     .register("fast_model", fast_llm_provider)</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6"></a><span class="c1">//     .register("creative_model", creative_llm_provider)</span>
 <a id="__codelineno-1-7" name="__codelineno-1-7"></a><span class="c1">//     .build();</span>
 <a id="__codelineno-1-8" name="__codelineno-1-8"></a>
 <a id="__codelineno-1-9" name="__codelineno-1-9"></a><span class="kd">let</span><span class="w"> </span><span class="n">chain</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">MultiPromptChain</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">registry</span><span class="p">)</span>
 <a id="__codelineno-1-10" name="__codelineno-1-10"></a><span class="w">    </span><span class="p">.</span><span class="n">step</span><span class="p">(</span>
 <a id="__codelineno-1-11" name="__codelineno-1-11"></a><span class="w">        </span><span class="n">MultiChainStepBuilder</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">MultiChainStepMode</span><span class="p">::</span><span class="n">Chat</span><span class="p">)</span>
-<a id="__codelineno-1-12" name="__codelineno-1-12"></a><span class="w">            </span><span class="p">.</span><span class="n">provider_id</span><span class="p">(</span><span class="s">&quot;fast_model&quot;</span><span class="p">)</span>
-<a id="__codelineno-1-13" name="__codelineno-1-13"></a><span class="w">            </span><span class="p">.</span><span class="n">id</span><span class="p">(</span><span class="s">&quot;step1_keywords&quot;</span><span class="p">)</span>
-<a id="__codelineno-1-14" name="__codelineno-1-14"></a><span class="w">            </span><span class="p">.</span><span class="n">template</span><span class="p">(</span><span class="s">&quot;Extract 3 keywords from this text: &#39;The future of AI is exciting.&#39;&quot;</span><span class="p">)</span>
+<a id="__codelineno-1-12" name="__codelineno-1-12"></a><span class="w">            </span><span class="p">.</span><span class="n">provider_id</span><span class="p">(</span><span class="s">"fast_model"</span><span class="p">)</span>
+<a id="__codelineno-1-13" name="__codelineno-1-13"></a><span class="w">            </span><span class="p">.</span><span class="n">id</span><span class="p">(</span><span class="s">"step1_keywords"</span><span class="p">)</span>
+<a id="__codelineno-1-14" name="__codelineno-1-14"></a><span class="w">            </span><span class="p">.</span><span class="n">template</span><span class="p">(</span><span class="s">"Extract 3 keywords from this text: 'The future of AI is exciting.'"</span><span class="p">)</span>
 <a id="__codelineno-1-15" name="__codelineno-1-15"></a><span class="w">            </span><span class="p">.</span><span class="n">build</span><span class="p">()</span><span class="o">?</span>
 <a id="__codelineno-1-16" name="__codelineno-1-16"></a><span class="w">    </span><span class="p">)</span>
 <a id="__codelineno-1-17" name="__codelineno-1-17"></a><span class="w">    </span><span class="p">.</span><span class="n">step</span><span class="p">(</span>
 <a id="__codelineno-1-18" name="__codelineno-1-18"></a><span class="w">        </span><span class="n">MultiChainStepBuilder</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">MultiChainStepMode</span><span class="p">::</span><span class="n">Completion</span><span class="p">)</span>
-<a id="__codelineno-1-19" name="__codelineno-1-19"></a><span class="w">            </span><span class="p">.</span><span class="n">provider_id</span><span class="p">(</span><span class="s">&quot;creative_model&quot;</span><span class="p">)</span>
-<a id="__codelineno-1-20" name="__codelineno-1-20"></a><span class="w">            </span><span class="p">.</span><span class="n">id</span><span class="p">(</span><span class="s">&quot;step2_tagline&quot;</span><span class="p">)</span>
-<a id="__codelineno-1-21" name="__codelineno-1-21"></a><span class="w">            </span><span class="p">.</span><span class="n">template</span><span class="p">(</span><span class="s">&quot;Generate a catchy tagline using these keywords: {{step1_keywords}}&quot;</span><span class="p">)</span>
+<a id="__codelineno-1-19" name="__codelineno-1-19"></a><span class="w">            </span><span class="p">.</span><span class="n">provider_id</span><span class="p">(</span><span class="s">"creative_model"</span><span class="p">)</span>
+<a id="__codelineno-1-20" name="__codelineno-1-20"></a><span class="w">            </span><span class="p">.</span><span class="n">id</span><span class="p">(</span><span class="s">"step2_tagline"</span><span class="p">)</span>
+<a id="__codelineno-1-21" name="__codelineno-1-21"></a><span class="w">            </span><span class="p">.</span><span class="n">template</span><span class="p">(</span><span class="s">"Generate a catchy tagline using these keywords: {{step1_keywords}}"</span><span class="p">)</span>
 <a id="__codelineno-1-22" name="__codelineno-1-22"></a><span class="w">            </span><span class="p">.</span><span class="n">max_tokens</span><span class="p">(</span><span class="mi">50</span><span class="p">)</span>
 <a id="__codelineno-1-23" name="__codelineno-1-23"></a><span class="w">            </span><span class="p">.</span><span class="n">response_transform</span><span class="p">(</span><span class="o">|</span><span class="n">s</span><span class="o">|</span><span class="w"> </span><span class="n">s</span><span class="p">.</span><span class="n">trim</span><span class="p">().</span><span class="n">to_uppercase</span><span class="p">())</span><span class="w"> </span><span class="c1">// Example transform</span>
 <a id="__codelineno-1-24" name="__codelineno-1-24"></a><span class="w">            </span><span class="p">.</span><span class="n">build</span><span class="p">()</span><span class="o">?</span>
 <a id="__codelineno-1-25" name="__codelineno-1-25"></a><span class="w">    </span><span class="p">);</span>
 <a id="__codelineno-1-26" name="__codelineno-1-26"></a>
 <a id="__codelineno-1-27" name="__codelineno-1-27"></a><span class="kd">let</span><span class="w"> </span><span class="n">results</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">chain</span><span class="p">.</span><span class="n">run</span><span class="p">().</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-1-28" name="__codelineno-1-28"></a><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;Generated Tagline: {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">results</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="s">&quot;step2_tagline&quot;</span><span class="p">).</span><span class="n">unwrap_or_default</span><span class="p">());</span>
+<a id="__codelineno-1-28" name="__codelineno-1-28"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"Generated Tagline: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">results</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="s">"step2_tagline"</span><span class="p">).</span><span class="n">unwrap_or_default</span><span class="p">());</span>
 </code></pre></div></td></tr></table></div>
 <p>Prompt chaining is a powerful technique for building more sophisticated LLM applications by decomposing tasks and leveraging the strengths of different models or configurations for different parts of a workflow.</p>
 
@@ -1942,7 +1942,7 @@
       <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"search":"../../assets/javascripts/workers/search.7d14d953.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.69c251d7.min.js"></script>
+      <script src="../../assets/javascripts/bundle.e886cdf1.min.js"></script>
       
     
   </body>

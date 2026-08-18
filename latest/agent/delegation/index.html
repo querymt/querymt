@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.0.53">
+      <meta name="generator" content="zensical-0.0.55">
     
     
       
@@ -2181,15 +2181,15 @@
 <span class="normal"><a href="#__codelineno-1-11">11</a></span>
 <span class="normal"><a href="#__codelineno-1-12">12</a></span>
 <span class="normal"><a href="#__codelineno-1-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-1-2" name="__codelineno-1-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;coder&quot;</span>
-<a id="__codelineno-1-3" name="__codelineno-1-3"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-1-4" name="__codelineno-1-4"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-1-5" name="__codelineno-1-5"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Coder agent that implements code changes&quot;</span>
-<a id="__codelineno-1-6" name="__codelineno-1-6"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;coding&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;filesystem&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">]</span>
-<a id="__codelineno-1-7" name="__codelineno-1-7"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;glob&quot;</span><span class="p">]</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Coder agent that implements code changes"</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"coding"</span><span class="p">,</span><span class="w"> </span><span class="s2">"filesystem"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
+<a id="__codelineno-1-7" name="__codelineno-1-7"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">]</span>
 <a id="__codelineno-1-8" name="__codelineno-1-8"></a>
-<a id="__codelineno-1-9" name="__codelineno-1-9"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;&quot;&quot;You are a coder agent. Implement the requested changes</span>
-<a id="__codelineno-1-10" name="__codelineno-1-10"></a><span class="s2">efficiently and correctly. Focus on writing clean, maintainable code.&quot;&quot;&quot;</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""You are a coder agent. Implement the requested changes</span>
+<a id="__codelineno-1-10" name="__codelineno-1-10"></a><span class="s2">efficiently and correctly. Focus on writing clean, maintainable code."""</span>
 <a id="__codelineno-1-11" name="__codelineno-1-11"></a>
 <a id="__codelineno-1-12" name="__codelineno-1-12"></a><span class="k">[delegates.execution]</span>
 <a id="__codelineno-1-13" name="__codelineno-1-13"></a><span class="n">max_steps</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">200</span>
@@ -2206,16 +2206,16 @@
 <span class="normal"><a href="#__codelineno-2-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-2-10">10</a></span>
 <span class="normal"><a href="#__codelineno-2-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1"></a><span class="k">[planner]</span>
-<a id="__codelineno-2-2" name="__codelineno-2-2"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-2-3" name="__codelineno-2-3"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-2-4" name="__codelineno-2-4"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;delegate&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;glob&quot;</span><span class="p">]</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"delegate"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">]</span>
 <a id="__codelineno-2-5" name="__codelineno-2-5"></a>
-<a id="__codelineno-2-6" name="__codelineno-2-6"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;&quot;&quot;You are a planner agent. Your role is to:</span>
+<a id="__codelineno-2-6" name="__codelineno-2-6"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""You are a planner agent. Your role is to:</span>
 <a id="__codelineno-2-7" name="__codelineno-2-7"></a><span class="s2">1. Analyze user requests</span>
 <a id="__codelineno-2-8" name="__codelineno-2-8"></a><span class="s2">2. Decide if delegation is needed</span>
 <a id="__codelineno-2-9" name="__codelineno-2-9"></a><span class="s2">3. Choose the appropriate delegate</span>
 <a id="__codelineno-2-10" name="__codelineno-2-10"></a><span class="s2">4. Provide clear instructions to delegates</span>
-<a id="__codelineno-2-11" name="__codelineno-2-11"></a><span class="s2">5. Review and integrate delegate results&quot;&quot;&quot;</span>
+<a id="__codelineno-2-11" name="__codelineno-2-11"></a><span class="s2">5. Review and integrate delegate results"""</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="delegation-lifecycle">Delegation Lifecycle</h2>
 <h3 id="1-delegation-request">1. Delegation Request</h3>
@@ -2280,10 +2280,10 @@
 <span class="normal"><a href="#__codelineno-6-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-6-10">10</a></span>
 <span class="normal"><a href="#__codelineno-6-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1"></a>Delegate receives:
-<a id="__codelineno-6-2" name="__codelineno-6-2"></a>  - Objective: &quot;Add user authentication&quot;
+<a id="__codelineno-6-2" name="__codelineno-6-2"></a>  - Objective: "Add user authentication"
 <a id="__codelineno-6-3" name="__codelineno-6-3"></a>  - Context: [Planning summary]
-<a id="__codelineno-6-4" name="__codelineno-6-4"></a>  - Constraints: &quot;Use JWT, follow security best practices&quot;
-<a id="__codelineno-6-5" name="__codelineno-6-5"></a>  - Expected Output: &quot;Working authentication with tests&quot;
+<a id="__codelineno-6-4" name="__codelineno-6-4"></a>  - Constraints: "Use JWT, follow security best practices"
+<a id="__codelineno-6-5" name="__codelineno-6-5"></a>  - Expected Output: "Working authentication with tests"
 <a id="__codelineno-6-6" name="__codelineno-6-6"></a>
 <a id="__codelineno-6-7" name="__codelineno-6-7"></a>Delegate:
 <a id="__codelineno-6-8" name="__codelineno-6-8"></a>  - Analyzes requirements
@@ -2299,7 +2299,7 @@
 <span class="normal"><a href="#__codelineno-7-2">2</a></span>
 <span class="normal"><a href="#__codelineno-7-3">3</a></span>
 <span class="normal"><a href="#__codelineno-7-4">4</a></span>
-<span class="normal"><a href="#__codelineno-7-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="c1">// Get delegate&#39;s history</span>
+<span class="normal"><a href="#__codelineno-7-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="c1">// Get delegate's history</span>
 <a id="__codelineno-7-2" name="__codelineno-7-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">history</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">session_ref</span><span class="p">.</span><span class="n">get_history</span><span class="p">().</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 <a id="__codelineno-7-3" name="__codelineno-7-3"></a>
 <a id="__codelineno-7-4" name="__codelineno-7-4"></a><span class="c1">// Extract summary</span>
@@ -2447,13 +2447,13 @@
 <span class="normal"><a href="#__codelineno-11-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-11-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1"></a><span class="c1"># In delegate configuration</span>
 <a id="__codelineno-11-2" name="__codelineno-11-2"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-11-3" name="__codelineno-11-3"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;coder&quot;</span>
+<a id="__codelineno-11-3" name="__codelineno-11-3"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
 <a id="__codelineno-11-4" name="__codelineno-11-4"></a><span class="c1"># ... other config</span>
 <a id="__codelineno-11-5" name="__codelineno-11-5"></a>
 <a id="__codelineno-11-6" name="__codelineno-11-6"></a><span class="c1"># Verification spec in delegation request</span>
 <a id="__codelineno-11-7" name="__codelineno-11-7"></a><span class="n">verification_spec</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-11-8" name="__codelineno-11-8"></a><span class="w">    </span><span class="n">verification_type</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;shell_command&quot;</span><span class="p">,</span>
-<a id="__codelineno-11-9" name="__codelineno-11-9"></a><span class="w">    </span><span class="n">command</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;cargo check &amp;&amp; cargo test&quot;</span>
+<a id="__codelineno-11-8" name="__codelineno-11-8"></a><span class="w">    </span><span class="n">verification_type</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"shell_command"</span><span class="p">,</span>
+<a id="__codelineno-11-9" name="__codelineno-11-9"></a><span class="w">    </span><span class="n">command</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"cargo check &amp;&amp; cargo test"</span>
 <a id="__codelineno-11-10" name="__codelineno-11-10"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="delegation-parameters">Delegation Parameters</h2>
@@ -2462,7 +2462,7 @@
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-12-1">1</a></span>
 <span class="normal"><a href="#__codelineno-12-2">2</a></span>
 <span class="normal"><a href="#__codelineno-12-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1"></a><span class="k">[quorum]</span>
-<a id="__codelineno-12-2" name="__codelineno-12-2"></a><span class="n">delegation_wait_policy</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;any&quot;</span><span class="w">  </span><span class="c1"># &quot;all&quot; | &quot;any&quot;</span>
+<a id="__codelineno-12-2" name="__codelineno-12-2"></a><span class="n">delegation_wait_policy</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"any"</span><span class="w">  </span><span class="c1"># "all" | "any"</span>
 <a id="__codelineno-12-3" name="__codelineno-12-3"></a><span class="n">delegation_wait_timeout_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">120</span>
 </code></pre></div></td></tr></table></div>
 <ul>
@@ -2502,20 +2502,20 @@
 <span class="normal"><a href="#__codelineno-15-17">17</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1"></a><span class="c1"># Mesh configuration</span>
 <a id="__codelineno-15-2" name="__codelineno-15-2"></a><span class="k">[mesh]</span>
 <a id="__codelineno-15-3" name="__codelineno-15-3"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-15-4" name="__codelineno-15-4"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/0.0.0.0/tcp/9000&quot;</span>
+<a id="__codelineno-15-4" name="__codelineno-15-4"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/0.0.0.0/tcp/9000"</span>
 <a id="__codelineno-15-5" name="__codelineno-15-5"></a>
 <a id="__codelineno-15-6" name="__codelineno-15-6"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-15-7" name="__codelineno-15-7"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-server&quot;</span>
-<a id="__codelineno-15-8" name="__codelineno-15-8"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/192.168.1.100/tcp/9000&quot;</span>
+<a id="__codelineno-15-7" name="__codelineno-15-7"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
+<a id="__codelineno-15-8" name="__codelineno-15-8"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.100/tcp/9000"</span>
 <a id="__codelineno-15-9" name="__codelineno-15-9"></a>
 <a id="__codelineno-15-10" name="__codelineno-15-10"></a><span class="c1"># Remote delegate</span>
 <a id="__codelineno-15-11" name="__codelineno-15-11"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-15-12" name="__codelineno-15-12"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;remote-coder&quot;</span>
-<a id="__codelineno-15-13" name="__codelineno-15-13"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-15-14" name="__codelineno-15-14"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-15-15" name="__codelineno-15-15"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Coder on GPU server&quot;</span>
-<a id="__codelineno-15-16" name="__codelineno-15-16"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-server&quot;</span><span class="w">  </span><span class="c1"># Routes LLM calls to remote node</span>
-<a id="__codelineno-15-17" name="__codelineno-15-17"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">]</span>
+<a id="__codelineno-15-12" name="__codelineno-15-12"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"remote-coder"</span>
+<a id="__codelineno-15-13" name="__codelineno-15-13"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-15-14" name="__codelineno-15-14"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-15-15" name="__codelineno-15-15"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Coder on GPU server"</span>
+<a id="__codelineno-15-16" name="__codelineno-15-16"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span><span class="w">  </span><span class="c1"># Routes LLM calls to remote node</span>
+<a id="__codelineno-15-17" name="__codelineno-15-17"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <p>When <code>peer</code> is specified:
 - LLM calls are routed to the remote node
@@ -2594,11 +2594,11 @@
 <a id="__codelineno-17-3" name="__codelineno-17-3"></a>
 <a id="__codelineno-17-4" name="__codelineno-17-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">delegation</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Delegation</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-17-5" name="__codelineno-17-5"></a><span class="w">    </span><span class="n">public_id</span><span class="p">:</span><span class="w"> </span><span class="nc">uuid</span><span class="p">::</span><span class="n">Uuid</span><span class="p">::</span><span class="n">new_v4</span><span class="p">().</span><span class="n">to_string</span><span class="p">(),</span>
-<a id="__codelineno-17-6" name="__codelineno-17-6"></a><span class="w">    </span><span class="n">target_agent_id</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;coder&quot;</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
-<a id="__codelineno-17-7" name="__codelineno-17-7"></a><span class="w">    </span><span class="n">objective</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Implement user authentication&quot;</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
-<a id="__codelineno-17-8" name="__codelineno-17-8"></a><span class="w">    </span><span class="n">context</span><span class="p">:</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="s">&quot;Project uses JWT for authentication&quot;</span><span class="p">.</span><span class="n">to_string</span><span class="p">()),</span>
-<a id="__codelineno-17-9" name="__codelineno-17-9"></a><span class="w">    </span><span class="n">constraints</span><span class="p">:</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="s">&quot;Follow security best practices&quot;</span><span class="p">.</span><span class="n">to_string</span><span class="p">()),</span>
-<a id="__codelineno-17-10" name="__codelineno-17-10"></a><span class="w">    </span><span class="n">expected_output</span><span class="p">:</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="s">&quot;Working auth with tests&quot;</span><span class="p">.</span><span class="n">to_string</span><span class="p">()),</span>
+<a id="__codelineno-17-6" name="__codelineno-17-6"></a><span class="w">    </span><span class="n">target_agent_id</span><span class="p">:</span><span class="w"> </span><span class="s">"coder"</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
+<a id="__codelineno-17-7" name="__codelineno-17-7"></a><span class="w">    </span><span class="n">objective</span><span class="p">:</span><span class="w"> </span><span class="s">"Implement user authentication"</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
+<a id="__codelineno-17-8" name="__codelineno-17-8"></a><span class="w">    </span><span class="n">context</span><span class="p">:</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="s">"Project uses JWT for authentication"</span><span class="p">.</span><span class="n">to_string</span><span class="p">()),</span>
+<a id="__codelineno-17-9" name="__codelineno-17-9"></a><span class="w">    </span><span class="n">constraints</span><span class="p">:</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="s">"Follow security best practices"</span><span class="p">.</span><span class="n">to_string</span><span class="p">()),</span>
+<a id="__codelineno-17-10" name="__codelineno-17-10"></a><span class="w">    </span><span class="n">expected_output</span><span class="p">:</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="s">"Working auth with tests"</span><span class="p">.</span><span class="n">to_string</span><span class="p">()),</span>
 <a id="__codelineno-17-11" name="__codelineno-17-11"></a><span class="w">    </span><span class="n">task_id</span><span class="p">:</span><span class="w"> </span><span class="nb">None</span><span class="p">,</span>
 <a id="__codelineno-17-12" name="__codelineno-17-12"></a><span class="w">    </span><span class="n">planning_summary</span><span class="p">:</span><span class="w"> </span><span class="nb">None</span><span class="p">,</span>
 <a id="__codelineno-17-13" name="__codelineno-17-13"></a><span class="w">    </span><span class="n">verification_spec</span><span class="p">:</span><span class="w"> </span><span class="nb">None</span><span class="p">,</span>
@@ -2628,13 +2628,13 @@
 <a id="__codelineno-18-3" name="__codelineno-18-3"></a><span class="k">while</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(</span><span class="n">event</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">events</span><span class="p">.</span><span class="n">recv</span><span class="p">().</span><span class="k">await</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-18-4" name="__codelineno-18-4"></a><span class="w">    </span><span class="k">match</span><span class="w"> </span><span class="n">event</span><span class="p">.</span><span class="n">kind</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-18-5" name="__codelineno-18-5"></a><span class="w">        </span><span class="n">AgentEventKind</span><span class="p">::</span><span class="n">DelegationRequested</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">delegation</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-18-6" name="__codelineno-18-6"></a><span class="w">            </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;Delegation requested: {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">delegation</span><span class="p">.</span><span class="n">objective</span><span class="p">);</span>
+<a id="__codelineno-18-6" name="__codelineno-18-6"></a><span class="w">            </span><span class="fm">println!</span><span class="p">(</span><span class="s">"Delegation requested: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">delegation</span><span class="p">.</span><span class="n">objective</span><span class="p">);</span>
 <a id="__codelineno-18-7" name="__codelineno-18-7"></a><span class="w">        </span><span class="p">}</span>
 <a id="__codelineno-18-8" name="__codelineno-18-8"></a><span class="w">        </span><span class="n">AgentEventKind</span><span class="p">::</span><span class="n">DelegationCompleted</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">delegation_id</span><span class="p">,</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-18-9" name="__codelineno-18-9"></a><span class="w">            </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;Delegation {} completed: {:?}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">delegation_id</span><span class="p">,</span><span class="w"> </span><span class="n">result</span><span class="p">);</span>
+<a id="__codelineno-18-9" name="__codelineno-18-9"></a><span class="w">            </span><span class="fm">println!</span><span class="p">(</span><span class="s">"Delegation {} completed: {:?}"</span><span class="p">,</span><span class="w"> </span><span class="n">delegation_id</span><span class="p">,</span><span class="w"> </span><span class="n">result</span><span class="p">);</span>
 <a id="__codelineno-18-10" name="__codelineno-18-10"></a><span class="w">        </span><span class="p">}</span>
 <a id="__codelineno-18-11" name="__codelineno-18-11"></a><span class="w">        </span><span class="n">AgentEventKind</span><span class="p">::</span><span class="n">DelegationFailed</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">delegation_id</span><span class="p">,</span><span class="w"> </span><span class="n">error</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-18-12" name="__codelineno-18-12"></a><span class="w">            </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;Delegation {} failed: {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">delegation_id</span><span class="p">,</span><span class="w"> </span><span class="n">error</span><span class="p">);</span>
+<a id="__codelineno-18-12" name="__codelineno-18-12"></a><span class="w">            </span><span class="fm">println!</span><span class="p">(</span><span class="s">"Delegation {} failed: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">delegation_id</span><span class="p">,</span><span class="w"> </span><span class="n">error</span><span class="p">);</span>
 <a id="__codelineno-18-13" name="__codelineno-18-13"></a><span class="w">        </span><span class="p">}</span>
 <a id="__codelineno-18-14" name="__codelineno-18-14"></a><span class="w">        </span><span class="n">_</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{}</span>
 <a id="__codelineno-18-15" name="__codelineno-18-15"></a><span class="w">    </span><span class="p">}</span>
@@ -2747,11 +2747,11 @@
 <span class="normal"><a href="#__codelineno-20-6">6</a></span>
 <span class="normal"><a href="#__codelineno-20-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-20-1" name="__codelineno-20-1"></a><span class="c1"># Planner delegates coding task to coder</span>
 <a id="__codelineno-20-2" name="__codelineno-20-2"></a><span class="k">[planner]</span>
-<a id="__codelineno-20-3" name="__codelineno-20-3"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;delegate&quot;</span><span class="p">]</span>
+<a id="__codelineno-20-3" name="__codelineno-20-3"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"delegate"</span><span class="p">]</span>
 <a id="__codelineno-20-4" name="__codelineno-20-4"></a>
 <a id="__codelineno-20-5" name="__codelineno-20-5"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-20-6" name="__codelineno-20-6"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;coder&quot;</span>
-<a id="__codelineno-20-7" name="__codelineno-20-7"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">]</span>
+<a id="__codelineno-20-6" name="__codelineno-20-6"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
+<a id="__codelineno-20-7" name="__codelineno-20-7"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <p>User: "Add a new API endpoint"
 Planner: Delegates to coder with task details
@@ -2765,12 +2765,12 @@ Planner: Reviews and integrates the changes</p>
 <span class="normal"><a href="#__codelineno-21-5">5</a></span>
 <span class="normal"><a href="#__codelineno-21-6">6</a></span>
 <span class="normal"><a href="#__codelineno-21-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-21-1" name="__codelineno-21-1"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-21-2" name="__codelineno-21-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;frontend-coder&quot;</span>
-<a id="__codelineno-21-3" name="__codelineno-21-3"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">]</span>
+<a id="__codelineno-21-2" name="__codelineno-21-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"frontend-coder"</span>
+<a id="__codelineno-21-3" name="__codelineno-21-3"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">]</span>
 <a id="__codelineno-21-4" name="__codelineno-21-4"></a>
 <a id="__codelineno-21-5" name="__codelineno-21-5"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-21-6" name="__codelineno-21-6"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;backend-coder&quot;</span>
-<a id="__codelineno-21-7" name="__codelineno-21-7"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">]</span>
+<a id="__codelineno-21-6" name="__codelineno-21-6"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"backend-coder"</span>
+<a id="__codelineno-21-7" name="__codelineno-21-7"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <p>User: "Implement feature X"
 Planner: Delegates frontend to frontend-coder, backend to backend-coder
@@ -2786,13 +2786,13 @@ Planner: Integrates both results</p>
 <span class="normal"><a href="#__codelineno-22-7">7</a></span>
 <span class="normal"><a href="#__codelineno-22-8">8</a></span>
 <span class="normal"><a href="#__codelineno-22-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-22-1" name="__codelineno-22-1"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-22-2" name="__codelineno-22-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;coder&quot;</span>
+<a id="__codelineno-22-2" name="__codelineno-22-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
 <a id="__codelineno-22-3" name="__codelineno-22-3"></a><span class="c1"># ...</span>
 <a id="__codelineno-22-4" name="__codelineno-22-4"></a>
 <a id="__codelineno-22-5" name="__codelineno-22-5"></a><span class="c1"># Verification in delegation request</span>
 <a id="__codelineno-22-6" name="__codelineno-22-6"></a><span class="n">verification_spec</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-22-7" name="__codelineno-22-7"></a><span class="w">    </span><span class="n">verification_type</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;shell_command&quot;</span><span class="p">,</span>
-<a id="__codelineno-22-8" name="__codelineno-22-8"></a><span class="w">    </span><span class="n">command</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;cargo test --lib&quot;</span>
+<a id="__codelineno-22-7" name="__codelineno-22-7"></a><span class="w">    </span><span class="n">verification_type</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"shell_command"</span><span class="p">,</span>
+<a id="__codelineno-22-8" name="__codelineno-22-8"></a><span class="w">    </span><span class="n">command</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"cargo test --lib"</span>
 <a id="__codelineno-22-9" name="__codelineno-22-9"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="troubleshooting">Troubleshooting</h2>
@@ -2946,7 +2946,7 @@ Planner: Integrates both results</p>
       <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"search":"../../assets/javascripts/workers/search.7d14d953.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.69c251d7.min.js"></script>
+      <script src="../../assets/javascripts/bundle.e886cdf1.min.js"></script>
       
     
   </body>

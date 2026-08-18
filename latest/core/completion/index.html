@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.0.53">
+      <meta name="generator" content="zensical-0.0.55">
     
     
       
@@ -1688,19 +1688,19 @@
 <span class="normal"><a href="#__codelineno-0-12">12</a></span>
 <span class="normal"><a href="#__codelineno-0-13">13</a></span>
 <span class="normal"><a href="#__codelineno-0-14">14</a></span>
-<span class="normal"><a href="#__codelineno-0-15">15</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a><span class="c1">// Assuming &#39;llm_provider&#39; is an instance of Box&lt;dyn LLMProvider&gt;</span>
+<span class="normal"><a href="#__codelineno-0-15">15</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a><span class="c1">// Assuming 'llm_provider' is an instance of Box&lt;dyn LLMProvider&gt;</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2"></a>
-<a id="__codelineno-0-3" name="__codelineno-0-3"></a><span class="kd">let</span><span class="w"> </span><span class="n">request</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">CompletionRequest</span><span class="p">::</span><span class="n">builder</span><span class="p">(</span><span class="s">&quot;Once upon a time, in a land far, far away,&quot;</span><span class="p">)</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3"></a><span class="kd">let</span><span class="w"> </span><span class="n">request</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">CompletionRequest</span><span class="p">::</span><span class="n">builder</span><span class="p">(</span><span class="s">"Once upon a time, in a land far, far away,"</span><span class="p">)</span>
 <a id="__codelineno-0-4" name="__codelineno-0-4"></a><span class="w">    </span><span class="p">.</span><span class="n">max_tokens</span><span class="p">(</span><span class="mi">100</span><span class="p">)</span>
 <a id="__codelineno-0-5" name="__codelineno-0-5"></a><span class="w">    </span><span class="p">.</span><span class="n">temperature</span><span class="p">(</span><span class="mf">0.7</span><span class="p">)</span>
 <a id="__codelineno-0-6" name="__codelineno-0-6"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">();</span>
 <a id="__codelineno-0-7" name="__codelineno-0-7"></a>
 <a id="__codelineno-0-8" name="__codelineno-0-8"></a><span class="k">match</span><span class="w"> </span><span class="n">llm_provider</span><span class="p">.</span><span class="n">complete</span><span class="p">(</span><span class="o">&amp;</span><span class="n">request</span><span class="p">).</span><span class="k">await</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-0-9" name="__codelineno-0-9"></a><span class="w">    </span><span class="nb">Ok</span><span class="p">(</span><span class="n">response</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10"></a><span class="w">        </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;Generated story: {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">response</span><span class="p">.</span><span class="n">text</span><span class="p">);</span>
+<a id="__codelineno-0-10" name="__codelineno-0-10"></a><span class="w">        </span><span class="fm">println!</span><span class="p">(</span><span class="s">"Generated story: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">response</span><span class="p">.</span><span class="n">text</span><span class="p">);</span>
 <a id="__codelineno-0-11" name="__codelineno-0-11"></a><span class="w">    </span><span class="p">}</span>
 <a id="__codelineno-0-12" name="__codelineno-0-12"></a><span class="w">    </span><span class="nb">Err</span><span class="p">(</span><span class="n">e</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-13" name="__codelineno-0-13"></a><span class="w">        </span><span class="fm">eprintln!</span><span class="p">(</span><span class="s">&quot;Error during completion: {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">e</span><span class="p">);</span>
+<a id="__codelineno-0-13" name="__codelineno-0-13"></a><span class="w">        </span><span class="fm">eprintln!</span><span class="p">(</span><span class="s">"Error during completion: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">e</span><span class="p">);</span>
 <a id="__codelineno-0-14" name="__codelineno-0-14"></a><span class="w">    </span><span class="p">}</span>
 <a id="__codelineno-0-15" name="__codelineno-0-15"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
@@ -1835,7 +1835,7 @@
       <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"search":"../../assets/javascripts/workers/search.7d14d953.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.69c251d7.min.js"></script>
+      <script src="../../assets/javascripts/bundle.e886cdf1.min.js"></script>
       
     
   </body>

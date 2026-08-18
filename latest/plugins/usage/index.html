@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.0.53">
+      <meta name="generator" content="zensical-0.0.55">
     
     
       
@@ -1645,7 +1645,7 @@
 <a id="__codelineno-0-2" name="__codelineno-0-2"></a>
 <a id="__codelineno-0-3" name="__codelineno-0-3"></a><span class="p">#</span><span class="w"> </span><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">example</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">(),</span><span class="w"> </span><span class="n">LLMError</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-0-4" name="__codelineno-0-4"></a><span class="c1">// 1. Create a registry from a config file path and attach the built-in loaders.</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5"></a><span class="kd">let</span><span class="w"> </span><span class="n">registry</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">PluginRegistry</span><span class="p">::</span><span class="n">from_path</span><span class="p">(</span><span class="s">&quot;providers.toml&quot;</span><span class="p">)</span><span class="o">?</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5"></a><span class="kd">let</span><span class="w"> </span><span class="n">registry</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">PluginRegistry</span><span class="p">::</span><span class="n">from_path</span><span class="p">(</span><span class="s">"providers.toml"</span><span class="p">)</span><span class="o">?</span>
 <a id="__codelineno-0-6" name="__codelineno-0-6"></a><span class="w">    </span><span class="p">.</span><span class="n">with_dynamic_loaders</span><span class="p">();</span>
 <a id="__codelineno-0-7" name="__codelineno-0-7"></a>
 <a id="__codelineno-0-8" name="__codelineno-0-8"></a><span class="c1">// 2. Load all plugins defined in the config file.</span>
@@ -1688,14 +1688,14 @@
 <a id="__codelineno-1-5" name="__codelineno-1-5"></a>
 <a id="__codelineno-1-6" name="__codelineno-1-6"></a><span class="c1">// Use the builder to configure a provider by its name from the config file.</span>
 <a id="__codelineno-1-7" name="__codelineno-1-7"></a><span class="kd">let</span><span class="w"> </span><span class="n">provider</span><span class="p">:</span><span class="w"> </span><span class="nb">Box</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">LLMProvider</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">registry</span>
-<a id="__codelineno-1-8" name="__codelineno-1-8"></a><span class="w">    </span><span class="p">.</span><span class="n">builder</span><span class="p">(</span><span class="s">&quot;my_openai_plugin&quot;</span><span class="p">)</span><span class="w"> </span><span class="c1">// This name must match a name in providers.toml</span>
-<a id="__codelineno-1-9" name="__codelineno-1-9"></a><span class="w">    </span><span class="p">.</span><span class="n">model</span><span class="p">(</span><span class="s">&quot;gpt-4-turbo&quot;</span><span class="p">)</span>
-<a id="__codelineno-1-10" name="__codelineno-1-10"></a><span class="w">    </span><span class="p">.</span><span class="n">parameter</span><span class="p">(</span><span class="s">&quot;custom_param&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">json</span><span class="o">!</span><span class="p">(</span><span class="kc">true</span><span class="p">))</span>
+<a id="__codelineno-1-8" name="__codelineno-1-8"></a><span class="w">    </span><span class="p">.</span><span class="n">builder</span><span class="p">(</span><span class="s">"my_openai_plugin"</span><span class="p">)</span><span class="w"> </span><span class="c1">// This name must match a name in providers.toml</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9"></a><span class="w">    </span><span class="p">.</span><span class="n">model</span><span class="p">(</span><span class="s">"gpt-4-turbo"</span><span class="p">)</span>
+<a id="__codelineno-1-10" name="__codelineno-1-10"></a><span class="w">    </span><span class="p">.</span><span class="n">parameter</span><span class="p">(</span><span class="s">"custom_param"</span><span class="p">,</span><span class="w"> </span><span class="n">json</span><span class="o">!</span><span class="p">(</span><span class="kc">true</span><span class="p">))</span>
 <a id="__codelineno-1-11" name="__codelineno-1-11"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
 <a id="__codelineno-1-12" name="__codelineno-1-12"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 <a id="__codelineno-1-13" name="__codelineno-1-13"></a>
 <a id="__codelineno-1-14" name="__codelineno-1-14"></a><span class="c1">// Now you have an LLMProvider instance and can use it.</span>
-<a id="__codelineno-1-15" name="__codelineno-1-15"></a><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;Successfully created provider instance for &#39;my_openai_plugin&#39;&quot;</span><span class="p">);</span>
+<a id="__codelineno-1-15" name="__codelineno-1-15"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"Successfully created provider instance for 'my_openai_plugin'"</span><span class="p">);</span>
 <a id="__codelineno-1-16" name="__codelineno-1-16"></a><span class="c1">// e.g., provider.chat(&amp;messages).await?</span>
 <a id="__codelineno-1-17" name="__codelineno-1-17"></a>
 <a id="__codelineno-1-18" name="__codelineno-1-18"></a><span class="p">#</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(())</span>
@@ -1726,14 +1726,14 @@
 <a id="__codelineno-2-5" name="__codelineno-2-5"></a><span class="c1">// List all loaded provider factories</span>
 <a id="__codelineno-2-6" name="__codelineno-2-6"></a><span class="kd">let</span><span class="w"> </span><span class="n">all_factories</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">Arc</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">LLMProviderFactory</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">registry</span><span class="p">.</span><span class="n">list</span><span class="p">();</span>
 <a id="__codelineno-2-7" name="__codelineno-2-7"></a><span class="k">for</span><span class="w"> </span><span class="n">factory</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">all_factories</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-2-8" name="__codelineno-2-8"></a><span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;Loaded provider factory: {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">factory</span><span class="p">.</span><span class="n">name</span><span class="p">());</span>
+<a id="__codelineno-2-8" name="__codelineno-2-8"></a><span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"Loaded provider factory: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">factory</span><span class="p">.</span><span class="n">name</span><span class="p">());</span>
 <a id="__codelineno-2-9" name="__codelineno-2-9"></a><span class="p">}</span>
 <a id="__codelineno-2-10" name="__codelineno-2-10"></a>
 <a id="__codelineno-2-11" name="__codelineno-2-11"></a><span class="c1">// Get a specific provider factory by name</span>
-<a id="__codelineno-2-12" name="__codelineno-2-12"></a><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">factory</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">registry</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="s">&quot;my_openai_plugin&quot;</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-2-12" name="__codelineno-2-12"></a><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">factory</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">registry</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="s">"my_openai_plugin"</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-2-13" name="__codelineno-2-13"></a><span class="w">    </span><span class="c1">// Get the config schema for this provider</span>
 <a id="__codelineno-2-14" name="__codelineno-2-14"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">schema</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">factory</span><span class="p">.</span><span class="n">config_schema</span><span class="p">();</span>
-<a id="__codelineno-2-15" name="__codelineno-2-15"></a><span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;Config schema: {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">serde_json</span><span class="p">::</span><span class="n">to_string_pretty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">schema</span><span class="p">)</span><span class="o">?</span><span class="p">);</span>
+<a id="__codelineno-2-15" name="__codelineno-2-15"></a><span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"Config schema: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">serde_json</span><span class="p">::</span><span class="n">to_string_pretty</span><span class="p">(</span><span class="o">&amp;</span><span class="n">schema</span><span class="p">)</span><span class="o">?</span><span class="p">);</span>
 <a id="__codelineno-2-16" name="__codelineno-2-16"></a><span class="p">}</span>
 <a id="__codelineno-2-17" name="__codelineno-2-17"></a><span class="p">#</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(())</span>
 <a id="__codelineno-2-18" name="__codelineno-2-18"></a><span class="p">#</span><span class="w"> </span><span class="p">}</span>
@@ -1861,7 +1861,7 @@
       <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"search":"../../assets/javascripts/workers/search.7d14d953.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.69c251d7.min.js"></script>
+      <script src="../../assets/javascripts/bundle.e886cdf1.min.js"></script>
       
     
   </body>

@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.0.53">
+      <meta name="generator" content="zensical-0.0.55">
     
     
       
@@ -2347,7 +2347,7 @@
 <a id="__codelineno-0-11" name="__codelineno-0-11"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
 <a id="__codelineno-0-12" name="__codelineno-0-12"></a>
 <a id="__codelineno-0-13" name="__codelineno-0-13"></a><span class="c1"># Dashboard + mesh (cross-machine sessions)</span>
-<a id="__codelineno-0-14" name="__codelineno-0-14"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span><span class="s2">&quot;dashboard remote&quot;</span><span class="w"> </span>--<span class="w"> </span>--dashboard<span class="w"> </span>--mesh
+<a id="__codelineno-0-14" name="__codelineno-0-14"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span><span class="s2">"dashboard remote"</span><span class="w"> </span>--<span class="w"> </span>--dashboard<span class="w"> </span>--mesh
 <a id="__codelineno-0-15" name="__codelineno-0-15"></a>
 <a id="__codelineno-0-16" name="__codelineno-0-16"></a><span class="c1"># Use a custom config file</span>
 <a id="__codelineno-0-17" name="__codelineno-0-17"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>dashboard<span class="w"> </span>--<span class="w"> </span>path/to/config.toml<span class="w"> </span>--dashboard
@@ -2377,8 +2377,8 @@
 <a id="__codelineno-2-2" name="__codelineno-2-2"></a>
 <a id="__codelineno-2-3" name="__codelineno-2-3"></a><span class="cp">#[tokio::main]</span>
 <a id="__codelineno-2-4" name="__codelineno-2-4"></a><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">anyhow</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-2-5" name="__codelineno-2-5"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">runner</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">from_config</span><span class="p">(</span><span class="s">&quot;examples/confs/single_agent.toml&quot;</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-2-6" name="__codelineno-2-6"></a><span class="w">    </span><span class="n">runner</span><span class="p">.</span><span class="n">acp</span><span class="p">(</span><span class="s">&quot;stdio&quot;</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">runner</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">from_config</span><span class="p">(</span><span class="s">"examples/confs/single_agent.toml"</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-2-6" name="__codelineno-2-6"></a><span class="w">    </span><span class="n">runner</span><span class="p">.</span><span class="n">acp</span><span class="p">(</span><span class="s">"stdio"</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 <a id="__codelineno-2-7" name="__codelineno-2-7"></a><span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
 <a id="__codelineno-2-8" name="__codelineno-2-8"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
@@ -2418,22 +2418,22 @@
 <a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="cp">#[tokio::main]</span>
 <a id="__codelineno-4-4" name="__codelineno-4-4"></a><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">anyhow</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-4-5" name="__codelineno-4-5"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">multi</span><span class="p">()</span>
-<a id="__codelineno-4-6" name="__codelineno-4-6"></a><span class="w">        </span><span class="p">.</span><span class="n">cwd</span><span class="p">(</span><span class="s">&quot;.&quot;</span><span class="p">)</span>
+<a id="__codelineno-4-6" name="__codelineno-4-6"></a><span class="w">        </span><span class="p">.</span><span class="n">cwd</span><span class="p">(</span><span class="s">"."</span><span class="p">)</span>
 <a id="__codelineno-4-7" name="__codelineno-4-7"></a><span class="w">        </span><span class="p">.</span><span class="n">planner</span><span class="p">(</span><span class="o">|</span><span class="n">p</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-4-8" name="__codelineno-4-8"></a><span class="w">            </span><span class="n">p</span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">&quot;anthropic&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;claude-sonnet-4-5-20250929&quot;</span><span class="p">)</span>
-<a id="__codelineno-4-9" name="__codelineno-4-9"></a><span class="w">                </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">&quot;delegate&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;read_tool&quot;</span><span class="p">])</span>
-<a id="__codelineno-4-10" name="__codelineno-4-10"></a><span class="w">                </span><span class="p">.</span><span class="n">system</span><span class="p">(</span><span class="s">&quot;You are a planner. Delegate coding tasks to the coder.&quot;</span><span class="p">)</span>
+<a id="__codelineno-4-8" name="__codelineno-4-8"></a><span class="w">            </span><span class="n">p</span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
+<a id="__codelineno-4-9" name="__codelineno-4-9"></a><span class="w">                </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"delegate"</span><span class="p">,</span><span class="w"> </span><span class="s">"read_tool"</span><span class="p">])</span>
+<a id="__codelineno-4-10" name="__codelineno-4-10"></a><span class="w">                </span><span class="p">.</span><span class="n">system</span><span class="p">(</span><span class="s">"You are a planner. Delegate coding tasks to the coder."</span><span class="p">)</span>
 <a id="__codelineno-4-11" name="__codelineno-4-11"></a><span class="w">        </span><span class="p">})</span>
-<a id="__codelineno-4-12" name="__codelineno-4-12"></a><span class="w">        </span><span class="p">.</span><span class="n">delegate</span><span class="p">(</span><span class="s">&quot;coder&quot;</span><span class="p">,</span><span class="w"> </span><span class="o">|</span><span class="n">d</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-4-13" name="__codelineno-4-13"></a><span class="w">            </span><span class="n">d</span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">&quot;anthropic&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;claude-sonnet-4-5-20250929&quot;</span><span class="p">)</span>
-<a id="__codelineno-4-14" name="__codelineno-4-14"></a><span class="w">                </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;read_tool&quot;</span><span class="p">])</span>
-<a id="__codelineno-4-15" name="__codelineno-4-15"></a><span class="w">                </span><span class="p">.</span><span class="n">capabilities</span><span class="p">([</span><span class="s">&quot;coding&quot;</span><span class="p">])</span>
-<a id="__codelineno-4-16" name="__codelineno-4-16"></a><span class="w">                </span><span class="p">.</span><span class="n">system</span><span class="p">(</span><span class="s">&quot;You are a coder. Implement the requested changes.&quot;</span><span class="p">)</span>
+<a id="__codelineno-4-12" name="__codelineno-4-12"></a><span class="w">        </span><span class="p">.</span><span class="n">delegate</span><span class="p">(</span><span class="s">"coder"</span><span class="p">,</span><span class="w"> </span><span class="o">|</span><span class="n">d</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-4-13" name="__codelineno-4-13"></a><span class="w">            </span><span class="n">d</span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
+<a id="__codelineno-4-14" name="__codelineno-4-14"></a><span class="w">                </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s">"read_tool"</span><span class="p">])</span>
+<a id="__codelineno-4-15" name="__codelineno-4-15"></a><span class="w">                </span><span class="p">.</span><span class="n">capabilities</span><span class="p">([</span><span class="s">"coding"</span><span class="p">])</span>
+<a id="__codelineno-4-16" name="__codelineno-4-16"></a><span class="w">                </span><span class="p">.</span><span class="n">system</span><span class="p">(</span><span class="s">"You are a coder. Implement the requested changes."</span><span class="p">)</span>
 <a id="__codelineno-4-17" name="__codelineno-4-17"></a><span class="w">        </span><span class="p">})</span>
 <a id="__codelineno-4-18" name="__codelineno-4-18"></a><span class="w">        </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
 <a id="__codelineno-4-19" name="__codelineno-4-19"></a><span class="w">        </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 <a id="__codelineno-4-20" name="__codelineno-4-20"></a>
-<a id="__codelineno-4-21" name="__codelineno-4-21"></a><span class="w">    </span><span class="n">agent</span><span class="p">.</span><span class="n">chat</span><span class="p">(</span><span class="s">&quot;Add a hello world function to src/lib.rs&quot;</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-4-21" name="__codelineno-4-21"></a><span class="w">    </span><span class="n">agent</span><span class="p">.</span><span class="n">chat</span><span class="p">(</span><span class="s">"Add a hello world function to src/lib.rs"</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 <a id="__codelineno-4-22" name="__codelineno-4-22"></a><span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
 <a id="__codelineno-4-23" name="__codelineno-4-23"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
@@ -2463,10 +2463,10 @@
 <a id="__codelineno-6-3" name="__codelineno-6-3"></a><span class="cp">#[tokio::main]</span>
 <a id="__codelineno-6-4" name="__codelineno-6-4"></a><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">anyhow</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-6-5" name="__codelineno-6-5"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">env</span><span class="p">::</span><span class="n">args</span><span class="p">().</span><span class="n">nth</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
-<a id="__codelineno-6-6" name="__codelineno-6-6"></a><span class="w">        </span><span class="p">.</span><span class="n">unwrap_or_else</span><span class="p">(</span><span class="o">||</span><span class="w"> </span><span class="s">&quot;examples/confs/single_agent.toml&quot;</span><span class="p">.</span><span class="n">to_string</span><span class="p">());</span>
+<a id="__codelineno-6-6" name="__codelineno-6-6"></a><span class="w">        </span><span class="p">.</span><span class="n">unwrap_or_else</span><span class="p">(</span><span class="o">||</span><span class="w"> </span><span class="s">"examples/confs/single_agent.toml"</span><span class="p">.</span><span class="n">to_string</span><span class="p">());</span>
 <a id="__codelineno-6-7" name="__codelineno-6-7"></a>
 <a id="__codelineno-6-8" name="__codelineno-6-8"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">runner</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">from_config</span><span class="p">(</span><span class="o">&amp;</span><span class="n">path</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-6-9" name="__codelineno-6-9"></a><span class="w">    </span><span class="n">runner</span><span class="p">.</span><span class="n">acp</span><span class="p">(</span><span class="s">&quot;stdio&quot;</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-6-9" name="__codelineno-6-9"></a><span class="w">    </span><span class="n">runner</span><span class="p">.</span><span class="n">acp</span><span class="p">(</span><span class="s">"stdio"</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 <a id="__codelineno-6-10" name="__codelineno-6-10"></a><span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
 <a id="__codelineno-6-11" name="__codelineno-6-11"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
@@ -2509,24 +2509,24 @@
 <a id="__codelineno-8-3" name="__codelineno-8-3"></a><span class="cp">#[tokio::main]</span>
 <a id="__codelineno-8-4" name="__codelineno-8-4"></a><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">anyhow</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-8-5" name="__codelineno-8-5"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">single</span><span class="p">()</span>
-<a id="__codelineno-8-6" name="__codelineno-8-6"></a><span class="w">        </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">&quot;anthropic&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;claude-sonnet-4-5-20250929&quot;</span><span class="p">)</span>
-<a id="__codelineno-8-7" name="__codelineno-8-7"></a><span class="w">        </span><span class="p">.</span><span class="n">cwd</span><span class="p">(</span><span class="s">&quot;.&quot;</span><span class="p">)</span>
-<a id="__codelineno-8-8" name="__codelineno-8-8"></a><span class="w">        </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;search_text&quot;</span><span class="p">])</span>
-<a id="__codelineno-8-9" name="__codelineno-8-9"></a><span class="w">        </span><span class="p">.</span><span class="n">system</span><span class="p">(</span><span class="s">&quot;You are a helpful coding assistant.&quot;</span><span class="p">)</span>
+<a id="__codelineno-8-6" name="__codelineno-8-6"></a><span class="w">        </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
+<a id="__codelineno-8-7" name="__codelineno-8-7"></a><span class="w">        </span><span class="p">.</span><span class="n">cwd</span><span class="p">(</span><span class="s">"."</span><span class="p">)</span>
+<a id="__codelineno-8-8" name="__codelineno-8-8"></a><span class="w">        </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s">"search_text"</span><span class="p">])</span>
+<a id="__codelineno-8-9" name="__codelineno-8-9"></a><span class="w">        </span><span class="p">.</span><span class="n">system</span><span class="p">(</span><span class="s">"You are a helpful coding assistant."</span><span class="p">)</span>
 <a id="__codelineno-8-10" name="__codelineno-8-10"></a><span class="w">        </span><span class="p">.</span><span class="n">middleware</span><span class="p">(</span><span class="o">|</span><span class="n">stack</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-8-11" name="__codelineno-8-11"></a><span class="w">            </span><span class="n">stack</span>
 <a id="__codelineno-8-12" name="__codelineno-8-12"></a><span class="w">                </span><span class="p">.</span><span class="n">limits</span><span class="p">(</span><span class="o">|</span><span class="n">l</span><span class="o">|</span><span class="w"> </span><span class="n">l</span><span class="p">.</span><span class="n">max_steps</span><span class="p">(</span><span class="mi">100</span><span class="p">).</span><span class="n">max_turns</span><span class="p">(</span><span class="mi">20</span><span class="p">))</span>
 <a id="__codelineno-8-13" name="__codelineno-8-13"></a><span class="w">                </span><span class="p">.</span><span class="n">context</span><span class="p">(</span><span class="o">|</span><span class="n">c</span><span class="o">|</span><span class="w"> </span><span class="n">c</span><span class="p">.</span><span class="n">warn_at_percent</span><span class="p">(</span><span class="mi">80</span><span class="p">).</span><span class="n">compact_at_percent</span><span class="p">(</span><span class="mi">90</span><span class="p">))</span>
 <a id="__codelineno-8-14" name="__codelineno-8-14"></a><span class="w">        </span><span class="p">})</span>
 <a id="__codelineno-8-15" name="__codelineno-8-15"></a><span class="w">        </span><span class="p">.</span><span class="n">on_message</span><span class="p">(</span><span class="o">|</span><span class="n">session_id</span><span class="p">,</span><span class="w"> </span><span class="n">content</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-8-16" name="__codelineno-8-16"></a><span class="w">            </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;[{}] {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">session_id</span><span class="p">,</span><span class="w"> </span><span class="n">content</span><span class="p">);</span>
+<a id="__codelineno-8-16" name="__codelineno-8-16"></a><span class="w">            </span><span class="fm">println!</span><span class="p">(</span><span class="s">"[{}] {}"</span><span class="p">,</span><span class="w"> </span><span class="n">session_id</span><span class="p">,</span><span class="w"> </span><span class="n">content</span><span class="p">);</span>
 <a id="__codelineno-8-17" name="__codelineno-8-17"></a><span class="w">            </span><span class="nb">Ok</span><span class="p">(())</span>
 <a id="__codelineno-8-18" name="__codelineno-8-18"></a><span class="w">        </span><span class="p">})</span>
 <a id="__codelineno-8-19" name="__codelineno-8-19"></a><span class="w">        </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
 <a id="__codelineno-8-20" name="__codelineno-8-20"></a><span class="w">        </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 <a id="__codelineno-8-21" name="__codelineno-8-21"></a>
-<a id="__codelineno-8-22" name="__codelineno-8-22"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">response</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">chat</span><span class="p">(</span><span class="s">&quot;What files are in the current directory?&quot;</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-8-23" name="__codelineno-8-23"></a><span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;{}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">response</span><span class="p">);</span>
+<a id="__codelineno-8-22" name="__codelineno-8-22"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">response</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">chat</span><span class="p">(</span><span class="s">"What files are in the current directory?"</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-8-23" name="__codelineno-8-23"></a><span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"{}"</span><span class="p">,</span><span class="w"> </span><span class="n">response</span><span class="p">);</span>
 <a id="__codelineno-8-24" name="__codelineno-8-24"></a><span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
 <a id="__codelineno-8-25" name="__codelineno-8-25"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
@@ -2561,17 +2561,17 @@
 <a id="__codelineno-10-3" name="__codelineno-10-3"></a><span class="cp">#[tokio::main]</span>
 <a id="__codelineno-10-4" name="__codelineno-10-4"></a><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">anyhow</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-10-5" name="__codelineno-10-5"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">single</span><span class="p">()</span>
-<a id="__codelineno-10-6" name="__codelineno-10-6"></a><span class="w">        </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">&quot;anthropic&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;claude-sonnet-4-5-20250929&quot;</span><span class="p">)</span>
-<a id="__codelineno-10-7" name="__codelineno-10-7"></a><span class="w">        </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;glob&quot;</span><span class="p">])</span>
-<a id="__codelineno-10-8" name="__codelineno-10-8"></a><span class="w">        </span><span class="p">.</span><span class="n">system</span><span class="p">(</span><span class="s">&quot;You are an assistant that creates concise daily briefings.&quot;</span><span class="p">)</span>
+<a id="__codelineno-10-6" name="__codelineno-10-6"></a><span class="w">        </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
+<a id="__codelineno-10-7" name="__codelineno-10-7"></a><span class="w">        </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s">"glob"</span><span class="p">])</span>
+<a id="__codelineno-10-8" name="__codelineno-10-8"></a><span class="w">        </span><span class="p">.</span><span class="n">system</span><span class="p">(</span><span class="s">"You are an assistant that creates concise daily briefings."</span><span class="p">)</span>
 <a id="__codelineno-10-9" name="__codelineno-10-9"></a><span class="w">        </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
 <a id="__codelineno-10-10" name="__codelineno-10-10"></a><span class="w">        </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 <a id="__codelineno-10-11" name="__codelineno-10-11"></a>
 <a id="__codelineno-10-12" name="__codelineno-10-12"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">brief</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span>
-<a id="__codelineno-10-13" name="__codelineno-10-13"></a><span class="w">        </span><span class="p">.</span><span class="n">chat</span><span class="p">(</span><span class="s">&quot;Summarize recent git commits and any open TODO items.&quot;</span><span class="p">)</span>
+<a id="__codelineno-10-13" name="__codelineno-10-13"></a><span class="w">        </span><span class="p">.</span><span class="n">chat</span><span class="p">(</span><span class="s">"Summarize recent git commits and any open TODO items."</span><span class="p">)</span>
 <a id="__codelineno-10-14" name="__codelineno-10-14"></a><span class="w">        </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 <a id="__codelineno-10-15" name="__codelineno-10-15"></a>
-<a id="__codelineno-10-16" name="__codelineno-10-16"></a><span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;{}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">brief</span><span class="p">);</span>
+<a id="__codelineno-10-16" name="__codelineno-10-16"></a><span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"{}"</span><span class="p">,</span><span class="w"> </span><span class="n">brief</span><span class="p">);</span>
 <a id="__codelineno-10-17" name="__codelineno-10-17"></a><span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
 <a id="__codelineno-10-18" name="__codelineno-10-18"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
@@ -2633,8 +2633,8 @@
 <a id="__codelineno-14-3" name="__codelineno-14-3"></a><span class="cp">#[tokio::main]</span>
 <a id="__codelineno-14-4" name="__codelineno-14-4"></a><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">anyhow</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-14-5" name="__codelineno-14-5"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">single</span><span class="p">()</span>
-<a id="__codelineno-14-6" name="__codelineno-14-6"></a><span class="w">        </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">&quot;anthropic&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;claude-sonnet-4-5-20250929&quot;</span><span class="p">)</span>
-<a id="__codelineno-14-7" name="__codelineno-14-7"></a><span class="w">        </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">&quot;read_tool&quot;</span><span class="p">])</span>
+<a id="__codelineno-14-6" name="__codelineno-14-6"></a><span class="w">        </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
+<a id="__codelineno-14-7" name="__codelineno-14-7"></a><span class="w">        </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"read_tool"</span><span class="p">])</span>
 <a id="__codelineno-14-8" name="__codelineno-14-8"></a><span class="w">        </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
 <a id="__codelineno-14-9" name="__codelineno-14-9"></a><span class="w">        </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 <a id="__codelineno-14-10" name="__codelineno-14-10"></a>
@@ -2643,12 +2643,12 @@
 <a id="__codelineno-14-13" name="__codelineno-14-13"></a><span class="w">    </span><span class="c1">// Start a chat in background</span>
 <a id="__codelineno-14-14" name="__codelineno-14-14"></a><span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">agent_clone</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">clone</span><span class="p">();</span>
 <a id="__codelineno-14-15" name="__codelineno-14-15"></a><span class="w">    </span><span class="n">tokio</span><span class="p">::</span><span class="n">spawn</span><span class="p">(</span><span class="k">async</span><span class="w"> </span><span class="k">move</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-14-16" name="__codelineno-14-16"></a><span class="w">        </span><span class="n">agent_clone</span><span class="p">.</span><span class="n">chat</span><span class="p">(</span><span class="s">&quot;List files in the current directory&quot;</span><span class="p">).</span><span class="k">await</span><span class="p">.</span><span class="n">ok</span><span class="p">();</span>
+<a id="__codelineno-14-16" name="__codelineno-14-16"></a><span class="w">        </span><span class="n">agent_clone</span><span class="p">.</span><span class="n">chat</span><span class="p">(</span><span class="s">"List files in the current directory"</span><span class="p">).</span><span class="k">await</span><span class="p">.</span><span class="n">ok</span><span class="p">();</span>
 <a id="__codelineno-14-17" name="__codelineno-14-17"></a><span class="w">    </span><span class="p">});</span>
 <a id="__codelineno-14-18" name="__codelineno-14-18"></a>
 <a id="__codelineno-14-19" name="__codelineno-14-19"></a><span class="w">    </span><span class="c1">// Print all events</span>
 <a id="__codelineno-14-20" name="__codelineno-14-20"></a><span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(</span><span class="n">envelope</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">events</span><span class="p">.</span><span class="n">recv</span><span class="p">().</span><span class="k">await</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-14-21" name="__codelineno-14-21"></a><span class="w">        </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;[{}] {:?}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">envelope</span><span class="p">.</span><span class="n">session_id</span><span class="p">(),</span><span class="w"> </span><span class="n">envelope</span><span class="p">.</span><span class="n">kind</span><span class="p">());</span>
+<a id="__codelineno-14-21" name="__codelineno-14-21"></a><span class="w">        </span><span class="fm">println!</span><span class="p">(</span><span class="s">"[{}] {:?}"</span><span class="p">,</span><span class="w"> </span><span class="n">envelope</span><span class="p">.</span><span class="n">session_id</span><span class="p">(),</span><span class="w"> </span><span class="n">envelope</span><span class="p">.</span><span class="n">kind</span><span class="p">());</span>
 <a id="__codelineno-14-22" name="__codelineno-14-22"></a><span class="w">    </span><span class="p">}</span>
 <a id="__codelineno-14-23" name="__codelineno-14-23"></a>
 <a id="__codelineno-14-24" name="__codelineno-14-24"></a><span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
@@ -2704,10 +2704,10 @@
 <span class="normal"><a href="#__codelineno-17-3">3</a></span>
 <span class="normal"><a href="#__codelineno-17-4">4</a></span>
 <span class="normal"><a href="#__codelineno-17-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1"></a><span class="k">[agent]</span>
-<a id="__codelineno-17-2" name="__codelineno-17-2"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-17-3" name="__codelineno-17-3"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-17-4" name="__codelineno-17-4"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">]</span>
-<a id="__codelineno-17-5" name="__codelineno-17-5"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;You are a helpful assistant.&quot;</span>
+<a id="__codelineno-17-2" name="__codelineno-17-2"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-17-3" name="__codelineno-17-3"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-17-4" name="__codelineno-17-4"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
+<a id="__codelineno-17-5" name="__codelineno-17-5"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"You are a helpful assistant."</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="single_codertoml-full-featured-single-coder"><code>single_coder.toml</code> — Full-featured single coder</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-18-1"> 1</a></span>
@@ -2758,24 +2758,24 @@
 <span class="normal"><a href="#__codelineno-18-46">46</a></span>
 <span class="normal"><a href="#__codelineno-18-47">47</a></span>
 <span class="normal"><a href="#__codelineno-18-48">48</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-18-1" name="__codelineno-18-1"></a><span class="k">[agent]</span>
-<a id="__codelineno-18-2" name="__codelineno-18-2"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-18-3" name="__codelineno-18-3"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
+<a id="__codelineno-18-2" name="__codelineno-18-2"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-18-3" name="__codelineno-18-3"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
 <a id="__codelineno-18-4" name="__codelineno-18-4"></a><span class="n">assume_mutating</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
-<a id="__codelineno-18-5" name="__codelineno-18-5"></a><span class="n">mutating_tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">]</span>
+<a id="__codelineno-18-5" name="__codelineno-18-5"></a><span class="n">mutating_tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 <a id="__codelineno-18-6" name="__codelineno-18-6"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-18-7" name="__codelineno-18-7"></a><span class="w">    </span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span>
-<a id="__codelineno-18-8" name="__codelineno-18-8"></a><span class="w">    </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;ls&quot;</span><span class="p">,</span>
-<a id="__codelineno-18-9" name="__codelineno-18-9"></a><span class="w">    </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span>
-<a id="__codelineno-18-10" name="__codelineno-18-10"></a><span class="w">    </span><span class="s2">&quot;create_task&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;todowrite&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;todoread&quot;</span><span class="p">,</span>
-<a id="__codelineno-18-11" name="__codelineno-18-11"></a><span class="w">    </span><span class="s2">&quot;question&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;web_fetch&quot;</span><span class="p">,</span>
+<a id="__codelineno-18-7" name="__codelineno-18-7"></a><span class="w">    </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span>
+<a id="__codelineno-18-8" name="__codelineno-18-8"></a><span class="w">    </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">,</span><span class="w"> </span><span class="s2">"ls"</span><span class="p">,</span>
+<a id="__codelineno-18-9" name="__codelineno-18-9"></a><span class="w">    </span><span class="s2">"shell"</span><span class="p">,</span>
+<a id="__codelineno-18-10" name="__codelineno-18-10"></a><span class="w">    </span><span class="s2">"create_task"</span><span class="p">,</span><span class="w"> </span><span class="s2">"todowrite"</span><span class="p">,</span><span class="w"> </span><span class="s2">"todoread"</span><span class="p">,</span>
+<a id="__codelineno-18-11" name="__codelineno-18-11"></a><span class="w">    </span><span class="s2">"question"</span><span class="p">,</span><span class="w"> </span><span class="s2">"web_fetch"</span><span class="p">,</span>
 <a id="__codelineno-18-12" name="__codelineno-18-12"></a><span class="p">]</span>
 <a id="__codelineno-18-13" name="__codelineno-18-13"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-18-14" name="__codelineno-18-14"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;../prompts/default_system.txt&quot;</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-18-15" name="__codelineno-18-15"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;../prompts/code_meta.jinja2&quot;</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-18-14" name="__codelineno-18-14"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"../prompts/default_system.txt"</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-18-15" name="__codelineno-18-15"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"../prompts/code_meta.jinja2"</span><span class="w"> </span><span class="p">},</span>
 <a id="__codelineno-18-16" name="__codelineno-18-16"></a><span class="p">]</span>
 <a id="__codelineno-18-17" name="__codelineno-18-17"></a>
 <a id="__codelineno-18-18" name="__codelineno-18-18"></a><span class="k">[agent.execution.snapshot]</span>
-<a id="__codelineno-18-19" name="__codelineno-18-19"></a><span class="n">backend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;git&quot;</span>
+<a id="__codelineno-18-19" name="__codelineno-18-19"></a><span class="n">backend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"git"</span>
 <a id="__codelineno-18-20" name="__codelineno-18-20"></a>
 <a id="__codelineno-18-21" name="__codelineno-18-21"></a><span class="k">[agent.execution.tool_output]</span>
 <a id="__codelineno-18-22" name="__codelineno-18-22"></a><span class="n">max_lines</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2000</span>
@@ -2788,21 +2788,21 @@
 <a id="__codelineno-18-29" name="__codelineno-18-29"></a><span class="n">auto</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
 <a id="__codelineno-18-30" name="__codelineno-18-30"></a>
 <a id="__codelineno-18-31" name="__codelineno-18-31"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-18-32" name="__codelineno-18-32"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;agent_mode&quot;</span>
-<a id="__codelineno-18-33" name="__codelineno-18-33"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;build&quot;</span>
+<a id="__codelineno-18-32" name="__codelineno-18-32"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
+<a id="__codelineno-18-33" name="__codelineno-18-33"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"build"</span>
 <a id="__codelineno-18-34" name="__codelineno-18-34"></a>
 <a id="__codelineno-18-35" name="__codelineno-18-35"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-18-36" name="__codelineno-18-36"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;limits&quot;</span>
+<a id="__codelineno-18-36" name="__codelineno-18-36"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"limits"</span>
 <a id="__codelineno-18-37" name="__codelineno-18-37"></a><span class="n">max_steps</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">200</span>
 <a id="__codelineno-18-38" name="__codelineno-18-38"></a><span class="n">max_turns</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">50</span>
 <a id="__codelineno-18-39" name="__codelineno-18-39"></a>
 <a id="__codelineno-18-40" name="__codelineno-18-40"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-18-41" name="__codelineno-18-41"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;context&quot;</span>
+<a id="__codelineno-18-41" name="__codelineno-18-41"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"context"</span>
 <a id="__codelineno-18-42" name="__codelineno-18-42"></a><span class="n">warn_at_percent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">80</span>
 <a id="__codelineno-18-43" name="__codelineno-18-43"></a><span class="n">compact_at_percent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">90</span>
 <a id="__codelineno-18-44" name="__codelineno-18-44"></a>
 <a id="__codelineno-18-45" name="__codelineno-18-45"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-18-46" name="__codelineno-18-46"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;dedup_check&quot;</span>
+<a id="__codelineno-18-46" name="__codelineno-18-46"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"dedup_check"</span>
 <a id="__codelineno-18-47" name="__codelineno-18-47"></a><span class="n">threshold</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.85</span>
 <a id="__codelineno-18-48" name="__codelineno-18-48"></a><span class="n">min_lines</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span>
 </code></pre></div></td></tr></table></div>
@@ -2829,25 +2829,25 @@
 <span class="normal"><a href="#__codelineno-19-18">18</a></span>
 <span class="normal"><a href="#__codelineno-19-19">19</a></span>
 <span class="normal"><a href="#__codelineno-19-20">20</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1"></a><span class="k">[quorum]</span>
-<a id="__codelineno-19-2" name="__codelineno-19-2"></a><span class="n">cwd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;.&quot;</span>
+<a id="__codelineno-19-2" name="__codelineno-19-2"></a><span class="n">cwd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"."</span>
 <a id="__codelineno-19-3" name="__codelineno-19-3"></a><span class="n">delegation</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
 <a id="__codelineno-19-4" name="__codelineno-19-4"></a><span class="n">verification</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
 <a id="__codelineno-19-5" name="__codelineno-19-5"></a><span class="n">max_parallel_delegations</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
 <a id="__codelineno-19-6" name="__codelineno-19-6"></a>
 <a id="__codelineno-19-7" name="__codelineno-19-7"></a><span class="k">[planner]</span>
-<a id="__codelineno-19-8" name="__codelineno-19-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-19-9" name="__codelineno-19-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-19-10" name="__codelineno-19-10"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;delegate&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;glob&quot;</span><span class="p">]</span>
-<a id="__codelineno-19-11" name="__codelineno-19-11"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;../prompts/planner.md&quot;</span><span class="w"> </span><span class="p">}]</span>
+<a id="__codelineno-19-8" name="__codelineno-19-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-19-9" name="__codelineno-19-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-19-10" name="__codelineno-19-10"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"delegate"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">]</span>
+<a id="__codelineno-19-11" name="__codelineno-19-11"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"../prompts/planner.md"</span><span class="w"> </span><span class="p">}]</span>
 <a id="__codelineno-19-12" name="__codelineno-19-12"></a>
 <a id="__codelineno-19-13" name="__codelineno-19-13"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-19-14" name="__codelineno-19-14"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;coder&quot;</span>
-<a id="__codelineno-19-15" name="__codelineno-19-15"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-19-16" name="__codelineno-19-16"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-19-17" name="__codelineno-19-17"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Implements code changes&quot;</span>
-<a id="__codelineno-19-18" name="__codelineno-19-18"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;coding&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;filesystem&quot;</span><span class="p">]</span>
-<a id="__codelineno-19-19" name="__codelineno-19-19"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">]</span>
-<a id="__codelineno-19-20" name="__codelineno-19-20"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;../prompts/coder.md&quot;</span><span class="w"> </span><span class="p">}]</span>
+<a id="__codelineno-19-14" name="__codelineno-19-14"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
+<a id="__codelineno-19-15" name="__codelineno-19-15"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-19-16" name="__codelineno-19-16"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-19-17" name="__codelineno-19-17"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Implements code changes"</span>
+<a id="__codelineno-19-18" name="__codelineno-19-18"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"coding"</span><span class="p">,</span><span class="w"> </span><span class="s2">"filesystem"</span><span class="p">]</span>
+<a id="__codelineno-19-19" name="__codelineno-19-19"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">]</span>
+<a id="__codelineno-19-20" name="__codelineno-19-20"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"../prompts/coder.md"</span><span class="w"> </span><span class="p">}]</span>
 </code></pre></div></td></tr></table></div>
 <hr />
 <h2 id="running-all-examples">Running All Examples</h2>
@@ -2949,41 +2949,41 @@
 <span class="normal"><a href="#__codelineno-22-36">36</a></span>
 <span class="normal"><a href="#__codelineno-22-37">37</a></span>
 <span class="normal"><a href="#__codelineno-22-38">38</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-22-1" name="__codelineno-22-1"></a><span class="k">[profile]</span>
-<a id="__codelineno-22-2" name="__codelineno-22-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;default&quot;</span>
-<a id="__codelineno-22-3" name="__codelineno-22-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Default&quot;</span>
-<a id="__codelineno-22-4" name="__codelineno-22-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Default single coder profile&quot;</span>
-<a id="__codelineno-22-5" name="__codelineno-22-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;coding&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;single-agent&quot;</span><span class="p">]</span>
+<a id="__codelineno-22-2" name="__codelineno-22-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"default"</span>
+<a id="__codelineno-22-3" name="__codelineno-22-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Default"</span>
+<a id="__codelineno-22-4" name="__codelineno-22-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Default single coder profile"</span>
+<a id="__codelineno-22-5" name="__codelineno-22-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"coding"</span><span class="p">,</span><span class="w"> </span><span class="s2">"single-agent"</span><span class="p">]</span>
 <a id="__codelineno-22-6" name="__codelineno-22-6"></a>
 <a id="__codelineno-22-7" name="__codelineno-22-7"></a><span class="k">[agent]</span>
-<a id="__codelineno-22-8" name="__codelineno-22-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-22-9" name="__codelineno-22-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
+<a id="__codelineno-22-8" name="__codelineno-22-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-22-9" name="__codelineno-22-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
 <a id="__codelineno-22-10" name="__codelineno-22-10"></a><span class="n">assume_mutating</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
-<a id="__codelineno-22-11" name="__codelineno-22-11"></a><span class="n">mutating_tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;multiedit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;replace_symbol&quot;</span><span class="p">]</span>
+<a id="__codelineno-22-11" name="__codelineno-22-11"></a><span class="n">mutating_tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"multiedit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"replace_symbol"</span><span class="p">]</span>
 <a id="__codelineno-22-12" name="__codelineno-22-12"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-22-13" name="__codelineno-22-13"></a><span class="w">  </span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;multiedit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;replace_symbol&quot;</span><span class="p">,</span>
-<a id="__codelineno-22-14" name="__codelineno-22-14"></a><span class="w">  </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;ls&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;index&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;get_symbol&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;get_function&quot;</span><span class="p">,</span>
-<a id="__codelineno-22-15" name="__codelineno-22-15"></a><span class="w">  </span><span class="s2">&quot;find_symbol_references&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;create_task&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;todowrite&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;todoread&quot;</span><span class="p">,</span>
-<a id="__codelineno-22-16" name="__codelineno-22-16"></a><span class="w">  </span><span class="s2">&quot;question&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;browse&quot;</span>
+<a id="__codelineno-22-13" name="__codelineno-22-13"></a><span class="w">  </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"multiedit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"replace_symbol"</span><span class="p">,</span>
+<a id="__codelineno-22-14" name="__codelineno-22-14"></a><span class="w">  </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">,</span><span class="w"> </span><span class="s2">"ls"</span><span class="p">,</span><span class="w"> </span><span class="s2">"index"</span><span class="p">,</span><span class="w"> </span><span class="s2">"get_symbol"</span><span class="p">,</span><span class="w"> </span><span class="s2">"get_function"</span><span class="p">,</span>
+<a id="__codelineno-22-15" name="__codelineno-22-15"></a><span class="w">  </span><span class="s2">"find_symbol_references"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"create_task"</span><span class="p">,</span><span class="w"> </span><span class="s2">"todowrite"</span><span class="p">,</span><span class="w"> </span><span class="s2">"todoread"</span><span class="p">,</span>
+<a id="__codelineno-22-16" name="__codelineno-22-16"></a><span class="w">  </span><span class="s2">"question"</span><span class="p">,</span><span class="w"> </span><span class="s2">"browse"</span>
 <a id="__codelineno-22-17" name="__codelineno-22-17"></a><span class="p">]</span>
 <a id="__codelineno-22-18" name="__codelineno-22-18"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-22-19" name="__codelineno-22-19"></a><span class="w">  </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;../prompts/default_system.txt&quot;</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-22-20" name="__codelineno-22-20"></a><span class="w">  </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;../prompts/code_meta.jinja2&quot;</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-22-19" name="__codelineno-22-19"></a><span class="w">  </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"../prompts/default_system.txt"</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-22-20" name="__codelineno-22-20"></a><span class="w">  </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"../prompts/code_meta.jinja2"</span><span class="w"> </span><span class="p">}</span>
 <a id="__codelineno-22-21" name="__codelineno-22-21"></a><span class="p">]</span>
 <a id="__codelineno-22-22" name="__codelineno-22-22"></a>
 <a id="__codelineno-22-23" name="__codelineno-22-23"></a><span class="k">[agent.execution.snapshot]</span>
-<a id="__codelineno-22-24" name="__codelineno-22-24"></a><span class="n">backend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;git&quot;</span>
+<a id="__codelineno-22-24" name="__codelineno-22-24"></a><span class="n">backend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"git"</span>
 <a id="__codelineno-22-25" name="__codelineno-22-25"></a>
 <a id="__codelineno-22-26" name="__codelineno-22-26"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-22-27" name="__codelineno-22-27"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;agent_mode&quot;</span>
-<a id="__codelineno-22-28" name="__codelineno-22-28"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;build&quot;</span>
+<a id="__codelineno-22-27" name="__codelineno-22-27"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
+<a id="__codelineno-22-28" name="__codelineno-22-28"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"build"</span>
 <a id="__codelineno-22-29" name="__codelineno-22-29"></a>
 <a id="__codelineno-22-30" name="__codelineno-22-30"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-22-31" name="__codelineno-22-31"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;limits&quot;</span>
+<a id="__codelineno-22-31" name="__codelineno-22-31"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"limits"</span>
 <a id="__codelineno-22-32" name="__codelineno-22-32"></a><span class="n">max_steps</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">200</span>
 <a id="__codelineno-22-33" name="__codelineno-22-33"></a><span class="n">max_turns</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">50</span>
 <a id="__codelineno-22-34" name="__codelineno-22-34"></a>
 <a id="__codelineno-22-35" name="__codelineno-22-35"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-22-36" name="__codelineno-22-36"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;context&quot;</span>
+<a id="__codelineno-22-36" name="__codelineno-22-36"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"context"</span>
 <a id="__codelineno-22-37" name="__codelineno-22-37"></a><span class="n">warn_at_percent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">80</span>
 <a id="__codelineno-22-38" name="__codelineno-22-38"></a><span class="n">compact_at_percent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">90</span>
 </code></pre></div></td></tr></table></div>
@@ -3008,25 +3008,25 @@
 <span class="normal"><a href="#__codelineno-23-18">18</a></span>
 <span class="normal"><a href="#__codelineno-23-19">19</a></span>
 <span class="normal"><a href="#__codelineno-23-20">20</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-23-1" name="__codelineno-23-1"></a><span class="k">[quorum]</span>
-<a id="__codelineno-23-2" name="__codelineno-23-2"></a><span class="n">cwd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;.&quot;</span>
+<a id="__codelineno-23-2" name="__codelineno-23-2"></a><span class="n">cwd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"."</span>
 <a id="__codelineno-23-3" name="__codelineno-23-3"></a><span class="n">delegation</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
 <a id="__codelineno-23-4" name="__codelineno-23-4"></a><span class="n">verification</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
 <a id="__codelineno-23-5" name="__codelineno-23-5"></a><span class="n">max_parallel_delegations</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
 <a id="__codelineno-23-6" name="__codelineno-23-6"></a>
 <a id="__codelineno-23-7" name="__codelineno-23-7"></a><span class="k">[planner]</span>
-<a id="__codelineno-23-8" name="__codelineno-23-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-23-9" name="__codelineno-23-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-23-10" name="__codelineno-23-10"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;delegate&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;glob&quot;</span><span class="p">]</span>
-<a id="__codelineno-23-11" name="__codelineno-23-11"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;../prompts/planner.md&quot;</span><span class="w"> </span><span class="p">}]</span>
+<a id="__codelineno-23-8" name="__codelineno-23-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-23-9" name="__codelineno-23-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-23-10" name="__codelineno-23-10"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"delegate"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">]</span>
+<a id="__codelineno-23-11" name="__codelineno-23-11"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"../prompts/planner.md"</span><span class="w"> </span><span class="p">}]</span>
 <a id="__codelineno-23-12" name="__codelineno-23-12"></a>
 <a id="__codelineno-23-13" name="__codelineno-23-13"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-23-14" name="__codelineno-23-14"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;coder&quot;</span>
-<a id="__codelineno-23-15" name="__codelineno-23-15"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-23-16" name="__codelineno-23-16"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-23-17" name="__codelineno-23-17"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Implements code changes&quot;</span>
-<a id="__codelineno-23-18" name="__codelineno-23-18"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;coding&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;filesystem&quot;</span><span class="p">]</span>
-<a id="__codelineno-23-19" name="__codelineno-23-19"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">]</span>
-<a id="__codelineno-23-20" name="__codelineno-23-20"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;../prompts/coder.md&quot;</span><span class="w"> </span><span class="p">}]</span>
+<a id="__codelineno-23-14" name="__codelineno-23-14"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
+<a id="__codelineno-23-15" name="__codelineno-23-15"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-23-16" name="__codelineno-23-16"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-23-17" name="__codelineno-23-17"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Implements code changes"</span>
+<a id="__codelineno-23-18" name="__codelineno-23-18"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"coding"</span><span class="p">,</span><span class="w"> </span><span class="s2">"filesystem"</span><span class="p">]</span>
+<a id="__codelineno-23-19" name="__codelineno-23-19"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">]</span>
+<a id="__codelineno-23-20" name="__codelineno-23-20"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"../prompts/coder.md"</span><span class="w"> </span><span class="p">}]</span>
 </code></pre></div></td></tr></table></div>
 <hr />
 <h2 id="mesh-networking-examples">Mesh Networking Examples</h2>
@@ -3042,14 +3042,14 @@
 <span class="normal"><a href="#__codelineno-24-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-24-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-24-1" name="__codelineno-24-1"></a><span class="c1"># mesh_lan.toml</span>
 <a id="__codelineno-24-2" name="__codelineno-24-2"></a><span class="k">[agent]</span>
-<a id="__codelineno-24-3" name="__codelineno-24-3"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-24-4" name="__codelineno-24-4"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-24-5" name="__codelineno-24-5"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">]</span>
+<a id="__codelineno-24-3" name="__codelineno-24-3"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-24-4" name="__codelineno-24-4"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-24-5" name="__codelineno-24-5"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 <a id="__codelineno-24-6" name="__codelineno-24-6"></a>
 <a id="__codelineno-24-7" name="__codelineno-24-7"></a><span class="k">[mesh]</span>
 <a id="__codelineno-24-8" name="__codelineno-24-8"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-24-9" name="__codelineno-24-9"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/0.0.0.0/tcp/0&quot;</span>
-<a id="__codelineno-24-10" name="__codelineno-24-10"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;mdns&quot;</span>
+<a id="__codelineno-24-9" name="__codelineno-24-9"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/0.0.0.0/tcp/0"</span>
+<a id="__codelineno-24-10" name="__codelineno-24-10"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mdns"</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Usage:</strong>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-25-1">1</a></span>
@@ -3069,7 +3069,7 @@
 <span class="normal"><a href="#__codelineno-26-4">4</a></span>
 <span class="normal"><a href="#__codelineno-26-5">5</a></span>
 <span class="normal"><a href="#__codelineno-26-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-26-1" name="__codelineno-26-1"></a><span class="c1"># Machine A: Create invite and host mesh</span>
-<a id="__codelineno-26-2" name="__codelineno-26-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh<span class="w"> </span>--mesh-invite<span class="o">=</span><span class="s2">&quot;Dev Team&quot;</span>
+<a id="__codelineno-26-2" name="__codelineno-26-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh<span class="w"> </span>--mesh-invite<span class="o">=</span><span class="s2">"Dev Team"</span>
 <a id="__codelineno-26-3" name="__codelineno-26-3"></a><span class="c1"># Output: Invite token: qmt://mesh/join/eyJpbnZ...</span>
 <a id="__codelineno-26-4" name="__codelineno-26-4"></a>
 <a id="__codelineno-26-5" name="__codelineno-26-5"></a><span class="c1"># Machine B: Join via invite token</span>
@@ -3102,9 +3102,9 @@
 <span class="normal"><a href="#__codelineno-27-24">24</a></span>
 <span class="normal"><a href="#__codelineno-27-25">25</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-27-1" name="__codelineno-27-1"></a><span class="c1"># mesh_multi.toml</span>
 <a id="__codelineno-27-2" name="__codelineno-27-2"></a><span class="k">[agent]</span>
-<a id="__codelineno-27-3" name="__codelineno-27-3"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-27-4" name="__codelineno-27-4"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-27-5" name="__codelineno-27-5"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">]</span>
+<a id="__codelineno-27-3" name="__codelineno-27-3"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-27-4" name="__codelineno-27-4"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-27-5" name="__codelineno-27-5"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 <a id="__codelineno-27-6" name="__codelineno-27-6"></a>
 <a id="__codelineno-27-7" name="__codelineno-27-7"></a><span class="k">[mesh]</span>
 <a id="__codelineno-27-8" name="__codelineno-27-8"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
@@ -3112,19 +3112,19 @@
 <a id="__codelineno-27-10" name="__codelineno-27-10"></a><span class="c1"># LAN transport</span>
 <a id="__codelineno-27-11" name="__codelineno-27-11"></a><span class="k">[mesh.lan]</span>
 <a id="__codelineno-27-12" name="__codelineno-27-12"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-27-13" name="__codelineno-27-13"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/0.0.0.0/tcp/0&quot;</span>
-<a id="__codelineno-27-14" name="__codelineno-27-14"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;mdns&quot;</span>
+<a id="__codelineno-27-13" name="__codelineno-27-13"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/0.0.0.0/tcp/0"</span>
+<a id="__codelineno-27-14" name="__codelineno-27-14"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mdns"</span>
 <a id="__codelineno-27-15" name="__codelineno-27-15"></a>
 <a id="__codelineno-27-16" name="__codelineno-27-16"></a><span class="c1"># Internet transport (iroh)</span>
 <a id="__codelineno-27-17" name="__codelineno-27-17"></a><span class="k">[[mesh.iroh]]</span>
 <a id="__codelineno-27-18" name="__codelineno-27-18"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-27-19" name="__codelineno-27-19"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;personal&quot;</span>
-<a id="__codelineno-27-20" name="__codelineno-27-20"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_PERSONAL_INVITE}&quot;</span>
+<a id="__codelineno-27-19" name="__codelineno-27-19"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"personal"</span>
+<a id="__codelineno-27-20" name="__codelineno-27-20"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_PERSONAL_INVITE}"</span>
 <a id="__codelineno-27-21" name="__codelineno-27-21"></a>
 <a id="__codelineno-27-22" name="__codelineno-27-22"></a><span class="k">[[mesh.iroh]]</span>
 <a id="__codelineno-27-23" name="__codelineno-27-23"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-27-24" name="__codelineno-27-24"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;team&quot;</span>
-<a id="__codelineno-27-25" name="__codelineno-27-25"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_TEAM_INVITE}&quot;</span>
+<a id="__codelineno-27-24" name="__codelineno-27-24"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"team"</span>
+<a id="__codelineno-27-25" name="__codelineno-27-25"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_TEAM_INVITE}"</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="example-remote-agents-with-delegation">Example: Remote Agents with Delegation</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-28-1"> 1</a></span>
@@ -3153,34 +3153,34 @@
 <span class="normal"><a href="#__codelineno-28-24">24</a></span>
 <span class="normal"><a href="#__codelineno-28-25">25</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-28-1" name="__codelineno-28-1"></a><span class="c1"># mesh_remote.toml</span>
 <a id="__codelineno-28-2" name="__codelineno-28-2"></a><span class="k">[agent]</span>
-<a id="__codelineno-28-3" name="__codelineno-28-3"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-28-4" name="__codelineno-28-4"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
+<a id="__codelineno-28-3" name="__codelineno-28-3"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-28-4" name="__codelineno-28-4"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
 <a id="__codelineno-28-5" name="__codelineno-28-5"></a>
 <a id="__codelineno-28-6" name="__codelineno-28-6"></a><span class="k">[mesh]</span>
 <a id="__codelineno-28-7" name="__codelineno-28-7"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
 <a id="__codelineno-28-8" name="__codelineno-28-8"></a>
 <a id="__codelineno-28-9" name="__codelineno-28-9"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-28-10" name="__codelineno-28-10"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-server&quot;</span>
-<a id="__codelineno-28-11" name="__codelineno-28-11"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/192.168.1.100/tcp/9000&quot;</span>
+<a id="__codelineno-28-10" name="__codelineno-28-10"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
+<a id="__codelineno-28-11" name="__codelineno-28-11"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.100/tcp/9000"</span>
 <a id="__codelineno-28-12" name="__codelineno-28-12"></a>
 <a id="__codelineno-28-13" name="__codelineno-28-13"></a><span class="k">[[remote_agents]]</span>
-<a id="__codelineno-28-14" name="__codelineno-28-14"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-coder&quot;</span>
-<a id="__codelineno-28-15" name="__codelineno-28-15"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;GPU Coder&quot;</span>
-<a id="__codelineno-28-16" name="__codelineno-28-16"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Fast coder on GPU server&quot;</span>
-<a id="__codelineno-28-17" name="__codelineno-28-17"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-server&quot;</span>
-<a id="__codelineno-28-18" name="__codelineno-28-18"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;gpu&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;fast-model&quot;</span><span class="p">]</span>
+<a id="__codelineno-28-14" name="__codelineno-28-14"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-coder"</span>
+<a id="__codelineno-28-15" name="__codelineno-28-15"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"GPU Coder"</span>
+<a id="__codelineno-28-16" name="__codelineno-28-16"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Fast coder on GPU server"</span>
+<a id="__codelineno-28-17" name="__codelineno-28-17"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
+<a id="__codelineno-28-18" name="__codelineno-28-18"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"gpu"</span><span class="p">,</span><span class="w"> </span><span class="s2">"fast-model"</span><span class="p">]</span>
 <a id="__codelineno-28-19" name="__codelineno-28-19"></a>
 <a id="__codelineno-28-20" name="__codelineno-28-20"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-28-21" name="__codelineno-28-21"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;remote-coder&quot;</span>
-<a id="__codelineno-28-22" name="__codelineno-28-22"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-28-23" name="__codelineno-28-23"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4&quot;</span>
-<a id="__codelineno-28-24" name="__codelineno-28-24"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-server&quot;</span>
-<a id="__codelineno-28-25" name="__codelineno-28-25"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">]</span>
+<a id="__codelineno-28-21" name="__codelineno-28-21"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"remote-coder"</span>
+<a id="__codelineno-28-22" name="__codelineno-28-22"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-28-23" name="__codelineno-28-23"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4"</span>
+<a id="__codelineno-28-24" name="__codelineno-28-24"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
+<a id="__codelineno-28-25" name="__codelineno-28-25"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Usage:</strong>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-29-1">1</a></span>
 <span class="normal"><a href="#__codelineno-29-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-29-1" name="__codelineno-29-1"></a><span class="c1"># Start mesh node with dashboard</span>
-<a id="__codelineno-29-2" name="__codelineno-29-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span><span class="s2">&quot;remote dashboard&quot;</span><span class="w"> </span>--<span class="w"> </span>--mesh<span class="w"> </span>--dashboard
+<a id="__codelineno-29-2" name="__codelineno-29-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span><span class="s2">"remote dashboard"</span><span class="w"> </span>--<span class="w"> </span>--mesh<span class="w"> </span>--dashboard
 </code></pre></div></td></tr></table></div></p>
 <p>For complete mesh documentation, see <a href="../mesh/">Mesh Networking Guide</a>.</p>
 <hr />
@@ -3242,36 +3242,36 @@
 <span class="normal"><a href="#__codelineno-31-31">31</a></span>
 <span class="normal"><a href="#__codelineno-31-32">32</a></span>
 <span class="normal"><a href="#__codelineno-31-33">33</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-31-1" name="__codelineno-31-1"></a><span class="k">[profile]</span>
-<a id="__codelineno-31-2" name="__codelineno-31-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;coder&quot;</span>
-<a id="__codelineno-31-3" name="__codelineno-31-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Full-Featured Coder&quot;</span>
-<a id="__codelineno-31-4" name="__codelineno-31-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Complete coding agent with all tools&quot;</span>
-<a id="__codelineno-31-5" name="__codelineno-31-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;coding&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;development&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;full-access&quot;</span><span class="p">]</span>
+<a id="__codelineno-31-2" name="__codelineno-31-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
+<a id="__codelineno-31-3" name="__codelineno-31-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Full-Featured Coder"</span>
+<a id="__codelineno-31-4" name="__codelineno-31-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Complete coding agent with all tools"</span>
+<a id="__codelineno-31-5" name="__codelineno-31-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"coding"</span><span class="p">,</span><span class="w"> </span><span class="s2">"development"</span><span class="p">,</span><span class="w"> </span><span class="s2">"full-access"</span><span class="p">]</span>
 <a id="__codelineno-31-6" name="__codelineno-31-6"></a>
 <a id="__codelineno-31-7" name="__codelineno-31-7"></a><span class="k">[agent]</span>
-<a id="__codelineno-31-8" name="__codelineno-31-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-31-9" name="__codelineno-31-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
+<a id="__codelineno-31-8" name="__codelineno-31-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-31-9" name="__codelineno-31-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
 <a id="__codelineno-31-10" name="__codelineno-31-10"></a><span class="n">assume_mutating</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
-<a id="__codelineno-31-11" name="__codelineno-31-11"></a><span class="n">mutating_tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;multiedit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;replace_symbol&quot;</span><span class="p">]</span>
+<a id="__codelineno-31-11" name="__codelineno-31-11"></a><span class="n">mutating_tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"multiedit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"replace_symbol"</span><span class="p">]</span>
 <a id="__codelineno-31-12" name="__codelineno-31-12"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-31-13" name="__codelineno-31-13"></a><span class="w">    </span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;multiedit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;replace_symbol&quot;</span><span class="p">,</span>
-<a id="__codelineno-31-14" name="__codelineno-31-14"></a><span class="w">    </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;ls&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;index&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;get_symbol&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;get_function&quot;</span><span class="p">,</span>
-<a id="__codelineno-31-15" name="__codelineno-31-15"></a><span class="w">    </span><span class="s2">&quot;find_symbol_references&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;create_task&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;todowrite&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;todoread&quot;</span><span class="p">,</span>
-<a id="__codelineno-31-16" name="__codelineno-31-16"></a><span class="w">    </span><span class="s2">&quot;question&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;browse&quot;</span>
+<a id="__codelineno-31-13" name="__codelineno-31-13"></a><span class="w">    </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"multiedit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"replace_symbol"</span><span class="p">,</span>
+<a id="__codelineno-31-14" name="__codelineno-31-14"></a><span class="w">    </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">,</span><span class="w"> </span><span class="s2">"ls"</span><span class="p">,</span><span class="w"> </span><span class="s2">"index"</span><span class="p">,</span><span class="w"> </span><span class="s2">"get_symbol"</span><span class="p">,</span><span class="w"> </span><span class="s2">"get_function"</span><span class="p">,</span>
+<a id="__codelineno-31-15" name="__codelineno-31-15"></a><span class="w">    </span><span class="s2">"find_symbol_references"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"create_task"</span><span class="p">,</span><span class="w"> </span><span class="s2">"todowrite"</span><span class="p">,</span><span class="w"> </span><span class="s2">"todoread"</span><span class="p">,</span>
+<a id="__codelineno-31-16" name="__codelineno-31-16"></a><span class="w">    </span><span class="s2">"question"</span><span class="p">,</span><span class="w"> </span><span class="s2">"browse"</span>
 <a id="__codelineno-31-17" name="__codelineno-31-17"></a><span class="p">]</span>
 <a id="__codelineno-31-18" name="__codelineno-31-18"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-31-19" name="__codelineno-31-19"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;prompts/coder_system.txt&quot;</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-31-20" name="__codelineno-31-20"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;prompts/code_meta.jinja2&quot;</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-31-19" name="__codelineno-31-19"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"prompts/coder_system.txt"</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-31-20" name="__codelineno-31-20"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"prompts/code_meta.jinja2"</span><span class="w"> </span><span class="p">}</span>
 <a id="__codelineno-31-21" name="__codelineno-31-21"></a><span class="p">]</span>
 <a id="__codelineno-31-22" name="__codelineno-31-22"></a>
 <a id="__codelineno-31-23" name="__codelineno-31-23"></a><span class="k">[agent.execution.snapshot]</span>
-<a id="__codelineno-31-24" name="__codelineno-31-24"></a><span class="n">backend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;git&quot;</span>
+<a id="__codelineno-31-24" name="__codelineno-31-24"></a><span class="n">backend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"git"</span>
 <a id="__codelineno-31-25" name="__codelineno-31-25"></a>
 <a id="__codelineno-31-26" name="__codelineno-31-26"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-31-27" name="__codelineno-31-27"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;agent_mode&quot;</span>
-<a id="__codelineno-31-28" name="__codelineno-31-28"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;build&quot;</span>
+<a id="__codelineno-31-27" name="__codelineno-31-27"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
+<a id="__codelineno-31-28" name="__codelineno-31-28"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"build"</span>
 <a id="__codelineno-31-29" name="__codelineno-31-29"></a>
 <a id="__codelineno-31-30" name="__codelineno-31-30"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-31-31" name="__codelineno-31-31"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;limits&quot;</span>
+<a id="__codelineno-31-31" name="__codelineno-31-31"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"limits"</span>
 <a id="__codelineno-31-32" name="__codelineno-31-32"></a><span class="n">max_steps</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">200</span>
 <a id="__codelineno-31-33" name="__codelineno-31-33"></a><span class="n">max_turns</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">50</span>
 </code></pre></div></td></tr></table></div>
@@ -3302,31 +3302,31 @@
 <span class="normal"><a href="#__codelineno-32-24">24</a></span>
 <span class="normal"><a href="#__codelineno-32-25">25</a></span>
 <span class="normal"><a href="#__codelineno-32-26">26</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-32-1" name="__codelineno-32-1"></a><span class="k">[profile]</span>
-<a id="__codelineno-32-2" name="__codelineno-32-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;reviewer&quot;</span>
-<a id="__codelineno-32-3" name="__codelineno-32-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Code Reviewer&quot;</span>
-<a id="__codelineno-32-4" name="__codelineno-32-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Read-only code review specialist&quot;</span>
-<a id="__codelineno-32-5" name="__codelineno-32-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;review&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;read-only&quot;</span><span class="p">]</span>
+<a id="__codelineno-32-2" name="__codelineno-32-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"reviewer"</span>
+<a id="__codelineno-32-3" name="__codelineno-32-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Code Reviewer"</span>
+<a id="__codelineno-32-4" name="__codelineno-32-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Read-only code review specialist"</span>
+<a id="__codelineno-32-5" name="__codelineno-32-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"review"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read-only"</span><span class="p">]</span>
 <a id="__codelineno-32-6" name="__codelineno-32-6"></a>
 <a id="__codelineno-32-7" name="__codelineno-32-7"></a><span class="k">[agent]</span>
-<a id="__codelineno-32-8" name="__codelineno-32-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-32-9" name="__codelineno-32-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
+<a id="__codelineno-32-8" name="__codelineno-32-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-32-9" name="__codelineno-32-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
 <a id="__codelineno-32-10" name="__codelineno-32-10"></a><span class="n">assume_mutating</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
 <a id="__codelineno-32-11" name="__codelineno-32-11"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-32-12" name="__codelineno-32-12"></a><span class="w">    </span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;ls&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;index&quot;</span><span class="p">,</span>
-<a id="__codelineno-32-13" name="__codelineno-32-13"></a><span class="w">    </span><span class="s2">&quot;get_symbol&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;get_function&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;find_symbol_references&quot;</span><span class="p">,</span>
-<a id="__codelineno-32-14" name="__codelineno-32-14"></a><span class="w">    </span><span class="s2">&quot;question&quot;</span>
+<a id="__codelineno-32-12" name="__codelineno-32-12"></a><span class="w">    </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">,</span><span class="w"> </span><span class="s2">"ls"</span><span class="p">,</span><span class="w"> </span><span class="s2">"index"</span><span class="p">,</span>
+<a id="__codelineno-32-13" name="__codelineno-32-13"></a><span class="w">    </span><span class="s2">"get_symbol"</span><span class="p">,</span><span class="w"> </span><span class="s2">"get_function"</span><span class="p">,</span><span class="w"> </span><span class="s2">"find_symbol_references"</span><span class="p">,</span>
+<a id="__codelineno-32-14" name="__codelineno-32-14"></a><span class="w">    </span><span class="s2">"question"</span>
 <a id="__codelineno-32-15" name="__codelineno-32-15"></a><span class="p">]</span>
-<a id="__codelineno-32-16" name="__codelineno-32-16"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;&quot;&quot;You are a code review specialist. Analyze code for:</span>
+<a id="__codelineno-32-16" name="__codelineno-32-16"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""You are a code review specialist. Analyze code for:</span>
 <a id="__codelineno-32-17" name="__codelineno-32-17"></a><span class="s2">- Correctness and logic errors</span>
 <a id="__codelineno-32-18" name="__codelineno-32-18"></a><span class="s2">- Security vulnerabilities</span>
 <a id="__codelineno-32-19" name="__codelineno-32-19"></a><span class="s2">- Performance issues</span>
 <a id="__codelineno-32-20" name="__codelineno-32-20"></a><span class="s2">- Code style and maintainability</span>
 <a id="__codelineno-32-21" name="__codelineno-32-21"></a>
-<a id="__codelineno-32-22" name="__codelineno-32-22"></a><span class="s2">Provide constructive feedback with specific suggestions.&quot;&quot;&quot;</span>
+<a id="__codelineno-32-22" name="__codelineno-32-22"></a><span class="s2">Provide constructive feedback with specific suggestions."""</span>
 <a id="__codelineno-32-23" name="__codelineno-32-23"></a>
 <a id="__codelineno-32-24" name="__codelineno-32-24"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-32-25" name="__codelineno-32-25"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;agent_mode&quot;</span>
-<a id="__codelineno-32-26" name="__codelineno-32-26"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;review&quot;</span>
+<a id="__codelineno-32-25" name="__codelineno-32-25"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
+<a id="__codelineno-32-26" name="__codelineno-32-26"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"review"</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="example-team-profiles-in-version-control">Example: Team Profiles in Version Control</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-33-1"> 1</a></span>
@@ -3353,23 +3353,23 @@
 <a id="__codelineno-33-2" name="__codelineno-33-2"></a>mkdir<span class="w"> </span>-p<span class="w"> </span>.qmt/profiles
 <a id="__codelineno-33-3" name="__codelineno-33-3"></a>
 <a id="__codelineno-33-4" name="__codelineno-33-4"></a><span class="c1"># Create team profile</span>
-<a id="__codelineno-33-5" name="__codelineno-33-5"></a>cat<span class="w"> </span>&gt;<span class="w"> </span>.qmt/profiles/team-coder.toml<span class="w"> </span><span class="s">&lt;&lt; &#39;EOF&#39;</span>
+<a id="__codelineno-33-5" name="__codelineno-33-5"></a>cat<span class="w"> </span>&gt;<span class="w"> </span>.qmt/profiles/team-coder.toml<span class="w"> </span><span class="s">&lt;&lt; 'EOF'</span>
 <a id="__codelineno-33-6" name="__codelineno-33-6"></a><span class="s">[profile]</span>
-<a id="__codelineno-33-7" name="__codelineno-33-7"></a><span class="s">id = &quot;team-coder&quot;</span>
-<a id="__codelineno-33-8" name="__codelineno-33-8"></a><span class="s">name = &quot;Team Coder&quot;</span>
-<a id="__codelineno-33-9" name="__codelineno-33-9"></a><span class="s">description = &quot;Standard team coding profile&quot;</span>
-<a id="__codelineno-33-10" name="__codelineno-33-10"></a><span class="s">tags = [&quot;team&quot;, &quot;standard&quot;]</span>
+<a id="__codelineno-33-7" name="__codelineno-33-7"></a><span class="s">id = "team-coder"</span>
+<a id="__codelineno-33-8" name="__codelineno-33-8"></a><span class="s">name = "Team Coder"</span>
+<a id="__codelineno-33-9" name="__codelineno-33-9"></a><span class="s">description = "Standard team coding profile"</span>
+<a id="__codelineno-33-10" name="__codelineno-33-10"></a><span class="s">tags = ["team", "standard"]</span>
 <a id="__codelineno-33-11" name="__codelineno-33-11"></a>
 <a id="__codelineno-33-12" name="__codelineno-33-12"></a><span class="s">[agent]</span>
-<a id="__codelineno-33-13" name="__codelineno-33-13"></a><span class="s">provider = &quot;anthropic&quot;</span>
-<a id="__codelineno-33-14" name="__codelineno-33-14"></a><span class="s">model = &quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-33-15" name="__codelineno-33-15"></a><span class="s">tools = [&quot;read_tool&quot;, &quot;edit&quot;, &quot;write_file&quot;, &quot;shell&quot;, &quot;glob&quot;, &quot;search_text&quot;]</span>
-<a id="__codelineno-33-16" name="__codelineno-33-16"></a><span class="s">system = &quot;You are a helpful coding assistant following team conventions.&quot;</span>
+<a id="__codelineno-33-13" name="__codelineno-33-13"></a><span class="s">provider = "anthropic"</span>
+<a id="__codelineno-33-14" name="__codelineno-33-14"></a><span class="s">model = "claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-33-15" name="__codelineno-33-15"></a><span class="s">tools = ["read_tool", "edit", "write_file", "shell", "glob", "search_text"]</span>
+<a id="__codelineno-33-16" name="__codelineno-33-16"></a><span class="s">system = "You are a helpful coding assistant following team conventions."</span>
 <a id="__codelineno-33-17" name="__codelineno-33-17"></a><span class="s">EOF</span>
 <a id="__codelineno-33-18" name="__codelineno-33-18"></a>
 <a id="__codelineno-33-19" name="__codelineno-33-19"></a><span class="c1"># Commit to version control</span>
 <a id="__codelineno-33-20" name="__codelineno-33-20"></a>git<span class="w"> </span>add<span class="w"> </span>.qmt/profiles/
-<a id="__codelineno-33-21" name="__codelineno-33-21"></a>git<span class="w"> </span>commit<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;Add team coding profile&quot;</span>
+<a id="__codelineno-33-21" name="__codelineno-33-21"></a>git<span class="w"> </span>commit<span class="w"> </span>-m<span class="w"> </span><span class="s2">"Add team coding profile"</span>
 </code></pre></div></td></tr></table></div>
 <p>For complete profiles documentation, see <a href="../profiles/">Profiles Guide</a>.</p>
 <hr />
@@ -3388,8 +3388,8 @@
 <span class="normal"><a href="#__codelineno-34-11">11</a></span>
 <span class="normal"><a href="#__codelineno-34-12">12</a></span>
 <span class="normal"><a href="#__codelineno-34-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-34-1" name="__codelineno-34-1"></a>---
-<a id="__codelineno-34-2" name="__codelineno-34-2"></a>description: &quot;Analyze and optimize code for performance&quot;
-<a id="__codelineno-34-3" name="__codelineno-34-3"></a><span class="gu">argument-hint: &quot;&lt;file-path&gt;&quot;</span>
+<a id="__codelineno-34-2" name="__codelineno-34-2"></a>description: "Analyze and optimize code for performance"
+<a id="__codelineno-34-3" name="__codelineno-34-3"></a><span class="gu">argument-hint: "&lt;file-path&gt;"</span>
 <a id="__codelineno-34-4" name="__codelineno-34-4"></a><span class="gu">---</span>
 <a id="__codelineno-34-5" name="__codelineno-34-5"></a>
 <a id="__codelineno-34-6" name="__codelineno-34-6"></a>Please analyze and optimize the code in $1 for:
@@ -3420,9 +3420,9 @@
 <span class="normal"><a href="#__codelineno-36-13">13</a></span>
 <span class="normal"><a href="#__codelineno-36-14">14</a></span>
 <span class="normal"><a href="#__codelineno-36-15">15</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-36-1" name="__codelineno-36-1"></a>---
-<a id="__codelineno-36-2" name="__codelineno-36-2"></a>description: &quot;Perform code review&quot;
-<a id="__codelineno-36-3" name="__codelineno-36-3"></a>argument-hint: &quot;&lt;file-path&gt; [focus-area]&quot;
-<a id="__codelineno-36-4" name="__codelineno-36-4"></a><span class="gu">allowed-tools: [&quot;read_tool&quot;, &quot;glob&quot;, &quot;search_text&quot;, &quot;question&quot;]</span>
+<a id="__codelineno-36-2" name="__codelineno-36-2"></a>description: "Perform code review"
+<a id="__codelineno-36-3" name="__codelineno-36-3"></a>argument-hint: "&lt;file-path&gt; [focus-area]"
+<a id="__codelineno-36-4" name="__codelineno-36-4"></a><span class="gu">allowed-tools: ["read_tool", "glob", "search_text", "question"]</span>
 <a id="__codelineno-36-5" name="__codelineno-36-5"></a><span class="gu">---</span>
 <a id="__codelineno-36-6" name="__codelineno-36-6"></a>
 <a id="__codelineno-36-7" name="__codelineno-36-7"></a>Please review the code in $1.
@@ -3452,8 +3452,8 @@
 <span class="normal"><a href="#__codelineno-38-11">11</a></span>
 <span class="normal"><a href="#__codelineno-38-12">12</a></span>
 <span class="normal"><a href="#__codelineno-38-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-38-1" name="__codelineno-38-1"></a>---
-<a id="__codelineno-38-2" name="__codelineno-38-2"></a>description: &quot;Run project tests&quot;
-<a id="__codelineno-38-3" name="__codelineno-38-3"></a><span class="gu">argument-hint: &quot;[test-filter]&quot;</span>
+<a id="__codelineno-38-2" name="__codelineno-38-2"></a>description: "Run project tests"
+<a id="__codelineno-38-3" name="__codelineno-38-3"></a><span class="gu">argument-hint: "[test-filter]"</span>
 <a id="__codelineno-38-4" name="__codelineno-38-4"></a><span class="gu">---</span>
 <a id="__codelineno-38-5" name="__codelineno-38-5"></a>
 <a id="__codelineno-38-6" name="__codelineno-38-6"></a>Run the project test suite.
@@ -3484,8 +3484,8 @@
 <span class="normal"><a href="#__codelineno-40-11">11</a></span>
 <span class="normal"><a href="#__codelineno-40-12">12</a></span>
 <span class="normal"><a href="#__codelineno-40-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-40-1" name="__codelineno-40-1"></a>---
-<a id="__codelineno-40-2" name="__codelineno-40-2"></a>description: &quot;Create semantic commit message&quot;
-<a id="__codelineno-40-3" name="__codelineno-40-3"></a><span class="gu">allowed-tools: [&quot;shell&quot;, &quot;question&quot;]</span>
+<a id="__codelineno-40-2" name="__codelineno-40-2"></a>description: "Create semantic commit message"
+<a id="__codelineno-40-3" name="__codelineno-40-3"></a><span class="gu">allowed-tools: ["shell", "question"]</span>
 <a id="__codelineno-40-4" name="__codelineno-40-4"></a><span class="gu">---</span>
 <a id="__codelineno-40-5" name="__codelineno-40-5"></a>
 <a id="__codelineno-40-6" name="__codelineno-40-6"></a>Create a semantic commit for the current changes.
@@ -3506,7 +3506,7 @@
 <h3 id="example-index-source-files">Example: Index Source Files</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-42-1">1</a></span>
 <span class="normal"><a href="#__codelineno-42-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-42-1" name="__codelineno-42-1"></a><span class="c1"># In the agent session, use the index tool</span>
-<a id="__codelineno-42-2" name="__codelineno-42-2"></a>&gt;<span class="w"> </span>index<span class="o">(</span><span class="nv">path</span><span class="o">=</span><span class="s2">&quot;src/main.rs&quot;</span><span class="o">)</span>
+<a id="__codelineno-42-2" name="__codelineno-42-2"></a>&gt;<span class="w"> </span>index<span class="o">(</span><span class="nv">path</span><span class="o">=</span><span class="s2">"src/main.rs"</span><span class="o">)</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Output:</strong>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-43-1">1</a></span>
@@ -3524,7 +3524,7 @@
 <a id="__codelineno-43-7" name="__codelineno-43-7"></a>Tests: [85-120]
 </code></pre></div></td></tr></table></div></p>
 <h3 id="example-get-symbol-definition">Example: Get Symbol Definition</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-44-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-44-1" name="__codelineno-44-1"></a>&gt;<span class="w"> </span>get_symbol<span class="o">(</span><span class="nv">requests</span><span class="o">=[{</span>path:<span class="w"> </span><span class="s2">&quot;src/lib.rs&quot;</span>,<span class="w"> </span>symbol:<span class="w"> </span><span class="s2">&quot;MyStruct&quot;</span>,<span class="w"> </span>kind:<span class="w"> </span><span class="s2">&quot;struct&quot;</span><span class="o">}])</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-44-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-44-1" name="__codelineno-44-1"></a>&gt;<span class="w"> </span>get_symbol<span class="o">(</span><span class="nv">requests</span><span class="o">=[{</span>path:<span class="w"> </span><span class="s2">"src/lib.rs"</span>,<span class="w"> </span>symbol:<span class="w"> </span><span class="s2">"MyStruct"</span>,<span class="w"> </span>kind:<span class="w"> </span><span class="s2">"struct"</span><span class="o">}])</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Output:</strong>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-45-1">1</a></span>
@@ -3536,7 +3536,7 @@
 <a id="__codelineno-45-4" name="__codelineno-45-4"></a>00013| }
 </code></pre></div></td></tr></table></div></p>
 <h3 id="example-find-all-references">Example: Find All References</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-46-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-46-1" name="__codelineno-46-1"></a>&gt;<span class="w"> </span>find_symbol_references<span class="o">(</span><span class="nv">paths</span><span class="o">=[</span><span class="s2">&quot;src/lib.rs&quot;</span><span class="o">]</span>,<span class="w"> </span><span class="nv">symbols</span><span class="o">=[</span><span class="s2">&quot;MyStruct&quot;</span><span class="o">])</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-46-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-46-1" name="__codelineno-46-1"></a>&gt;<span class="w"> </span>find_symbol_references<span class="o">(</span><span class="nv">paths</span><span class="o">=[</span><span class="s2">"src/lib.rs"</span><span class="o">]</span>,<span class="w"> </span><span class="nv">symbols</span><span class="o">=[</span><span class="s2">"MyStruct"</span><span class="o">])</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Output:</strong>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-47-1">1</a></span>
@@ -3551,9 +3551,9 @@
 <span class="normal"><a href="#__codelineno-48-3">3</a></span>
 <span class="normal"><a href="#__codelineno-48-4">4</a></span>
 <span class="normal"><a href="#__codelineno-48-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-48-1" name="__codelineno-48-1"></a>&gt;<span class="w"> </span>replace_symbol<span class="o">(</span><span class="nv">replacements</span><span class="o">=[{</span>
-<a id="__codelineno-48-2" name="__codelineno-48-2"></a><span class="w">    </span>path:<span class="w"> </span><span class="s2">&quot;src/lib.rs&quot;</span>,
-<a id="__codelineno-48-3" name="__codelineno-48-3"></a><span class="w">    </span>symbol:<span class="w"> </span><span class="s2">&quot;my_function&quot;</span>,
-<a id="__codelineno-48-4" name="__codelineno-48-4"></a><span class="w">    </span>newText:<span class="w"> </span><span class="s2">&quot;fn my_function() -&gt; i32 {\n    42\n}&quot;</span>
+<a id="__codelineno-48-2" name="__codelineno-48-2"></a><span class="w">    </span>path:<span class="w"> </span><span class="s2">"src/lib.rs"</span>,
+<a id="__codelineno-48-3" name="__codelineno-48-3"></a><span class="w">    </span>symbol:<span class="w"> </span><span class="s2">"my_function"</span>,
+<a id="__codelineno-48-4" name="__codelineno-48-4"></a><span class="w">    </span>newText:<span class="w"> </span><span class="s2">"fn my_function() -&gt; i32 {\n    42\n}"</span>
 <a id="__codelineno-48-5" name="__codelineno-48-5"></a><span class="o">}])</span>
 </code></pre></div></td></tr></table></div>
 <p>For more on code intelligence tools, see <a href="../configuration/#new-tools-reference">Configuration Guide</a>.</p>
@@ -3564,7 +3564,7 @@
 <ol>
 <li>
 <p>Start a mesh node with dashboard:
-   <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-49-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-49-1" name="__codelineno-49-1"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span><span class="s2">&quot;remote dashboard&quot;</span><span class="w"> </span>--<span class="w"> </span>--mesh<span class="w"> </span>--dashboard
+   <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-49-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-49-1" name="__codelineno-49-1"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span><span class="s2">"remote dashboard"</span><span class="w"> </span>--<span class="w"> </span>--mesh<span class="w"> </span>--dashboard
 </code></pre></div></td></tr></table></div></p>
 </li>
 <li>
@@ -3631,11 +3631,11 @@
 <span class="normal"><a href="#__codelineno-51-5">5</a></span>
 <span class="normal"><a href="#__codelineno-51-6">6</a></span>
 <span class="normal"><a href="#__codelineno-51-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-51-1" name="__codelineno-51-1"></a><span class="p">{</span>
-<a id="__codelineno-51-2" name="__codelineno-51-2"></a><span class="w">  </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;create_schedule&quot;</span><span class="p">,</span>
-<a id="__codelineno-51-3" name="__codelineno-51-3"></a><span class="w">  </span><span class="nt">&quot;session_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&lt;session-public-id&gt;&quot;</span><span class="p">,</span>
-<a id="__codelineno-51-4" name="__codelineno-51-4"></a><span class="w">  </span><span class="nt">&quot;prompt&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Run system health check: verify services, check disk space, review logs for errors&quot;</span><span class="p">,</span>
-<a id="__codelineno-51-5" name="__codelineno-51-5"></a><span class="w">  </span><span class="nt">&quot;trigger&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;interval&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;seconds&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">3600</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-51-6" name="__codelineno-51-6"></a><span class="w">  </span><span class="nt">&quot;max_steps&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">50</span>
+<a id="__codelineno-51-2" name="__codelineno-51-2"></a><span class="w">  </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"create_schedule"</span><span class="p">,</span>
+<a id="__codelineno-51-3" name="__codelineno-51-3"></a><span class="w">  </span><span class="nt">"session_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;session-public-id&gt;"</span><span class="p">,</span>
+<a id="__codelineno-51-4" name="__codelineno-51-4"></a><span class="w">  </span><span class="nt">"prompt"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Run system health check: verify services, check disk space, review logs for errors"</span><span class="p">,</span>
+<a id="__codelineno-51-5" name="__codelineno-51-5"></a><span class="w">  </span><span class="nt">"trigger"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"interval"</span><span class="p">,</span><span class="w"> </span><span class="nt">"seconds"</span><span class="p">:</span><span class="w"> </span><span class="mi">3600</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-51-6" name="__codelineno-51-6"></a><span class="w">  </span><span class="nt">"max_steps"</span><span class="p">:</span><span class="w"> </span><span class="mi">50</span>
 <a id="__codelineno-51-7" name="__codelineno-51-7"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="example-code-quality-monitor-event-driven">Example: Code Quality Monitor (Event-Driven)</h3>
@@ -3652,16 +3652,16 @@
 <span class="normal"><a href="#__codelineno-52-11">11</a></span>
 <span class="normal"><a href="#__codelineno-52-12">12</a></span>
 <span class="normal"><a href="#__codelineno-52-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-52-1" name="__codelineno-52-1"></a><span class="p">{</span>
-<a id="__codelineno-52-2" name="__codelineno-52-2"></a><span class="w">  </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;create_schedule&quot;</span><span class="p">,</span>
-<a id="__codelineno-52-3" name="__codelineno-52-3"></a><span class="w">  </span><span class="nt">&quot;session_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&lt;session-public-id&gt;&quot;</span><span class="p">,</span>
-<a id="__codelineno-52-4" name="__codelineno-52-4"></a><span class="w">  </span><span class="nt">&quot;prompt&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Review recent file changes for code quality issues&quot;</span><span class="p">,</span>
-<a id="__codelineno-52-5" name="__codelineno-52-5"></a><span class="w">  </span><span class="nt">&quot;trigger&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-52-6" name="__codelineno-52-6"></a><span class="w">    </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;event_driven&quot;</span><span class="p">,</span>
-<a id="__codelineno-52-7" name="__codelineno-52-7"></a><span class="w">    </span><span class="nt">&quot;event_filter&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-52-8" name="__codelineno-52-8"></a><span class="w">      </span><span class="nt">&quot;event_kinds&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;file_modified&quot;</span><span class="p">],</span>
-<a id="__codelineno-52-9" name="__codelineno-52-9"></a><span class="w">      </span><span class="nt">&quot;threshold&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">10</span>
+<a id="__codelineno-52-2" name="__codelineno-52-2"></a><span class="w">  </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"create_schedule"</span><span class="p">,</span>
+<a id="__codelineno-52-3" name="__codelineno-52-3"></a><span class="w">  </span><span class="nt">"session_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;session-public-id&gt;"</span><span class="p">,</span>
+<a id="__codelineno-52-4" name="__codelineno-52-4"></a><span class="w">  </span><span class="nt">"prompt"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Review recent file changes for code quality issues"</span><span class="p">,</span>
+<a id="__codelineno-52-5" name="__codelineno-52-5"></a><span class="w">  </span><span class="nt">"trigger"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-52-6" name="__codelineno-52-6"></a><span class="w">    </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"event_driven"</span><span class="p">,</span>
+<a id="__codelineno-52-7" name="__codelineno-52-7"></a><span class="w">    </span><span class="nt">"event_filter"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-52-8" name="__codelineno-52-8"></a><span class="w">      </span><span class="nt">"event_kinds"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"file_modified"</span><span class="p">],</span>
+<a id="__codelineno-52-9" name="__codelineno-52-9"></a><span class="w">      </span><span class="nt">"threshold"</span><span class="p">:</span><span class="w"> </span><span class="mi">10</span>
 <a id="__codelineno-52-10" name="__codelineno-52-10"></a><span class="w">    </span><span class="p">},</span>
-<a id="__codelineno-52-11" name="__codelineno-52-11"></a><span class="w">    </span><span class="nt">&quot;debounce_seconds&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">300</span>
+<a id="__codelineno-52-11" name="__codelineno-52-11"></a><span class="w">    </span><span class="nt">"debounce_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mi">300</span>
 <a id="__codelineno-52-12" name="__codelineno-52-12"></a><span class="w">  </span><span class="p">}</span>
 <a id="__codelineno-52-13" name="__codelineno-52-13"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
@@ -3672,10 +3672,10 @@
 <span class="normal"><a href="#__codelineno-53-4">4</a></span>
 <span class="normal"><a href="#__codelineno-53-5">5</a></span>
 <span class="normal"><a href="#__codelineno-53-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-53-1" name="__codelineno-53-1"></a><span class="p">{</span>
-<a id="__codelineno-53-2" name="__codelineno-53-2"></a><span class="w">  </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;create_schedule&quot;</span><span class="p">,</span>
-<a id="__codelineno-53-3" name="__codelineno-53-3"></a><span class="w">  </span><span class="nt">&quot;session_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&lt;session-public-id&gt;&quot;</span><span class="p">,</span>
-<a id="__codelineno-53-4" name="__codelineno-53-4"></a><span class="w">  </span><span class="nt">&quot;prompt&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Generate daily standup summary: what was done yesterday, what&#39;s planned today, any blockers&quot;</span><span class="p">,</span>
-<a id="__codelineno-53-5" name="__codelineno-53-5"></a><span class="w">  </span><span class="nt">&quot;trigger&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;interval&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;seconds&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">86400</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-53-2" name="__codelineno-53-2"></a><span class="w">  </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"create_schedule"</span><span class="p">,</span>
+<a id="__codelineno-53-3" name="__codelineno-53-3"></a><span class="w">  </span><span class="nt">"session_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;session-public-id&gt;"</span><span class="p">,</span>
+<a id="__codelineno-53-4" name="__codelineno-53-4"></a><span class="w">  </span><span class="nt">"prompt"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Generate daily standup summary: what was done yesterday, what's planned today, any blockers"</span><span class="p">,</span>
+<a id="__codelineno-53-5" name="__codelineno-53-5"></a><span class="w">  </span><span class="nt">"trigger"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"interval"</span><span class="p">,</span><span class="w"> </span><span class="nt">"seconds"</span><span class="p">:</span><span class="w"> </span><span class="mi">86400</span><span class="w"> </span><span class="p">}</span>
 <a id="__codelineno-53-6" name="__codelineno-53-6"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="example-scheduled-agent-configurations">Example Scheduled Agent Configurations</h3>
@@ -3743,7 +3743,7 @@
 <a id="__codelineno-54-26" name="__codelineno-54-26"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--profile<span class="w"> </span>coder
 <a id="__codelineno-54-27" name="__codelineno-54-27"></a>
 <a id="__codelineno-54-28" name="__codelineno-54-28"></a><span class="c1"># Dashboard with mesh</span>
-<a id="__codelineno-54-29" name="__codelineno-54-29"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span><span class="s2">&quot;dashboard remote&quot;</span><span class="w"> </span>--<span class="w"> </span>--dashboard<span class="w"> </span>--mesh
+<a id="__codelineno-54-29" name="__codelineno-54-29"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span><span class="s2">"dashboard remote"</span><span class="w"> </span>--<span class="w"> </span>--dashboard<span class="w"> </span>--mesh
 </code></pre></div></td></tr></table></div>
 <hr />
 <h2 id="related-documentation">Related Documentation</h2>
@@ -3880,7 +3880,7 @@
       <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"search":"../../assets/javascripts/workers/search.7d14d953.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.69c251d7.min.js"></script>
+      <script src="../../assets/javascripts/bundle.e886cdf1.min.js"></script>
       
     
   </body>

@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.0.53">
+      <meta name="generator" content="zensical-0.0.55">
     
     
       
@@ -3251,9 +3251,9 @@
 <span class="normal"><a href="#__codelineno-0-12">12</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2"></a>
 <a id="__codelineno-0-3" name="__codelineno-0-3"></a><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">single</span><span class="p">()</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4"></a><span class="w">    </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">&quot;anthropic&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;claude-sonnet-4-5-20250929&quot;</span><span class="p">)</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5"></a><span class="w">    </span><span class="p">.</span><span class="n">cwd</span><span class="p">(</span><span class="s">&quot;.&quot;</span><span class="p">)</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6"></a><span class="w">    </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;edit&quot;</span><span class="p">])</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4"></a><span class="w">    </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5"></a><span class="w">    </span><span class="p">.</span><span class="n">cwd</span><span class="p">(</span><span class="s">"."</span><span class="p">)</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6"></a><span class="w">    </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s">"edit"</span><span class="p">])</span>
 <a id="__codelineno-0-7" name="__codelineno-0-7"></a><span class="w">    </span><span class="p">.</span><span class="n">mesh</span><span class="p">(</span><span class="n">Mesh</span><span class="p">::</span><span class="n">hybrid</span><span class="p">())</span>
 <a id="__codelineno-0-8" name="__codelineno-0-8"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
 <a id="__codelineno-0-9" name="__codelineno-0-9"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
@@ -3277,7 +3277,7 @@
 <a id="__codelineno-1-5" name="__codelineno-1-5"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh<span class="o">=</span>/ip4/0.0.0.0/tcp/9001
 <a id="__codelineno-1-6" name="__codelineno-1-6"></a>
 <a id="__codelineno-1-7" name="__codelineno-1-7"></a><span class="c1"># Start with dashboard and mesh</span>
-<a id="__codelineno-1-8" name="__codelineno-1-8"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span><span class="s2">&quot;dashboard remote&quot;</span><span class="w"> </span>--<span class="w"> </span>--dashboard<span class="w"> </span>--mesh
+<a id="__codelineno-1-8" name="__codelineno-1-8"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span><span class="s2">"dashboard remote"</span><span class="w"> </span>--<span class="w"> </span>--dashboard<span class="w"> </span>--mesh
 </code></pre></div></td></tr></table></div>
 <h3 id="connecting-to-a-mesh">Connecting to a Mesh</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-2-1">1</a></span>
@@ -3309,20 +3309,20 @@
 <span class="normal"><a href="#__codelineno-3-21">21</a></span>
 <span class="normal"><a href="#__codelineno-3-22">22</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a><span class="k">[mesh]</span>
 <a id="__codelineno-3-2" name="__codelineno-3-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-3-3" name="__codelineno-3-3"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/0.0.0.0/tcp/9000&quot;</span><span class="w">  </span><span class="c1"># Multiaddr to listen on</span>
-<a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="n">transport</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;iroh&quot;</span><span class="w">                 </span><span class="c1"># Enable iroh transport for invite joins</span>
-<a id="__codelineno-3-5" name="__codelineno-3-5"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;mdns&quot;</span><span class="w">                 </span><span class="c1"># &quot;mdns&quot; | &quot;kademlia&quot; | &quot;none&quot;</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/0.0.0.0/tcp/9000"</span><span class="w">  </span><span class="c1"># Multiaddr to listen on</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="n">transport</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"iroh"</span><span class="w">                 </span><span class="c1"># Enable iroh transport for invite joins</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mdns"</span><span class="w">                 </span><span class="c1"># "mdns" | "kademlia" | "none"</span>
 <a id="__codelineno-3-6" name="__codelineno-3-6"></a><span class="n">auto_fallback</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span><span class="w">              </span><span class="c1"># Allow mesh provider discovery</span>
-<a id="__codelineno-3-7" name="__codelineno-3-7"></a><span class="n">node_name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;my-agent-node&quot;</span><span class="w">        </span><span class="c1"># Optional: human-readable name</span>
-<a id="__codelineno-3-8" name="__codelineno-3-8"></a><span class="n">identity_file</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;~/.qmt/mesh_identity.key&quot;</span><span class="w">  </span><span class="c1"># Optional: identity keypair</span>
+<a id="__codelineno-3-7" name="__codelineno-3-7"></a><span class="n">node_name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"my-agent-node"</span><span class="w">        </span><span class="c1"># Optional: human-readable name</span>
+<a id="__codelineno-3-8" name="__codelineno-3-8"></a><span class="n">identity_file</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"~/.qmt/mesh_identity.key"</span><span class="w">  </span><span class="c1"># Optional: identity keypair</span>
 <a id="__codelineno-3-9" name="__codelineno-3-9"></a>
 <a id="__codelineno-3-10" name="__codelineno-3-10"></a><span class="k">[mesh.lan]</span>
 <a id="__codelineno-3-11" name="__codelineno-3-11"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
 <a id="__codelineno-3-12" name="__codelineno-3-12"></a>
 <a id="__codelineno-3-13" name="__codelineno-3-13"></a><span class="c1"># Explicit peers to connect to</span>
 <a id="__codelineno-3-14" name="__codelineno-3-14"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-3-15" name="__codelineno-3-15"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;dev-gpu&quot;</span>
-<a id="__codelineno-3-16" name="__codelineno-3-16"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/192.168.1.100/tcp/9000&quot;</span>
+<a id="__codelineno-3-15" name="__codelineno-3-15"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"dev-gpu"</span>
+<a id="__codelineno-3-16" name="__codelineno-3-16"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.100/tcp/9000"</span>
 <a id="__codelineno-3-17" name="__codelineno-3-17"></a>
 <a id="__codelineno-3-18" name="__codelineno-3-18"></a><span class="c1"># Request timeout for non-streaming calls</span>
 <a id="__codelineno-3-19" name="__codelineno-3-19"></a><span class="n">request_timeout_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">300</span>
@@ -3412,7 +3412,7 @@
 <span class="normal"><a href="#__codelineno-4-2">2</a></span>
 <span class="normal"><a href="#__codelineno-4-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="k">[mesh]</span>
 <a id="__codelineno-4-2" name="__codelineno-4-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="n">transport</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;lan&quot;</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="n">transport</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"lan"</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Characteristics:</strong>
 - ✅ <strong>Fast</strong>: Optimized for low-latency LAN connections
@@ -3430,7 +3430,7 @@
 <span class="normal"><a href="#__codelineno-5-2">2</a></span>
 <span class="normal"><a href="#__codelineno-5-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="k">[mesh]</span>
 <a id="__codelineno-5-2" name="__codelineno-5-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="n">transport</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;iroh&quot;</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="n">transport</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"iroh"</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Characteristics:</strong>
 - ✅ <strong>Internet-capable</strong>: Works across the internet
@@ -3496,7 +3496,7 @@
 <p>Automatic discovery on local network:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-6-1">1</a></span>
 <span class="normal"><a href="#__codelineno-6-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1"></a><span class="k">[mesh]</span>
-<a id="__codelineno-6-2" name="__codelineno-6-2"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;mdns&quot;</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mdns"</span>
 </code></pre></div></td></tr></table></div>
 <ul>
 <li><strong>Pros</strong>: Zero-config, automatic</li>
@@ -3506,7 +3506,7 @@
 <p>Distributed discovery across the internet:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-7-1">1</a></span>
 <span class="normal"><a href="#__codelineno-7-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="k">[mesh]</span>
-<a id="__codelineno-7-2" name="__codelineno-7-2"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;kademlia&quot;</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"kademlia"</span>
 </code></pre></div></td></tr></table></div>
 <ul>
 <li><strong>Pros</strong>: Cross-subnet, internet-wide</li>
@@ -3524,15 +3524,15 @@
 <span class="normal"><a href="#__codelineno-8-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-8-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-8-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1"></a><span class="k">[mesh]</span>
-<a id="__codelineno-8-2" name="__codelineno-8-2"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;none&quot;</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"none"</span>
 <a id="__codelineno-8-3" name="__codelineno-8-3"></a>
 <a id="__codelineno-8-4" name="__codelineno-8-4"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-8-5" name="__codelineno-8-5"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;server1&quot;</span>
-<a id="__codelineno-8-6" name="__codelineno-8-6"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/192.168.1.100/tcp/9000&quot;</span>
+<a id="__codelineno-8-5" name="__codelineno-8-5"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"server1"</span>
+<a id="__codelineno-8-6" name="__codelineno-8-6"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.100/tcp/9000"</span>
 <a id="__codelineno-8-7" name="__codelineno-8-7"></a>
 <a id="__codelineno-8-8" name="__codelineno-8-8"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-8-9" name="__codelineno-8-9"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;server2&quot;</span>
-<a id="__codelineno-8-10" name="__codelineno-8-10"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/192.168.1.101/tcp/9000&quot;</span>
+<a id="__codelineno-8-9" name="__codelineno-8-9"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"server2"</span>
+<a id="__codelineno-8-10" name="__codelineno-8-10"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.101/tcp/9000"</span>
 </code></pre></div></td></tr></table></div>
 <ul>
 <li><strong>Pros</strong>: Precise control, reliable</li>
@@ -3543,7 +3543,7 @@
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1">1</a></span>
 <span class="normal"><a href="#__codelineno-9-2">2</a></span>
 <span class="normal"><a href="#__codelineno-9-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a><span class="k">[mesh]</span>
-<a id="__codelineno-9-2" name="__codelineno-9-2"></a><span class="n">transport</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;iroh&quot;</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2"></a><span class="n">transport</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"iroh"</span>
 <a id="__codelineno-9-3" name="__codelineno-9-3"></a><span class="c1"># Discovery is automatic via invite tokens and relay network</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>How it works:</strong>
@@ -3638,20 +3638,20 @@
 <a id="__codelineno-10-4" name="__codelineno-10-4"></a><span class="c1"># LAN transport configuration</span>
 <a id="__codelineno-10-5" name="__codelineno-10-5"></a><span class="k">[mesh.lan]</span>
 <a id="__codelineno-10-6" name="__codelineno-10-6"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-10-7" name="__codelineno-10-7"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/0.0.0.0/tcp/0&quot;</span>
-<a id="__codelineno-10-8" name="__codelineno-10-8"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;mdns&quot;</span>
+<a id="__codelineno-10-7" name="__codelineno-10-7"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/0.0.0.0/tcp/0"</span>
+<a id="__codelineno-10-8" name="__codelineno-10-8"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mdns"</span>
 <a id="__codelineno-10-9" name="__codelineno-10-9"></a>
 <a id="__codelineno-10-10" name="__codelineno-10-10"></a><span class="c1"># Iroh scope 1: Personal mesh</span>
 <a id="__codelineno-10-11" name="__codelineno-10-11"></a><span class="k">[[mesh.iroh]]</span>
 <a id="__codelineno-10-12" name="__codelineno-10-12"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-10-13" name="__codelineno-10-13"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;personal&quot;</span>
-<a id="__codelineno-10-14" name="__codelineno-10-14"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_PERSONAL_INVITE}&quot;</span>
+<a id="__codelineno-10-13" name="__codelineno-10-13"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"personal"</span>
+<a id="__codelineno-10-14" name="__codelineno-10-14"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_PERSONAL_INVITE}"</span>
 <a id="__codelineno-10-15" name="__codelineno-10-15"></a>
 <a id="__codelineno-10-16" name="__codelineno-10-16"></a><span class="c1"># Iroh scope 2: Team mesh</span>
 <a id="__codelineno-10-17" name="__codelineno-10-17"></a><span class="k">[[mesh.iroh]]</span>
 <a id="__codelineno-10-18" name="__codelineno-10-18"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-10-19" name="__codelineno-10-19"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;team&quot;</span>
-<a id="__codelineno-10-20" name="__codelineno-10-20"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_TEAM_INVITE}&quot;</span>
+<a id="__codelineno-10-19" name="__codelineno-10-19"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"team"</span>
+<a id="__codelineno-10-20" name="__codelineno-10-20"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_TEAM_INVITE}"</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="configuration-reference_1">Configuration Reference</h3>
 <h4 id="lan-subtable-meshlan">LAN Subtable (<code>[mesh.lan]</code>)</h4>
@@ -3660,8 +3660,8 @@
 <span class="normal"><a href="#__codelineno-11-3">3</a></span>
 <span class="normal"><a href="#__codelineno-11-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1"></a><span class="k">[mesh.lan]</span>
 <a id="__codelineno-11-2" name="__codelineno-11-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span><span class="w">                           </span><span class="c1"># Enable LAN transport</span>
-<a id="__codelineno-11-3" name="__codelineno-11-3"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/0.0.0.0/tcp/0&quot;</span><span class="w">           </span><span class="c1"># Multiaddr to listen on</span>
-<a id="__codelineno-11-4" name="__codelineno-11-4"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;mdns&quot;</span><span class="w">                       </span><span class="c1"># &quot;mdns&quot; | &quot;kademlia&quot; | &quot;none&quot;</span>
+<a id="__codelineno-11-3" name="__codelineno-11-3"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/0.0.0.0/tcp/0"</span><span class="w">           </span><span class="c1"># Multiaddr to listen on</span>
+<a id="__codelineno-11-4" name="__codelineno-11-4"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mdns"</span><span class="w">                       </span><span class="c1"># "mdns" | "kademlia" | "none"</span>
 </code></pre></div></td></tr></table></div>
 <table>
 <thead>
@@ -3699,8 +3699,8 @@
 <span class="normal"><a href="#__codelineno-12-3">3</a></span>
 <span class="normal"><a href="#__codelineno-12-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1"></a><span class="k">[[mesh.iroh]]</span>
 <a id="__codelineno-12-2" name="__codelineno-12-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span><span class="w">                           </span><span class="c1"># Enable this Iroh scope</span>
-<a id="__codelineno-12-3" name="__codelineno-12-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;scope-name&quot;</span><span class="w">                      </span><span class="c1"># Human-readable scope name (used as mesh_id)</span>
-<a id="__codelineno-12-4" name="__codelineno-12-4"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_INVITE_TOKEN}&quot;</span><span class="w">           </span><span class="c1"># Invite token to join existing mesh</span>
+<a id="__codelineno-12-3" name="__codelineno-12-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"scope-name"</span><span class="w">                      </span><span class="c1"># Human-readable scope name (used as mesh_id)</span>
+<a id="__codelineno-12-4" name="__codelineno-12-4"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_INVITE_TOKEN}"</span><span class="w">           </span><span class="c1"># Invite token to join existing mesh</span>
 </code></pre></div></td></tr></table></div>
 <table>
 <thead>
@@ -3750,12 +3750,12 @@
 <a id="__codelineno-13-3" name="__codelineno-13-3"></a>
 <a id="__codelineno-13-4" name="__codelineno-13-4"></a><span class="k">[mesh.lan]</span>
 <a id="__codelineno-13-5" name="__codelineno-13-5"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-13-6" name="__codelineno-13-6"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;mdns&quot;</span>
+<a id="__codelineno-13-6" name="__codelineno-13-6"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mdns"</span>
 <a id="__codelineno-13-7" name="__codelineno-13-7"></a>
 <a id="__codelineno-13-8" name="__codelineno-13-8"></a><span class="k">[[mesh.iroh]]</span>
 <a id="__codelineno-13-9" name="__codelineno-13-9"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-13-10" name="__codelineno-13-10"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;personal&quot;</span>
-<a id="__codelineno-13-11" name="__codelineno-13-11"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_HOME_INVITE}&quot;</span>
+<a id="__codelineno-13-10" name="__codelineno-13-10"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"personal"</span>
+<a id="__codelineno-13-11" name="__codelineno-13-11"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_HOME_INVITE}"</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Benefits:</strong>
 - Fast LAN connections for local machines
@@ -3784,18 +3784,18 @@
 <a id="__codelineno-14-3" name="__codelineno-14-3"></a>
 <a id="__codelineno-14-4" name="__codelineno-14-4"></a><span class="k">[[mesh.iroh]]</span>
 <a id="__codelineno-14-5" name="__codelineno-14-5"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-14-6" name="__codelineno-14-6"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;engineering&quot;</span>
-<a id="__codelineno-14-7" name="__codelineno-14-7"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_ENG_INVITE}&quot;</span>
+<a id="__codelineno-14-6" name="__codelineno-14-6"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"engineering"</span>
+<a id="__codelineno-14-7" name="__codelineno-14-7"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_ENG_INVITE}"</span>
 <a id="__codelineno-14-8" name="__codelineno-14-8"></a>
 <a id="__codelineno-14-9" name="__codelineno-14-9"></a><span class="k">[[mesh.iroh]]</span>
 <a id="__codelineno-14-10" name="__codelineno-14-10"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-14-11" name="__codelineno-14-11"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;data-science&quot;</span>
-<a id="__codelineno-14-12" name="__codelineno-14-12"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_DS_INVITE}&quot;</span>
+<a id="__codelineno-14-11" name="__codelineno-14-11"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"data-science"</span>
+<a id="__codelineno-14-12" name="__codelineno-14-12"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_DS_INVITE}"</span>
 <a id="__codelineno-14-13" name="__codelineno-14-13"></a>
 <a id="__codelineno-14-14" name="__codelineno-14-14"></a><span class="k">[[mesh.iroh]]</span>
 <a id="__codelineno-14-15" name="__codelineno-14-15"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-14-16" name="__codelineno-14-16"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;devops&quot;</span>
-<a id="__codelineno-14-17" name="__codelineno-14-17"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_DEVOPS_INVITE}&quot;</span>
+<a id="__codelineno-14-16" name="__codelineno-14-16"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"devops"</span>
+<a id="__codelineno-14-17" name="__codelineno-14-17"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_DEVOPS_INVITE}"</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Benefits:</strong>
 - Single node accessible from multiple teams
@@ -3821,13 +3821,13 @@
 <a id="__codelineno-15-4" name="__codelineno-15-4"></a>
 <a id="__codelineno-15-5" name="__codelineno-15-5"></a><span class="k">[mesh.lan]</span>
 <a id="__codelineno-15-6" name="__codelineno-15-6"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-15-7" name="__codelineno-15-7"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/0.0.0.0/tcp/9000&quot;</span>
-<a id="__codelineno-15-8" name="__codelineno-15-8"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;mdns&quot;</span>
+<a id="__codelineno-15-7" name="__codelineno-15-7"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/0.0.0.0/tcp/9000"</span>
+<a id="__codelineno-15-8" name="__codelineno-15-8"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mdns"</span>
 <a id="__codelineno-15-9" name="__codelineno-15-9"></a>
 <a id="__codelineno-15-10" name="__codelineno-15-10"></a><span class="k">[[mesh.iroh]]</span>
 <a id="__codelineno-15-11" name="__codelineno-15-11"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-15-12" name="__codelineno-15-12"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;remote-access&quot;</span>
-<a id="__codelineno-15-13" name="__codelineno-15-13"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_REMOTE_INVITE}&quot;</span>
+<a id="__codelineno-15-12" name="__codelineno-15-12"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"remote-access"</span>
+<a id="__codelineno-15-13" name="__codelineno-15-13"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_REMOTE_INVITE}"</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="multi-transport-routing">Multi-Transport Routing</h3>
 <p>When a node participates in multiple meshes, routing considers:</p>
@@ -3867,8 +3867,8 @@
 <span class="normal"><a href="#__codelineno-17-3">3</a></span>
 <span class="normal"><a href="#__codelineno-17-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1"></a><span class="k">[mesh]</span>
 <a id="__codelineno-17-2" name="__codelineno-17-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-17-3" name="__codelineno-17-3"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/0.0.0.0/tcp/0&quot;</span>
-<a id="__codelineno-17-4" name="__codelineno-17-4"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;mdns&quot;</span>
+<a id="__codelineno-17-3" name="__codelineno-17-3"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/0.0.0.0/tcp/0"</span>
+<a id="__codelineno-17-4" name="__codelineno-17-4"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mdns"</span>
 </code></pre></div></td></tr></table></div></p>
 <p><strong>After (LAN + Internet):</strong>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-18-1"> 1</a></span>
@@ -3887,13 +3887,13 @@
 <a id="__codelineno-18-3" name="__codelineno-18-3"></a>
 <a id="__codelineno-18-4" name="__codelineno-18-4"></a><span class="k">[mesh.lan]</span>
 <a id="__codelineno-18-5" name="__codelineno-18-5"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-18-6" name="__codelineno-18-6"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/0.0.0.0/tcp/0&quot;</span>
-<a id="__codelineno-18-7" name="__codelineno-18-7"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;mdns&quot;</span>
+<a id="__codelineno-18-6" name="__codelineno-18-6"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/0.0.0.0/tcp/0"</span>
+<a id="__codelineno-18-7" name="__codelineno-18-7"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mdns"</span>
 <a id="__codelineno-18-8" name="__codelineno-18-8"></a>
 <a id="__codelineno-18-9" name="__codelineno-18-9"></a><span class="k">[[mesh.iroh]]</span>
 <a id="__codelineno-18-10" name="__codelineno-18-10"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-18-11" name="__codelineno-18-11"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;remote&quot;</span>
-<a id="__codelineno-18-12" name="__codelineno-18-12"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_REMOTE_INVITE}&quot;</span>
+<a id="__codelineno-18-11" name="__codelineno-18-11"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"remote"</span>
+<a id="__codelineno-18-12" name="__codelineno-18-12"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_REMOTE_INVITE}"</span>
 </code></pre></div></td></tr></table></div></p>
 <h4 id="from-single-iroh-to-multi-transport">From Single Iroh to Multi-Transport</h4>
 <p><strong>Before (Single Iroh):</strong>
@@ -3902,8 +3902,8 @@
 <span class="normal"><a href="#__codelineno-19-3">3</a></span>
 <span class="normal"><a href="#__codelineno-19-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1"></a><span class="k">[mesh]</span>
 <a id="__codelineno-19-2" name="__codelineno-19-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-19-3" name="__codelineno-19-3"></a><span class="n">transport</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;iroh&quot;</span>
-<a id="__codelineno-19-4" name="__codelineno-19-4"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_INVITE}&quot;</span>
+<a id="__codelineno-19-3" name="__codelineno-19-3"></a><span class="n">transport</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"iroh"</span>
+<a id="__codelineno-19-4" name="__codelineno-19-4"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_INVITE}"</span>
 </code></pre></div></td></tr></table></div></p>
 <p><strong>After (Multiple Iroh scopes):</strong>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-20-1"> 1</a></span>
@@ -3922,13 +3922,13 @@
 <a id="__codelineno-20-3" name="__codelineno-20-3"></a>
 <a id="__codelineno-20-4" name="__codelineno-20-4"></a><span class="k">[[mesh.iroh]]</span>
 <a id="__codelineno-20-5" name="__codelineno-20-5"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-20-6" name="__codelineno-20-6"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;primary&quot;</span>
-<a id="__codelineno-20-7" name="__codelineno-20-7"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_PRIMARY_INVITE}&quot;</span>
+<a id="__codelineno-20-6" name="__codelineno-20-6"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"primary"</span>
+<a id="__codelineno-20-7" name="__codelineno-20-7"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_PRIMARY_INVITE}"</span>
 <a id="__codelineno-20-8" name="__codelineno-20-8"></a>
 <a id="__codelineno-20-9" name="__codelineno-20-9"></a><span class="k">[[mesh.iroh]]</span>
 <a id="__codelineno-20-10" name="__codelineno-20-10"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-20-11" name="__codelineno-20-11"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;secondary&quot;</span>
-<a id="__codelineno-20-12" name="__codelineno-20-12"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_SECONDARY_INVITE}&quot;</span>
+<a id="__codelineno-20-11" name="__codelineno-20-11"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"secondary"</span>
+<a id="__codelineno-20-12" name="__codelineno-20-12"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_SECONDARY_INVITE}"</span>
 </code></pre></div></td></tr></table></div></p>
 <h3 id="multi-transport-best-practices">Multi-Transport Best Practices</h3>
 <ol>
@@ -4011,7 +4011,7 @@
 <a id="__codelineno-23-2" name="__codelineno-23-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh<span class="w"> </span>--mesh-invite
 <a id="__codelineno-23-3" name="__codelineno-23-3"></a>
 <a id="__codelineno-23-4" name="__codelineno-23-4"></a><span class="c1"># Create named mesh invite</span>
-<a id="__codelineno-23-5" name="__codelineno-23-5"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh<span class="w"> </span>--mesh-invite<span class="o">=</span><span class="s2">&quot;My Agent Mesh&quot;</span>
+<a id="__codelineno-23-5" name="__codelineno-23-5"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh<span class="w"> </span>--mesh-invite<span class="o">=</span><span class="s2">"My Agent Mesh"</span>
 <a id="__codelineno-23-6" name="__codelineno-23-6"></a>
 <a id="__codelineno-23-7" name="__codelineno-23-7"></a><span class="c1"># Create invite with specific TTL (default: 24h)</span>
 <a id="__codelineno-23-8" name="__codelineno-23-8"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh<span class="w"> </span>--mesh-invite<span class="w"> </span>--invite-ttl<span class="o">=</span>7d
@@ -4029,9 +4029,9 @@
 <span class="normal"><a href="#__codelineno-24-4">4</a></span>
 <span class="normal"><a href="#__codelineno-24-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-24-1" name="__codelineno-24-1"></a><span class="k">[mesh]</span>
 <a id="__codelineno-24-2" name="__codelineno-24-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-24-3" name="__codelineno-24-3"></a><span class="n">transport</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;iroh&quot;</span>
+<a id="__codelineno-24-3" name="__codelineno-24-3"></a><span class="n">transport</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"iroh"</span>
 <a id="__codelineno-24-4" name="__codelineno-24-4"></a><span class="c1"># Store invite in environment variable</span>
-<a id="__codelineno-24-5" name="__codelineno-24-5"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_MESH_INVITE}&quot;</span>
+<a id="__codelineno-24-5" name="__codelineno-24-5"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_MESH_INVITE}"</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="joining-via-invite-tokens">Joining via Invite Tokens</h3>
 <h4 id="via-cli_1">Via CLI</h4>
@@ -4050,8 +4050,8 @@
 <a id="__codelineno-25-5" name="__codelineno-25-5"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh-join<span class="o">=</span>eyJpbnZ...
 <a id="__codelineno-25-6" name="__codelineno-25-6"></a>
 <a id="__codelineno-25-7" name="__codelineno-25-7"></a><span class="c1"># Join using environment variable</span>
-<a id="__codelineno-25-8" name="__codelineno-25-8"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_MESH_INVITE</span><span class="o">=</span><span class="s2">&quot;eyJpbnZ...&quot;</span>
-<a id="__codelineno-25-9" name="__codelineno-25-9"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh-join<span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">QMT_MESH_INVITE</span><span class="si">}</span><span class="s2">&quot;</span>
+<a id="__codelineno-25-8" name="__codelineno-25-8"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_MESH_INVITE</span><span class="o">=</span><span class="s2">"eyJpbnZ..."</span>
+<a id="__codelineno-25-9" name="__codelineno-25-9"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh-join<span class="o">=</span><span class="s2">"</span><span class="si">${</span><span class="nv">QMT_MESH_INVITE</span><span class="si">}</span><span class="s2">"</span>
 </code></pre></div></td></tr></table></div>
 <h4 id="via-toml-configuration_1">Via TOML Configuration</h4>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-26-1">1</a></span>
@@ -4059,8 +4059,8 @@
 <span class="normal"><a href="#__codelineno-26-3">3</a></span>
 <span class="normal"><a href="#__codelineno-26-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-26-1" name="__codelineno-26-1"></a><span class="k">[mesh]</span>
 <a id="__codelineno-26-2" name="__codelineno-26-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-26-3" name="__codelineno-26-3"></a><span class="c1"># Join mode: when invite is set, transport auto-switches to &quot;iroh&quot;</span>
-<a id="__codelineno-26-4" name="__codelineno-26-4"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_MESH_INVITE}&quot;</span>
+<a id="__codelineno-26-3" name="__codelineno-26-3"></a><span class="c1"># Join mode: when invite is set, transport auto-switches to "iroh"</span>
+<a id="__codelineno-26-4" name="__codelineno-26-4"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_MESH_INVITE}"</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="invite-security-model">Invite Security Model</h3>
 <h4 id="ed25519-identity-keypair">Ed25519 Identity Keypair</h4>
@@ -4112,7 +4112,7 @@
 <span class="normal"><a href="#__codelineno-27-14">14</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-27-1" name="__codelineno-27-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">InviteGrant</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-27-2" name="__codelineno-27-2"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">version</span><span class="p">:</span><span class="w"> </span><span class="kt">u8</span><span class="p">,</span><span class="w">              </span><span class="c1">// Wire format version (3)</span>
 <a id="__codelineno-27-3" name="__codelineno-27-3"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">invite_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w">        </span><span class="c1">// UUID v7 (time-ordered)</span>
-<a id="__codelineno-27-4" name="__codelineno-27-4"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">inviter_peer_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w">  </span><span class="c1">// Host&#39;s PeerId</span>
+<a id="__codelineno-27-4" name="__codelineno-27-4"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">inviter_peer_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w">  </span><span class="c1">// Host's PeerId</span>
 <a id="__codelineno-27-5" name="__codelineno-27-5"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">mesh_name</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span><span class="c1">// Human-readable mesh name</span>
 <a id="__codelineno-27-6" name="__codelineno-27-6"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">expires_at</span><span class="p">:</span><span class="w"> </span><span class="kt">u64</span><span class="p">,</span><span class="w">          </span><span class="c1">// Unix timestamp (0 = no expiry)</span>
 <a id="__codelineno-27-7" name="__codelineno-27-7"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">max_uses</span><span class="p">:</span><span class="w"> </span><span class="kt">u32</span><span class="p">,</span><span class="w">            </span><span class="c1">// Max uses (0 = unlimited)</span>
@@ -4121,7 +4121,7 @@
 <a id="__codelineno-27-10" name="__codelineno-27-10"></a>
 <a id="__codelineno-27-11" name="__codelineno-27-11"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">InvitePermissions</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-27-12" name="__codelineno-27-12"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">can_invite</span><span class="p">:</span><span class="w"> </span><span class="kt">bool</span><span class="p">,</span><span class="w">         </span><span class="c1">// Can create sub-invites?</span>
-<a id="__codelineno-27-13" name="__codelineno-27-13"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">role</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w">             </span><span class="c1">// &quot;member&quot; or &quot;client&quot;</span>
+<a id="__codelineno-27-13" name="__codelineno-27-13"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">role</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w">             </span><span class="c1">// "member" or "client"</span>
 <a id="__codelineno-27-14" name="__codelineno-27-14"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="qr-code-support">QR Code Support</h3>
@@ -4139,7 +4139,7 @@
 <a id="__codelineno-28-2" name="__codelineno-28-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">agent</span><span class="p">::</span><span class="n">remote</span><span class="p">::</span><span class="n">qr</span><span class="p">;</span>
 <a id="__codelineno-28-3" name="__codelineno-28-3"></a>
 <a id="__codelineno-28-4" name="__codelineno-28-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">qr_code</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">qr</span><span class="p">::</span><span class="n">generate_qr</span><span class="p">(</span><span class="o">&amp;</span><span class="n">invite_token</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-28-5" name="__codelineno-28-5"></a><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;{}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">qr_code</span><span class="p">);</span>
+<a id="__codelineno-28-5" name="__codelineno-28-5"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"{}"</span><span class="p">,</span><span class="w"> </span><span class="n">qr_code</span><span class="p">);</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="invite-management">Invite Management</h3>
 <h4 id="environment-variable-interpolation">Environment Variable Interpolation</h4>
@@ -4148,10 +4148,10 @@
 <span class="normal"><a href="#__codelineno-29-2">2</a></span>
 <span class="normal"><a href="#__codelineno-29-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-29-1" name="__codelineno-29-1"></a><span class="k">[mesh]</span>
 <a id="__codelineno-29-2" name="__codelineno-29-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-29-3" name="__codelineno-29-3"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_MESH_INVITE}&quot;</span><span class="w">  </span><span class="c1"># Reads from environment</span>
+<a id="__codelineno-29-3" name="__codelineno-29-3"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_MESH_INVITE}"</span><span class="w">  </span><span class="c1"># Reads from environment</span>
 </code></pre></div></td></tr></table></div>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-30-1">1</a></span>
-<span class="normal"><a href="#__codelineno-30-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-30-1" name="__codelineno-30-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_MESH_INVITE</span><span class="o">=</span><span class="s2">&quot;eyJpbnZ...&quot;</span>
+<span class="normal"><a href="#__codelineno-30-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-30-1" name="__codelineno-30-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_MESH_INVITE</span><span class="o">=</span><span class="s2">"eyJpbnZ..."</span>
 <a id="__codelineno-30-2" name="__codelineno-30-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh
 </code></pre></div></td></tr></table></div>
 <h4 id="token-lifecycle">Token Lifecycle</h4>
@@ -4172,7 +4172,7 @@
 <span class="normal"><a href="#__codelineno-31-4">4</a></span>
 <span class="normal"><a href="#__codelineno-31-5">5</a></span>
 <span class="normal"><a href="#__codelineno-31-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-31-1" name="__codelineno-31-1"></a><span class="c1"># Machine A (host): Create invite</span>
-<a id="__codelineno-31-2" name="__codelineno-31-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh<span class="w"> </span>--mesh-invite<span class="o">=</span><span class="s2">&quot;Dev Team&quot;</span>
+<a id="__codelineno-31-2" name="__codelineno-31-2"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>qmtcode<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh<span class="w"> </span>--mesh-invite<span class="o">=</span><span class="s2">"Dev Team"</span>
 <a id="__codelineno-31-3" name="__codelineno-31-3"></a><span class="c1"># Output: Invite token: qmt://mesh/join/eyJpbnZ...</span>
 <a id="__codelineno-31-4" name="__codelineno-31-4"></a>
 <a id="__codelineno-31-5" name="__codelineno-31-5"></a><span class="c1"># Machine B (joiner): Join via token</span>
@@ -4198,7 +4198,7 @@
 <a id="__codelineno-33-4" name="__codelineno-33-4"></a><span class="c1"># config.toml</span>
 <a id="__codelineno-33-5" name="__codelineno-33-5"></a><span class="k">[mesh]</span>
 <a id="__codelineno-33-6" name="__codelineno-33-6"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-33-7" name="__codelineno-33-7"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_MESH_INVITE}&quot;</span>
+<a id="__codelineno-33-7" name="__codelineno-33-7"></a><span class="n">invite</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_MESH_INVITE}"</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="best-practices">Best Practices</h3>
 <ol>
@@ -4225,10 +4225,10 @@
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-34-1">1</a></span>
 <span class="normal"><a href="#__codelineno-34-2">2</a></span>
 <span class="normal"><a href="#__codelineno-34-3">3</a></span>
-<span class="normal"><a href="#__codelineno-34-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-34-1" name="__codelineno-34-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">mesh</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">mesh</span><span class="p">().</span><span class="n">expect</span><span class="p">(</span><span class="s">&quot;agent built with mesh support&quot;</span><span class="p">);</span>
+<span class="normal"><a href="#__codelineno-34-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-34-1" name="__codelineno-34-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">mesh</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">mesh</span><span class="p">().</span><span class="n">expect</span><span class="p">(</span><span class="s">"agent built with mesh support"</span><span class="p">);</span>
 <a id="__codelineno-34-2" name="__codelineno-34-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">joined</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mesh</span><span class="p">.</span><span class="n">join</span><span class="p">(</span><span class="n">invite_code</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 <a id="__codelineno-34-3" name="__codelineno-34-3"></a>
-<a id="__codelineno-34-4" name="__codelineno-34-4"></a><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;joined mesh {} via {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">joined</span><span class="p">.</span><span class="n">mesh_id</span><span class="p">,</span><span class="w"> </span><span class="n">joined</span><span class="p">.</span><span class="n">inviter_peer_id</span><span class="p">);</span>
+<a id="__codelineno-34-4" name="__codelineno-34-4"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"joined mesh {} via {}"</span><span class="p">,</span><span class="w"> </span><span class="n">joined</span><span class="p">.</span><span class="n">mesh_id</span><span class="p">,</span><span class="w"> </span><span class="n">joined</span><span class="p">.</span><span class="n">inviter_peer_id</span><span class="p">);</span>
 </code></pre></div></td></tr></table></div>
 <p>The returned <code>MeshJoinOutcome</code> reports:</p>
 <ul>
@@ -4252,16 +4252,16 @@
 <span class="normal"><a href="#__codelineno-35-11">11</a></span>
 <span class="normal"><a href="#__codelineno-35-12">12</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-35-1" name="__codelineno-35-1"></a><span class="c1"># Mesh peer definition</span>
 <a id="__codelineno-35-2" name="__codelineno-35-2"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-35-3" name="__codelineno-35-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-server&quot;</span>
-<a id="__codelineno-35-4" name="__codelineno-35-4"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/192.168.1.100/tcp/9000&quot;</span>
+<a id="__codelineno-35-3" name="__codelineno-35-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
+<a id="__codelineno-35-4" name="__codelineno-35-4"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.100/tcp/9000"</span>
 <a id="__codelineno-35-5" name="__codelineno-35-5"></a>
 <a id="__codelineno-35-6" name="__codelineno-35-6"></a><span class="c1"># Remote agent configuration</span>
 <a id="__codelineno-35-7" name="__codelineno-35-7"></a><span class="k">[[remote_agents]]</span>
-<a id="__codelineno-35-8" name="__codelineno-35-8"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-coder&quot;</span>
-<a id="__codelineno-35-9" name="__codelineno-35-9"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;GPU Coder&quot;</span>
-<a id="__codelineno-35-10" name="__codelineno-35-10"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Coder running on GPU server with fast model&quot;</span>
-<a id="__codelineno-35-11" name="__codelineno-35-11"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-server&quot;</span>
-<a id="__codelineno-35-12" name="__codelineno-35-12"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;gpu&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;fast-model&quot;</span><span class="p">]</span>
+<a id="__codelineno-35-8" name="__codelineno-35-8"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-coder"</span>
+<a id="__codelineno-35-9" name="__codelineno-35-9"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"GPU Coder"</span>
+<a id="__codelineno-35-10" name="__codelineno-35-10"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Coder running on GPU server with fast model"</span>
+<a id="__codelineno-35-11" name="__codelineno-35-11"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
+<a id="__codelineno-35-12" name="__codelineno-35-12"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"gpu"</span><span class="p">,</span><span class="w"> </span><span class="s2">"fast-model"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="remote-delegate">Remote Delegate</h3>
 <p>Delegates can run on remote nodes:</p>
@@ -4272,12 +4272,12 @@
 <span class="normal"><a href="#__codelineno-36-5">5</a></span>
 <span class="normal"><a href="#__codelineno-36-6">6</a></span>
 <span class="normal"><a href="#__codelineno-36-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-36-1" name="__codelineno-36-1"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-36-2" name="__codelineno-36-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;remote-coder&quot;</span>
-<a id="__codelineno-36-3" name="__codelineno-36-3"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-36-4" name="__codelineno-36-4"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-36-5" name="__codelineno-36-5"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Coder on remote GPU machine&quot;</span>
-<a id="__codelineno-36-6" name="__codelineno-36-6"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-server&quot;</span><span class="w">  </span><span class="c1"># Routes LLM calls to remote node</span>
-<a id="__codelineno-36-7" name="__codelineno-36-7"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">]</span>
+<a id="__codelineno-36-2" name="__codelineno-36-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"remote-coder"</span>
+<a id="__codelineno-36-3" name="__codelineno-36-3"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-36-4" name="__codelineno-36-4"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-36-5" name="__codelineno-36-5"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Coder on remote GPU machine"</span>
+<a id="__codelineno-36-6" name="__codelineno-36-6"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span><span class="w">  </span><span class="c1"># Routes LLM calls to remote node</span>
+<a id="__codelineno-36-7" name="__codelineno-36-7"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Behavior:</strong>
 - LLM calls are routed to the remote node
@@ -4297,7 +4297,7 @@
 <span class="normal"><a href="#__codelineno-37-2">2</a></span>
 <span class="normal"><a href="#__codelineno-37-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-37-1" name="__codelineno-37-1"></a><span class="k">[mesh]</span>
 <a id="__codelineno-37-2" name="__codelineno-37-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-37-3" name="__codelineno-37-3"></a><span class="n">identity_file</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;~/.qmt/mesh_identity.key&quot;</span><span class="w">  </span><span class="c1"># Default location</span>
+<a id="__codelineno-37-3" name="__codelineno-37-3"></a><span class="n">identity_file</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"~/.qmt/mesh_identity.key"</span><span class="w">  </span><span class="c1"># Default location</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="custom-identity-path">Custom Identity Path</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-38-1">1</a></span>
@@ -4306,9 +4306,9 @@
 <span class="normal"><a href="#__codelineno-38-4">4</a></span>
 <span class="normal"><a href="#__codelineno-38-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-38-1" name="__codelineno-38-1"></a><span class="k">[mesh]</span>
 <a id="__codelineno-38-2" name="__codelineno-38-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-38-3" name="__codelineno-38-3"></a><span class="n">identity_file</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/etc/querymt/mesh.key&quot;</span><span class="w">  </span><span class="c1"># System-wide</span>
+<a id="__codelineno-38-3" name="__codelineno-38-3"></a><span class="n">identity_file</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/etc/querymt/mesh.key"</span><span class="w">  </span><span class="c1"># System-wide</span>
 <a id="__codelineno-38-4" name="__codelineno-38-4"></a><span class="c1"># Or relative to config directory</span>
-<a id="__codelineno-38-5" name="__codelineno-38-5"></a><span class="n">identity_file</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;./mesh.key&quot;</span>
+<a id="__codelineno-38-5" name="__codelineno-38-5"></a><span class="n">identity_file</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"./mesh.key"</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="identity-management-best-practices">Identity Management Best Practices</h3>
 <ol>
@@ -4323,7 +4323,7 @@
 <span class="normal"><a href="#__codelineno-39-2">2</a></span>
 <span class="normal"><a href="#__codelineno-39-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-39-1" name="__codelineno-39-1"></a><span class="k">[mesh]</span>
 <a id="__codelineno-39-2" name="__codelineno-39-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-39-3" name="__codelineno-39-3"></a><span class="n">node_name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-server-01&quot;</span><span class="w">  </span><span class="c1"># Human-readable name</span>
+<a id="__codelineno-39-3" name="__codelineno-39-3"></a><span class="n">node_name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server-01"</span><span class="w">  </span><span class="c1"># Human-readable name</span>
 </code></pre></div></td></tr></table></div>
 <p>Useful when:
 - OS hostname is meaningless (e.g., "unknown" on mobile)
@@ -4346,14 +4346,14 @@
 <a id="__codelineno-40-2" name="__codelineno-40-2"></a>
 <a id="__codelineno-40-3" name="__codelineno-40-3"></a><span class="c1">// Create session on remote node</span>
 <a id="__codelineno-40-4" name="__codelineno-40-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">remote_session</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span>
-<a id="__codelineno-40-5" name="__codelineno-40-5"></a><span class="w">    </span><span class="p">.</span><span class="n">create_remote_session</span><span class="p">(</span><span class="s">&quot;gpu-server&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;coder&quot;</span><span class="p">)</span>
+<a id="__codelineno-40-5" name="__codelineno-40-5"></a><span class="w">    </span><span class="p">.</span><span class="n">create_remote_session</span><span class="p">(</span><span class="s">"gpu-server"</span><span class="p">,</span><span class="w"> </span><span class="s">"coder"</span><span class="p">)</span>
 <a id="__codelineno-40-6" name="__codelineno-40-6"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 <a id="__codelineno-40-7" name="__codelineno-40-7"></a>
 <a id="__codelineno-40-8" name="__codelineno-40-8"></a><span class="c1">// Attach to remote session</span>
 <a id="__codelineno-40-9" name="__codelineno-40-9"></a><span class="kd">let</span><span class="w"> </span><span class="n">session</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">attach_remote_session</span><span class="p">(</span><span class="n">remote_session</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 <a id="__codelineno-40-10" name="__codelineno-40-10"></a>
 <a id="__codelineno-40-11" name="__codelineno-40-11"></a><span class="c1">// Use session normally</span>
-<a id="__codelineno-40-12" name="__codelineno-40-12"></a><span class="kd">let</span><span class="w"> </span><span class="n">response</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">session</span><span class="p">.</span><span class="n">chat</span><span class="p">(</span><span class="s">&quot;Hello!&quot;</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-40-12" name="__codelineno-40-12"></a><span class="kd">let</span><span class="w"> </span><span class="n">response</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">session</span><span class="p">.</span><span class="n">chat</span><span class="p">(</span><span class="s">"Hello!"</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="listing-remote-nodes">Listing Remote Nodes</h3>
 <p>Use <code>list_remote_nodes()</code> to discover available mesh peers and their capabilities:</p>
@@ -4418,7 +4418,7 @@
 <span class="normal"><a href="#__codelineno-44-2">2</a></span>
 <span class="normal"><a href="#__codelineno-44-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-44-1" name="__codelineno-44-1"></a><span class="c1"># On remote node (host)</span>
 <a id="__codelineno-44-2" name="__codelineno-44-2"></a><span class="k">[agent]</span>
-<a id="__codelineno-44-3" name="__codelineno-44-3"></a><span class="n">db</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/path/to/sessions.db&quot;</span><span class="w">  </span><span class="c1"># Session storage</span>
+<a id="__codelineno-44-3" name="__codelineno-44-3"></a><span class="n">db</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/path/to/sessions.db"</span><span class="w">  </span><span class="c1"># Session storage</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Persistence features:</strong>
 - <strong>SQLite storage</strong>: Sessions stored in SQLite database
@@ -4541,15 +4541,15 @@
 <a id="__codelineno-48-2" name="__codelineno-48-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
 <a id="__codelineno-48-3" name="__codelineno-48-3"></a>
 <a id="__codelineno-48-4" name="__codelineno-48-4"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-48-5" name="__codelineno-48-5"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-server&quot;</span>
-<a id="__codelineno-48-6" name="__codelineno-48-6"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/192.168.1.100/tcp/9000&quot;</span>
+<a id="__codelineno-48-5" name="__codelineno-48-5"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
+<a id="__codelineno-48-6" name="__codelineno-48-6"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.100/tcp/9000"</span>
 <a id="__codelineno-48-7" name="__codelineno-48-7"></a>
 <a id="__codelineno-48-8" name="__codelineno-48-8"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-48-9" name="__codelineno-48-9"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-coder&quot;</span>
-<a id="__codelineno-48-10" name="__codelineno-48-10"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-48-11" name="__codelineno-48-11"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4&quot;</span>
-<a id="__codelineno-48-12" name="__codelineno-48-12"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-server&quot;</span>
-<a id="__codelineno-48-13" name="__codelineno-48-13"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">]</span>
+<a id="__codelineno-48-9" name="__codelineno-48-9"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-coder"</span>
+<a id="__codelineno-48-10" name="__codelineno-48-10"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-48-11" name="__codelineno-48-11"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4"</span>
+<a id="__codelineno-48-12" name="__codelineno-48-12"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
+<a id="__codelineno-48-13" name="__codelineno-48-13"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div></p>
 <h3 id="2-distributed-team-collaboration">2. Distributed Team Collaboration</h3>
 <pre class="mermaid"><code>flowchart TD
@@ -4587,15 +4587,15 @@
 <span class="normal"><a href="#__codelineno-49-10">10</a></span>
 <span class="normal"><a href="#__codelineno-49-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-49-1" name="__codelineno-49-1"></a><span class="k">[mesh]</span>
 <a id="__codelineno-49-2" name="__codelineno-49-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-49-3" name="__codelineno-49-3"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;kademlia&quot;</span>
+<a id="__codelineno-49-3" name="__codelineno-49-3"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"kademlia"</span>
 <a id="__codelineno-49-4" name="__codelineno-49-4"></a>
 <a id="__codelineno-49-5" name="__codelineno-49-5"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-49-6" name="__codelineno-49-6"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;worker1&quot;</span>
-<a id="__codelineno-49-7" name="__codelineno-49-7"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/10.0.0.1/tcp/9000&quot;</span>
+<a id="__codelineno-49-6" name="__codelineno-49-6"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"worker1"</span>
+<a id="__codelineno-49-7" name="__codelineno-49-7"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/10.0.0.1/tcp/9000"</span>
 <a id="__codelineno-49-8" name="__codelineno-49-8"></a>
 <a id="__codelineno-49-9" name="__codelineno-49-9"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-49-10" name="__codelineno-49-10"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;worker2&quot;</span>
-<a id="__codelineno-49-11" name="__codelineno-49-11"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/10.0.0.2/tcp/9000&quot;</span>
+<a id="__codelineno-49-10" name="__codelineno-49-10"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"worker2"</span>
+<a id="__codelineno-49-11" name="__codelineno-49-11"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/10.0.0.2/tcp/9000"</span>
 </code></pre></div></td></tr></table></div></p>
 <h3 id="4-specialized-hardware">4. Specialized Hardware</h3>
 <pre class="mermaid"><code>flowchart LR
@@ -4936,12 +4936,12 @@
 <a id="__codelineno-59-2" name="__codelineno-59-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">peer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mesh</span><span class="p">.</span><span class="n">peer_id</span><span class="p">();</span>
 <a id="__codelineno-59-3" name="__codelineno-59-3"></a><span class="kd">let</span><span class="w"> </span><span class="n">listen_addrs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mesh</span><span class="p">.</span><span class="n">listen_addresses</span><span class="p">();</span>
 <a id="__codelineno-59-4" name="__codelineno-59-4"></a>
-<a id="__codelineno-59-5" name="__codelineno-59-5"></a><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;Local peer ID: {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">peer_id</span><span class="p">);</span>
-<a id="__codelineno-59-6" name="__codelineno-59-6"></a><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;Listening on: {:?}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">listen_addrs</span><span class="p">);</span>
+<a id="__codelineno-59-5" name="__codelineno-59-5"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"Local peer ID: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">peer_id</span><span class="p">);</span>
+<a id="__codelineno-59-6" name="__codelineno-59-6"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"Listening on: {:?}"</span><span class="p">,</span><span class="w"> </span><span class="n">listen_addrs</span><span class="p">);</span>
 <a id="__codelineno-59-7" name="__codelineno-59-7"></a>
 <a id="__codelineno-59-8" name="__codelineno-59-8"></a><span class="c1">// Get connected peers</span>
 <a id="__codelineno-59-9" name="__codelineno-59-9"></a><span class="kd">let</span><span class="w"> </span><span class="n">peers</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mesh</span><span class="p">.</span><span class="n">connected_peers</span><span class="p">().</span><span class="k">await</span><span class="p">;</span>
-<a id="__codelineno-59-10" name="__codelineno-59-10"></a><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;Connected to {} peers&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">peers</span><span class="p">.</span><span class="n">len</span><span class="p">());</span>
+<a id="__codelineno-59-10" name="__codelineno-59-10"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"Connected to {} peers"</span><span class="p">,</span><span class="w"> </span><span class="n">peers</span><span class="p">.</span><span class="n">len</span><span class="p">());</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="event-logging">Event Logging</h3>
 <p>Enable mesh logging:</p>
@@ -5039,32 +5039,32 @@
 <span class="normal"><a href="#__codelineno-61-27">27</a></span>
 <span class="normal"><a href="#__codelineno-61-28">28</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-61-1" name="__codelineno-61-1"></a><span class="k">[mesh]</span>
 <a id="__codelineno-61-2" name="__codelineno-61-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-61-3" name="__codelineno-61-3"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/0.0.0.0/tcp/9000&quot;</span>
-<a id="__codelineno-61-4" name="__codelineno-61-4"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;mdns&quot;</span>
+<a id="__codelineno-61-3" name="__codelineno-61-3"></a><span class="n">listen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/0.0.0.0/tcp/9000"</span>
+<a id="__codelineno-61-4" name="__codelineno-61-4"></a><span class="n">discovery</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mdns"</span>
 <a id="__codelineno-61-5" name="__codelineno-61-5"></a><span class="n">auto_fallback</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
 <a id="__codelineno-61-6" name="__codelineno-61-6"></a><span class="n">request_timeout_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">300</span>
 <a id="__codelineno-61-7" name="__codelineno-61-7"></a>
 <a id="__codelineno-61-8" name="__codelineno-61-8"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-61-9" name="__codelineno-61-9"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;dev-gpu&quot;</span>
-<a id="__codelineno-61-10" name="__codelineno-61-10"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/192.168.1.100/tcp/9000&quot;</span>
+<a id="__codelineno-61-9" name="__codelineno-61-9"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"dev-gpu"</span>
+<a id="__codelineno-61-10" name="__codelineno-61-10"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.100/tcp/9000"</span>
 <a id="__codelineno-61-11" name="__codelineno-61-11"></a>
 <a id="__codelineno-61-12" name="__codelineno-61-12"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-61-13" name="__codelineno-61-13"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;build-server&quot;</span>
-<a id="__codelineno-61-14" name="__codelineno-61-14"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/192.168.1.101/tcp/9000&quot;</span>
+<a id="__codelineno-61-13" name="__codelineno-61-13"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"build-server"</span>
+<a id="__codelineno-61-14" name="__codelineno-61-14"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.101/tcp/9000"</span>
 <a id="__codelineno-61-15" name="__codelineno-61-15"></a>
 <a id="__codelineno-61-16" name="__codelineno-61-16"></a><span class="k">[[remote_agents]]</span>
-<a id="__codelineno-61-17" name="__codelineno-61-17"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-coder&quot;</span>
-<a id="__codelineno-61-18" name="__codelineno-61-18"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;GPU Coder&quot;</span>
-<a id="__codelineno-61-19" name="__codelineno-61-19"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Coder on GPU machine&quot;</span>
-<a id="__codelineno-61-20" name="__codelineno-61-20"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;dev-gpu&quot;</span>
-<a id="__codelineno-61-21" name="__codelineno-61-21"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;gpu&quot;</span><span class="p">]</span>
+<a id="__codelineno-61-17" name="__codelineno-61-17"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-coder"</span>
+<a id="__codelineno-61-18" name="__codelineno-61-18"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"GPU Coder"</span>
+<a id="__codelineno-61-19" name="__codelineno-61-19"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Coder on GPU machine"</span>
+<a id="__codelineno-61-20" name="__codelineno-61-20"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"dev-gpu"</span>
+<a id="__codelineno-61-21" name="__codelineno-61-21"></a><span class="n">capabilities</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"gpu"</span><span class="p">]</span>
 <a id="__codelineno-61-22" name="__codelineno-61-22"></a>
 <a id="__codelineno-61-23" name="__codelineno-61-23"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-61-24" name="__codelineno-61-24"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-coder-delegate&quot;</span>
-<a id="__codelineno-61-25" name="__codelineno-61-25"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-61-26" name="__codelineno-61-26"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4&quot;</span>
-<a id="__codelineno-61-27" name="__codelineno-61-27"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;dev-gpu&quot;</span>
-<a id="__codelineno-61-28" name="__codelineno-61-28"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">]</span>
+<a id="__codelineno-61-24" name="__codelineno-61-24"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-coder-delegate"</span>
+<a id="__codelineno-61-25" name="__codelineno-61-25"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-61-26" name="__codelineno-61-26"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4"</span>
+<a id="__codelineno-61-27" name="__codelineno-61-27"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"dev-gpu"</span>
+<a id="__codelineno-61-28" name="__codelineno-61-28"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="command-line-examples">Command Line Examples</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-62-1"> 1</a></span>
@@ -5084,7 +5084,7 @@
 <a id="__codelineno-62-5" name="__codelineno-62-5"></a>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh<span class="o">=</span>/ip4/0.0.0.0/tcp/9001
 <a id="__codelineno-62-6" name="__codelineno-62-6"></a>
 <a id="__codelineno-62-7" name="__codelineno-62-7"></a><span class="c1"># Start with dashboard and mesh</span>
-<a id="__codelineno-62-8" name="__codelineno-62-8"></a>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span><span class="s2">&quot;dashboard remote&quot;</span><span class="w"> </span>--<span class="w"> </span>--dashboard<span class="w"> </span>--mesh
+<a id="__codelineno-62-8" name="__codelineno-62-8"></a>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span><span class="s2">"dashboard remote"</span><span class="w"> </span>--<span class="w"> </span>--dashboard<span class="w"> </span>--mesh
 <a id="__codelineno-62-9" name="__codelineno-62-9"></a>
 <a id="__codelineno-62-10" name="__codelineno-62-10"></a><span class="c1"># Connect to specific peer</span>
 <a id="__codelineno-62-11" name="__codelineno-62-11"></a>cargo<span class="w"> </span>run<span class="w"> </span>--features<span class="w"> </span>remote<span class="w"> </span>--<span class="w"> </span>--mesh<span class="o">=</span>/ip4/192.168.1.100/tcp/9000
@@ -5219,7 +5219,7 @@
       <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"search":"../../assets/javascripts/workers/search.7d14d953.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.69c251d7.min.js"></script>
+      <script src="../../assets/javascripts/bundle.e886cdf1.min.js"></script>
       
     
   </body>

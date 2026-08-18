@@ -17,7 +17,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.0.53">
+      <meta name="generator" content="zensical-0.0.55">
     
     
       
@@ -1690,39 +1690,39 @@
 <span class="normal"><a href="#__codelineno-3-36">36</a></span>
 <span class="normal"><a href="#__codelineno-3-37">37</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a><span class="c1"># Optional profile metadata (for local catalogs)</span>
 <a id="__codelineno-3-2" name="__codelineno-3-2"></a><span class="k">[profile]</span>
-<a id="__codelineno-3-3" name="__codelineno-3-3"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;coder&quot;</span>
-<a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Full-Featured Coder&quot;</span>
-<a id="__codelineno-3-5" name="__codelineno-3-5"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Complete coding agent with all tools enabled&quot;</span>
-<a id="__codelineno-3-6" name="__codelineno-3-6"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;coding&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;development&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;full-access&quot;</span><span class="p">]</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Full-Featured Coder"</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Complete coding agent with all tools enabled"</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"coding"</span><span class="p">,</span><span class="w"> </span><span class="s2">"development"</span><span class="p">,</span><span class="w"> </span><span class="s2">"full-access"</span><span class="p">]</span>
 <a id="__codelineno-3-7" name="__codelineno-3-7"></a>
 <a id="__codelineno-3-8" name="__codelineno-3-8"></a><span class="c1"># Agent configuration (same as regular config)</span>
 <a id="__codelineno-3-9" name="__codelineno-3-9"></a><span class="k">[agent]</span>
-<a id="__codelineno-3-10" name="__codelineno-3-10"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-3-11" name="__codelineno-3-11"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
+<a id="__codelineno-3-10" name="__codelineno-3-10"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-3-11" name="__codelineno-3-11"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
 <a id="__codelineno-3-12" name="__codelineno-3-12"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-3-13" name="__codelineno-3-13"></a><span class="w">    </span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;multiedit&quot;</span><span class="p">,</span>
-<a id="__codelineno-3-14" name="__codelineno-3-14"></a><span class="w">    </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;index&quot;</span><span class="p">,</span>
-<a id="__codelineno-3-15" name="__codelineno-3-15"></a><span class="w">    </span><span class="s2">&quot;get_symbol&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;get_function&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;replace_symbol&quot;</span><span class="p">,</span>
-<a id="__codelineno-3-16" name="__codelineno-3-16"></a><span class="w">    </span><span class="s2">&quot;create_task&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;todowrite&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;todoread&quot;</span><span class="p">,</span>
-<a id="__codelineno-3-17" name="__codelineno-3-17"></a><span class="w">    </span><span class="s2">&quot;question&quot;</span>
+<a id="__codelineno-3-13" name="__codelineno-3-13"></a><span class="w">    </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"multiedit"</span><span class="p">,</span>
+<a id="__codelineno-3-14" name="__codelineno-3-14"></a><span class="w">    </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">,</span><span class="w"> </span><span class="s2">"index"</span><span class="p">,</span>
+<a id="__codelineno-3-15" name="__codelineno-3-15"></a><span class="w">    </span><span class="s2">"get_symbol"</span><span class="p">,</span><span class="w"> </span><span class="s2">"get_function"</span><span class="p">,</span><span class="w"> </span><span class="s2">"replace_symbol"</span><span class="p">,</span>
+<a id="__codelineno-3-16" name="__codelineno-3-16"></a><span class="w">    </span><span class="s2">"create_task"</span><span class="p">,</span><span class="w"> </span><span class="s2">"todowrite"</span><span class="p">,</span><span class="w"> </span><span class="s2">"todoread"</span><span class="p">,</span>
+<a id="__codelineno-3-17" name="__codelineno-3-17"></a><span class="w">    </span><span class="s2">"question"</span>
 <a id="__codelineno-3-18" name="__codelineno-3-18"></a><span class="p">]</span>
 <a id="__codelineno-3-19" name="__codelineno-3-19"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-3-20" name="__codelineno-3-20"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;prompts/coder_system.txt&quot;</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-3-21" name="__codelineno-3-21"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;prompts/code_meta.jinja2&quot;</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-3-20" name="__codelineno-3-20"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"prompts/coder_system.txt"</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-3-21" name="__codelineno-3-21"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"prompts/code_meta.jinja2"</span><span class="w"> </span><span class="p">}</span>
 <a id="__codelineno-3-22" name="__codelineno-3-22"></a><span class="p">]</span>
 <a id="__codelineno-3-23" name="__codelineno-3-23"></a>
 <a id="__codelineno-3-24" name="__codelineno-3-24"></a><span class="c1"># Middleware stack</span>
 <a id="__codelineno-3-25" name="__codelineno-3-25"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-3-26" name="__codelineno-3-26"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;agent_mode&quot;</span>
-<a id="__codelineno-3-27" name="__codelineno-3-27"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;build&quot;</span>
+<a id="__codelineno-3-26" name="__codelineno-3-26"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
+<a id="__codelineno-3-27" name="__codelineno-3-27"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"build"</span>
 <a id="__codelineno-3-28" name="__codelineno-3-28"></a>
 <a id="__codelineno-3-29" name="__codelineno-3-29"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-3-30" name="__codelineno-3-30"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;limits&quot;</span>
+<a id="__codelineno-3-30" name="__codelineno-3-30"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"limits"</span>
 <a id="__codelineno-3-31" name="__codelineno-3-31"></a><span class="n">max_steps</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">200</span>
 <a id="__codelineno-3-32" name="__codelineno-3-32"></a><span class="n">max_turns</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">50</span>
 <a id="__codelineno-3-33" name="__codelineno-3-33"></a>
 <a id="__codelineno-3-34" name="__codelineno-3-34"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-3-35" name="__codelineno-3-35"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;context&quot;</span>
+<a id="__codelineno-3-35" name="__codelineno-3-35"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"context"</span>
 <a id="__codelineno-3-36" name="__codelineno-3-36"></a><span class="n">warn_at_percent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">80</span>
 <a id="__codelineno-3-37" name="__codelineno-3-37"></a><span class="n">compact_at_percent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">90</span>
 </code></pre></div></td></tr></table></div>
@@ -1773,8 +1773,8 @@
 <span class="normal"><a href="#__codelineno-4-2">2</a></span>
 <span class="normal"><a href="#__codelineno-4-3">3</a></span>
 <span class="normal"><a href="#__codelineno-4-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="k">[agent]</span>
-<a id="__codelineno-4-2" name="__codelineno-4-2"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
 <a id="__codelineno-4-4" name="__codelineno-4-4"></a><span class="c1"># ... agent settings</span>
 </code></pre></div></td></tr></table></div></p>
 </li>
@@ -1793,17 +1793,17 @@
 <span class="normal"><a href="#__codelineno-5-11">11</a></span>
 <span class="normal"><a href="#__codelineno-5-12">12</a></span>
 <span class="normal"><a href="#__codelineno-5-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="k">[quorum]</span>
-<a id="__codelineno-5-2" name="__codelineno-5-2"></a><span class="n">cwd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;.&quot;</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2"></a><span class="n">cwd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"."</span>
 <a id="__codelineno-5-3" name="__codelineno-5-3"></a>
 <a id="__codelineno-5-4" name="__codelineno-5-4"></a><span class="k">[planner]</span>
-<a id="__codelineno-5-5" name="__codelineno-5-5"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-5-6" name="__codelineno-5-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
+<a id="__codelineno-5-5" name="__codelineno-5-5"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-5-6" name="__codelineno-5-6"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
 <a id="__codelineno-5-7" name="__codelineno-5-7"></a><span class="c1"># ... planner settings</span>
 <a id="__codelineno-5-8" name="__codelineno-5-8"></a>
 <a id="__codelineno-5-9" name="__codelineno-5-9"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-5-10" name="__codelineno-5-10"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;coder&quot;</span>
-<a id="__codelineno-5-11" name="__codelineno-5-11"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-5-12" name="__codelineno-5-12"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
+<a id="__codelineno-5-10" name="__codelineno-5-10"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
+<a id="__codelineno-5-11" name="__codelineno-5-11"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-5-12" name="__codelineno-5-12"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
 <a id="__codelineno-5-13" name="__codelineno-5-13"></a><span class="c1"># ... delegate settings</span>
 </code></pre></div></td></tr></table></div></p>
 </li>
@@ -1947,18 +1947,18 @@
 <a id="__codelineno-12-2" name="__codelineno-12-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">profiles</span><span class="p">::{</span><span class="n">LocalProfileCatalog</span><span class="p">,</span><span class="w"> </span><span class="n">ProfileCatalog</span><span class="p">};</span>
 <a id="__codelineno-12-3" name="__codelineno-12-3"></a>
 <a id="__codelineno-12-4" name="__codelineno-12-4"></a><span class="c1">// Load profile catalog from directory</span>
-<a id="__codelineno-12-5" name="__codelineno-12-5"></a><span class="kd">let</span><span class="w"> </span><span class="n">catalog</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LocalProfileCatalog</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="s">&quot;~/.qmt/profiles&quot;</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-12-5" name="__codelineno-12-5"></a><span class="kd">let</span><span class="w"> </span><span class="n">catalog</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LocalProfileCatalog</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="s">"~/.qmt/profiles"</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
 <a id="__codelineno-12-6" name="__codelineno-12-6"></a>
 <a id="__codelineno-12-7" name="__codelineno-12-7"></a><span class="c1">// List available profiles</span>
 <a id="__codelineno-12-8" name="__codelineno-12-8"></a><span class="kd">let</span><span class="w"> </span><span class="n">profiles</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">catalog</span><span class="p">.</span><span class="n">list_profiles</span><span class="p">().</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 <a id="__codelineno-12-9" name="__codelineno-12-9"></a><span class="k">for</span><span class="w"> </span><span class="n">profile</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">profiles</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-12-10" name="__codelineno-12-10"></a><span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;{}: {}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">profile</span><span class="p">.</span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">profile</span><span class="p">.</span><span class="n">name</span><span class="p">);</span>
+<a id="__codelineno-12-10" name="__codelineno-12-10"></a><span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"{}: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">profile</span><span class="p">.</span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">profile</span><span class="p">.</span><span class="n">name</span><span class="p">);</span>
 <a id="__codelineno-12-11" name="__codelineno-12-11"></a><span class="p">}</span>
 <a id="__codelineno-12-12" name="__codelineno-12-12"></a>
 <a id="__codelineno-12-13" name="__codelineno-12-13"></a><span class="c1">// Load specific profile</span>
-<a id="__codelineno-12-14" name="__codelineno-12-14"></a><span class="kd">let</span><span class="w"> </span><span class="n">profile_doc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">catalog</span><span class="p">.</span><span class="n">load_profile</span><span class="p">(</span><span class="s">&quot;coder&quot;</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-12-14" name="__codelineno-12-14"></a><span class="kd">let</span><span class="w"> </span><span class="n">profile_doc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">catalog</span><span class="p">.</span><span class="n">load_profile</span><span class="p">(</span><span class="s">"coder"</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 <a id="__codelineno-12-15" name="__codelineno-12-15"></a>
-<a id="__codelineno-12-16" name="__codelineno-12-16"></a><span class="c1">// Use profile&#39;s agent configuration</span>
+<a id="__codelineno-12-16" name="__codelineno-12-16"></a><span class="c1">// Use profile's agent configuration</span>
 <a id="__codelineno-12-17" name="__codelineno-12-17"></a><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">from_config</span><span class="p">(</span><span class="n">ConfigSource</span><span class="p">::</span><span class="n">Toml</span><span class="p">(</span>
 <a id="__codelineno-12-18" name="__codelineno-12-18"></a><span class="w">    </span><span class="n">toml</span><span class="p">::</span><span class="n">to_string</span><span class="p">(</span><span class="o">&amp;</span><span class="n">profile_doc</span><span class="p">.</span><span class="n">config</span><span class="p">)</span><span class="o">?</span>
 <a id="__codelineno-12-19" name="__codelineno-12-19"></a><span class="p">)).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
@@ -1992,16 +1992,16 @@
 <span class="normal"><a href="#__codelineno-14-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-14-10">10</a></span>
 <span class="normal"><a href="#__codelineno-14-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a><span class="k">[profile]</span>
-<a id="__codelineno-14-2" name="__codelineno-14-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;my-profile&quot;</span>
-<a id="__codelineno-14-3" name="__codelineno-14-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;My Custom Profile&quot;</span>
-<a id="__codelineno-14-4" name="__codelineno-14-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Customized for my workflow&quot;</span>
-<a id="__codelineno-14-5" name="__codelineno-14-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;custom&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;personal&quot;</span><span class="p">]</span>
+<a id="__codelineno-14-2" name="__codelineno-14-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"my-profile"</span>
+<a id="__codelineno-14-3" name="__codelineno-14-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"My Custom Profile"</span>
+<a id="__codelineno-14-4" name="__codelineno-14-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Customized for my workflow"</span>
+<a id="__codelineno-14-5" name="__codelineno-14-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"custom"</span><span class="p">,</span><span class="w"> </span><span class="s2">"personal"</span><span class="p">]</span>
 <a id="__codelineno-14-6" name="__codelineno-14-6"></a>
 <a id="__codelineno-14-7" name="__codelineno-14-7"></a><span class="k">[agent]</span>
-<a id="__codelineno-14-8" name="__codelineno-14-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-14-9" name="__codelineno-14-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-14-10" name="__codelineno-14-10"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">]</span>
-<a id="__codelineno-14-11" name="__codelineno-14-11"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;You are a helpful coding assistant.&quot;</span>
+<a id="__codelineno-14-8" name="__codelineno-14-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-14-9" name="__codelineno-14-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-14-10" name="__codelineno-14-10"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
+<a id="__codelineno-14-11" name="__codelineno-14-11"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"You are a helpful coding assistant."</span>
 </code></pre></div></td></tr></table></div></p>
 </li>
 <li>
@@ -2016,9 +2016,9 @@
 <span class="normal"><a href="#__codelineno-16-2">2</a></span>
 <span class="normal"><a href="#__codelineno-16-3">3</a></span>
 <span class="normal"><a href="#__codelineno-16-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1"></a><span class="k">[agent]</span>
-<a id="__codelineno-16-2" name="__codelineno-16-2"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-16-3" name="__codelineno-16-3"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-16-4" name="__codelineno-16-4"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">]</span>
+<a id="__codelineno-16-2" name="__codelineno-16-2"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-16-3" name="__codelineno-16-3"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-16-4" name="__codelineno-16-4"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <h4 id="coder-profile">Coder Profile</h4>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-17-1"> 1</a></span>
@@ -2060,41 +2060,41 @@
 <span class="normal"><a href="#__codelineno-17-37">37</a></span>
 <span class="normal"><a href="#__codelineno-17-38">38</a></span>
 <span class="normal"><a href="#__codelineno-17-39">39</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1"></a><span class="k">[profile]</span>
-<a id="__codelineno-17-2" name="__codelineno-17-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;coder&quot;</span>
-<a id="__codelineno-17-3" name="__codelineno-17-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Coder&quot;</span>
-<a id="__codelineno-17-4" name="__codelineno-17-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Full-featured coding agent&quot;</span>
-<a id="__codelineno-17-5" name="__codelineno-17-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;coding&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;development&quot;</span><span class="p">]</span>
+<a id="__codelineno-17-2" name="__codelineno-17-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
+<a id="__codelineno-17-3" name="__codelineno-17-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Coder"</span>
+<a id="__codelineno-17-4" name="__codelineno-17-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Full-featured coding agent"</span>
+<a id="__codelineno-17-5" name="__codelineno-17-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"coding"</span><span class="p">,</span><span class="w"> </span><span class="s2">"development"</span><span class="p">]</span>
 <a id="__codelineno-17-6" name="__codelineno-17-6"></a>
 <a id="__codelineno-17-7" name="__codelineno-17-7"></a><span class="k">[agent]</span>
-<a id="__codelineno-17-8" name="__codelineno-17-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-17-9" name="__codelineno-17-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
+<a id="__codelineno-17-8" name="__codelineno-17-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-17-9" name="__codelineno-17-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
 <a id="__codelineno-17-10" name="__codelineno-17-10"></a><span class="n">assume_mutating</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
-<a id="__codelineno-17-11" name="__codelineno-17-11"></a><span class="n">mutating_tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;multiedit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;replace_symbol&quot;</span><span class="p">]</span>
+<a id="__codelineno-17-11" name="__codelineno-17-11"></a><span class="n">mutating_tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"multiedit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"replace_symbol"</span><span class="p">]</span>
 <a id="__codelineno-17-12" name="__codelineno-17-12"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-17-13" name="__codelineno-17-13"></a><span class="w">    </span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;multiedit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;replace_symbol&quot;</span><span class="p">,</span>
-<a id="__codelineno-17-14" name="__codelineno-17-14"></a><span class="w">    </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;ls&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;index&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;get_symbol&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;get_function&quot;</span><span class="p">,</span>
-<a id="__codelineno-17-15" name="__codelineno-17-15"></a><span class="w">    </span><span class="s2">&quot;find_symbol_references&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;create_task&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;todowrite&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;todoread&quot;</span><span class="p">,</span>
-<a id="__codelineno-17-16" name="__codelineno-17-16"></a><span class="w">    </span><span class="s2">&quot;question&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;browse&quot;</span>
+<a id="__codelineno-17-13" name="__codelineno-17-13"></a><span class="w">    </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"multiedit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"replace_symbol"</span><span class="p">,</span>
+<a id="__codelineno-17-14" name="__codelineno-17-14"></a><span class="w">    </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">,</span><span class="w"> </span><span class="s2">"ls"</span><span class="p">,</span><span class="w"> </span><span class="s2">"index"</span><span class="p">,</span><span class="w"> </span><span class="s2">"get_symbol"</span><span class="p">,</span><span class="w"> </span><span class="s2">"get_function"</span><span class="p">,</span>
+<a id="__codelineno-17-15" name="__codelineno-17-15"></a><span class="w">    </span><span class="s2">"find_symbol_references"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"create_task"</span><span class="p">,</span><span class="w"> </span><span class="s2">"todowrite"</span><span class="p">,</span><span class="w"> </span><span class="s2">"todoread"</span><span class="p">,</span>
+<a id="__codelineno-17-16" name="__codelineno-17-16"></a><span class="w">    </span><span class="s2">"question"</span><span class="p">,</span><span class="w"> </span><span class="s2">"browse"</span>
 <a id="__codelineno-17-17" name="__codelineno-17-17"></a><span class="p">]</span>
 <a id="__codelineno-17-18" name="__codelineno-17-18"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-17-19" name="__codelineno-17-19"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;prompts/coder_system.txt&quot;</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-17-20" name="__codelineno-17-20"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;prompts/code_meta.jinja2&quot;</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-17-19" name="__codelineno-17-19"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"prompts/coder_system.txt"</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-17-20" name="__codelineno-17-20"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"prompts/code_meta.jinja2"</span><span class="w"> </span><span class="p">}</span>
 <a id="__codelineno-17-21" name="__codelineno-17-21"></a><span class="p">]</span>
 <a id="__codelineno-17-22" name="__codelineno-17-22"></a>
 <a id="__codelineno-17-23" name="__codelineno-17-23"></a><span class="k">[agent.execution.snapshot]</span>
-<a id="__codelineno-17-24" name="__codelineno-17-24"></a><span class="n">backend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;git&quot;</span>
+<a id="__codelineno-17-24" name="__codelineno-17-24"></a><span class="n">backend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"git"</span>
 <a id="__codelineno-17-25" name="__codelineno-17-25"></a>
 <a id="__codelineno-17-26" name="__codelineno-17-26"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-17-27" name="__codelineno-17-27"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;agent_mode&quot;</span>
-<a id="__codelineno-17-28" name="__codelineno-17-28"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;build&quot;</span>
+<a id="__codelineno-17-27" name="__codelineno-17-27"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
+<a id="__codelineno-17-28" name="__codelineno-17-28"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"build"</span>
 <a id="__codelineno-17-29" name="__codelineno-17-29"></a>
 <a id="__codelineno-17-30" name="__codelineno-17-30"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-17-31" name="__codelineno-17-31"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;limits&quot;</span>
+<a id="__codelineno-17-31" name="__codelineno-17-31"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"limits"</span>
 <a id="__codelineno-17-32" name="__codelineno-17-32"></a><span class="n">max_steps</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">200</span>
 <a id="__codelineno-17-33" name="__codelineno-17-33"></a><span class="n">max_turns</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">50</span>
 <a id="__codelineno-17-34" name="__codelineno-17-34"></a>
 <a id="__codelineno-17-35" name="__codelineno-17-35"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-17-36" name="__codelineno-17-36"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;context&quot;</span>
+<a id="__codelineno-17-36" name="__codelineno-17-36"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"context"</span>
 <a id="__codelineno-17-37" name="__codelineno-17-37"></a><span class="n">warn_at_percent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">80</span>
 <a id="__codelineno-17-38" name="__codelineno-17-38"></a><span class="n">compact_at_percent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">90</span>
 <a id="__codelineno-17-39" name="__codelineno-17-39"></a><span class="n">fallback_max_tokens</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">150000</span>
@@ -2127,32 +2127,32 @@
 <span class="normal"><a href="#__codelineno-18-25">25</a></span>
 <span class="normal"><a href="#__codelineno-18-26">26</a></span>
 <span class="normal"><a href="#__codelineno-18-27">27</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-18-1" name="__codelineno-18-1"></a><span class="k">[profile]</span>
-<a id="__codelineno-18-2" name="__codelineno-18-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;reviewer&quot;</span>
-<a id="__codelineno-18-3" name="__codelineno-18-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Code Reviewer&quot;</span>
-<a id="__codelineno-18-4" name="__codelineno-18-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Read-only code review specialist&quot;</span>
-<a id="__codelineno-18-5" name="__codelineno-18-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;review&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;read-only&quot;</span><span class="p">]</span>
+<a id="__codelineno-18-2" name="__codelineno-18-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"reviewer"</span>
+<a id="__codelineno-18-3" name="__codelineno-18-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Code Reviewer"</span>
+<a id="__codelineno-18-4" name="__codelineno-18-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Read-only code review specialist"</span>
+<a id="__codelineno-18-5" name="__codelineno-18-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"review"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read-only"</span><span class="p">]</span>
 <a id="__codelineno-18-6" name="__codelineno-18-6"></a>
 <a id="__codelineno-18-7" name="__codelineno-18-7"></a><span class="k">[agent]</span>
-<a id="__codelineno-18-8" name="__codelineno-18-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-18-9" name="__codelineno-18-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
+<a id="__codelineno-18-8" name="__codelineno-18-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-18-9" name="__codelineno-18-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
 <a id="__codelineno-18-10" name="__codelineno-18-10"></a><span class="n">assume_mutating</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
 <a id="__codelineno-18-11" name="__codelineno-18-11"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-18-12" name="__codelineno-18-12"></a><span class="w">    </span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;ls&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;index&quot;</span><span class="p">,</span>
-<a id="__codelineno-18-13" name="__codelineno-18-13"></a><span class="w">    </span><span class="s2">&quot;get_symbol&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;get_function&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;find_symbol_references&quot;</span><span class="p">,</span>
-<a id="__codelineno-18-14" name="__codelineno-18-14"></a><span class="w">    </span><span class="s2">&quot;question&quot;</span>
+<a id="__codelineno-18-12" name="__codelineno-18-12"></a><span class="w">    </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">,</span><span class="w"> </span><span class="s2">"ls"</span><span class="p">,</span><span class="w"> </span><span class="s2">"index"</span><span class="p">,</span>
+<a id="__codelineno-18-13" name="__codelineno-18-13"></a><span class="w">    </span><span class="s2">"get_symbol"</span><span class="p">,</span><span class="w"> </span><span class="s2">"get_function"</span><span class="p">,</span><span class="w"> </span><span class="s2">"find_symbol_references"</span><span class="p">,</span>
+<a id="__codelineno-18-14" name="__codelineno-18-14"></a><span class="w">    </span><span class="s2">"question"</span>
 <a id="__codelineno-18-15" name="__codelineno-18-15"></a><span class="p">]</span>
-<a id="__codelineno-18-16" name="__codelineno-18-16"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;&quot;&quot;You are a code review specialist. Analyze code for:</span>
+<a id="__codelineno-18-16" name="__codelineno-18-16"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""You are a code review specialist. Analyze code for:</span>
 <a id="__codelineno-18-17" name="__codelineno-18-17"></a><span class="s2">- Correctness and logic errors</span>
 <a id="__codelineno-18-18" name="__codelineno-18-18"></a><span class="s2">- Security vulnerabilities</span>
 <a id="__codelineno-18-19" name="__codelineno-18-19"></a><span class="s2">- Performance issues</span>
 <a id="__codelineno-18-20" name="__codelineno-18-20"></a><span class="s2">- Code style and maintainability</span>
 <a id="__codelineno-18-21" name="__codelineno-18-21"></a><span class="s2">- Documentation quality</span>
 <a id="__codelineno-18-22" name="__codelineno-18-22"></a>
-<a id="__codelineno-18-23" name="__codelineno-18-23"></a><span class="s2">Provide constructive feedback with specific suggestions for improvement.&quot;&quot;&quot;</span>
+<a id="__codelineno-18-23" name="__codelineno-18-23"></a><span class="s2">Provide constructive feedback with specific suggestions for improvement."""</span>
 <a id="__codelineno-18-24" name="__codelineno-18-24"></a>
 <a id="__codelineno-18-25" name="__codelineno-18-25"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-18-26" name="__codelineno-18-26"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;agent_mode&quot;</span>
-<a id="__codelineno-18-27" name="__codelineno-18-27"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;review&quot;</span>
+<a id="__codelineno-18-26" name="__codelineno-18-26"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
+<a id="__codelineno-18-27" name="__codelineno-18-27"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"review"</span>
 </code></pre></div></td></tr></table></div>
 <h4 id="multi-agent-profile">Multi-Agent Profile</h4>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-19-1"> 1</a></span>
@@ -2184,34 +2184,34 @@
 <span class="normal"><a href="#__codelineno-19-27">27</a></span>
 <span class="normal"><a href="#__codelineno-19-28">28</a></span>
 <span class="normal"><a href="#__codelineno-19-29">29</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1"></a><span class="k">[profile]</span>
-<a id="__codelineno-19-2" name="__codelineno-19-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;multi-agent&quot;</span>
-<a id="__codelineno-19-3" name="__codelineno-19-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Multi-Agent Team&quot;</span>
-<a id="__codelineno-19-4" name="__codelineno-19-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Planner with specialized delegates&quot;</span>
-<a id="__codelineno-19-5" name="__codelineno-19-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;multi-agent&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;delegation&quot;</span><span class="p">]</span>
+<a id="__codelineno-19-2" name="__codelineno-19-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"multi-agent"</span>
+<a id="__codelineno-19-3" name="__codelineno-19-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Multi-Agent Team"</span>
+<a id="__codelineno-19-4" name="__codelineno-19-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Planner with specialized delegates"</span>
+<a id="__codelineno-19-5" name="__codelineno-19-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"multi-agent"</span><span class="p">,</span><span class="w"> </span><span class="s2">"delegation"</span><span class="p">]</span>
 <a id="__codelineno-19-6" name="__codelineno-19-6"></a>
 <a id="__codelineno-19-7" name="__codelineno-19-7"></a><span class="k">[quorum]</span>
-<a id="__codelineno-19-8" name="__codelineno-19-8"></a><span class="n">cwd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;.&quot;</span>
+<a id="__codelineno-19-8" name="__codelineno-19-8"></a><span class="n">cwd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"."</span>
 <a id="__codelineno-19-9" name="__codelineno-19-9"></a><span class="n">delegation</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">auto</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="n">require_approval</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="n">timeout_secs</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="mi">300</span><span class="w"> </span><span class="p">}</span>
 <a id="__codelineno-19-10" name="__codelineno-19-10"></a>
 <a id="__codelineno-19-11" name="__codelineno-19-11"></a><span class="k">[planner]</span>
-<a id="__codelineno-19-12" name="__codelineno-19-12"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-19-13" name="__codelineno-19-13"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-19-14" name="__codelineno-19-14"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;create_task&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;todowrite&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;todoread&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;question&quot;</span><span class="p">]</span>
-<a id="__codelineno-19-15" name="__codelineno-19-15"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;&quot;&quot;You are a planning agent. Analyze tasks and delegate to specialists.&quot;&quot;&quot;</span>
+<a id="__codelineno-19-12" name="__codelineno-19-12"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-19-13" name="__codelineno-19-13"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-19-14" name="__codelineno-19-14"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"create_task"</span><span class="p">,</span><span class="w"> </span><span class="s2">"todowrite"</span><span class="p">,</span><span class="w"> </span><span class="s2">"todoread"</span><span class="p">,</span><span class="w"> </span><span class="s2">"question"</span><span class="p">]</span>
+<a id="__codelineno-19-15" name="__codelineno-19-15"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""You are a planning agent. Analyze tasks and delegate to specialists."""</span>
 <a id="__codelineno-19-16" name="__codelineno-19-16"></a>
 <a id="__codelineno-19-17" name="__codelineno-19-17"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-19-18" name="__codelineno-19-18"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;coder&quot;</span>
-<a id="__codelineno-19-19" name="__codelineno-19-19"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-19-20" name="__codelineno-19-20"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-19-21" name="__codelineno-19-21"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Code implementation specialist&quot;</span>
-<a id="__codelineno-19-22" name="__codelineno-19-22"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">]</span>
+<a id="__codelineno-19-18" name="__codelineno-19-18"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
+<a id="__codelineno-19-19" name="__codelineno-19-19"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-19-20" name="__codelineno-19-20"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-19-21" name="__codelineno-19-21"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Code implementation specialist"</span>
+<a id="__codelineno-19-22" name="__codelineno-19-22"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">]</span>
 <a id="__codelineno-19-23" name="__codelineno-19-23"></a>
 <a id="__codelineno-19-24" name="__codelineno-19-24"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-19-25" name="__codelineno-19-25"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;reviewer&quot;</span>
-<a id="__codelineno-19-26" name="__codelineno-19-26"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-19-27" name="__codelineno-19-27"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-19-28" name="__codelineno-19-28"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Code review specialist&quot;</span>
-<a id="__codelineno-19-29" name="__codelineno-19-29"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;question&quot;</span><span class="p">]</span>
+<a id="__codelineno-19-25" name="__codelineno-19-25"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"reviewer"</span>
+<a id="__codelineno-19-26" name="__codelineno-19-26"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-19-27" name="__codelineno-19-27"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-19-28" name="__codelineno-19-28"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Code review specialist"</span>
+<a id="__codelineno-19-29" name="__codelineno-19-29"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">,</span><span class="w"> </span><span class="s2">"question"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <h4 id="remote-gpu-profile">Remote GPU Profile</h4>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-20-1"> 1</a></span>
@@ -2238,29 +2238,29 @@
 <span class="normal"><a href="#__codelineno-20-22">22</a></span>
 <span class="normal"><a href="#__codelineno-20-23">23</a></span>
 <span class="normal"><a href="#__codelineno-20-24">24</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-20-1" name="__codelineno-20-1"></a><span class="k">[profile]</span>
-<a id="__codelineno-20-2" name="__codelineno-20-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-coder&quot;</span>
-<a id="__codelineno-20-3" name="__codelineno-20-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;GPU Coder&quot;</span>
-<a id="__codelineno-20-4" name="__codelineno-20-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Fast coding on GPU server&quot;</span>
-<a id="__codelineno-20-5" name="__codelineno-20-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;gpu&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;fast&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;remote&quot;</span><span class="p">]</span>
+<a id="__codelineno-20-2" name="__codelineno-20-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-coder"</span>
+<a id="__codelineno-20-3" name="__codelineno-20-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"GPU Coder"</span>
+<a id="__codelineno-20-4" name="__codelineno-20-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Fast coding on GPU server"</span>
+<a id="__codelineno-20-5" name="__codelineno-20-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"gpu"</span><span class="p">,</span><span class="w"> </span><span class="s2">"fast"</span><span class="p">,</span><span class="w"> </span><span class="s2">"remote"</span><span class="p">]</span>
 <a id="__codelineno-20-6" name="__codelineno-20-6"></a>
 <a id="__codelineno-20-7" name="__codelineno-20-7"></a><span class="k">[agent]</span>
-<a id="__codelineno-20-8" name="__codelineno-20-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-20-9" name="__codelineno-20-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-20-10" name="__codelineno-20-10"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">]</span>
+<a id="__codelineno-20-8" name="__codelineno-20-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-20-9" name="__codelineno-20-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-20-10" name="__codelineno-20-10"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">]</span>
 <a id="__codelineno-20-11" name="__codelineno-20-11"></a>
 <a id="__codelineno-20-12" name="__codelineno-20-12"></a><span class="k">[mesh]</span>
 <a id="__codelineno-20-13" name="__codelineno-20-13"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
 <a id="__codelineno-20-14" name="__codelineno-20-14"></a>
 <a id="__codelineno-20-15" name="__codelineno-20-15"></a><span class="k">[[mesh.peers]]</span>
-<a id="__codelineno-20-16" name="__codelineno-20-16"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-server&quot;</span>
-<a id="__codelineno-20-17" name="__codelineno-20-17"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;/ip4/192.168.1.100/tcp/9000&quot;</span>
+<a id="__codelineno-20-16" name="__codelineno-20-16"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
+<a id="__codelineno-20-17" name="__codelineno-20-17"></a><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"/ip4/192.168.1.100/tcp/9000"</span>
 <a id="__codelineno-20-18" name="__codelineno-20-18"></a>
 <a id="__codelineno-20-19" name="__codelineno-20-19"></a><span class="k">[[delegates]]</span>
-<a id="__codelineno-20-20" name="__codelineno-20-20"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;remote-coder&quot;</span>
-<a id="__codelineno-20-21" name="__codelineno-20-21"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-20-22" name="__codelineno-20-22"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4&quot;</span>
-<a id="__codelineno-20-23" name="__codelineno-20-23"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;gpu-server&quot;</span>
-<a id="__codelineno-20-24" name="__codelineno-20-24"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">]</span>
+<a id="__codelineno-20-20" name="__codelineno-20-20"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"remote-coder"</span>
+<a id="__codelineno-20-21" name="__codelineno-20-21"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-20-22" name="__codelineno-20-22"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4"</span>
+<a id="__codelineno-20-23" name="__codelineno-20-23"></a><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"gpu-server"</span>
+<a id="__codelineno-20-24" name="__codelineno-20-24"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="advanced-profile-features">Advanced Profile Features</h3>
 <h4 id="environment-variable-interpolation">Environment Variable Interpolation</h4>
@@ -2269,9 +2269,9 @@
 <span class="normal"><a href="#__codelineno-21-2">2</a></span>
 <span class="normal"><a href="#__codelineno-21-3">3</a></span>
 <span class="normal"><a href="#__codelineno-21-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-21-1" name="__codelineno-21-1"></a><span class="k">[agent]</span>
-<a id="__codelineno-21-2" name="__codelineno-21-2"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_PROVIDER:anthropic}&quot;</span><span class="w">  </span><span class="c1"># Default: anthropic</span>
-<a id="__codelineno-21-3" name="__codelineno-21-3"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${QMT_MODEL:claude-sonnet-4-5-20250929}&quot;</span>
-<a id="__codelineno-21-4" name="__codelineno-21-4"></a><span class="n">api_key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;${ANTHROPIC_API_KEY}&quot;</span>
+<a id="__codelineno-21-2" name="__codelineno-21-2"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_PROVIDER:anthropic}"</span><span class="w">  </span><span class="c1"># Default: anthropic</span>
+<a id="__codelineno-21-3" name="__codelineno-21-3"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${QMT_MODEL:claude-sonnet-4-5-20250929}"</span>
+<a id="__codelineno-21-4" name="__codelineno-21-4"></a><span class="n">api_key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"${ANTHROPIC_API_KEY}"</span>
 </code></pre></div></td></tr></table></div>
 <h4 id="file-references">File References</h4>
 <p>Reference external files for system prompts:</p>
@@ -2282,9 +2282,9 @@
 <span class="normal"><a href="#__codelineno-22-5">5</a></span>
 <span class="normal"><a href="#__codelineno-22-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-22-1" name="__codelineno-22-1"></a><span class="k">[agent]</span>
 <a id="__codelineno-22-2" name="__codelineno-22-2"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-22-3" name="__codelineno-22-3"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;prompts/default_system.txt&quot;</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-22-4" name="__codelineno-22-4"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;prompts/code_meta.jinja2&quot;</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-22-5" name="__codelineno-22-5"></a><span class="w">    </span><span class="s2">&quot;Additional inline instructions&quot;</span>
+<a id="__codelineno-22-3" name="__codelineno-22-3"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"prompts/default_system.txt"</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-22-4" name="__codelineno-22-4"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"prompts/code_meta.jinja2"</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-22-5" name="__codelineno-22-5"></a><span class="w">    </span><span class="s2">"Additional inline instructions"</span>
 <a id="__codelineno-22-6" name="__codelineno-22-6"></a><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>File path resolution:</strong>
@@ -2322,7 +2322,7 @@
 <a id="__codelineno-24-3" name="__codelineno-24-3"></a>
 <a id="__codelineno-24-4" name="__codelineno-24-4"></a><span class="c1">// Session metadata includes profile binding</span>
 <a id="__codelineno-24-5" name="__codelineno-24-5"></a><span class="kd">let</span><span class="w"> </span><span class="n">metadata</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">session</span><span class="p">.</span><span class="n">metadata</span><span class="p">();</span>
-<a id="__codelineno-24-6" name="__codelineno-24-6"></a><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;Profile: {:?}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">metadata</span><span class="p">.</span><span class="n">profile_id</span><span class="p">);</span>
+<a id="__codelineno-24-6" name="__codelineno-24-6"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"Profile: {:?}"</span><span class="p">,</span><span class="w"> </span><span class="n">metadata</span><span class="p">.</span><span class="n">profile_id</span><span class="p">);</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Binding behavior:</strong>
 - New sessions use current profile
@@ -2332,8 +2332,8 @@
 <h3 id="profile-fingerprinting">Profile Fingerprinting</h3>
 <p>Each profile configuration is fingerprinted for change detection:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-25-1">1</a></span>
-<span class="normal"><a href="#__codelineno-25-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-25-1" name="__codelineno-25-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">profile</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">catalog</span><span class="p">.</span><span class="n">load_profile</span><span class="p">(</span><span class="s">&quot;coder&quot;</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-25-2" name="__codelineno-25-2"></a><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;Fingerprint: {:?}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">profile</span><span class="p">.</span><span class="n">metadata</span><span class="p">.</span><span class="n">fingerprint</span><span class="p">);</span>
+<span class="normal"><a href="#__codelineno-25-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-25-1" name="__codelineno-25-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">profile</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">catalog</span><span class="p">.</span><span class="n">load_profile</span><span class="p">(</span><span class="s">"coder"</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-25-2" name="__codelineno-25-2"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"Fingerprint: {:?}"</span><span class="p">,</span><span class="w"> </span><span class="n">profile</span><span class="p">.</span><span class="n">metadata</span><span class="p">.</span><span class="n">fingerprint</span><span class="p">);</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Use cases:</strong>
 - Detect profile changes between sessions
@@ -2343,7 +2343,7 @@
 <p>Tags enable filtering and organization:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-26-1">1</a></span>
 <span class="normal"><a href="#__codelineno-26-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-26-1" name="__codelineno-26-1"></a><span class="k">[profile]</span>
-<a id="__codelineno-26-2" name="__codelineno-26-2"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;coding&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;review&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;production&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;team-a&quot;</span><span class="p">]</span>
+<a id="__codelineno-26-2" name="__codelineno-26-2"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"coding"</span><span class="p">,</span><span class="w"> </span><span class="s2">"review"</span><span class="p">,</span><span class="w"> </span><span class="s2">"production"</span><span class="p">,</span><span class="w"> </span><span class="s2">"team-a"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <p><strong>Tag usage:</strong>
 - Filter profiles by tags in listings
@@ -2359,11 +2359,11 @@
 <span class="normal"><a href="#__codelineno-27-6">6</a></span>
 <span class="normal"><a href="#__codelineno-27-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-27-1" name="__codelineno-27-1"></a><span class="c1"># Future feature</span>
 <a id="__codelineno-27-2" name="__codelineno-27-2"></a><span class="k">[profile]</span>
-<a id="__codelineno-27-3" name="__codelineno-27-3"></a><span class="n">inherits</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;base-coder&quot;</span><span class="w">  </span><span class="c1"># Inherit from base profile</span>
+<a id="__codelineno-27-3" name="__codelineno-27-3"></a><span class="n">inherits</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"base-coder"</span><span class="w">  </span><span class="c1"># Inherit from base profile</span>
 <a id="__codelineno-27-4" name="__codelineno-27-4"></a>
 <a id="__codelineno-27-5" name="__codelineno-27-5"></a><span class="c1"># Override specific settings</span>
 <a id="__codelineno-27-6" name="__codelineno-27-6"></a><span class="k">[agent]</span>
-<a id="__codelineno-27-7" name="__codelineno-27-7"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-opus-4-20250914&quot;</span><span class="w">  </span><span class="c1"># Use different model</span>
+<a id="__codelineno-27-7" name="__codelineno-27-7"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-opus-4-20250914"</span><span class="w">  </span><span class="c1"># Use different model</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="examples">Examples</h2>
 <h3 id="example-1-development-workflow">Example 1: Development Workflow</h3>
@@ -2379,15 +2379,15 @@
 <span class="normal"><a href="#__codelineno-28-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-28-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-28-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-28-1" name="__codelineno-28-1"></a><span class="k">[profile]</span>
-<a id="__codelineno-28-2" name="__codelineno-28-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;planner&quot;</span>
-<a id="__codelineno-28-3" name="__codelineno-28-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Planner&quot;</span>
-<a id="__codelineno-28-4" name="__codelineno-28-4"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;planning&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;read-only&quot;</span><span class="p">]</span>
+<a id="__codelineno-28-2" name="__codelineno-28-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"planner"</span>
+<a id="__codelineno-28-3" name="__codelineno-28-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Planner"</span>
+<a id="__codelineno-28-4" name="__codelineno-28-4"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"planning"</span><span class="p">,</span><span class="w"> </span><span class="s2">"read-only"</span><span class="p">]</span>
 <a id="__codelineno-28-5" name="__codelineno-28-5"></a>
 <a id="__codelineno-28-6" name="__codelineno-28-6"></a><span class="k">[agent]</span>
-<a id="__codelineno-28-7" name="__codelineno-28-7"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-28-8" name="__codelineno-28-8"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-28-9" name="__codelineno-28-9"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;create_task&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;todowrite&quot;</span><span class="p">]</span>
-<a id="__codelineno-28-10" name="__codelineno-28-10"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;You are a planning agent. Analyze tasks and create implementation plans.&quot;</span>
+<a id="__codelineno-28-7" name="__codelineno-28-7"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-28-8" name="__codelineno-28-8"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-28-9" name="__codelineno-28-9"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">,</span><span class="w"> </span><span class="s2">"create_task"</span><span class="p">,</span><span class="w"> </span><span class="s2">"todowrite"</span><span class="p">]</span>
+<a id="__codelineno-28-10" name="__codelineno-28-10"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"You are a planning agent. Analyze tasks and create implementation plans."</span>
 </code></pre></div></td></tr></table></div></p>
 <p><strong><code>~/.qmt/profiles/coder.toml</code>:</strong>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-29-1"> 1</a></span>
@@ -2400,15 +2400,15 @@
 <span class="normal"><a href="#__codelineno-29-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-29-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-29-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-29-1" name="__codelineno-29-1"></a><span class="k">[profile]</span>
-<a id="__codelineno-29-2" name="__codelineno-29-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;coder&quot;</span>
-<a id="__codelineno-29-3" name="__codelineno-29-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Coder&quot;</span>
-<a id="__codelineno-29-4" name="__codelineno-29-4"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;coding&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;implementation&quot;</span><span class="p">]</span>
+<a id="__codelineno-29-2" name="__codelineno-29-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"coder"</span>
+<a id="__codelineno-29-3" name="__codelineno-29-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Coder"</span>
+<a id="__codelineno-29-4" name="__codelineno-29-4"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"coding"</span><span class="p">,</span><span class="w"> </span><span class="s2">"implementation"</span><span class="p">]</span>
 <a id="__codelineno-29-5" name="__codelineno-29-5"></a>
 <a id="__codelineno-29-6" name="__codelineno-29-6"></a><span class="k">[agent]</span>
-<a id="__codelineno-29-7" name="__codelineno-29-7"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-29-8" name="__codelineno-29-8"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-29-9" name="__codelineno-29-9"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">]</span>
-<a id="__codelineno-29-10" name="__codelineno-29-10"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;You are a coding agent. Implement features based on plans.&quot;</span>
+<a id="__codelineno-29-7" name="__codelineno-29-7"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-29-8" name="__codelineno-29-8"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-29-9" name="__codelineno-29-9"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">]</span>
+<a id="__codelineno-29-10" name="__codelineno-29-10"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"You are a coding agent. Implement features based on plans."</span>
 </code></pre></div></td></tr></table></div></p>
 <p><strong><code>~/.qmt/profiles/reviewer.toml</code>:</strong>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-30-1"> 1</a></span>
@@ -2421,15 +2421,15 @@
 <span class="normal"><a href="#__codelineno-30-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-30-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-30-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-30-1" name="__codelineno-30-1"></a><span class="k">[profile]</span>
-<a id="__codelineno-30-2" name="__codelineno-30-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;reviewer&quot;</span>
-<a id="__codelineno-30-3" name="__codelineno-30-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Reviewer&quot;</span>
-<a id="__codelineno-30-4" name="__codelineno-30-4"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;review&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;quality&quot;</span><span class="p">]</span>
+<a id="__codelineno-30-2" name="__codelineno-30-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"reviewer"</span>
+<a id="__codelineno-30-3" name="__codelineno-30-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Reviewer"</span>
+<a id="__codelineno-30-4" name="__codelineno-30-4"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"review"</span><span class="p">,</span><span class="w"> </span><span class="s2">"quality"</span><span class="p">]</span>
 <a id="__codelineno-30-5" name="__codelineno-30-5"></a>
 <a id="__codelineno-30-6" name="__codelineno-30-6"></a><span class="k">[agent]</span>
-<a id="__codelineno-30-7" name="__codelineno-30-7"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-30-8" name="__codelineno-30-8"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-30-9" name="__codelineno-30-9"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;question&quot;</span><span class="p">]</span>
-<a id="__codelineno-30-10" name="__codelineno-30-10"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;You are a code reviewer. Analyze code quality and suggest improvements.&quot;</span>
+<a id="__codelineno-30-7" name="__codelineno-30-7"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-30-8" name="__codelineno-30-8"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-30-9" name="__codelineno-30-9"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">,</span><span class="w"> </span><span class="s2">"question"</span><span class="p">]</span>
+<a id="__codelineno-30-10" name="__codelineno-30-10"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"You are a code reviewer. Analyze code quality and suggest improvements."</span>
 </code></pre></div></td></tr></table></div></p>
 <p><strong>Workflow:</strong>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-31-1">1</a></span>
@@ -2468,27 +2468,27 @@
 <span class="normal"><a href="#__codelineno-32-15">15</a></span>
 <span class="normal"><a href="#__codelineno-32-16">16</a></span>
 <span class="normal"><a href="#__codelineno-32-17">17</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-32-1" name="__codelineno-32-1"></a><span class="k">[profile]</span>
-<a id="__codelineno-32-2" name="__codelineno-32-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;team-coder&quot;</span>
-<a id="__codelineno-32-3" name="__codelineno-32-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Team Coder&quot;</span>
-<a id="__codelineno-32-4" name="__codelineno-32-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Standard team coding profile&quot;</span>
-<a id="__codelineno-32-5" name="__codelineno-32-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;team&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;standard&quot;</span><span class="p">]</span>
+<a id="__codelineno-32-2" name="__codelineno-32-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"team-coder"</span>
+<a id="__codelineno-32-3" name="__codelineno-32-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Team Coder"</span>
+<a id="__codelineno-32-4" name="__codelineno-32-4"></a><span class="n">description</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Standard team coding profile"</span>
+<a id="__codelineno-32-5" name="__codelineno-32-5"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"team"</span><span class="p">,</span><span class="w"> </span><span class="s2">"standard"</span><span class="p">]</span>
 <a id="__codelineno-32-6" name="__codelineno-32-6"></a>
 <a id="__codelineno-32-7" name="__codelineno-32-7"></a><span class="k">[agent]</span>
-<a id="__codelineno-32-8" name="__codelineno-32-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-32-9" name="__codelineno-32-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
+<a id="__codelineno-32-8" name="__codelineno-32-8"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-32-9" name="__codelineno-32-9"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
 <a id="__codelineno-32-10" name="__codelineno-32-10"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-32-11" name="__codelineno-32-11"></a><span class="w">    </span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span>
-<a id="__codelineno-32-12" name="__codelineno-32-12"></a><span class="w">    </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;index&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;get_symbol&quot;</span>
+<a id="__codelineno-32-11" name="__codelineno-32-11"></a><span class="w">    </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span>
+<a id="__codelineno-32-12" name="__codelineno-32-12"></a><span class="w">    </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">,</span><span class="w"> </span><span class="s2">"index"</span><span class="p">,</span><span class="w"> </span><span class="s2">"get_symbol"</span>
 <a id="__codelineno-32-13" name="__codelineno-32-13"></a><span class="p">]</span>
 <a id="__codelineno-32-14" name="__codelineno-32-14"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-32-15" name="__codelineno-32-15"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;.qmt/prompts/team_system.txt&quot;</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-32-16" name="__codelineno-32-16"></a><span class="w">    </span><span class="s2">&quot;Follow team coding standards and conventions.&quot;</span>
+<a id="__codelineno-32-15" name="__codelineno-32-15"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">".qmt/prompts/team_system.txt"</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-32-16" name="__codelineno-32-16"></a><span class="w">    </span><span class="s2">"Follow team coding standards and conventions."</span>
 <a id="__codelineno-32-17" name="__codelineno-32-17"></a><span class="p">]</span>
 </code></pre></div></td></tr></table></div></p>
 <p><strong>Commit to repository:</strong>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-33-1">1</a></span>
 <span class="normal"><a href="#__codelineno-33-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-33-1" name="__codelineno-33-1"></a>git<span class="w"> </span>add<span class="w"> </span>.qmt/profiles/
-<a id="__codelineno-33-2" name="__codelineno-33-2"></a>git<span class="w"> </span>commit<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;Add team coding profiles&quot;</span>
+<a id="__codelineno-33-2" name="__codelineno-33-2"></a>git<span class="w"> </span>commit<span class="w"> </span>-m<span class="w"> </span><span class="s2">"Add team coding profiles"</span>
 </code></pre></div></td></tr></table></div></p>
 <h3 id="example-3-language-specific-profiles">Example 3: Language-Specific Profiles</h3>
 <p><strong><code>~/.qmt/profiles/rust-coder.toml</code>:</strong>
@@ -2513,18 +2513,18 @@
 <span class="normal"><a href="#__codelineno-34-19">19</a></span>
 <span class="normal"><a href="#__codelineno-34-20">20</a></span>
 <span class="normal"><a href="#__codelineno-34-21">21</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-34-1" name="__codelineno-34-1"></a><span class="k">[profile]</span>
-<a id="__codelineno-34-2" name="__codelineno-34-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;rust-coder&quot;</span>
-<a id="__codelineno-34-3" name="__codelineno-34-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Rust Coder&quot;</span>
-<a id="__codelineno-34-4" name="__codelineno-34-4"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;rust&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;systems&quot;</span><span class="p">]</span>
+<a id="__codelineno-34-2" name="__codelineno-34-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"rust-coder"</span>
+<a id="__codelineno-34-3" name="__codelineno-34-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Rust Coder"</span>
+<a id="__codelineno-34-4" name="__codelineno-34-4"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"rust"</span><span class="p">,</span><span class="w"> </span><span class="s2">"systems"</span><span class="p">]</span>
 <a id="__codelineno-34-5" name="__codelineno-34-5"></a>
 <a id="__codelineno-34-6" name="__codelineno-34-6"></a><span class="k">[agent]</span>
-<a id="__codelineno-34-7" name="__codelineno-34-7"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-34-8" name="__codelineno-34-8"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
+<a id="__codelineno-34-7" name="__codelineno-34-7"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-34-8" name="__codelineno-34-8"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
 <a id="__codelineno-34-9" name="__codelineno-34-9"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-34-10" name="__codelineno-34-10"></a><span class="w">    </span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span>
-<a id="__codelineno-34-11" name="__codelineno-34-11"></a><span class="w">    </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;index&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;get_symbol&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;get_function&quot;</span>
+<a id="__codelineno-34-10" name="__codelineno-34-10"></a><span class="w">    </span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span>
+<a id="__codelineno-34-11" name="__codelineno-34-11"></a><span class="w">    </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">,</span><span class="w"> </span><span class="s2">"index"</span><span class="p">,</span><span class="w"> </span><span class="s2">"get_symbol"</span><span class="p">,</span><span class="w"> </span><span class="s2">"get_function"</span>
 <a id="__codelineno-34-12" name="__codelineno-34-12"></a><span class="p">]</span>
-<a id="__codelineno-34-13" name="__codelineno-34-13"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;&quot;&quot;You are a Rust systems programmer.</span>
+<a id="__codelineno-34-13" name="__codelineno-34-13"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""You are a Rust systems programmer.</span>
 <a id="__codelineno-34-14" name="__codelineno-34-14"></a>
 <a id="__codelineno-34-15" name="__codelineno-34-15"></a><span class="s2">Focus on:</span>
 <a id="__codelineno-34-16" name="__codelineno-34-16"></a><span class="s2">- Memory safety and ownership</span>
@@ -2532,7 +2532,7 @@
 <a id="__codelineno-34-18" name="__codelineno-34-18"></a><span class="s2">- Idiomatic Rust patterns</span>
 <a id="__codelineno-34-19" name="__codelineno-34-19"></a><span class="s2">- Proper error handling with Result/Option</span>
 <a id="__codelineno-34-20" name="__codelineno-34-20"></a><span class="s2">- Documentation with doc comments</span>
-<a id="__codelineno-34-21" name="__codelineno-34-21"></a><span class="s2">&quot;&quot;&quot;</span>
+<a id="__codelineno-34-21" name="__codelineno-34-21"></a><span class="s2">"""</span>
 </code></pre></div></td></tr></table></div></p>
 <p><strong><code>~/.qmt/profiles/python-coder.toml</code>:</strong>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-35-1"> 1</a></span>
@@ -2553,15 +2553,15 @@
 <span class="normal"><a href="#__codelineno-35-16">16</a></span>
 <span class="normal"><a href="#__codelineno-35-17">17</a></span>
 <span class="normal"><a href="#__codelineno-35-18">18</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-35-1" name="__codelineno-35-1"></a><span class="k">[profile]</span>
-<a id="__codelineno-35-2" name="__codelineno-35-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;python-coder&quot;</span>
-<a id="__codelineno-35-3" name="__codelineno-35-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Python Coder&quot;</span>
-<a id="__codelineno-35-4" name="__codelineno-35-4"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;python&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;data-science&quot;</span><span class="p">]</span>
+<a id="__codelineno-35-2" name="__codelineno-35-2"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"python-coder"</span>
+<a id="__codelineno-35-3" name="__codelineno-35-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"Python Coder"</span>
+<a id="__codelineno-35-4" name="__codelineno-35-4"></a><span class="n">tags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"python"</span><span class="p">,</span><span class="w"> </span><span class="s2">"data-science"</span><span class="p">]</span>
 <a id="__codelineno-35-5" name="__codelineno-35-5"></a>
 <a id="__codelineno-35-6" name="__codelineno-35-6"></a><span class="k">[agent]</span>
-<a id="__codelineno-35-7" name="__codelineno-35-7"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;anthropic&quot;</span>
-<a id="__codelineno-35-8" name="__codelineno-35-8"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;claude-sonnet-4-5-20250929&quot;</span>
-<a id="__codelineno-35-9" name="__codelineno-35-9"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;read_tool&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;edit&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write_file&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;shell&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;glob&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;search_text&quot;</span><span class="p">]</span>
-<a id="__codelineno-35-10" name="__codelineno-35-10"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;&quot;&quot;You are a Python developer.</span>
+<a id="__codelineno-35-7" name="__codelineno-35-7"></a><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"anthropic"</span>
+<a id="__codelineno-35-8" name="__codelineno-35-8"></a><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"claude-sonnet-4-5-20250929"</span>
+<a id="__codelineno-35-9" name="__codelineno-35-9"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"search_text"</span><span class="p">]</span>
+<a id="__codelineno-35-10" name="__codelineno-35-10"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""You are a Python developer.</span>
 <a id="__codelineno-35-11" name="__codelineno-35-11"></a>
 <a id="__codelineno-35-12" name="__codelineno-35-12"></a><span class="s2">Focus on:</span>
 <a id="__codelineno-35-13" name="__codelineno-35-13"></a><span class="s2">- Clean, readable code</span>
@@ -2569,7 +2569,7 @@
 <a id="__codelineno-35-15" name="__codelineno-35-15"></a><span class="s2">- Docstrings (Google or NumPy style)</span>
 <a id="__codelineno-35-16" name="__codelineno-35-16"></a><span class="s2">- Virtual environments and packaging</span>
 <a id="__codelineno-35-17" name="__codelineno-35-17"></a><span class="s2">- Testing with pytest</span>
-<a id="__codelineno-35-18" name="__codelineno-35-18"></a><span class="s2">&quot;&quot;&quot;</span>
+<a id="__codelineno-35-18" name="__codelineno-35-18"></a><span class="s2">"""</span>
 </code></pre></div></td></tr></table></div></p>
 <h2 id="best-practices">Best Practices</h2>
 <h3 id="profile-organization">Profile Organization</h3>
@@ -2753,7 +2753,7 @@
       <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"search":"../../assets/javascripts/workers/search.7d14d953.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.69c251d7.min.js"></script>
+      <script src="../../assets/javascripts/bundle.e886cdf1.min.js"></script>
       
     
   </body>

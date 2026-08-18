@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.0.53">
+      <meta name="generator" content="zensical-0.0.55">
     
     
       
@@ -1933,7 +1933,7 @@
 <span class="normal"><a href="#__codelineno-0-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a>$<span class="w"> </span>qmt
 <a id="__codelineno-0-2" name="__codelineno-0-2"></a>qmt<span class="w"> </span>-<span class="w"> </span>Interactive<span class="w"> </span>Chat
 <a id="__codelineno-0-3" name="__codelineno-0-3"></a>Provider:<span class="w"> </span>openai
-<a id="__codelineno-0-4" name="__codelineno-0-4"></a>Type<span class="w"> </span><span class="s1">&#39;exit&#39;</span><span class="w"> </span>to<span class="w"> </span>quit
+<a id="__codelineno-0-4" name="__codelineno-0-4"></a>Type<span class="w"> </span><span class="s1">'exit'</span><span class="w"> </span>to<span class="w"> </span>quit
 <a id="__codelineno-0-5" name="__codelineno-0-5"></a>──────────────────────────────────────────────────
 <a id="__codelineno-0-6" name="__codelineno-0-6"></a>::<span class="w"> </span>What<span class="w"> </span>is<span class="w"> </span>the<span class="w"> </span>QueryMT<span class="w"> </span>project?
 <a id="__codelineno-0-7" name="__codelineno-0-7"></a>Thinking...
@@ -1946,7 +1946,7 @@
 <p>Pass a prompt directly as an argument for a quick question and answer.</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-1-1">1</a></span>
 <span class="normal"><a href="#__codelineno-1-2">2</a></span>
-<span class="normal"><a href="#__codelineno-1-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1"></a>$<span class="w"> </span>qmt<span class="w"> </span><span class="s2">&quot;What is the capital of France?&quot;</span>
+<span class="normal"><a href="#__codelineno-1-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1"></a>$<span class="w"> </span>qmt<span class="w"> </span><span class="s2">"What is the capital of France?"</span>
 <a id="__codelineno-1-2" name="__codelineno-1-2"></a>
 <a id="__codelineno-1-3" name="__codelineno-1-3"></a>&gt;<span class="w"> </span>Assistant:<span class="w"> </span>The<span class="w"> </span>capital<span class="w"> </span>of<span class="w"> </span>France<span class="w"> </span>is<span class="w"> </span>Paris.
 </code></pre></div></td></tr></table></div>
@@ -1960,13 +1960,13 @@
 <span class="normal"><a href="#__codelineno-2-6">6</a></span>
 <span class="normal"><a href="#__codelineno-2-7">7</a></span>
 <span class="normal"><a href="#__codelineno-2-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1"></a><span class="c1"># Summarize a text file</span>
-<a id="__codelineno-2-2" name="__codelineno-2-2"></a>$<span class="w"> </span>cat<span class="w"> </span>report.txt<span class="w"> </span><span class="p">|</span><span class="w"> </span>qmt<span class="w"> </span><span class="s2">&quot;Please provide a 3-sentence summary of the following text.&quot;</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2"></a>$<span class="w"> </span>cat<span class="w"> </span>report.txt<span class="w"> </span><span class="p">|</span><span class="w"> </span>qmt<span class="w"> </span><span class="s2">"Please provide a 3-sentence summary of the following text."</span>
 <a id="__codelineno-2-3" name="__codelineno-2-3"></a>
 <a id="__codelineno-2-4" name="__codelineno-2-4"></a><span class="c1"># Analyze a log file</span>
-<a id="__codelineno-2-5" name="__codelineno-2-5"></a>$<span class="w"> </span>cat<span class="w"> </span>server.log<span class="w"> </span><span class="p">|</span><span class="w"> </span>qmt<span class="w"> </span><span class="s2">&quot;Are there any &#39;ERROR&#39; level messages in this log?&quot;</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5"></a>$<span class="w"> </span>cat<span class="w"> </span>server.log<span class="w"> </span><span class="p">|</span><span class="w"> </span>qmt<span class="w"> </span><span class="s2">"Are there any 'ERROR' level messages in this log?"</span>
 <a id="__codelineno-2-6" name="__codelineno-2-6"></a>
-<a id="__codelineno-2-7" name="__codelineno-2-7"></a><span class="c1"># Analyze an image&#39;s content (requires a provider that supports vision)</span>
-<a id="__codelineno-2-8" name="__codelineno-2-8"></a>$<span class="w"> </span>cat<span class="w"> </span>my_image.jpg<span class="w"> </span><span class="p">|</span><span class="w"> </span>qmt<span class="w"> </span><span class="s2">&quot;Describe what is happening in this image.&quot;</span>
+<a id="__codelineno-2-7" name="__codelineno-2-7"></a><span class="c1"># Analyze an image's content (requires a provider that supports vision)</span>
+<a id="__codelineno-2-8" name="__codelineno-2-8"></a>$<span class="w"> </span>cat<span class="w"> </span>my_image.jpg<span class="w"> </span><span class="p">|</span><span class="w"> </span>qmt<span class="w"> </span><span class="s2">"Describe what is happening in this image."</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="generating-embeddings">Generating Embeddings</h3>
 <p>The <code>embed</code> subcommand generates vector embeddings. It can read from an argument or from stdin, and it outputs the results as a JSON array.</p>
@@ -1981,7 +1981,7 @@
 <span class="normal"><a href="#__codelineno-3-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-3-10">10</a></span>
 <span class="normal"><a href="#__codelineno-3-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a><span class="c1"># Embed a single string</span>
-<a id="__codelineno-3-2" name="__codelineno-3-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>embed<span class="w"> </span><span class="s2">&quot;This is a test sentence.&quot;</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>embed<span class="w"> </span><span class="s2">"This is a test sentence."</span>
 <a id="__codelineno-3-3" name="__codelineno-3-3"></a><span class="o">[[</span>
 <a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="w">  </span>-0.0189,
 <a id="__codelineno-3-5" name="__codelineno-3-5"></a><span class="w">  </span><span class="m">0</span>.0234,
@@ -1989,7 +1989,7 @@
 <a id="__codelineno-3-7" name="__codelineno-3-7"></a><span class="w">  </span>-0.0056
 <a id="__codelineno-3-8" name="__codelineno-3-8"></a><span class="o">]]</span>
 <a id="__codelineno-3-9" name="__codelineno-3-9"></a>
-<a id="__codelineno-3-10" name="__codelineno-3-10"></a><span class="c1"># Embed a file&#39;s content</span>
+<a id="__codelineno-3-10" name="__codelineno-3-10"></a><span class="c1"># Embed a file's content</span>
 <a id="__codelineno-3-11" name="__codelineno-3-11"></a>$<span class="w"> </span>cat<span class="w"> </span>document.txt<span class="w"> </span><span class="p">|</span><span class="w"> </span>qmt<span class="w"> </span>embed
 </code></pre></div></td></tr></table></div>
 <p>You can also embed multiple documents at once by specifying a separator.</p>
@@ -2002,8 +2002,8 @@
 <span class="normal"><a href="#__codelineno-4-7"> 7</a></span>
 <span class="normal"><a href="#__codelineno-4-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-4-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-4-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="c1"># Embed two documents separated by &quot;---&quot;</span>
-<a id="__codelineno-4-2" name="__codelineno-4-2"></a>$<span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;First document.---Second document.&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>qmt<span class="w"> </span>embed<span class="w"> </span>--separator<span class="w"> </span><span class="s2">&quot;---&quot;</span>
+<span class="normal"><a href="#__codelineno-4-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="c1"># Embed two documents separated by "---"</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2"></a>$<span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">"First document.---Second document."</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>qmt<span class="w"> </span>embed<span class="w"> </span>--separator<span class="w"> </span><span class="s2">"---"</span>
 <a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="o">[</span>
 <a id="__codelineno-4-4" name="__codelineno-4-4"></a><span class="w">  </span><span class="o">[</span>
 <a id="__codelineno-4-5" name="__codelineno-4-5"></a><span class="w">    </span>-0.01,<span class="w"> </span>...
@@ -2022,7 +2022,7 @@
 <span class="normal"><a href="#__codelineno-5-3">3</a></span>
 <span class="normal"><a href="#__codelineno-5-4">4</a></span>
 <span class="normal"><a href="#__codelineno-5-5">5</a></span>
-<span class="normal"><a href="#__codelineno-5-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="c1"># Set the default provider to OpenAI&#39;s gpt-4-turbo model</span>
+<span class="normal"><a href="#__codelineno-5-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="c1"># Set the default provider to OpenAI's gpt-4-turbo model</span>
 <a id="__codelineno-5-2" name="__codelineno-5-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>default<span class="w"> </span>openai:gpt-4-turbo
 <a id="__codelineno-5-3" name="__codelineno-5-3"></a>
 <a id="__codelineno-5-4" name="__codelineno-5-4"></a><span class="c1"># Check the current default</span>
@@ -2092,7 +2092,7 @@
 <a id="__codelineno-6-25" name="__codelineno-6-25"></a><span class="w">  </span>Refresh<span class="w"> </span>token<span class="w"> </span>available
 <a id="__codelineno-6-26" name="__codelineno-6-26"></a>
 <a id="__codelineno-6-27" name="__codelineno-6-27"></a>codex:<span class="w"> </span>Not<span class="w"> </span>authenticated
-<a id="__codelineno-6-28" name="__codelineno-6-28"></a><span class="w">  </span>Run<span class="w"> </span><span class="s1">&#39;qmt auth login codex&#39;</span><span class="w"> </span>to<span class="w"> </span>authenticate
+<a id="__codelineno-6-28" name="__codelineno-6-28"></a><span class="w">  </span>Run<span class="w"> </span><span class="s1">'qmt auth login codex'</span><span class="w"> </span>to<span class="w"> </span>authenticate
 <a id="__codelineno-6-29" name="__codelineno-6-29"></a>
 <a id="__codelineno-6-30" name="__codelineno-6-30"></a><span class="c1"># Check status for a specific provider (with automatic refresh disabled)</span>
 <a id="__codelineno-6-31" name="__codelineno-6-31"></a>$<span class="w"> </span>qmt<span class="w"> </span>auth<span class="w"> </span>status<span class="w"> </span>anthropic<span class="w"> </span>--no-refresh
@@ -2114,8 +2114,8 @@
 <span class="normal"><a href="#__codelineno-7-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-7-10">10</a></span>
 <span class="normal"><a href="#__codelineno-7-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="c1"># Store your OpenAI API key</span>
-<a id="__codelineno-7-2" name="__codelineno-7-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>secrets<span class="w"> </span><span class="nb">set</span><span class="w"> </span>OPENAI_API_KEY<span class="w"> </span><span class="s2">&quot;sk-...&quot;</span>
-<a id="__codelineno-7-3" name="__codelineno-7-3"></a>✓<span class="w"> </span>Secret<span class="w"> </span><span class="s1">&#39;OPENAI_API_KEY&#39;</span><span class="w"> </span>has<span class="w"> </span>been<span class="w"> </span>set.
+<a id="__codelineno-7-2" name="__codelineno-7-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>secrets<span class="w"> </span><span class="nb">set</span><span class="w"> </span>OPENAI_API_KEY<span class="w"> </span><span class="s2">"sk-..."</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3"></a>✓<span class="w"> </span>Secret<span class="w"> </span><span class="s1">'OPENAI_API_KEY'</span><span class="w"> </span>has<span class="w"> </span>been<span class="w"> </span>set.
 <a id="__codelineno-7-4" name="__codelineno-7-4"></a>
 <a id="__codelineno-7-5" name="__codelineno-7-5"></a><span class="c1"># Retrieve a stored key (for verification)</span>
 <a id="__codelineno-7-6" name="__codelineno-7-6"></a>$<span class="w"> </span>qmt<span class="w"> </span>secrets<span class="w"> </span>get<span class="w"> </span>OPENAI_API_KEY
@@ -2123,7 +2123,7 @@
 <a id="__codelineno-7-8" name="__codelineno-7-8"></a>
 <a id="__codelineno-7-9" name="__codelineno-7-9"></a><span class="c1"># Delete a key</span>
 <a id="__codelineno-7-10" name="__codelineno-7-10"></a>$<span class="w"> </span>qmt<span class="w"> </span>secrets<span class="w"> </span>delete<span class="w"> </span>OPENAI_API_KEY
-<a id="__codelineno-7-11" name="__codelineno-7-11"></a>✓<span class="w"> </span>Secret<span class="w"> </span><span class="s1">&#39;OPENAI_API_KEY&#39;</span><span class="w"> </span>has<span class="w"> </span>been<span class="w"> </span>deleted.
+<a id="__codelineno-7-11" name="__codelineno-7-11"></a>✓<span class="w"> </span>Secret<span class="w"> </span><span class="s1">'OPENAI_API_KEY'</span><span class="w"> </span>has<span class="w"> </span>been<span class="w"> </span>deleted.
 </code></pre></div></td></tr></table></div>
 <h3 id="discovering-providers-models">Discovering Providers &amp; Models</h3>
 <p>List the providers and models that <code>qmt</code> has loaded from your configuration.</p>
@@ -2170,32 +2170,32 @@
 <span class="normal"><a href="#__codelineno-9-3">3</a></span>
 <span class="normal"><a href="#__codelineno-9-4">4</a></span>
 <span class="normal"><a href="#__codelineno-9-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a><span class="c1"># Use the anthropic provider with the claude-3-sonnet model</span>
-<a id="__codelineno-9-2" name="__codelineno-9-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>anthropic<span class="w"> </span>--model<span class="w"> </span>claude-3-sonnet-20240229<span class="w"> </span><span class="s2">&quot;Explain the concept of emergence.&quot;</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>anthropic<span class="w"> </span>--model<span class="w"> </span>claude-3-sonnet-20240229<span class="w"> </span><span class="s2">"Explain the concept of emergence."</span>
 <a id="__codelineno-9-3" name="__codelineno-9-3"></a>
 <a id="__codelineno-9-4" name="__codelineno-9-4"></a><span class="c1"># A more concise way to do the same</span>
-<a id="__codelineno-9-5" name="__codelineno-9-5"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>anthropic:claude-3-sonnet-20240229<span class="w"> </span><span class="s2">&quot;Explain the concept of emergence.&quot;</span>
+<a id="__codelineno-9-5" name="__codelineno-9-5"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>anthropic:claude-3-sonnet-20240229<span class="w"> </span><span class="s2">"Explain the concept of emergence."</span>
 </code></pre></div></td></tr></table></div>
 <h4 id="using-a-local-model-via-a-proxylocal-server">Using a Local Model via a Proxy/Local Server</h4>
 <p>Override the <code>--base-url</code> to point to a local service like Ollama.</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-10-1">1</a></span>
-<span class="normal"><a href="#__codelineno-10-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1"></a><span class="c1"># Assuming you have an &#39;ollama&#39; provider configured that works with OpenAI&#39;s API format</span>
-<a id="__codelineno-10-2" name="__codelineno-10-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>ollama:llama3<span class="w"> </span>--base-url<span class="w"> </span>http://localhost:11434<span class="w"> </span><span class="s2">&quot;Who are you?&quot;</span>
+<span class="normal"><a href="#__codelineno-10-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1"></a><span class="c1"># Assuming you have an 'ollama' provider configured that works with OpenAI's API format</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>ollama:llama3<span class="w"> </span>--base-url<span class="w"> </span>http://localhost:11434<span class="w"> </span><span class="s2">"Who are you?"</span>
 </code></pre></div></td></tr></table></div>
 <h4 id="setting-a-system-prompt">Setting a System Prompt</h4>
 <p>Guide the model's behavior with a system prompt using <code>--system</code> (<code>-s</code>).</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-11-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>-s<span class="w"> </span><span class="s2">&quot;You are a helpful assistant that only speaks in rhyme.&quot;</span><span class="w"> </span><span class="s2">&quot;What is a computer?&quot;</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-11-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>-s<span class="w"> </span><span class="s2">"You are a helpful assistant that only speaks in rhyme."</span><span class="w"> </span><span class="s2">"What is a computer?"</span>
 </code></pre></div></td></tr></table></div>
 <h4 id="controlling-generation-parameters">Controlling Generation Parameters</h4>
 <p>Adjust temperature, max tokens, and other parameters for more creative or controlled output.</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-12-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>--temperature<span class="w"> </span><span class="m">1</span>.2<span class="w"> </span>--max-tokens<span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="s2">&quot;Write a short, creative opening line for a fantasy novel.&quot;</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-12-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>--temperature<span class="w"> </span><span class="m">1</span>.2<span class="w"> </span>--max-tokens<span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="s2">"Write a short, creative opening line for a fantasy novel."</span>
 </code></pre></div></td></tr></table></div>
 <h4 id="passing-custom-provider-specific-options">Passing Custom Provider-Specific Options</h4>
 <p>Use the <code>--options</code> (<code>-o</code>) flag to pass arbitrary key-value pairs that a specific plugin might support. Values are parsed as JSON if possible, otherwise as strings.</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-13-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>some-custom-provider<span class="w"> </span>-o<span class="w"> </span><span class="nv">vision_mode</span><span class="o">=</span><span class="nb">true</span><span class="w"> </span>-o<span class="w"> </span><span class="nv">response_format</span><span class="o">=</span><span class="s1">&#39;{&quot;type&quot;: &quot;json_object&quot;}&#39;</span><span class="w"> </span><span class="s2">&quot;Analyze this image&quot;</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-13-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>-p<span class="w"> </span>some-custom-provider<span class="w"> </span>-o<span class="w"> </span><span class="nv">vision_mode</span><span class="o">=</span><span class="nb">true</span><span class="w"> </span>-o<span class="w"> </span><span class="nv">response_format</span><span class="o">=</span><span class="s1">'{"type": "json_object"}'</span><span class="w"> </span><span class="s2">"Analyze this image"</span>
 </code></pre></div></td></tr></table></div>
 <h4 id="embedding-with-specific-dimensions">Embedding with Specific Dimensions</h4>
 <p>Some embedding models support custom dimensions.</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>embed<span class="w"> </span><span class="s2">&quot;This is a test&quot;</span><span class="w"> </span>-p<span class="w"> </span>openai:text-embedding-3-small<span class="w"> </span>--dimensions<span class="w"> </span><span class="m">512</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a>$<span class="w"> </span>qmt<span class="w"> </span>embed<span class="w"> </span><span class="s2">"This is a test"</span><span class="w"> </span>-p<span class="w"> </span>openai:text-embedding-3-small<span class="w"> </span>--dimensions<span class="w"> </span><span class="m">512</span>
 </code></pre></div></td></tr></table></div>
 <h4 id="using-tools-via-mcp">Using Tools via MCP</h4>
 <p>Create a file named <code>mcp-config.toml</code>. This file tells QueryMT how to launch and communicate with the tool server.</p>
@@ -2217,18 +2217,18 @@
 <span class="normal"><a href="#__codelineno-15-13">13</a></span>
 <span class="normal"><a href="#__codelineno-15-14">14</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1"></a><span class="c1"># mcp-config.toml - Stdio example</span>
 <a id="__codelineno-15-2" name="__codelineno-15-2"></a><span class="k">[[mcp]]</span>
-<a id="__codelineno-15-3" name="__codelineno-15-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;mem_server&quot;</span>
-<a id="__codelineno-15-4" name="__codelineno-15-4"></a><span class="n">protocol</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;stdio&quot;</span>
-<a id="__codelineno-15-5" name="__codelineno-15-5"></a><span class="n">command</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;npx&quot;</span>
-<a id="__codelineno-15-6" name="__codelineno-15-6"></a><span class="n">args</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;-y&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;@modelcontextprotocol/server-memory&quot;</span><span class="p">]</span>
-<a id="__codelineno-15-7" name="__codelineno-15-7"></a><span class="c1"># envs = { VAR1 = &quot;value1&quot; } # optional environment variables</span>
+<a id="__codelineno-15-3" name="__codelineno-15-3"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"mem_server"</span>
+<a id="__codelineno-15-4" name="__codelineno-15-4"></a><span class="n">protocol</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"stdio"</span>
+<a id="__codelineno-15-5" name="__codelineno-15-5"></a><span class="n">command</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"npx"</span>
+<a id="__codelineno-15-6" name="__codelineno-15-6"></a><span class="n">args</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"-y"</span><span class="p">,</span><span class="w"> </span><span class="s2">"@modelcontextprotocol/server-memory"</span><span class="p">]</span>
+<a id="__codelineno-15-7" name="__codelineno-15-7"></a><span class="c1"># envs = { VAR1 = "value1" } # optional environment variables</span>
 <a id="__codelineno-15-8" name="__codelineno-15-8"></a>
 <a id="__codelineno-15-9" name="__codelineno-15-9"></a><span class="c1"># HTTP example</span>
 <a id="__codelineno-15-10" name="__codelineno-15-10"></a><span class="k">[[mcp]]</span>
-<a id="__codelineno-15-11" name="__codelineno-15-11"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;http_server&quot;</span>
-<a id="__codelineno-15-12" name="__codelineno-15-12"></a><span class="n">protocol</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;http&quot;</span>
-<a id="__codelineno-15-13" name="__codelineno-15-13"></a><span class="n">url</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;https://api.example.com/mcp&quot;</span>
-<a id="__codelineno-15-14" name="__codelineno-15-14"></a><span class="c1"># token = &quot;your-bearer-token&quot; # optional</span>
+<a id="__codelineno-15-11" name="__codelineno-15-11"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"http_server"</span>
+<a id="__codelineno-15-12" name="__codelineno-15-12"></a><span class="n">protocol</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"http"</span>
+<a id="__codelineno-15-13" name="__codelineno-15-13"></a><span class="n">url</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"https://api.example.com/mcp"</span>
+<a id="__codelineno-15-14" name="__codelineno-15-14"></a><span class="c1"># token = "your-bearer-token" # optional</span>
 </code></pre></div></td></tr></table></div>
 <p>When you ask a question that requires a tool, the LLM will request to use it, and <code>qmt</code> will handle the communication.</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-16-1"> 1</a></span>
@@ -2250,23 +2250,23 @@
 <span class="normal"><a href="#__codelineno-16-17">17</a></span>
 <span class="normal"><a href="#__codelineno-16-18">18</a></span>
 <span class="normal"><a href="#__codelineno-16-19">19</a></span>
-<span class="normal"><a href="#__codelineno-16-20">20</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1"></a><span class="c1"># Ask the LLM to use the &#39;set&#39; tool from our stdio server</span>
+<span class="normal"><a href="#__codelineno-16-20">20</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1"></a><span class="c1"># Ask the LLM to use the 'set' tool from our stdio server</span>
 <a id="__codelineno-16-2" name="__codelineno-16-2"></a>$<span class="w"> </span>qmt<span class="w"> </span>--provider<span class="w"> </span>openai:gpt-4o-mini<span class="w"> </span>--mcp-config<span class="w"> </span>./mcp-config.toml
 <a id="__codelineno-16-3" name="__codelineno-16-3"></a>qmt<span class="w"> </span>-<span class="w"> </span>Interactive<span class="w"> </span>Chat
 <a id="__codelineno-16-4" name="__codelineno-16-4"></a>Provider:<span class="w"> </span>openai
-<a id="__codelineno-16-5" name="__codelineno-16-5"></a>Type<span class="w"> </span><span class="s1">&#39;exit&#39;</span><span class="w"> </span>to<span class="w"> </span>quit
+<a id="__codelineno-16-5" name="__codelineno-16-5"></a>Type<span class="w"> </span><span class="s1">'exit'</span><span class="w"> </span>to<span class="w"> </span>quit
 <a id="__codelineno-16-6" name="__codelineno-16-6"></a>──────────────────────────────────────────────────
 <a id="__codelineno-16-7" name="__codelineno-16-7"></a>::<span class="w"> </span>create<span class="w"> </span>two<span class="w"> </span>entities:<span class="w"> </span>qmt<span class="w"> </span>and<span class="w"> </span>awesome<span class="w"> </span>and<span class="w"> </span>connect<span class="w"> </span>qmt<span class="w"> </span>with<span class="w"> </span>an<span class="w"> </span>isa<span class="w"> </span>relation<span class="w"> </span>to<span class="w"> </span>awesome
 <a id="__codelineno-16-8" name="__codelineno-16-8"></a>┌─<span class="w"> </span>create_entities
 <a id="__codelineno-16-9" name="__codelineno-16-9"></a>└─<span class="w"> </span>calling...
 <a id="__codelineno-16-10" name="__codelineno-16-10"></a>┌─<span class="w"> </span>create_entities
 <a id="__codelineno-16-11" name="__codelineno-16-11"></a>└─<span class="w"> </span>generated
-<a id="__codelineno-16-12" name="__codelineno-16-12"></a>&gt;<span class="w"> </span>Assistant:<span class="w"> </span>The<span class="w"> </span>entities<span class="w"> </span><span class="s2">&quot;qmt&quot;</span><span class="w"> </span>and<span class="w"> </span><span class="s2">&quot;awesome&quot;</span><span class="w"> </span>have<span class="w"> </span>been<span class="w"> </span>successfully<span class="w"> </span>created,<span class="w"> </span>and<span class="w"> </span>the<span class="w"> </span>relation<span class="w"> </span><span class="s2">&quot;isa&quot;</span><span class="w"> </span>has<span class="w"> </span>been<span class="w"> </span>established<span class="w"> </span>from<span class="w"> </span><span class="s2">&quot;qmt&quot;</span><span class="w"> </span>to<span class="w"> </span><span class="s2">&quot;awesome.&quot;</span><span class="w"> </span>If<span class="w"> </span>you<span class="w"> </span>need<span class="w"> </span>any<span class="w"> </span>further<span class="w"> </span>modifications<span class="w"> </span>or<span class="w"> </span>additional<span class="w"> </span>actions,<span class="w"> </span>just<span class="w"> </span><span class="nb">let</span><span class="w"> </span>me<span class="w"> </span>know!
+<a id="__codelineno-16-12" name="__codelineno-16-12"></a>&gt;<span class="w"> </span>Assistant:<span class="w"> </span>The<span class="w"> </span>entities<span class="w"> </span><span class="s2">"qmt"</span><span class="w"> </span>and<span class="w"> </span><span class="s2">"awesome"</span><span class="w"> </span>have<span class="w"> </span>been<span class="w"> </span>successfully<span class="w"> </span>created,<span class="w"> </span>and<span class="w"> </span>the<span class="w"> </span>relation<span class="w"> </span><span class="s2">"isa"</span><span class="w"> </span>has<span class="w"> </span>been<span class="w"> </span>established<span class="w"> </span>from<span class="w"> </span><span class="s2">"qmt"</span><span class="w"> </span>to<span class="w"> </span><span class="s2">"awesome."</span><span class="w"> </span>If<span class="w"> </span>you<span class="w"> </span>need<span class="w"> </span>any<span class="w"> </span>further<span class="w"> </span>modifications<span class="w"> </span>or<span class="w"> </span>additional<span class="w"> </span>actions,<span class="w"> </span>just<span class="w"> </span><span class="nb">let</span><span class="w"> </span>me<span class="w"> </span>know!
 <a id="__codelineno-16-13" name="__codelineno-16-13"></a>──────────────────────────────────────────────────
 <a id="__codelineno-16-14" name="__codelineno-16-14"></a>::<span class="w"> </span>what<span class="w"> </span>is<span class="w"> </span>qmt?
 <a id="__codelineno-16-15" name="__codelineno-16-15"></a>┌─<span class="w"> </span>open_nodes
 <a id="__codelineno-16-16" name="__codelineno-16-16"></a>└─<span class="w"> </span>generated
-<a id="__codelineno-16-17" name="__codelineno-16-17"></a>&gt;<span class="w"> </span>Assistant:<span class="w"> </span>The<span class="w"> </span>entity<span class="w"> </span><span class="s2">&quot;qmt&quot;</span><span class="w"> </span>is<span class="w"> </span>of<span class="w"> </span><span class="nb">type</span><span class="w"> </span><span class="s2">&quot;type1&quot;</span><span class="w"> </span>and<span class="w"> </span>currently<span class="w"> </span>has<span class="w"> </span>no<span class="w"> </span>associated<span class="w"> </span>observations<span class="w"> </span>or<span class="w"> </span>relations<span class="w"> </span>other<span class="w"> </span>than<span class="w"> </span>the<span class="w"> </span>relation<span class="w"> </span>to<span class="w"> </span><span class="s2">&quot;awesome&quot;</span><span class="w"> </span>established<span class="w"> </span>earlier.<span class="w"> </span>If<span class="w"> </span>you<span class="w"> </span>need<span class="w"> </span>more<span class="w"> </span>information<span class="w"> </span>or<span class="w"> </span>to<span class="w"> </span>add<span class="w"> </span>observations,<span class="w"> </span>feel<span class="w"> </span>free<span class="w"> </span>to<span class="w"> </span>ask!
+<a id="__codelineno-16-17" name="__codelineno-16-17"></a>&gt;<span class="w"> </span>Assistant:<span class="w"> </span>The<span class="w"> </span>entity<span class="w"> </span><span class="s2">"qmt"</span><span class="w"> </span>is<span class="w"> </span>of<span class="w"> </span><span class="nb">type</span><span class="w"> </span><span class="s2">"type1"</span><span class="w"> </span>and<span class="w"> </span>currently<span class="w"> </span>has<span class="w"> </span>no<span class="w"> </span>associated<span class="w"> </span>observations<span class="w"> </span>or<span class="w"> </span>relations<span class="w"> </span>other<span class="w"> </span>than<span class="w"> </span>the<span class="w"> </span>relation<span class="w"> </span>to<span class="w"> </span><span class="s2">"awesome"</span><span class="w"> </span>established<span class="w"> </span>earlier.<span class="w"> </span>If<span class="w"> </span>you<span class="w"> </span>need<span class="w"> </span>more<span class="w"> </span>information<span class="w"> </span>or<span class="w"> </span>to<span class="w"> </span>add<span class="w"> </span>observations,<span class="w"> </span>feel<span class="w"> </span>free<span class="w"> </span>to<span class="w"> </span>ask!
 <a id="__codelineno-16-18" name="__codelineno-16-18"></a>──────────────────────────────────────────────────
 <a id="__codelineno-16-19" name="__codelineno-16-19"></a>::
 <a id="__codelineno-16-20" name="__codelineno-16-20"></a>👋<span class="w"> </span>Goodbye!
@@ -2554,7 +2554,7 @@
       <script id="__config" type="application/json">{"annotate":null,"base":"..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"search":"../assets/javascripts/workers/search.7d14d953.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../assets/javascripts/bundle.69c251d7.min.js"></script>
+      <script src="../assets/javascripts/bundle.e886cdf1.min.js"></script>
       
     
   </body>
