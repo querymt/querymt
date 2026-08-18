@@ -739,8 +739,18 @@ fn sanitize_xai_schema_in_place(value: &mut Value) {
 fn sanitize_xai_schema_object(map: &mut Map<String, Value>) {
     map.remove("pattern");
     map.remove("format");
-    for value in map.values_mut() {
-        sanitize_xai_schema_in_place(value);
+
+    for (key, value) in map.iter_mut() {
+        if key == "properties" {
+            // Entries here are parameter names, not JSON Schema keywords.
+            if let Value::Object(properties) = value {
+                for property_schema in properties.values_mut() {
+                    sanitize_xai_schema_in_place(property_schema);
+                }
+            }
+        } else {
+            sanitize_xai_schema_in_place(value);
+        }
     }
 }
 
@@ -1119,13 +1129,15 @@ mod tests {
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "q": {
+                        "pattern": {
                             "type": "string",
                             "pattern": "^[a-z]+$",
                             "format": "regex",
                             "items": { "type": "string", "format": "uuid" }
-                        }
+                        },
+                        "format": { "type": "string", "format": "uuid" }
                     },
+                    "required": ["pattern", "format"],
                     "format": "json-schema"
                 }),
             },
@@ -1151,6 +1163,15 @@ mod tests {
         assert_eq!(body["tools"][0]["description"], "Look up data");
         assert_eq!(body["tools"][0]["strict"], false);
         assert!(body["tools"][0].get("function").is_none());
+        let parameters = &body["tools"][0]["parameters"];
+        assert!(parameters["properties"].get("pattern").is_some());
+        assert!(parameters["properties"].get("format").is_some());
+        assert!(parameters["properties"]["pattern"].get("pattern").is_none());
+        assert!(parameters["properties"]["format"].get("format").is_none());
+        assert_eq!(
+            parameters["required"],
+            serde_json::json!(["pattern", "format"])
+        );
         assert_eq!(body["tool_choice"]["type"], "function");
         assert_eq!(body["tool_choice"]["name"], "lookup");
         assert!(body["tool_choice"].get("function").is_none());
@@ -1221,29 +1242,38 @@ mod tests {
     }
 
     #[test]
-    fn responses_tool_schema_sanitizer_strips_nested_pattern_and_format() {
+    fn responses_tool_schema_sanitizer_preserves_property_names() {
         let schema = serde_json::json!({
             "type": "object",
             "format": "top",
             "properties": {
-                "name": { "type": "string", "pattern": "^[a-z]+$" },
+                "pattern": { "type": "string", "pattern": "^[a-z]+$" },
+                "format": { "type": "string", "format": "uuid" },
                 "items": {
                     "type": "array",
                     "items": [{ "type": "string", "format": "uuid" }]
                 }
-            }
+            },
+            "required": ["pattern", "format"]
         });
 
         let sanitized = sanitize_xai_schema(schema.clone());
 
         assert!(sanitized.get("format").is_none());
-        assert!(sanitized["properties"]["name"].get("pattern").is_none());
+        assert!(sanitized["properties"].get("pattern").is_some());
+        assert!(sanitized["properties"].get("format").is_some());
+        assert!(sanitized["properties"]["pattern"].get("pattern").is_none());
+        assert!(sanitized["properties"]["format"].get("format").is_none());
         assert!(
             sanitized["properties"]["items"]["items"][0]
                 .get("format")
                 .is_none()
         );
-        assert!(schema["properties"]["name"].get("pattern").is_some());
+        assert_eq!(
+            sanitized["required"],
+            serde_json::json!(["pattern", "format"])
+        );
+        assert!(schema["properties"]["pattern"].get("pattern").is_some());
     }
 
     #[test]
