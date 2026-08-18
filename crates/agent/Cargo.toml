@@ -88,7 +88,7 @@ infer = "0.22"
 rayon = "1.11"
 
 # Unix process-group cleanup on cancellation (shell tool)
-imagesize = "0.14"
+imagesize = "0.15"
 
 # NLP: multilingual stopwords, stemming, language detection
 stop-words = "0.10"
