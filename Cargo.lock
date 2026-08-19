@@ -70,17 +70,19 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol"
-version = "1.0.1"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16302d16c7531355db16593d99c38c8297db0c4653aa7dd80c3556bb17f4cd8c"
+checksum = "6d87bc7769eba641753ba5dc52f73ec3765d51022c6753bf040967125ddc86a8"
 dependencies = [
  "agent-client-protocol-derive",
  "agent-client-protocol-schema",
+ "async-io",
  "async-process",
  "blocking",
  "futures",
  "futures-concurrency",
  "rustc-hash 2.1.2",
+ "rustix 1.1.4",
  "schemars 1.2.2",
  "serde",
  "serde_json",
@@ -92,19 +94,19 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-derive"
-version = "1.0.1"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88b37d552feb6981a0109febda6b71fc723678cd065974c2d76279c19c407095"
+checksum = "3abd4080f51e4f24f5042beb7fb7a66ede29a2dc1c2582c329532e1c27264ddc"
 dependencies = [
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
 name = "agent-client-protocol-schema"
-version = "1.1.0"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac542aba230234b1591ace7286a47c0514fe3efc3037d43296bde31ba7ee5728"
+checksum = "d5c231915b4ab578c722eca2d1bd7df4d300bfd6cac3b8e9f0d1e3ddc95b187c"
 dependencies = [
  "anyhow",
  "derive_more",

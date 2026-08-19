@@ -43,6 +43,16 @@ pub(crate) fn create_elicitation_request(
     let schema = serde_json::from_value::<ElicitationSchema>(requested_schema).map_err(|err| {
         Error::invalid_params().data(format!("Invalid elicitation schema: {err}"))
     })?;
+
+    for (name, property) in &schema.properties {
+        if let crate::acp::protocol::ElicitationPropertySchema::Other(other) = property {
+            return Err(Error::invalid_params().data(format!(
+                "Unsupported elicitation property type `{}` for property `{name}`",
+                other.type_
+            )));
+        }
+    }
+
     let scope = ElicitationSessionScope::new(SessionId::from(session_id));
     let mode = ElicitationFormMode::new(scope, schema);
     let mut meta = serde_json::Map::new();
@@ -1204,6 +1214,47 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::sync::{Mutex, Notify};
     use tokio::time::{Duration, timeout};
+
+    #[test]
+    fn elicitation_request_rejects_unknown_property_types() {
+        let result = create_elicitation_request(
+            "e-1".to_string(),
+            "s-1".to_string(),
+            "Invalid".to_string(),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"nested": {"type": "object"}}
+            }),
+            "test".to_string(),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn elicitation_request_accepts_supported_property_types() {
+        let result = create_elicitation_request(
+            "e-1".to_string(),
+            "s-1".to_string(),
+            "Supported".to_string(),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "score": {"type": "number"},
+                    "count": {"type": "integer"},
+                    "enabled": {"type": "boolean"},
+                    "choices": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["a", "b"]}
+                    }
+                }
+            }),
+            "test".to_string(),
+        );
+
+        assert!(result.is_ok());
+    }
 
     fn tool_start_event(tool_name: &str, arguments: serde_json::Value) -> EventEnvelope {
         EventEnvelope::Durable(DurableEvent {
