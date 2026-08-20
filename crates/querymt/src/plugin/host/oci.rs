@@ -253,21 +253,8 @@ async fn verify_image_signature(
         Err(e) => return Err(anyhow!("Invalid image reference: {}", e)),
     };
 
-    // Triangulate to find the signature image and source digest
-    let (cosign_signature_image, source_image_digest) =
-        match client.triangulate(&image_ref, auth).await {
-            Ok((sig_image, digest)) => (sig_image, digest),
-            Err(e) => {
-                log::warn!("Failed to triangulate image: {}", e);
-                return Ok(false); // No signatures found
-            }
-        };
-
-    // Get trusted signature layers
-    let signature_layers = match client
-        .trusted_signature_layers(auth, &source_image_digest, &cosign_signature_image)
-        .await
-    {
+    // Sigstore performs triangulation internally and checks all supported signature formats.
+    let signature_layers = match client.trusted_signature_layers(auth, &image_ref).await {
         Ok(layers) => layers,
         Err(e) => {
             log::warn!("Failed to get trusted signature layers: {}", e);
