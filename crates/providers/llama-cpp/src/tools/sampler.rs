@@ -204,6 +204,67 @@ pub(crate) fn build_standard_sampler(params: &SamplingParams) -> LlamaSampler {
     LlamaSampler::chain_simple(samplers)
 }
 
+#[cfg(feature = "llguidance")]
+pub(crate) fn build_structured_sampler(
+    model: &Arc<LlamaModel>,
+    schema: &serde_json::Value,
+    params: &SamplingParams,
+) -> Result<LlamaSampler, LLMError> {
+    use llguidance::{Matcher, ParserFactory, api::TopLevelGrammar};
+    use std::sync::Arc as StdArc;
+    use toktrie::{ApproximateTokEnv, TokRxInfo, TokTrie};
+
+    let n_vocab = model.n_vocab() as u32;
+    let eos = model.token_eos().0 as u32;
+    let mut eog_tokens = vec![eos];
+    let mut words = Vec::with_capacity(n_vocab as usize);
+    for id in 0..n_vocab as i32 {
+        let token = llama_cpp_2::token::LlamaToken(id);
+        if model.is_eog_token(token) && id as u32 != eos {
+            eog_tokens.push(id as u32);
+        }
+        let mut bytes = model
+            .token_to_piece_bytes(token, 32, false, None)
+            .unwrap_or_default();
+        if bytes.is_empty() {
+            bytes = model
+                .token_to_piece_bytes(token, 32, true, None)
+                .unwrap_or_default();
+            if !bytes.is_empty() {
+                bytes.insert(0, 0xff);
+            }
+        }
+        words.push(bytes);
+    }
+    let trie = TokTrie::from(&TokRxInfo::new(n_vocab, eos), &words).with_eos_tokens(&eog_tokens);
+    let tok_env: toktrie::TokEnv = StdArc::new(ApproximateTokEnv::new(trie));
+    let mut factory = ParserFactory::new_simple(&tok_env)
+        .map_err(|e| LLMError::ProviderError(format!("Failed to initialize llguidance: {e}")))?;
+    factory.quiet();
+    let parser = factory.create_parser(TopLevelGrammar::from_json_schema(schema.clone()));
+    let matcher = Matcher::new(parser);
+    Ok(LlamaSampler::chain_simple([
+        LlamaSampler::from(matcher),
+        build_standard_sampler(params),
+    ]))
+}
+
+#[cfg(not(feature = "llguidance"))]
+pub(crate) fn build_structured_sampler(
+    model: &Arc<LlamaModel>,
+    schema: &serde_json::Value,
+    params: &SamplingParams,
+) -> Result<LlamaSampler, LLMError> {
+    let grammar = llama_cpp_2::json_schema_to_grammar(&schema.to_string())
+        .map_err(|e| LLMError::ProviderError(format!("Failed to compile JSON schema: {e}")))?;
+    let constraint = LlamaSampler::grammar(model, &grammar, "root")
+        .map_err(|e| LLMError::ProviderError(format!("Failed to build JSON grammar: {e}")))?;
+    Ok(LlamaSampler::chain_simple([
+        constraint,
+        build_standard_sampler(params),
+    ]))
+}
+
 /// Conservative fallback used only when a model immediately emits EOG with the
 /// configured sampler and no explicit sampling options were set.
 pub(crate) fn build_fallback_sampler(seed: u32) -> LlamaSampler {

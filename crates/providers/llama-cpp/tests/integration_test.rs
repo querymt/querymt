@@ -47,6 +47,8 @@ fn test_config_serialization() {
         mmproj_use_gpu: Some(true),
         n_ubatch: Some(4096),
         text_only: None,
+        mtp: None,
+        backend_sampling: None,
         json_schema: None,
     };
 

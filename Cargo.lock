@@ -2999,6 +2999,7 @@ version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd3bf7087923a80510e6ea986960cb4011bcf54259ecb19a80bf40a645a1526c"
 dependencies = [
+ "ahash",
  "anyhow",
  "bytemuck",
  "bytemuck_derive",
@@ -3854,6 +3855,17 @@ dependencies = [
  "num-traits",
  "rand 0.9.4",
  "rand_distr 0.5.1",
+]
+
+[[package]]
+name = "fluent-uri"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1918b65d96df47d3591bed19c5cca17e3fa5d0707318e4b5ef2eae01764df7e5"
+dependencies = [
+ "borrow-or-share",
+ "ref-cast",
+ "serde",
 ]
 
 [[package]]
@@ -7008,7 +7020,7 @@ dependencies = [
  "num-cmp",
  "num-traits",
  "percent-encoding",
- "referencing",
+ "referencing 0.49.9",
  "regex",
  "reqwest 0.13.4",
  "rustls 0.23.40",
@@ -7746,7 +7758,9 @@ dependencies = [
  "encoding_rs",
  "enumflags2",
  "llama-cpp-sys-2",
+ "llguidance",
  "thiserror 2.0.20",
+ "toktrie",
  "tracing",
  "tracing-core",
 ]
@@ -7774,6 +7788,8 @@ dependencies = [
  "anyhow",
  "derivre",
  "indexmap 2.14.0",
+ "rayon",
+ "referencing 0.29.1",
  "regex-syntax",
  "serde",
  "serde_json",
@@ -11031,6 +11047,7 @@ dependencies = [
  "futures",
  "infer",
  "llama-cpp-2",
+ "llguidance",
  "log",
  "minijinja",
  "minijinja-contrib",
@@ -11041,6 +11058,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toktrie",
 ]
 
 [[package]]
@@ -11969,12 +11987,26 @@ dependencies = [
 
 [[package]]
 name = "referencing"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40a64b3a635fad9000648b4d8a59c8710c523ab61a23d392a7d91d47683f5adc"
+dependencies = [
+ "ahash",
+ "fluent-uri 0.3.2",
+ "once_cell",
+ "parking_lot",
+ "percent-encoding",
+ "serde_json",
+]
+
+[[package]]
+name = "referencing"
 version = "0.49.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6efa2154ea6f5ce0fdecdd2a8d18f2fa1a39a8fbba91564f555a592e4dce8278"
 dependencies = [
  "ahash",
- "fluent-uri",
+ "fluent-uri 0.4.1",
  "getrandom 0.3.4",
  "hashbrown 0.17.1",
  "itoa",

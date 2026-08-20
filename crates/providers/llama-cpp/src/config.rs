@@ -128,6 +128,15 @@ pub struct LlamaCppConfig {
     /// when you only need text generation from a VL model.
     /// Defaults to `false`.
     pub text_only: Option<bool>,
+    /// Multi-token prediction speculative decoding.
+    ///
+    /// When enabled without a model, the target GGUF must contain bundled NextN/MTP tensors.
+    /// Set `model` to use a separate MTP sidecar GGUF instead.
+    pub mtp: Option<MtpConfig>,
+    /// Offload the standard sampler chain to the backend context.
+    ///
+    /// Grammar-constrained, MTP, and mutable fallback sampling remain on the CPU path.
+    pub backend_sampling: Option<bool>,
     /// Optional structured output schema.
     ///
     /// When set, llama.cpp converts the JSON Schema into a GBNF grammar that
@@ -135,6 +144,49 @@ pub struct LlamaCppConfig {
     /// The schema is forwarded to the chat template engine via
     /// `OpenAIChatTemplateParams::json_schema`.
     pub json_schema: Option<StructuredOutputFormat>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct MtpConfig {
+    /// Optional MTP sidecar model. If omitted, use bundled MTP tensors.
+    pub model: Option<String>,
+    /// Maximum number of draft tokens proposed per step. Defaults to 3.
+    pub n_max: Option<u32>,
+    /// Minimum useful draft length. Defaults to 0.
+    pub n_min: Option<u32>,
+    /// Minimum draft-token probability. Defaults to 0.0.
+    pub p_min: Option<f32>,
+    /// GPU layers for a sidecar model. Defaults to the target model setting.
+    pub n_gpu_layers: Option<u32>,
+}
+
+impl Default for MtpConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            n_max: Some(3),
+            n_min: Some(0),
+            p_min: Some(0.0),
+            n_gpu_layers: None,
+        }
+    }
+}
+
+impl MtpConfig {
+    pub(crate) fn params(&self) -> Result<llama_cpp_2::speculative::MtpSpeculativeParams, String> {
+        let n_max = self.n_max.unwrap_or(3);
+        let n_min = self.n_min.unwrap_or(0);
+        let p_min = self.p_min.unwrap_or(0.0);
+        if n_max == 0 || n_min > n_max || !p_min.is_finite() || !(0.0..=1.0).contains(&p_min) {
+            return Err("MTP requires n_max > 0, n_min <= n_max, and p_min in 0..=1".into());
+        }
+        Ok(llama_cpp_2::speculative::MtpSpeculativeParams {
+            n_max: n_max as i32,
+            n_min: n_min as i32,
+            p_min,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]

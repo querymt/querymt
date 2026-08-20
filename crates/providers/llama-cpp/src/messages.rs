@@ -95,7 +95,7 @@ pub(crate) fn messages_to_json(
                         "type": "function",
                         "function": {
                             "name": name,
-                            "arguments": serde_json::to_string(arguments).unwrap_or_default()
+                            "arguments": arguments
                         }
                     }));
                 }
@@ -316,6 +316,8 @@ mod tests {
             mmproj_use_gpu: None,
             n_ubatch: None,
             text_only: None,
+            mtp: None,
+            backend_sampling: None,
             json_schema: None,
         }
     }
@@ -415,6 +417,11 @@ mod tests {
             parsed[0]["tool_calls"][0]["function"]["name"],
             "get_weather"
         );
+        assert_eq!(
+            parsed[0]["tool_calls"][0]["function"]["arguments"],
+            serde_json::json!({"city": "Paris"})
+        );
+        assert!(parsed[0]["tool_calls"][0]["function"]["arguments"].is_object());
     }
 
     #[test]

@@ -11,7 +11,8 @@ type = "native"
 default = ["native"]
 api = ["querymt", "querymt/tracing"]
 native = ["api", "common", "openmp"]
-common = ["llama-cpp-2/common", "llama-cpp-2/mtmd"]
+common = ["llama-cpp-2/common", "llama-cpp-2/mtmd", "llama-cpp-2/llguidance", "dep:llguidance", "dep:toktrie"]
+llguidance = ["common"]
 cuda = ["api", "common", "llama-cpp-2/cuda"]
 metal = ["api", "common", "llama-cpp-2/metal"]
 openmp = ["llama-cpp-2/openmp"]
@@ -25,7 +26,9 @@ async-trait.workspace = true
 encoding_rs = "0.8"
 futures.workspace = true
 infer = { version = "0.22", default-features = false }
-llama-cpp-2 = { version = "0.1", default-features = false }
+llama-cpp-2 = { version = "0.1.154", default-features = false }
+llguidance = { version = "1.7.5", optional = true }
+toktrie = { version = "1.7.5", optional = true }
 querymt-provider-common = { path = "../../provider-common" }
 log.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

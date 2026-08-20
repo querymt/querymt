@@ -135,12 +135,44 @@ fn preserved_token_set(
 pub(crate) fn generate(
     model: &Arc<LlamaModel>,
     cfg: &LlamaCppConfig,
+    mtp_model: Option<&Arc<LlamaModel>>,
     prompt: &str,
     max_tokens: u32,
     temperature: Option<f32>,
     mm_ctx: Option<&MultimodalContext>,
     bitmaps: &[MtmdBitmap],
 ) -> Result<GeneratedText, LLMError> {
+    if cfg.mtp.is_some() && bitmaps.is_empty() {
+        let mut output = String::new();
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let preserved = preserved_token_set(model, None);
+        let stats = crate::mtp::run_mtp(
+            model,
+            mtp_model,
+            cfg,
+            prompt,
+            max_tokens,
+            temperature,
+            None,
+            |token| {
+                output.push_str(&decode_token_piece(model, &mut decoder, &preserved, token)?);
+                Ok(true)
+            },
+        )?;
+        return Ok(GeneratedText {
+            text: output,
+            usage: Usage {
+                input_tokens: stats.input_tokens,
+                output_tokens: stats.output_tokens,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning_tokens: 0,
+            },
+        });
+    }
+    if cfg.mtp.is_some() && !bitmaps.is_empty() {
+        log::warn!("MTP is disabled for multimodal requests");
+    }
     let backend = llama_backend()?;
 
     // Validate: if bitmaps provided, must have mm_ctx
@@ -177,7 +209,18 @@ pub(crate) fn generate(
     }
     ctx_params = apply_context_params(cfg, ctx_params)?;
 
-    let mut ctx = model.new_context(&*backend, ctx_params).map_err(|e| {
+    let sampling_params = SamplingParams::from_config(cfg, temperature);
+    let backend_sampling = cfg.backend_sampling.unwrap_or(false);
+    let mut ctx = if backend_sampling {
+        model.new_context_with_samplers(
+            &*backend,
+            ctx_params,
+            [(0, build_standard_sampler(&sampling_params))],
+        )
+    } else {
+        model.new_context(&*backend, ctx_params)
+    }
+    .map_err(|e| {
         let n = if effective_n_ctx > 0 {
             effective_n_ctx
         } else {
@@ -185,8 +228,7 @@ pub(crate) fn generate(
         };
         let est = estimate_context_memory(model, cfg, n);
         LLMError::ProviderError(format!(
-            "Failed to create context: {}. {}\n\
-             Try reducing n_ctx or using KV cache quantization.",
+            "Failed to create context: {}. {}\nTry reducing n_ctx or using KV cache quantization.",
             e,
             est.summary()
         ))
@@ -340,9 +382,9 @@ pub(crate) fn generate(
 
     // UNIFIED GENERATION PHASE (identical for both paths)
 
-    let params = SamplingParams::from_config(cfg, temperature);
+    let params = sampling_params;
     let mut sampler = build_standard_sampler(&params);
-    let allow_fallback = !params.is_explicit();
+    let allow_fallback = !backend_sampling && !params.is_explicit();
     let mut fallback_used = false;
 
     let mut n_cur = n_past;
@@ -353,7 +395,13 @@ pub(crate) fn generate(
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let preserved = preserved_token_set(model, None);
     while n_cur < n_len_total {
-        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+        let token = if backend_sampling {
+            ctx.sampled_token_ith(batch.n_tokens() - 1).ok_or_else(|| {
+                LLMError::ProviderError("Backend sampler did not produce a token".into())
+            })?
+        } else {
+            sampler.sample(&ctx, batch.n_tokens() - 1)
+        };
         if model.is_eog_token(token) {
             if output_tokens == 0 && allow_fallback && !fallback_used {
                 sampler = build_fallback_sampler(params.seed);
@@ -402,6 +450,7 @@ pub(crate) fn generate(
 pub(crate) fn generate_streaming_with_thinking(
     model: &Arc<LlamaModel>,
     cfg: &LlamaCppConfig,
+    mtp_model: Option<&Arc<LlamaModel>>,
     result: &ChatTemplateResult,
     max_tokens: u32,
     temperature: Option<f32>,
@@ -409,6 +458,47 @@ pub(crate) fn generate_streaming_with_thinking(
     mm_ctx: Option<&MultimodalContext>,
     bitmaps: &[MtmdBitmap],
 ) -> Result<Usage, LLMError> {
+    if cfg.mtp.is_some() && bitmaps.is_empty() {
+        let mut stream_state = result.streaming_state();
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let preserved = preserved_token_set(model, Some(result));
+        let stats = crate::mtp::run_mtp(
+            model,
+            mtp_model,
+            cfg,
+            &result.prompt,
+            max_tokens,
+            temperature,
+            None,
+            |token| {
+                let piece = decode_token_piece(model, &mut decoder, &preserved, token)?;
+                for delta in stream_state.update(&piece, true) {
+                    let chunk = match delta {
+                        ParsedDelta::Content(v) => querymt::chat::StreamChunk::Text(v),
+                        ParsedDelta::Thinking(v) => querymt::chat::StreamChunk::Thinking(v),
+                    };
+                    if tx.unbounded_send(Ok(chunk)).is_err() {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            },
+        )?;
+        for delta in stream_state.finish() {
+            let chunk = match delta {
+                ParsedDelta::Content(v) => querymt::chat::StreamChunk::Text(v),
+                ParsedDelta::Thinking(v) => querymt::chat::StreamChunk::Thinking(v),
+            };
+            let _ = tx.unbounded_send(Ok(chunk));
+        }
+        return Ok(Usage {
+            input_tokens: stats.input_tokens,
+            output_tokens: stats.output_tokens,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning_tokens: 0,
+        });
+    }
     let backend = llama_backend()?;
 
     // Validate: bitmaps require a multimodal context.

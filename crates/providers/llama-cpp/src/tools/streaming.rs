@@ -4,7 +4,7 @@ use crate::config::LlamaCppConfig;
 use crate::multimodal::MultimodalContext;
 use crate::tools::generation::parse_tool_response;
 use crate::tools::prefill::prefill_for_tool_generation;
-use crate::tools::sampler::{SamplingParams, build_tool_sampler};
+use crate::tools::sampler::{SamplingParams, build_structured_sampler, build_tool_sampler};
 use futures::channel::mpsc;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::{AddBos, LlamaModel};
@@ -19,6 +19,7 @@ use std::sync::Arc;
 pub(crate) fn generate_streaming_with_tools(
     model: &Arc<LlamaModel>,
     cfg: &LlamaCppConfig,
+    mtp_model: Option<&Arc<LlamaModel>>,
     result: &ChatTemplateResult,
     max_tokens: u32,
     temperature: Option<f32>,
@@ -26,6 +27,87 @@ pub(crate) fn generate_streaming_with_tools(
     mm_ctx: Option<&MultimodalContext>,
     bitmaps: &[MtmdBitmap],
 ) -> Result<(Usage, bool), LLMError> {
+    if cfg.mtp.is_some() && bitmaps.is_empty() {
+        let params = SamplingParams::from_config(cfg, temperature);
+        let sampler = if let Some(schema) = cfg.json_schema.as_ref().and_then(|s| s.schema.as_ref())
+        {
+            build_structured_sampler(model, schema, &params)?
+        } else {
+            build_tool_sampler(model, result, &params)?
+        };
+        let mut text = String::new();
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut preserved = HashSet::new();
+        for value in &result.preserved_tokens {
+            if let Ok(tokens) = model.str_to_token(value, AddBos::Never)
+                && tokens.len() == 1
+            {
+                preserved.insert(tokens[0]);
+            }
+        }
+        let mut stream_state = result.streaming_state();
+        let stats = crate::mtp::run_mtp(
+            model,
+            mtp_model,
+            cfg,
+            &result.prompt,
+            max_tokens,
+            temperature,
+            Some(sampler),
+            |token| {
+                let piece = model
+                    .token_to_piece(token, &mut decoder, preserved.contains(&token), None)
+                    .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+                text.push_str(&piece);
+                let stop_now = result
+                    .additional_stops
+                    .iter()
+                    .any(|s| !s.is_empty() && text.ends_with(s));
+                for delta in stream_state.update(&piece, !stop_now) {
+                    if let ParsedDelta::Thinking(thinking) = delta
+                        && tx
+                            .unbounded_send(Ok(querymt::chat::StreamChunk::Thinking(thinking)))
+                            .is_err()
+                    {
+                        return Ok(false);
+                    }
+                }
+                Ok(!stop_now)
+            },
+        )?;
+        for stop in &result.additional_stops {
+            if !stop.is_empty() && text.ends_with(stop) {
+                text.truncate(text.len() - stop.len());
+                break;
+            }
+        }
+        let (content, thinking, calls, _) = parse_tool_response(result, &text)?;
+        if let Some(thinking) = thinking {
+            let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Thinking(thinking)));
+        }
+        let has_calls = calls.is_some();
+        if let Some(calls) = calls {
+            for (index, tool_call) in calls.into_iter().enumerate() {
+                let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::ToolUseComplete {
+                    index,
+                    tool_call,
+                }));
+            }
+        } else if !content.is_empty() {
+            let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Text(content)));
+        }
+        return Ok((
+            Usage {
+                input_tokens: stats.input_tokens,
+                output_tokens: stats.output_tokens,
+
+                cache_read: 0,
+                cache_write: 0,
+                reasoning_tokens: 0,
+            },
+            has_calls,
+        ));
+    }
     let mut state =
         prefill_for_tool_generation(model, cfg, &result.prompt, max_tokens, mm_ctx, bitmaps)?;
 
@@ -62,7 +144,12 @@ pub(crate) fn generate_streaming_with_tools(
 
     let mut stream_state = result.streaming_state();
     let params = SamplingParams::from_config(cfg, temperature);
-    let mut sampler = build_tool_sampler(model, result, &params)?;
+    let mut sampler = if let Some(schema) = cfg.json_schema.as_ref().and_then(|s| s.schema.as_ref())
+    {
+        build_structured_sampler(model, schema, &params)?
+    } else {
+        build_tool_sampler(model, result, &params)?
+    };
     let mut output_tokens = 0u32;
     let mut generated_text = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
