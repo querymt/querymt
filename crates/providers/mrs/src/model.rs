@@ -1,10 +1,3 @@
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-    str::FromStr,
-};
-
-use hf_hub::{Cache, Repo, RepoType, api::sync::ApiBuilder};
 use mistralrs::core::{
     EmbeddingLoaderType, MultimodalLoaderType, NormalLoaderType, PagedCacheType, SpeechLoaderType,
 };
@@ -20,8 +13,15 @@ use querymt::embedding::EmbeddingProvider;
 use querymt::stt::{SttRequest, SttResponse};
 use querymt::tts::{TtsRequest, TtsResponse};
 use querymt::{LLMProvider, error::LLMError};
-use querymt_provider_common::{ModelRef, parse_model_ref};
+use querymt_provider_common::{
+    HfFileRef, ModelRef, download_hf_file_sync, no_progress, parse_model_ref,
+};
 use serde::Deserialize;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use crate::config::{
     MistralRSConfig, MistralRSDeviceMap, MistralRSModelKind, MistralRSPagedCacheType,
@@ -286,8 +286,7 @@ fn load_model_config_artifacts(cfg: &MistralRSConfig) -> Result<ModelConfigArtif
         return load_model_config_from_path(model_path);
     }
 
-    let token_source = resolve_token_source(cfg)?;
-    load_model_config_from_hf(&cfg.model, cfg.hf_revision.as_deref(), &token_source)
+    load_model_config_from_hf(&cfg.model, cfg.hf_revision.as_deref())
 }
 
 fn load_model_config_from_path(path: &Path) -> Result<ModelConfigArtifacts, LLMError> {
@@ -315,58 +314,27 @@ fn load_model_config_from_path(path: &Path) -> Result<ModelConfigArtifacts, LLME
 fn load_model_config_from_hf(
     model_id: &str,
     revision: Option<&str>,
-    token_source: &TokenSource,
 ) -> Result<ModelConfigArtifacts, LLMError> {
-    let token = token_from_source(token_source)?;
-    let cache = Cache::from_env();
-    let mut api = ApiBuilder::from_cache(cache)
-        .with_progress(false)
-        .with_token(token);
-    if let Ok(cache_dir) = env::var("HF_HUB_CACHE") {
-        api = api.with_cache_dir(cache_dir.into());
-    }
-    let api = api
-        .build()
-        .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))?;
-    let revision = revision.unwrap_or("main");
-    let repo = api.repo(Repo::with_revision(
-        model_id.to_string(),
-        RepoType::Model,
-        revision.to_string(),
-    ));
-    let config_path = repo
-        .get("config.json")
-        .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))?;
+    let file_ref = |filename: &str| {
+        let file = HfFileRef::new(model_id, filename);
+        match revision {
+            Some(revision) => file.with_revision(revision),
+            None => file,
+        }
+    };
+    let config_path = download_hf_file_sync(&file_ref("config.json"), no_progress())
+        .map_err(|e| LLMError::ProviderError(e.to_string()))?;
     let contents = fs::read_to_string(&config_path)
         .map_err(|e| LLMError::ProviderError(format!("{:#}", e)))?;
-    let sentence_transformers_present = repo.get("config_sentence_transformers.json").is_ok();
+    let sentence_transformers_present = download_hf_file_sync(
+        &file_ref("config_sentence_transformers.json"),
+        no_progress(),
+    )
+    .is_ok();
     Ok(ModelConfigArtifacts {
         contents,
         sentence_transformers_present,
     })
-}
-
-fn resolve_token_source(cfg: &MistralRSConfig) -> Result<TokenSource, LLMError> {
-    match cfg.token_source.as_ref() {
-        Some(token_source) => TokenSource::from_str(token_source).map_err(LLMError::InvalidRequest),
-        None => Ok(TokenSource::CacheToken),
-    }
-}
-
-fn token_from_source(source: &TokenSource) -> Result<Option<String>, LLMError> {
-    let token = match source {
-        TokenSource::Literal(data) => Some(data.clone()),
-        TokenSource::EnvVar(envvar) => env::var(envvar).ok(),
-        TokenSource::Path(path) => fs::read_to_string(path).ok(),
-        TokenSource::CacheToken => {
-            let home = env::var("HOME").or_else(|_| env::var("USERPROFILE")).ok();
-            home.and_then(|path| {
-                fs::read_to_string(Path::new(&path).join(".cache/huggingface/token")).ok()
-            })
-        }
-        TokenSource::None => None,
-    };
-    Ok(token.map(|s| s.trim().to_string()))
 }
 
 fn device_map_setting(cfg: &MistralRSConfig, kind: MistralRSModelKind) -> Option<DeviceMapSetting> {

@@ -68,9 +68,19 @@ struct Args {
     media_marker: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let hf_download_config = querymt_provider_common::configure_hf_download_concurrency();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(hf_download_config))
+}
+
+async fn run(
+    hf_download_config: querymt_provider_common::HfDownloadConcurrencyConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    querymt_provider_common::log_hf_download_concurrency(&hf_download_config);
 
     let args = Args::parse();
 
@@ -106,7 +116,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         use_chat_template: None,
         add_bos: None,
         log: None,
-        fast_download: None,
         enable_thinking: None,
         flash_attention: None,
         kv_cache_type_k: None,

@@ -8,5 +8,5 @@ description = "Shared model reference parsing and HuggingFace GGUF resolution"
 [dependencies]
 dirs.workspace = true
 hf-hub.workspace = true
+indicatif = "0.18"
 log.workspace = true
-tokio = { version = "1.0", features = ["rt-multi-thread"] }

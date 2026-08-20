@@ -37,7 +37,6 @@ fn test_config_serialization() {
         use_chat_template: Some(true),
         add_bos: Some(true),
         log: None,
-        fast_download: Some(false),
         enable_thinking: Some(true),
         flash_attention: None,
         kv_cache_type_k: Some("q4_0".to_string()),

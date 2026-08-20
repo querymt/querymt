@@ -16,8 +16,8 @@ use crate::agent::remote::SessionActorRef;
 use crate::session::store::CustomModel;
 use crate::ui::session::session_ref_for_session;
 use querymt_provider_common::{
-    DownloadProgress, DownloadStatus, HfModelRef, canonical_id_from_file, canonical_id_from_hf,
-    download_hf_gguf_with_progress, parse_gguf_metadata,
+    DownloadProgress, DownloadStatus, HfFileRef, canonical_id_from_file, canonical_id_from_hf,
+    download_hf_file, parse_gguf_metadata,
 };
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
@@ -281,11 +281,8 @@ pub async fn handle_add_custom_model_from_hf(
             });
         });
 
-        let result = download_hf_gguf_with_progress(
-            &HfModelRef {
-                repo: repo_owned.clone(),
-                file: filename_owned.clone(),
-            },
+        let result = download_hf_file(
+            &HfFileRef::new(repo_owned.clone(), filename_owned.clone()),
             progress_cb,
         )
         .await;

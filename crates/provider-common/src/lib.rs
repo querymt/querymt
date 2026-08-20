@@ -1,14 +1,45 @@
-use hf_hub::api::sync::ApiBuilder as SyncApiBuilder;
-use hf_hub::api::tokio::ApiBuilder as AsyncApiBuilder;
+use hf_hub::progress::{DownloadEvent, ProgressEvent, ProgressHandler};
+use hf_hub::{HFClient, HFClientSync, split_id};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::debug;
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HfModelRef {
     pub repo: String,
     pub file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HfFileRef {
+    pub repo: String,
+    pub file: String,
+    pub revision: Option<String>,
+}
+
+impl HfFileRef {
+    pub fn new(repo: impl Into<String>, file: impl Into<String>) -> Self {
+        Self {
+            repo: repo.into(),
+            file: file.into(),
+            revision: None,
+        }
+    }
+
+    pub fn with_revision(mut self, revision: impl Into<String>) -> Self {
+        self.revision = Some(revision.into());
+        self
+    }
+}
+
+impl From<&HfModelRef> for HfFileRef {
+    fn from(model: &HfModelRef) -> Self {
+        Self::new(&model.repo, &model.file)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +90,316 @@ pub enum DownloadStatus {
 }
 
 pub type ProgressCallback = Box<dyn Fn(DownloadProgress) + Send + Sync>;
+
+pub const QMT_HF_DOWNLOAD_CONCURRENCY: &str = "QMT_HF_DOWNLOAD_CONCURRENCY";
+pub const DEFAULT_HF_DOWNLOAD_CONCURRENCY: usize = 8;
+
+const XET_INITIAL_DOWNLOAD_CONCURRENCY: &str = "HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY";
+const XET_MIN_DOWNLOAD_CONCURRENCY: &str = "HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY";
+const XET_MAX_DOWNLOAD_CONCURRENCY: &str = "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY";
+const XET_DOWNLOAD_CONCURRENCY_VARS: [&str; 3] = [
+    XET_INITIAL_DOWNLOAD_CONCURRENCY,
+    XET_MIN_DOWNLOAD_CONCURRENCY,
+    XET_MAX_DOWNLOAD_CONCURRENCY,
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HfDownloadConcurrencySource {
+    XetEnvironment,
+    QueryMtEnvironment,
+    QueryMtDefault,
+    PartialXetEnvironment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HfDownloadConcurrencyConfig {
+    pub source: HfDownloadConcurrencySource,
+    pub concurrency: Option<usize>,
+}
+
+/// Configure Xet download concurrency before the first Hugging Face client is created.
+///
+/// Explicit low-level Xet settings take precedence. Otherwise QueryMT applies
+/// `QMT_HF_DOWNLOAD_CONCURRENCY`, falling back to eight concurrent downloads.
+pub fn configure_hf_download_concurrency() -> HfDownloadConcurrencyConfig {
+    let xet_values = XET_DOWNLOAD_CONCURRENCY_VARS.map(std::env::var_os);
+    let configured_xet_vars = xet_values.iter().filter(|value| value.is_some()).count();
+
+    if configured_xet_vars == XET_DOWNLOAD_CONCURRENCY_VARS.len() {
+        let parsed = xet_values
+            .iter()
+            .map(|value| {
+                value
+                    .as_ref()
+                    .and_then(|value| value.to_str())
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .collect::<Option<Vec<_>>>();
+        let concurrency = parsed.and_then(|values| {
+            (values.iter().all(|value| *value > 0)
+                && values.windows(2).all(|pair| pair[0] == pair[1]))
+            .then_some(values[0])
+        });
+        return HfDownloadConcurrencyConfig {
+            source: HfDownloadConcurrencySource::XetEnvironment,
+            concurrency,
+        };
+    }
+
+    if configured_xet_vars > 0 {
+        return HfDownloadConcurrencyConfig {
+            source: HfDownloadConcurrencySource::PartialXetEnvironment,
+            concurrency: None,
+        };
+    }
+
+    let (source, concurrency) = match std::env::var(QMT_HF_DOWNLOAD_CONCURRENCY) {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(value) if value > 0 => (HfDownloadConcurrencySource::QueryMtEnvironment, value),
+            _ => {
+                log::warn!(
+                    "Ignoring invalid {QMT_HF_DOWNLOAD_CONCURRENCY}={value:?}; using {DEFAULT_HF_DOWNLOAD_CONCURRENCY}"
+                );
+                (
+                    HfDownloadConcurrencySource::QueryMtDefault,
+                    DEFAULT_HF_DOWNLOAD_CONCURRENCY,
+                )
+            }
+        },
+        Err(_) => (
+            HfDownloadConcurrencySource::QueryMtDefault,
+            DEFAULT_HF_DOWNLOAD_CONCURRENCY,
+        ),
+    };
+    let value = concurrency.to_string();
+    for variable in XET_DOWNLOAD_CONCURRENCY_VARS {
+        // SAFETY: Callers must invoke this during single-threaded process startup,
+        // before constructing a Hugging Face client or spawning worker threads.
+        unsafe { std::env::set_var(variable, &value) };
+    }
+
+    HfDownloadConcurrencyConfig {
+        source,
+        concurrency: Some(concurrency),
+    }
+}
+
+pub fn log_hf_download_concurrency(config: &HfDownloadConcurrencyConfig) {
+    match config.source {
+        HfDownloadConcurrencySource::PartialXetEnvironment => log::warn!(
+            "Partial Xet download concurrency configuration detected; set all of {}, {}, and {}",
+            XET_INITIAL_DOWNLOAD_CONCURRENCY,
+            XET_MIN_DOWNLOAD_CONCURRENCY,
+            XET_MAX_DOWNLOAD_CONCURRENCY,
+        ),
+        HfDownloadConcurrencySource::XetEnvironment if config.concurrency.is_none() => log::warn!(
+            "Xet download concurrency variables must be positive and equal to define a fixed QueryMT profile"
+        ),
+        _ => log::debug!(
+            "Hugging Face download concurrency: {:?}, value={:?}",
+            config.source,
+            config.concurrency
+        ),
+    }
+}
+
+type SharedProgressCallback = Arc<dyn Fn(DownloadProgress) + Send + Sync>;
+
+struct HfDownloadProgressHandler {
+    callback: SharedProgressCallback,
+    files: Mutex<HashMap<String, (u64, u64)>>,
+}
+
+impl HfDownloadProgressHandler {
+    fn new(callback: SharedProgressCallback) -> Self {
+        Self {
+            callback,
+            files: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn emit(&self, bytes_downloaded: u64, bytes_total: u64, speed_bps: Option<f64>) {
+        let bytes_downloaded = if bytes_total > 0 {
+            bytes_downloaded.min(bytes_total)
+        } else {
+            bytes_downloaded
+        };
+        let percent =
+            (bytes_total > 0).then_some(bytes_downloaded as f32 * 100.0 / bytes_total as f32);
+        let eta_seconds = speed_bps
+            .filter(|speed| *speed > 0.0)
+            .map(|speed| ((bytes_total.saturating_sub(bytes_downloaded)) as f64 / speed) as u64);
+        (self.callback)(DownloadProgress {
+            bytes_downloaded,
+            bytes_total: (bytes_total > 0).then_some(bytes_total),
+            percent,
+            speed_bps: speed_bps.map(|speed| speed as u64),
+            eta_seconds,
+            status: DownloadStatus::Downloading,
+        });
+    }
+}
+
+impl ProgressHandler for HfDownloadProgressHandler {
+    fn on_progress(&self, event: &ProgressEvent) {
+        match event {
+            ProgressEvent::Download(DownloadEvent::Start { total_bytes, .. }) => {
+                if let Ok(mut files) = self.files.lock() {
+                    files.clear();
+                }
+                self.emit(0, *total_bytes, None);
+            }
+            ProgressEvent::Download(DownloadEvent::Progress { files }) => {
+                let Ok(mut tracked) = self.files.lock() else {
+                    return;
+                };
+                for file in files {
+                    tracked.insert(
+                        file.filename.clone(),
+                        (file.bytes_completed, file.total_bytes),
+                    );
+                }
+                let (bytes_downloaded, bytes_total) = tracked.values().fold(
+                    (0_u64, 0_u64),
+                    |(downloaded, total), (file_downloaded, file_total)| {
+                        (
+                            downloaded.saturating_add(*file_downloaded),
+                            total.saturating_add(*file_total),
+                        )
+                    },
+                );
+                drop(tracked);
+                self.emit(bytes_downloaded, bytes_total, None);
+            }
+            ProgressEvent::Download(DownloadEvent::AggregateProgress {
+                bytes_completed,
+                total_bytes,
+                bytes_per_sec,
+            }) => self.emit(*bytes_completed, *total_bytes, *bytes_per_sec),
+            ProgressEvent::Download(DownloadEvent::Complete) | ProgressEvent::Upload(_) => {}
+        }
+    }
+}
+
+pub fn no_progress() -> ProgressCallback {
+    Box::new(|_| {})
+}
+
+struct TerminalProgressState {
+    bar: ProgressBar,
+    interactive: bool,
+    determinate: bool,
+    finished: bool,
+    last_log: Instant,
+}
+
+pub fn terminal_progress(label: impl Into<String>) -> ProgressCallback {
+    let label = label.into();
+    let interactive = std::io::stderr().is_terminal();
+    let bar = ProgressBar::new_spinner();
+    if interactive {
+        bar.set_draw_target(ProgressDrawTarget::stderr());
+        bar.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .expect("valid spinner progress template"),
+        );
+        bar.enable_steady_tick(Duration::from_millis(100));
+        bar.set_message(format!("Downloading {label}"));
+    } else {
+        bar.set_draw_target(ProgressDrawTarget::hidden());
+    }
+    let state = Arc::new(Mutex::new(TerminalProgressState {
+        bar,
+        interactive,
+        determinate: false,
+        finished: false,
+        last_log: Instant::now(),
+    }));
+
+    Box::new(move |progress| {
+        let Ok(mut state) = state.lock() else {
+            return;
+        };
+        if state.finished {
+            return;
+        }
+
+        match progress.status {
+            DownloadStatus::Starting => {
+                if !state.interactive {
+                    eprintln!("Downloading {label}...");
+                }
+            }
+            DownloadStatus::Downloading => {
+                if state.interactive {
+                    if let Some(total) = progress.bytes_total.filter(|total| *total > 0) {
+                        if !state.determinate {
+                            state.bar.disable_steady_tick();
+                            state.bar.set_style(
+                                ProgressStyle::with_template(
+                                    "{msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} \
+                                     ({bytes_per_sec}, {eta})",
+                                )
+                                .expect("valid download progress template")
+                                .progress_chars("=>-"),
+                            );
+                            state.determinate = true;
+                        }
+                        state.bar.set_length(total);
+                    }
+                    state.bar.set_position(progress.bytes_downloaded);
+                    state.bar.set_message(format!("Downloading {label}"));
+                } else if state.last_log.elapsed() >= Duration::from_secs(10) {
+                    if let Some(percent) = progress.percent {
+                        eprintln!("Downloading {label}: {percent:.1}%");
+                    } else {
+                        eprintln!("Downloading {label}: {} bytes", progress.bytes_downloaded);
+                    }
+                    state.last_log = Instant::now();
+                }
+            }
+            DownloadStatus::Verifying => {
+                if state.interactive {
+                    state.bar.set_message(format!("Verifying {label}"));
+                }
+            }
+            DownloadStatus::Completed => {
+                if state.interactive {
+                    state.bar.finish_with_message(format!("Downloaded {label}"));
+                } else {
+                    eprintln!("Downloaded {label}");
+                }
+                state.finished = true;
+            }
+            DownloadStatus::Failed(message) => {
+                if state.interactive {
+                    state
+                        .bar
+                        .abandon_with_message(format!("Failed to download {label}: {message}"));
+                } else {
+                    eprintln!("Failed to download {label}: {message}");
+                }
+                state.finished = true;
+            }
+        }
+    })
+}
+
+fn model_repository(
+    client: &HFClient,
+    repo_id: &str,
+) -> hf_hub::HFRepository<hf_hub::RepoTypeModel> {
+    let (owner, name) = split_id(repo_id);
+    client.model(owner, name)
+}
+
+fn model_repository_sync(
+    client: &HFClientSync,
+    repo_id: &str,
+) -> hf_hub::HFRepositorySync<hf_hub::RepoTypeModel> {
+    let (owner, name) = split_id(repo_id);
+    client.model(owner, name)
+}
 
 impl std::fmt::Display for ModelRefError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -292,139 +633,117 @@ pub fn infer_gguf_filename(repo: &str, selector: &str) -> String {
     format!("{base}-{selector}.gguf")
 }
 
-pub async fn download_hf_gguf_with_progress(
-    model: &HfModelRef,
-    progress_cb: ProgressCallback,
-) -> Result<PathBuf, ModelRefError> {
-    progress_cb(DownloadProgress {
+fn starting_progress() -> DownloadProgress {
+    DownloadProgress {
         bytes_downloaded: 0,
         bytes_total: None,
         percent: None,
         speed_bps: None,
         eta_seconds: None,
         status: DownloadStatus::Starting,
-    });
+    }
+}
 
-    // 4 parallel streams saturate typical home/office bandwidth (~1 Gbps) without
-    // pinning all CPU cores. The default .high() uses num_cpus (14 on this machine)
-    // which saturates rustls TLS decryption before saturating the NIC.
-    // 100 MB chunks reduce HTTP range requests from ~800 to ~80 for an 8 GB model.
-    const CHUNK_SIZE: usize = 100_000_000;
-    debug!(
-        "download_hf_gguf_with_progress: building async API — max_files={} chunk_size={} for {}/{}",
-        FAST_DOWNLOAD_WORKER_THREADS, CHUNK_SIZE, model.repo, model.file,
-    );
-    let api = AsyncApiBuilder::new()
-        .with_progress(true)
-        .with_max_files(FAST_DOWNLOAD_WORKER_THREADS)
-        .with_chunk_size(Some(CHUNK_SIZE))
-        .build()
-        .map_err(|e| ModelRefError::Download(e.to_string()))?;
-
-    progress_cb(DownloadProgress {
-        bytes_downloaded: 0,
-        bytes_total: None,
-        percent: None,
-        speed_bps: None,
-        eta_seconds: None,
-        status: DownloadStatus::Downloading,
-    });
-
-    let result = api.model(model.repo.clone()).get(&model.file).await;
+fn finish_download<E: std::fmt::Display>(
+    result: Result<PathBuf, E>,
+    progress_cb: &SharedProgressCallback,
+) -> Result<PathBuf, ModelRefError> {
     match result {
         Ok(path) => {
-            progress_cb(DownloadProgress {
-                bytes_downloaded: 0,
-                bytes_total: None,
-                percent: Some(100.0),
-                speed_bps: None,
-                eta_seconds: Some(0),
-                status: DownloadStatus::Verifying,
-            });
-            progress_cb(DownloadProgress {
-                bytes_downloaded: 0,
-                bytes_total: None,
-                percent: Some(100.0),
-                speed_bps: None,
-                eta_seconds: Some(0),
-                status: DownloadStatus::Completed,
-            });
+            let bytes_downloaded = std::fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            for status in [DownloadStatus::Verifying, DownloadStatus::Completed] {
+                progress_cb(DownloadProgress {
+                    bytes_downloaded,
+                    bytes_total: Some(bytes_downloaded),
+                    percent: Some(100.0),
+                    speed_bps: None,
+                    eta_seconds: Some(0),
+                    status,
+                });
+            }
             Ok(path)
         }
-        Err(e) => {
-            let msg = e.to_string();
+        Err(error) => {
+            let message = error.to_string();
             progress_cb(DownloadProgress {
                 bytes_downloaded: 0,
                 bytes_total: None,
                 percent: None,
                 speed_bps: None,
                 eta_seconds: None,
-                status: DownloadStatus::Failed(msg.clone()),
+                status: DownloadStatus::Failed(message.clone()),
             });
-            Err(ModelRefError::Download(msg))
+            Err(ModelRefError::Download(message))
         }
     }
 }
 
-pub fn resolve_hf_model_sync(model: &HfModelRef) -> Result<PathBuf, ModelRefError> {
+pub async fn download_hf_file(
+    file: &HfFileRef,
+    progress_cb: ProgressCallback,
+) -> Result<PathBuf, ModelRefError> {
+    let progress_cb: SharedProgressCallback = Arc::from(progress_cb);
     debug!(
-        "resolve_hf_model_sync: single-stream ureq download for {}/{}",
-        model.repo, model.file,
+        "download_hf_file: async download for {}/{}",
+        file.repo, file.file
     );
-    let api = SyncApiBuilder::new()
-        .with_progress(true)
+    let client = HFClient::builder()
         .build()
         .map_err(|e| ModelRefError::Download(e.to_string()))?;
-    api.model(model.repo.clone())
-        .get(&model.file)
-        .map_err(|e| ModelRefError::Download(e.to_string()))
+    progress_cb(starting_progress());
+    let repo = model_repository(&client, &file.repo);
+    let result = match &file.revision {
+        Some(revision) => {
+            repo.download_file()
+                .filename(&file.file)
+                .progress(HfDownloadProgressHandler::new(Arc::clone(&progress_cb)))
+                .revision(revision)
+                .send()
+                .await
+        }
+        None => {
+            repo.download_file()
+                .filename(&file.file)
+                .progress(HfDownloadProgressHandler::new(Arc::clone(&progress_cb)))
+                .send()
+                .await
+        }
+    };
+
+    finish_download(result, &progress_cb)
 }
 
-/// Number of parallel download streams used by the fast downloader.
-///
-/// Each stream runs TLS decryption independently, so this directly trades
-/// CPU cores for download throughput.
-const FAST_DOWNLOAD_WORKER_THREADS: usize = 8;
+pub fn download_hf_file_sync(
+    file: &HfFileRef,
+    progress_cb: ProgressCallback,
+) -> Result<PathBuf, ModelRefError> {
+    let progress_cb: SharedProgressCallback = Arc::from(progress_cb);
+    debug!(
+        "download_hf_file_sync: blocking download for {}/{}",
+        file.repo, file.file
+    );
+    let client = HFClient::builder()
+        .build_sync()
+        .map_err(|e| ModelRefError::Download(e.to_string()))?;
+    progress_cb(starting_progress());
+    let repo = model_repository_sync(&client, &file.repo);
+    let result = match &file.revision {
+        Some(revision) => repo
+            .download_file()
+            .filename(&file.file)
+            .progress(HfDownloadProgressHandler::new(Arc::clone(&progress_cb)))
+            .revision(revision)
+            .send(),
+        None => repo
+            .download_file()
+            .filename(&file.file)
+            .progress(HfDownloadProgressHandler::new(Arc::clone(&progress_cb)))
+            .send(),
+    };
 
-pub fn resolve_hf_model_fast(model: &HfModelRef) -> Result<PathBuf, ModelRefError> {
-    // Try the host's runtime first. This works when called from a regular
-    // async binary, but fails when called from a cdylib plugin: each dylib
-    // gets its own copy of thread-local storage, so the host's tokio runtime
-    // handle is invisible here and try_current() returns Err.
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            debug!(
-                "resolve_hf_model_fast: host tokio runtime found — using block_in_place path \
-                 ({}:{}, kind={:?})",
-                model.repo,
-                model.file,
-                handle.runtime_flavor(),
-            );
-            let model = model.clone();
-            tokio::task::block_in_place(|| {
-                handle.block_on(async move {
-                    download_hf_gguf_with_progress(&model, Box::new(|_| {})).await
-                })
-            })
-        }
-        Err(e) => {
-            debug!(
-                "resolve_hf_model_fast: no host tokio runtime ({}) — spawning dedicated \
-                 {}-worker runtime for {}/{}",
-                e, FAST_DOWNLOAD_WORKER_THREADS, model.repo, model.file,
-            );
-            // Dylib case: spin up a dedicated multi-thread runtime so parallel chunk
-            // downloads actually run on separate threads (the sync fallback is
-            // single-threaded and pegs one CPU core on TLS decryption).
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(FAST_DOWNLOAD_WORKER_THREADS)
-                .enable_all()
-                .build()
-                .map_err(|e| ModelRefError::Download(e.to_string()))?;
-
-            rt.block_on(async { download_hf_gguf_with_progress(model, Box::new(|_| {})).await })
-        }
-    }
+    finish_download(result, &progress_cb)
 }
 
 /// Preferred mmproj filenames in priority order (best quality/size tradeoff first).
@@ -441,25 +760,24 @@ const MMPROJ_PREFERENCES: &[&str] = &["mmproj-F16.gguf", "mmproj-BF16.gguf", "mm
 /// Errors are suppressed and returned as `Ok(None)` so that callers can treat
 /// auto-discovery as a best-effort operation.
 pub fn discover_mmproj_in_hf_repo(repo: &str) -> Result<Option<String>, ModelRefError> {
-    let api = SyncApiBuilder::new()
-        .build()
+    let client = HFClient::builder()
+        .build_sync()
         .map_err(|e| ModelRefError::Download(e.to_string()))?;
-
-    let info = api
-        .model(repo.to_string())
+    let info = model_repository_sync(&client, repo)
         .info()
+        .send()
         .map_err(|e| ModelRefError::Download(e.to_string()))?;
 
     let mmproj_files: Vec<String> = info
         .siblings
-        .iter()
-        .map(|s| s.rfilename.as_str())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.rfilename)
         .filter(|f| {
             // Grab just the filename portion (repos may have subdirectories)
             let name = f.rsplit('/').next().unwrap_or(f).to_lowercase();
             name.starts_with("mmproj") && name.ends_with(".gguf")
         })
-        .map(|f| f.to_string())
         .collect();
 
     if mmproj_files.is_empty() {
@@ -477,20 +795,6 @@ pub fn discover_mmproj_in_hf_repo(repo: &str) -> Result<Option<String>, ModelRef
     }
 
     Ok(Some(mmproj_files[0].clone()))
-}
-
-/// Download (or return cached path) for an mmproj file from an HF repo.
-/// Uses the sync downloader; respects `fast_download` via the `fast` flag.
-pub fn resolve_hf_mmproj(repo: &str, filename: &str, fast: bool) -> Result<PathBuf, ModelRefError> {
-    let model_ref = HfModelRef {
-        repo: repo.to_string(),
-        file: filename.to_string(),
-    };
-    if fast {
-        resolve_hf_model_fast(&model_ref)
-    } else {
-        resolve_hf_model_sync(&model_ref)
-    }
 }
 
 #[cfg(test)]

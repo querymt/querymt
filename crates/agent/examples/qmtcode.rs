@@ -365,8 +365,18 @@ fn load_stored_iroh_scopes() -> anyhow::Result<Vec<querymt_agent::agent::remote:
         .collect())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let hf_download_config = querymt_provider_common::configure_hf_download_concurrency();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(hf_download_config))
+}
+
+async fn run(
+    hf_download_config: querymt_provider_common::HfDownloadConcurrencyConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    querymt_provider_common::log_hf_download_concurrency(&hf_download_config);
     let cli = Cli::parse();
     let is_acp = cli.acp;
     let is_acp_ws = cli.acp_ws.is_some();

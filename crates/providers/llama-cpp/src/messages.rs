@@ -306,7 +306,6 @@ mod tests {
             use_chat_template: None,
             add_bos: None,
             log: None,
-            fast_download: None,
             enable_thinking: None,
             flash_attention: None,
             kv_cache_type_k: None,
