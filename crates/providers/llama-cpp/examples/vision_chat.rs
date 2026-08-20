@@ -124,6 +124,8 @@ async fn run(
         mmproj_use_gpu: None,
         n_ubatch: None,
         text_only: None,
+        mtp: None,
+        backend_sampling: None,
         json_schema: None,
     };
 

@@ -36,6 +36,10 @@ pub(crate) struct ModelCacheKey {
     pub model_path: String,
     /// Number of GPU layers (affects Metal/CUDA offloading).
     pub n_gpu_layers: Option<u32>,
+    /// Resolved MTP sidecar path, when configured.
+    pub mtp_model_path: Option<String>,
+    /// Sidecar GPU layers.
+    pub mtp_n_gpu_layers: Option<u32>,
 }
 
 /// A cached model + multimodal context, shared across provider instances.
@@ -43,6 +47,7 @@ pub(crate) struct CachedModel {
     pub key: ModelCacheKey,
     pub model: Arc<LlamaModel>,
     pub multimodal: Option<Arc<MultimodalContext>>,
+    pub mtp_model: Option<Arc<LlamaModel>>,
 }
 
 /// The main llama.cpp provider.
@@ -50,6 +55,7 @@ pub(crate) struct LlamaCppProvider {
     pub(crate) model: Arc<LlamaModel>,
     pub(crate) cfg: LlamaCppConfig,
     pub(crate) multimodal: Option<Arc<MultimodalContext>>,
+    pub(crate) mtp_model: Option<Arc<LlamaModel>>,
 }
 
 impl LlamaCppProvider {
@@ -77,9 +83,6 @@ impl LlamaCppProvider {
     }
 
     pub(crate) fn new(cfg: LlamaCppConfig) -> Result<Self, LLMError> {
-        // Install the ggml abort callback before any llama.cpp operations.
-        // This ensures that if Metal/CUDA triggers a fatal error, the user sees
-        // a meaningful error message instead of just a raw stack trace.
         install_abort_callback();
 
         let mut backend = llama_backend()?;
@@ -89,8 +92,10 @@ impl LlamaCppProvider {
             LlamaCppLogMode::Tracing => send_logs_to_tracing(LogOptions::default()),
             LlamaCppLogMode::Off => backend.void_logs(),
         }
+        if let Some(mtp) = &cfg.mtp {
+            mtp.params().map_err(LLMError::InvalidRequest)?;
+        }
         let model_path = Self::resolve_model_path(&cfg.model)?;
-        let model_path = Path::new(&model_path);
         if !model_path.exists() {
             return Err(LLMError::InvalidRequest(format!(
                 "Model path does not exist: {}",
@@ -102,41 +107,45 @@ impl LlamaCppProvider {
         if let Some(n_gpu_layers) = cfg.n_gpu_layers {
             params = params.with_n_gpu_layers(n_gpu_layers);
         }
+        let model = Arc::new(
+            LlamaModel::load_from_file(&*backend, &model_path, &params)
+                .map_err(|e| LLMError::ProviderError(e.to_string()))?,
+        );
 
-        let model = LlamaModel::load_from_file(&*backend, model_path, &params)
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+        let mtp_model = if let Some(sidecar) = cfg.mtp.as_ref().and_then(|m| m.model.as_deref()) {
+            let sidecar_path = Self::resolve_model_path(sidecar)?;
+            let mut params = LlamaModelParams::default();
+            if let Some(n) = cfg
+                .mtp
+                .as_ref()
+                .and_then(|m| m.n_gpu_layers)
+                .or(cfg.n_gpu_layers)
+            {
+                params = params.with_n_gpu_layers(n);
+            }
+            Some(Arc::new(
+                LlamaModel::load_from_file(&*backend, &sidecar_path, &params).map_err(|e| {
+                    LLMError::ProviderError(format!("Failed to load MTP sidecar: {e}"))
+                })?,
+            ))
+        } else {
+            None
+        };
 
-        // Extract the HF repo name (if the model came from HF) so multimodal
-        // context can auto-discover the matching mmproj file from the same repo.
         let model_hf_repo = match parse_model_ref(&cfg.model) {
             Ok(ModelRef::Hf(hf_ref)) => Some(hf_ref.repo),
             _ => None,
         };
-
-        // Initialize multimodal support if available
         let multimodal =
             MultimodalContext::new(&model, &cfg, model_hf_repo.as_deref())?.map(Arc::new);
 
-        if let Some(ref mm_ctx) = multimodal {
-            log::info!(
-                "Multimodal support enabled (marker: '{}', vision: {}, audio: {})",
-                mm_ctx.marker(),
-                mm_ctx.ctx.support_vision(),
-                mm_ctx.ctx.support_audio()
-            );
-        } else {
-            log::debug!("Multimodal support not available for this model");
-        }
-
         let provider = Self {
-            model: Arc::new(model),
+            model,
             cfg,
             multimodal,
+            mtp_model,
         };
-
-        // Advisory memory warning at startup — never fails, just informs.
         Self::log_memory_advisory(&provider);
-
         Ok(provider)
     }
 
@@ -153,47 +162,48 @@ impl LlamaCppProvider {
         install_abort_callback();
 
         let mut backend = llama_backend()?;
-        let log_mode = cfg.log.unwrap_or(LlamaCppLogMode::Off);
-        match log_mode {
+        match cfg.log.unwrap_or(LlamaCppLogMode::Off) {
             LlamaCppLogMode::Stderr => {}
             LlamaCppLogMode::Tracing => send_logs_to_tracing(LogOptions::default()),
             LlamaCppLogMode::Off => backend.void_logs(),
         }
+        if let Some(mtp) = &cfg.mtp {
+            mtp.params().map_err(LLMError::InvalidRequest)?;
+        }
 
         let model_path = Self::resolve_model_path(&cfg.model)?;
-        let model_path_str = model_path.to_string_lossy().to_string();
+        let mtp_model_path = cfg
+            .mtp
+            .as_ref()
+            .and_then(|m| m.model.as_deref())
+            .map(Self::resolve_model_path)
+            .transpose()?;
         let key = ModelCacheKey {
-            model_path: model_path_str,
+            model_path: model_path.to_string_lossy().to_string(),
             n_gpu_layers: cfg.n_gpu_layers,
+            mtp_model_path: mtp_model_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            mtp_n_gpu_layers: cfg
+                .mtp
+                .as_ref()
+                .and_then(|m| m.n_gpu_layers)
+                .or(cfg.n_gpu_layers),
         };
 
         let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-
         if let Some(cached) = guard.as_ref() {
             if cached.key == key {
-                // Cache hit — reuse model, attach new config
-                log::debug!("LlamaCpp model cache hit: {}", key.model_path);
-                let provider = Self {
+                return Ok(Self {
                     model: Arc::clone(&cached.model),
                     cfg,
                     multimodal: cached.multimodal.as_ref().map(Arc::clone),
-                };
-                return Ok(provider);
+                    mtp_model: cached.mtp_model.as_ref().map(Arc::clone),
+                });
             }
-            // Cache miss — different model, evict old one
-            log::info!(
-                "LlamaCpp model cache evict: {} -> {}",
-                cached.key.model_path,
-                key.model_path
-            );
         }
-
-        // Drop the guard before expensive model loading to avoid holding the
-        // mutex for a long time (model loading can take seconds).
-        // We'll re-acquire to store the result.
         drop(guard);
 
-        // Load new model
         let model_path = Path::new(&key.model_path);
         if !model_path.exists() {
             return Err(LLMError::InvalidRequest(format!(
@@ -201,52 +211,51 @@ impl LlamaCppProvider {
                 model_path.display()
             )));
         }
-
         let mut params = LlamaModelParams::default();
-        if let Some(n_gpu_layers) = cfg.n_gpu_layers {
-            params = params.with_n_gpu_layers(n_gpu_layers);
+        if let Some(n) = cfg.n_gpu_layers {
+            params = params.with_n_gpu_layers(n);
         }
-
         let model = Arc::new(
             LlamaModel::load_from_file(&backend, model_path, &params)
                 .map_err(|e| LLMError::ProviderError(e.to_string()))?,
         );
 
+        let mtp_model = if let Some(path) = &key.mtp_model_path {
+            let mut params = LlamaModelParams::default();
+            if let Some(n) = key.mtp_n_gpu_layers {
+                params = params.with_n_gpu_layers(n);
+            }
+            Some(Arc::new(
+                LlamaModel::load_from_file(&backend, Path::new(path), &params).map_err(|e| {
+                    LLMError::ProviderError(format!("Failed to load MTP sidecar: {e}"))
+                })?,
+            ))
+        } else {
+            None
+        };
+
         let model_hf_repo = match parse_model_ref(&cfg.model) {
             Ok(ModelRef::Hf(hf_ref)) => Some(hf_ref.repo),
             _ => None,
         };
-
         let multimodal =
             MultimodalContext::new(&model, &cfg, model_hf_repo.as_deref())?.map(Arc::new);
 
-        if let Some(ref mm_ctx) = multimodal {
-            log::info!(
-                "Multimodal support enabled (marker: '{}', vision: {}, audio: {})",
-                mm_ctx.marker(),
-                mm_ctx.ctx.support_vision(),
-                mm_ctx.ctx.support_audio()
-            );
-        } else {
-            log::debug!("Multimodal support not available for this model");
-        }
-
-        // Store in cache
         let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(CachedModel {
             key,
             model: Arc::clone(&model),
             multimodal: multimodal.as_ref().map(Arc::clone),
+            mtp_model: mtp_model.as_ref().map(Arc::clone),
         });
 
         let provider = Self {
             model,
             cfg,
             multimodal,
+            mtp_model,
         };
-
         Self::log_memory_advisory(&provider);
-
         Ok(provider)
     }
 
@@ -343,6 +352,7 @@ impl ChatProvider for LlamaCppProvider {
                 let generated = generate_with_tools(
                     &self.model,
                     &self.cfg,
+                    self.mtp_model.as_ref(),
                     &template_result,
                     max_tokens,
                     None,
@@ -370,6 +380,7 @@ impl ChatProvider for LlamaCppProvider {
             let generated = generate_with_tools(
                 &self.model,
                 &self.cfg,
+                self.mtp_model.as_ref(),
                 &template_result,
                 max_tokens,
                 None,
@@ -395,6 +406,7 @@ impl ChatProvider for LlamaCppProvider {
         let mut generated = generate(
             &self.model,
             &self.cfg,
+            self.mtp_model.as_ref(),
             &prompt,
             max_tokens,
             None,
@@ -409,6 +421,7 @@ impl ChatProvider for LlamaCppProvider {
                 generated = generate(
                     &self.model,
                     &self.cfg,
+                    self.mtp_model.as_ref(),
                     &fallback_prompt,
                     max_tokens,
                     None,
@@ -422,6 +435,7 @@ impl ChatProvider for LlamaCppProvider {
             generated = generate(
                 &self.model,
                 &self.cfg,
+                self.mtp_model.as_ref(),
                 &raw_prompt,
                 max_tokens,
                 None,
@@ -496,6 +510,7 @@ impl ChatProvider for LlamaCppProvider {
                 )?;
                 let cfg = self.cfg.clone();
                 let model = Arc::clone(&self.model);
+                let mtp_model = self.mtp_model.clone();
                 let multimodal = if bitmaps.is_empty() {
                     None
                 } else {
@@ -506,6 +521,7 @@ impl ChatProvider for LlamaCppProvider {
                     match generate_streaming_with_tools(
                         &model,
                         &cfg,
+                        mtp_model.as_ref(),
                         &template_result,
                         max_tokens,
                         None,
@@ -541,6 +557,7 @@ impl ChatProvider for LlamaCppProvider {
             apply_template_for_thinking(&self.model, &self.cfg, messages, media_marker)?;
         let cfg = self.cfg.clone();
         let model = Arc::clone(&self.model);
+        let mtp_model = self.mtp_model.clone();
         let multimodal = if bitmaps.is_empty() {
             None
         } else {
@@ -551,6 +568,7 @@ impl ChatProvider for LlamaCppProvider {
             match generate_streaming_with_thinking(
                 &model,
                 &cfg,
+                mtp_model.as_ref(),
                 &thinking_template,
                 max_tokens,
                 None,
@@ -591,6 +609,7 @@ impl CompletionProvider for LlamaCppProvider {
         let generated = generate(
             &self.model,
             &self.cfg,
+            self.mtp_model.as_ref(),
             &req.prompt,
             max_tokens,
             req.temperature,

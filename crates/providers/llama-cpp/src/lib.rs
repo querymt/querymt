@@ -6,13 +6,14 @@ mod context;
 mod generation;
 mod memory;
 mod messages;
+mod mtp;
 mod multimodal;
 mod provider;
 mod response;
 mod template;
 mod tools;
 
-pub use config::LlamaCppConfig;
+pub use config::{LlamaCppConfig, MtpConfig};
 use provider::LlamaCppProvider;
 
 /// Create a provider directly from a config struct (useful for testing and embedding).

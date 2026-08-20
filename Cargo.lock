@@ -868,7 +868,7 @@ dependencies = [
  "bitflags 2.11.1",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2999,6 +2999,7 @@ version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd3bf7087923a80510e6ea986960cb4011bcf54259ecb19a80bf40a645a1526c"
 dependencies = [
+ "ahash",
  "anyhow",
  "bytemuck",
  "bytemuck_derive",
@@ -3854,6 +3855,17 @@ dependencies = [
  "num-traits",
  "rand 0.9.4",
  "rand_distr 0.5.1",
+]
+
+[[package]]
+name = "fluent-uri"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1918b65d96df47d3591bed19c5cca17e3fa5d0707318e4b5ef2eae01764df7e5"
+dependencies = [
+ "borrow-or-share",
+ "ref-cast",
+ "serde",
 ]
 
 [[package]]
@@ -7008,7 +7020,7 @@ dependencies = [
  "num-cmp",
  "num-traits",
  "percent-encoding",
- "referencing",
+ "referencing 0.49.9",
  "regex",
  "reqwest 0.13.4",
  "rustls 0.23.40",
@@ -7739,23 +7751,25 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "llama-cpp-2"
-version = "0.1.150"
+version = "0.1.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e82ec86fd73aaa7d8f4898cc4693410c217431506ba3237ea5c856127f49d84d"
+checksum = "4397360a0bd81be29929a55ad2f49eba27a744a6578f3271894d6f41d86bd15b"
 dependencies = [
  "encoding_rs",
  "enumflags2",
  "llama-cpp-sys-2",
+ "llguidance",
  "thiserror 2.0.20",
+ "toktrie",
  "tracing",
  "tracing-core",
 ]
 
 [[package]]
 name = "llama-cpp-sys-2"
-version = "0.1.150"
+version = "0.1.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f67dab3ed2b68e4fc4a42471eac73e128ed2ee97bd10de66ddcc609dd5d838a0"
+checksum = "13a9ea2ce0cdc20bcb1870534022e340b391663f8fe09133951e2fe37fbc29cf"
 dependencies = [
  "bindgen",
  "cc",
@@ -7774,6 +7788,8 @@ dependencies = [
  "anyhow",
  "derivre",
  "indexmap 2.14.0",
+ "rayon",
+ "referencing 0.29.1",
  "regex-syntax",
  "serde",
  "serde_json",
@@ -10895,7 +10911,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-alibaba"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "extism-pdk",
  "http 1.5.0",
@@ -10910,7 +10926,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-anthropic"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "base64 0.23.1",
  "extism-pdk",
@@ -10925,7 +10941,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-codex"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "base64 0.23.1",
  "extism-pdk",
@@ -10942,7 +10958,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-deepseek"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "extism-pdk",
  "http 1.5.0",
@@ -10957,7 +10973,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-google"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "base64 0.23.1",
  "extism-pdk",
@@ -10973,7 +10989,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-groq"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "extism-pdk",
  "http 1.5.0",
@@ -10988,7 +11004,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-izwi"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -11004,7 +11020,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-kimi-code"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "extism-pdk",
  "http 1.5.0",
@@ -11021,7 +11037,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-llama-cpp"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -11031,6 +11047,7 @@ dependencies = [
  "futures",
  "infer",
  "llama-cpp-2",
+ "llguidance",
  "log",
  "minijinja",
  "minijinja-contrib",
@@ -11041,11 +11058,12 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toktrie",
 ]
 
 [[package]]
 name = "qmt-mistral"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "extism-pdk",
  "http 1.5.0",
@@ -11060,7 +11078,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-moonshot"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "extism-pdk",
  "http 1.5.0",
@@ -11075,7 +11093,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-mrs"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -11093,7 +11111,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-ollama"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "base64 0.23.1",
  "extism-pdk",
@@ -11108,7 +11126,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-openai"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "either",
  "extism-pdk",
@@ -11124,7 +11142,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-openrouter"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "extism-pdk",
  "http 1.5.0",
@@ -11139,7 +11157,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-xai"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "base64 0.23.1",
  "extism-pdk",
@@ -11156,7 +11174,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-zai"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "extism-pdk",
  "http 1.5.0",
@@ -11189,7 +11207,7 @@ dependencies = [
 
 [[package]]
 name = "querymt"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11232,7 +11250,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-agent"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -11329,7 +11347,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-agent-py"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "pyo3",
@@ -11340,7 +11358,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-cli"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11367,7 +11385,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-extism-macros"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "base64 0.23.1",
  "extism-pdk",
@@ -11381,7 +11399,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-mobile-ffi"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11409,7 +11427,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-provider-common"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "dirs 6.0.0",
  "hf-hub 1.0.0",
@@ -11419,7 +11437,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-py"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -11436,7 +11454,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-remote"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11466,7 +11484,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-service-client"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "oauth2",
  "querymt-utils",
@@ -11479,7 +11497,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-utils"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anthropic-auth",
  "anyhow",
@@ -11969,12 +11987,26 @@ dependencies = [
 
 [[package]]
 name = "referencing"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40a64b3a635fad9000648b4d8a59c8710c523ab61a23d392a7d91d47683f5adc"
+dependencies = [
+ "ahash",
+ "fluent-uri 0.3.2",
+ "once_cell",
+ "parking_lot",
+ "percent-encoding",
+ "serde_json",
+]
+
+[[package]]
+name = "referencing"
 version = "0.49.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6efa2154ea6f5ce0fdecdd2a8d18f2fa1a39a8fbba91564f555a592e4dce8278"
 dependencies = [
  "ahash",
- "fluent-uri",
+ "fluent-uri 0.4.1",
  "getrandom 0.3.4",
  "hashbrown 0.17.1",
  "itoa",
