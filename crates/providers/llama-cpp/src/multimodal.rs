@@ -14,7 +14,7 @@ use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, mtmd_default
 use querymt::chat::{ChatMessage, Content};
 use querymt::error::LLMError;
 use querymt_provider_common::{
-    ModelRef, ModelRefError, parse_model_ref, resolve_hf_model_fast, resolve_hf_model_sync,
+    HfFileRef, ModelRef, ModelRefError, download_hf_file_sync, parse_model_ref, terminal_progress,
 };
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
@@ -78,11 +78,9 @@ impl MultimodalContext {
         cfg: &LlamaCppConfig,
         model_hf_repo: Option<&str>,
     ) -> Result<Option<MtmdContext>, LLMError> {
-        let fast = cfg.fast_download.unwrap_or(false);
-
         // 1. Explicit mmproj_path takes precedence
         if let Some(ref path_str) = cfg.mmproj_path {
-            let path = Self::resolve_mmproj_path(path_str, fast)?;
+            let path = Self::resolve_mmproj_path(path_str)?;
             let ctx = Self::init_mtmd_from_path(&path, model, cfg)?;
             log::info!(
                 "Multimodal projection loaded: vision={}, audio={}",
@@ -102,7 +100,8 @@ impl MultimodalContext {
                         mmproj_filename
                     );
                     log::info!("Downloading {} from {}...", mmproj_filename, repo);
-                    match querymt_provider_common::resolve_hf_mmproj(repo, &mmproj_filename, fast)
+                    let file = HfFileRef::new(repo, &mmproj_filename);
+                    match download_hf_file_sync(&file, terminal_progress(&mmproj_filename))
                         .map_err(Self::map_model_ref_error)
                     {
                         Ok(path) => {
@@ -189,7 +188,7 @@ impl MultimodalContext {
     }
 
     /// Resolve an explicit mmproj_path value (local path or hf: ref) to a local PathBuf.
-    fn resolve_mmproj_path(raw: &str, fast: bool) -> Result<PathBuf, LLMError> {
+    fn resolve_mmproj_path(raw: &str) -> Result<PathBuf, LLMError> {
         let model_ref = parse_model_ref(raw).map_err(Self::map_model_ref_error)?;
         match model_ref {
             ModelRef::LocalPath(path) => {
@@ -202,11 +201,9 @@ impl MultimodalContext {
                 Ok(path)
             }
             ModelRef::Hf(hf_ref) => {
-                if fast {
-                    resolve_hf_model_fast(&hf_ref).map_err(Self::map_model_ref_error)
-                } else {
-                    resolve_hf_model_sync(&hf_ref).map_err(Self::map_model_ref_error)
-                }
+                let file = HfFileRef::from(&hf_ref);
+                download_hf_file_sync(&file, terminal_progress(&hf_ref.file))
+                    .map_err(Self::map_model_ref_error)
             }
             ModelRef::HfRepo(repo) => Err(LLMError::InvalidRequest(format!(
                 "mmproj_path must include a file selector for Hugging Face repos: {}:<filename.gguf>",
@@ -481,7 +478,6 @@ mod tests {
             use_chat_template: None,
             add_bos: None,
             log: None,
-            fast_download: None,
             enable_thinking: None,
             flash_attention: None,
             kv_cache_type_k: None,

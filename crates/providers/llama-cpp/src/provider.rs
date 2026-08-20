@@ -23,7 +23,7 @@ use querymt::completion::{CompletionProvider, CompletionRequest, CompletionRespo
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
 use querymt_provider_common::{
-    ModelRef, ModelRefError, parse_model_ref, resolve_hf_model_fast, resolve_hf_model_sync,
+    HfFileRef, ModelRef, ModelRefError, download_hf_file_sync, parse_model_ref, terminal_progress,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -54,16 +54,14 @@ pub(crate) struct LlamaCppProvider {
 
 impl LlamaCppProvider {
     /// Resolve a model path, potentially downloading from Hugging Face Hub.
-    fn resolve_model_path(raw: &str, fast: bool) -> Result<PathBuf, LLMError> {
+    fn resolve_model_path(raw: &str) -> Result<PathBuf, LLMError> {
         let model_ref = parse_model_ref(raw).map_err(Self::map_model_ref_error)?;
         match model_ref {
             ModelRef::LocalPath(path) => Ok(path),
             ModelRef::Hf(model) => {
-                if fast {
-                    resolve_hf_model_fast(&model).map_err(Self::map_model_ref_error)
-                } else {
-                    resolve_hf_model_sync(&model).map_err(Self::map_model_ref_error)
-                }
+                let file = HfFileRef::from(&model);
+                download_hf_file_sync(&file, terminal_progress(&model.file))
+                    .map_err(Self::map_model_ref_error)
             }
             ModelRef::HfRepo(repo) => Err(LLMError::InvalidRequest(format!(
                 "llama_cpp model must include a selector for Hugging Face repos: {repo}:<selector>"
@@ -91,7 +89,7 @@ impl LlamaCppProvider {
             LlamaCppLogMode::Tracing => send_logs_to_tracing(LogOptions::default()),
             LlamaCppLogMode::Off => backend.void_logs(),
         }
-        let model_path = Self::resolve_model_path(&cfg.model, cfg.fast_download.unwrap_or(false))?;
+        let model_path = Self::resolve_model_path(&cfg.model)?;
         let model_path = Path::new(&model_path);
         if !model_path.exists() {
             return Err(LLMError::InvalidRequest(format!(
@@ -162,7 +160,7 @@ impl LlamaCppProvider {
             LlamaCppLogMode::Off => backend.void_logs(),
         }
 
-        let model_path = Self::resolve_model_path(&cfg.model, cfg.fast_download.unwrap_or(false))?;
+        let model_path = Self::resolve_model_path(&cfg.model)?;
         let model_path_str = model_path.to_string_lossy().to_string();
         let key = ModelCacheKey {
             model_path: model_path_str,

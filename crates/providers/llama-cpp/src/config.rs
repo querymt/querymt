@@ -72,11 +72,6 @@ pub struct LlamaCppConfig {
     pub add_bos: Option<bool>,
     /// Logging destination for llama.cpp output.
     pub log: Option<LlamaCppLogMode>,
-    /// Enable high-throughput HuggingFace Hub downloads. Uses multiple parallel
-    /// connections to saturate high-bandwidth connections (>500MB/s). This will
-    /// heavily utilize CPU cores during download. Only recommended for cloud
-    /// instances with high CPU and bandwidth.
-    pub fast_download: Option<bool>,
     /// Enable thinking/reasoning output from the model.
     /// When true, the template is rendered with thinking support and
     /// `<think>` blocks are parsed into separate reasoning_content.
