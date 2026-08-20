@@ -7074,6 +7074,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonwebtoken"
+version = "10.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "getrandom 0.2.17",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "signature 2.2.0",
+ "zeroize",
+]
+
+[[package]]
 name = "jwt"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9418,6 +9434,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "oci-client"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5261a7fb43d9c53b8e63e6d5e86860719dad253d015d022066c72d585125aed8"
+dependencies = [
+ "bytes",
+ "chrono",
+ "futures-util",
+ "hex",
+ "http 1.5.0",
+ "http-auth",
+ "jsonwebtoken 10.4.0",
+ "lazy_static",
+ "oci-spec 0.9.0",
+ "olpc-cjson",
+ "regex",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "unicase",
+]
+
+[[package]]
 name = "oci-spec"
 version = "0.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9437,6 +9480,23 @@ name = "oci-spec"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc3da52b83ce3258fbf29f66ac784b279453c2ac3c22c5805371b921ede0d308"
+dependencies = [
+ "const_format",
+ "derive_builder",
+ "getset",
+ "regex",
+ "serde",
+ "serde_json",
+ "strum 0.27.2",
+ "strum_macros 0.27.2",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "oci-spec"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8445a2631507cec628a15fdd6154b54a3ab3f20ed4fe9d73a3b8b7a4e1ba03a"
 dependencies = [
  "const_format",
  "derive_builder",
@@ -9569,7 +9629,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19d3c008af7a377f1836af62ae19d7e0fa9af9a801a9b1aa63f211140d7619fc"
 dependencies = [
  "base64 0.22.1",
- "jsonwebtoken",
+ "jsonwebtoken 9.3.1",
  "querystring",
  "rand 0.8.6",
  "reqwest 0.12.28",
@@ -11313,7 +11373,7 @@ dependencies = [
  "jsonschema",
  "libloading 0.9.0",
  "log",
- "oci-client",
+ "oci-client 0.17.0",
  "once_cell",
  "reqwest 0.13.4",
  "rmcp",
@@ -13429,7 +13489,7 @@ dependencies = [
  "futures-util",
  "hex",
  "json-syntax",
- "oci-client",
+ "oci-client 0.15.0",
  "olpc-cjson",
  "openidconnect",
  "p256",

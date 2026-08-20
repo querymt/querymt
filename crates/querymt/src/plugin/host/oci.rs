@@ -823,8 +823,8 @@ impl OciDownloader {
                             );
 
                             let wasm_platform = Platform {
-                                os: "wasi".to_string(),
-                                architecture: "wasm".to_string(),
+                                os: "wasi".into(),
+                                architecture: "wasm".into(),
                                 os_version: None,
                                 os_features: None,
                                 variant: None,
