@@ -10911,7 +10911,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-alibaba"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "extism-pdk",
  "http 1.5.0",
@@ -10926,7 +10926,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-anthropic"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "base64 0.23.1",
  "extism-pdk",
@@ -10941,7 +10941,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-codex"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "base64 0.23.1",
  "extism-pdk",
@@ -10958,7 +10958,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-deepseek"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "extism-pdk",
  "http 1.5.0",
@@ -10973,7 +10973,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-google"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "base64 0.23.1",
  "extism-pdk",
@@ -10989,7 +10989,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-groq"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "extism-pdk",
  "http 1.5.0",
@@ -11004,7 +11004,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-izwi"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -11020,7 +11020,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-kimi-code"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "extism-pdk",
  "http 1.5.0",
@@ -11037,7 +11037,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-llama-cpp"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -11063,7 +11063,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-mistral"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "extism-pdk",
  "http 1.5.0",
@@ -11078,7 +11078,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-moonshot"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "extism-pdk",
  "http 1.5.0",
@@ -11093,7 +11093,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-mrs"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -11111,7 +11111,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-ollama"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "base64 0.23.1",
  "extism-pdk",
@@ -11126,7 +11126,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-openai"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "either",
  "extism-pdk",
@@ -11142,7 +11142,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-openrouter"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "extism-pdk",
  "http 1.5.0",
@@ -11157,7 +11157,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-xai"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "base64 0.23.1",
  "extism-pdk",
@@ -11174,7 +11174,7 @@ dependencies = [
 
 [[package]]
 name = "qmt-zai"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "extism-pdk",
  "http 1.5.0",
@@ -11207,7 +11207,7 @@ dependencies = [
 
 [[package]]
 name = "querymt"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11250,7 +11250,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-agent"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -11347,7 +11347,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-agent-py"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "pyo3",
@@ -11358,7 +11358,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-cli"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11385,7 +11385,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-extism-macros"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "base64 0.23.1",
  "extism-pdk",
@@ -11399,7 +11399,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-mobile-ffi"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11427,7 +11427,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-provider-common"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "dirs 6.0.0",
  "hf-hub 1.0.0",
@@ -11437,7 +11437,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-py"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -11454,7 +11454,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-remote"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11484,7 +11484,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-service-client"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "oauth2",
  "querymt-utils",
@@ -11497,7 +11497,7 @@ dependencies = [
 
 [[package]]
 name = "querymt-utils"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anthropic-auth",
  "anyhow",
