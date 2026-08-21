@@ -24,6 +24,7 @@ pub enum ProviderErrorKind {
     ContextWindowExceeded,
     Authentication,
     InvalidRequest,
+    UnsupportedOperation,
     /// Unclassified vendor failure treated as transient (e.g. bare 5xx).
     /// Retryability lives **only** on the kind — there is no parallel
     /// `transient` flag that can disagree.
@@ -37,7 +38,7 @@ impl ProviderErrorKind {
     /// Unified retry policy for provider failures.
     ///
     /// QueryMT product choice: overload is retried (upstream Codex marks it
-    /// non-retryable). Quota/context/auth/request failures never are.
+    /// non-retryable). Quota/context/auth/request/unsupported failures never are.
     /// [`Self::UnknownTransient`] / [`Self::UnknownPermanent`] cover unmapped
     /// vendor envelopes without a second field.
     pub fn is_retryable(self) -> bool {
@@ -1237,6 +1238,12 @@ mod tests {
             "no credits",
         ));
         assert!(!quota.is_retryable());
+
+        let unsupported = LLMError::from(ProviderFailure::new(
+            ProviderErrorKind::UnsupportedOperation,
+            "streaming is unavailable",
+        ));
+        assert!(!unsupported.is_retryable());
     }
 
     #[test]

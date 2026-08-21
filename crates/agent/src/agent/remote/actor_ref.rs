@@ -114,6 +114,15 @@ impl SessionActorRef {
     const REMOTE_HISTORY_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
     const REMOTE_IO_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
+    pub(super) fn map_local_prompt_send_error(
+        error: kameo::error::SendError<messages::Prompt, AgentError>,
+    ) -> AcpError {
+        AcpError::from(match error {
+            kameo::error::SendError::HandlerError(err) => err,
+            other => AgentError::RemoteActor(other.to_string()),
+        })
+    }
+
     fn map_infallible_remote_send_error(
         error: kameo::error::RemoteSendError<kameo::error::Infallible>,
     ) -> AgentError {
@@ -164,7 +173,7 @@ impl SessionActorRef {
             Self::Local(actor_ref) => actor_ref
                 .ask(messages::Prompt { req })
                 .await
-                .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
+                .map_err(Self::map_local_prompt_send_error),
 
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref

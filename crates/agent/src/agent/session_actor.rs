@@ -24,6 +24,7 @@ use kameo::message::{Context, Message};
 use kameo::reply::DelegatedReply;
 use log::{debug, info, warn};
 use querymt::chat::{ChatRole, ReasoningEffort};
+use querymt::error::LLMError;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, oneshot};
@@ -2013,15 +2014,35 @@ async fn execute_prompt_detached(
         Ok(CycleOutcome::Cancelled) => Ok(PromptResponse::new(StopReason::Cancelled)),
         Ok(CycleOutcome::Stopped(stop_reason)) => Ok(PromptResponse::new(stop_reason)),
         Err(e) => {
+            let message = e.to_string();
             config.emit_event(
                 &session_id,
                 AgentEventKind::Error {
-                    message: e.to_string(),
+                    message: message.clone(),
                 },
             );
-            Err(AgentError::Internal(e.to_string()))
+            Err(provider_failure_from_execution_error(&e, &exec_ctx)
+                .unwrap_or(AgentError::Internal(message)))
         }
     }
+}
+
+fn provider_failure_from_execution_error(
+    error: &anyhow::Error,
+    exec_ctx: &ExecutionContext,
+) -> Option<AgentError> {
+    let llm_error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<LLMError>())?;
+    let llm_config = exec_ctx.llm_config();
+
+    Some(AgentError::ProviderFailure {
+        message: error.to_string(),
+        provider: llm_config.map(|config| config.provider.clone()),
+        model: llm_config.map(|config| config.model.clone()),
+        retryable: llm_error.is_retryable(),
+        error: Box::new(llm_error.to_payload()),
+    })
 }
 
 #[instrument(
@@ -2083,6 +2104,7 @@ mod tests {
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
     use crate::session::backend::StorageBackend;
+    use crate::session::runtime::RuntimeContext;
     use crate::session::store::SessionStore;
     use crate::test_utils::{
         MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
@@ -2090,6 +2112,7 @@ mod tests {
     };
     use kameo::actor::Spawn;
     use querymt::LLMParams;
+    use querymt::error::{LLMErrorPayload, ProviderErrorKind, ProviderFailure};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -2107,6 +2130,32 @@ mod tests {
     impl ActorFixture {
         async fn new() -> Self {
             Self::with_session_id("test-session").await
+        }
+
+        async fn execution_context(&self, session_id: &str) -> ExecutionContext {
+            let session_handle = self
+                .config
+                .provider
+                .with_session(session_id)
+                .await
+                .expect("load session handle");
+            let runtime_context =
+                RuntimeContext::new(self.config.provider.history_store(), session_id.to_string())
+                    .await
+                    .expect("create runtime context");
+            let runtime = crate::agent::core::SessionRuntime::new(
+                None,
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            );
+
+            ExecutionContext::new(
+                session_id.to_string(),
+                runtime,
+                runtime_context,
+                session_handle,
+                ToolConfig::default(),
+            )
         }
 
         async fn with_session_id(session_id: &str) -> Self {
@@ -2136,6 +2185,10 @@ mod tests {
             store
                 .expect_get_llm_config()
                 .returning(move |_| Ok(Some(llm_config_for_mock.clone())))
+                .times(0..);
+            store
+                .expect_get_session_execution_config()
+                .returning(|_| Ok(None))
                 .times(0..);
             store
                 .expect_create_or_get_llm_config()
@@ -2194,6 +2247,59 @@ mod tests {
                 _temp_dir: temp_dir,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn provider_failure_recovers_contextualized_llm_error() {
+        let fixture = ActorFixture::new().await;
+        let exec_ctx = fixture.execution_context("test-session").await;
+        let llm_error = LLMError::from(
+            ProviderFailure::new(ProviderErrorKind::ServerOverloaded, "provider is busy")
+                .with_code(Some("server_overloaded".to_string()))
+                .with_error_type(Some("api_error".to_string()))
+                .with_request_id(Some("req-123".to_string()))
+                .with_retry_after_secs(Some(3)),
+        );
+        let error = anyhow::Error::new(llm_error).context("execute cycle failed");
+
+        let provider_failure = provider_failure_from_execution_error(&error, &exec_ctx)
+            .expect("recover provider failure");
+
+        match provider_failure {
+            AgentError::ProviderFailure {
+                message,
+                provider,
+                model,
+                retryable,
+                error,
+            } => {
+                assert_eq!(message, "execute cycle failed");
+                assert_eq!(provider.as_deref(), Some("mock"));
+                assert_eq!(model.as_deref(), Some("mock-model"));
+                assert!(retryable);
+                assert_eq!(
+                    *error,
+                    LLMErrorPayload::ProviderError {
+                        message: "provider is busy".to_string(),
+                        kind: Some(ProviderErrorKind::ServerOverloaded),
+                        code: Some("server_overloaded".to_string()),
+                        error_type: Some("api_error".to_string()),
+                        request_id: Some("req-123".to_string()),
+                        retry_after_secs: Some(3),
+                    }
+                );
+            }
+            other => panic!("expected provider failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_failure_ignores_non_llm_error_chain() {
+        let fixture = ActorFixture::new().await;
+        let exec_ctx = fixture.execution_context("test-session").await;
+        let error = anyhow::anyhow!("storage unavailable").context("execute cycle failed");
+
+        assert!(provider_failure_from_execution_error(&error, &exec_ctx).is_none());
     }
 
     // ── Actor message handler tests ──────────────────────────────────────────
