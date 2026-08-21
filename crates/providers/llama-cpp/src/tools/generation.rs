@@ -10,6 +10,7 @@ use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::mtmd::MtmdBitmap;
 use querymt::Usage;
 use querymt::error::LLMError;
+use querymt_utils::str_utils::{truncate_str, truncate_str_tail};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -193,11 +194,9 @@ pub(crate) fn generate_with_tools(
         }
     }
 
-    let head_len = 400.min(output.len());
-    let tail_len = 400.min(output.len());
-    let head = &output[..head_len];
+    let head = truncate_str(&output, 400);
     let tail = if output.len() > 400 {
-        &output[output.len() - tail_len..]
+        truncate_str_tail(&output, 400)
     } else {
         ""
     };

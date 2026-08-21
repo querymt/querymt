@@ -24,6 +24,7 @@
 
 use qmt_llama_cpp::{LlamaCppConfig, create_provider};
 use querymt::chat::{ChatMessage, Content, FunctionTool, Tool};
+use querymt_utils::str_utils::truncate_str;
 use serde_json::json;
 use std::env;
 
@@ -279,7 +280,7 @@ async fn test_text_only_with_vision_model() {
         "Should generate tokens"
     );
 
-    println!("Response: {}", &text[..text.len().min(100)]);
+    println!("Response: {}", truncate_str(&text, 100));
 }
 
 #[test]

@@ -6,6 +6,7 @@ use llama_cpp_2::model::LlamaModel;
 use minijinja::Environment;
 use querymt::chat::{ChatMessage, ReasoningEffort, Tool};
 use querymt::error::LLMError;
+use querymt_utils::str_utils::truncate_str_tail;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
@@ -248,12 +249,7 @@ fn render_template(
     let reasoning_format = ReasoningFormat::detect(&prompt);
     let starts_in_thinking = prompt_starts_in_thinking(&prompt, reasoning_format);
 
-    let prompt_tail_len = 1200.min(prompt.len());
-    let prompt_tail = if prompt_tail_len > 0 {
-        &prompt[prompt.len() - prompt_tail_len..]
-    } else {
-        ""
-    };
+    let prompt_tail = truncate_str_tail(&prompt, 1200);
     let tools_in_prompt = tools.is_some() && prompt.contains("tools");
     log::debug!(
         "render_template: prompt_len={}, starts_in_thinking={}, reasoning_format={:?}, tools_section_in_prompt={}, prompt_tail=<<<{}>>>",

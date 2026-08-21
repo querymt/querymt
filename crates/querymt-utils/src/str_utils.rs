@@ -75,6 +75,18 @@ pub fn truncate_str(input: &str, max_bytes: usize) -> &str {
     &input[..end]
 }
 
+/// Return the tail of `input` using at most `max_bytes` bytes.
+///
+/// Returns a borrowed suffix that starts on a UTF-8 character boundary. If
+/// `max_bytes` falls inside a multibyte character, that character is omitted.
+pub fn truncate_str_tail(input: &str, max_bytes: usize) -> &str {
+    if input.len() <= max_bytes {
+        return input;
+    }
+    let start = ceil_char_boundary(input, input.len().saturating_sub(max_bytes));
+    &input[start..]
+}
+
 /// Return the largest index `<= target` that is a valid UTF-8 char
 /// boundary in `input`.
 ///
@@ -88,6 +100,18 @@ fn floor_char_boundary(s: &str, target: usize) -> usize {
     let mut i = target;
     while !s.is_char_boundary(i) {
         i -= 1;
+    }
+    i
+}
+
+/// Return the smallest index `>= target` that is a valid UTF-8 char boundary.
+fn ceil_char_boundary(s: &str, target: usize) -> usize {
+    if target >= s.len() {
+        return s.len();
+    }
+    let mut i = target;
+    while !s.is_char_boundary(i) {
+        i += 1;
     }
     i
 }
@@ -164,6 +188,29 @@ mod tests {
     fn truncate_str_inside_multibyte() {
         let s = "абвгд"; // each 2 bytes, total 10
         assert_eq!(truncate_str(s, 5), "аб"); // floor to 4 (2 chars)
+    }
+
+    #[test]
+    fn truncate_str_tail_basic() {
+        assert_eq!(truncate_str_tail("hello world", 5), "world");
+        assert_eq!(truncate_str_tail("hello", 5), "hello");
+        assert_eq!(truncate_str_tail("hello", 0), "");
+    }
+
+    #[test]
+    fn truncate_str_tail_inside_multibyte() {
+        assert_eq!(truncate_str_tail("абвгд", 5), "гд");
+        assert_eq!(truncate_str_tail("ab─cd", 4), "cd");
+        assert_eq!(truncate_str_tail("ab🎉cd", 5), "cd");
+    }
+
+    #[test]
+    fn truncate_str_tail_matches_reported_box_drawing_boundary() {
+        let input = format!("{}─{}", "a".repeat(139_012), "b".repeat(1_199));
+        let tail = truncate_str_tail(&input, 1_200);
+        assert_eq!(tail, "b".repeat(1_199));
+        assert!(tail.len() <= 1_200);
+        assert!(input.ends_with(tail));
     }
 
     #[test]

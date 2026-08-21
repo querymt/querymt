@@ -11124,6 +11124,7 @@ dependencies = [
  "minijinja-contrib",
  "querymt",
  "querymt-provider-common",
+ "querymt-utils",
  "regex",
  "schemars 1.2.2",
  "serde",

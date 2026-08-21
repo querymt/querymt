@@ -246,12 +246,13 @@ fn safe_emit_len(buffer: &str, marker: &str, is_partial: bool) -> usize {
 
 fn longest_suffix_prefix_len(buffer: &str, marker: &str) -> usize {
     let max = buffer.len().min(marker.len().saturating_sub(1));
-    for len in (1..=max).rev() {
-        if buffer.ends_with(&marker[..len]) {
-            return len;
-        }
-    }
-    0
+    marker
+        .char_indices()
+        .map(|(index, _)| index)
+        .filter(|&len| len > 0 && len <= max)
+        .rev()
+        .find(|&len| buffer.ends_with(&marker[..len]))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -270,6 +271,14 @@ mod tests {
         }
         deltas.extend(state.finish());
         deltas
+    }
+
+    #[test]
+    fn finds_partial_multibyte_marker_without_invalid_slices() {
+        let marker = "─end";
+        assert_eq!(longest_suffix_prefix_len("text─", marker), "─".len());
+        assert_eq!(longest_suffix_prefix_len("text─en", marker), "─en".len());
+        assert_eq!(longest_suffix_prefix_len("text", marker), 0);
     }
 
     #[test]
