@@ -13,7 +13,7 @@ fn test_config_schema_generation() {
     assert!(schema["properties"]["speculative"].is_object());
     let schema_json = serde_json::to_string(schema).unwrap();
     assert!(schema_json.contains("mtp"));
-    assert!(!schema_json.contains("draft-dflash"));
+    assert!(schema_json.contains("draft-dflash"));
 }
 
 #[test]
@@ -80,38 +80,34 @@ fn test_config_serialization() {
 
 #[test]
 fn test_speculative_config_serialization() {
-    let speculative = SpeculativeConfig {
-        kind: SpeculativeType::Mtp,
-        model: None,
-        n_max: Some(3),
+    let mtp: SpeculativeConfig = serde_json::from_value(serde_json::json!({
+        "type": "mtp",
+        "n_max": 3
+    }))
+    .unwrap();
+    assert_eq!(mtp.kind, SpeculativeType::Mtp);
+    assert_eq!(mtp.n_max, Some(3));
+
+    let dflash = SpeculativeConfig {
+        kind: SpeculativeType::DraftDflash,
+        model: Some("incoai/Qwen3.8-27B-DFlash2-GGUF:Q4_K_M".into()),
+        n_max: Some(7),
         n_min: Some(0),
         p_min: Some(0.0),
         n_gpu_layers: None,
     };
+    let json = serde_json::to_value(&dflash).unwrap();
+    assert_eq!(json["type"], "draft-dflash");
+    assert_eq!(json["n_max"], 7);
 
-    let json = serde_json::to_value(&speculative).unwrap();
-    assert_eq!(json["type"], "mtp");
-    assert_eq!(json["n_max"], 3);
-
-    let parsed: SpeculativeConfig = serde_json::from_value(serde_json::json!({
-        "type": "mtp",
-        "n_max": 7
-    }))
-    .unwrap();
-    assert_eq!(parsed.kind, SpeculativeType::Mtp);
-    assert_eq!(parsed.n_max, Some(7));
+    let missing_model: SpeculativeConfig =
+        serde_json::from_value(serde_json::json!({"type": "draft-dflash"})).unwrap();
+    assert!(missing_model.model.is_none());
 }
 
 #[test]
-fn test_speculative_config_requires_supported_type() {
+fn test_speculative_config_requires_type() {
     assert!(serde_json::from_value::<SpeculativeConfig>(serde_json::json!({"n_max": 3})).is_err());
-    assert!(
-        serde_json::from_value::<SpeculativeConfig>(serde_json::json!({
-            "type": "draft-dflash",
-            "model": "draft.gguf"
-        }))
-        .is_err()
-    );
 }
 
 #[test]

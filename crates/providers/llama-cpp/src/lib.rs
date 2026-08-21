@@ -6,10 +6,10 @@ mod context;
 mod generation;
 mod memory;
 mod messages;
-mod mtp;
 mod multimodal;
 mod provider;
 mod response;
+mod speculative;
 mod template;
 mod tools;
 

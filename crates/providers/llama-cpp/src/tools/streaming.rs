@@ -19,7 +19,7 @@ use std::sync::Arc;
 pub(crate) fn generate_streaming_with_tools(
     model: &Arc<LlamaModel>,
     cfg: &LlamaCppConfig,
-    mtp_model: Option<&Arc<LlamaModel>>,
+    draft_model: Option<&Arc<LlamaModel>>,
     result: &ChatTemplateResult,
     max_tokens: u32,
     temperature: Option<f32>,
@@ -46,9 +46,9 @@ pub(crate) fn generate_streaming_with_tools(
             }
         }
         let mut stream_state = result.streaming_state();
-        let stats = crate::mtp::run_mtp(
+        let stats = crate::speculative::run_speculative(
             model,
-            mtp_model,
+            draft_model,
             cfg,
             &result.prompt,
             max_tokens,
