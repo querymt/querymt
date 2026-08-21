@@ -3,9 +3,9 @@ use mistralrs::core::{
 };
 use mistralrs::{
     AudioInput, DeviceMapSetting, EmbeddingModelBuilder, EmbeddingRequestBuilder, GgufModelBuilder,
-    IsqType, MemoryGpuConfig, Model, ModelDType, MultimodalModelBuilder, PagedAttentionConfig,
-    RequestBuilder, SpeechModelBuilder, TextMessageRole, TextModelBuilder, TokenSource, Topology,
-    parse_isq_value, speech_utils,
+    IsqType, MemoryGpuConfig, Model, ModelDType, MtpConfig, MultimodalModelBuilder,
+    PagedAttentionConfig, RequestBuilder, SpeechModelBuilder, TextMessageRole, TextModelBuilder,
+    TokenSource, Topology, parse_isq_value, speech_utils,
 };
 use querymt::chat::Tool;
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
@@ -32,9 +32,7 @@ use crate::messages::ensure_embedding_model;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModelCacheKey {
     pub model: String,
-    pub model_kind: Option<MistralRSModelKind>,
-    pub dtype: Option<String>,
-    pub force_cpu: bool,
+    load_config: String,
 }
 
 /// A cached model, shared across provider instances via `Arc`.
@@ -59,12 +57,7 @@ impl MistralRS {
         cfg: MistralRSConfig,
         cache: &std::sync::Mutex<Option<CachedModel>>,
     ) -> Result<Self, LLMError> {
-        let key = ModelCacheKey {
-            model: cfg.model.clone(),
-            model_kind: cfg.model_kind,
-            dtype: cfg.dtype.clone(),
-            force_cpu: cfg.force_cpu.unwrap_or(false),
-        };
+        let key = model_cache_key(&cfg)?;
 
         // Fast path: check cache under lock, return immediately on hit.
         {
@@ -240,6 +233,19 @@ struct ModelConfigArtifacts {
 struct ModelAutoConfig {
     #[serde(default)]
     architectures: Vec<String>,
+}
+
+pub(crate) fn model_cache_key(cfg: &MistralRSConfig) -> Result<ModelCacheKey, LLMError> {
+    let mut load_config = serde_json::to_value(cfg)?;
+    if let Some(config) = load_config.as_object_mut() {
+        config.remove("tools");
+        config.remove("tool_choice");
+    }
+
+    Ok(ModelCacheKey {
+        model: cfg.model.clone(),
+        load_config: serde_json::to_string(&load_config)?,
+    })
 }
 
 fn token_source_override(cfg: &MistralRSConfig) -> Result<Option<TokenSource>, LLMError> {
@@ -429,18 +435,52 @@ fn paged_cache_type_from_config(cache_type: MistralRSPagedCacheType) -> PagedCac
     }
 }
 
-fn paged_attn_config(cfg: &MistralRSConfig) -> Result<Option<PagedAttentionConfig>, LLMError> {
+pub(crate) fn mtp_config(cfg: &MistralRSConfig) -> Result<Option<MtpConfig>, LLMError> {
+    let Some(mtp) = cfg.mtp.as_ref() else {
+        return Ok(None);
+    };
+    if mtp.n_predict == Some(0) {
+        return Err(LLMError::InvalidRequest(
+            "mtp.n_predict must be greater than zero".into(),
+        ));
+    }
+
+    match mtp.model.as_deref() {
+        Some(model) if model.trim().is_empty() => Err(LLMError::InvalidRequest(
+            "mtp.model must not be empty".into(),
+        )),
+        Some(model) => Ok(Some(MtpConfig::new(model, mtp.n_predict))),
+        None => Ok(Some(MtpConfig::builtin(mtp.n_predict))),
+    }
+}
+
+pub(crate) fn paged_attn_config(
+    cfg: &MistralRSConfig,
+) -> Result<Option<PagedAttentionConfig>, LLMError> {
+    if cfg.mtp.is_some() && cfg.no_kv_cache.unwrap_or(false) {
+        return Err(LLMError::InvalidRequest(
+            "no_kv_cache cannot be enabled with mtp".into(),
+        ));
+    }
+    mtp_config(cfg)?;
+
     let has_settings = cfg.paged_attn_block_size.is_some()
         || cfg.paged_attn_gpu_mem.is_some()
         || cfg.paged_attn_gpu_mem_usage.is_some()
         || cfg.paged_attn_context_len.is_some()
         || cfg.paged_attn_cache_type.is_some();
-    let enabled = cfg.paged_attn.unwrap_or(has_settings);
+    let mtp_enabled = cfg.mtp.is_some();
+    let enabled = cfg.paged_attn.unwrap_or(has_settings || mtp_enabled);
 
     if !enabled {
         if has_settings {
             return Err(LLMError::InvalidRequest(
                 "paged_attn is disabled but paged_attn_* settings were provided".into(),
+            ));
+        }
+        if mtp_enabled {
+            return Err(LLMError::InvalidRequest(
+                "paged_attn must be enabled when mtp is configured".into(),
             ));
         }
         return Ok(None);
@@ -548,6 +588,9 @@ async fn build_text_model(cfg: &MistralRSConfig) -> Result<Model, LLMError> {
     if let Some(paged_attn_cfg) = paged_attn_config(cfg)? {
         builder = builder.with_paged_attn(paged_attn_cfg);
     }
+    if let Some(mtp_config) = mtp_config(cfg)? {
+        builder = builder.with_mtp_config(mtp_config);
+    }
     if cfg.throughput_logging.unwrap_or(false) {
         builder = builder.with_throughput_logging();
     }
@@ -613,6 +656,9 @@ async fn build_vision_model(cfg: &MistralRSConfig) -> Result<Model, LLMError> {
     }
     if let Some(paged_attn_cfg) = paged_attn_config(cfg)? {
         builder = builder.with_paged_attn(paged_attn_cfg);
+    }
+    if let Some(mtp_config) = mtp_config(cfg)? {
+        builder = builder.with_mtp_config(mtp_config);
     }
     if cfg.throughput_logging.unwrap_or(false) {
         builder = builder.with_throughput_logging();
@@ -687,6 +733,13 @@ async fn build_embedding_model(cfg: &MistralRSConfig) -> Result<Model, LLMError>
 }
 
 async fn build_gguf_model(cfg: &MistralRSConfig, spec: GgufSpec) -> Result<Model, LLMError> {
+    if cfg.mtp.is_some() {
+        return Err(LLMError::InvalidRequest(
+            "mistralrs MTP is not currently supported for GGUF targets; use a normal or UQFF target checkpoint"
+                .into(),
+        ));
+    }
+
     let mut builder = GgufModelBuilder::new(spec.model_id, spec.files).with_logging();
     if let Some(token_source) = token_source_override(cfg)? {
         builder = builder.with_token_source(token_source);

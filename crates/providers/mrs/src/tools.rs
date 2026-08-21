@@ -38,6 +38,7 @@ pub(crate) fn build_mistral_tools(tools: &[Tool]) -> Result<Vec<MistralTool>, LL
                     description: Some(tool.function.description.clone()),
                     name: tool.function.name.clone(),
                     parameters: params,
+                    strict: None,
                 },
             })
         })

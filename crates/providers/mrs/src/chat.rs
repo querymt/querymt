@@ -96,7 +96,7 @@ fn build_chat_request(
     ensure_chat_model(&provider.mrs_model)?;
     let mut req = RequestBuilder::new();
     for msg in messages {
-        req = apply_message_to_request(req, msg, &provider.mrs_model)?;
+        req = apply_message_to_request(req, msg)?;
     }
 
     let tools = tools.or(provider.config.tools.as_deref());

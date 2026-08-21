@@ -29,6 +29,8 @@ pub struct MistralRSConfig {
     pub no_kv_cache: Option<bool>,
     pub prefix_cache_n: Option<usize>,
     pub throughput_logging: Option<bool>,
+    /// Multi-token prediction speculative decoding configuration.
+    pub mtp: Option<MistralRSMtpConfig>,
     pub paged_attn: Option<bool>,
     pub paged_attn_block_size: Option<usize>,
     pub paged_attn_gpu_mem: Option<usize>,
@@ -39,6 +41,17 @@ pub struct MistralRSConfig {
     pub speech_loader_type: Option<String>,
     /// Optional DAC model ID override for speech models.
     pub speech_dac_model_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct MistralRSMtpConfig {
+    /// External safetensors assistant model ID or local directory.
+    /// Omit to use the target checkpoint's built-in MTP head.
+    pub model: Option<String>,
+    /// Number of draft tokens proposed per target step.
+    /// Omit to use the model-specific default or adaptive depth.
+    pub n_predict: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, JsonSchema, Serialize)]

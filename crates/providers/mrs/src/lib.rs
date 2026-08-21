@@ -7,7 +7,8 @@ mod streaming;
 mod tools;
 
 pub use config::{
-    MistralRSConfig, MistralRSDeviceMap, MistralRSModelKind, MistralRSPagedCacheType,
+    MistralRSConfig, MistralRSDeviceMap, MistralRSModelKind, MistralRSMtpConfig,
+    MistralRSPagedCacheType,
 };
 pub use factory::create_factory;
 pub use model::MistralRS;

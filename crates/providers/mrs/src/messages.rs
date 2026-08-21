@@ -15,7 +15,6 @@ fn map_chat_role(role: &ChatRole) -> TextMessageRole {
 pub(crate) fn apply_message_to_request(
     mut req: RequestBuilder,
     msg: &ChatMessage,
-    model: &Model,
 ) -> Result<RequestBuilder, LLMError> {
     let role = map_chat_role(&msg.role);
     let text = msg

@@ -3,12 +3,12 @@ use querymt::chat::{ChatMessageBuilder, ChatRole};
 use querymt::completion::CompletionRequest;
 use querymt::error::LLMError;
 
-use crate::config::MistralRSConfig;
+use crate::config::{MistralRSConfig, MistralRSMtpConfig};
 use crate::factory::create_factory;
+use crate::model::{model_cache_key, mtp_config, paged_attn_config};
 
-fn get_provider() -> Box<dyn LLMProvider> {
-    let factory = create_factory();
-    let cfg = MistralRSConfig {
+fn test_config() -> MistralRSConfig {
+    MistralRSConfig {
         model: "microsoft/Phi-3.5-mini-instruct".to_string(),
         model_kind: None,
         tools: None,
@@ -33,6 +33,7 @@ fn get_provider() -> Box<dyn LLMProvider> {
         no_kv_cache: None,
         prefix_cache_n: None,
         throughput_logging: None,
+        mtp: None,
         paged_attn: None,
         paged_attn_block_size: None,
         paged_attn_gpu_mem: None,
@@ -41,10 +42,110 @@ fn get_provider() -> Box<dyn LLMProvider> {
         paged_attn_cache_type: None,
         speech_loader_type: None,
         speech_dac_model_id: None,
-    };
+    }
+}
 
-    let json_cfg = serde_json::to_string(&cfg).unwrap();
+fn get_provider() -> Box<dyn LLMProvider> {
+    let factory = create_factory();
+    let json_cfg = serde_json::to_string(&test_config()).unwrap();
     factory.from_config(&json_cfg).unwrap()
+}
+
+#[test]
+fn mtp_config_supports_builtin_and_external_models() {
+    let mut cfg = test_config();
+    cfg.mtp = Some(MistralRSMtpConfig {
+        model: None,
+        n_predict: Some(3),
+    });
+    let builtin = mtp_config(&cfg).unwrap().unwrap();
+    assert!(builtin.is_builtin());
+    assert_eq!(builtin.n_predict, Some(3));
+
+    cfg.mtp = Some(MistralRSMtpConfig {
+        model: Some("incoai/Qwen3.8-27B-DFlash2".into()),
+        n_predict: None,
+    });
+    let external = mtp_config(&cfg).unwrap().unwrap();
+    assert!(!external.is_builtin());
+    assert_eq!(
+        external.model.as_deref(),
+        Some("incoai/Qwen3.8-27B-DFlash2")
+    );
+    assert_eq!(external.n_predict, None);
+}
+
+#[test]
+fn mtp_config_enables_paged_attention_and_changes_cache_identity() {
+    let base = test_config();
+    let mut mtp = test_config();
+    mtp.mtp = Some(MistralRSMtpConfig {
+        model: None,
+        n_predict: Some(3),
+    });
+
+    assert!(paged_attn_config(&base).unwrap().is_none());
+    assert!(paged_attn_config(&mtp).unwrap().is_some());
+    assert_ne!(
+        model_cache_key(&base).unwrap(),
+        model_cache_key(&mtp).unwrap()
+    );
+}
+
+#[test]
+fn mtp_rejects_invalid_or_incompatible_config() {
+    let mut cfg = test_config();
+    cfg.mtp = Some(MistralRSMtpConfig {
+        model: None,
+        n_predict: Some(0),
+    });
+    assert!(matches!(mtp_config(&cfg), Err(LLMError::InvalidRequest(_))));
+
+    cfg.mtp = Some(MistralRSMtpConfig {
+        model: Some("  ".into()),
+        n_predict: None,
+    });
+    assert!(matches!(mtp_config(&cfg), Err(LLMError::InvalidRequest(_))));
+
+    cfg.mtp = Some(MistralRSMtpConfig {
+        model: None,
+        n_predict: None,
+    });
+    cfg.paged_attn = Some(false);
+    assert!(matches!(
+        paged_attn_config(&cfg),
+        Err(LLMError::InvalidRequest(_))
+    ));
+
+    cfg.paged_attn = None;
+    cfg.no_kv_cache = Some(true);
+    assert!(matches!(
+        paged_attn_config(&cfg),
+        Err(LLMError::InvalidRequest(_))
+    ));
+}
+
+#[test]
+fn mtp_config_rejects_unknown_fields() {
+    let mut value = serde_json::to_value(test_config()).unwrap();
+    value["mtp"] = serde_json::json!({"n_max": 3});
+
+    let error = match serde_json::from_value::<MistralRSConfig>(value) {
+        Ok(_) => panic!("unknown MTP fields should be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("unknown field `n_max`"));
+}
+
+#[test]
+fn request_options_do_not_change_cache_identity() {
+    let mut configured = test_config();
+    configured.tool_choice = Some(querymt::chat::ToolChoice::Auto);
+
+    assert_eq!(
+        model_cache_key(&test_config()).unwrap(),
+        model_cache_key(&configured).unwrap()
+    );
 }
 
 #[test]
