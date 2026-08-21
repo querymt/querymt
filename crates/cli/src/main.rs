@@ -587,6 +587,9 @@ async fn run(
     if let Some(max) = args.max_tokens {
         builder = builder.max_tokens(max);
     }
+    if let Some(effort) = args.reasoning_effort {
+        builder = builder.reasoning_effort(effort);
+    }
     if let Some(tp) = args.top_p {
         builder = builder.top_p(tp);
     }

@@ -1,6 +1,7 @@
 use crate::utils::parse_kv;
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
+use querymt::chat::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -68,6 +69,10 @@ pub struct CliArgs {
     /// Maximum tokens in the response
     #[arg(long)]
     pub max_tokens: Option<u32>,
+
+    /// Reasoning effort level (low, medium, high, max)
+    #[arg(long)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 
     #[arg(long)]
     pub mcp_config: Option<String>,
@@ -184,4 +189,30 @@ pub enum SecretsCommands {
     Get { key: String },
     /// Delete a secret key
     Delete { key: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_reasoning_effort_levels() {
+        for (value, expected) in [
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("high", ReasoningEffort::High),
+            ("max", ReasoningEffort::Max),
+        ] {
+            let args = CliArgs::try_parse_from(["qmt", "--reasoning-effort", value])
+                .expect("portable reasoning effort should parse");
+            assert_eq!(args.reasoning_effort, Some(expected));
+        }
+    }
+
+    #[test]
+    fn rejects_provider_specific_reasoning_effort() {
+        let error = CliArgs::try_parse_from(["qmt", "--reasoning-effort", "xhigh"])
+            .expect_err("xhigh is provider-specific; portable max should be used");
+        assert!(error.to_string().contains("low, medium, high, max"));
+    }
 }

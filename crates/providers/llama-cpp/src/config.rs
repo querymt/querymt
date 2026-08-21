@@ -1,3 +1,4 @@
+use querymt::chat::ReasoningEffort;
 use querymt::chat::StructuredOutputFormat;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -77,6 +78,9 @@ pub struct LlamaCppConfig {
     /// `<think>` blocks are parsed into separate reasoning_content.
     /// Defaults to true.
     pub enable_thinking: Option<bool>,
+    /// Portable reasoning effort. The selected chat template determines the
+    /// provider-specific value rendered for this level.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Flash attention policy. Enables flash attention for faster inference
     /// and is required for KV cache quantization. Supported on Metal (Apple
     /// Silicon) and CUDA backends.

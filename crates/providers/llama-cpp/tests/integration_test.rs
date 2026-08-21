@@ -38,6 +38,7 @@ fn test_config_serialization() {
         add_bos: Some(true),
         log: None,
         enable_thinking: Some(true),
+        reasoning_effort: Some(querymt::chat::ReasoningEffort::High),
         flash_attention: None,
         kv_cache_type_k: Some("q4_0".to_string()),
         kv_cache_type_v: Some("q4_0".to_string()),
@@ -58,6 +59,10 @@ fn test_config_serialization() {
 
     assert_eq!(deserialized.model, "/path/to/model.gguf");
     assert_eq!(deserialized.max_tokens, Some(512));
+    assert_eq!(
+        deserialized.reasoning_effort,
+        Some(querymt::chat::ReasoningEffort::High)
+    );
     assert_eq!(deserialized.kv_cache_type_k, Some("q4_0".to_string()));
     assert_eq!(
         deserialized.mmproj_path,
