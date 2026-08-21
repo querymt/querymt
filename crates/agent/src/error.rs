@@ -5,6 +5,7 @@
 //! error code via the `From<AgentError> for AcpError` impl.
 
 use agent_client_protocol::Error as AcpError;
+use querymt::error::{LLMErrorPayload, ProviderErrorKind};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -55,6 +56,15 @@ pub enum AgentError {
     #[error("provider chat failed ({operation}): {reason}")]
     ProviderChat { operation: String, reason: String },
 
+    #[error("provider request failed: {message}")]
+    ProviderFailure {
+        message: String,
+        provider: Option<String>,
+        model: Option<String>,
+        retryable: bool,
+        error: LLMErrorPayload,
+    },
+
     // --- Client bridge ---
     #[error("client bridge closed")]
     ClientBridgeClosed,
@@ -99,6 +109,26 @@ pub enum AgentError {
 /// | -32603  | InternalError      | everything else (replaces the old -32000 catch-all) |
 impl From<AgentError> for AcpError {
     fn from(e: AgentError) -> Self {
+        if let AgentError::ProviderFailure {
+            message,
+            provider,
+            model,
+            retryable,
+            error,
+        } = &e
+        {
+            let (kind, provider_message) = provider_error_metadata(error);
+            return AcpError::new(-32010, "Provider request failed").data(serde_json::json!({
+                "category": "provider",
+                "kind": kind,
+                "message": provider_message.unwrap_or_else(|| message.clone()),
+                "provider": provider,
+                "model": model,
+                "retryable": retryable,
+                "error": error,
+            }));
+        }
+
         let code: i32 = match &e {
             AgentError::MethodNotImplemented { .. } => -32601, // MethodNotFound
             AgentError::SessionNotFound { .. }
@@ -107,6 +137,28 @@ impl From<AgentError> for AcpError {
             _ => -32603,                                       // InternalError
         };
         AcpError::new(code, e.to_string())
+    }
+}
+
+fn provider_error_metadata(error: &LLMErrorPayload) -> (Option<ProviderErrorKind>, Option<String>) {
+    match error {
+        LLMErrorPayload::ProviderError { message, kind, .. } => (*kind, Some(message.clone())),
+        LLMErrorPayload::RateLimited { message, .. } => {
+            (Some(ProviderErrorKind::RateLimited), Some(message.clone()))
+        }
+        LLMErrorPayload::AuthError { message } => (
+            Some(ProviderErrorKind::Authentication),
+            Some(message.clone()),
+        ),
+        LLMErrorPayload::InvalidRequest { message } => (
+            Some(ProviderErrorKind::InvalidRequest),
+            Some(message.clone()),
+        ),
+        LLMErrorPayload::NotImplemented { message } => (
+            Some(ProviderErrorKind::UnsupportedOperation),
+            Some(message.clone()),
+        ),
+        _ => (None, None),
     }
 }
 
@@ -224,6 +276,110 @@ mod tests {
         assert_eq!(acp.code, ErrorCode::InternalError);
         assert!(acp.message.contains("chat_with_tools"));
         assert!(acp.message.contains("rate limit"));
+    }
+
+    #[test]
+    fn structured_quota_failure_maps_to_provider_acp_error() {
+        let acp: AcpError = AgentError::ProviderFailure {
+            message: "LLM streaming error".to_string(),
+            provider: Some("codex".to_string()),
+            model: Some("gpt-5.6-sol".to_string()),
+            retryable: false,
+            error: LLMErrorPayload::ProviderError {
+                message: "The usage limit has been reached".to_string(),
+                kind: Some(ProviderErrorKind::QuotaExceeded),
+                code: Some("usage_limit_reached".to_string()),
+                error_type: Some("usage_limit_reached".to_string()),
+                request_id: None,
+                retry_after_secs: None,
+            },
+        }
+        .into();
+
+        assert_eq!(acp.code, ErrorCode::Other(-32010));
+        assert_eq!(acp.message, "Provider request failed");
+        assert_eq!(
+            acp.data,
+            Some(serde_json::json!({
+                "category": "provider",
+                "kind": "quota_exceeded",
+                "message": "The usage limit has been reached",
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "retryable": false,
+                "error": {
+                    "type": "provider_error",
+                    "message": "The usage limit has been reached",
+                    "kind": "quota_exceeded",
+                    "code": "usage_limit_reached",
+                    "error_type": "usage_limit_reached"
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn structured_unsupported_operation_maps_to_provider_acp_error() {
+        let acp: AcpError = AgentError::ProviderFailure {
+            message: "LLM streaming error".to_string(),
+            provider: Some("openrouter".to_string()),
+            model: Some("qwen/qwen3.5-122b-a10b".to_string()),
+            retryable: false,
+            error: LLMErrorPayload::NotImplemented {
+                message: "Streaming request construction not supported by this HTTP provider"
+                    .to_string(),
+            },
+        }
+        .into();
+
+        assert_eq!(acp.code, ErrorCode::Other(-32010));
+        assert_eq!(
+            acp.data,
+            Some(serde_json::json!({
+                "category": "provider",
+                "kind": "unsupported_operation",
+                "message": "Streaming request construction not supported by this HTTP provider",
+                "provider": "openrouter",
+                "model": "qwen/qwen3.5-122b-a10b",
+                "retryable": false,
+                "error": {
+                    "type": "not_implemented",
+                    "message": "Streaming request construction not supported by this HTTP provider"
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn structured_auth_failure_maps_to_provider_acp_error() {
+        let acp: AcpError = AgentError::ProviderFailure {
+            message: "LLM provider initialization error".to_string(),
+            provider: Some("groq".to_string()),
+            model: Some("openai/gpt-oss-20b".to_string()),
+            retryable: false,
+            error: LLMErrorPayload::AuthError {
+                message: "No API key found for provider 'groq'. Set GROQ_API_KEY or run 'qmt auth login groq'"
+                    .to_string(),
+            },
+        }
+        .into();
+
+        assert_eq!(acp.code, ErrorCode::Other(-32010));
+        assert_eq!(
+            acp.data,
+            Some(serde_json::json!({
+                "category": "provider",
+                "kind": "authentication",
+                "message": "No API key found for provider 'groq'. Set GROQ_API_KEY or run 'qmt auth login groq'",
+                "provider": "groq",
+                "model": "openai/gpt-oss-20b",
+                "retryable": false,
+                "error": {
+                    "type": "auth_error",
+                    "message": "No API key found for provider 'groq'. Set GROQ_API_KEY or run 'qmt auth login groq'"
+                }
+            }))
+        );
     }
 
     #[test]

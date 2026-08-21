@@ -24,6 +24,7 @@ use kameo::message::{Context, Message};
 use kameo::reply::DelegatedReply;
 use log::{debug, info, warn};
 use querymt::chat::{ChatRole, ReasoningEffort};
+use querymt::error::LLMError;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, oneshot};
@@ -2013,15 +2014,35 @@ async fn execute_prompt_detached(
         Ok(CycleOutcome::Cancelled) => Ok(PromptResponse::new(StopReason::Cancelled)),
         Ok(CycleOutcome::Stopped(stop_reason)) => Ok(PromptResponse::new(stop_reason)),
         Err(e) => {
+            let message = e.to_string();
             config.emit_event(
                 &session_id,
                 AgentEventKind::Error {
-                    message: e.to_string(),
+                    message: message.clone(),
                 },
             );
-            Err(AgentError::Internal(e.to_string()))
+            Err(provider_failure_from_execution_error(&e, &exec_ctx)
+                .unwrap_or(AgentError::Internal(message)))
         }
     }
+}
+
+fn provider_failure_from_execution_error(
+    error: &anyhow::Error,
+    exec_ctx: &ExecutionContext,
+) -> Option<AgentError> {
+    let llm_error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<LLMError>())?;
+    let llm_config = exec_ctx.llm_config();
+
+    Some(AgentError::ProviderFailure {
+        message: error.to_string(),
+        provider: llm_config.map(|config| config.provider.clone()),
+        model: llm_config.map(|config| config.model.clone()),
+        retryable: llm_error.is_retryable(),
+        error: llm_error.to_payload(),
+    })
 }
 
 #[instrument(

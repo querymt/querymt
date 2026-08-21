@@ -62,6 +62,9 @@ mod remote_actor_impl;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod actor_ref_tests;
+
 // ── Test modules (remote feature) ────────────────────────────────────────────
 
 #[cfg(all(test, feature = "remote"))]
