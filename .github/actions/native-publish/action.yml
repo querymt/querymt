@@ -33,6 +33,10 @@ inputs:
   repository_owner:
     description: GitHub repository owner for GHCR image path
     required: true
+  channel:
+    description: Optional OCI tag namespace prefix (e.g. dflash2)
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -121,8 +125,10 @@ runs:
       shell: bash
       run: |
         IMAGE_BASE="ghcr.io/${{ inputs.repository_owner }}/${{ inputs.crate }}"
-        VERSIONED="${{ env.VERSION }}-${{ inputs.os }}-${{ inputs.arch }}-${{ inputs.feature_tag }}"
-        ALIAS="${{ inputs.os }}-${{ inputs.arch }}-${{ inputs.feature_tag }}"
+        CHANNEL="${{ inputs.channel }}"
+        PREFIX="${CHANNEL:+${CHANNEL}-}"
+        VERSIONED="${PREFIX}${{ env.VERSION }}-${{ inputs.os }}-${{ inputs.arch }}-${{ inputs.feature_tag }}"
+        ALIAS="${PREFIX}${{ inputs.os }}-${{ inputs.arch }}-${{ inputs.feature_tag }}"
 
         echo "Pushing native artifact to ${IMAGE_BASE} with tags ${VERSIONED} and ${ALIAS}"
 
@@ -130,19 +136,34 @@ runs:
           --config oci-config.json:application/vnd.oci.image.config.v1+json \
           --annotation "mt.query.plugin.type=native" \
           --annotation "mt.query.plugin.feature=${{ inputs.feature_tag }}" \
+          --annotation "mt.query.plugin.channel=${{ inputs.channel }}" \
           --annotation "org.opencontainers.image.version=${{ env.VERSION }}" \
+          --annotation "org.opencontainers.image.revision=${{ github.sha }}" \
+          --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
           --annotation "org.opencontainers.image.os=${{ inputs.os }}" \
           --annotation "org.opencontainers.image.architecture=${{ inputs.arch }}" \
           ${PLUGIN_TAR}:application/vnd.oci.image.layer.v1.tar+gzip
 
         echo "Verifying manifest has platform fields..."
-        oras manifest fetch "${IMAGE_BASE}:${VERSIONED}" | jq '.'
+        for attempt in {1..6}; do
+          if oras manifest fetch "${IMAGE_BASE}:${VERSIONED}" | jq '.'; then
+            exit 0
+          fi
+          if [[ $attempt -lt 6 ]]; then
+            echo "Manifest not indexed yet (attempt $attempt/6); retrying in 10 seconds..."
+            sleep 10
+          fi
+        done
+        echo "Failed to fetch ${IMAGE_BASE}:${VERSIONED} after 6 attempts" >&2
+        exit 1
 
     - name: Save manifest data for aggregation
       shell: bash
       run: |
         IMAGE_BASE="ghcr.io/${{ inputs.repository_owner }}/${{ inputs.crate }}"
-        VERSIONED="${{ env.VERSION }}-${{ inputs.os }}-${{ inputs.arch }}-${{ inputs.feature_tag }}"
+        CHANNEL="${{ inputs.channel }}"
+        PREFIX="${CHANNEL:+${CHANNEL}-}"
+        VERSIONED="${PREFIX}${{ env.VERSION }}-${{ inputs.os }}-${{ inputs.arch }}-${{ inputs.feature_tag }}"
 
         mkdir -p manifest-data
         cat > manifest-data/data.txt <<EOF
@@ -151,12 +172,13 @@ runs:
         OS=${{ inputs.os }}
         ARCH=${{ inputs.arch }}
         FEATURE_TAG=${{ inputs.feature_tag }}
+        CHANNEL=${{ inputs.channel }}
         IMAGE_REF=${IMAGE_BASE}:${VERSIONED}
         EOF
 
     - name: Upload manifest data artifact
       uses: actions/upload-artifact@v7
       with:
-        name: manifest-${{ inputs.crate }}-${{ inputs.os }}-${{ inputs.arch }}-${{ inputs.feature_tag }}
+        name: manifest-${{ inputs.crate }}-${{ inputs.channel || 'default' }}-${{ inputs.os }}-${{ inputs.arch }}-${{ inputs.feature_tag }}
         path: manifest-data/data.txt
         retention-days: 1

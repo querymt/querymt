@@ -38,6 +38,10 @@ inputs:
       (e.g. '{"CUDA_COMPUTE_CAP":"80"}')
     required: false
     default: "{}"
+  version_override:
+    description: Optional OCI artifact version instead of the Cargo package version
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -48,14 +52,17 @@ runs:
       run: |
         set -euo pipefail
         pkg="qmt-${{ inputs.crate }}"
-        v=$(cargo pkgid -p "$pkg" | sed -E 's/.*@([^ ]+)$/\1/')
+        v="${{ inputs.version_override }}"
+        if [[ -z "$v" ]]; then
+          v=$(cargo pkgid -p "$pkg" | sed -E 's/.*@([^ ]+)$/\1/')
+        fi
 
-        if [[ -z "$v" ]] || [[ "$v" == *" "* ]] || [[ "$v" == *"="* ]] || [[ "$v" == *"workspace"* ]]; then
+        if [[ -z "$v" ]] || [[ ! "$v" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || [[ "$v" == *"workspace"* ]]; then
           echo "Invalid resolved version for $pkg: '$v'" >&2
           exit 1
         fi
 
-        echo "Resolved $pkg version: $v"
+        echo "Resolved $pkg artifact version: $v"
         echo "VERSION=$v" >> "$GITHUB_ENV"
 
     - name: Export extra environment variables

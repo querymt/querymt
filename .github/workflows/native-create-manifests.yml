@@ -12,6 +12,16 @@ on:
         required: false
         type: boolean
         default: false
+      channel:
+        description: Optional OCI tag namespace prefix (e.g. dflash2)
+        required: false
+        type: string
+        default: ""
+      alias:
+        description: Optional moving alias override (e.g. latest or stable)
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -68,12 +78,18 @@ jobs:
             [[ -f "$data_file" ]] || continue
 
             # Read the data file
-            unset PROVIDER VERSION OS ARCH FEATURE_TAG IMAGE_REF
+            unset PROVIDER VERSION OS ARCH FEATURE_TAG CHANNEL IMAGE_REF
             source "$data_file"
+            CHANNEL="${CHANNEL:-}"
 
             # Skip noop entries
             if [[ "$PROVIDER" == "noop" ]]; then
               continue
+            fi
+
+            if [[ "$CHANNEL" != "${{ inputs.channel }}" ]]; then
+              echo "Manifest channel mismatch in $data_file: '$CHANNEL' != '${{ inputs.channel }}'" >&2
+              exit 1
             fi
 
             # Store build info
@@ -89,11 +105,16 @@ jobs:
             exit 0
           fi
 
-          if [[ "${{ inputs.is_tagged_release }}" == "true" ]]; then
-            ALIAS_TAG="stable"
-          else
-            ALIAS_TAG="latest"
+          ALIAS_TAG="${{ inputs.alias }}"
+          if [[ -z "$ALIAS_TAG" ]]; then
+            if [[ "${{ inputs.is_tagged_release }}" == "true" ]]; then
+              ALIAS_TAG="stable"
+            else
+              ALIAS_TAG="latest"
+            fi
           fi
+          CHANNEL="${{ inputs.channel }}"
+          PREFIX="${CHANNEL:+${CHANNEL}-}"
 
           echo "Found $build_count builds to aggregate"
           echo ""
@@ -330,16 +351,16 @@ jobs:
             fi
 
             # 1. Create version-pinned multi-platform manifest (e.g., 0.1.0-metal)
-            versioned_tag="${base}:${version}-${feature_tag}"
+            versioned_tag="${base}:${PREFIX}${version}-${feature_tag}"
             create_index "$versioned_tag" "${refs[@]}" || exit 1
 
             # 2. Create/update alias-{feature} tag (e.g., stable-metal or latest-metal)
-            alias_feature_tag="${base}:${ALIAS_TAG}-${feature_tag}"
+            alias_feature_tag="${base}:${PREFIX}${ALIAS_TAG}-${feature_tag}"
             create_index "$alias_feature_tag" "${refs[@]}" || exit 1
 
             # 3. For "default" feature, also create plain version tag (e.g., 0.1.0)
             if [[ "$feature_tag" == "default" ]]; then
-              plain_version_tag="${base}:${version}"
+              plain_version_tag="${base}:${PREFIX}${version}"
               create_index "$plain_version_tag" "${refs[@]}" || exit 1
             fi
 
@@ -353,7 +374,7 @@ jobs:
             if [[ -n "${groups[$group_key]:-}" ]]; then
               IFS=' ' read -ra refs <<< "${groups[$group_key]}"
               base="ghcr.io/${{ github.repository_owner }}/${provider}"
-              alias_tag="${base}:${ALIAS_TAG}"
+              alias_tag="${base}:${PREFIX}${ALIAS_TAG}"
               create_index "$alias_tag" "${refs[@]}" || exit 1
             else
               echo "  Skipping ${provider}:${ALIAS_TAG} (no 'default' feature set found)"
@@ -389,11 +410,16 @@ jobs:
 
           echo "=== Signing multi-platform index manifests ==="
 
-          if [[ "${{ inputs.is_tagged_release }}" == "true" ]]; then
-            ALIAS_TAG="stable"
-          else
-            ALIAS_TAG="latest"
+          ALIAS_TAG="${{ inputs.alias }}"
+          if [[ -z "$ALIAS_TAG" ]]; then
+            if [[ "${{ inputs.is_tagged_release }}" == "true" ]]; then
+              ALIAS_TAG="stable"
+            else
+              ALIAS_TAG="latest"
+            fi
           fi
+          CHANNEL="${{ inputs.channel }}"
+          PREFIX="${CHANNEL:+${CHANNEL}-}"
 
           # Collect unique (provider, feature_tag) pairs and versions
           declare -A provider_versions
@@ -401,8 +427,10 @@ jobs:
 
           for data_file in manifests/*/data.txt; do
             [[ -f "$data_file" ]] || continue
-            unset PROVIDER VERSION FEATURE_TAG
+            unset PROVIDER VERSION FEATURE_TAG CHANNEL
             source "$data_file"
+            CHANNEL="${CHANNEL:-}"
+            [[ "$CHANNEL" == "${{ inputs.channel }}" ]] || continue
             [[ "$PROVIDER" == "noop" ]] && continue
             provider_versions[$PROVIDER]="$VERSION"
             groups["${PROVIDER}|${FEATURE_TAG}"]=1
@@ -433,21 +461,21 @@ jobs:
             version="${provider_versions[$provider]}"
 
             # Sign version-feature tag (e.g., 0.1.0-metal)
-            sign_tag "${base}:${version}-${feature_tag}"
+            sign_tag "${base}:${PREFIX}${version}-${feature_tag}"
 
             # Sign alias-feature tag (e.g., stable-metal or latest-metal)
-            sign_tag "${base}:${ALIAS_TAG}-${feature_tag}"
+            sign_tag "${base}:${PREFIX}${ALIAS_TAG}-${feature_tag}"
 
             # Sign plain version tag for default feature
             if [[ "$feature_tag" == "default" ]]; then
-              sign_tag "${base}:${version}"
+              sign_tag "${base}:${PREFIX}${version}"
             fi
           done
 
           # Sign plain alias tags
           for provider in "${!provider_versions[@]}"; do
             if [[ -n "${groups[${provider}|default]:-}" ]]; then
-              sign_tag "ghcr.io/${{ github.repository_owner }}/${provider}:${ALIAS_TAG}"
+              sign_tag "ghcr.io/${{ github.repository_owner }}/${provider}:${PREFIX}${ALIAS_TAG}"
             fi
           done
 
@@ -459,11 +487,16 @@ jobs:
           #!/bin/bash
           set -euo pipefail
 
-          if [[ "${{ inputs.is_tagged_release }}" == "true" ]]; then
-            ALIAS_TAG="stable"
-          else
-            ALIAS_TAG="latest"
+          ALIAS_TAG="${{ inputs.alias }}"
+          if [[ -z "$ALIAS_TAG" ]]; then
+            if [[ "${{ inputs.is_tagged_release }}" == "true" ]]; then
+              ALIAS_TAG="stable"
+            else
+              ALIAS_TAG="latest"
+            fi
           fi
+          CHANNEL="${{ inputs.channel }}"
+          PREFIX="${CHANNEL:+${CHANNEL}-}"
 
           echo "=== Validating multi-platform manifests ==="
           echo "Verifying that platform fields are properly set..."
@@ -475,8 +508,10 @@ jobs:
           for data_file in manifests/*/data.txt; do
             [[ -f "$data_file" ]] || continue
 
-            unset PROVIDER FEATURE_TAG
+            unset PROVIDER FEATURE_TAG CHANNEL
             source "$data_file"
+            CHANNEL="${CHANNEL:-}"
+            [[ "$CHANNEL" == "${{ inputs.channel }}" ]] || continue
 
             if [[ "$PROVIDER" == "noop" ]]; then
               continue
@@ -497,7 +532,7 @@ jobs:
           for key in "${!provider_features[@]}"; do
             IFS='|' read -r provider feature_tag <<< "$key"
             base="ghcr.io/${{ github.repository_owner }}/${provider}"
-            tag="${base}:${ALIAS_TAG}-${feature_tag}"
+            tag="${base}:${PREFIX}${ALIAS_TAG}-${feature_tag}"
 
             echo "Validating: $tag"
 
