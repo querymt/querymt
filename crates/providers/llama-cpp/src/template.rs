@@ -113,6 +113,38 @@ fn render_template_source(
         .map_err(|e| LLMError::ProviderError(format!("Failed to render chat template: {e}")))
 }
 
+fn message_shape_summary(messages: &Value) -> String {
+    let Some(messages) = messages.as_array() else {
+        return "invalid".to_string();
+    };
+
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let content_type = match message.get("content") {
+                Some(Value::String(_)) => "string",
+                Some(Value::Null) => "null",
+                Some(Value::Array(_)) => "array",
+                Some(Value::Object(_)) => "object",
+                Some(Value::Bool(_)) => "bool",
+                Some(Value::Number(_)) => "number",
+                None => "missing",
+            };
+            let tool_calls = message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            format!("{index}:{role}(content={content_type},tool_calls={tool_calls})")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 pub(crate) fn apply_template_for_thinking(
     model: &Arc<LlamaModel>,
     cfg: &LlamaCppConfig,
@@ -205,7 +237,13 @@ fn render_template(
         reasoning_effort,
     };
     let template = rewrite_generation_tags(&template);
-    let prompt = render_template_source(&template, &context)?;
+    let prompt = render_template_source(&template, &context).map_err(|error| {
+        LLMError::ProviderError(format!(
+            "Chat template rendering failed (messages=[{}], tools={}): {error}",
+            message_shape_summary(&context.messages),
+            tools.map_or(0, <[Tool]>::len),
+        ))
+    })?;
 
     let reasoning_format = ReasoningFormat::detect(&prompt);
     let starts_in_thinking = prompt_starts_in_thinking(&prompt, reasoning_format);
@@ -378,6 +416,27 @@ mod tests {
             enable_thinking,
             reasoning_effort,
         }
+    }
+
+    #[test]
+    fn message_shape_summary_does_not_include_message_content() {
+        let messages = serde_json::json!([
+            {"role": "user", "content": "secret prompt"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_1"}]
+            },
+            {"role": "tool", "content": "secret result"}
+        ]);
+
+        let summary = message_shape_summary(&messages);
+
+        assert_eq!(
+            summary,
+            "0:user(content=string,tool_calls=0),1:assistant(content=string,tool_calls=1),2:tool(content=string,tool_calls=0)"
+        );
+        assert!(!summary.contains("secret"));
     }
 
     #[test]

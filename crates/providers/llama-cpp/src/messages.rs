@@ -151,12 +151,9 @@ pub(crate) fn messages_to_json(
         media_count += image_count;
 
         if !tool_calls_array.is_empty() {
-            let text = text_parts.join("\n");
-            let content = if text.is_empty() {
-                Value::Null
-            } else {
-                Value::String(text)
-            };
+            // Some model templates apply string operations to assistant content.
+            // Keep tool-only assistant messages compatible by emitting an empty string.
+            let content = Value::String(text_parts.join("\n"));
 
             let mut json_msg = serde_json::json!({
                 "role": "assistant",
@@ -423,6 +420,82 @@ mod tests {
             serde_json::json!({"city": "Paris"})
         );
         assert!(parsed[0]["tool_calls"][0]["function"]["arguments"].is_object());
+    }
+
+    #[test]
+    fn tool_use_without_text_uses_empty_string_content() {
+        let cfg = test_config();
+        let messages = vec![assistant_msg(vec![
+            Content::thinking("Let me inspect the directory"),
+            Content::tool_use(
+                "call_123",
+                "ls",
+                serde_json::json!({"path": "crates/provider-common/src"}),
+            ),
+        ])];
+
+        let (result, media_count) = messages_to_json(&cfg, &messages, None).unwrap();
+        let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(media_count, 0);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["role"], "assistant");
+        assert_eq!(parsed[0]["content"], "");
+        assert_eq!(
+            parsed[0]["reasoning_content"],
+            "Let me inspect the directory"
+        );
+        assert_eq!(parsed[0]["tool_calls"][0]["id"], "call_123");
+    }
+
+    #[test]
+    fn multi_turn_tool_history_has_string_assistant_content() {
+        let cfg = test_config();
+        let messages = vec![
+            user_msg(vec![Content::text("Analyze provider-common")]),
+            assistant_msg(vec![
+                Content::thinking("Start with the manifest"),
+                Content::text("I'll inspect the manifest."),
+                Content::tool_use(
+                    "call_manifest",
+                    "read_tool",
+                    serde_json::json!({"path": "crates/provider-common/Cargo.toml"}),
+                ),
+            ]),
+            user_msg(vec![Content::ToolResult {
+                id: "call_manifest".to_string(),
+                name: Some("read_tool".to_string()),
+                is_error: false,
+                content: vec![Content::text("[package]\nname = provider-common")],
+            }]),
+            assistant_msg(vec![
+                Content::thinking("Now inspect the sources"),
+                Content::tool_use(
+                    "call_sources",
+                    "ls",
+                    serde_json::json!({"path": "crates/provider-common/src"}),
+                ),
+            ]),
+            user_msg(vec![Content::ToolResult {
+                id: "call_sources".to_string(),
+                name: Some("ls".to_string()),
+                is_error: false,
+                content: vec![Content::text("lib.rs")],
+            }]),
+        ];
+
+        let (result, media_count) = messages_to_json(&cfg, &messages, None).unwrap();
+        let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(media_count, 0);
+        assert_eq!(parsed.len(), 5);
+        assert_eq!(parsed[1]["content"], "I'll inspect the manifest.");
+        assert_eq!(parsed[2]["role"], "tool");
+        assert_eq!(parsed[3]["role"], "assistant");
+        assert_eq!(parsed[3]["content"], "");
+        assert!(parsed[3]["content"].is_string());
+        assert_eq!(parsed[3]["tool_calls"][0]["id"], "call_sources");
+        assert_eq!(parsed[4]["tool_call_id"], "call_sources");
     }
 
     #[test]
