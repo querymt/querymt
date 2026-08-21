@@ -11,10 +11,10 @@ fn local_prompt_handler_error_preserves_structured_provider_data() {
         provider: Some("openrouter".to_string()),
         model: Some("qwen/qwen3.5-122b-a10b".to_string()),
         retryable: false,
-        error: LLMErrorPayload::NotImplemented {
+        error: Box::new(LLMErrorPayload::NotImplemented {
             message: "Streaming request construction not supported by this HTTP provider"
                 .to_string(),
-        },
+        }),
     });
 
     let acp = SessionActorRef::map_local_prompt_send_error(error);

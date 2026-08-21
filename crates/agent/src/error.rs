@@ -62,7 +62,7 @@ pub enum AgentError {
         provider: Option<String>,
         model: Option<String>,
         retryable: bool,
-        error: LLMErrorPayload,
+        error: Box<LLMErrorPayload>,
     },
 
     // --- Client bridge ---
@@ -285,14 +285,14 @@ mod tests {
             provider: Some("codex".to_string()),
             model: Some("gpt-5.6-sol".to_string()),
             retryable: false,
-            error: LLMErrorPayload::ProviderError {
+            error: Box::new(LLMErrorPayload::ProviderError {
                 message: "The usage limit has been reached".to_string(),
                 kind: Some(ProviderErrorKind::QuotaExceeded),
                 code: Some("usage_limit_reached".to_string()),
                 error_type: Some("usage_limit_reached".to_string()),
                 request_id: None,
                 retry_after_secs: None,
-            },
+            }),
         }
         .into();
 
@@ -325,10 +325,10 @@ mod tests {
             provider: Some("openrouter".to_string()),
             model: Some("qwen/qwen3.5-122b-a10b".to_string()),
             retryable: false,
-            error: LLMErrorPayload::NotImplemented {
+            error: Box::new(LLMErrorPayload::NotImplemented {
                 message: "Streaming request construction not supported by this HTTP provider"
                     .to_string(),
-            },
+            }),
         }
         .into();
 
@@ -357,10 +357,10 @@ mod tests {
             provider: Some("groq".to_string()),
             model: Some("openai/gpt-oss-20b".to_string()),
             retryable: false,
-            error: LLMErrorPayload::AuthError {
+            error: Box::new(LLMErrorPayload::AuthError {
                 message: "No API key found for provider 'groq'. Set GROQ_API_KEY or run 'qmt auth login groq'"
                     .to_string(),
-            },
+            }),
         }
         .into();
 
