@@ -137,10 +137,7 @@ pub struct LlamaCppConfig {
     /// when you only need text generation from a VL model.
     /// Defaults to `false`.
     pub text_only: Option<bool>,
-    /// Model-based speculative decoding.
-    ///
-    /// Mainline supports `type: "mtp"`. When no sidecar model is configured,
-    /// the target GGUF must contain bundled NextN/MTP tensors.
+    /// Model-based speculative decoding (MTP or DFlash/DFlash2).
     pub speculative: Option<SpeculativeConfig>,
     /// Offload the standard sampler chain to the backend context.
     ///
@@ -160,6 +157,8 @@ pub struct LlamaCppConfig {
 pub enum SpeculativeType {
     /// Multi-token prediction using bundled tensors or a sidecar model.
     Mtp,
+    /// DFlash, including DFlash2 models detected through GGUF metadata.
+    DraftDflash,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -168,7 +167,7 @@ pub struct SpeculativeConfig {
     /// Speculative decoding implementation.
     #[serde(rename = "type")]
     pub kind: SpeculativeType,
-    /// Optional MTP sidecar model. If omitted, use bundled MTP tensors.
+    /// Optional sidecar model. DFlash requires one; MTP can use bundled tensors.
     pub model: Option<String>,
     /// Maximum number of draft tokens proposed per step. Defaults to 3.
     pub n_max: Option<u32>,
@@ -181,7 +180,7 @@ pub struct SpeculativeConfig {
 }
 
 impl SpeculativeConfig {
-    pub(crate) fn params(&self) -> Result<llama_cpp_2::speculative::MtpSpeculativeParams, String> {
+    pub(crate) fn params(&self) -> Result<llama_cpp_2::speculative::SpeculativeParams, String> {
         let n_max = self.n_max.unwrap_or(3);
         let n_min = self.n_min.unwrap_or(0);
         let p_min = self.p_min.unwrap_or(0.0);
@@ -196,7 +195,17 @@ impl SpeculativeConfig {
                     .into(),
             );
         }
-        Ok(llama_cpp_2::speculative::MtpSpeculativeParams {
+        if self.kind == SpeculativeType::DraftDflash
+            && self.model.as_deref().is_none_or(str::is_empty)
+        {
+            return Err("draft-dflash speculative decoding requires a sidecar model".into());
+        }
+        let kind = match self.kind {
+            SpeculativeType::Mtp => llama_cpp_2::speculative::SpeculativeType::Mtp,
+            SpeculativeType::DraftDflash => llama_cpp_2::speculative::SpeculativeType::DraftDflash,
+        };
+        Ok(llama_cpp_2::speculative::SpeculativeParams {
+            kind,
             n_max: n_max as i32,
             n_min: n_min as i32,
             p_min,
@@ -228,10 +237,10 @@ pub enum FlashAttentionPolicy {
 mod tests {
     use super::{SpeculativeConfig, SpeculativeType};
 
-    fn config(n_max: u32, n_min: u32, p_min: f32) -> SpeculativeConfig {
+    fn config(kind: SpeculativeType, n_max: u32, n_min: u32, p_min: f32) -> SpeculativeConfig {
         SpeculativeConfig {
-            kind: SpeculativeType::Mtp,
-            model: None,
+            kind,
+            model: (kind == SpeculativeType::DraftDflash).then(|| "draft.gguf".into()),
             n_max: Some(n_max),
             n_min: Some(n_min),
             p_min: Some(p_min),
@@ -241,11 +250,25 @@ mod tests {
 
     #[test]
     fn speculative_params_validate_bounds() {
-        assert!(config(3, 0, 0.0).params().is_ok());
-        assert!(config(0, 0, 0.0).params().is_err());
-        assert!(config(3, 4, 0.0).params().is_err());
-        assert!(config(3, 0, -0.1).params().is_err());
-        assert!(config(3, 0, 1.1).params().is_err());
-        assert!(config(i32::MAX as u32 + 1, 0, 0.0).params().is_err());
+        assert!(config(SpeculativeType::Mtp, 3, 0, 0.0).params().is_ok());
+        assert!(config(SpeculativeType::Mtp, 0, 0, 0.0).params().is_err());
+        assert!(config(SpeculativeType::Mtp, 3, 4, 0.0).params().is_err());
+        assert!(config(SpeculativeType::Mtp, 3, 0, -0.1).params().is_err());
+        assert!(config(SpeculativeType::Mtp, 3, 0, 1.1).params().is_err());
+        assert!(
+            config(SpeculativeType::Mtp, i32::MAX as u32 + 1, 0, 0.0)
+                .params()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn draft_dflash_requires_sidecar_model() {
+        let mut config = config(SpeculativeType::DraftDflash, 7, 0, 0.0);
+        assert!(config.params().is_ok());
+        config.model = None;
+        assert!(config.params().is_err());
+        config.model = Some(String::new());
+        assert!(config.params().is_err());
     }
 }

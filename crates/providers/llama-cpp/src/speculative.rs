@@ -8,7 +8,7 @@ use llama_cpp_2::context::params::{LlamaContextParams, LlamaContextType};
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
-use llama_cpp_2::speculative::MtpSpeculative;
+use llama_cpp_2::speculative::Speculative;
 use llama_cpp_2::token::LlamaToken;
 use querymt::error::LLMError;
 use std::num::NonZeroU32;
@@ -17,7 +17,7 @@ use std::sync::Arc;
 const SEQ_ID: i32 = 0;
 
 #[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct MtpRunStats {
+pub(crate) struct SpeculativeRunStats {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub rounds: u32,
@@ -29,11 +29,12 @@ pub(crate) struct MtpRunStats {
 fn clear_from(ctx: &mut LlamaContext<'_>, pos: i32, which: &str) -> Result<(), LLMError> {
     let from = u32::try_from(pos).map_err(|_| {
         LLMError::ProviderError(format!(
-            "Invalid negative MTP {which} rollback position {pos}"
+            "Invalid negative speculative {which} rollback position {pos}"
         ))
     })?;
-    ctx.kv_cache_seq_rm(SEQ_ID, Some(from), None)
-        .map_err(|e| LLMError::ProviderError(format!("MTP {which} rollback at {pos} failed: {e}")))
+    ctx.kv_cache_seq_rm(SEQ_ID, Some(from), None).map_err(|e| {
+        LLMError::ProviderError(format!("speculative {which} rollback at {pos} failed: {e}"))
+    })
 }
 
 fn draft_head_layers(model: &LlamaModel) -> u32 {
@@ -50,20 +51,20 @@ fn draft_head_layers(model: &LlamaModel) -> u32 {
 fn validate_models(target: &LlamaModel, draft: &LlamaModel) -> Result<(), LLMError> {
     if draft_head_layers(draft) == 0 {
         return Err(LLMError::InvalidRequest(
-            "MTP was requested, but the selected bundled model or sidecar has no nextn_predict_layers metadata"
+            "speculative was requested, but the selected bundled model or sidecar has no nextn_predict_layers metadata"
                 .into(),
         ));
     }
     if draft.n_embd_out() != target.n_embd() {
         return Err(LLMError::InvalidRequest(format!(
-            "MTP draft embedding width {} does not match target width {}",
+            "speculative draft embedding width {} does not match target width {}",
             draft.n_embd_out(),
             target.n_embd()
         )));
     }
     if !std::ptr::eq(target, draft) && draft.n_vocab() != target.n_vocab() {
         return Err(LLMError::InvalidRequest(format!(
-            "MTP draft vocabulary {} does not match target vocabulary {}",
+            "speculative draft vocabulary {} does not match target vocabulary {}",
             draft.n_vocab(),
             target.n_vocab()
         )));
@@ -71,11 +72,11 @@ fn validate_models(target: &LlamaModel, draft: &LlamaModel) -> Result<(), LLMErr
     Ok(())
 }
 
-/// Run MTP decoding and deliver each target-approved, non-EOG token immediately.
+/// Run speculative decoding and deliver each target-approved, non-EOG token immediately.
 ///
-/// The callback returns `false` to stop generation, for example after a stop
-/// sequence or when a stream receiver has disconnected.
-pub(crate) fn run_mtp(
+/// The callback returns a termination reason to stop generation, for example
+/// after a stop sequence or when a stream receiver has disconnected.
+pub(crate) fn run_speculative(
     model: &Arc<LlamaModel>,
     draft_model: Option<&Arc<LlamaModel>>,
     cfg: &LlamaCppConfig,
@@ -84,14 +85,16 @@ pub(crate) fn run_mtp(
     temperature: Option<f32>,
     sampler: Option<LlamaSampler>,
     mut on_token: impl FnMut(LlamaToken) -> Result<Option<GenerationTermination>, LLMError>,
-) -> Result<MtpRunStats, LLMError> {
+) -> Result<SpeculativeRunStats, LLMError> {
     let speculative_cfg = cfg
         .speculative
         .as_ref()
         .ok_or_else(|| LLMError::InvalidRequest("speculative decoding is not configured".into()))?;
     let spec_params = speculative_cfg.params().map_err(LLMError::InvalidRequest)?;
     let draft_model = draft_model.map_or(model.as_ref(), Arc::as_ref);
-    validate_models(model, draft_model)?;
+    if speculative_cfg.kind == crate::config::SpeculativeType::Mtp {
+        validate_models(model, draft_model)?;
+    }
 
     let tokens = model
         .str_to_token(
@@ -108,9 +111,9 @@ pub(crate) fn run_mtp(
             "Prompt tokenization resulted in an empty sequence".into(),
         ));
     }
-    let mut stats = MtpRunStats {
+    let mut stats = SpeculativeRunStats {
         input_tokens: tokens.len() as u32,
-        ..MtpRunStats::default()
+        ..SpeculativeRunStats::default()
     };
     if max_tokens == 0 {
         return Ok(stats);
@@ -143,12 +146,16 @@ pub(crate) fn run_mtp(
 
     // The draft context intentionally does not inherit target KV quantization,
     // flash-attention, or recurrent snapshots.
+    let context_type = match speculative_cfg.kind {
+        crate::config::SpeculativeType::Mtp => LlamaContextType::Mtp,
+        crate::config::SpeculativeType::DraftDflash => LlamaContextType::Default,
+    };
     let mut draft_params = LlamaContextParams::default()
         .with_n_ctx(Some(n_ctx))
         .with_n_batch(n_batch)
         .with_n_ubatch(n_ubatch)
         .with_n_rs_seq(0)
-        .with_context_type(LlamaContextType::Mtp)
+        .with_context_type(context_type)
         .with_no_perf(false);
     if let Some(n) = cfg.n_threads {
         draft_params = draft_params.with_n_threads(n);
@@ -159,13 +166,15 @@ pub(crate) fn run_mtp(
 
     let backend = llama_backend()?;
     let target_ctx = model.new_context(&backend, target_params).map_err(|e| {
-        LLMError::ProviderError(format!("Failed to create MTP target context: {e}"))
+        LLMError::ProviderError(format!("Failed to create speculative target context: {e}"))
     })?;
     let draft_ctx = draft_model
-        .new_context(&backend, draft_params)
-        .map_err(|e| LLMError::ProviderError(format!("Failed to create MTP draft context: {e}")))?;
-    let mut spec = MtpSpeculative::new(target_ctx, draft_ctx, spec_params)
-        .map_err(|e| LLMError::ProviderError(format!("Failed to initialize MTP: {e}")))?;
+        .new_context_with_ctx_other(&backend, draft_params, &target_ctx)
+        .map_err(|e| {
+            LLMError::ProviderError(format!("Failed to create speculative draft context: {e}"))
+        })?;
+    let mut spec = Speculative::new(target_ctx, draft_ctx, spec_params)
+        .map_err(|e| LLMError::ProviderError(format!("Failed to initialize speculative: {e}")))?;
 
     let mut batch = LlamaBatch::new(n_batch as usize, 1);
     for chunk_start in (0..tokens.len()).step_by(n_batch as usize) {
@@ -176,17 +185,17 @@ pub(crate) fn run_mtp(
                 .add(*token, position as i32, &[SEQ_ID], true)
                 .map_err(|e| LLMError::ProviderError(e.to_string()))?;
         }
-        spec.target_context_mut()
-            .decode(&mut batch)
-            .map_err(|e| LLMError::ProviderError(format!("MTP prompt decode failed: {e}")))?;
+        spec.target_context_mut().decode(&mut batch).map_err(|e| {
+            LLMError::ProviderError(format!("speculative prompt decode failed: {e}"))
+        })?;
         spec.process(&batch)
-            .map_err(|e| LLMError::ProviderError(format!("MTP prompt sync failed: {e}")))?;
+            .map_err(|e| LLMError::ProviderError(format!("speculative prompt sync failed: {e}")))?;
     }
     spec.begin(&tokens)
-        .map_err(|e| LLMError::ProviderError(format!("MTP begin failed: {e}")))?;
+        .map_err(|e| LLMError::ProviderError(format!("speculative begin failed: {e}")))?;
 
-    let mut sampler = sampler
-        .unwrap_or_else(|| build_standard_sampler(&SamplingParams::from_config(cfg, temperature)));
+    let sampling_params = SamplingParams::from_config(cfg, temperature);
+    let mut sampler = sampler.unwrap_or_else(|| build_standard_sampler(model, &sampling_params));
     let mut committed_prefix = tokens;
     let mut pending_position = committed_prefix.len() as i32;
     let mut pending = sampler.sample(spec.target_context(), batch.n_tokens() - 1);
@@ -206,10 +215,16 @@ pub(crate) fn run_mtp(
         }
 
         let drafts = spec
-            .draft(pending_position, pending, &committed_prefix)
+            .draft(
+                pending_position,
+                pending,
+                &committed_prefix,
+                sampling_params.temperature.unwrap_or(0.0),
+                sampling_params.seed,
+            )
             .map_err(|e| {
                 LLMError::ProviderError(format!(
-                    "MTP draft failed at position {pending_position}: {e}"
+                    "speculative draft failed at position {pending_position}: {e}"
                 ))
             })?;
         stats.rounds += 1;
@@ -234,44 +249,35 @@ pub(crate) fn run_mtp(
         )?;
         spec.target_context_mut().decode(&mut batch).map_err(|e| {
             LLMError::ProviderError(format!(
-                "MTP verification decode failed at position {pending_position}: {e}"
+                "speculative verification decode failed at position {pending_position}: {e}"
             ))
         })?;
         spec.process(&batch).map_err(|e| {
             LLMError::ProviderError(format!(
-                "MTP verification sync failed at position {pending_position}, draft_len={}: {e}",
+                "speculative verification sync failed at position {pending_position}, draft_len={}: {e}",
                 drafts.len()
             ))
         })?;
 
-        let mut accepted = 0usize;
-        let mut next_pending = None;
         let remaining = (max_tokens - stats.output_tokens) as usize;
-        for index in 0..=drafts.len() {
-            let sampled = sampler.sample(spec.target_context(), index as i32);
-            match drafts.get(index) {
-                Some(draft) if sampled == *draft && accepted < remaining => {
-                    accepted += 1;
-                    stats.accepted += 1;
-                    if model.is_eog_token(sampled) {
-                        next_pending = Some(sampled);
-                        break;
-                    }
-                }
-                _ => {
-                    next_pending = Some(sampled);
-                    break;
-                }
-            }
-        }
-
-        if !drafts.is_empty() {
-            spec.accept(accepted as u16).map_err(|e| {
+        let (accepted, next_pending) = if drafts.is_empty() {
+            (0, Some(sampler.sample(spec.target_context(), 0)))
+        } else {
+            let verification = spec.verify(&mut sampler).map_err(|e| {
                 LLMError::ProviderError(format!(
-                    "MTP accept failed at position {pending_position}, accepted={accepted}: {e}"
+                    "speculative verification failed at position {pending_position}: {e}"
                 ))
             })?;
-        }
+            let accepted = verification.accepted.min(remaining);
+            let next_pending = verification.tokens.get(accepted).copied();
+            spec.accept(accepted as u16).map_err(|e| {
+                LLMError::ProviderError(format!(
+                    "speculative accept failed at position {pending_position}, accepted={accepted}: {e}"
+                ))
+            })?;
+            (accepted, next_pending)
+        };
+        stats.accepted += accepted as u32;
 
         let committed_end = pending_position + 1 + accepted as i32;
         clear_from(spec.target_context_mut(), committed_end, "target")?;
@@ -296,12 +302,14 @@ pub(crate) fn run_mtp(
 
         pending_position = committed_end;
         pending = next_pending.ok_or_else(|| {
-            LLMError::ProviderError("MTP verification produced no continuation token".into())
+            LLMError::ProviderError(
+                "speculative verification produced no continuation token".into(),
+            )
         })?;
     }
 
     log::debug!(
-        "MTP complete: input={}, output={}, rounds={}, drafted={}, accepted={}",
+        "speculative complete: input={}, output={}, rounds={}, drafted={}, accepted={}",
         stats.input_tokens,
         stats.output_tokens,
         stats.rounds,
@@ -309,11 +317,11 @@ pub(crate) fn run_mtp(
         stats.accepted
     );
     log::info!(
-        "llama.cpp MTP target timings:\n{}",
+        "llama.cpp speculative target timings:\n{}",
         spec.target_context_mut().timings()
     );
     log::info!(
-        "llama.cpp MTP draft timings:\n{}",
+        "llama.cpp speculative draft timings:\n{}",
         spec.draft_context_mut().timings()
     );
     Ok(stats)

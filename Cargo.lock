@@ -7748,8 +7748,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 [[package]]
 name = "llama-cpp-2"
 version = "0.1.154"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4397360a0bd81be29929a55ad2f49eba27a744a6578f3271894d6f41d86bd15b"
+source = "git+https://github.com/querymt/llama-cpp-rs?rev=f3c84a9cae5d3ad889370c3beb31998c185af920#f3c84a9cae5d3ad889370c3beb31998c185af920"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -7764,8 +7763,7 @@ dependencies = [
 [[package]]
 name = "llama-cpp-sys-2"
 version = "0.1.154"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13a9ea2ce0cdc20bcb1870534022e340b391663f8fe09133951e2fe37fbc29cf"
+source = "git+https://github.com/querymt/llama-cpp-rs?rev=f3c84a9cae5d3ad889370c3beb31998c185af920#f3c84a9cae5d3ad889370c3beb31998c185af920"
 dependencies = [
  "bindgen",
  "cc",
@@ -10761,7 +10759,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -13714,7 +13712,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",

@@ -135,7 +135,7 @@ fn preserved_token_set(
 pub(crate) fn generate(
     model: &Arc<LlamaModel>,
     cfg: &LlamaCppConfig,
-    mtp_model: Option<&Arc<LlamaModel>>,
+    draft_model: Option<&Arc<LlamaModel>>,
     prompt: &str,
     max_tokens: u32,
     temperature: Option<f32>,
@@ -146,9 +146,9 @@ pub(crate) fn generate(
         let mut output = String::new();
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let preserved = preserved_token_set(model, None);
-        let stats = crate::mtp::run_mtp(
+        let stats = crate::speculative::run_speculative(
             model,
-            mtp_model,
+            draft_model,
             cfg,
             prompt,
             max_tokens,
@@ -172,7 +172,7 @@ pub(crate) fn generate(
         });
     }
     if cfg.speculative.is_some() && !bitmaps.is_empty() {
-        log::warn!("MTP is disabled for multimodal requests");
+        log::warn!("speculative decoding is disabled for multimodal requests");
     }
     let backend = llama_backend()?;
 
@@ -216,7 +216,7 @@ pub(crate) fn generate(
         model.new_context_with_samplers(
             &*backend,
             ctx_params,
-            [(0, build_standard_sampler(&sampling_params))],
+            [(0, build_standard_sampler(model, &sampling_params))],
         )
     } else {
         model.new_context(&*backend, ctx_params)
@@ -386,7 +386,7 @@ pub(crate) fn generate(
     // UNIFIED GENERATION PHASE (identical for both paths)
 
     let params = sampling_params;
-    let mut sampler = build_standard_sampler(&params);
+    let mut sampler = build_standard_sampler(model, &params);
     let allow_fallback = !backend_sampling && !params.is_explicit();
     let mut fallback_used = false;
 
@@ -456,7 +456,7 @@ pub(crate) fn generate(
 pub(crate) fn generate_streaming_with_thinking(
     model: &Arc<LlamaModel>,
     cfg: &LlamaCppConfig,
-    mtp_model: Option<&Arc<LlamaModel>>,
+    draft_model: Option<&Arc<LlamaModel>>,
     result: &ChatTemplateResult,
     max_tokens: u32,
     temperature: Option<f32>,
@@ -468,9 +468,9 @@ pub(crate) fn generate_streaming_with_thinking(
         let mut stream_state = result.streaming_state();
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let preserved = preserved_token_set(model, Some(result));
-        let stats = crate::mtp::run_mtp(
+        let stats = crate::speculative::run_speculative(
             model,
-            mtp_model,
+            draft_model,
             cfg,
             &result.prompt,
             max_tokens,
@@ -700,7 +700,7 @@ pub(crate) fn generate_streaming_with_thinking(
     let mut stream_state = result.streaming_state();
 
     let params = SamplingParams::from_config(cfg, temperature);
-    let mut sampler = build_standard_sampler(&params);
+    let mut sampler = build_standard_sampler(model, &params);
     let allow_fallback = !params.is_explicit();
     let mut fallback_used = false;
 

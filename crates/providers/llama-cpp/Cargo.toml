@@ -26,7 +26,7 @@ async-trait.workspace = true
 encoding_rs = "0.8"
 futures.workspace = true
 infer = { version = "0.22", default-features = false }
-llama-cpp-2 = { version = "0.1", default-features = false }
+llama-cpp-2 = { git = "https://github.com/querymt/llama-cpp-rs", rev = "f3c84a9cae5d3ad889370c3beb31998c185af920", version = "0.1.154", default-features = false }
 llguidance = { version = "1.7", optional = true }
 toktrie = { version = "1.7", optional = true }
 querymt-provider-common = { path = "../../provider-common" }

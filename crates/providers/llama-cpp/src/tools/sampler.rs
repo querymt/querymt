@@ -137,7 +137,7 @@ pub(crate) fn build_tool_sampler(
 
         return Ok(LlamaSampler::chain_simple([
             grammar_sampler,
-            build_standard_sampler(params),
+            build_standard_sampler(model, params),
         ]));
     }
 
@@ -149,7 +149,7 @@ pub(crate) fn build_tool_sampler(
     #[cfg(not(feature = "common"))]
     let _ = (model, result);
 
-    Ok(build_standard_sampler(params))
+    Ok(build_standard_sampler(model, params))
 }
 
 fn regex_escape(value: &str) -> String {
@@ -167,7 +167,7 @@ fn regex_escape(value: &str) -> String {
 }
 
 /// Build a standard sampler without grammar constraints.
-pub(crate) fn build_standard_sampler(params: &SamplingParams) -> LlamaSampler {
+pub(crate) fn build_standard_sampler(model: &LlamaModel, params: &SamplingParams) -> LlamaSampler {
     let mut samplers = Vec::new();
 
     // Penalties first — they modify logits before temperature/top-p sampling.
@@ -176,6 +176,7 @@ pub(crate) fn build_standard_sampler(params: &SamplingParams) -> LlamaSampler {
         || params.frequency_penalty.is_some()
     {
         samplers.push(LlamaSampler::penalties(
+            model.n_vocab(),
             params.penalty_last_n.unwrap_or(64),
             params.repeat_penalty.unwrap_or(1.0),
             params.frequency_penalty.unwrap_or(0.0),
@@ -245,7 +246,7 @@ pub(crate) fn build_structured_sampler(
     let matcher = Matcher::new(parser);
     Ok(LlamaSampler::chain_simple([
         LlamaSampler::from(matcher),
-        build_standard_sampler(params),
+        build_standard_sampler(model, params),
     ]))
 }
 
@@ -261,7 +262,7 @@ pub(crate) fn build_structured_sampler(
         .map_err(|e| LLMError::ProviderError(format!("Failed to build JSON grammar: {e}")))?;
     Ok(LlamaSampler::chain_simple([
         constraint,
-        build_standard_sampler(params),
+        build_standard_sampler(model, params),
     ]))
 }
 

@@ -2,10 +2,11 @@ name: "Build & Publish: llama-cpp Provider"
 
 on:
   push:
-    branches: [main]
-    tags: [ 'v*.*.*' ]
+    branches: [main, experimental/llama-cpp-dflash2]
+    tags: [ 'v*.*.*', 'dflash2-v*.*.*' ]
     paths:
       - 'crates/providers/llama-cpp/**'
+      - 'Cargo.lock'
       - 'crates/querymt/**'
       - 'crates/provider-common/**'
       - '.github/actions/native-setup/**'
@@ -198,7 +199,7 @@ jobs:
           arch: ${{ matrix.arch }}
           target: ${{ matrix.target }}
           features: ${{ matrix.features }}
-          feature_tag: ${{ matrix.feature_tag }}
+          feature_tag: ${{ (github.ref_name == 'experimental/llama-cpp-dflash2' || startsWith(github.ref_name, 'dflash2-v')) && format('dflash2-{0}', matrix.feature_tag) || matrix.feature_tag }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           github_actor: ${{ github.actor }}
           repository_owner: ${{ github.repository_owner }}
