@@ -276,7 +276,7 @@ impl SessionStore for SqliteStorage {
                 "INSERT INTO sessions (public_id, name, cwd, created_at, updated_at, llm_config_id, parent_session_id, fork_origin, fork_point_type, fork_point_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     new_session_public_id.clone(),
-                    format!("Fork of session"), // Temporary name
+                    "Fork of session", // Temporary name
                     parent_cwd,
                     now.clone(),
                     now,
