@@ -83,11 +83,11 @@ pub(crate) fn run_mtp(
     sampler: Option<LlamaSampler>,
     mut on_token: impl FnMut(LlamaToken) -> Result<bool, LLMError>,
 ) -> Result<MtpRunStats, LLMError> {
-    let mtp_cfg = cfg
-        .mtp
+    let speculative_cfg = cfg
+        .speculative
         .as_ref()
-        .ok_or_else(|| LLMError::InvalidRequest("MTP is not configured".into()))?;
-    let spec_params = mtp_cfg.params().map_err(LLMError::InvalidRequest)?;
+        .ok_or_else(|| LLMError::InvalidRequest("speculative decoding is not configured".into()))?;
+    let spec_params = speculative_cfg.params().map_err(LLMError::InvalidRequest)?;
     let draft_model = draft_model.map_or(model.as_ref(), Arc::as_ref);
     validate_models(model, draft_model)?;
 

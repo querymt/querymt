@@ -132,11 +132,11 @@ pub struct LlamaCppConfig {
     /// when you only need text generation from a VL model.
     /// Defaults to `false`.
     pub text_only: Option<bool>,
-    /// Multi-token prediction speculative decoding.
+    /// Model-based speculative decoding.
     ///
-    /// When enabled without a model, the target GGUF must contain bundled NextN/MTP tensors.
-    /// Set `model` to use a separate MTP sidecar GGUF instead.
-    pub mtp: Option<MtpConfig>,
+    /// Mainline supports `type: "mtp"`. When no sidecar model is configured,
+    /// the target GGUF must contain bundled NextN/MTP tensors.
+    pub speculative: Option<SpeculativeConfig>,
     /// Offload the standard sampler chain to the backend context.
     ///
     /// Grammar-constrained, MTP, and mutable fallback sampling remain on the CPU path.
@@ -150,9 +150,19 @@ pub struct LlamaCppConfig {
     pub json_schema: Option<StructuredOutputFormat>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpeculativeType {
+    /// Multi-token prediction using bundled tensors or a sidecar model.
+    Mtp,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub struct MtpConfig {
+pub struct SpeculativeConfig {
+    /// Speculative decoding implementation.
+    #[serde(rename = "type")]
+    pub kind: SpeculativeType,
     /// Optional MTP sidecar model. If omitted, use bundled MTP tensors.
     pub model: Option<String>,
     /// Maximum number of draft tokens proposed per step. Defaults to 3.
@@ -165,25 +175,21 @@ pub struct MtpConfig {
     pub n_gpu_layers: Option<u32>,
 }
 
-impl Default for MtpConfig {
-    fn default() -> Self {
-        Self {
-            model: None,
-            n_max: Some(3),
-            n_min: Some(0),
-            p_min: Some(0.0),
-            n_gpu_layers: None,
-        }
-    }
-}
-
-impl MtpConfig {
+impl SpeculativeConfig {
     pub(crate) fn params(&self) -> Result<llama_cpp_2::speculative::MtpSpeculativeParams, String> {
         let n_max = self.n_max.unwrap_or(3);
         let n_min = self.n_min.unwrap_or(0);
         let p_min = self.p_min.unwrap_or(0.0);
-        if n_max == 0 || n_min > n_max || !p_min.is_finite() || !(0.0..=1.0).contains(&p_min) {
-            return Err("MTP requires n_max > 0, n_min <= n_max, and p_min in 0..=1".into());
+        if n_max == 0
+            || n_max > i32::MAX as u32
+            || n_min > n_max
+            || !p_min.is_finite()
+            || !(0.0..=1.0).contains(&p_min)
+        {
+            return Err(
+                "speculative decoding requires n_max > 0, n_min <= n_max, and p_min in 0..=1"
+                    .into(),
+            );
         }
         Ok(llama_cpp_2::speculative::MtpSpeculativeParams {
             n_max: n_max as i32,
@@ -211,4 +217,30 @@ pub enum FlashAttentionPolicy {
     Enabled,
     /// Explicitly disable flash attention.
     Disabled,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SpeculativeConfig, SpeculativeType};
+
+    fn config(n_max: u32, n_min: u32, p_min: f32) -> SpeculativeConfig {
+        SpeculativeConfig {
+            kind: SpeculativeType::Mtp,
+            model: None,
+            n_max: Some(n_max),
+            n_min: Some(n_min),
+            p_min: Some(p_min),
+            n_gpu_layers: None,
+        }
+    }
+
+    #[test]
+    fn speculative_params_validate_bounds() {
+        assert!(config(3, 0, 0.0).params().is_ok());
+        assert!(config(0, 0, 0.0).params().is_err());
+        assert!(config(3, 4, 0.0).params().is_err());
+        assert!(config(3, 0, -0.1).params().is_err());
+        assert!(config(3, 0, 1.1).params().is_err());
+        assert!(config(i32::MAX as u32 + 1, 0, 0.0).params().is_err());
+    }
 }

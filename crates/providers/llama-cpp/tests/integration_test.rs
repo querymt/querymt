@@ -2,14 +2,18 @@
 ///
 /// These tests verify that the modular structure compiles and the public API
 /// remains compatible.
-use qmt_llama_cpp::LlamaCppConfig;
+use qmt_llama_cpp::{LlamaCppConfig, SpeculativeConfig, SpeculativeType};
 use schemars::schema_for;
 
 #[test]
 fn test_config_schema_generation() {
     // Verify that the config schema can be generated (tests serde/schemars integration)
     let schema = schema_for!(LlamaCppConfig);
-    assert!(schema.as_object().is_some());
+    let schema = schema.as_value();
+    assert!(schema["properties"]["speculative"].is_object());
+    let schema_json = serde_json::to_string(schema).unwrap();
+    assert!(schema_json.contains("mtp"));
+    assert!(!schema_json.contains("draft-dflash"));
 }
 
 #[test]
@@ -48,7 +52,7 @@ fn test_config_serialization() {
         mmproj_use_gpu: Some(true),
         n_ubatch: Some(4096),
         text_only: None,
-        mtp: None,
+        speculative: None,
         backend_sampling: None,
         json_schema: None,
     };
@@ -72,6 +76,42 @@ fn test_config_serialization() {
     assert_eq!(deserialized.mmproj_threads, Some(4));
     assert_eq!(deserialized.mmproj_use_gpu, Some(true));
     assert_eq!(deserialized.n_ubatch, Some(4096));
+}
+
+#[test]
+fn test_speculative_config_serialization() {
+    let speculative = SpeculativeConfig {
+        kind: SpeculativeType::Mtp,
+        model: None,
+        n_max: Some(3),
+        n_min: Some(0),
+        p_min: Some(0.0),
+        n_gpu_layers: None,
+    };
+
+    let json = serde_json::to_value(&speculative).unwrap();
+    assert_eq!(json["type"], "mtp");
+    assert_eq!(json["n_max"], 3);
+
+    let parsed: SpeculativeConfig = serde_json::from_value(serde_json::json!({
+        "type": "mtp",
+        "n_max": 7
+    }))
+    .unwrap();
+    assert_eq!(parsed.kind, SpeculativeType::Mtp);
+    assert_eq!(parsed.n_max, Some(7));
+}
+
+#[test]
+fn test_speculative_config_requires_supported_type() {
+    assert!(serde_json::from_value::<SpeculativeConfig>(serde_json::json!({"n_max": 3})).is_err());
+    assert!(
+        serde_json::from_value::<SpeculativeConfig>(serde_json::json!({
+            "type": "draft-dflash",
+            "model": "draft.gguf"
+        }))
+        .is_err()
+    );
 }
 
 #[test]

@@ -27,7 +27,7 @@ pub(crate) fn generate_streaming_with_tools(
     mm_ctx: Option<&MultimodalContext>,
     bitmaps: &[MtmdBitmap],
 ) -> Result<(Usage, bool), LLMError> {
-    if cfg.mtp.is_some() && bitmaps.is_empty() {
+    if cfg.speculative.is_some() && bitmaps.is_empty() {
         let params = SamplingParams::from_config(cfg, temperature);
         let sampler = if let Some(schema) = cfg.json_schema.as_ref().and_then(|s| s.schema.as_ref())
         {

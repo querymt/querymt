@@ -92,8 +92,8 @@ impl LlamaCppProvider {
             LlamaCppLogMode::Tracing => send_logs_to_tracing(LogOptions::default()),
             LlamaCppLogMode::Off => backend.void_logs(),
         }
-        if let Some(mtp) = &cfg.mtp {
-            mtp.params().map_err(LLMError::InvalidRequest)?;
+        if let Some(speculative) = &cfg.speculative {
+            speculative.params().map_err(LLMError::InvalidRequest)?;
         }
         let model_path = Self::resolve_model_path(&cfg.model)?;
         if !model_path.exists() {
@@ -112,25 +112,26 @@ impl LlamaCppProvider {
                 .map_err(|e| LLMError::ProviderError(e.to_string()))?,
         );
 
-        let mtp_model = if let Some(sidecar) = cfg.mtp.as_ref().and_then(|m| m.model.as_deref()) {
-            let sidecar_path = Self::resolve_model_path(sidecar)?;
-            let mut params = LlamaModelParams::default();
-            if let Some(n) = cfg
-                .mtp
-                .as_ref()
-                .and_then(|m| m.n_gpu_layers)
-                .or(cfg.n_gpu_layers)
-            {
-                params = params.with_n_gpu_layers(n);
-            }
-            Some(Arc::new(
-                LlamaModel::load_from_file(&*backend, &sidecar_path, &params).map_err(|e| {
-                    LLMError::ProviderError(format!("Failed to load MTP sidecar: {e}"))
-                })?,
-            ))
-        } else {
-            None
-        };
+        let mtp_model =
+            if let Some(sidecar) = cfg.speculative.as_ref().and_then(|m| m.model.as_deref()) {
+                let sidecar_path = Self::resolve_model_path(sidecar)?;
+                let mut params = LlamaModelParams::default();
+                if let Some(n) = cfg
+                    .speculative
+                    .as_ref()
+                    .and_then(|m| m.n_gpu_layers)
+                    .or(cfg.n_gpu_layers)
+                {
+                    params = params.with_n_gpu_layers(n);
+                }
+                Some(Arc::new(
+                    LlamaModel::load_from_file(&*backend, &sidecar_path, &params).map_err(|e| {
+                        LLMError::ProviderError(format!("Failed to load MTP sidecar: {e}"))
+                    })?,
+                ))
+            } else {
+                None
+            };
 
         let model_hf_repo = match parse_model_ref(&cfg.model) {
             Ok(ModelRef::Hf(hf_ref)) => Some(hf_ref.repo),
@@ -167,13 +168,13 @@ impl LlamaCppProvider {
             LlamaCppLogMode::Tracing => send_logs_to_tracing(LogOptions::default()),
             LlamaCppLogMode::Off => backend.void_logs(),
         }
-        if let Some(mtp) = &cfg.mtp {
-            mtp.params().map_err(LLMError::InvalidRequest)?;
+        if let Some(speculative) = &cfg.speculative {
+            speculative.params().map_err(LLMError::InvalidRequest)?;
         }
 
         let model_path = Self::resolve_model_path(&cfg.model)?;
         let mtp_model_path = cfg
-            .mtp
+            .speculative
             .as_ref()
             .and_then(|m| m.model.as_deref())
             .map(Self::resolve_model_path)
@@ -185,7 +186,7 @@ impl LlamaCppProvider {
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string()),
             mtp_n_gpu_layers: cfg
-                .mtp
+                .speculative
                 .as_ref()
                 .and_then(|m| m.n_gpu_layers)
                 .or(cfg.n_gpu_layers),

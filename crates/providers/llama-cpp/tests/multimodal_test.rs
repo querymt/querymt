@@ -71,7 +71,7 @@ fn make_provider(model: String, mmproj_path: Option<String>) -> Box<dyn querymt:
         mmproj_use_gpu: None,
         n_ubatch: None,
         text_only: None,
-        mtp: None,
+        speculative: None,
         backend_sampling: None,
         json_schema: None,
     };
@@ -317,7 +317,7 @@ fn test_config_with_multimodal_fields() {
         kv_cache_type_v: None,
         n_ubatch: None,
         text_only: None,
-        mtp: None,
+        speculative: None,
         backend_sampling: None,
         json_schema: None,
     };

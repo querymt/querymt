@@ -142,7 +142,7 @@ pub(crate) fn generate(
     mm_ctx: Option<&MultimodalContext>,
     bitmaps: &[MtmdBitmap],
 ) -> Result<GeneratedText, LLMError> {
-    if cfg.mtp.is_some() && bitmaps.is_empty() {
+    if cfg.speculative.is_some() && bitmaps.is_empty() {
         let mut output = String::new();
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let preserved = preserved_token_set(model, None);
@@ -170,7 +170,7 @@ pub(crate) fn generate(
             },
         });
     }
-    if cfg.mtp.is_some() && !bitmaps.is_empty() {
+    if cfg.speculative.is_some() && !bitmaps.is_empty() {
         log::warn!("MTP is disabled for multimodal requests");
     }
     let backend = llama_backend()?;
@@ -458,7 +458,7 @@ pub(crate) fn generate_streaming_with_thinking(
     mm_ctx: Option<&MultimodalContext>,
     bitmaps: &[MtmdBitmap],
 ) -> Result<Usage, LLMError> {
-    if cfg.mtp.is_some() && bitmaps.is_empty() {
+    if cfg.speculative.is_some() && bitmaps.is_empty() {
         let mut stream_state = result.streaming_state();
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let preserved = preserved_token_set(model, Some(result));
