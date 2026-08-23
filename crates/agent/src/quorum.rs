@@ -130,6 +130,10 @@ impl AgentQuorum {
         if let Some(orchestrator) = &self.orchestrator {
             orchestrator.cancel_active_delegations().await;
         }
+        self.planner.shutdown().await;
+        for delegate in &self.delegates {
+            delegate.agent.shutdown().await;
+        }
     }
 }
 

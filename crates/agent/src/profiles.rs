@@ -937,7 +937,7 @@ where
             let debounce = Duration::from_millis(350);
             while let Some(event) = rx.recv().await {
                 match event {
-                    Ok(event) if event.paths.iter().any(|path| is_profile_toml_path(path)) => {
+                    Ok(event) if should_reload_profiles(&event) => {
                         debug!(?event.kind, "profile file change detected");
                         while tokio::time::timeout(debounce, rx.recv()).await.is_ok() {}
                         manager.reload_profiles_logged().await;
@@ -1079,6 +1079,19 @@ async fn build_profile_runtime(
     };
 
     Ok(ProfileRuntime { metadata, agent })
+}
+
+fn should_reload_profiles(event: &notify::Event) -> bool {
+    use notify::EventKind::{Create, Modify, Remove};
+    use notify::event::{MetadataKind, ModifyKind};
+
+    let mutates_profile = match event.kind {
+        Create(_) | Remove(_) => true,
+        Modify(ModifyKind::Metadata(MetadataKind::AccessTime)) => false,
+        Modify(_) => true,
+        _ => false,
+    };
+    mutates_profile && event.paths.iter().any(|path| is_profile_toml_path(path))
 }
 
 fn is_profile_toml_path(path: &Path) -> bool {
@@ -1485,6 +1498,36 @@ system = "inline"
                 .to_string()
                 .contains("requires name")
         );
+    }
+
+    #[test]
+    fn profile_watcher_ignores_file_access_events() {
+        let event = notify::Event::new(notify::EventKind::Access(notify::event::AccessKind::Open(
+            notify::event::AccessMode::Read,
+        )))
+        .add_path(PathBuf::from("profile.toml"));
+
+        assert!(!should_reload_profiles(&event));
+    }
+
+    #[test]
+    fn profile_watcher_ignores_access_time_metadata_updates() {
+        let event = notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Metadata(notify::event::MetadataKind::AccessTime),
+        ))
+        .add_path(PathBuf::from("profile.toml"));
+
+        assert!(!should_reload_profiles(&event));
+    }
+
+    #[test]
+    fn profile_watcher_accepts_profile_mutations() {
+        let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )))
+        .add_path(PathBuf::from("profile.toml"));
+
+        assert!(should_reload_profiles(&event));
     }
 
     #[tokio::test]
@@ -1896,6 +1939,82 @@ system = "inline"
         assert_eq!(manager.cached_runtime_count().await, 1);
         let cached = manager.runtime_for_profile("alpha").await.unwrap();
         assert!(Arc::ptr_eq(&current, &cached));
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn profile_reads_do_not_reload_live_quorum_runtime() {
+        let dir = temp_profile_dir();
+        write_profile(
+            dir.path(),
+            "team.toml",
+            r#"
+[quorum]
+delegation = true
+verification = false
+snapshot_policy = "none"
+
+[planner]
+provider = "test"
+model = "planner-model"
+system = "plan"
+tools = ["delegate"]
+
+[[delegates]]
+id = "coder"
+provider = "test"
+model = "coder-model"
+system = "code"
+capabilities = ["coding"]
+"#,
+        );
+        let (mut infra, _registry_dir) = test_infra().await;
+        let fanout = Arc::new(crate::event_fanout::EventFanout::new());
+        infra.event_fanout = Some(fanout.clone());
+        let catalog = LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(dir.path())
+            .build();
+        let manager = Arc::new(ProfileRuntimeManager::with_infra(catalog, "team", infra));
+        let _watcher = manager.start_profile_watcher().expect("profile watcher");
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.runtime_for_profile("team"),
+        )
+        .await
+        .expect("initial quorum runtime build hung")
+        .expect("initial quorum runtime");
+        assert!(first.agent().quorum().is_some());
+        assert!(
+            first
+                .agent()
+                .handle()
+                .agent_registry()
+                .get_handle("coder")
+                .is_some()
+        );
+        let subscriber_count = fanout.subscriber_count();
+        for _ in 0..3 {
+            let document = manager
+                .catalog
+                .load_profile("team")
+                .await
+                .expect("profile read");
+            assert_eq!(document.metadata.id, "team");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.runtime_for_profile("team"),
+        )
+        .await
+        .expect("cached quorum runtime lookup hung")
+        .expect("cached quorum runtime");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(manager.cached_runtime_count().await, 1);
+        assert_eq!(fanout.subscriber_count(), subscriber_count);
         manager.shutdown().await;
     }
 

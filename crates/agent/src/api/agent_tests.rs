@@ -82,7 +82,7 @@ async fn build_test_profile_multi_agent(
         session_mcp_attachment_source: None,
         event_fanout: Some(Arc::new(crate::event_fanout::EventFanout::new())),
     };
-    let profiles = AgentProfiles::new(catalog, "alpha", infra);
+    let profiles = AgentProfiles::new(catalog, "team", infra);
     let runtime = profiles.active_runtime().await?;
     Ok(runtime.agent().clone().with_profiles(profiles))
 }
@@ -710,20 +710,19 @@ tools = []
     let planner = agent.planner().expect("planner present");
     let delegate = agent.delegate("coder").expect("delegate present");
 
-    // Verify all are running before shutdown
+    let planner = planner
+        .as_any()
+        .downcast_ref::<crate::agent::LocalAgentHandle>()
+        .expect("local planner");
+    let delegate = delegate
+        .as_any()
+        .downcast_ref::<crate::agent::LocalAgentHandle>()
+        .expect("local delegate");
     assert!(!planner.is_shutdown());
     assert!(!delegate.is_shutdown());
 
-    // Shutdown the agent - both profiles and quorum should be shut down
     agent.shutdown().await;
 
-    // Verify the planner and delegates were shut down
-    // This confirms that both quorum.shutdown() and profiles.shutdown() were called,
-    // because:
-    // 1. quorum.shutdown() cancels active delegations and shuts down the orchestrator
-    // 2. profiles.shutdown() iterates through runtimes and shuts down each agent
-    // If the bug existed (else-if instead of two separate if statements),
-    // only one of these would execute, and we'd see incomplete shutdown.
     assert!(planner.is_shutdown());
     assert!(delegate.is_shutdown());
 

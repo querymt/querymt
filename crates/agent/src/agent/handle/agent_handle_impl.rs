@@ -68,6 +68,10 @@ impl AgentHandle for LocalAgentHandle {
         self.config.agent_registry.clone()
     }
 
+    async fn shutdown(&self) {
+        self.shutdown().await;
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
