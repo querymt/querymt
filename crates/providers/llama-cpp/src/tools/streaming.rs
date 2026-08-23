@@ -80,6 +80,20 @@ pub(crate) fn generate_streaming_with_tools(
                 Ok(stop_now.then_some(GenerationTermination::StopSequence))
             },
         )?;
+        if stats.termination == GenerationTermination::ConsumerClosed {
+            return Ok((
+                Usage {
+                    input_tokens: stats.input_tokens,
+                    output_tokens: stats.output_tokens,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning_tokens: 0,
+                },
+                stats.termination,
+                false,
+            ));
+        }
+
         for stop in &result.additional_stops {
             if !stop.is_empty() && text.ends_with(stop) {
                 text.truncate(text.len() - stop.len());
