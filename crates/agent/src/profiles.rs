@@ -1953,7 +1953,24 @@ capabilities = ["coding"]
             "the initialized cell remains the per-profile single-flight lock"
         );
         manager.shutdown().await;
-        tokio::task::yield_now().await;
+
+        // Wait for subscriber_count to reach zero with timeout
+        let timeout = std::time::Duration::from_secs(5);
+        let start = std::time::Instant::now();
+        loop {
+            if fanout.subscriber_count() == 0 {
+                break;
+            }
+            if start.elapsed() >= timeout {
+                panic!(
+                    "Timeout waiting for subscribers to drop: {} remaining after {:?}",
+                    fanout.subscriber_count(),
+                    timeout
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
         assert_eq!(fanout.subscriber_count(), 0);
         assert!(manager.runtime_for_profile("team").await.is_err());
     }

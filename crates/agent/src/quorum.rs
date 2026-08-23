@@ -55,7 +55,12 @@ pub struct AgentQuorum {
 
 impl Drop for AgentQuorum {
     fn drop(&mut self) {
-        if let Some(handle) = self.listener_handle.lock().unwrap().take() {
+        // Recover the mutex guard even if poisoned to avoid panicking in Drop
+        let mut guard = match self.listener_handle.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(handle) = guard.take() {
             handle.abort();
         }
     }

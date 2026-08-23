@@ -325,23 +325,46 @@ impl DelegationOrchestrator {
             AgentEventKind::DelegationRequested { delegation, .. } => {
                 tracing::Span::current().record("event_kind", "DelegationRequested");
                 if let Some(profile_id) = self.profile_id.as_deref() {
-                    match self.store.get_profile_binding(session_id).await {
-                        Ok(Some(owner)) if owner == profile_id => {}
-                        Ok(Some(_)) => return,
+                    let mut last_error = None;
+                    let mut binding_result = None;
+                    for attempt in 0..3 {
+                        match self.store.get_profile_binding(session_id).await {
+                            Ok(result) => {
+                                binding_result = Some(result);
+                                break;
+                            }
+                            Err(err) => {
+                                last_error = Some(err);
+                                if attempt < 2 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                }
+                            }
+                        }
+                    }
+
+                    match binding_result {
+                        Some(Some(owner)) if owner == profile_id => {}
+                        Some(Some(_)) => return,
                         // Live profile sessions must already be bound. Legacy support belongs in
                         // session loading, where one deterministic profile could be backfilled.
-                        Ok(None) => {
+                        Some(None) => {
                             error!(
                                 "Ignoring delegation {} from unbound session {}",
                                 delegation.public_id, session_id
                             );
                             return;
                         }
-                        Err(err) => {
-                            error!(
-                                "Failed to resolve profile owner for delegation {}: {}",
-                                delegation.public_id, err
+                        None => {
+                            let error_message = format!(
+                                "Failed to resolve profile owner for delegation {} after retries: {}",
+                                delegation.public_id,
+                                last_error
+                                    .as_ref()
+                                    .map(|e| e.to_string())
+                                    .unwrap_or_else(|| "unknown error".to_string())
                             );
+                            self.fail_unclaimed_delegation(delegation, session_id, &error_message)
+                                .await;
                             return;
                         }
                     }
@@ -1031,9 +1054,15 @@ async fn execute_delegation(
                 .await
             {
                 Ok(true) => {}
-                Ok(false) => return,
+                Ok(false) => {
+                    let mut active = ctx.active_delegations.lock().await;
+                    active.remove(&delegation_id);
+                    return;
+                }
                 Err(e) => {
                     warn!("Failed to update delegation status to Cancelled: {}", e);
+                    let mut active = ctx.active_delegations.lock().await;
+                    active.remove(&delegation_id);
                     return;
                 }
             }
@@ -1209,9 +1238,15 @@ async fn execute_delegation(
                 .await
             {
                 Ok(true) => {}
-                Ok(false) => return,
+                Ok(false) => {
+                    let mut active = ctx.active_delegations.lock().await;
+                    active.remove(&delegation_id);
+                    return;
+                }
                 Err(e) => {
                     warn!("Failed to persist delegation completion: {}", e);
+                    let mut active = ctx.active_delegations.lock().await;
+                    active.remove(&delegation_id);
                     return;
                 }
             }
