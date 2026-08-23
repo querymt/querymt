@@ -88,6 +88,42 @@ async fn with_profiles_reuses_root_agent_for_active_profile() -> Result<()> {
 }
 
 #[tokio::test]
+async fn shutdown_with_profiles_also_stops_independent_root() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    std::fs::write(
+        dir.path().join("alpha.toml"),
+        "[agent]\nprovider = \"test\"\nmodel = \"test-model\"\nsystem = \"inline\"\n",
+    )?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let root = test_agent_with_storage(Some(storage.clone())).await?;
+    assert!(!root.handle().is_shutdown());
+    let (registry, _temp_dir) = empty_plugin_registry()?;
+    let catalog: Arc<dyn ProfileCatalog> = Arc::new(
+        LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(dir.path())
+            .build(),
+    );
+    let profiles = AgentProfiles::new(
+        catalog,
+        "alpha",
+        AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        },
+    );
+    let root = root.with_profiles(profiles);
+
+    root.shutdown().await;
+
+    assert!(root.handle().is_shutdown());
+    Ok(())
+}
+
+#[tokio::test]
 async fn with_profiles_keeps_watcher_alive() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
     std::fs::write(

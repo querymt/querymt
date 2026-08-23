@@ -254,6 +254,46 @@ impl DelegationOrchestrator {
         })
     }
 
+    async fn fail_unclaimed_delegation(
+        &self,
+        delegation: &Delegation,
+        parent_session_id: &str,
+        error_message: &str,
+    ) {
+        match self
+            .store
+            .transition_delegation_status(
+                &delegation.public_id,
+                DelegationStatus::Requested,
+                DelegationStatus::Failed,
+            )
+            .await
+        {
+            Ok(true) => {
+                emit_delegation_event(
+                    &self.delegator,
+                    &self.event_sink,
+                    parent_session_id,
+                    AgentEventKind::DelegationFailed {
+                        delegation_id: delegation.public_id.clone(),
+                        error: error_message.to_string(),
+                    },
+                );
+                if self.config.inject_results {
+                    inject_failure(
+                        &self.delegator,
+                        parent_session_id,
+                        &delegation.public_id,
+                        error_message,
+                    )
+                    .await;
+                }
+            }
+            Ok(false) => {}
+            Err(err) => warn!("Failed to persist delegation claim failure: {}", err),
+        }
+    }
+
     async fn claim_delegation(&self, delegation_id: &str) -> Result<DelegationClaim, String> {
         let mut last_error = None;
         for attempt in 0..3 {
@@ -335,18 +375,9 @@ impl DelegationOrchestrator {
                         return;
                     }
                     Err(err) => {
-                        fail_delegation(
-                            DelegationFailureContext {
-                                event_sink: &self.event_sink,
-                                delegator: &self.delegator,
-                                store: &self.store,
-                                hooks: None,
-                                config: &self.config,
-                                parent_session_id: session_id,
-                                delegation_id: &delegation.public_id,
-                                target_agent_id: Some(&delegation.target_agent_id),
-                                objective: Some(&delegation.objective),
-                            },
+                        self.fail_unclaimed_delegation(
+                            delegation,
+                            session_id,
                             &format!("Failed to claim delegation before execution: {err}"),
                         )
                         .await;
@@ -1664,7 +1695,12 @@ mod tests {
     use crate::agent::handle::AgentHandle;
     use crate::agent::remote::SessionActorRef;
     use crate::event_fanout::EventFanout;
+    use crate::event_sink::EventSink;
     use crate::events::EventEnvelope;
+    use crate::hooks::Hooks;
+    use crate::session::backend::StorageBackend;
+    use crate::session::sqlite_storage::SqliteStorage;
+    use crate::test_utils::MockSessionStore;
     use async_trait::async_trait;
 
     // ── Minimal stub AgentHandle ──────────────────────────────────────────────
@@ -1734,6 +1770,59 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    #[tokio::test]
+    async fn claim_error_does_not_fail_running_winner() {
+        let mut store = MockSessionStore::new();
+        store
+            .expect_transition_delegation_status()
+            .withf(|id, expected, next| {
+                id == "delegation-1"
+                    && *expected == DelegationStatus::Requested
+                    && *next == DelegationStatus::Failed
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(false));
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("storage"),
+        );
+        let fanout = Arc::new(EventFanout::new());
+        let event_sink = Arc::new(EventSink::new(storage.event_journal(), fanout));
+        let orchestrator = DelegationOrchestrator::new(
+            StubAgentHandle::new("delegator"),
+            event_sink,
+            store,
+            Arc::new(DefaultAgentRegistry::new()),
+            Arc::new(ToolRegistry::new()),
+            Hooks::default(),
+            None,
+        );
+        let delegation = Delegation {
+            id: 1,
+            public_id: "delegation-1".to_string(),
+            session_id: 1,
+            task_id: None,
+            target_agent_id: "coder".to_string(),
+            objective: "test".to_string(),
+            objective_hash: crate::hash::RapidHash::new(b"test"),
+            context: None,
+            constraints: None,
+            expected_output: None,
+            verification_spec: None,
+            planning_summary: None,
+            status: DelegationStatus::Requested,
+            retry_count: 0,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+
+        orchestrator
+            .fail_unclaimed_delegation(&delegation, "session-1", "claim failed")
+            .await;
     }
 
     fn make_agent_info(id: &str) -> AgentInfo {

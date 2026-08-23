@@ -228,6 +228,11 @@ impl LocalAgentHandle {
         self.scheduler_handle.lock().clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.shutdown_done.load(Ordering::SeqCst)
+    }
+
     pub(super) fn clear_scheduler_handle(&self) {
         *self.scheduler_handle.lock() = None;
     }
