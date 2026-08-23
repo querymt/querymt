@@ -8,8 +8,8 @@ use crate::types::FfiErrorCode;
 use querymt::plugin::host::PluginRegistry;
 use querymt_agent::config::{Config, ConfigSource};
 use querymt_agent::profiles::{
-    DEFAULT_EMBEDDED_PROFILE_KEY, LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager,
-    standard_embedded_profile_catalog_builder,
+    DEFAULT_EMBEDDED_PROFILE_KEY, LocalProfileCatalog, ProfileCatalog, ProfileRuntime,
+    ProfileRuntimeManager, standard_embedded_profile_catalog_builder,
 };
 use std::ffi::CStr;
 use std::path::PathBuf;
@@ -124,15 +124,22 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
             );
             FfiErrorCode::RuntimeError
         })?;
-    let profile_manager = Arc::new(ProfileRuntimeManager::with_infra_boxed(
-        Arc::new(profile_catalog) as Arc<dyn ProfileCatalog>,
-        DEFAULT_EMBEDDED_PROFILE_KEY,
-        infra.clone(),
-    ));
+    let profile_catalog: Arc<dyn ProfileCatalog> = Arc::new(profile_catalog);
+    let root_metadata = profile_catalog
+        .load_profile(DEFAULT_EMBEDDED_PROFILE_KEY)
+        .await
+        .map_err(|e| {
+            set_last_error(
+                FfiErrorCode::RuntimeError,
+                format!("Failed to load default profile metadata: {:#}", e),
+            );
+            FfiErrorCode::RuntimeError
+        })?
+        .metadata;
 
     let agent = match config {
         Config::Single(single) => {
-            querymt_agent::api::Agent::from_single_config_with_infra(*single, infra)
+            querymt_agent::api::Agent::from_single_config_with_infra(*single, infra.clone())
                 .await
                 .map_err(|e| {
                     set_last_error(
@@ -144,7 +151,18 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
         }
         Config::Multi(quorum) => {
             log::info!("Initializing multi-agent/quorum config");
-            querymt_agent::api::Agent::from_quorum_config_with_infra(*quorum, infra)
+            let builder = querymt_agent::api::Agent::builder_from_quorum_config(*quorum, None)
+                .map_err(|e| {
+                    set_last_error(
+                        FfiErrorCode::RuntimeError,
+                        format!("Quorum configuration failed: {:#}", e),
+                    );
+                    FfiErrorCode::RuntimeError
+                })?;
+            builder
+                .with_profile_id(DEFAULT_EMBEDDED_PROFILE_KEY)
+                .infra(infra.clone())
+                .build()
                 .await
                 .map_err(|e| {
                     set_last_error(
@@ -155,6 +173,14 @@ async fn init_agent_async(config: Config) -> Result<u64, FfiErrorCode> {
                 })?
         }
     };
+    let profile_manager = Arc::new(ProfileRuntimeManager::with_runtime(
+        profile_catalog,
+        infra,
+        ProfileRuntime {
+            metadata: root_metadata,
+            agent: agent.clone(),
+        },
+    ));
 
     let (handle, reused_runtime) = state::attach_or_insert_runtime_agent(agent, storage);
 

@@ -76,6 +76,7 @@ pub struct QuorumBuilder {
 
     /// Optional pre-built infrastructure (plugin registry + storage).
     pub(super) infra: Option<super::agent::AgentInfra>,
+    pub(crate) profile_id: Option<String>,
 }
 
 impl Default for QuorumBuilder {
@@ -111,6 +112,7 @@ impl QuorumBuilder {
             #[cfg(feature = "remote")]
             peer_delegates: Vec::new(),
             infra: None,
+            profile_id: None,
         }
     }
 
@@ -171,6 +173,11 @@ impl QuorumBuilder {
     /// When not called, `build()` uses platform defaults.
     pub fn infra(mut self, infra: super::agent::AgentInfra) -> Self {
         self.infra = Some(infra);
+        self
+    }
+
+    pub fn with_profile_id(mut self, profile_id: impl Into<String>) -> Self {
+        self.profile_id = Some(profile_id.into());
         self
     }
 
@@ -548,6 +555,9 @@ impl QuorumBuilder {
             Arc::new(AgentHandle::from_config(config)) as Arc<dyn AgentHandleTrait>
         });
 
+        if let Some(profile_id) = self.profile_id {
+            builder = builder.with_profile_id(profile_id);
+        }
         builder = builder
             .with_delegation(self.delegation_enabled)
             .with_verification(self.verification_enabled)
@@ -731,7 +741,7 @@ impl QuorumBuilder {
             cwd,
             callbacks: Arc::new(EventCallbacksState::new(None)),
             profiles: None,
-            quorum: Some(quorum),
+            quorum: Some(Arc::new(quorum)),
         })
     }
 }

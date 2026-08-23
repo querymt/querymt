@@ -1,6 +1,6 @@
 //! SQLite implementation of DelegationRepository
 
-use crate::session::domain::{Delegation, DelegationStatus};
+use crate::session::domain::{Delegation, DelegationClaim, DelegationStatus};
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::repository::DelegationRepository;
 use async_trait::async_trait;
@@ -161,29 +161,76 @@ impl DelegationRepository for SqliteDelegationRepository {
         .await
     }
 
-    async fn update_delegation_status(
-        &self,
-        delegation_id: &str,
-        status: DelegationStatus,
-    ) -> SessionResult<()> {
-        let delegation_id_owned = delegation_id.to_string();
+    async fn claim_delegation(&self, delegation_id: &str) -> SessionResult<DelegationClaim> {
+        let delegation_id = delegation_id.to_string();
         self.run_blocking(move |conn| {
             let affected = conn.execute(
-                "UPDATE delegations SET status = ? WHERE public_id = ?",
-                params![status.to_string(), delegation_id_owned],
+                "UPDATE delegations SET status = ? WHERE public_id = ? AND status = ?",
+                params![
+                    DelegationStatus::Running.to_string(),
+                    delegation_id,
+                    DelegationStatus::Requested.to_string()
+                ],
             )?;
-            if affected == 0 {
-                return Err(rusqlite::Error::QueryReturnedNoRows);
+            if affected == 1 {
+                return Ok(DelegationClaim::Claimed);
             }
-            Ok(())
+
+            let status = conn
+                .query_row(
+                    "SELECT status FROM delegations WHERE public_id = ?",
+                    params![delegation_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            match status {
+                None => Ok(DelegationClaim::NotFound),
+                Some(status) => {
+                    let status = status.parse().map_err(|message: String| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            message.into(),
+                        )
+                    })?;
+                    if status == DelegationStatus::Running {
+                        Ok(DelegationClaim::AlreadyClaimed)
+                    } else {
+                        Ok(DelegationClaim::InvalidState(status))
+                    }
+                }
+            }
         })
         .await
-        .map_err(|e| match e {
-            SessionError::DatabaseError(_) => {
-                SessionError::DelegationNotFound(delegation_id.to_string())
-            }
-            _ => e,
+    }
+
+    async fn transition_delegation_status(
+        &self,
+        delegation_id: &str,
+        expected: DelegationStatus,
+        next: DelegationStatus,
+    ) -> SessionResult<bool> {
+        let delegation_id = delegation_id.to_string();
+        self.run_blocking(move |conn| {
+            let completed_at = matches!(
+                next,
+                DelegationStatus::Complete
+                    | DelegationStatus::Failed
+                    | DelegationStatus::Cancelled
+            )
+            .then(|| format_rfc3339(&OffsetDateTime::now_utc()));
+            conn.execute(
+                "UPDATE delegations SET status = ?, completed_at = ? WHERE public_id = ? AND status = ?",
+                params![
+                    next.to_string(),
+                    completed_at,
+                    delegation_id,
+                    expected.to_string()
+                ],
+            )
+            .map(|affected| affected == 1)
         })
+        .await
     }
 
     async fn update_delegation(&self, delegation: Delegation) -> SessionResult<()> {

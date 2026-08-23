@@ -569,6 +569,7 @@ impl AgentBuilder {
     }
 }
 
+#[derive(Clone)]
 pub struct Agent {
     pub(super) inner: Arc<AgentHandle>,
     #[cfg_attr(not(feature = "api"), allow(dead_code))]
@@ -576,10 +577,10 @@ pub struct Agent {
     pub(super) default_session_id: Arc<Mutex<Option<String>>>,
     pub(super) cwd: Option<PathBuf>,
     pub(super) callbacks: Arc<EventCallbacksState>,
-    pub(super) profiles: Option<AgentProfiles>,
+    pub(super) profiles: Option<Arc<AgentProfiles>>,
     /// Present when this agent was built with `Agent::multi()`.
     /// Holds the quorum orchestrator for delegate access.
-    pub(super) quorum: Option<crate::quorum::AgentQuorum>,
+    pub(super) quorum: Option<Arc<crate::quorum::AgentQuorum>>,
 }
 
 impl Agent {
@@ -734,12 +735,26 @@ impl Agent {
             manager.set_mesh_handle(mesh);
         }
         self.inner.set_profiles(manager);
-        self.profiles = Some(profiles);
+        self.profiles = Some(Arc::new(profiles));
         self
     }
 
     pub fn profiles(&self) -> Option<ProfileRuntimeHandle> {
-        self.profiles.as_ref().map(AgentProfiles::manager)
+        self.profiles
+            .as_ref()
+            .map(|profiles| profiles.manager())
+            .or_else(|| self.inner.profiles())
+    }
+
+    pub async fn shutdown(&self) {
+        if let Some(profiles) = self.profiles() {
+            profiles.shutdown().await;
+        } else {
+            if let Some(quorum) = self.quorum() {
+                quorum.shutdown().await;
+            }
+            self.inner.shutdown().await;
+        }
     }
 
     #[cfg(feature = "api")]
@@ -808,7 +823,7 @@ impl Agent {
 
     /// Access the quorum orchestrator (returns `None` for single agents).
     pub fn quorum(&self) -> Option<&crate::quorum::AgentQuorum> {
-        self.quorum.as_ref()
+        self.quorum.as_deref()
     }
 
     /// Access the planner handle (returns `None` for single agents).

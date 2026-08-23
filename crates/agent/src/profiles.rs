@@ -16,8 +16,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 #[cfg(feature = "remote")]
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tracing::{debug, info, warn};
 
 /// Embedded profile key used for the qmtcode default single-agent profile.
@@ -631,8 +632,12 @@ pub struct ProfileRuntimeManager<C = Arc<dyn ProfileCatalog>> {
     // profile resolution for new sessions; existing session bindings should remain authoritative.
     active_profile_id: Mutex<String>,
     runtimes: Mutex<HashMap<String, Arc<ProfileRuntime>>>,
+    building_runtimes: Mutex<HashMap<String, Arc<OnceCell<Arc<ProfileRuntime>>>>>,
     runtime_fingerprints: Mutex<HashMap<String, Option<String>>>,
     session_bindings: Mutex<HashMap<String, SessionProfileBinding>>,
+    shutdown: AtomicBool,
+    generation: AtomicU64,
+    lifecycle: Mutex<()>,
     #[cfg(feature = "remote")]
     mesh: StdMutex<Option<crate::agent::remote::MeshHandle>>,
 }
@@ -657,13 +662,18 @@ where
         active_profile_id: impl Into<String>,
         shared_infra: AgentInfra,
     ) -> Self {
+        let active_profile_id = active_profile_id.into();
         Self {
             catalog,
             shared_infra,
-            active_profile_id: Mutex::new(active_profile_id.into()),
+            active_profile_id: Mutex::new(active_profile_id),
             runtimes: Mutex::new(HashMap::new()),
+            building_runtimes: Mutex::new(HashMap::new()),
             runtime_fingerprints: Mutex::new(HashMap::new()),
             session_bindings: Mutex::new(HashMap::new()),
+            shutdown: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            lifecycle: Mutex::new(()),
             #[cfg(feature = "remote")]
             mesh: StdMutex::new(None),
         }
@@ -675,6 +685,8 @@ where
 
     pub async fn reload_profiles(&self) -> Result<Vec<ProfileMetadata>> {
         let profiles = self.catalog.list_profiles().await?;
+        let lifecycle = self.lifecycle.lock().await;
+        self.generation.fetch_add(1, Ordering::AcqRel);
         let profile_fingerprints = profiles
             .iter()
             .map(|profile| (profile.id.clone(), profile.fingerprint.clone()))
@@ -689,17 +701,30 @@ where
 
         let mut runtime_fingerprints = self.runtime_fingerprints.lock().await;
         let mut runtimes = self.runtimes.lock().await;
-        runtimes.retain(|profile_id, _| {
-            let Some(current_fingerprint) = profile_fingerprints.get(profile_id) else {
+        let stale_profile_ids = runtimes
+            .keys()
+            .filter(|profile_id| {
+                profile_fingerprints.get(*profile_id) != runtime_fingerprints.get(*profile_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let stale_runtimes = stale_profile_ids
+            .iter()
+            .filter_map(|profile_id| {
                 runtime_fingerprints.remove(profile_id);
-                return false;
-            };
-            if runtime_fingerprints.get(profile_id) != Some(current_fingerprint) {
-                runtime_fingerprints.remove(profile_id);
-                return false;
+                runtimes.remove(profile_id)
+            })
+            .collect::<Vec<_>>();
+        drop(runtimes);
+        drop(runtime_fingerprints);
+        self.building_runtimes.lock().await.clear();
+        drop(lifecycle);
+        for runtime in stale_runtimes {
+            if let Some(quorum) = runtime.agent.quorum() {
+                quorum.shutdown().await;
             }
-            true
-        });
+            runtime.agent.handle().shutdown().await;
+        }
         Ok(profiles)
     }
 
@@ -729,30 +754,67 @@ where
     }
 
     pub async fn runtime_for_profile(&self, profile_id: &str) -> Result<Arc<ProfileRuntime>> {
-        if let Some(runtime) = self.runtimes.lock().await.get(profile_id).cloned() {
+        loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                return Err(anyhow!("profile runtime manager is shut down"));
+            }
+            if let Some(runtime) = self.runtimes.lock().await.get(profile_id).cloned() {
+                return Ok(runtime);
+            }
+
+            // Runtime startup stays outside the cache lock; the per-generation cell coalesces
+            // concurrent lookups without blocking unrelated cached profiles.
+            let generation = self.generation.load(Ordering::Acquire);
+            let cell = self
+                .building_runtimes
+                .lock()
+                .await
+                .entry(profile_id.to_string())
+                .or_default()
+                .clone();
+            let runtime = cell
+                .get_or_try_init(|| async {
+                    let document = self.catalog.load_profile(profile_id).await?;
+                    let runtime =
+                        Arc::new(build_profile_runtime(document, self.shared_infra.clone()).await?);
+                    #[cfg(feature = "remote")]
+                    if let Some(mesh) = self.mesh_handle() {
+                        runtime.agent().handle().set_mesh(mesh);
+                    }
+                    Ok::<_, anyhow::Error>(runtime)
+                })
+                .await?
+                .clone();
+
+            let lifecycle = self.lifecycle.lock().await;
+            if self.shutdown.load(Ordering::Acquire) {
+                drop(lifecycle);
+                if let Some(quorum) = runtime.agent.quorum() {
+                    quorum.shutdown().await;
+                }
+                runtime.agent.handle().shutdown().await;
+                return Err(anyhow!("profile runtime manager is shut down"));
+            }
+            if self.generation.load(Ordering::Acquire) != generation {
+                drop(lifecycle);
+                if let Some(quorum) = runtime.agent.quorum() {
+                    quorum.shutdown().await;
+                }
+                runtime.agent.handle().shutdown().await;
+                continue;
+            }
+
+            self.runtime_fingerprints
+                .lock()
+                .await
+                .insert(profile_id.to_string(), runtime.metadata.fingerprint.clone());
+            self.runtimes
+                .lock()
+                .await
+                .insert(profile_id.to_string(), runtime.clone());
+            drop(lifecycle);
             return Ok(runtime);
         }
-
-        // Do profile I/O/runtime startup outside the cache lock so slow profile startup does not
-        // block unrelated cached runtime reads or event-forwarder polling. Re-check before insert
-        // in case another task won the race.
-        let document = self.catalog.load_profile(profile_id).await?;
-        let runtime = Arc::new(build_profile_runtime(document, self.shared_infra.clone()).await?);
-
-        let mut runtimes = self.runtimes.lock().await;
-        if let Some(existing) = runtimes.get(profile_id) {
-            return Ok(existing.clone());
-        }
-        #[cfg(feature = "remote")]
-        if let Some(mesh) = self.mesh_handle() {
-            runtime.agent().handle().set_mesh(mesh);
-        }
-        self.runtime_fingerprints
-            .lock()
-            .await
-            .insert(profile_id.to_string(), runtime.metadata.fingerprint.clone());
-        runtimes.insert(profile_id.to_string(), runtime.clone());
-        Ok(runtime)
     }
 
     pub async fn bind_session_to_profile(
@@ -924,8 +986,15 @@ where
     }
 
     pub async fn shutdown(&self) {
+        let lifecycle = self.lifecycle.lock().await;
+        self.shutdown.store(true, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
         let runtimes = std::mem::take(&mut *self.runtimes.lock().await);
+        drop(lifecycle);
         for runtime in runtimes.into_values() {
+            if let Some(quorum) = runtime.agent.quorum() {
+                quorum.shutdown().await;
+            }
             runtime.agent.handle().shutdown().await;
         }
     }
@@ -933,6 +1002,11 @@ where
     #[cfg(test)]
     async fn cached_runtime_count(&self) -> usize {
         self.runtimes.lock().await.len()
+    }
+
+    #[cfg(test)]
+    async fn building_runtime_count(&self) -> usize {
+        self.building_runtimes.lock().await.len()
     }
 }
 
@@ -953,13 +1027,27 @@ impl ProfileRuntimeManager<Arc<dyn ProfileCatalog>> {
         active_profile_id: impl Into<String>,
         shared_infra: AgentInfra,
     ) -> Self {
+        Self::with_infra(catalog, active_profile_id, shared_infra)
+    }
+
+    pub fn with_runtime(
+        catalog: Arc<dyn ProfileCatalog>,
+        shared_infra: AgentInfra,
+        runtime: ProfileRuntime,
+    ) -> Self {
+        let profile_id = runtime.profile_id().to_string();
+        let fingerprint = runtime.metadata.fingerprint.clone();
         Self {
             catalog,
             shared_infra,
-            active_profile_id: Mutex::new(active_profile_id.into()),
-            runtimes: Mutex::new(HashMap::new()),
-            runtime_fingerprints: Mutex::new(HashMap::new()),
+            active_profile_id: Mutex::new(profile_id.clone()),
+            runtimes: Mutex::new(HashMap::from([(profile_id.clone(), Arc::new(runtime))])),
+            building_runtimes: Mutex::new(HashMap::new()),
+            runtime_fingerprints: Mutex::new(HashMap::from([(profile_id, fingerprint)])),
             session_bindings: Mutex::new(HashMap::new()),
+            shutdown: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            lifecycle: Mutex::new(()),
             #[cfg(feature = "remote")]
             mesh: StdMutex::new(None),
         }
@@ -981,7 +1069,12 @@ async fn build_profile_runtime(
             #[cfg(not(feature = "remote"))]
             let infra = shared_infra;
 
-            Agent::from_quorum_config_with_infra(*config, infra).await?
+            let builder = Agent::builder_from_quorum_config(*config, None)?;
+            builder
+                .with_profile_id(metadata.id.clone())
+                .infra(infra)
+                .build()
+                .await?
         }
     };
 
@@ -1077,6 +1170,8 @@ mod tests {
     #[cfg(feature = "remote")]
     use querymt::error::LLMError;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Notify;
 
     #[cfg(feature = "remote")]
     use std::time::Duration;
@@ -1714,6 +1809,191 @@ unknown = true
             .await
             .expect_err("missing profile should fail");
         assert!(err.to_string().contains("was not found"));
+    }
+
+    #[derive(Clone)]
+    struct BlockingCatalog {
+        inner: LocalProfileCatalog,
+        load_started: Arc<Notify>,
+        release_load: Arc<Notify>,
+        load_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ProfileCatalog for BlockingCatalog {
+        async fn list_profiles(&self) -> Result<Vec<ProfileMetadata>> {
+            self.inner.list_profiles().await
+        }
+
+        async fn load_profile(&self, id: &str) -> Result<ProfileDocument> {
+            let document = self.inner.load_profile(id).await?;
+            self.load_count.fetch_add(1, Ordering::AcqRel);
+            self.load_started.notify_one();
+            self.release_load.notified().await;
+            Ok(document)
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_does_not_reinsert_in_flight_stale_runtime() {
+        let dir = temp_profile_dir();
+        write_profile(
+            dir.path(),
+            "alpha.toml",
+            r#"
+[agent]
+provider = "test"
+model = "first-model"
+system = "inline"
+"#,
+        );
+        let load_started = Arc::new(Notify::new());
+        let release_load = Arc::new(Notify::new());
+        let load_count = Arc::new(AtomicUsize::new(0));
+        let catalog = BlockingCatalog {
+            inner: LocalProfileCatalog::builder()
+                .include_embedded_default(false)
+                .local_dir(dir.path())
+                .build(),
+            load_started: load_started.clone(),
+            release_load: release_load.clone(),
+            load_count: load_count.clone(),
+        };
+        let (infra, _registry_dir) = test_infra().await;
+        let manager = Arc::new(ProfileRuntimeManager::with_infra(catalog, "alpha", infra));
+        let build = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.runtime_for_profile("alpha").await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), load_started.notified())
+            .await
+            .expect("runtime build did not start");
+
+        write_profile(
+            dir.path(),
+            "alpha.toml",
+            r#"
+[agent]
+provider = "test"
+model = "second-model"
+system = "inline"
+"#,
+        );
+        manager.reload_profiles().await.unwrap();
+        release_load.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), load_started.notified())
+            .await
+            .expect("replacement runtime build did not start");
+        release_load.notify_one();
+        let current = tokio::time::timeout(std::time::Duration::from_secs(5), build)
+            .await
+            .expect("runtime build hung")
+            .expect("runtime task panicked")
+            .expect("generation change should retry runtime startup");
+
+        assert_eq!(current.profile_id(), "alpha");
+        assert_eq!(load_count.load(Ordering::Acquire), 2);
+        assert_eq!(manager.cached_runtime_count().await, 1);
+        let cached = manager.runtime_for_profile("alpha").await.unwrap();
+        assert!(Arc::ptr_eq(&current, &cached));
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_runtime_lookup_builds_one_quorum_listener() {
+        let dir = temp_profile_dir();
+        write_profile(
+            dir.path(),
+            "team.toml",
+            r#"
+[quorum]
+delegation = true
+verification = false
+snapshot_policy = "none"
+
+[planner]
+provider = "test"
+model = "planner-model"
+system = "plan"
+tools = ["delegate"]
+
+[[delegates]]
+id = "coder"
+provider = "test"
+model = "coder-model"
+system = "code"
+capabilities = ["coding"]
+"#,
+        );
+        let (mut infra, _registry_dir) = test_infra().await;
+        let fanout = Arc::new(crate::event_fanout::EventFanout::new());
+        infra.event_fanout = Some(fanout.clone());
+        let catalog = LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(dir.path())
+            .build();
+        let manager = Arc::new(ProfileRuntimeManager::with_infra(catalog, "team", infra));
+
+        let (first, second) = tokio::join!(
+            manager.runtime_for_profile("team"),
+            manager.runtime_for_profile("team")
+        );
+        let first = first.expect("first runtime");
+        let second = second.expect("second runtime");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            fanout.subscriber_count(),
+            2,
+            "one orchestrator and one model-inventory subscriber should be materialized"
+        );
+        assert_eq!(
+            manager.building_runtime_count().await,
+            1,
+            "the initialized cell remains the per-profile single-flight lock"
+        );
+        manager.shutdown().await;
+        tokio::task::yield_now().await;
+        assert_eq!(fanout.subscriber_count(), 0);
+        assert!(manager.runtime_for_profile("team").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn reload_rebuilds_changed_profile_runtime() {
+        let dir = temp_profile_dir();
+        write_profile(
+            dir.path(),
+            "alpha.toml",
+            r#"
+[agent]
+provider = "test"
+model = "first-model"
+system = "inline"
+"#,
+        );
+        let (infra, _registry_dir) = test_infra().await;
+        let catalog = LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(dir.path())
+            .build();
+        let manager = ProfileRuntimeManager::with_infra(catalog, "alpha", infra);
+        let first = manager.runtime_for_profile("alpha").await.unwrap();
+
+        write_profile(
+            dir.path(),
+            "alpha.toml",
+            r#"
+[agent]
+provider = "test"
+model = "second-model"
+system = "inline"
+"#,
+        );
+        manager.reload_profiles().await.unwrap();
+        let second = manager.runtime_for_profile("alpha").await.unwrap();
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        manager.shutdown().await;
     }
 
     #[tokio::test]

@@ -13,8 +13,8 @@ mod tests {
 
     use crate::session::domain::{
         Alternative, AlternativeStatus, Artifact, Decision, DecisionStatus, Delegation,
-        DelegationStatus, ForkOrigin, ForkPointType, IntentSnapshot, ProgressEntry, ProgressKind,
-        Task, TaskKind, TaskStatus,
+        DelegationClaim, DelegationStatus, ForkOrigin, ForkPointType, IntentSnapshot,
+        ProgressEntry, ProgressKind, Task, TaskKind, TaskStatus,
     };
     use crate::session::repository::{
         ArtifactRepository, DecisionRepository, DelegationRepository, IntentRepository,
@@ -809,16 +809,21 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn update_delegation_status() {
-            let (session_public_id, session_id, repo) = make_session_and_repo().await;
+        async fn delegation_claim_distinguishes_claimed_and_already_running() {
+            let (_session_public_id, session_id, repo) = make_session_and_repo().await;
             let created = repo
-                .create_delegation(make_delegation(session_id, "agent-x", "run task"))
+                .create_delegation(make_delegation(session_id, "agent-x", "run once"))
                 .await
                 .unwrap();
 
-            repo.update_delegation_status(&created.public_id, DelegationStatus::Running)
-                .await
-                .unwrap();
+            assert_eq!(
+                repo.claim_delegation(&created.public_id).await.unwrap(),
+                DelegationClaim::Claimed
+            );
+            assert_eq!(
+                repo.claim_delegation(&created.public_id).await.unwrap(),
+                DelegationClaim::AlreadyClaimed
+            );
 
             let fetched = repo
                 .get_delegation(&created.public_id)
@@ -826,19 +831,84 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(fetched.status, DelegationStatus::Running);
+        }
 
-            repo.update_delegation_status(&created.public_id, DelegationStatus::Complete)
+        #[tokio::test]
+        async fn delegation_claim_reports_missing_and_terminal_rows() {
+            let (_session_public_id, session_id, repo) = make_session_and_repo().await;
+            assert_eq!(
+                repo.claim_delegation("missing").await.unwrap(),
+                DelegationClaim::NotFound
+            );
+
+            let mut terminal = make_delegation(session_id, "agent-x", "already done");
+            terminal.status = DelegationStatus::Complete;
+            let terminal = repo.create_delegation(terminal).await.unwrap();
+            assert_eq!(
+                repo.claim_delegation(&terminal.public_id).await.unwrap(),
+                DelegationClaim::InvalidState(DelegationStatus::Complete)
+            );
+        }
+
+        #[tokio::test]
+        async fn concurrent_delegation_claim_has_one_winner() {
+            let (_session_public_id, session_id, repo) = make_session_and_repo().await;
+            let created = repo
+                .create_delegation(make_delegation(session_id, "agent-x", "run once"))
                 .await
                 .unwrap();
 
-            let fetched2 = repo
+            let first = repo.claim_delegation(&created.public_id);
+            let second = repo.claim_delegation(&created.public_id);
+            let (first, second) = tokio::join!(first, second);
+
+            assert_eq!(
+                [first.unwrap(), second.unwrap()]
+                    .into_iter()
+                    .filter(|result| *result == DelegationClaim::Claimed)
+                    .count(),
+                1
+            );
+        }
+
+        #[tokio::test]
+        async fn guarded_transition_rejects_stale_terminal_update() {
+            let (_session_public_id, session_id, repo) = make_session_and_repo().await;
+            let created = repo
+                .create_delegation(make_delegation(session_id, "agent-x", "run once"))
+                .await
+                .unwrap();
+            assert_eq!(
+                repo.claim_delegation(&created.public_id).await.unwrap(),
+                DelegationClaim::Claimed
+            );
+            assert!(
+                repo.transition_delegation_status(
+                    &created.public_id,
+                    DelegationStatus::Running,
+                    DelegationStatus::Complete,
+                )
+                .await
+                .unwrap()
+            );
+            assert!(
+                !repo
+                    .transition_delegation_status(
+                        &created.public_id,
+                        DelegationStatus::Running,
+                        DelegationStatus::Failed,
+                    )
+                    .await
+                    .unwrap()
+            );
+
+            let completed = repo
                 .get_delegation(&created.public_id)
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(fetched2.status, DelegationStatus::Complete);
-
-            let _ = session_public_id;
+            assert_eq!(completed.status, DelegationStatus::Complete);
+            assert!(completed.completed_at.is_some());
         }
 
         #[tokio::test]

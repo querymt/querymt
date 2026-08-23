@@ -159,11 +159,16 @@ mock! {
         async fn create_delegation(&self, delegation: Delegation) -> SessionResult<Delegation>;
         async fn get_delegation(&self, delegation_id: &str) -> SessionResult<Option<Delegation>>;
         async fn list_delegations(&self, session_id: &str) -> SessionResult<Vec<Delegation>>;
-        async fn update_delegation_status(
+        async fn claim_delegation(
             &self,
             delegation_id: &str,
-            status: DelegationStatus,
-        ) -> SessionResult<()>;
+        ) -> SessionResult<crate::session::domain::DelegationClaim>;
+        async fn transition_delegation_status(
+            &self,
+            delegation_id: &str,
+            expected: DelegationStatus,
+            next: DelegationStatus,
+        ) -> SessionResult<bool>;
         async fn update_delegation(&self, delegation: Delegation) -> SessionResult<()>;
         async fn peek_revert_state(
             &self,

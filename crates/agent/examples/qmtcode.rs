@@ -456,14 +456,10 @@ async fn run(
     } else {
         let selected_profile = selected_profile_id(&cli).to_string();
         eprintln!("Loading agent from profile: {selected_profile}");
-        let document = profile_catalog.load_profile(&selected_profile).await?;
-        let runner = from_config_value_with_infra(document.config, shared_infra.clone()).await?;
         let catalog: Arc<dyn ProfileCatalog> = Arc::new(profile_catalog);
-        runner.with_profiles(AgentProfiles::new(
-            catalog,
-            selected_profile,
-            shared_infra.clone(),
-        ))
+        let profiles = AgentProfiles::new(catalog, selected_profile, shared_infra.clone());
+        let runtime = profiles.active_runtime().await?;
+        AgentRunner::new(runtime.agent().clone()).with_profiles(profiles)
     };
 
     eprintln!("Agent loaded successfully!\n");
@@ -705,7 +701,7 @@ async fn run(
     }
 
     // Request shutdown without blocking on background drains; telemetry is finalized last.
-    runner.handle().shutdown().await;
+    runner.shutdown().await;
     #[cfg(feature = "remote")]
     if let Some(runtime) = mesh_runtime.take() {
         runtime.request_shutdown();

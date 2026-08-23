@@ -1,4 +1,4 @@
-use crate::profiles::{ProfileCatalog, ProfileRuntimeManager};
+use crate::profiles::{ProfileCatalog, ProfileRuntime, ProfileRuntimeManager};
 use notify::RecommendedWatcher;
 use std::sync::Arc;
 
@@ -44,6 +44,10 @@ impl AgentProfiles {
 
     pub fn manager(&self) -> ProfileRuntimeHandle {
         self.manager.clone()
+    }
+
+    pub async fn active_runtime(&self) -> anyhow::Result<Arc<ProfileRuntime>> {
+        self.manager.active_runtime().await
     }
 
     #[cfg(test)]

@@ -43,8 +43,7 @@ async fn test_agent_with_storage(
         .await
 }
 
-async fn attach_test_profiles(
-    agent: Agent,
+async fn build_test_profile_agent(
     storage: Arc<crate::session::sqlite_storage::SqliteStorage>,
     profile_dir: &std::path::Path,
 ) -> Result<Agent> {
@@ -55,16 +54,37 @@ async fn attach_test_profiles(
             .local_dir(profile_dir)
             .build(),
     );
-    Ok(agent.with_profiles(AgentProfiles::new(
-        catalog,
-        "alpha",
-        AgentInfra {
-            plugin_registry: Arc::new(registry),
-            storage: Some(storage),
-            session_mcp_attachment_source: None,
-            event_fanout: None,
-        },
-    )))
+    let infra = AgentInfra {
+        plugin_registry: Arc::new(registry),
+        storage: Some(storage),
+        session_mcp_attachment_source: None,
+        event_fanout: None,
+    };
+    let profiles = AgentProfiles::new(catalog, "alpha", infra);
+    let runtime = profiles.active_runtime().await?;
+    Ok(runtime.agent().clone().with_profiles(profiles))
+}
+
+#[tokio::test]
+async fn with_profiles_reuses_root_agent_for_active_profile() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    std::fs::write(
+        dir.path().join("alpha.toml"),
+        "[agent]\nprovider = \"test\"\nmodel = \"test-model\"\nsystem = \"inline\"\n",
+    )?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = build_test_profile_agent(storage, dir.path()).await?;
+    let root_handle = agent.handle();
+
+    let runtime = agent
+        .profiles()
+        .expect("profiles attached")
+        .active_runtime()
+        .await?;
+
+    assert!(Arc::ptr_eq(&root_handle, &runtime.agent().handle()));
+    Ok(())
 }
 
 #[tokio::test]
@@ -76,8 +96,7 @@ async fn with_profiles_keeps_watcher_alive() -> Result<()> {
     )?;
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
-    let agent = test_agent_with_storage(Some(storage.clone())).await?;
-    let agent = attach_test_profiles(agent, storage, dir.path()).await?;
+    let agent = build_test_profile_agent(storage, dir.path()).await?;
 
     assert!(agent.profiles().is_some());
     assert!(
@@ -101,8 +120,7 @@ async fn server_inherits_attached_profiles() -> Result<()> {
     )?;
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
-    let agent = test_agent_with_storage(Some(storage.clone())).await?;
-    let agent = attach_test_profiles(agent, storage, dir.path()).await?;
+    let agent = build_test_profile_agent(storage, dir.path()).await?;
 
     let server = agent.server();
     assert!(server.profiles().is_some());

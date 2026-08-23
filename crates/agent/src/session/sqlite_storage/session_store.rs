@@ -1075,13 +1075,23 @@ impl SessionStore for SqliteStorage {
         repo.list_delegations(session_id).await
     }
 
-    async fn update_delegation_status(
+    async fn claim_delegation(
         &self,
         delegation_id: &str,
-        status: DelegationStatus,
-    ) -> SessionResult<()> {
+    ) -> SessionResult<crate::session::domain::DelegationClaim> {
         let repo = SqliteDelegationRepository::new(self.conn.clone());
-        repo.update_delegation_status(delegation_id, status).await
+        repo.claim_delegation(delegation_id).await
+    }
+
+    async fn transition_delegation_status(
+        &self,
+        delegation_id: &str,
+        expected: DelegationStatus,
+        next: DelegationStatus,
+    ) -> SessionResult<bool> {
+        let repo = SqliteDelegationRepository::new(self.conn.clone());
+        repo.transition_delegation_status(delegation_id, expected, next)
+            .await
     }
 
     async fn update_delegation(&self, delegation: Delegation) -> SessionResult<()> {

@@ -130,6 +130,7 @@ struct TestHarness {
     config: Arc<AgentConfig>,
     exec_ctx: ExecutionContext,
     provider: Arc<Mutex<MockLlmProvider>>,
+    orchestrator_handle: Option<tokio::task::JoinHandle<()>>,
     _temp_dir: TempDir,
 }
 
@@ -246,7 +247,7 @@ impl TestHarness {
             )
             .with_delegate_model_overrides(config.delegate_model_overrides.clone()),
         );
-        let _orchestrator_handle = orchestrator.start_listening(config.event_sink.fanout());
+        let orchestrator_handle = Some(orchestrator.start_listening(config.event_sink.fanout()));
 
         // Create a SessionRuntime for the execution context
         let session_runtime = crate::agent::core::SessionRuntime::new(
@@ -267,7 +268,14 @@ impl TestHarness {
             config,
             exec_ctx,
             provider,
+            orchestrator_handle,
             _temp_dir: temp_dir,
+        }
+    }
+
+    fn stop_harness_orchestrator(&mut self) {
+        if let Some(handle) = self.orchestrator_handle.take() {
+            handle.abort();
         }
     }
 
@@ -344,6 +352,53 @@ impl TestHarness {
             .times(0..);
 
         self.run().await
+    }
+
+    async fn run_single_delegation_without_child_tool(&mut self) -> CycleOutcome {
+        let delegate_call = mock_querymt_tool_call(
+            "call-1",
+            "delegate",
+            r#"{"target_agent_id":"agent","objective":"task"}"#,
+        );
+        let mut seq = Sequence::new();
+        self.provider_mut()
+            .await
+            .expect_chat()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(move |_| {
+                Ok(Box::new(MockChatResponse::with_tools(
+                    "Delegating task",
+                    vec![delegate_call.clone()],
+                )))
+            });
+        self.provider_mut()
+            .await
+            .expect_chat()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(Box::new(MockChatResponse::text_only("Done"))));
+        self.provider_mut()
+            .await
+            .expect_call_tool()
+            .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
+            .times(1);
+        self.provider_mut()
+            .await
+            .expect_tools()
+            .return_const(None)
+            .times(0..);
+
+        self.run().await
+    }
+
+    async fn child_sessions(&self) -> Vec<String> {
+        self.config
+            .provider
+            .history_store()
+            .list_child_sessions(&self.exec_ctx.session_id)
+            .await
+            .expect("child sessions")
     }
 
     async fn child_llm_params(&self) -> (String, LLMParams) {
@@ -536,6 +591,262 @@ fn agent_info(id: &str) -> AgentInfo {
 }
 
 // Helper functions moved to crate::test_utils::helpers
+
+#[tokio::test]
+async fn duplicate_orchestrators_create_one_child_for_one_request() {
+    let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
+    let config = harness.config.clone();
+    let store = config.provider.history_store();
+    let duplicate = Arc::new(
+        DelegationOrchestrator::new(
+            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
+            config.event_sink.clone(),
+            store,
+            config.agent_registry.clone(),
+            config.tool_registry_arc(),
+            config.hooks.clone(),
+            None,
+        )
+        .with_delegate_model_overrides(config.delegate_model_overrides.clone()),
+    );
+    let duplicate_listener = duplicate.start_listening(config.event_sink.fanout());
+    assert_eq!(config.event_sink.fanout().subscriber_count(), 2);
+
+    let outcome = harness.run_single_delegation().await;
+    let children = harness.child_sessions().await;
+    duplicate_listener.abort();
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+    assert_eq!(children.len(), 1);
+}
+
+#[tokio::test]
+async fn profile_orchestrator_does_not_poison_unbound_session() {
+    let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
+    let config = harness.config.clone();
+    let spectator = Arc::new(
+        DelegationOrchestrator::new(
+            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
+            config.event_sink.clone(),
+            config.provider.history_store(),
+            config.agent_registry.clone(),
+            config.tool_registry_arc(),
+            config.hooks.clone(),
+            None,
+        )
+        .with_profile_id("owner"),
+    );
+    let spectator_listener = spectator.start_listening(config.event_sink.fanout());
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        harness.run_single_delegation(),
+    )
+    .await
+    .expect("unbound delegation timed out");
+    let children = harness.child_sessions().await;
+    spectator_listener.abort();
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+    assert_eq!(children.len(), 1);
+}
+
+#[tokio::test]
+async fn unrelated_profile_orchestrator_does_not_claim_delegation() {
+    let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
+    harness.stop_harness_orchestrator();
+    let config = harness.config.clone();
+    let store = config.provider.history_store();
+    store
+        .set_profile_binding(&harness.exec_ctx.session_id, "owner")
+        .await
+        .expect("bind parent profile");
+    let owner = Arc::new(
+        DelegationOrchestrator::new(
+            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
+            config.event_sink.clone(),
+            store.clone(),
+            config.agent_registry.clone(),
+            config.tool_registry_arc(),
+            config.hooks.clone(),
+            None,
+        )
+        .with_profile_id("owner"),
+    );
+    let unrelated = Arc::new(
+        DelegationOrchestrator::new(
+            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
+            config.event_sink.clone(),
+            store,
+            config.agent_registry.clone(),
+            config.tool_registry_arc(),
+            config.hooks.clone(),
+            None,
+        )
+        .with_profile_id("other"),
+    );
+    let owner_listener = owner.start_listening(config.event_sink.fanout());
+    let unrelated_listener = unrelated.start_listening(config.event_sink.fanout());
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        harness.run_single_delegation(),
+    )
+    .await
+    .expect("profile-isolated delegation timed out");
+    let children = harness.child_sessions().await;
+    owner_listener.abort();
+    unrelated_listener.abort();
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+    assert_eq!(children.len(), 1);
+}
+
+#[tokio::test]
+async fn missing_target_fails_and_unblocks_parent() {
+    let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
+    harness.stop_harness_orchestrator();
+    let config = harness.config.clone();
+    let missing_target = Arc::new(DelegationOrchestrator::new(
+        Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
+        config.event_sink.clone(),
+        config.provider.history_store(),
+        Arc::new(DefaultAgentRegistry::new()),
+        config.tool_registry_arc(),
+        config.hooks.clone(),
+        None,
+    ));
+    let listener = missing_target.start_listening(config.event_sink.fanout());
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        harness.run_single_delegation_without_child_tool(),
+    )
+    .await
+    .expect("missing target did not unblock the parent");
+    listener.abort();
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+    let delegations = config
+        .provider
+        .history_store()
+        .list_delegations(&harness.exec_ctx.session_id)
+        .await
+        .expect("delegations");
+    assert_eq!(delegations.len(), 1);
+    assert_eq!(delegations[0].status, DelegationStatus::Failed);
+}
+
+#[tokio::test]
+async fn timeout_cleanup_cancels_requested_delegation_before_it_can_start() {
+    let harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
+    let store = harness.config.provider.history_store();
+    let session = store
+        .get_session(&harness.exec_ctx.session_id)
+        .await
+        .expect("session lookup")
+        .expect("parent session");
+    let delegation = Delegation {
+        id: 0,
+        public_id: String::new(),
+        session_id: session.id,
+        task_id: None,
+        target_agent_id: "agent".to_string(),
+        objective: "not started yet".to_string(),
+        objective_hash: crate::hash::RapidHash::new(b"not started yet"),
+        context: None,
+        constraints: None,
+        expected_output: None,
+        verification_spec: None,
+        planning_summary: None,
+        status: DelegationStatus::Requested,
+        retry_count: 0,
+        created_at: OffsetDateTime::now_utc(),
+        completed_at: None,
+    };
+    let delegation = store
+        .create_delegation(delegation)
+        .await
+        .expect("create delegation");
+
+    crate::agent::execution::cleanup_timed_out_delegations(
+        &harness.config,
+        &harness.exec_ctx,
+        std::slice::from_ref(&delegation.public_id),
+    )
+    .await;
+
+    let delegation = store
+        .get_delegation(&delegation.public_id)
+        .await
+        .expect("delegation lookup")
+        .expect("delegation");
+    assert_eq!(delegation.status, DelegationStatus::Cancelled);
+    assert_eq!(
+        store
+            .claim_delegation(&delegation.public_id)
+            .await
+            .expect("claim result"),
+        crate::session::domain::DelegationClaim::InvalidState(DelegationStatus::Cancelled)
+    );
+}
+
+#[tokio::test]
+async fn timeout_cleanup_does_not_overwrite_terminal_delegation() {
+    let harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
+    let store = harness.config.provider.history_store();
+    let session = store
+        .get_session(&harness.exec_ctx.session_id)
+        .await
+        .expect("session lookup")
+        .expect("parent session");
+    let delegation = Delegation {
+        id: 0,
+        public_id: String::new(),
+        session_id: session.id,
+        task_id: None,
+        target_agent_id: "agent".to_string(),
+        objective: "already complete".to_string(),
+        objective_hash: crate::hash::RapidHash::new(b"already complete"),
+        context: None,
+        constraints: None,
+        expected_output: None,
+        verification_spec: None,
+        planning_summary: None,
+        status: DelegationStatus::Complete,
+        retry_count: 0,
+        created_at: OffsetDateTime::now_utc(),
+        completed_at: None,
+    };
+    let delegation = store
+        .create_delegation(delegation)
+        .await
+        .expect("create delegation");
+    let mut event_rx = harness.config.event_sink.fanout().subscribe();
+
+    crate::agent::execution::cleanup_timed_out_delegations(
+        &harness.config,
+        &harness.exec_ctx,
+        std::slice::from_ref(&delegation.public_id),
+    )
+    .await;
+
+    assert_eq!(
+        store
+            .get_delegation(&delegation.public_id)
+            .await
+            .expect("delegation lookup")
+            .expect("delegation")
+            .status,
+        DelegationStatus::Complete
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), event_rx.recv())
+            .await
+            .is_err(),
+        "terminal delegations must not emit timeout cancellation events"
+    );
+}
 
 #[tokio::test]
 async fn test_delegate_inherits_parent_reasoning_effort() {

@@ -401,9 +401,13 @@ impl LocalAgentHandle {
     ) -> std::result::Result<crate::acp::protocol::LoadSessionResponse, Error> {
         let session_id = req.session_id.to_string();
 
-        if let Some(profiles) = self.profiles()
-            && let Some(binding) = profiles.session_binding(&session_id).await
-        {
+        if let Some(profiles) = self.profiles() {
+            let binding = profiles.session_binding(&session_id).await.ok_or_else(|| {
+                Error::invalid_params().data(serde_json::json!({
+                    "message": "Session has no profile binding",
+                    "sessionId": session_id,
+                }))
+            })?;
             let runtime = profiles
                 .runtime_for_profile(&binding.profile_id)
                 .await

@@ -11,7 +11,7 @@ use crate::session::store::SessionStore;
 use crate::tools::CapabilityRequirement;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 type DelegateFactory =
     Box<dyn FnOnce(Arc<dyn StorageBackend>, Arc<EventFanout>) -> Arc<dyn AgentHandle> + Send>;
@@ -49,7 +49,16 @@ pub struct AgentQuorum {
     planner: Arc<dyn AgentHandle>,
     delegates: Vec<DelegateAgent>,
     orchestrator: Option<Arc<DelegationOrchestrator>>,
+    listener_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     cwd: Option<PathBuf>,
+}
+
+impl Drop for AgentQuorum {
+    fn drop(&mut self) {
+        if let Some(handle) = self.listener_handle.lock().unwrap().take() {
+            handle.abort();
+        }
+    }
 }
 
 impl AgentQuorum {
@@ -108,6 +117,15 @@ impl AgentQuorum {
     pub fn cwd(&self) -> Option<&PathBuf> {
         self.cwd.as_ref()
     }
+
+    pub async fn shutdown(&self) {
+        if let Some(handle) = self.listener_handle.lock().unwrap().take() {
+            handle.abort();
+        }
+        if let Some(orchestrator) = &self.orchestrator {
+            orchestrator.cancel_active_delegations().await;
+        }
+    }
 }
 
 pub struct AgentQuorumBuilder {
@@ -130,6 +148,7 @@ pub struct AgentQuorumBuilder {
     preregistered: Vec<(AgentInfo, Arc<dyn AgentHandle>)>,
     /// Optional routing snapshot handle for per-agent routing decisions.
     routing_snapshot: Option<crate::agent::remote::RoutingSnapshotHandle>,
+    profile_id: Option<String>,
 }
 
 impl AgentQuorumBuilder {
@@ -149,6 +168,7 @@ impl AgentQuorumBuilder {
             delegation_summarizer: None,
             preregistered: Vec::new(),
             routing_snapshot: None,
+            profile_id: None,
         }
     }
 
@@ -178,6 +198,7 @@ impl AgentQuorumBuilder {
             delegation_summarizer: None,
             preregistered: Vec::new(),
             routing_snapshot: None,
+            profile_id: None,
         }
     }
 
@@ -268,6 +289,11 @@ impl AgentQuorumBuilder {
         snapshot: crate::agent::remote::RoutingSnapshotHandle,
     ) -> Self {
         self.routing_snapshot = Some(snapshot);
+        self
+    }
+
+    pub fn with_profile_id(mut self, profile_id: impl Into<String>) -> Self {
+        self.profile_id = Some(profile_id.into());
         self
     }
 
@@ -370,16 +396,19 @@ impl AgentQuorumBuilder {
             if let Some(snap) = self.routing_snapshot {
                 orch = orch.with_routing_snapshot(snap);
             }
+            if let Some(profile_id) = self.profile_id {
+                orch = orch.with_profile_id(profile_id);
+            }
             let orchestrator = Arc::new(orch);
-
-            // All local agents are validated against this fanout above.
-            let _listener_handle = orchestrator.start_listening(&self.event_fanout);
 
             Some(orchestrator)
         } else {
             None
         };
 
+        let listener_handle = orchestrator
+            .as_ref()
+            .map(|orchestrator| orchestrator.start_listening(&self.event_fanout));
         Ok(AgentQuorum {
             storage: self.storage,
             event_fanout: self.event_fanout,
@@ -387,6 +416,7 @@ impl AgentQuorumBuilder {
             planner,
             delegates,
             orchestrator,
+            listener_handle: Mutex::new(listener_handle),
             cwd: self.cwd,
         })
     }
