@@ -749,7 +749,8 @@ impl Agent {
     pub async fn shutdown(&self) {
         if let Some(profiles) = self.profiles() {
             profiles.shutdown().await;
-        } else if let Some(quorum) = self.quorum() {
+        }
+        if let Some(quorum) = self.quorum() {
             quorum.shutdown().await;
         }
         self.inner.shutdown().await;

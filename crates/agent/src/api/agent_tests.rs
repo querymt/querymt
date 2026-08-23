@@ -65,6 +65,28 @@ async fn build_test_profile_agent(
     Ok(runtime.agent().clone().with_profiles(profiles))
 }
 
+async fn build_test_profile_multi_agent(
+    storage: Arc<crate::session::sqlite_storage::SqliteStorage>,
+    profile_dir: &std::path::Path,
+) -> Result<Agent> {
+    let (registry, _temp_dir) = empty_plugin_registry()?;
+    let catalog: Arc<dyn ProfileCatalog> = Arc::new(
+        LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(profile_dir)
+            .build(),
+    );
+    let infra = AgentInfra {
+        plugin_registry: Arc::new(registry),
+        storage: Some(storage),
+        session_mcp_attachment_source: None,
+        event_fanout: Some(Arc::new(crate::event_fanout::EventFanout::new())),
+    };
+    let profiles = AgentProfiles::new(catalog, "alpha", infra);
+    let runtime = profiles.active_runtime().await?;
+    Ok(runtime.agent().clone().with_profiles(profiles))
+}
+
 #[tokio::test]
 async fn with_profiles_reuses_root_agent_for_active_profile() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
@@ -649,5 +671,61 @@ async fn list_sessions_remote_bookmarks_mode_includes_detached_bookmarks() -> Re
         .expect("remote bookmark should be present");
     assert_eq!(remote.attached, Some(false));
     assert_eq!(remote.node.as_deref(), Some("remote-peer"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_with_profiles_and_quorum_executes_both() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    std::fs::write(
+        dir.path().join("team.toml"),
+        r#"
+[quorum]
+delegation = true
+verification = false
+snapshot_policy = "none"
+
+[planner]
+provider = "test"
+model = "test-planner"
+tools = ["delegate"]
+
+[[delegates]]
+id = "coder"
+provider = "test"
+model = "test-coder"
+tools = []
+"#,
+    )?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = build_test_profile_multi_agent(storage, dir.path()).await?;
+
+    // Verify both profiles and quorum are present
+    assert!(agent.profiles().is_some());
+    assert!(agent.quorum().is_some());
+    assert!(agent.is_multi());
+
+    // Get references before shutdown
+    let planner = agent.planner().expect("planner present");
+    let delegate = agent.delegate("coder").expect("delegate present");
+
+    // Verify all are running before shutdown
+    assert!(!planner.is_shutdown());
+    assert!(!delegate.is_shutdown());
+
+    // Shutdown the agent - both profiles and quorum should be shut down
+    agent.shutdown().await;
+
+    // Verify the planner and delegates were shut down
+    // This confirms that both quorum.shutdown() and profiles.shutdown() were called,
+    // because:
+    // 1. quorum.shutdown() cancels active delegations and shuts down the orchestrator
+    // 2. profiles.shutdown() iterates through runtimes and shuts down each agent
+    // If the bug existed (else-if instead of two separate if statements),
+    // only one of these would execute, and we'd see incomplete shutdown.
+    assert!(planner.is_shutdown());
+    assert!(delegate.is_shutdown());
+
     Ok(())
 }
