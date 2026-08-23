@@ -33,6 +33,9 @@ import {
   ConsolidationInfo,
   MeshInviteInfo,
   MeshInviteCreated,
+  SessionRuntimeStatus,
+  SessionRuntimePhase,
+  UiInputDelivery,
 } from '../types';
 import { debugLog, debugTrace } from '../utils/debugLog';
 
@@ -45,6 +48,16 @@ type UndoFrame = {
   messageId: string;
   status: 'pending' | 'confirmed';
   revertedFiles: string[];
+};
+
+export type PendingSessionInput = {
+  inputId: string;
+  sessionId: string;
+  delivery: 'steer' | 'queue';
+  text: string;
+  state: 'sending' | 'accepted' | 'queued' | 'applied' | 'started' | 'failed' | 'discarded';
+  position?: number;
+  error?: string;
 };
 
 type UndoState = {
@@ -145,6 +158,8 @@ export function useUiClient() {
   const [routingMode, setRoutingMode] = useState<RoutingMode>(RoutingMode.Single);
   const [activeAgentId, setActiveAgentId] = useState<string>('primary');
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [runtimeBySession, setRuntimeBySession] = useState<Map<string, SessionRuntimeStatus>>(new Map());
+  const [pendingInputsBySession, setPendingInputsBySession] = useState<Map<string, PendingSessionInput[]>>(new Map());
   const [connected, setConnected] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
   const reconnectAttemptRef = useRef(0);
@@ -327,6 +342,10 @@ export function useUiClient() {
             type: 'subscribe_session',
             data: { session_id: prevSession },
           } as any);
+          sendOnSocket(socket, {
+            type: 'get_runtime_state',
+            data: { session_id: prevSession },
+          });
         }
       };
 
@@ -422,6 +441,18 @@ export function useUiClient() {
     };
   }, []);
 
+  const updatePendingInput = useCallback(
+    (targetSessionId: string, inputId: string, update: Partial<PendingSessionInput>) => {
+      setPendingInputsBySession((prev) => {
+        const next = new Map(prev);
+        const items = next.get(targetSessionId) ?? [];
+        next.set(targetSessionId, items.map((item) => item.inputId === inputId ? { ...item, ...update } : item));
+        return next;
+      });
+    },
+    [],
+  );
+
   const pushSessionActionNotice = useCallback((kind: 'success' | 'error', message: string) => {
     const id = Date.now() + Math.floor(Math.random() * 1000);
     setSessionActionNotices((prev) => [...prev, { id, kind, message }]);
@@ -477,6 +508,53 @@ export function useUiClient() {
         }
         break;
       }
+      case 'input_submission_failed': {
+        updatePendingInput(msg.data.session_id, msg.data.client_input_id, {
+          state: 'failed',
+          error: msg.data.message,
+        });
+        pushSessionActionNotice('error', msg.data.code === 'run_closing'
+          ? 'The run is finishing. Queue this message for the next turn.'
+          : msg.data.message);
+        if (msg.data.active_run_id) {
+          requestAnimationFrame(() => {
+            socketRef.current?.send(JSON.stringify({
+              type: 'get_runtime_state',
+              data: { session_id: msg.data.session_id },
+            } satisfies UiClientMessage));
+          });
+        }
+        break;
+      }
+
+      case 'runtime_state': {
+        setRuntimeBySession((prev) => {
+          const next = new Map(prev);
+          next.set(msg.data.session_id, msg.data.state);
+          return next;
+        });
+        break;
+      }
+
+      case 'input_submitted': {
+        const result = msg.data.result;
+        const inputId = result.data.input_id;
+        if (result.status === 'steered') {
+          updatePendingInput(msg.data.session_id, inputId, {
+            state: 'accepted',
+            position: result.data.position,
+          });
+        } else if (result.status === 'queued') {
+          updatePendingInput(msg.data.session_id, inputId, {
+            state: 'queued',
+            position: result.data.position,
+          });
+        } else {
+          updatePendingInput(msg.data.session_id, inputId, { state: 'started' });
+        }
+        break;
+      }
+
       case 'session_events': {
         const d = msg.data;
         if (d.profile_id) {
@@ -533,6 +611,35 @@ export function useUiClient() {
         const eventEnvelope = unwrapEnvelope(d.event);
         const eventKind = eventEnvelope?.kind?.type;
         const kindData = eventEnvelope?.kind?.data ?? {};
+
+        if (eventKind === 'run_started') {
+          setRuntimeBySession((prev) => {
+            const next = new Map(prev);
+            next.set(d.session_id, {
+              phase: SessionRuntimePhase.Starting,
+              active_run_id: kindData.run_id,
+              steerable: true,
+              pending_steering_count: 0,
+              queued_input_count: next.get(d.session_id)?.queued_input_count ?? 0,
+              run_started_at_ms: Date.now(),
+            });
+            return next;
+          });
+        } else if (eventKind === 'run_completed') {
+          socketRef.current?.send(JSON.stringify({
+            type: 'get_runtime_state',
+            data: { session_id: d.session_id },
+          } satisfies UiClientMessage));
+        } else if (eventKind === 'steering_applied') {
+          updatePendingInput(d.session_id, kindData.input_id, { state: 'applied' });
+        } else if (eventKind === 'steering_discarded') {
+          updatePendingInput(d.session_id, kindData.input_id, {
+            state: 'discarded',
+            error: kindData.reason,
+          });
+        } else if (eventKind === 'queued_input_started') {
+          updatePendingInput(d.session_id, kindData.input_id, { state: 'started' });
+        }
 
         if (eventKind === 'llm_retry_wait' || eventKind === 'llm_retry_resume') {
           // TODO(ui): replace this stub with the deferred generic retry countdown UI.
@@ -1573,6 +1680,49 @@ export function useUiClient() {
     });
   }, [requestWorkspacePath, sessionGroups, sessionId, defaultCwd]);
 
+  const requestRuntimeState = useCallback((targetSessionId?: string) => {
+    const resolvedSessionId = targetSessionId ?? sessionIdRef.current;
+    if (!resolvedSessionId) return;
+    sendMessage({ type: 'get_runtime_state', data: { session_id: resolvedSessionId } });
+  }, []);
+
+  const submitInput = useCallback((
+    delivery: 'steer' | 'queue',
+    prompt: UiPromptBlock[],
+    targetSessionId?: string,
+  ): boolean => {
+    const resolvedSessionId = targetSessionId ?? sessionIdRef.current;
+    if (!resolvedSessionId) return false;
+    const runtime = runtimeBySession.get(resolvedSessionId);
+    if (delivery === 'steer' && (!runtime?.steerable || !runtime.active_run_id)) return false;
+
+    const inputId = uuidv7();
+    const text = prompt
+      .filter((block): block is Extract<UiPromptBlock, { type: 'text' }> => block.type === 'text')
+      .map((block) => block.data.text)
+      .join('\n');
+    setPendingInputsBySession((prev) => {
+      const next = new Map(prev);
+      next.set(resolvedSessionId, [
+        ...(next.get(resolvedSessionId) ?? []),
+        { inputId, sessionId: resolvedSessionId, delivery, text, state: 'sending' },
+      ]);
+      return next;
+    });
+
+    sendMessage({
+      type: 'submit_input',
+      data: {
+        session_id: resolvedSessionId,
+        delivery: delivery === 'steer' ? UiInputDelivery.Steer : UiInputDelivery.Queue,
+        expected_run_id: delivery === 'steer' ? runtime?.active_run_id : undefined,
+        client_input_id: inputId,
+        prompt,
+      },
+    });
+    return true;
+  }, [runtimeBySession]);
+
   const sendPrompt = useCallback(async (prompt: UiPromptBlock[]) => {
     sendMessage({ type: 'prompt', data: { prompt } });
   }, []);
@@ -2019,6 +2169,10 @@ export function useUiClient() {
     reconnecting,
     newSession,
     sendPrompt,
+    submitInput,
+    requestRuntimeState,
+    runtimeBySession,
+    pendingInputsBySession,
     cancelSession,
     deleteSession,
     agents,

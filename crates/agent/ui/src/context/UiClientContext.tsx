@@ -27,7 +27,9 @@ import type {
   ConsolidationInfo,
   MeshInviteInfo,
   MeshInviteCreated,
+  SessionRuntimeStatus,
 } from '../types';
+import type { PendingSessionInput } from '../hooks/useUiClient';
 
 // ---------------------------------------------------------------------------
 // 1. Actions Context — stable callbacks that never change
@@ -36,6 +38,8 @@ import type {
 export interface UiClientActionsContextValue {
   newSession: (cwd?: string, node?: string) => Promise<string>;
   sendPrompt: (blocks: UiPromptBlock[], agentId?: string, agentMode?: string) => void;
+  submitInput: (delivery: 'steer' | 'queue', blocks: UiPromptBlock[], sessionId?: string) => boolean;
+  requestRuntimeState: (sessionId?: string) => void;
   cancelSession: () => void;
   deleteSession: (sessionId: string, sessionLabel?: string) => void;
   loadSession: (sessionId: string, sessionLabel?: string) => void;
@@ -135,6 +139,8 @@ export interface UiClientSessionContextValue {
   sessionsByAgent: Record<string, string>;
   sessionParentMap: Map<string, string>;
   thinkingBySession: Map<string, Set<string>>;
+  runtimeBySession: Map<string, SessionRuntimeStatus>;
+  pendingInputsBySession: Map<string, PendingSessionInput[]>;
   thinkingAgentId: string | null;
   thinkingAgentIds: Set<string>;
   isConversationComplete: boolean;
@@ -226,6 +232,8 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
   const actions = useMemo<UiClientActionsContextValue>(() => ({
     newSession: uiClient.newSession,
     sendPrompt: uiClient.sendPrompt,
+    submitInput: uiClient.submitInput,
+    requestRuntimeState: uiClient.requestRuntimeState,
     cancelSession: uiClient.cancelSession,
     deleteSession: uiClient.deleteSession,
     loadSession: uiClient.loadSession,
@@ -316,6 +324,8 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     sessionsByAgent: uiClient.sessionsByAgent,
     sessionParentMap: uiClient.sessionParentMap,
     thinkingBySession: uiClient.thinkingBySession,
+    runtimeBySession: uiClient.runtimeBySession,
+    pendingInputsBySession: uiClient.pendingInputsBySession,
     thinkingAgentId: uiClient.thinkingAgentId,
     thinkingAgentIds: uiClient.thinkingAgentIds,
     isConversationComplete: uiClient.isConversationComplete,
@@ -355,6 +365,8 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     uiClient.sessionsByAgent,
     uiClient.sessionParentMap,
     uiClient.thinkingBySession,
+    uiClient.runtimeBySession,
+    uiClient.pendingInputsBySession,
     uiClient.thinkingAgentId,
     uiClient.thinkingAgentIds,
     uiClient.isConversationComplete,

@@ -62,6 +62,15 @@ pub(super) async fn transition_waiting_for_event(
                 _ = exec_ctx.cancellation_token.cancelled() => {
                     return Ok(ExecutionState::Cancelled);
                 }
+                _ = async {
+                    if let Some(inbox) = &exec_ctx.steering {
+                        inbox.notified().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    return Ok(ExecutionState::BeforeLlmCall { context: context.clone() });
+                }
                 event = event_rx.recv() => {
                     let event = match event {
                         Ok(event) => event,

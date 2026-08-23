@@ -12,6 +12,16 @@ struct SessionIdRequest {
     session_id: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct SubmitInputRequest {
+    session_id: String,
+    prompt: Vec<crate::acp::protocol::ContentBlock>,
+    #[serde(default)]
+    expected_run_id: Option<String>,
+    #[serde(default)]
+    client_input_id: Option<String>,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct UndoStackFrameResponse {
     message_id: String,
@@ -39,6 +49,43 @@ struct UndoStackResponse {
 }
 
 impl LocalAgentHandle {
+    pub(super) async fn handle_ext_session_submit_input(
+        &self,
+        req: ExtRequest,
+        delivery: crate::agent::messages::InputDelivery,
+    ) -> Result<ExtResponse, Error> {
+        let parsed: SubmitInputRequest = parse_session_op_request(req)?;
+        let session_ref = self
+            .session_ref_for_agent_session(&parsed.session_id)
+            .await?;
+        let result = session_ref
+            .submit_input(crate::agent::messages::SubmitInput {
+                session_id: parsed.session_id,
+                client_input_id: parsed.client_input_id,
+                expected_run_id: parsed.expected_run_id,
+                delivery,
+                prompt: parsed.prompt,
+            })
+            .await
+            .map_err(Error::from)?;
+        ext_json_response(&result)
+    }
+
+    pub(super) async fn handle_ext_session_runtime_state(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
+        let parsed: SessionIdRequest = parse_session_op_request(req)?;
+        let session_ref = self
+            .session_ref_for_agent_session(&parsed.session_id)
+            .await?;
+        let state = session_ref
+            .get_runtime_status()
+            .await
+            .map_err(Error::from)?;
+        ext_json_response(&state)
+    }
+
     pub(super) async fn handle_ext_session_undo(
         &self,
         req: ExtRequest,

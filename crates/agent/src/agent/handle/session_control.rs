@@ -2,7 +2,7 @@ use super::utils::format_prefixed_error_chain;
 use super::*;
 
 impl LocalAgentHandle {
-    pub(super) async fn session_ref_for_agent_session(
+    pub(crate) async fn session_ref_for_agent_session(
         &self,
         session_id: &str,
     ) -> Result<SessionActorRef, Error> {

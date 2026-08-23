@@ -72,23 +72,30 @@ impl MiddlewareDriver for AgentModeMiddleware {
         state: ExecutionState,
         _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
     ) -> Result<ExecutionState> {
+        Ok(state)
+    }
+
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> Result<ExecutionState> {
         match state {
             ExecutionState::BeforeLlmCall { ref context } => {
-                // Read mode from the per-session ConversationContext
-                let mode = context.session_mode;
-
-                if let Some(reminder) = self.reminders.get(&mode) {
-                    trace!(
-                        "AgentModeMiddleware: injecting reminder for {:?} mode",
-                        mode
-                    );
-                    let new_context = context.inject_message(reminder.clone());
-                    Ok(ExecutionState::BeforeLlmCall {
-                        context: Arc::new(new_context),
-                    })
+                let new_context = if let Some(reminder) = self.reminders.get(&context.session_mode)
+                {
+                    trace!("AgentModeMiddleware: refreshing reminder fragment");
+                    context.upsert_fragment(
+                        "agent_mode",
+                        reminder.clone(),
+                        crate::middleware::ContextPriority::High,
+                    )
                 } else {
-                    Ok(state)
-                }
+                    context.remove_fragment("agent_mode")
+                };
+                Ok(ExecutionState::BeforeLlmCall {
+                    context: Arc::new(new_context),
+                })
             }
             other => Ok(other),
         }

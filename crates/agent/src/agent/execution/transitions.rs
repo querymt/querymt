@@ -212,7 +212,7 @@ pub(super) async fn transition_call_llm(
     debug!(
         "CallLlm: session={}, messages={}",
         session_id,
-        context.messages.len()
+        context.request_messages().len()
     );
 
     if exec_ctx.cancellation_token.is_cancelled() {
@@ -231,7 +231,8 @@ pub(super) async fn transition_call_llm(
     );
 
     let session_handle = &exec_ctx.session_handle;
-    let messages_with_cache = apply_cache_breakpoints(&context.messages);
+    let request_messages = context.request_messages();
+    let messages_with_cache = apply_cache_breakpoints(&request_messages);
 
     // Pre-allocated message_id for streaming path so that delta events and the
     // final AssistantMessageStored share the same ID.
@@ -940,7 +941,8 @@ pub(super) async fn transition_after_llm(
             context.provider.clone(),
             context.model.clone(),
         )
-        .with_session_mode(context.session_mode),
+        .with_session_mode(context.session_mode)
+        .with_fragments(context.fragments.clone()),
     );
 
     match response.finish_reason {
@@ -968,15 +970,18 @@ pub(super) async fn transition_after_llm(
                             task.public_id
                         );
                     }
-                    TaskKind::Finite | TaskKind::Evolving => {
+                    TaskKind::Finite => {
                         if let Err(e) = exec_ctx.state.update_task_status(TaskStatus::Done).await {
-                            debug!("Failed to auto-complete task on stop: {}", e);
+                            debug!("Failed to auto-complete finite task on stop: {}", e);
                         } else if let Some(task) = exec_ctx.state.active_task.clone() {
                             config.emit_event(
                                 &exec_ctx.session_id,
                                 AgentEventKind::TaskStatusChanged { task },
                             );
                         }
+                    }
+                    TaskKind::Evolving => {
+                        debug!("Evolving task remains active after an ordinary model stop");
                     }
                 }
             }

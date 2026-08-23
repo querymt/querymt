@@ -91,6 +91,9 @@ pub enum AgentError {
     #[error("mesh admission rejected: {reason}")]
     AdmissionRejected { reason: String },
 
+    #[error("turn control error: {message}")]
+    TurnControl { message: String },
+
     // --- Serialization ---
     #[error("serialization error: {0}")]
     Serialization(String),
@@ -159,6 +162,14 @@ fn provider_error_metadata(error: &LLMErrorPayload) -> (Option<ProviderErrorKind
             Some(message.clone()),
         ),
         _ => (None, None),
+    }
+}
+
+impl From<crate::agent::turn_control::TurnControlError> for AgentError {
+    fn from(error: crate::agent::turn_control::TurnControlError) -> Self {
+        Self::TurnControl {
+            message: error.to_string(),
+        }
     }
 }
 

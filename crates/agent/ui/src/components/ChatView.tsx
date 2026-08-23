@@ -54,6 +54,8 @@ export function ChatView() {
   // (no Config context), so auth/model-list/plugin changes won't trigger re-renders.
   const {
     sendPrompt,
+    submitInput,
+    requestRuntimeState,
     cancelSession,
     deleteSession,
     loadMoreSessions,
@@ -87,6 +89,8 @@ export function ChatView() {
     agents,
     sessionGroups,
     thinkingBySession,
+    runtimeBySession,
+    pendingInputsBySession,
     sessionParentMap,
     sessionNextCursor,
     sessionTotalCount,
@@ -271,7 +275,14 @@ export function ChatView() {
 
   // Keyboard shortcuts (Ctrl+X chords, double Esc, etc. moved to AppShell)
 
-  const handleSendPrompt = async () => {
+  const runtimeState = sessionId ? runtimeBySession.get(sessionId) : undefined;
+  const pendingInputs = sessionId ? pendingInputsBySession.get(sessionId) ?? [] : [];
+
+  useEffect(() => {
+    if (sessionId && connected) requestRuntimeState(sessionId);
+  }, [sessionId, connected, requestRuntimeState]);
+
+  const handleSendPrompt = async (delivery?: 'steer' | 'queue') => {
     if (!prompt.trim() || loading || !sessionId) return;
 
     fileMention.clear();
@@ -279,8 +290,12 @@ export function ChatView() {
 
     setLoading(true);
     try {
-      await sendPrompt(buildPromptBlocksFromInput(prompt));
-      setPrompt('');
+      const blocks = buildPromptBlocksFromInput(prompt);
+      const activeDelivery = delivery ?? (runtimeState?.steerable ? 'steer' : undefined);
+      const accepted = activeDelivery
+        ? submitInput(activeDelivery, blocks, sessionId)
+        : (await sendPrompt(blocks), true);
+      if (accepted) setPrompt('');
     } catch (err) {
       followArmedRef.current = false;
       console.error('Failed to send prompt:', err);
@@ -1027,6 +1042,8 @@ export function ChatView() {
         loading={loading}
         isMobile={isMobile}
         sessionThinkingAgentId={sessionThinkingAgentId}
+        runtimeState={runtimeState}
+        pendingInputs={pendingInputs}
         rateLimitState={rateLimitState}
         activeIndexStatus={activeIndexStatus}
         allFiles={fileMention.allFiles}

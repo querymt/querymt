@@ -385,6 +385,7 @@ mod tests {
         let context = Arc::new(ConversationContext {
             session_id: "test".into(),
             messages: Arc::from([]),
+            fragments: Arc::from([]),
             stats: Arc::new(AgentStats::default()),
             provider: "mock".into(),
             model: "mock-model".into(),
@@ -418,6 +419,7 @@ mod tests {
         let context = Arc::new(ConversationContext {
             session_id: "test".into(),
             messages: Arc::from([]),
+            fragments: Arc::from([]),
             stats: Arc::new(AgentStats::default()),
             provider: "mock".into(),
             model: "mock-model".into(),

@@ -980,8 +980,6 @@ mod remote_impl {
             msg: ListRemoteSessions,
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
-            use crate::agent::messages::SessionRuntimeStatus;
-
             let shared_state = self.shared_state.clone();
             let hostname = self.node_name.clone().unwrap_or_else(get_hostname);
 
@@ -1049,12 +1047,18 @@ mod remote_impl {
                                 )
                                 .await
                             {
-                                Ok(SessionRuntimeStatus::Idle) => "idle".to_string(),
-                                Ok(SessionRuntimeStatus::Waiting) => "waiting".to_string(),
-                                Ok(SessionRuntimeStatus::Running) => "running".to_string(),
-                                Ok(SessionRuntimeStatus::CancelRequested) => {
-                                    "cancel_requested".to_string()
-                                }
+                                Ok(status) => match status.phase {
+                                    crate::agent::messages::SessionRuntimePhase::Idle => {
+                                        "idle".to_string()
+                                    }
+                                    crate::agent::messages::SessionRuntimePhase::Waiting => {
+                                        "waiting".to_string()
+                                    }
+                                    crate::agent::messages::SessionRuntimePhase::CancelRequested => {
+                                        "cancel_requested".to_string()
+                                    }
+                                    _ => "running".to_string(),
+                                },
                                 Err(_) => "active".to_string(),
                             };
                             (aid, Some(state))

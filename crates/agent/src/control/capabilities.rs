@@ -32,6 +32,7 @@ pub struct ControlFeatureInfo {
     pub profiles: bool,
     pub auth: bool,
     pub models: bool,
+    pub steering: bool,
 }
 
 #[typeshare]
@@ -85,6 +86,9 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         "querymt/auth/setApiToken".to_string(),
         "querymt/auth/clearApiToken".to_string(),
         "querymt/auth/setMethod".to_string(),
+        "querymt/session/steer".to_string(),
+        "querymt/session/queue".to_string(),
+        "querymt/session/runtimeState".to_string(),
         "querymt/session/undo".to_string(),
         "querymt/session/redo".to_string(),
         "querymt/session/undoStack".to_string(),
@@ -150,6 +154,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
             profiles: agent.profiles().is_some(),
             auth: true,
             models: true,
+            steering: true,
         },
         methods,
         notifications: vec![

@@ -68,34 +68,29 @@ pub(crate) struct ExecutionContext {
     pub tool_config: ToolConfig,
 
     /// Origin of this execution cycle — interactive (user/delegation) or scheduled.
-    ///
-    /// When `Scheduled`, the `SessionActor` emits explicit terminal events
-    /// (`ScheduledExecutionCompleted` / `ScheduledExecutionFailed`) so the
-    /// `SchedulerActor` can correlate cycle completion without relying on
-    /// generic task events.
     pub execution_origin: ExecutionOrigin,
 
-    /// Optional knowledge store, propagated into tool contexts so knowledge
-    /// tools (`knowledge_ingest`, `knowledge_query`, etc.) can access it.
+    /// Optional knowledge store, propagated into tool contexts so knowledge tools can access it.
     pub knowledge_store: Option<Arc<dyn KnowledgeStore>>,
 
-    /// Optional event sink, propagated into tool contexts so tools can emit
-    /// agent events (e.g. `KnowledgeIngested`, `KnowledgeConsolidated`).
+    /// Optional event sink, propagated into tool contexts so tools can emit agent events.
     pub event_sink: Option<Arc<crate::event_sink::EventSink>>,
 
     /// Optional workspace query bridge for VS Code language intelligence.
-    /// When set, the `language_query` tool can access diagnostics, references,
-    /// definitions, symbols, hover docs, and type definitions through the
-    /// editor's language server.
     pub workspace_query_bridge: Option<ClientBridgeSender>,
     /// Stable turn id used by hook payloads and turn-scoped metadata.
     pub turn_id: Option<String>,
     /// Agent mode captured at turn start for this execution.
-    ///
-    /// This is intentionally a per-turn snapshot rather than a live view of the
-    /// mutable session actor mode. If the user changes mode while a prompt is
-    /// running, the new mode applies to the next turn.
     pub turn_mode: AgentMode,
+    /// Inbox bound to this run for boundary-safe steering.
+    pub steering: Option<Arc<crate::agent::turn_control::SteeringInbox>>,
+    /// Original complete prompt, retained for objective anchoring.
+    pub initial_prompt: Vec<crate::acp::protocol::ContentBlock>,
+    /// Latest steering summaries applied during this run.
+    pub steering_summaries: Vec<String>,
+    /// Reports execution phase changes back to the owning session actor.
+    pub phase_reporter:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::agent::turn_control::RunPhase>>,
 }
 
 impl ExecutionContext {
@@ -120,6 +115,10 @@ impl ExecutionContext {
             workspace_query_bridge: None,
             turn_id: None,
             turn_mode: AgentMode::Build,
+            steering: None,
+            initial_prompt: Vec::new(),
+            steering_summaries: Vec::new(),
+            phase_reporter: None,
         }
     }
 
@@ -164,6 +163,33 @@ impl ExecutionContext {
     pub fn with_turn_mode(mut self, mode: AgentMode) -> Self {
         self.turn_mode = mode;
         self
+    }
+
+    pub fn with_steering(
+        mut self,
+        steering: Arc<crate::agent::turn_control::SteeringInbox>,
+    ) -> Self {
+        self.steering = Some(steering);
+        self
+    }
+
+    pub fn with_initial_prompt(mut self, prompt: Vec<crate::acp::protocol::ContentBlock>) -> Self {
+        self.initial_prompt = prompt;
+        self
+    }
+
+    pub fn with_phase_reporter(
+        mut self,
+        reporter: tokio::sync::mpsc::UnboundedSender<crate::agent::turn_control::RunPhase>,
+    ) -> Self {
+        self.phase_reporter = Some(reporter);
+        self
+    }
+
+    pub fn report_phase(&self, phase: crate::agent::turn_control::RunPhase) {
+        if let Some(reporter) = &self.phase_reporter {
+            let _ = reporter.send(phase);
+        }
     }
 
     pub fn cwd(&self) -> Option<&Path> {

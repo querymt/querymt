@@ -76,6 +76,25 @@ pub async fn prompt_for_mode(
     Ok(())
 }
 
+pub async fn build_ui_prompt_blocks(
+    state: &ServerState,
+    session_id: &str,
+    prompt: &[UiPromptBlock],
+) -> Result<(SessionActorRef, Vec<ContentBlock>), String> {
+    let session_ref = session_ref_for_session(state, session_id)
+        .await
+        .ok_or_else(|| format!("session not found: {session_id}"))?;
+    let session_cwd = session_cwd_for(state, session_id).await;
+    let blocks = super::mentions::build_prompt_blocks(
+        &state.workspace_manager,
+        session_cwd.as_ref(),
+        prompt,
+        Some(&session_ref),
+    )
+    .await;
+    Ok((session_ref, blocks))
+}
+
 async fn prompt_session(
     state: &ServerState,
     session_id: &str,

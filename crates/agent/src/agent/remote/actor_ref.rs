@@ -202,6 +202,63 @@ impl SessionActorRef {
         }
     }
 
+    pub async fn submit_input(
+        &self,
+        input: messages::SubmitInput,
+    ) -> Result<messages::SubmitInputResult, AgentError> {
+        let message = messages::SubmitSessionInput { input };
+        match self {
+            Self::Local(actor_ref) => actor_ref.ask(message).await.map_err(|error| match error {
+                kameo::error::SendError::HandlerError(error) => error,
+                other => AgentError::RemoteActor(other.to_string()),
+            }),
+            #[cfg(feature = "remote")]
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&message)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
+                .send()
+                .await
+                .map_err(|error| {
+                    Self::map_agent_timeout_remote_send_error(
+                        error,
+                        "SubmitInput timed out on remote session",
+                    )
+                }),
+        }
+    }
+
+    pub async fn steer(
+        &self,
+        session_id: String,
+        expected_run_id: String,
+        prompt: Vec<crate::acp::protocol::ContentBlock>,
+    ) -> Result<messages::SubmitInputResult, AgentError> {
+        self.submit_input(messages::SubmitInput {
+            session_id,
+            client_input_id: None,
+            expected_run_id: Some(expected_run_id),
+            delivery: messages::InputDelivery::Steer,
+            prompt,
+        })
+        .await
+    }
+
+    pub async fn queue(
+        &self,
+        session_id: String,
+        prompt: Vec<crate::acp::protocol::ContentBlock>,
+    ) -> Result<messages::SubmitInputResult, AgentError> {
+        self.submit_input(messages::SubmitInput {
+            session_id,
+            client_input_id: None,
+            expected_run_id: None,
+            delivery: messages::InputDelivery::Queue,
+            prompt,
+        })
+        .await
+    }
+
     /// Fire-and-forget cancellation.
     pub async fn cancel(&self) -> Result<(), AgentError> {
         match self {

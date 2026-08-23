@@ -16,6 +16,12 @@ pub enum MessagePart {
     Prompt {
         blocks: Vec<ContentBlock>,
     },
+    Steering {
+        run_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_input_id: Option<String>,
+        blocks: Vec<ContentBlock>,
+    },
     Reasoning {
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,6 +85,7 @@ impl MessagePart {
         match self {
             MessagePart::Text { .. } => "text",
             MessagePart::Prompt { .. } => "prompt",
+            MessagePart::Steering { .. } => "steering",
             MessagePart::Reasoning { .. } => "reasoning",
             MessagePart::StepStart { .. } => "step_start",
             MessagePart::StepFinish { .. } => "step_finish",
@@ -176,6 +183,10 @@ impl AgentMessage {
                 }
                 MessagePart::Prompt {
                     blocks: prompt_blocks,
+                }
+                | MessagePart::Steering {
+                    blocks: prompt_blocks,
+                    ..
                 } => {
                     blocks.push(Content::text(render_prompt_for_llm(
                         prompt_blocks,

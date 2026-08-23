@@ -29,6 +29,7 @@ pub mod session_mcp;
 pub mod session_registry;
 pub mod snapshots;
 pub mod tools;
+pub mod turn_control;
 pub mod undo;
 pub mod utils;
 
@@ -40,6 +41,7 @@ pub use core::{
 };
 pub use execution::CycleOutcome;
 pub use snapshots::SnapshotState;
+pub use turn_control::{InputDelivery, SubmitInput, SubmitInputResult, TurnControlError};
 
 // Re-export kameo actor types
 pub use agent_config::AgentConfig;
