@@ -38,10 +38,6 @@ describe('useUiClient steering', () => {
   beforeEach(() => {
     MockWebSocket.instance = null;
     (globalThis as unknown as { WebSocket: typeof MockWebSocket }).WebSocket = MockWebSocket;
-    Object.defineProperty(window, 'location', {
-      value: { protocol: 'http:', host: 'localhost:3000' },
-      writable: true,
-    });
   });
 
   afterEach(() => {
@@ -147,6 +143,20 @@ describe('useUiClient steering', () => {
       position: 2,
     });
 
+    // Replay input_queued event to verify idempotent reconciliation
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage(eventMessage('session-1', {
+        type: 'input_queued',
+        data: { input_id: queuedInputId, position: 2 },
+      }));
+    });
+    expect(result.current.pendingInputsBySession.get('session-1')).toHaveLength(1);
+    expect(result.current.pendingInputsBySession.get('session-1')?.[0]).toMatchObject({
+      inputId: queuedInputId,
+      state: 'queued',
+      position: 2,
+    });
+
     await act(async () => {
       MockWebSocket.instance?.simulateMessage({
         type: 'runtime_state',
@@ -183,6 +193,18 @@ describe('useUiClient steering', () => {
     expect(result.current.pendingInputsBySession.get('session-1')?.find(
       (item) => item.inputId === steeringInputId,
     )).toMatchObject({ state: 'accepted', position: 1 });
+
+    // Replay steering_accepted event to verify idempotent reconciliation
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage(eventMessage('session-1', {
+        type: 'steering_accepted',
+        data: { run_id: 'run-1', input_id: steeringInputId, position: 1 },
+      }));
+    });
+    expect(result.current.pendingInputsBySession.get('session-1')).toHaveLength(2);
+    expect(result.current.pendingInputsBySession.get('session-1')?.find(
+      (item) => item.inputId === steeringInputId,
+    )).toMatchObject({ state: 'accepted', position: 1 });
   });
 
   it('refreshes runtime state when a queued input starts', async () => {
@@ -199,6 +221,7 @@ describe('useUiClient steering', () => {
         [{ type: 'text', data: { text: 'Run this next.' } }],
         'session-1',
       );
+      expect(dispatch.accepted).toBe(true);
       if (dispatch.accepted) inputId = dispatch.inputId;
     });
     MockWebSocket.instance!.sent = [];
