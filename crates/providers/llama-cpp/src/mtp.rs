@@ -1,6 +1,7 @@
 use crate::backend::llama_backend;
 use crate::config::LlamaCppConfig;
 use crate::context::{apply_context_params, resolve_n_batch, resolve_n_ubatch};
+use crate::response::GenerationTermination;
 use crate::tools::sampler::{SamplingParams, build_standard_sampler};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{LlamaContextParams, LlamaContextType};
@@ -22,6 +23,7 @@ pub(crate) struct MtpRunStats {
     pub rounds: u32,
     pub drafted: u32,
     pub accepted: u32,
+    pub termination: GenerationTermination,
 }
 
 fn clear_from(ctx: &mut LlamaContext<'_>, pos: i32, which: &str) -> Result<(), LLMError> {
@@ -81,7 +83,7 @@ pub(crate) fn run_mtp(
     max_tokens: u32,
     temperature: Option<f32>,
     sampler: Option<LlamaSampler>,
-    mut on_token: impl FnMut(LlamaToken) -> Result<bool, LLMError>,
+    mut on_token: impl FnMut(LlamaToken) -> Result<Option<GenerationTermination>, LLMError>,
 ) -> Result<MtpRunStats, LLMError> {
     let speculative_cfg = cfg
         .speculative
@@ -191,10 +193,15 @@ pub(crate) fn run_mtp(
 
     'generate: while stats.output_tokens < max_tokens {
         if model.is_eog_token(pending) {
+            stats.termination = GenerationTermination::Eog;
             break;
         }
         stats.output_tokens += 1;
-        if !on_token(pending)? || stats.output_tokens >= max_tokens {
+        if let Some(termination) = on_token(pending)? {
+            stats.termination = termination;
+            break;
+        }
+        if stats.output_tokens >= max_tokens {
             break;
         }
 
@@ -274,10 +281,15 @@ pub(crate) fn run_mtp(
         for token in drafts.iter().take(accepted) {
             committed_prefix.push(*token);
             if model.is_eog_token(*token) {
+                stats.termination = GenerationTermination::Eog;
                 break 'generate;
             }
             stats.output_tokens += 1;
-            if !on_token(*token)? || stats.output_tokens >= max_tokens {
+            if let Some(termination) = on_token(*token)? {
+                stats.termination = termination;
+                break 'generate;
+            }
+            if stats.output_tokens >= max_tokens {
                 break 'generate;
             }
         }

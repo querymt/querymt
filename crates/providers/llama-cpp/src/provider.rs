@@ -18,7 +18,7 @@ use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 use querymt::LLMProvider;
-use querymt::chat::{ChatMessage, ChatProvider, ChatResponse, FinishReason, Tool};
+use querymt::chat::{ChatMessage, ChatProvider, ChatResponse, Tool};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
@@ -360,8 +360,11 @@ impl ChatProvider for LlamaCppProvider {
                     active_multimodal,
                     &bitmaps,
                 )?;
-                let (content, thinking, tool_calls, finish_reason) =
+                let (content, thinking, tool_calls, _) =
                     parse_tool_response(&template_result, &generated.text)?;
+                let finish_reason = generated
+                    .termination
+                    .finish_reason(tool_calls.as_ref().is_some_and(|calls| !calls.is_empty()));
 
                 return Ok(Box::new(LlamaCppChatResponse {
                     text: content,
@@ -388,8 +391,9 @@ impl ChatProvider for LlamaCppProvider {
                 active_multimodal,
                 &bitmaps,
             )?;
-            let (content, thinking, _tool_calls, finish_reason) =
+            let (content, thinking, _tool_calls, _) =
                 parse_tool_response(&template_result, &generated.text)?;
+            let finish_reason = generated.termination.finish_reason(false);
             return Ok(Box::new(LlamaCppChatResponse {
                 text: content,
                 thinking,
@@ -414,8 +418,10 @@ impl ChatProvider for LlamaCppProvider {
             active_multimodal,
             &bitmaps,
         )?;
-        // Fallback handling (existing logic)
-        if generated.text.trim().is_empty() {
+        // Retry alternate prompt formats only when the model ended immediately.
+        if generated.text.trim().is_empty()
+            && generated.termination == crate::response::GenerationTermination::Eog
+        {
             if used_chat_template && self.cfg.use_chat_template.is_none() {
                 let (fallback_prompt, _) =
                     build_prompt_with(&self.model, &self.cfg, messages, false, media_marker)?;
@@ -431,7 +437,9 @@ impl ChatProvider for LlamaCppProvider {
                 )?;
             }
         }
-        if generated.text.trim().is_empty() {
+        if generated.text.trim().is_empty()
+            && generated.termination == crate::response::GenerationTermination::Eog
+        {
             let raw_prompt = build_raw_prompt(&self.cfg, messages)?;
             generated = generate(
                 &self.model,
@@ -456,7 +464,7 @@ impl ChatProvider for LlamaCppProvider {
             text: clean_text,
             thinking,
             tool_calls: None,
-            finish_reason: FinishReason::Stop,
+            finish_reason: generated.termination.finish_reason(false),
             usage: generated.usage,
         }))
     }
@@ -530,14 +538,10 @@ impl ChatProvider for LlamaCppProvider {
                         multimodal.as_deref(),
                         &bitmaps,
                     ) {
-                        Ok((usage, has_tool_calls)) => {
+                        Ok((usage, termination, has_tool_calls)) => {
                             let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Usage(usage)));
                             let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Done {
-                                finish_reason: if has_tool_calls {
-                                    FinishReason::ToolCalls
-                                } else {
-                                    FinishReason::Stop
-                                },
+                                finish_reason: termination.finish_reason(has_tool_calls),
                             }));
                         }
                         Err(err) => {
@@ -577,10 +581,10 @@ impl ChatProvider for LlamaCppProvider {
                 multimodal.as_deref(),
                 &bitmaps,
             ) {
-                Ok(usage) => {
+                Ok((usage, termination)) => {
                     let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Usage(usage)));
                     let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::Done {
-                        finish_reason: FinishReason::Stop,
+                        finish_reason: termination.finish_reason(false),
                     }));
                 }
                 Err(err) => {

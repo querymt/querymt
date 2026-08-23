@@ -2,7 +2,7 @@ use crate::chat_format::parse_assistant_format_with_state;
 use crate::common_chat::ChatTemplateResult;
 use crate::config::LlamaCppConfig;
 use crate::multimodal::MultimodalContext;
-use crate::response::GeneratedText;
+use crate::response::{GeneratedText, GenerationTermination};
 use crate::tools::prefill::prefill_for_tool_generation;
 use crate::tools::sampler::{SamplingParams, build_structured_sampler, build_tool_sampler};
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -57,10 +57,11 @@ pub(crate) fn generate_with_tools(
                     .token_to_piece(token, &mut decoder, special, None)
                     .map_err(|e| LLMError::ProviderError(e.to_string()))?;
                 output.push_str(&piece);
-                Ok(!result
+                Ok(result
                     .additional_stops
                     .iter()
-                    .any(|s| !s.is_empty() && output.ends_with(s)))
+                    .any(|s| !s.is_empty() && output.ends_with(s))
+                    .then_some(GenerationTermination::StopSequence))
             },
         )?;
         for stop in &result.additional_stops {
@@ -78,6 +79,7 @@ pub(crate) fn generate_with_tools(
                 cache_write: 0,
                 reasoning_tokens: 0,
             },
+            termination: stats.termination,
         });
     }
     let mut state =
@@ -100,6 +102,7 @@ pub(crate) fn generate_with_tools(
                 cache_write: 0,
                 reasoning_tokens: 0,
             },
+            termination: GenerationTermination::MaxTokens,
         });
     }
 
@@ -127,6 +130,7 @@ pub(crate) fn generate_with_tools(
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut first_token_logged = false;
     let mut eog_hit = false;
+    let mut termination = GenerationTermination::MaxTokens;
 
     log::debug!(
         "generate_with_tools: sampler built, has_grammar={}, input_tokens={}, max_tokens={}",
@@ -139,6 +143,7 @@ pub(crate) fn generate_with_tools(
         let token = sampler.sample(&state.ctx, batch.n_tokens() - 1);
         if model.is_eog_token(token) {
             eog_hit = true;
+            termination = GenerationTermination::Eog;
             break;
         }
 
@@ -169,6 +174,7 @@ pub(crate) fn generate_with_tools(
             .iter()
             .any(|stop| !stop.is_empty() && output.ends_with(stop))
         {
+            termination = GenerationTermination::StopSequence;
             break;
         }
 
@@ -218,6 +224,7 @@ pub(crate) fn generate_with_tools(
             cache_write: 0,
             reasoning_tokens: 0,
         },
+        termination,
     })
 }
 
