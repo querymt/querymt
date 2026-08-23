@@ -350,6 +350,16 @@ pub(crate) struct TurnState {
     pub(crate) token: CancellationToken,
 }
 
+const MAX_QUEUED_PROMPTS: usize = 32;
+
+fn queued_prompt_capacity_error(session_id: &str) -> AgentError {
+    AgentError::AdmissionRejected {
+        reason: format!(
+            "session {session_id} queued prompt capacity ({MAX_QUEUED_PROMPTS}) reached"
+        ),
+    }
+}
+
 struct QueuedPrompt {
     input_id: String,
     req: crate::acp::protocol::PromptRequest,
@@ -1589,6 +1599,9 @@ impl Message<SubmitSessionInput> for SessionActor {
             InputDelivery::Queue => {
                 let req =
                     crate::acp::protocol::PromptRequest::new(self.session_id.clone(), input.prompt);
+                if self.active_run.is_some() && self.queued_prompts.len() >= MAX_QUEUED_PROMPTS {
+                    return Err(queued_prompt_capacity_error(&self.session_id));
+                }
                 let (reply, receiver) = oneshot::channel();
                 let log_session_id = self.session_id.clone();
                 let log_input_id = input_id.clone();
@@ -1645,6 +1658,10 @@ impl Message<Prompt> for SessionActor {
     async fn handle(&mut self, msg: Prompt, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let (reply, receiver) = oneshot::channel();
         if self.active_run.is_some() {
+            if self.queued_prompts.len() >= MAX_QUEUED_PROMPTS {
+                let error = queued_prompt_capacity_error(&self.session_id);
+                return ctx.spawn(async move { Err(error) });
+            }
             let input_id = Uuid::new_v4().to_string();
             let position = self.queued_prompts.len() + 1;
             self.queued_prompts.push_back(QueuedPrompt {

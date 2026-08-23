@@ -264,6 +264,15 @@ export function useUiClient() {
   const [workspacePathDialogOpen, setWorkspacePathDialogOpen] = useState(false);
   const [workspacePathDialogDefaultValue, setWorkspacePathDialogDefaultValue] = useState('');
   const socketRef = useRef<WebSocket | null>(null);
+  const requestRuntimeState = useCallback((targetSessionId?: string) => {
+    const resolvedSessionId = targetSessionId ?? sessionIdRef.current;
+    const socket = socketRef.current;
+    if (!resolvedSessionId || !socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({
+      type: 'get_runtime_state',
+      data: { session_id: resolvedSessionId },
+    } satisfies UiClientMessage));
+  }, []);
   const fileIndexCallbackRef = useRef<FileIndexCallback | null>(null);
   const fileIndexErrorCallbackRef = useRef<FileIndexErrorCallback | null>(null);
   const llmConfigCallbacksRef = useRef<Map<number, (config: LlmConfigDetails) => void>>(new Map());
@@ -348,10 +357,7 @@ export function useUiClient() {
             type: 'subscribe_session',
             data: { session_id: prevSession },
           } as any);
-          sendOnSocket(socket, {
-            type: 'get_runtime_state',
-            data: { session_id: prevSession },
-          });
+          requestRuntimeState(prevSession);
         }
       };
 
@@ -536,12 +542,7 @@ export function useUiClient() {
           removePendingInput(msg.data.session_id, msg.data.client_input_id);
         }, 5000);
         if (msg.data.active_run_id) {
-          requestAnimationFrame(() => {
-            socketRef.current?.send(JSON.stringify({
-              type: 'get_runtime_state',
-              data: { session_id: msg.data.session_id },
-            } satisfies UiClientMessage));
-          });
+          requestAnimationFrame(() => requestRuntimeState(msg.data.session_id));
         }
         break;
       }
@@ -645,10 +646,17 @@ export function useUiClient() {
             return next;
           });
         } else if (eventKind === 'run_completed') {
-          socketRef.current?.send(JSON.stringify({
-            type: 'get_runtime_state',
-            data: { session_id: d.session_id },
-          } satisfies UiClientMessage));
+          requestRuntimeState(d.session_id);
+        } else if (eventKind === 'steering_accepted') {
+          updatePendingInput(d.session_id, kindData.input_id, {
+            state: 'accepted',
+            position: kindData.position,
+          });
+        } else if (eventKind === 'input_queued') {
+          updatePendingInput(d.session_id, kindData.input_id, {
+            state: 'queued',
+            position: kindData.position,
+          });
         } else if (eventKind === 'steering_applied') {
           removePendingInput(d.session_id, kindData.input_id);
         } else if (eventKind === 'steering_discarded') {
@@ -662,6 +670,7 @@ export function useUiClient() {
           }, 5000);
         } else if (eventKind === 'queued_input_started') {
           removePendingInput(d.session_id, kindData.input_id);
+          requestRuntimeState(d.session_id);
         }
 
         if (eventKind === 'llm_retry_wait' || eventKind === 'llm_retry_resume') {
@@ -1702,12 +1711,6 @@ export function useUiClient() {
       });
     });
   }, [requestWorkspacePath, sessionGroups, sessionId, defaultCwd]);
-
-  const requestRuntimeState = useCallback((targetSessionId?: string) => {
-    const resolvedSessionId = targetSessionId ?? sessionIdRef.current;
-    if (!resolvedSessionId) return;
-    sendMessage({ type: 'get_runtime_state', data: { session_id: resolvedSessionId } });
-  }, []);
 
   const submitInput = useCallback((
     delivery: 'steer' | 'queue',
