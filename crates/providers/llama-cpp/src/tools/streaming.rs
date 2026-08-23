@@ -56,6 +56,10 @@ pub(crate) fn generate_streaming_with_tools(
             temperature,
             Some(sampler),
             |token| {
+                if tx.is_closed() {
+                    return Ok(Some(GenerationTermination::ConsumerClosed));
+                }
+
                 let piece = model
                     .token_to_piece(token, &mut decoder, preserved.contains(&token), None)
                     .map_err(|e| LLMError::ProviderError(e.to_string()))?;
@@ -159,6 +163,20 @@ pub(crate) fn generate_streaming_with_tools(
     let mut decoder = encoding_rs::UTF_8.new_decoder();
 
     while state.n_cur < state.n_len_total {
+        if tx.is_closed() {
+            return Ok((
+                Usage {
+                    input_tokens: state.input_tokens,
+                    output_tokens,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning_tokens: 0,
+                },
+                GenerationTermination::ConsumerClosed,
+                false,
+            ));
+        }
+
         let token = sampler.sample(&state.ctx, batch.n_tokens() - 1);
         if model.is_eog_token(token) {
             termination = GenerationTermination::Eog;
@@ -235,9 +253,33 @@ pub(crate) fn generate_streaming_with_tools(
                 .unbounded_send(Ok(querymt::chat::StreamChunk::Thinking(thinking)))
                 .is_err()
             {
-                break;
+                return Ok((
+                    Usage {
+                        input_tokens: state.input_tokens,
+                        output_tokens,
+                        cache_read: 0,
+                        cache_write: 0,
+                        reasoning_tokens: 0,
+                    },
+                    GenerationTermination::ConsumerClosed,
+                    false,
+                ));
             }
         }
+    }
+
+    if tx.is_closed() {
+        return Ok((
+            Usage {
+                input_tokens: state.input_tokens,
+                output_tokens,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning_tokens: 0,
+            },
+            GenerationTermination::ConsumerClosed,
+            false,
+        ));
     }
 
     let (content, _, tool_calls, _) = parse_tool_response(result, &generated_text)?;
