@@ -8,7 +8,7 @@ use crate::context::{
 };
 use crate::messages;
 use crate::multimodal::MultimodalContext;
-use crate::response::GeneratedText;
+use crate::response::{GeneratedText, GenerationTermination};
 use crate::tools::sampler::{SamplingParams, build_fallback_sampler, build_standard_sampler};
 use futures::channel::mpsc;
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -156,7 +156,7 @@ pub(crate) fn generate(
             None,
             |token| {
                 output.push_str(&decode_token_piece(model, &mut decoder, &preserved, token)?);
-                Ok(true)
+                Ok(None)
             },
         )?;
         return Ok(GeneratedText {
@@ -168,6 +168,7 @@ pub(crate) fn generate(
                 cache_write: 0,
                 reasoning_tokens: 0,
             },
+            termination: stats.termination,
         });
     }
     if cfg.speculative.is_some() && !bitmaps.is_empty() {
@@ -283,6 +284,7 @@ pub(crate) fn generate(
                     cache_write: 0,
                     reasoning_tokens: 0,
                 },
+                termination: GenerationTermination::MaxTokens,
             });
         }
 
@@ -341,6 +343,7 @@ pub(crate) fn generate(
                     cache_write: 0,
                     reasoning_tokens: 0,
                 },
+                termination: GenerationTermination::MaxTokens,
             });
         }
 
@@ -392,6 +395,7 @@ pub(crate) fn generate(
     let mut batch = LlamaBatch::new(n_batch as usize, 1);
     let mut output_tokens = 0u32;
     let mut output = String::new();
+    let mut termination = GenerationTermination::MaxTokens;
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let preserved = preserved_token_set(model, None);
     while n_cur < n_len_total {
@@ -408,6 +412,7 @@ pub(crate) fn generate(
                 fallback_used = true;
                 continue;
             }
+            termination = GenerationTermination::Eog;
             break;
         }
 
@@ -434,6 +439,7 @@ pub(crate) fn generate(
             cache_write: 0,
             reasoning_tokens: 0,
         },
+        termination,
     })
 }
 
@@ -457,7 +463,7 @@ pub(crate) fn generate_streaming_with_thinking(
     tx: &mpsc::UnboundedSender<Result<querymt::chat::StreamChunk, LLMError>>,
     mm_ctx: Option<&MultimodalContext>,
     bitmaps: &[MtmdBitmap],
-) -> Result<Usage, LLMError> {
+) -> Result<(Usage, GenerationTermination), LLMError> {
     if cfg.speculative.is_some() && bitmaps.is_empty() {
         let mut stream_state = result.streaming_state();
         let mut decoder = encoding_rs::UTF_8.new_decoder();
@@ -478,10 +484,10 @@ pub(crate) fn generate_streaming_with_thinking(
                         ParsedDelta::Thinking(v) => querymt::chat::StreamChunk::Thinking(v),
                     };
                     if tx.unbounded_send(Ok(chunk)).is_err() {
-                        return Ok(false);
+                        return Ok(Some(GenerationTermination::ConsumerClosed));
                     }
                 }
-                Ok(true)
+                Ok(None)
             },
         )?;
         for delta in stream_state.finish() {
@@ -491,13 +497,16 @@ pub(crate) fn generate_streaming_with_thinking(
             };
             let _ = tx.unbounded_send(Ok(chunk));
         }
-        return Ok(Usage {
-            input_tokens: stats.input_tokens,
-            output_tokens: stats.output_tokens,
-            cache_read: 0,
-            cache_write: 0,
-            reasoning_tokens: 0,
-        });
+        return Ok((
+            Usage {
+                input_tokens: stats.input_tokens,
+                output_tokens: stats.output_tokens,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning_tokens: 0,
+            },
+            stats.termination,
+        ));
     }
     let backend = llama_backend()?;
 
@@ -594,13 +603,16 @@ pub(crate) fn generate_streaming_with_thinking(
         }
 
         if max_tokens == 0 {
-            return Ok(Usage {
-                input_tokens: total_tokens as u32,
-                output_tokens: 0,
-                cache_read: 0,
-                cache_write: 0,
-                reasoning_tokens: 0,
-            });
+            return Ok((
+                Usage {
+                    input_tokens: total_tokens as u32,
+                    output_tokens: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning_tokens: 0,
+                },
+                GenerationTermination::MaxTokens,
+            ));
         }
 
         let n_len_total = total_tokens as i32 + max_tokens as i32;
@@ -641,13 +653,16 @@ pub(crate) fn generate_streaming_with_thinking(
             ));
         }
         if max_tokens == 0 {
-            return Ok(Usage {
-                input_tokens: tokens.len() as u32,
-                output_tokens: 0,
-                cache_read: 0,
-                cache_write: 0,
-                reasoning_tokens: 0,
-            });
+            return Ok((
+                Usage {
+                    input_tokens: tokens.len() as u32,
+                    output_tokens: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning_tokens: 0,
+                },
+                GenerationTermination::MaxTokens,
+            ));
         }
 
         let n_len_total = tokens.len() as i32 + max_tokens as i32;
@@ -692,6 +707,7 @@ pub(crate) fn generate_streaming_with_thinking(
     let mut n_cur = n_past;
     let n_len_total = n_past + max_tokens as i32;
     let mut output_tokens = 0u32;
+    let mut termination = GenerationTermination::MaxTokens;
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let preserved = preserved_token_set(model, Some(result));
 
@@ -703,6 +719,7 @@ pub(crate) fn generate_streaming_with_thinking(
                 fallback_used = true;
                 continue;
             }
+            termination = GenerationTermination::Eog;
             break;
         }
 
@@ -714,13 +731,16 @@ pub(crate) fn generate_streaming_with_thinking(
                 ParsedDelta::Thinking(thinking) => querymt::chat::StreamChunk::Thinking(thinking),
             };
             if tx.unbounded_send(Ok(stream_chunk)).is_err() {
-                return Ok(Usage {
-                    input_tokens: input_tokens as u32,
-                    output_tokens,
-                    cache_read: 0,
-                    cache_write: 0,
-                    reasoning_tokens: 0,
-                });
+                return Ok((
+                    Usage {
+                        input_tokens: input_tokens as u32,
+                        output_tokens,
+                        cache_read: 0,
+                        cache_write: 0,
+                        reasoning_tokens: 0,
+                    },
+                    GenerationTermination::ConsumerClosed,
+                ));
             }
         }
 
@@ -745,11 +765,14 @@ pub(crate) fn generate_streaming_with_thinking(
         }
     }
 
-    Ok(Usage {
-        input_tokens: input_tokens as u32,
-        output_tokens,
-        cache_read: 0,
-        cache_write: 0,
-        reasoning_tokens: 0,
-    })
+    Ok((
+        Usage {
+            input_tokens: input_tokens as u32,
+            output_tokens,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning_tokens: 0,
+        },
+        termination,
+    ))
 }

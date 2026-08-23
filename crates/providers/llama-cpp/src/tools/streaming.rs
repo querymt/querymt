@@ -2,6 +2,7 @@ use crate::chat_format::ParsedDelta;
 use crate::common_chat::ChatTemplateResult;
 use crate::config::LlamaCppConfig;
 use crate::multimodal::MultimodalContext;
+use crate::response::GenerationTermination;
 use crate::tools::generation::parse_tool_response;
 use crate::tools::prefill::prefill_for_tool_generation;
 use crate::tools::sampler::{SamplingParams, build_structured_sampler, build_tool_sampler};
@@ -15,7 +16,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Generate text with streaming and grammar-constrained sampling for tool calls.
-/// Returns (Usage, has_tool_calls) where has_tool_calls indicates if tool calls were made.
+/// Returns usage, termination, and whether tool calls were made.
 pub(crate) fn generate_streaming_with_tools(
     model: &Arc<LlamaModel>,
     cfg: &LlamaCppConfig,
@@ -26,7 +27,7 @@ pub(crate) fn generate_streaming_with_tools(
     tx: &mpsc::UnboundedSender<Result<querymt::chat::StreamChunk, LLMError>>,
     mm_ctx: Option<&MultimodalContext>,
     bitmaps: &[MtmdBitmap],
-) -> Result<(Usage, bool), LLMError> {
+) -> Result<(Usage, GenerationTermination, bool), LLMError> {
     if cfg.speculative.is_some() && bitmaps.is_empty() {
         let params = SamplingParams::from_config(cfg, temperature);
         let sampler = if let Some(schema) = cfg.json_schema.as_ref().and_then(|s| s.schema.as_ref())
@@ -69,10 +70,10 @@ pub(crate) fn generate_streaming_with_tools(
                             .unbounded_send(Ok(querymt::chat::StreamChunk::Thinking(thinking)))
                             .is_err()
                     {
-                        return Ok(false);
+                        return Ok(Some(GenerationTermination::ConsumerClosed));
                     }
                 }
-                Ok(!stop_now)
+                Ok(stop_now.then_some(GenerationTermination::StopSequence))
             },
         )?;
         for stop in &result.additional_stops {
@@ -105,6 +106,7 @@ pub(crate) fn generate_streaming_with_tools(
                 cache_write: 0,
                 reasoning_tokens: 0,
             },
+            stats.termination,
             has_calls,
         ));
     }
@@ -127,6 +129,7 @@ pub(crate) fn generate_streaming_with_tools(
                 cache_write: 0,
                 reasoning_tokens: 0,
             },
+            GenerationTermination::MaxTokens,
             false,
         ));
     }
@@ -152,11 +155,13 @@ pub(crate) fn generate_streaming_with_tools(
     };
     let mut output_tokens = 0u32;
     let mut generated_text = String::new();
+    let mut termination = GenerationTermination::MaxTokens;
     let mut decoder = encoding_rs::UTF_8.new_decoder();
 
     while state.n_cur < state.n_len_total {
         let token = sampler.sample(&state.ctx, batch.n_tokens() - 1);
         if model.is_eog_token(token) {
+            termination = GenerationTermination::Eog;
             break;
         }
 
@@ -191,6 +196,7 @@ pub(crate) fn generate_streaming_with_tools(
                             cache_write: 0,
                             reasoning_tokens: 0,
                         },
+                        GenerationTermination::ConsumerClosed,
                         false,
                     ));
                 }
@@ -198,6 +204,7 @@ pub(crate) fn generate_streaming_with_tools(
         }
 
         if stop_now {
+            termination = GenerationTermination::StopSequence;
             break;
         }
 
@@ -262,6 +269,7 @@ pub(crate) fn generate_streaming_with_tools(
             cache_write: 0,
             reasoning_tokens: 0,
         },
+        termination,
         has_tool_calls,
     ))
 }

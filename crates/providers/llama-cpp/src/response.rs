@@ -40,8 +40,67 @@ impl ChatResponse for LlamaCppChatResponse {
     }
 }
 
+/// Reason generation stopped inside the provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GenerationTermination {
+    Eog,
+    StopSequence,
+    MaxTokens,
+    ConsumerClosed,
+}
+
+impl Default for GenerationTermination {
+    fn default() -> Self {
+        Self::MaxTokens
+    }
+}
+
+impl GenerationTermination {
+    pub(crate) fn finish_reason(self, has_tool_calls: bool) -> FinishReason {
+        match self {
+            Self::MaxTokens => FinishReason::Length,
+            Self::Eog | Self::StopSequence if has_tool_calls => FinishReason::ToolCalls,
+            Self::Eog | Self::StopSequence | Self::ConsumerClosed => FinishReason::Stop,
+        }
+    }
+}
+
 /// Generated text from a completion request.
 pub(crate) struct GeneratedText {
     pub(crate) text: String,
     pub(crate) usage: Usage,
+    pub(crate) termination: GenerationTermination,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_generation_termination_to_finish_reason() {
+        let cases = [
+            (GenerationTermination::Eog, false, FinishReason::Stop),
+            (GenerationTermination::Eog, true, FinishReason::ToolCalls),
+            (
+                GenerationTermination::StopSequence,
+                false,
+                FinishReason::Stop,
+            ),
+            (
+                GenerationTermination::StopSequence,
+                true,
+                FinishReason::ToolCalls,
+            ),
+            (
+                GenerationTermination::MaxTokens,
+                false,
+                FinishReason::Length,
+            ),
+            (GenerationTermination::MaxTokens, true, FinishReason::Length),
+        ];
+
+        for (termination, has_tool_calls, expected) in cases {
+            assert_eq!(termination.finish_reason(has_tool_calls), expected);
+        }
+    }
 }
