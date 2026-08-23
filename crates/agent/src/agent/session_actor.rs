@@ -1566,7 +1566,22 @@ impl Message<SubmitSessionInput> for SessionActor {
             InputDelivery::Queue => {
                 let req =
                     crate::acp::protocol::PromptRequest::new(self.session_id.clone(), input.prompt);
-                let (reply, _receiver) = oneshot::channel();
+                let (reply, receiver) = oneshot::channel();
+                let log_session_id = self.session_id.clone();
+                let log_input_id = input_id.clone();
+                tokio::spawn(async move {
+                    match receiver.await {
+                        Ok(Err(error)) => warn!(
+                            "Session {}: queued input {} execution failed: {}",
+                            log_session_id, log_input_id, error
+                        ),
+                        Err(error) => warn!(
+                            "Session {}: queued input {} result channel dropped: {}",
+                            log_session_id, log_input_id, error
+                        ),
+                        Ok(Ok(_)) => {}
+                    }
+                });
                 if self.active_run.is_none() {
                     self.launch_prompt(req, reply, ctx.actor_ref().clone(), Some(input_id.clone()));
                     let run_id = self
@@ -1657,28 +1672,23 @@ impl Message<ScheduledPrompt> for SessionActor {
             self.session_id, msg.schedule_public_id
         );
 
-        if self.prompt_running {
-            if self.turn_state.token.is_cancelled() {
-                debug!(
-                    "Session {}: scheduled prompt: prompt_running=true, cancelled=true → allowing through",
-                    self.session_id
-                );
-            } else {
-                debug!(
-                    "Session {}: scheduled prompt: prompt_running=true → queueing behind running prompt",
-                    self.session_id
-                );
-            }
+        if self.active_run.is_some() {
+            let session_id = self.session_id.clone();
+            let schedule_public_id = msg.schedule_public_id.clone();
+            return ctx.spawn(async move {
+                Err(AgentError::AdmissionRejected {
+                    reason: format!(
+                        "session {session_id} already has an active run; scheduled execution {schedule_public_id} must be retried"
+                    ),
+                })
+            });
         }
 
         self.prompt_running = true;
         self.turn_state.generation = self.turn_state.generation.saturating_add(1);
         let prompt_generation = self.turn_state.generation;
         let run_id = Uuid::new_v4().to_string();
-
-        if self.turn_state.token.is_cancelled() {
-            self.turn_state.token = CancellationToken::new();
-        }
+        self.turn_state.token = CancellationToken::new();
         let scheduled_run = ActiveRun::new(
             run_id.clone(),
             prompt_generation,
@@ -1964,7 +1974,6 @@ async fn execute_prompt_detached(
     // Create execution context — attach the cancellation token so it propagates
     // into individual tool calls for cooperative cancellation.
     // The knowledge store is propagated so knowledge tools can access it.
-    let turn_id = Uuid::new_v4().to_string();
     let mut exec_ctx = ExecutionContext::new(
         session_id.clone(),
         runtime.clone(),
@@ -2013,7 +2022,7 @@ async fn execute_prompt_detached(
         .hooks
         .run_user_prompt_submit(crate::hooks::UserPromptSubmitRequest {
             session_id: session_id.clone(),
-            turn_id: turn_id.clone(),
+            turn_id: run_id.clone(),
             cwd: exec_ctx.cwd().map(|p| p.to_path_buf()),
             model: exec_ctx
                 .llm_config()
@@ -2175,7 +2184,7 @@ async fn execute_prompt_detached(
         }
 
         let turn_snapshot_data = runtime.turn_snapshot.lock().take();
-        if let Some((turn_id, pre_snapshot_id)) = turn_snapshot_data {
+        if let Some((_turn_id, pre_snapshot_id)) = turn_snapshot_data {
             match backend.track(worktree).await {
                 Ok(post_snapshot_id) => {
                     if pre_snapshot_id != post_snapshot_id {
@@ -2185,7 +2194,7 @@ async fn execute_prompt_detached(
                         {
                             Ok(changed) if !changed.is_empty() => {
                                 let patch_part = MessagePart::TurnSnapshotPatch {
-                                    turn_id: turn_id.clone(),
+                                    turn_id: run_id.clone(),
                                     snapshot_id: post_snapshot_id.clone(),
                                     changed_paths: changed
                                         .iter()

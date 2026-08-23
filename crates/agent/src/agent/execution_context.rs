@@ -91,6 +91,8 @@ pub(crate) struct ExecutionContext {
     /// Reports execution phase changes back to the owning session actor.
     pub phase_reporter:
         Option<tokio::sync::mpsc::UnboundedSender<crate::agent::turn_control::RunPhase>>,
+    /// Delegations left running when steering interrupts a wait.
+    pub suspended_delegations: tokio::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl ExecutionContext {
@@ -119,6 +121,7 @@ impl ExecutionContext {
             initial_prompt: Vec::new(),
             steering_summaries: Vec::new(),
             phase_reporter: None,
+            suspended_delegations: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 

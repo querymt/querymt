@@ -29,7 +29,7 @@ import type {
   MeshInviteCreated,
   SessionRuntimeStatus,
 } from '../types';
-import type { PendingSessionInput } from '../hooks/useUiClient';
+import type { PendingSessionInput, SubmitInputDispatchResult } from '../hooks/useUiClient';
 
 // ---------------------------------------------------------------------------
 // 1. Actions Context — stable callbacks that never change
@@ -38,7 +38,7 @@ import type { PendingSessionInput } from '../hooks/useUiClient';
 export interface UiClientActionsContextValue {
   newSession: (cwd?: string, node?: string) => Promise<string>;
   sendPrompt: (blocks: UiPromptBlock[], agentId?: string, agentMode?: string) => void;
-  submitInput: (delivery: 'steer' | 'queue', blocks: UiPromptBlock[], sessionId?: string) => boolean;
+  submitInput: (delivery: 'steer' | 'queue', blocks: UiPromptBlock[], sessionId?: string) => SubmitInputDispatchResult;
   requestRuntimeState: (sessionId?: string) => void;
   cancelSession: () => void;
   deleteSession: (sessionId: string, sessionLabel?: string) => void;

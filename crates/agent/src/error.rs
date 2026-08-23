@@ -92,7 +92,7 @@ pub enum AgentError {
     AdmissionRejected { reason: String },
 
     #[error("turn control error: {message}")]
-    TurnControl { message: String },
+    TurnControl { kind: String, message: String },
 
     // --- Serialization ---
     #[error("serialization error: {0}")]
@@ -131,13 +131,20 @@ impl From<AgentError> for AcpError {
                 "error": error,
             }));
         }
+        if let AgentError::TurnControl { kind, message } = &e {
+            return AcpError::new(-32602, message.clone()).data(serde_json::json!({
+                "category": "turn_control",
+                "kind": kind,
+                "message": message,
+            }));
+        }
 
         let code: i32 = match &e {
-            AgentError::MethodNotImplemented { .. } => -32601, // MethodNotFound
+            AgentError::MethodNotImplemented { .. } => -32601,
             AgentError::SessionNotFound { .. }
             | AgentError::RemoteSessionNotFound { .. }
-            | AgentError::ScheduleNotFound { .. } => -32002, // ResourceNotFound
-            _ => -32603,                                       // InternalError
+            | AgentError::ScheduleNotFound { .. } => -32002,
+            _ => -32603,
         };
         AcpError::new(code, e.to_string())
     }
@@ -168,6 +175,7 @@ fn provider_error_metadata(error: &LLMErrorPayload) -> (Option<ProviderErrorKind
 impl From<crate::agent::turn_control::TurnControlError> for AgentError {
     fn from(error: crate::agent::turn_control::TurnControlError) -> Self {
         Self::TurnControl {
+            kind: error.kind().to_string(),
             message: error.to_string(),
         }
     }

@@ -307,6 +307,13 @@ pub(crate) async fn execute_cycle_state_machine(
         state = match state {
             ExecutionState::BeforeLlmCall { context } => {
                 exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Model);
+                let context = wait::reconcile_suspended_delegations(
+                    config,
+                    &context,
+                    exec_ctx,
+                    &mut event_rx,
+                )
+                .await?;
                 let context = apply_pending_steering(
                     config,
                     exec_ctx,
@@ -472,19 +479,19 @@ pub(crate) async fn execute_cycle_state_machine(
                     .await?
             }
 
-            ExecutionState::Complete => {
+            ExecutionState::Complete { context } => {
                 exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Closing);
                 let history = Arc::from(exec_ctx.session_handle.history().await.into_boxed_slice());
                 let fallback_context = Arc::new(
                     crate::middleware::ConversationContext::new(
-                        initial_context.session_id.clone(),
+                        context.session_id.clone(),
                         history,
-                        initial_context.stats.clone(),
-                        initial_context.provider.clone(),
-                        initial_context.model.clone(),
+                        context.stats.clone(),
+                        context.provider.clone(),
+                        context.model.clone(),
                     )
-                    .with_session_mode(initial_context.session_mode)
-                    .with_fragments(initial_context.fragments.clone()),
+                    .with_session_mode(context.session_mode)
+                    .with_fragments(context.fragments.clone()),
                 );
                 if let Some(context) = apply_pending_steering(
                     config,
@@ -499,7 +506,12 @@ pub(crate) async fn execute_cycle_state_machine(
                     continue;
                 }
                 let turn_end_state = driver
-                    .run_turn_end(ExecutionState::Complete, Some(&exec_ctx.runtime))
+                    .run_turn_end(
+                        ExecutionState::Complete {
+                            context: fallback_context,
+                        },
+                        Some(&exec_ctx.runtime),
+                    )
                     .instrument(info_span!(
                         "agent.execution.middleware.turn_end",
                         session_id = %exec_ctx.session_id
@@ -509,7 +521,9 @@ pub(crate) async fn execute_cycle_state_machine(
 
                 match turn_end_state {
                     ExecutionState::BeforeLlmCall { .. } => turn_end_state,
-                    ExecutionState::Complete => {
+                    ExecutionState::Complete {
+                        context: completed_context,
+                    } => {
                         debug!("State machine reached Complete state");
 
                         let stop_hook = config
@@ -544,10 +558,7 @@ pub(crate) async fn execute_cycle_state_machine(
                                 );
                             } else {
                                 stop_hook_continuations += 1;
-                                let current_context = state
-                                    .context()
-                                    .cloned()
-                                    .unwrap_or_else(|| initial_context.clone());
+                                let current_context = completed_context.clone();
                                 let message = format_stop_hook_continuation_message(
                                     stop_hook.stop_reason.or(stop_hook.block_reason),
                                     &stop_hook.additional_contexts,

@@ -278,7 +278,7 @@ impl CompositeDriver {
                 _ => {
                     matches!(
                         current,
-                        ExecutionState::Complete
+                        ExecutionState::Complete { .. }
                             | ExecutionState::Stopped { .. }
                             | ExecutionState::Cancelled
                     )

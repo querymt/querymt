@@ -292,10 +292,19 @@ export function ChatView() {
     try {
       const blocks = buildPromptBlocksFromInput(prompt);
       const activeDelivery = delivery ?? (runtimeState?.steerable ? 'steer' : undefined);
-      const accepted = activeDelivery
-        ? submitInput(activeDelivery, blocks, sessionId)
-        : (await sendPrompt(blocks), true);
-      if (accepted) setPrompt('');
+      if (activeDelivery) {
+        const result = submitInput(activeDelivery, blocks, sessionId);
+        if (result.accepted) {
+          setPrompt('');
+        } else {
+          followArmedRef.current = false;
+          requestRuntimeState(sessionId);
+          console.warn(`Input was not submitted: ${result.reason}`);
+        }
+      } else {
+        await sendPrompt(blocks);
+        setPrompt('');
+      }
     } catch (err) {
       followArmedRef.current = false;
       console.error('Failed to send prompt:', err);

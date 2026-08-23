@@ -90,7 +90,7 @@ async fn test_composite_driver_complete_halts() {
 
     let result = composite.run_turn_start(state, None).await.unwrap();
 
-    assert!(matches!(result, ExecutionState::Complete));
+    assert!(matches!(result, ExecutionState::Complete { .. }));
     assert_eq!(counter.count.load(Ordering::SeqCst), 0);
 }
 
@@ -195,9 +195,9 @@ async fn test_max_steps_ignores_other_states() {
     let result = middleware.on_step_start(state, None).await.unwrap();
     assert!(matches!(result, ExecutionState::CallLlm { .. }));
 
-    let state = ExecutionState::Complete;
+    let state = ExecutionState::Complete { context };
     let result = middleware.on_step_start(state, None).await.unwrap();
-    assert!(matches!(result, ExecutionState::Complete));
+    assert!(matches!(result, ExecutionState::Complete { .. }));
 }
 
 #[tokio::test]

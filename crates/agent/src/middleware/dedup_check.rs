@@ -690,7 +690,7 @@ impl MiddlewareDriver for DedupCheckMiddleware {
         }
 
         // Only run on Complete state
-        if !matches!(state, ExecutionState::Complete) {
+        if !matches!(state, ExecutionState::Complete { .. }) {
             log::debug!(
                 "DedupCheckMiddleware: skipping — state is {} (not Complete)",
                 state.name()

@@ -209,10 +209,12 @@ pub(super) async fn transition_call_llm(
     exec_ctx: &ExecutionContext,
 ) -> Result<ExecutionState, anyhow::Error> {
     let session_id = &exec_ctx.session_id;
+    let mut request_messages = apply_cache_breakpoints(&context.messages);
+    request_messages.extend(context.fragment_messages());
     debug!(
         "CallLlm: session={}, messages={}",
         session_id,
-        context.request_messages().len()
+        request_messages.len()
     );
 
     if exec_ctx.cancellation_token.is_cancelled() {
@@ -223,16 +225,15 @@ pub(super) async fn transition_call_llm(
         session_id,
         AgentEventKind::LlmRequestStart {
             message_count: u32_from_usize(
-                context.messages.len(),
-                "context.messages.len",
+                request_messages.len(),
+                "request_messages.len",
                 Some(session_id),
             ),
         },
     );
 
     let session_handle = &exec_ctx.session_handle;
-    let request_messages = context.request_messages();
-    let messages_with_cache = apply_cache_breakpoints(&request_messages);
+    let messages_with_cache = request_messages;
 
     // Pre-allocated message_id for streaming path so that delta events and the
     // final AssistantMessageStored share the same ID.
@@ -954,7 +955,9 @@ pub(super) async fn transition_after_llm(
                     context: new_context,
                 })
             } else {
-                Ok(ExecutionState::Complete)
+                Ok(ExecutionState::Complete {
+                    context: new_context,
+                })
             }
         }
 
@@ -985,7 +988,9 @@ pub(super) async fn transition_after_llm(
                     }
                 }
             }
-            Ok(ExecutionState::Complete)
+            Ok(ExecutionState::Complete {
+                context: new_context,
+            })
         }
 
         Some(FinishReason::Length) => Ok(ExecutionState::Stopped {
@@ -1005,7 +1010,9 @@ pub(super) async fn transition_after_llm(
         | Some(FinishReason::Other)
         | None => {
             if response.tool_calls.is_empty() {
-                Ok(ExecutionState::Complete)
+                Ok(ExecutionState::Complete {
+                    context: new_context,
+                })
             } else {
                 Ok(ExecutionState::ProcessingToolCalls {
                     remaining_calls: Arc::from(response.tool_calls.clone().into_boxed_slice()),

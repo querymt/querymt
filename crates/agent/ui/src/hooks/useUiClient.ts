@@ -50,6 +50,10 @@ type UndoFrame = {
   revertedFiles: string[];
 };
 
+export type SubmitInputDispatchResult =
+  | { accepted: true; inputId: string }
+  | { accepted: false; reason: 'no_session' | 'not_connected' | 'not_steerable' };
+
 export type PendingSessionInput = {
   inputId: string;
   sessionId: string;
@@ -159,6 +163,8 @@ export function useUiClient() {
   const [activeAgentId, setActiveAgentId] = useState<string>('primary');
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [runtimeBySession, setRuntimeBySession] = useState<Map<string, SessionRuntimeStatus>>(new Map());
+  const runtimeBySessionRef = useRef(runtimeBySession);
+  runtimeBySessionRef.current = runtimeBySession;
   const [pendingInputsBySession, setPendingInputsBySession] = useState<Map<string, PendingSessionInput[]>>(new Map());
   const [connected, setConnected] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
@@ -1690,11 +1696,16 @@ export function useUiClient() {
     delivery: 'steer' | 'queue',
     prompt: UiPromptBlock[],
     targetSessionId?: string,
-  ): boolean => {
+  ): SubmitInputDispatchResult => {
     const resolvedSessionId = targetSessionId ?? sessionIdRef.current;
-    if (!resolvedSessionId) return false;
-    const runtime = runtimeBySession.get(resolvedSessionId);
-    if (delivery === 'steer' && (!runtime?.steerable || !runtime.active_run_id)) return false;
+    if (!resolvedSessionId) return { accepted: false, reason: 'no_session' };
+    if (socketRef.current?.readyState !== WebSocket.OPEN) {
+      return { accepted: false, reason: 'not_connected' };
+    }
+    const runtime = runtimeBySessionRef.current.get(resolvedSessionId);
+    if (delivery === 'steer' && (!runtime?.steerable || !runtime.active_run_id)) {
+      return { accepted: false, reason: 'not_steerable' };
+    }
 
     const inputId = uuidv7();
     const text = prompt
@@ -1720,8 +1731,8 @@ export function useUiClient() {
         prompt,
       },
     });
-    return true;
-  }, [runtimeBySession]);
+    return { accepted: true, inputId };
+  }, []);
 
   const sendPrompt = useCallback(async (prompt: UiPromptBlock[]) => {
     sendMessage({ type: 'prompt', data: { prompt } });
@@ -2294,6 +2305,7 @@ export function useUiClient() {
     setSpeechErrorCallback,
   };
 }
+
 
 function findCurrentWorkspace(groups: SessionGroup[], activeSessionId: string | null): string | null {
   if (!activeSessionId) {

@@ -266,10 +266,15 @@ pub struct CompleteDriver;
 impl MiddlewareDriver for CompleteDriver {
     async fn on_turn_start(
         &self,
-        _state: ExecutionState,
+        state: ExecutionState,
         _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
     ) -> Result<ExecutionState> {
-        Ok(ExecutionState::Complete)
+        let context = state.context().cloned().ok_or_else(|| {
+            crate::middleware::error::MiddlewareError::Other(anyhow::anyhow!(
+                "CompleteDriver requires a conversation context"
+            ))
+        })?;
+        Ok(ExecutionState::Complete { context })
     }
 
     async fn on_step_start(

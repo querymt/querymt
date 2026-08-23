@@ -225,9 +225,11 @@ pub async fn handle_ui_message(
             let tx = tx.clone();
             tokio::spawn(async move {
                 let failure_input_id = client_input_id.clone().unwrap_or_default();
-                let result = async {
+                let result: Result<_, crate::error::AgentError> = async {
                     let (session_ref, prompt) =
-                        build_ui_prompt_blocks(&state, &session_id, &prompt).await?;
+                        build_ui_prompt_blocks(&state, &session_id, &prompt)
+                            .await
+                            .map_err(crate::error::AgentError::Internal)?;
                     session_ref
                         .submit_input(crate::agent::messages::SubmitInput {
                             session_id: session_id.clone(),
@@ -244,7 +246,6 @@ pub async fn handle_ui_message(
                             prompt,
                         })
                         .await
-                        .map_err(|error| error.to_string())
                 }
                 .await;
                 match result {
@@ -255,23 +256,14 @@ pub async fn handle_ui_message(
                         }
                     }
                     Err(error) => {
-                        let code = if error.contains("active run mismatch") {
-                            "run_mismatch"
-                        } else if error.contains("closing") {
-                            "run_closing"
-                        } else if error.contains("no active run") {
-                            "no_active_run"
-                        } else if error.contains("slash commands") {
-                            "slash_command_not_steerable"
-                        } else if error.contains("too large") {
-                            "input_too_large"
-                        } else if error.contains("queue is full") {
-                            "queue_full"
-                        } else {
-                            "submission_failed"
+                        let code = match &error {
+                            crate::error::AgentError::TurnControl { kind, .. } => kind.as_str(),
+                            _ => "submission_failed",
                         };
                         let active_run_id =
-                            match state.agent.registry.lock().await.get(&session_id).cloned() {
+                            match crate::ui::session::session_ref_for_session(&state, &session_id)
+                                .await
+                            {
                                 Some(session_ref) => session_ref
                                     .get_runtime_status()
                                     .await
@@ -283,7 +275,7 @@ pub async fn handle_ui_message(
                             session_id,
                             client_input_id: failure_input_id,
                             code: code.to_string(),
-                            message: error,
+                            message: error.to_string(),
                             active_run_id,
                         };
                         if let Ok(json) = serde_json::to_string(&message) {

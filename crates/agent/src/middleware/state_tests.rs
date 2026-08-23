@@ -52,7 +52,12 @@ fn test_execution_state_name_all_variants() {
             },
             "WaitingForEvent",
         ),
-        (ExecutionState::Complete, "Complete"),
+        (
+            ExecutionState::Complete {
+                context: context.clone(),
+            },
+            "Complete",
+        ),
         (
             ExecutionState::Stopped {
                 message: "done".into(),
@@ -100,6 +105,9 @@ fn test_execution_state_context_accessors() {
             context: context.clone(),
             wait: WaitCondition::delegation("del-1".to_string()),
         },
+        ExecutionState::Complete {
+            context: context.clone(),
+        },
     ];
 
     for state in stateful_states {
@@ -107,7 +115,6 @@ fn test_execution_state_context_accessors() {
     }
 
     let terminal_states = vec![
-        ExecutionState::Complete,
         ExecutionState::Stopped {
             message: "done".into(),
             stop_type: StopType::Other,

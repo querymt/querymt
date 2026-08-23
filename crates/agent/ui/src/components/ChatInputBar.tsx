@@ -8,7 +8,7 @@
  * When STT is available, a microphone button appears next to the send button.
  */
 
-import { type RefObject, useCallback, useState } from 'react';
+import { type RefObject, useCallback, useEffect, useState } from 'react';
 import { Send, Loader, Square, Mic, MicOff, CornerDownRight, Clock3, ChevronDown } from 'lucide-react';
 import { MentionInput } from './MentionInput';
 import type { RateLimitState, SessionRuntimeStatus } from '../types';
@@ -59,14 +59,27 @@ export function ChatInputBar({
   isLoadingFiles,
 }: ChatInputBarProps) {
   const isThinking = sessionThinkingAgentId !== null || Boolean(runtimeState?.active_run_id);
-  const defaultDelivery: 'steer' | 'queue' | undefined = runtimeState?.steerable
+  const canSteer = Boolean(runtimeState?.active_run_id) && runtimeState?.steerable === true;
+  const defaultDelivery: 'steer' | 'queue' | undefined = canSteer
     ? 'steer'
     : runtimeState?.active_run_id
       ? 'queue'
       : undefined;
   const [deliveryOverride, setDeliveryOverride] = useState<'steer' | 'queue' | undefined>();
   const [menuOpen, setMenuOpen] = useState(false);
-  const delivery = deliveryOverride ?? defaultDelivery;
+  const activeRunId = runtimeState?.active_run_id;
+
+  useEffect(() => {
+    setDeliveryOverride(undefined);
+    setMenuOpen(false);
+  }, [sessionId, activeRunId, runtimeState?.steerable]);
+
+  const delivery = deliveryOverride === 'steer' && !canSteer
+    ? defaultDelivery
+    : deliveryOverride ?? defaultDelivery;
+  const submitCurrentInput = useCallback(() => {
+    handleSendPrompt(delivery);
+  }, [delivery, handleSendPrompt]);
   const canSend = !loading && connected && !!sessionId && !!prompt.trim() && !rateLimitState?.isRateLimited;
 
   const { audioCapabilities } = useUiClientConfig();
@@ -111,7 +124,7 @@ export function ChatInputBar({
   const actionButton = (
     <div className="relative flex items-center gap-1">
       <button
-        onClick={() => handleSendPrompt(delivery)}
+        onClick={submitCurrentInput}
         disabled={!canSend}
         className="h-8 px-2.5 rounded-lg flex items-center gap-1.5 text-xs font-medium transition-all duration-150 hover:bg-accent-primary/10 disabled:opacity-20 disabled:cursor-not-allowed"
         style={{ color: 'var(--mode-color)' }}
@@ -127,7 +140,7 @@ export function ChatInputBar({
           </button>
           {menuOpen && (
             <div className="absolute bottom-10 right-8 z-50 min-w-52 rounded-xl border border-surface-border bg-surface-elevated p-1 shadow-xl">
-              {runtimeState?.steerable && (
+              {canSteer && (
                 <button type="button" className="w-full rounded-lg px-3 py-2 text-left text-xs hover:bg-accent-primary/10" onClick={() => { setDeliveryOverride('steer'); setMenuOpen(false); }}>
                   <span className="font-medium text-text-primary">Steer current run</span><span className="block text-text-secondary mt-0.5">Apply at the next safe boundary</span>
                 </button>
@@ -174,7 +187,7 @@ export function ChatInputBar({
         ref={mentionInputRef}
         value={prompt}
         onChange={setPrompt}
-        onSubmit={handleSendPrompt}
+        onSubmit={submitCurrentInput}
         placeholder={
           !sessionId
             ? "Create a session to start chatting..."

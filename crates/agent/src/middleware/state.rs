@@ -208,15 +208,20 @@ impl ConversationContext {
         next
     }
 
-    pub fn request_messages(&self) -> Vec<ChatMessage> {
-        let mut messages = self.messages.to_vec();
-        for fragment in self.fragments.iter() {
-            messages.push(ChatMessage {
+    pub fn fragment_messages(&self) -> Vec<ChatMessage> {
+        self.fragments
+            .iter()
+            .map(|fragment| ChatMessage {
                 role: ChatRole::User,
                 content: vec![Content::text(fragment.content.clone())],
                 cache: None,
-            });
-        }
+            })
+            .collect()
+    }
+
+    pub fn request_messages(&self) -> Vec<ChatMessage> {
+        let mut messages = self.messages.to_vec();
+        messages.extend(self.fragment_messages());
         messages
     }
 
@@ -419,7 +424,7 @@ pub enum ExecutionState {
     },
 
     /// Execution completed successfully
-    Complete,
+    Complete { context: Arc<ConversationContext> },
 
     /// Execution stopped by middleware
     Stopped {
@@ -441,7 +446,7 @@ impl ExecutionState {
             ExecutionState::AfterLlm { .. } => "AfterLlm",
             ExecutionState::ProcessingToolCalls { .. } => "ProcessingToolCalls",
             ExecutionState::WaitingForEvent { .. } => "WaitingForEvent",
-            ExecutionState::Complete => "Complete",
+            ExecutionState::Complete { .. } => "Complete",
             ExecutionState::Stopped { .. } => "Stopped",
             ExecutionState::Cancelled => "Cancelled",
         }
@@ -455,6 +460,7 @@ impl ExecutionState {
             ExecutionState::AfterLlm { context, .. } => Some(context),
             ExecutionState::ProcessingToolCalls { context, .. } => Some(context),
             ExecutionState::WaitingForEvent { context, .. } => Some(context),
+            ExecutionState::Complete { context } => Some(context),
             ExecutionState::Stopped { context, .. } => context.as_ref(),
             _ => None,
         }

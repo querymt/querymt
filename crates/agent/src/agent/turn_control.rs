@@ -77,6 +77,21 @@ pub enum TurnControlError {
     SessionMismatch { expected: String, received: String },
 }
 
+impl TurnControlError {
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::NoActiveRun => "no_active_run",
+            Self::ExpectedRunIdRequired => "expected_run_id_required",
+            Self::RunMismatch { .. } => "run_mismatch",
+            Self::RunClosing { .. } => "run_closing",
+            Self::QueueFull => "queue_full",
+            Self::InputTooLarge { .. } => "input_too_large",
+            Self::SlashCommandNotSteerable => "slash_command_not_steerable",
+            Self::SessionMismatch { .. } => "session_mismatch",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SteeringInput {
     pub input_id: String,
@@ -94,13 +109,15 @@ struct SteeringInboxState {
 
 #[derive(Debug)]
 pub struct SteeringInbox {
+    run_id: String,
     state: Mutex<SteeringInboxState>,
     changed: Notify,
 }
 
 impl SteeringInbox {
-    pub fn new() -> Self {
+    pub fn new(run_id: String) -> Self {
         Self {
+            run_id,
             state: Mutex::new(SteeringInboxState {
                 accepting: true,
                 total_bytes: 0,
@@ -125,17 +142,16 @@ impl SteeringInbox {
                 max_bytes: MAX_STEERING_INPUT_BYTES,
             });
         }
-        if blocks.iter().any(|block| match block {
-            ContentBlock::Text(text) => text.text.trim_start().starts_with('/'),
-            _ => false,
-        }) {
+        if let Some(ContentBlock::Text(text)) = blocks.first()
+            && text.text.trim_start().starts_with('/')
+        {
             return Err(TurnControlError::SlashCommandNotSteerable);
         }
 
         let mut state = self.state.lock().await;
         if !state.accepting {
             return Err(TurnControlError::RunClosing {
-                run_id: String::new(),
+                run_id: self.run_id.clone(),
             });
         }
         if state.pending.len() >= MAX_STEERING_MESSAGES
@@ -152,7 +168,7 @@ impl SteeringInbox {
         });
         let position = state.pending.len();
         drop(state);
-        self.changed.notify_waiters();
+        self.changed.notify_one();
         Ok(position)
     }
 
@@ -182,12 +198,6 @@ impl SteeringInbox {
     }
 }
 
-impl Default for SteeringInbox {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ActiveRun {
     pub run_id: String,
@@ -201,10 +211,10 @@ pub struct ActiveRun {
 impl ActiveRun {
     pub fn new(run_id: String, generation: u64, cancellation: CancellationToken) -> Self {
         Self {
+            steering: Arc::new(SteeringInbox::new(run_id.clone())),
             run_id,
             generation,
             cancellation,
-            steering: Arc::new(SteeringInbox::new()),
             phase: RunPhase::Starting,
             started_at_ms: now_ms(),
         }
@@ -231,7 +241,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbox_preserves_order_and_closes_atomically() {
-        let inbox = SteeringInbox::new();
+        let inbox = SteeringInbox::new("run-1".to_string());
         assert_eq!(inbox.push("a".into(), None, text("one")).await.unwrap(), 1);
         assert_eq!(inbox.push("b".into(), None, text("two")).await.unwrap(), 2);
         let drained = inbox.begin_closing_and_drain().await;
@@ -250,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbox_rejects_slash_commands() {
-        let inbox = SteeringInbox::new();
+        let inbox = SteeringInbox::new("run-1".to_string());
         assert_eq!(
             inbox
                 .push("a".into(), None, text(" /compact"))
