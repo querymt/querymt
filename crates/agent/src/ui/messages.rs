@@ -84,6 +84,14 @@ impl From<ProfileMetadata> for UiProfileInfo {
 #[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum UiInputDelivery {
+    Steer,
+    Queue,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RoutingMode {
     Single,
     Broadcast,
@@ -174,6 +182,18 @@ pub enum UiClientMessage {
     },
     Prompt {
         prompt: Vec<UiPromptBlock>,
+    },
+    SubmitInput {
+        session_id: String,
+        delivery: UiInputDelivery,
+        #[serde(default)]
+        expected_run_id: Option<String>,
+        #[serde(default)]
+        client_input_id: Option<String>,
+        prompt: Vec<UiPromptBlock>,
+    },
+    GetRuntimeState {
+        session_id: String,
     },
     ListSessions {
         /// Query mode: browse (default), group, or search.
@@ -748,6 +768,21 @@ pub enum UiServerMessage {
         session_id: String,
         event: EventEnvelope,
     },
+    InputSubmitted {
+        session_id: String,
+        result: crate::agent::messages::SubmitInputResult,
+    },
+    InputSubmissionFailed {
+        session_id: String,
+        client_input_id: String,
+        code: String,
+        message: String,
+        active_run_id: Option<String>,
+    },
+    RuntimeState {
+        session_id: String,
+        state: crate::agent::messages::SessionRuntimeStatus,
+    },
     SessionEvents {
         session_id: String,
         agent_id: String,
@@ -1028,6 +1063,9 @@ impl UiServerMessage {
             Self::ProviderCapabilities { .. } => "provider_capabilities",
             Self::FileIndex { .. } => "file_index",
             Self::LlmConfig { .. } => "llm_config",
+            Self::InputSubmitted { .. } => "input_submitted",
+            Self::InputSubmissionFailed { .. } => "input_submission_failed",
+            Self::RuntimeState { .. } => "runtime_state",
             Self::SessionEvents { .. } => "session_events",
             Self::UndoResult { .. } => "undo_result",
             Self::RedoResult { .. } => "redo_result",
@@ -1064,6 +1102,7 @@ mod tests {
         AudioModelInfo, OAuthFlowKind, PluginUpdateResult, RoutingMode, UiClientMessage,
         UiProfileInfo, UiServerMessage,
     };
+    use crate::agent::messages::{SessionRuntimePhase, SessionRuntimeStatus};
     use crate::session::load_snapshot::StreamCursor;
     use crate::session::projection::AuditView;
     use serde_json::json;
@@ -1085,6 +1124,38 @@ mod tests {
             delegations: Vec::new(),
             generated_at: time::OffsetDateTime::UNIX_EPOCH,
         }
+    }
+
+    #[test]
+    fn steering_protocol_round_trips() {
+        let request: UiClientMessage = serde_json::from_value(json!({
+            "type": "submit_input",
+            "data": {
+                "session_id": "session-1",
+                "delivery": "steer",
+                "expected_run_id": "run-1",
+                "client_input_id": "input-1",
+                "prompt": [{ "type": "text", "data": { "text": "focus here" } }]
+            }
+        }))
+        .expect("steering request should deserialize");
+        assert!(matches!(request, UiClientMessage::SubmitInput { .. }));
+
+        let response = UiServerMessage::RuntimeState {
+            session_id: "session-1".to_string(),
+            state: SessionRuntimeStatus {
+                phase: SessionRuntimePhase::Tools,
+                active_run_id: Some("run-1".to_string()),
+                steerable: true,
+                pending_steering_count: 1,
+                queued_input_count: 2,
+                run_started_at_ms: Some(42),
+            },
+        };
+        let value = serde_json::to_value(response).expect("runtime state should serialize");
+        assert_eq!(value["type"], "runtime_state");
+        assert_eq!(value["data"]["state"]["pending_steering_count"], 1);
+        assert_eq!(value["data"]["state"]["queued_input_count"], 2);
     }
 
     #[test]

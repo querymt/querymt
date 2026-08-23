@@ -26,6 +26,21 @@ impl LocalAgentHandle {
             "querymt/auth/setApiToken" => self.handle_ext_auth_set_api_token(req).await,
             "querymt/auth/clearApiToken" => self.handle_ext_auth_clear_api_token(req).await,
             "querymt/auth/setMethod" => self.handle_ext_auth_set_method(req).await,
+            "querymt/session/steer" => {
+                self.handle_ext_session_submit_input(
+                    req,
+                    crate::agent::messages::InputDelivery::Steer,
+                )
+                .await
+            }
+            "querymt/session/queue" => {
+                self.handle_ext_session_submit_input(
+                    req,
+                    crate::agent::messages::InputDelivery::Queue,
+                )
+                .await
+            }
+            "querymt/session/runtimeState" => self.handle_ext_session_runtime_state(req).await,
             "querymt/session/undo" => self.handle_ext_session_undo(req).await,
             "querymt/session/redo" => self.handle_ext_session_redo(req).await,
             "querymt/session/undoStack" => self.handle_ext_session_undo_stack(req).await,

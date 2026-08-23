@@ -66,6 +66,117 @@ pub enum CycleOutcome {
     Stopped(StopReason),
 }
 
+fn render_objective_anchor(exec_ctx: &ExecutionContext) -> String {
+    let mut sections = vec![format!(
+        "Original requested outcome:\n{}",
+        crate::agent::utils::render_prompt_for_llm(&exec_ctx.initial_prompt, Some(16 * 1024))
+    )];
+    if let Some(task) = &exec_ctx.state.active_task {
+        if let Some(deliverable) = &task.expected_deliverable {
+            sections.push(format!("Active task deliverable: {deliverable}"));
+        }
+        if let Some(criteria) = &task.acceptance_criteria {
+            sections.push(format!("Acceptance criteria: {criteria}"));
+        }
+    }
+    if let Some(intent) = &exec_ctx.state.current_intent {
+        sections.push(format!("Current intent: {}", intent.summary));
+        if let Some(constraints) = &intent.constraints {
+            sections.push(format!("Constraints: {constraints}"));
+        }
+    }
+    if !exec_ctx.steering_summaries.is_empty() {
+        sections.push(format!(
+            "Latest steering (highest priority):\n{}",
+            exec_ctx.steering_summaries.join("\n")
+        ));
+    }
+    sections.push(
+        "Stay within this scope. Finish once sufficient evidence exists. Ask the user rather than silently replacing the objective."
+            .to_string(),
+    );
+    format!("[Active objective]\n{}", sections.join("\n\n"))
+}
+
+fn refresh_objective_fragment(
+    context: &Arc<crate::middleware::ConversationContext>,
+    exec_ctx: &ExecutionContext,
+) -> Arc<crate::middleware::ConversationContext> {
+    Arc::new(context.upsert_fragment(
+        "active_objective",
+        render_objective_anchor(exec_ctx),
+        crate::middleware::ContextPriority::High,
+    ))
+}
+
+async fn apply_pending_steering(
+    config: &AgentConfig,
+    exec_ctx: &mut ExecutionContext,
+    context: &Arc<crate::middleware::ConversationContext>,
+    boundary: &'static str,
+    closing: bool,
+) -> Result<Option<Arc<crate::middleware::ConversationContext>>, anyhow::Error> {
+    let Some(inbox) = exec_ctx.steering.clone() else {
+        return Ok(None);
+    };
+    let pending = if closing {
+        inbox.begin_closing_and_drain().await
+    } else {
+        inbox.drain().await
+    };
+    if pending.is_empty() {
+        return Ok(None);
+    }
+
+    let mut messages = context.messages.to_vec();
+    for input in pending {
+        let display = crate::agent::utils::render_prompt_for_display(&input.blocks);
+        let message = crate::model::AgentMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: exec_ctx.session_id.clone(),
+            role: querymt::chat::ChatRole::User,
+            parts: vec![crate::model::MessagePart::Steering {
+                run_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+                client_input_id: input.client_input_id.clone(),
+                blocks: input.blocks,
+            }],
+            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        exec_ctx.add_message(message.clone()).await?;
+        messages.push(message.to_chat_message());
+        if !display.trim().is_empty() {
+            exec_ctx.steering_summaries.push(display);
+            if exec_ctx.steering_summaries.len() > 2 {
+                exec_ctx.steering_summaries.remove(0);
+            }
+        }
+        config.emit_event(
+            &exec_ctx.session_id,
+            AgentEventKind::SteeringApplied {
+                run_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+                input_id: input.input_id,
+                boundary: boundary.to_string(),
+                latency_ms: crate::agent::turn_control::now_ms()
+                    .saturating_sub(input.accepted_at_ms),
+            },
+        );
+    }
+
+    let next = crate::middleware::ConversationContext::new(
+        context.session_id.clone(),
+        Arc::from(messages.into_boxed_slice()),
+        context.stats.clone(),
+        context.provider.clone(),
+        context.model.clone(),
+    )
+    .with_session_mode(context.session_mode)
+    .with_fragments(context.fragments.clone());
+    Ok(Some(Arc::new(next)))
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 //  State machine implementation
 // ══════════════════════════════════════════════════════════════════════════
@@ -163,6 +274,7 @@ pub(crate) async fn execute_cycle_state_machine(
     };
     let mut event_rx = config.event_sink.fanout().subscribe();
     let mut stop_hook_continuations = 0u8;
+    let mut last_objective_checkpoint_step = 0usize;
 
     state = driver
         .run_turn_start(state, Some(&exec_ctx.runtime))
@@ -193,7 +305,50 @@ pub(crate) async fn execute_cycle_state_machine(
         );
 
         state = match state {
-            ExecutionState::BeforeLlmCall { .. } => {
+            ExecutionState::BeforeLlmCall { context } => {
+                exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Model);
+                let context = wait::reconcile_suspended_delegations(
+                    config,
+                    &context,
+                    exec_ctx,
+                    &mut event_rx,
+                )
+                .await?;
+                let context = apply_pending_steering(
+                    config,
+                    exec_ctx,
+                    &context,
+                    "before_model_request",
+                    false,
+                )
+                .await?
+                .unwrap_or(context);
+                let mut context = refresh_objective_fragment(&context, exec_ctx);
+                let steps = context.stats.steps;
+                let checkpoint_due = (steps >= 7 && last_objective_checkpoint_step == 0)
+                    || (last_objective_checkpoint_step > 0
+                        && steps.saturating_sub(last_objective_checkpoint_step) >= 4);
+                if checkpoint_due {
+                    last_objective_checkpoint_step = steps;
+                    context = Arc::new(context.upsert_fragment(
+                        "objective_checkpoint",
+                        "Re-evaluate the active objective before taking more actions. If the gathered evidence is sufficient, answer now. Otherwise identify exactly one missing fact and take only the action needed to resolve it. Do not expand scope without explaining why it is required.".to_string(),
+                        crate::middleware::ContextPriority::High,
+                    ));
+                    config.emit_event(
+                        &exec_ctx.session_id,
+                        AgentEventKind::ObjectiveCheckpoint {
+                            run_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+                            reason: "exploration_budget".to_string(),
+                            action: "refocus".to_string(),
+                        },
+                    );
+                } else if last_objective_checkpoint_step > 0
+                    && steps > last_objective_checkpoint_step
+                {
+                    context = Arc::new(context.remove_fragment("objective_checkpoint"));
+                }
+                let state = ExecutionState::BeforeLlmCall { context };
                 let state = driver
                     .run_step_start(state, Some(&exec_ctx.runtime))
                     .instrument(info_span!(
@@ -240,7 +395,53 @@ pub(crate) async fn execute_cycle_state_machine(
                 }
             }
 
-            ExecutionState::ProcessingToolCalls { .. } => {
+            ExecutionState::ProcessingToolCalls {
+                remaining_calls,
+                results,
+                context,
+            } => {
+                exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Tools);
+                if results.is_empty()
+                    && let Some(steered_context) = apply_pending_steering(
+                        config,
+                        exec_ctx,
+                        &context,
+                        "before_tool_batch",
+                        false,
+                    )
+                    .await?
+                {
+                    let skipped = remaining_calls
+                        .iter()
+                        .map(|call| {
+                            crate::middleware::ToolResult::new(
+                                call.id.clone(),
+                                vec![querymt::chat::Content::text(
+                                    "Skipped because new user steering was received",
+                                )],
+                                true,
+                                Some(call.function.name.clone()),
+                                Some(call.function.arguments.clone()),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let next = transitions::transition_processing_tool_calls(
+                        config,
+                        &Arc::from(Vec::new().into_boxed_slice()),
+                        &Arc::from(skipped.into_boxed_slice()),
+                        &steered_context,
+                        exec_ctx,
+                        bridge.as_ref(),
+                    )
+                    .await?;
+                    state = next;
+                    continue;
+                }
+                let state = ExecutionState::ProcessingToolCalls {
+                    remaining_calls,
+                    results,
+                    context,
+                };
                 let state = driver
                     .run_processing_tool_calls(state, Some(&exec_ctx.runtime))
                     .instrument(info_span!(
@@ -273,13 +474,44 @@ pub(crate) async fn execute_cycle_state_machine(
                 ref context,
                 ref wait,
             } => {
+                exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Waiting);
                 wait::transition_waiting_for_event(config, wait, context, exec_ctx, &mut event_rx)
                     .await?
             }
 
-            ExecutionState::Complete => {
+            ExecutionState::Complete { context } => {
+                exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Closing);
+                let history = Arc::from(exec_ctx.session_handle.history().await.into_boxed_slice());
+                let fallback_context = Arc::new(
+                    crate::middleware::ConversationContext::new(
+                        context.session_id.clone(),
+                        history,
+                        context.stats.clone(),
+                        context.provider.clone(),
+                        context.model.clone(),
+                    )
+                    .with_session_mode(context.session_mode)
+                    .with_fragments(context.fragments.clone()),
+                );
+                if let Some(context) = apply_pending_steering(
+                    config,
+                    exec_ctx,
+                    &fallback_context,
+                    "before_completion",
+                    true,
+                )
+                .await?
+                {
+                    state = ExecutionState::BeforeLlmCall { context };
+                    continue;
+                }
                 let turn_end_state = driver
-                    .run_turn_end(ExecutionState::Complete, Some(&exec_ctx.runtime))
+                    .run_turn_end(
+                        ExecutionState::Complete {
+                            context: fallback_context,
+                        },
+                        Some(&exec_ctx.runtime),
+                    )
                     .instrument(info_span!(
                         "agent.execution.middleware.turn_end",
                         session_id = %exec_ctx.session_id
@@ -289,7 +521,9 @@ pub(crate) async fn execute_cycle_state_machine(
 
                 match turn_end_state {
                     ExecutionState::BeforeLlmCall { .. } => turn_end_state,
-                    ExecutionState::Complete => {
+                    ExecutionState::Complete {
+                        context: completed_context,
+                    } => {
                         debug!("State machine reached Complete state");
 
                         let stop_hook = config
@@ -324,10 +558,7 @@ pub(crate) async fn execute_cycle_state_machine(
                                 );
                             } else {
                                 stop_hook_continuations += 1;
-                                let current_context = state
-                                    .context()
-                                    .cloned()
-                                    .unwrap_or_else(|| initial_context.clone());
+                                let current_context = completed_context.clone();
                                 let message = format_stop_hook_continuation_message(
                                     stop_hook.stop_reason.or(stop_hook.block_reason),
                                     &stop_hook.additional_contexts,

@@ -10,6 +10,9 @@ use crate::agent::core::{AgentMode, SessionRuntime, ToolConfig};
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::messages::*;
+use crate::agent::turn_control::{
+    ActiveRun, InputDelivery, RunPhase, SubmitInputResult, TurnControlError,
+};
 use crate::agent::undo::{RedoResult, UndoError, UndoResult};
 use crate::agent::utils::{format_prompt_user_text_only, render_prompt_for_display};
 use crate::elicitation::ElicitationAction;
@@ -25,7 +28,7 @@ use kameo::reply::DelegatedReply;
 use log::{debug, info, warn};
 use querymt::chat::{ChatRole, ReasoningEffort};
 use querymt::error::LLMError;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -327,6 +330,8 @@ pub struct SessionActor {
 
     // ── Execution tracking ───────────────────────────────────────
     pub(crate) prompt_running: bool,
+    pub(crate) active_run: Option<ActiveRun>,
+    queued_prompts: VecDeque<QueuedPrompt>,
 
     // ── Mesh (remote sessions only) ──────────────────────────────
     /// Present when this actor was spawned on a mesh node via
@@ -343,6 +348,23 @@ pub struct SessionActor {
 pub(crate) struct TurnState {
     pub(crate) generation: u64,
     pub(crate) token: CancellationToken,
+}
+
+const MAX_QUEUED_PROMPTS: usize = 32;
+
+fn queued_prompt_capacity_error(session_id: &str) -> AgentError {
+    AgentError::TurnControl {
+        kind: "queue_full".to_string(),
+        message: format!(
+            "session {session_id} queued prompt capacity ({MAX_QUEUED_PROMPTS}) reached"
+        ),
+    }
+}
+
+struct QueuedPrompt {
+    input_id: String,
+    req: crate::acp::protocol::PromptRequest,
+    reply: oneshot::Sender<Result<PromptResponse, AgentError>>,
 }
 
 impl TurnState {
@@ -376,6 +398,8 @@ impl SessionActor {
             turn_state: TurnState::new(),
             bridge: None,
             prompt_running: false,
+            active_run: None,
+            queued_prompts: VecDeque::new(),
             #[cfg(feature = "remote")]
             mesh: None,
             relay_forwarder_handles: HashMap::new(),
@@ -396,6 +420,93 @@ impl SessionActor {
     pub fn with_mesh(mut self, mesh: Option<crate::agent::remote::MeshHandle>) -> Self {
         self.mesh = mesh;
         self
+    }
+
+    fn launch_prompt(
+        &mut self,
+        req: crate::acp::protocol::PromptRequest,
+        reply: oneshot::Sender<Result<PromptResponse, AgentError>>,
+        actor_ref: kameo::actor::ActorRef<SessionActor>,
+        queued_input_id: Option<String>,
+    ) {
+        self.prompt_running = true;
+        self.turn_state.generation = self.turn_state.generation.saturating_add(1);
+        self.turn_state.token = CancellationToken::new();
+        let generation = self.turn_state.generation;
+        let run_id = Uuid::new_v4().to_string();
+        let active_run = ActiveRun::new(run_id.clone(), generation, self.turn_state.token.clone());
+        let steering = active_run.steering.clone();
+        self.active_run = Some(active_run);
+
+        self.config.emit_event(
+            &self.session_id,
+            AgentEventKind::RunStarted {
+                run_id: run_id.clone(),
+                origin: "interactive".to_string(),
+            },
+        );
+        if let Some(input_id) = queued_input_id {
+            self.config.emit_event(
+                &self.session_id,
+                AgentEventKind::QueuedInputStarted {
+                    input_id,
+                    run_id: run_id.clone(),
+                },
+            );
+        }
+
+        let (phase_tx, mut phase_rx) = tokio::sync::mpsc::unbounded_channel();
+        let phase_actor = actor_ref.clone();
+        let phase_run_id = run_id.clone();
+        tokio::spawn(async move {
+            while let Some(phase) = phase_rx.recv().await {
+                if phase_actor
+                    .tell(RunPhaseChanged {
+                        generation,
+                        run_id: phase_run_id.clone(),
+                        phase,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let exec = DetachedPromptExecution {
+            req,
+            session_id: self.session_id.clone(),
+            runtime: self.runtime.clone(),
+            config: self.config.clone(),
+            cancel_token: self.turn_state.token.clone(),
+            bridge: self.bridge.clone(),
+            mode: self.mode,
+            tool_config: self.tool_config.clone(),
+            execution_origin: crate::agent::execution_context::ExecutionOrigin::Interactive,
+            run_id: run_id.clone(),
+            steering,
+            phase_reporter: phase_tx,
+        };
+        let completion_token = self.turn_state.token.clone();
+        tokio::spawn(async move {
+            let result = execute_prompt_detached(exec).await;
+            let disposition = if completion_token.is_cancelled() {
+                RunCompletionDisposition::Cancelled
+            } else if result.is_err() {
+                RunCompletionDisposition::Failed
+            } else {
+                RunCompletionDisposition::Completed
+            };
+            let _ = reply.send(result);
+            let _ = actor_ref
+                .tell(PromptFinished {
+                    generation,
+                    run_id,
+                    disposition,
+                })
+                .await;
+        });
     }
 
     /// Helper method to extract system prompt from current session config.
@@ -441,6 +552,20 @@ impl Message<Cancel> for SessionActor {
     async fn handle(&mut self, _msg: Cancel, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         debug!("Session {}: Cancel received", self.session_id);
         self.turn_state.token.cancel();
+        if let Some(run) = &mut self.active_run {
+            run.phase = RunPhase::Closing;
+            let run_id = run.run_id.clone();
+            for input in run.steering.discard().await {
+                self.config.emit_event(
+                    &self.session_id,
+                    AgentEventKind::SteeringDiscarded {
+                        run_id: run_id.clone(),
+                        input_id: input.input_id,
+                        reason: "run_cancelled".to_string(),
+                    },
+                );
+            }
+        }
         self.config
             .emit_event(&self.session_id, AgentEventKind::Cancelled);
     }
@@ -448,29 +573,67 @@ impl Message<Cancel> for SessionActor {
 
 // ── PromptFinished (internal) ────────────────────────────────────────────
 
+impl Message<RunPhaseChanged> for SessionActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: RunPhaseChanged,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if let Some(run) = &mut self.active_run
+            && run.generation == msg.generation
+            && run.run_id == msg.run_id
+        {
+            run.phase = msg.phase;
+        }
+    }
+}
+
 impl Message<PromptFinished> for SessionActor {
     type Reply = ();
 
     async fn handle(
         &mut self,
         msg: PromptFinished,
-        _ctx: &mut Context<Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if msg.generation != self.turn_state.generation {
+        if self
+            .active_run
+            .as_ref()
+            .is_none_or(|run| run.generation != msg.generation || run.run_id != msg.run_id)
+        {
             debug!(
-                "Session {} PromptFinished: stale generation={}, current={} (ignored)",
-                self.session_id, msg.generation, self.turn_state.generation
+                "Session {} PromptFinished: stale run ignored",
+                self.session_id
             );
             return;
         }
 
-        self.prompt_running = false;
-        // Reset the token so the next turn starts with a clean (uncancelled) token.
-        self.turn_state.token = CancellationToken::new();
-        debug!(
-            "Session {} PromptFinished: prompt_running=false, token reset (generation={})",
-            self.session_id, msg.generation
+        let outcome = match msg.disposition {
+            RunCompletionDisposition::Completed => "completed",
+            RunCompletionDisposition::Failed => "failed",
+            RunCompletionDisposition::Cancelled => "cancelled",
+        };
+        self.config.emit_event(
+            &self.session_id,
+            AgentEventKind::RunCompleted {
+                run_id: msg.run_id,
+                outcome: outcome.to_string(),
+            },
         );
+        self.active_run = None;
+        self.prompt_running = false;
+        self.turn_state.token = CancellationToken::new();
+
+        if let Some(queued) = self.queued_prompts.pop_front() {
+            self.launch_prompt(
+                queued.req,
+                queued.reply,
+                ctx.actor_ref().clone(),
+                Some(queued.input_id),
+            );
+        }
     }
 }
 
@@ -834,21 +997,41 @@ impl Message<GetRuntimeStatus> for SessionActor {
         _msg: GetRuntimeStatus,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let status = if !self.prompt_running {
-            SessionRuntimeStatus::Idle
-        } else if self.turn_state.token.is_cancelled() {
-            SessionRuntimeStatus::CancelRequested
-        } else if crate::elicitation::has_pending_elicitation_for_session(
-            &self.config.pending_elicitations,
-            &self.session_id,
-        )
-        .await
-        {
-            SessionRuntimeStatus::Waiting
-        } else {
-            SessionRuntimeStatus::Running
+        let pending_steering_count = match &self.active_run {
+            Some(run) => run.steering.pending_count().await,
+            None => 0,
         };
-        Ok(status)
+        let phase = if self.turn_state.token.is_cancelled() && self.active_run.is_some() {
+            SessionRuntimePhase::CancelRequested
+        } else {
+            match self.active_run.as_ref().map(|run| run.phase) {
+                None => SessionRuntimePhase::Idle,
+                Some(RunPhase::Starting) => SessionRuntimePhase::Starting,
+                Some(RunPhase::Model) => SessionRuntimePhase::Model,
+                Some(RunPhase::Tools) => SessionRuntimePhase::Tools,
+                Some(RunPhase::Waiting) => SessionRuntimePhase::Waiting,
+                Some(RunPhase::Closing) => SessionRuntimePhase::Closing,
+            }
+        };
+        Ok(SessionRuntimeStatus {
+            phase,
+            active_run_id: self.active_run.as_ref().map(|run| run.run_id.clone()),
+            steerable: self
+                .active_run
+                .as_ref()
+                .is_some_and(|run| run.phase != RunPhase::Closing),
+            pending_steering_count: crate::agent::utils::u32_from_usize(
+                pending_steering_count,
+                "pending_steering_count",
+                Some(&self.session_id),
+            ),
+            queued_input_count: crate::agent::utils::u32_from_usize(
+                self.queued_prompts.len(),
+                "queued_input_count",
+                Some(&self.session_id),
+            ),
+            run_started_at_ms: self.active_run.as_ref().map(|run| run.started_at_ms),
+        })
     }
 }
 
@@ -1350,115 +1533,162 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
 
 // ── Prompt (the big one) ─────────────────────────────────────────────────
 
+impl Message<SubmitSessionInput> for SessionActor {
+    type Reply = Result<SubmitInputResult, AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: SubmitSessionInput,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let input = msg.input;
+        if input.session_id != self.session_id {
+            return Err(AgentError::from(TurnControlError::SessionMismatch {
+                expected: self.session_id.clone(),
+                received: input.session_id,
+            }));
+        }
+        let input_id = input
+            .client_input_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        match input.delivery {
+            InputDelivery::Steer => {
+                let run = self
+                    .active_run
+                    .as_ref()
+                    .ok_or_else(|| AgentError::from(TurnControlError::NoActiveRun))?;
+                let expected = input
+                    .expected_run_id
+                    .ok_or_else(|| AgentError::from(TurnControlError::ExpectedRunIdRequired))?;
+                if expected != run.run_id {
+                    return Err(AgentError::from(TurnControlError::RunMismatch {
+                        expected,
+                        active: run.run_id.clone(),
+                    }));
+                }
+                if run.phase == RunPhase::Closing {
+                    return Err(AgentError::from(TurnControlError::RunClosing {
+                        run_id: run.run_id.clone(),
+                    }));
+                }
+                let position = run
+                    .steering
+                    .push(input_id.clone(), input.client_input_id, input.prompt)
+                    .await
+                    .map_err(AgentError::from)?;
+                let position = crate::agent::utils::u32_from_usize(
+                    position,
+                    "steering_position",
+                    Some(&self.session_id),
+                );
+                self.config.emit_event(
+                    &self.session_id,
+                    AgentEventKind::SteeringAccepted {
+                        run_id: run.run_id.clone(),
+                        input_id: input_id.clone(),
+                        position,
+                    },
+                );
+                Ok(SubmitInputResult::Steered {
+                    run_id: run.run_id.clone(),
+                    input_id,
+                    position,
+                })
+            }
+            InputDelivery::Queue => {
+                let req =
+                    crate::acp::protocol::PromptRequest::new(self.session_id.clone(), input.prompt);
+                if self.active_run.is_some() && self.queued_prompts.len() >= MAX_QUEUED_PROMPTS {
+                    return Err(queued_prompt_capacity_error(&self.session_id));
+                }
+                let (reply, receiver) = oneshot::channel();
+                let log_session_id = self.session_id.clone();
+                let log_input_id = input_id.clone();
+                tokio::spawn(async move {
+                    match receiver.await {
+                        Ok(Err(error)) => warn!(
+                            "Session {}: queued input {} execution failed: {}",
+                            log_session_id, log_input_id, error
+                        ),
+                        Err(error) => warn!(
+                            "Session {}: queued input {} result channel dropped: {}",
+                            log_session_id, log_input_id, error
+                        ),
+                        Ok(Ok(_)) => {}
+                    }
+                });
+                if self.active_run.is_none() {
+                    self.launch_prompt(req, reply, ctx.actor_ref().clone(), Some(input_id.clone()));
+                    let run_id = self
+                        .active_run
+                        .as_ref()
+                        .map(|run| run.run_id.clone())
+                        .unwrap_or_default();
+                    Ok(SubmitInputResult::Started { run_id, input_id })
+                } else {
+                    let position = self.queued_prompts.len() + 1;
+                    self.queued_prompts.push_back(QueuedPrompt {
+                        input_id: input_id.clone(),
+                        req,
+                        reply,
+                    });
+                    let position = crate::agent::utils::u32_from_usize(
+                        position,
+                        "queued_input_position",
+                        Some(&self.session_id),
+                    );
+                    self.config.emit_event(
+                        &self.session_id,
+                        AgentEventKind::InputQueued {
+                            input_id: input_id.clone(),
+                            position,
+                        },
+                    );
+                    Ok(SubmitInputResult::Queued { input_id, position })
+                }
+            }
+        }
+    }
+}
+
 impl Message<Prompt> for SessionActor {
     type Reply = DelegatedReply<Result<PromptResponse, AgentError>>;
 
     async fn handle(&mut self, msg: Prompt, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        if self.prompt_running {
-            // Allow new prompts through even while one is running.
-            // execution_permit still serializes actual turn execution, so this
-            // behaves like queueing instead of fail-fast rejection.
-            if self.turn_state.token.is_cancelled() {
-                debug!(
-                    "Session {}: prompt_running=true, cancelled=true → allowing new prompt through",
-                    self.session_id
-                );
-            } else {
-                debug!(
-                    "Session {}: prompt_running=true, cancelled=false → queueing behind running prompt",
-                    self.session_id
-                );
+        let (reply, receiver) = oneshot::channel();
+        if self.active_run.is_some() {
+            if self.queued_prompts.len() >= MAX_QUEUED_PROMPTS {
+                let error = queued_prompt_capacity_error(&self.session_id);
+                return ctx.spawn(async move { Err(error) });
             }
-        } else {
-            debug!(
-                "Session {}: prompt_running=false → accepting new prompt",
-                self.session_id
-            );
-        }
-
-        self.prompt_running = true;
-
-        // Advance generation for this prompt so stale PromptFinished messages from
-        // older detached tasks cannot mutate current state.
-        self.turn_state.generation = self.turn_state.generation.saturating_add(1);
-        let prompt_generation = self.turn_state.generation;
-
-        // Only create a fresh token when the previous token was already cancelled.
-        // Otherwise keep the token so Cancel still reaches the currently-running task
-        // while additional prompts wait behind the execution permit.
-        if self.turn_state.token.is_cancelled() {
-            self.turn_state.token = CancellationToken::new();
-            debug!(
-                "Session {}: set prompt_running=true, generation={}, fresh token created (previous was cancelled)",
-                self.session_id, prompt_generation
+            let input_id = Uuid::new_v4().to_string();
+            let position = self.queued_prompts.len() + 1;
+            self.queued_prompts.push_back(QueuedPrompt {
+                input_id: input_id.clone(),
+                req: msg.req,
+                reply,
+            });
+            self.config.emit_event(
+                &self.session_id,
+                AgentEventKind::InputQueued {
+                    input_id,
+                    position: crate::agent::utils::u32_from_usize(
+                        position,
+                        "legacy_queued_input_position",
+                        Some(&self.session_id),
+                    ),
+                },
             );
         } else {
-            debug!(
-                "Session {}: set prompt_running=true, generation={}, reusing existing token",
-                self.session_id, prompt_generation
-            );
+            self.launch_prompt(msg.req, reply, ctx.actor_ref().clone(), None);
         }
-
-        // Capture everything needed for the detached task
-        let config = self.config.clone();
-        let session_id = self.session_id.clone();
-        let runtime = self.runtime.clone();
-        let cancel_token = self.turn_state.token.clone();
-        let bridge = self.bridge.clone();
-        let mode = self.mode;
-        let tool_config = self.tool_config.clone();
-        let actor_ref = ctx.actor_ref().clone();
-        let span_session_id = session_id.clone();
-
-        // Capture the current span (kameo's `actor.handle_message`) so the
-        // spawned task's span tree remains a child of the actor message span.
-        // Without this, `tokio::spawn` breaks the tracing context and the
-        // entire execution trace appears as an orphaned root.
-        let parent_span = tracing::Span::current();
-
-        ctx.spawn(
-            async move {
-                let result = execute_prompt_detached(DetachedPromptExecution {
-                    req: msg.req,
-                    session_id: session_id.clone(),
-                    runtime,
-                    config,
-                    cancel_token,
-                    bridge,
-                    mode,
-                    tool_config,
-                    execution_origin: crate::agent::execution_context::ExecutionOrigin::Interactive,
-                })
-                .await;
-
-                debug!("Session {}: sending PromptFinished to actor", session_id);
-                // Reset prompt_running flag via message back to actor
-                if let Err(e) = actor_ref
-                    .tell(PromptFinished {
-                        generation: prompt_generation,
-                    })
-                    .await
-                {
-                    debug!(
-                        "Failed to send PromptFinished message to actor ({}): {:?}. \
-                         Actor may have been shutdown — next prompt will reset via generation guard.",
-                        session_id, e
-                    );
-                } else {
-                    debug!("Session {}: PromptFinished sent successfully", session_id);
-                }
-
-                result
-            }
-            .instrument(info_span!(
-                parent: &parent_span,
-                "agent.prompt.task",
-                session_id = %span_session_id,
-                prompt_generation,
-                execution_origin = ?crate::agent::execution_context::ExecutionOrigin::Interactive,
-                mode = %mode,
-            )),
-        )
+        ctx.spawn(async move {
+            receiver.await.unwrap_or_else(|_| {
+                Err(AgentError::Internal("prompt execution dropped".to_string()))
+            })
+        })
     }
 }
 
@@ -1483,27 +1713,30 @@ impl Message<ScheduledPrompt> for SessionActor {
             self.session_id, msg.schedule_public_id
         );
 
-        if self.prompt_running {
-            if self.turn_state.token.is_cancelled() {
-                debug!(
-                    "Session {}: scheduled prompt: prompt_running=true, cancelled=true → allowing through",
-                    self.session_id
-                );
-            } else {
-                debug!(
-                    "Session {}: scheduled prompt: prompt_running=true → queueing behind running prompt",
-                    self.session_id
-                );
-            }
+        if self.active_run.is_some() {
+            let session_id = self.session_id.clone();
+            let schedule_public_id = msg.schedule_public_id.clone();
+            return ctx.spawn(async move {
+                Err(AgentError::AdmissionRejected {
+                    reason: format!(
+                        "session {session_id} already has an active run; scheduled execution {schedule_public_id} must be retried"
+                    ),
+                })
+            });
         }
 
         self.prompt_running = true;
         self.turn_state.generation = self.turn_state.generation.saturating_add(1);
         let prompt_generation = self.turn_state.generation;
-
-        if self.turn_state.token.is_cancelled() {
-            self.turn_state.token = CancellationToken::new();
-        }
+        let run_id = Uuid::new_v4().to_string();
+        self.turn_state.token = CancellationToken::new();
+        let scheduled_run = ActiveRun::new(
+            run_id.clone(),
+            prompt_generation,
+            self.turn_state.token.clone(),
+        );
+        let steering = scheduled_run.steering.clone();
+        self.active_run = Some(scheduled_run);
 
         // Build a PromptRequest from the schedule's prompt text
         let prompt_request = crate::acp::protocol::PromptRequest::new(
@@ -1522,7 +1755,26 @@ impl Message<ScheduledPrompt> for SessionActor {
         let tool_config = self.tool_config.clone();
         let schedule_public_id = msg.schedule_public_id.clone();
         let actor_ref = ctx.actor_ref().clone();
+        let (phase_reporter, mut phase_rx) = tokio::sync::mpsc::unbounded_channel();
+        let phase_actor = actor_ref.clone();
+        let phase_run_id = run_id.clone();
+        tokio::spawn(async move {
+            while let Some(phase) = phase_rx.recv().await {
+                if phase_actor
+                    .tell(RunPhaseChanged {
+                        generation: prompt_generation,
+                        run_id: phase_run_id.clone(),
+                        phase,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let span_session_id = session_id.clone();
+        let completion_token = self.turn_state.token.clone();
 
         // Capture the current span (kameo's `actor.handle_message`) so the
         // spawned task's span tree remains a child of the actor message span.
@@ -1542,6 +1794,9 @@ impl Message<ScheduledPrompt> for SessionActor {
                     execution_origin: crate::agent::execution_context::ExecutionOrigin::Scheduled {
                         schedule_public_id: schedule_public_id.clone(),
                     },
+                    run_id: run_id.clone(),
+                    steering,
+                    phase_reporter,
                 })
                 .await;
 
@@ -1569,9 +1824,18 @@ impl Message<ScheduledPrompt> for SessionActor {
                     }
                 }
 
+                let disposition = if completion_token.is_cancelled() {
+                    RunCompletionDisposition::Cancelled
+                } else if result.is_err() {
+                    RunCompletionDisposition::Failed
+                } else {
+                    RunCompletionDisposition::Completed
+                };
                 if let Err(e) = actor_ref
                     .tell(PromptFinished {
                         generation: prompt_generation,
+                        run_id,
+                        disposition,
                     })
                     .await
                 {
@@ -1610,6 +1874,9 @@ struct DetachedPromptExecution {
     tool_config: ToolConfig,
     /// Origin of this execution — interactive or scheduled.
     execution_origin: crate::agent::execution_context::ExecutionOrigin,
+    run_id: String,
+    steering: Arc<crate::agent::turn_control::SteeringInbox>,
+    phase_reporter: tokio::sync::mpsc::UnboundedSender<RunPhase>,
 }
 
 enum PermitWaitOutcome {
@@ -1664,6 +1931,9 @@ async fn execute_prompt_detached(
         mode,
         tool_config,
         execution_origin,
+        run_id,
+        steering,
+        phase_reporter,
     } = exec;
     debug!(
         "Prompt request for session {} with {} block(s)",
@@ -1749,10 +2019,11 @@ async fn execute_prompt_detached(
         .await
         .map_err(|e| AgentError::Internal(e.to_string()))?;
 
+    let initial_prompt = req.prompt.clone();
+
     // Create execution context — attach the cancellation token so it propagates
     // into individual tool calls for cooperative cancellation.
     // The knowledge store is propagated so knowledge tools can access it.
-    let turn_id = Uuid::new_v4().to_string();
     let mut exec_ctx = ExecutionContext::new(
         session_id.clone(),
         runtime.clone(),
@@ -1765,8 +2036,11 @@ async fn execute_prompt_detached(
     .with_knowledge_store(config.knowledge_store())
     .with_event_sink(config.event_sink.clone())
     .with_workspace_query_bridge(bridge.clone())
-    .with_turn_id(turn_id.clone())
-    .with_turn_mode(mode);
+    .with_turn_id(run_id.clone())
+    .with_turn_mode(mode)
+    .with_steering(steering)
+    .with_initial_prompt(initial_prompt)
+    .with_phase_reporter(phase_reporter);
 
     // 4. Slash command expansion (before storing user messages)
     let mut req = req;
@@ -1798,7 +2072,7 @@ async fn execute_prompt_detached(
         .hooks
         .run_user_prompt_submit(crate::hooks::UserPromptSubmitRequest {
             session_id: session_id.clone(),
-            turn_id: turn_id.clone(),
+            turn_id: run_id.clone(),
             cwd: exec_ctx.cwd().map(|p| p.to_path_buf()),
             model: exec_ctx
                 .llm_config()
@@ -1960,7 +2234,7 @@ async fn execute_prompt_detached(
         }
 
         let turn_snapshot_data = runtime.turn_snapshot.lock().take();
-        if let Some((turn_id, pre_snapshot_id)) = turn_snapshot_data {
+        if let Some((_turn_id, pre_snapshot_id)) = turn_snapshot_data {
             match backend.track(worktree).await {
                 Ok(post_snapshot_id) => {
                     if pre_snapshot_id != post_snapshot_id {
@@ -1970,7 +2244,7 @@ async fn execute_prompt_detached(
                         {
                             Ok(changed) if !changed.is_empty() => {
                                 let patch_part = MessagePart::TurnSnapshotPatch {
-                                    turn_id: turn_id.clone(),
+                                    turn_id: run_id.clone(),
                                     snapshot_id: post_snapshot_id.clone(),
                                     changed_paths: changed
                                         .iter()
@@ -2380,7 +2654,11 @@ mod tests {
         // Simulate prompt_running=true and token cancelled (the state after Cancel
         // is received while a prompt execution task is still in flight).
         f.actor_ref
-            .tell(PromptFinished { generation: 0 })
+            .tell(PromptFinished {
+                generation: 0,
+                run_id: String::new(),
+                disposition: RunCompletionDisposition::Completed,
+            })
             .await
             .expect("tell PromptFinished");
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -2686,7 +2964,11 @@ mod tests {
         let f = ActorFixture::new().await;
         // Send PromptFinished — even when not "running", should be a no-op that doesn't panic
         f.actor_ref
-            .tell(PromptFinished { generation: 0 })
+            .tell(PromptFinished {
+                generation: 0,
+                run_id: String::new(),
+                disposition: RunCompletionDisposition::Completed,
+            })
             .await
             .expect("tell PromptFinished");
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;

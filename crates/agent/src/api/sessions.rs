@@ -351,7 +351,7 @@ impl AgentSessions {
                 .unwrap_or_default();
             let runtime_status = runtime_statuses
                 .get(&session_id)
-                .copied()
+                .cloned()
                 .unwrap_or(SessionRuntimeStatus::Idle);
             let has_errors = stats.last_finish_reason == Some(FinishReason::Error);
             let meta = SessionMeta {

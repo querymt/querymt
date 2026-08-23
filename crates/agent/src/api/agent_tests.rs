@@ -509,8 +509,16 @@ async fn acp_session_list_includes_relationship_and_operational_meta() -> Result
     );
     assert_eq!(child_meta.get("hasErrors"), Some(&serde_json::json!(true)));
     assert_eq!(
-        child_meta.get("runtimeStatus"),
+        child_meta
+            .get("runtimeStatus")
+            .and_then(|status| status.get("phase")),
         Some(&serde_json::json!("idle"))
+    );
+    assert_eq!(
+        child_meta
+            .get("runtimeStatus")
+            .and_then(|status| status.get("active_run_id")),
+        Some(&serde_json::Value::Null)
     );
     Ok(())
 }

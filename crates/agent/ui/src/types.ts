@@ -29,6 +29,8 @@ export {
   TaskStatus,
   EventOriginKind,
   OAuthFlowKindTs,
+  UiInputDelivery,
+  SessionRuntimePhase,
 } from './generated/types';
 
 export type {
@@ -65,6 +67,8 @@ export type {
   UiPromptBlock,
   UiClientMessage,
   UiServerMessage,
+  SessionRuntimeStatus,
+  SubmitInputResult,
   // P3: Previously `any` types, now generated with proper structure
   UsageInfo,
   ToolInfo,

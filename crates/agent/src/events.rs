@@ -148,6 +148,44 @@ pub enum AgentEventKind {
     /// state machine begins. Signals the UI that preparation is underway
     /// (loading history, snapshotting, building tools, running middleware).
     TurnStarted,
+    RunStarted {
+        run_id: String,
+        origin: String,
+    },
+    RunCompleted {
+        run_id: String,
+        outcome: String,
+    },
+    SteeringAccepted {
+        run_id: String,
+        input_id: String,
+        position: u32,
+    },
+    SteeringApplied {
+        run_id: String,
+        input_id: String,
+        boundary: String,
+        #[typeshare(serialized_as = "number")]
+        latency_ms: u64,
+    },
+    SteeringDiscarded {
+        run_id: String,
+        input_id: String,
+        reason: String,
+    },
+    InputQueued {
+        input_id: String,
+        position: u32,
+    },
+    QueuedInputStarted {
+        input_id: String,
+        run_id: String,
+    },
+    ObjectiveCheckpoint {
+        run_id: String,
+        reason: String,
+        action: String,
+    },
     AssistantMessageStored {
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]

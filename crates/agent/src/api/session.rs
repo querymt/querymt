@@ -102,6 +102,51 @@ impl AgentSession {
         latest_assistant_message(&history).ok_or_else(|| anyhow!("No assistant response found"))
     }
 
+    pub async fn runtime_state(&self) -> Result<crate::agent::messages::SessionRuntimeStatus> {
+        let session = self
+            .agent
+            .session_ref_for_agent_session(&self.session_id)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        session
+            .get_runtime_status()
+            .await
+            .map_err(|error| anyhow!(error.to_string()))
+    }
+
+    pub async fn steer(&self, expected_run_id: &str, prompt: &str) -> Result<()> {
+        let session = self
+            .agent
+            .session_ref_for_agent_session(&self.session_id)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        session
+            .steer(
+                self.session_id.clone(),
+                expected_run_id.to_string(),
+                vec![ContentBlock::Text(TextContent::new(prompt))],
+            )
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn queue(&self, prompt: &str) -> Result<()> {
+        let session = self
+            .agent
+            .session_ref_for_agent_session(&self.session_id)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        session
+            .queue(
+                self.session_id.clone(),
+                vec![ContentBlock::Text(TextContent::new(prompt))],
+            )
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        Ok(())
+    }
+
     pub async fn set_provider(&self, provider: &str, model: &str) -> Result<()> {
         self.agent
             .set_provider(&self.session_id, provider, model)

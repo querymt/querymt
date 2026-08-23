@@ -67,8 +67,10 @@ pub use session_ops::{ListSessionsRequest, handle_list_session_children, handle_
 use super::ServerState;
 use super::connection::{send_error, send_state};
 use super::error::format_prefixed_error_chain;
-use super::messages::{UiClientMessage, UiPromptBlock};
-use super::session::{ensure_sessions_for_mode_with_profile, prompt_for_mode, resolve_cwd};
+use super::messages::{UiClientMessage, UiInputDelivery, UiPromptBlock, UiServerMessage};
+use super::session::{
+    build_ui_prompt_blocks, ensure_sessions_for_mode_with_profile, prompt_for_mode, resolve_cwd,
+};
 use models::handle_get_recent_models;
 #[cfg(not(all(test, feature = "remote")))]
 use models::handle_set_session_model;
@@ -209,6 +211,105 @@ pub async fn handle_ui_message(
 
                 if !state.shutdown_token.is_cancelled() {
                     handle_list_sessions(&state, &tx, ListSessionsRequest::root_browse()).await;
+                }
+            });
+        }
+        UiClientMessage::SubmitInput {
+            session_id,
+            delivery,
+            expected_run_id,
+            client_input_id,
+            prompt,
+        } => {
+            let state = state.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let failure_input_id = client_input_id.clone().unwrap_or_default();
+                let result: Result<_, crate::error::AgentError> = async {
+                    let (session_ref, prompt) =
+                        build_ui_prompt_blocks(&state, &session_id, &prompt)
+                            .await
+                            .map_err(crate::error::AgentError::Internal)?;
+                    session_ref
+                        .submit_input(crate::agent::messages::SubmitInput {
+                            session_id: session_id.clone(),
+                            client_input_id,
+                            expected_run_id,
+                            delivery: match delivery {
+                                UiInputDelivery::Steer => {
+                                    crate::agent::messages::InputDelivery::Steer
+                                }
+                                UiInputDelivery::Queue => {
+                                    crate::agent::messages::InputDelivery::Queue
+                                }
+                            },
+                            prompt,
+                        })
+                        .await
+                }
+                .await;
+                match result {
+                    Ok(result) => {
+                        let message = UiServerMessage::InputSubmitted { session_id, result };
+                        if let Ok(json) = serde_json::to_string(&message) {
+                            let _ = tx.send(json).await;
+                        }
+                    }
+                    Err(error) => {
+                        let code = match &error {
+                            crate::error::AgentError::TurnControl { kind, .. } => kind.as_str(),
+                            _ => "submission_failed",
+                        };
+                        let active_run_id =
+                            match crate::ui::session::session_ref_for_session(&state, &session_id)
+                                .await
+                            {
+                                Some(session_ref) => session_ref
+                                    .get_runtime_status()
+                                    .await
+                                    .ok()
+                                    .and_then(|runtime| runtime.active_run_id),
+                                None => None,
+                            };
+                        let message = UiServerMessage::InputSubmissionFailed {
+                            session_id,
+                            client_input_id: failure_input_id,
+                            code: code.to_string(),
+                            message: error.to_string(),
+                            active_run_id,
+                        };
+                        if let Ok(json) = serde_json::to_string(&message) {
+                            let _ = tx.send(json).await;
+                        }
+                    }
+                }
+            });
+        }
+        UiClientMessage::GetRuntimeState { session_id } => {
+            let state = state.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result =
+                    match crate::ui::session::session_ref_for_session(&state, &session_id).await {
+                        Some(session_ref) => session_ref
+                            .get_runtime_status()
+                            .await
+                            .map_err(|error| error.to_string()),
+                        None => Err(format!("session not found: {session_id}")),
+                    };
+                match result {
+                    Ok(runtime_state) => {
+                        let message = UiServerMessage::RuntimeState {
+                            session_id,
+                            state: runtime_state,
+                        };
+                        if let Ok(json) = serde_json::to_string(&message) {
+                            let _ = tx.send(json).await;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = send_error(&tx, error).await;
+                    }
                 }
             });
         }

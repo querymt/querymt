@@ -34,6 +34,22 @@ enum WaitEventOutcome {
 /// This function blocks until matching events are received or execution is cancelled.
 /// For delegation waits, policy controls whether we resume on first result (Any)
 /// or wait for all requested delegations (All), with optional timeout cleanup.
+async fn wait_for_pending_steering(exec_ctx: &ExecutionContext) {
+    let Some(inbox) = &exec_ctx.steering else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if inbox.pending_count().await > 0 {
+            return;
+        }
+        inbox.notified().await;
+        if inbox.pending_count().await > 0 {
+            return;
+        }
+    }
+}
+
 pub(super) async fn transition_waiting_for_event(
     config: &AgentConfig,
     wait: &WaitCondition,
@@ -61,6 +77,19 @@ pub(super) async fn transition_waiting_for_event(
             tokio::select! {
                 _ = exec_ctx.cancellation_token.cancelled() => {
                     return Ok(ExecutionState::Cancelled);
+                }
+                _ = wait_for_pending_steering(exec_ctx) => {
+                    exec_ctx
+                        .suspended_delegations
+                        .lock()
+                        .await
+                        .extend(wait.correlation_ids.iter().cloned());
+                    let pending = wait.correlation_ids.join(", ");
+                    let message = format!(
+                        "New user steering was received. Delegations still running and awaiting later reconciliation: {pending}"
+                    );
+                    let new_context = inject_wait_message(config, context, exec_ctx, message).await?;
+                    return Ok(ExecutionState::BeforeLlmCall { context: new_context });
                 }
                 event = event_rx.recv() => {
                     let event = match event {
@@ -122,6 +151,19 @@ pub(super) async fn transition_waiting_for_event(
             _ = exec_ctx.cancellation_token.cancelled() => {
                 return Ok(ExecutionState::Cancelled);
             }
+            _ = wait_for_pending_steering(exec_ctx) => {
+                exec_ctx
+                    .suspended_delegations
+                    .lock()
+                    .await
+                    .extend(pending.iter().cloned());
+                let message = format!(
+                    "New user steering was received. Delegations still running and awaiting later reconciliation: {}",
+                    pending.iter().cloned().collect::<Vec<_>>().join(", ")
+                );
+                let new_context = inject_wait_message(config, context, exec_ctx, message).await?;
+                return Ok(ExecutionState::BeforeLlmCall { context: new_context });
+            }
             _ = &mut sleep, if timeout_secs > 0 => {
                 let timed_out_ids: Vec<String> = pending.iter().cloned().collect();
                 cleanup_timed_out_delegations(config, exec_ctx, &timed_out_ids).await;
@@ -182,6 +224,53 @@ pub(super) async fn transition_waiting_for_event(
             }
         }
     }
+}
+
+pub(super) async fn reconcile_suspended_delegations(
+    config: &AgentConfig,
+    context: &Arc<crate::middleware::ConversationContext>,
+    exec_ctx: &ExecutionContext,
+    event_rx: &mut tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>,
+) -> Result<Arc<crate::middleware::ConversationContext>, anyhow::Error> {
+    let mut context = context.clone();
+    if exec_ctx.suspended_delegations.lock().await.is_empty() {
+        return Ok(context);
+    }
+    loop {
+        let event = match event_rx.try_recv() {
+            Ok(event) => event,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+        };
+        if event.session_id() != exec_ctx.session_id {
+            continue;
+        }
+        let suspended = exec_ctx.suspended_delegations.lock().await.clone();
+        if suspended.is_empty() {
+            break;
+        }
+        let wait = WaitCondition {
+            reason: WaitReason::Delegation,
+            correlation_ids: suspended.iter().cloned().collect(),
+        };
+        let Some(outcome) = match_wait_event(&wait, &event) else {
+            continue;
+        };
+        let delegation_id = match &outcome {
+            WaitEventOutcome::Completed { delegation_id, .. }
+            | WaitEventOutcome::Failed { delegation_id, .. }
+            | WaitEventOutcome::Cancelled { delegation_id } => delegation_id,
+        };
+        exec_ctx
+            .suspended_delegations
+            .lock()
+            .await
+            .remove(delegation_id);
+        context =
+            inject_wait_message(config, &context, exec_ctx, format_wait_outcome(&outcome)).await?;
+    }
+    Ok(context)
 }
 
 fn match_wait_event(

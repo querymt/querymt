@@ -2,7 +2,7 @@ use super::utils::format_prefixed_error_chain;
 use super::*;
 
 impl LocalAgentHandle {
-    pub(super) async fn session_ref_for_agent_session(
+    pub(crate) async fn session_ref_for_agent_session(
         &self,
         session_id: &str,
     ) -> Result<SessionActorRef, Error> {
@@ -43,7 +43,7 @@ impl LocalAgentHandle {
     }
 
     pub async fn stop_session(&self, session_id: &str) -> Result<(), Error> {
-        use crate::agent::messages::SessionRuntimeStatus;
+        use crate::agent::messages::{SessionRuntimePhase, SessionRuntimeStatus};
 
         const STOP_ESCALATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -70,7 +70,7 @@ impl LocalAgentHandle {
             .get_runtime_status()
             .await
             .unwrap_or(SessionRuntimeStatus::Running);
-        if status == SessionRuntimeStatus::Idle {
+        if status.phase == SessionRuntimePhase::Idle {
             tracing::debug!(
                 "Session {} stop: status=Idle, graceful shutdown — returning without force-stop",
                 session_id,
@@ -79,7 +79,7 @@ impl LocalAgentHandle {
         }
         // For remote sessions, CancelRequested doesn't mean the prompt is done —
         // the provider stream might still be active on the remote node.
-        if status == SessionRuntimeStatus::CancelRequested && !session_ref.is_remote() {
+        if status.phase == SessionRuntimePhase::CancelRequested && !session_ref.is_remote() {
             tracing::debug!(
                 "Session {} stop: status=CancelRequested (local), graceful shutdown — returning without force-stop",
                 session_id,
@@ -87,7 +87,7 @@ impl LocalAgentHandle {
             return Ok(());
         }
 
-        if matches!(status, SessionRuntimeStatus::CancelRequested) {
+        if status.phase == SessionRuntimePhase::CancelRequested {
             tracing::warn!(
                 "Session {} stop: still CancelRequested after {:?}; escalating to force-stop",
                 session_id,

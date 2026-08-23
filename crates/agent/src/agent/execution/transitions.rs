@@ -209,10 +209,20 @@ pub(super) async fn transition_call_llm(
     exec_ctx: &ExecutionContext,
 ) -> Result<ExecutionState, anyhow::Error> {
     let session_id = &exec_ctx.session_id;
+    let (stable_messages, latest_message) = context
+        .messages
+        .split_last()
+        .map(|(latest, stable)| (stable, Some(latest.clone())))
+        .unwrap_or((&[], None));
+    let mut request_messages = apply_cache_breakpoints(stable_messages);
+    request_messages.extend(context.fragment_messages());
+    if let Some(latest_message) = latest_message {
+        request_messages.push(latest_message);
+    }
     debug!(
         "CallLlm: session={}, messages={}",
         session_id,
-        context.messages.len()
+        request_messages.len()
     );
 
     if exec_ctx.cancellation_token.is_cancelled() {
@@ -223,15 +233,15 @@ pub(super) async fn transition_call_llm(
         session_id,
         AgentEventKind::LlmRequestStart {
             message_count: u32_from_usize(
-                context.messages.len(),
-                "context.messages.len",
+                request_messages.len(),
+                "request_messages.len",
                 Some(session_id),
             ),
         },
     );
 
     let session_handle = &exec_ctx.session_handle;
-    let messages_with_cache = apply_cache_breakpoints(&context.messages);
+    let messages_with_cache = request_messages;
 
     // Pre-allocated message_id for streaming path so that delta events and the
     // final AssistantMessageStored share the same ID.
@@ -940,7 +950,8 @@ pub(super) async fn transition_after_llm(
             context.provider.clone(),
             context.model.clone(),
         )
-        .with_session_mode(context.session_mode),
+        .with_session_mode(context.session_mode)
+        .with_fragments(context.fragments.clone()),
     );
 
     match response.finish_reason {
@@ -952,7 +963,9 @@ pub(super) async fn transition_after_llm(
                     context: new_context,
                 })
             } else {
-                Ok(ExecutionState::Complete)
+                Ok(ExecutionState::Complete {
+                    context: new_context,
+                })
             }
         }
 
@@ -968,9 +981,9 @@ pub(super) async fn transition_after_llm(
                             task.public_id
                         );
                     }
-                    TaskKind::Finite | TaskKind::Evolving => {
+                    TaskKind::Finite => {
                         if let Err(e) = exec_ctx.state.update_task_status(TaskStatus::Done).await {
-                            debug!("Failed to auto-complete task on stop: {}", e);
+                            debug!("Failed to auto-complete finite task on stop: {}", e);
                         } else if let Some(task) = exec_ctx.state.active_task.clone() {
                             config.emit_event(
                                 &exec_ctx.session_id,
@@ -978,9 +991,14 @@ pub(super) async fn transition_after_llm(
                             );
                         }
                     }
+                    TaskKind::Evolving => {
+                        debug!("Evolving task remains active after an ordinary model stop");
+                    }
                 }
             }
-            Ok(ExecutionState::Complete)
+            Ok(ExecutionState::Complete {
+                context: new_context,
+            })
         }
 
         Some(FinishReason::Length) => Ok(ExecutionState::Stopped {
@@ -1000,7 +1018,9 @@ pub(super) async fn transition_after_llm(
         | Some(FinishReason::Other)
         | None => {
             if response.tool_calls.is_empty() {
-                Ok(ExecutionState::Complete)
+                Ok(ExecutionState::Complete {
+                    context: new_context,
+                })
             } else {
                 Ok(ExecutionState::ProcessingToolCalls {
                     remaining_calls: Arc::from(response.tool_calls.clone().into_boxed_slice()),

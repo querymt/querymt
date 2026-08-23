@@ -94,11 +94,25 @@ pub struct ToolFunction {
     pub arguments: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ContextPriority {
+    Normal,
+    High,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextFragment {
+    pub key: &'static str,
+    pub content: String,
+    pub priority: ContextPriority,
+}
+
 /// Context passed to middleware during state transitions
 #[derive(Debug, Clone)]
 pub struct ConversationContext {
     pub session_id: Arc<str>,
     pub messages: Arc<[ChatMessage]>,
+    pub fragments: Arc<[ContextFragment]>,
     pub stats: Arc<AgentStats>,
     /// Current provider for the session (for dynamic model info lookup)
     pub provider: Arc<str>,
@@ -121,6 +135,7 @@ impl ConversationContext {
         Self {
             session_id,
             messages,
+            fragments: Arc::from([]),
             stats,
             provider,
             model,
@@ -151,6 +166,7 @@ impl ConversationContext {
         Self {
             session_id: self.session_id.clone(),
             messages: Arc::from(messages.into_boxed_slice()),
+            fragments: self.fragments.clone(),
             stats: self.stats.clone(),
             provider: self.provider.clone(),
             model: self.model.clone(),
@@ -158,9 +174,65 @@ impl ConversationContext {
         }
     }
 
+    pub fn upsert_fragment(
+        &self,
+        key: &'static str,
+        content: String,
+        priority: ContextPriority,
+    ) -> Self {
+        let mut fragments = self.fragments.to_vec();
+        fragments.retain(|fragment| fragment.key != key);
+        if !content.trim().is_empty() {
+            fragments.push(ContextFragment {
+                key,
+                content,
+                priority,
+            });
+            fragments.sort_by_key(|fragment| (fragment.priority, fragment.key));
+        }
+        let mut next = self.clone();
+        next.fragments = Arc::from(fragments.into_boxed_slice());
+        next
+    }
+
+    pub fn remove_fragment(&self, key: &str) -> Self {
+        let mut next = self.clone();
+        next.fragments = Arc::from(
+            self.fragments
+                .iter()
+                .filter(|fragment| fragment.key != key)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        next
+    }
+
+    pub fn fragment_messages(&self) -> Vec<ChatMessage> {
+        self.fragments
+            .iter()
+            .map(|fragment| ChatMessage {
+                role: ChatRole::User,
+                content: vec![Content::text(fragment.content.clone())],
+                cache: None,
+            })
+            .collect()
+    }
+
+    pub fn request_messages(&self) -> Vec<ChatMessage> {
+        let mut messages = self.messages.to_vec();
+        messages.extend(self.fragment_messages());
+        messages
+    }
+
     /// Set the per-session mode on this context (builder-style).
     pub fn with_session_mode(mut self, mode: crate::agent::core::AgentMode) -> Self {
         self.session_mode = mode;
+        self
+    }
+
+    pub fn with_fragments(mut self, fragments: Arc<[ContextFragment]>) -> Self {
+        self.fragments = fragments;
         self
     }
 
@@ -352,7 +424,7 @@ pub enum ExecutionState {
     },
 
     /// Execution completed successfully
-    Complete,
+    Complete { context: Arc<ConversationContext> },
 
     /// Execution stopped by middleware
     Stopped {
@@ -374,7 +446,7 @@ impl ExecutionState {
             ExecutionState::AfterLlm { .. } => "AfterLlm",
             ExecutionState::ProcessingToolCalls { .. } => "ProcessingToolCalls",
             ExecutionState::WaitingForEvent { .. } => "WaitingForEvent",
-            ExecutionState::Complete => "Complete",
+            ExecutionState::Complete { .. } => "Complete",
             ExecutionState::Stopped { .. } => "Stopped",
             ExecutionState::Cancelled => "Cancelled",
         }
@@ -388,6 +460,7 @@ impl ExecutionState {
             ExecutionState::AfterLlm { context, .. } => Some(context),
             ExecutionState::ProcessingToolCalls { context, .. } => Some(context),
             ExecutionState::WaitingForEvent { context, .. } => Some(context),
+            ExecutionState::Complete { context } => Some(context),
             ExecutionState::Stopped { context, .. } => context.as_ref(),
             _ => None,
         }

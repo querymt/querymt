@@ -8,10 +8,11 @@
  * When STT is available, a microphone button appears next to the send button.
  */
 
-import { type RefObject, useCallback } from 'react';
-import { Send, Loader, Square, Mic, MicOff } from 'lucide-react';
+import { type RefObject, useCallback, useEffect, useState } from 'react';
+import { Send, Loader, Square, Mic, MicOff, CornerDownRight, Clock3, ChevronDown } from 'lucide-react';
 import { MentionInput } from './MentionInput';
-import type { RateLimitState } from '../types';
+import type { RateLimitState, SessionRuntimeStatus } from '../types';
+import type { PendingSessionInput } from '../hooks/useUiClient';
 import type { FileIndexEntry } from '../generated/types';
 import { useVoiceInput } from '../hooks/useVoiceInput';
 import { useVoiceStore } from '../store/voiceStore';
@@ -21,13 +22,15 @@ interface ChatInputBarProps {
   mentionInputRef: RefObject<HTMLTextAreaElement | null>;
   prompt: string;
   setPrompt: (value: string) => void;
-  handleSendPrompt: () => void;
+  handleSendPrompt: (delivery?: 'steer' | 'queue') => void;
   cancelSession: () => void;
   sessionId: string | null;
   connected: boolean;
   loading: boolean;
   isMobile: boolean;
   sessionThinkingAgentId: string | null;
+  runtimeState?: SessionRuntimeStatus;
+  pendingInputs: PendingSessionInput[];
   rateLimitState: RateLimitState | undefined;
   activeIndexStatus: string | undefined;
   // File mention
@@ -47,13 +50,36 @@ export function ChatInputBar({
   loading,
   isMobile,
   sessionThinkingAgentId,
+  runtimeState,
+  pendingInputs,
   rateLimitState,
   activeIndexStatus,
   allFiles,
   requestIndex,
   isLoadingFiles,
 }: ChatInputBarProps) {
-  const isThinking = sessionThinkingAgentId !== null;
+  const isThinking = sessionThinkingAgentId !== null || Boolean(runtimeState?.active_run_id);
+  const canSteer = Boolean(runtimeState?.active_run_id) && runtimeState?.steerable === true;
+  const defaultDelivery: 'steer' | 'queue' | undefined = canSteer
+    ? 'steer'
+    : runtimeState?.active_run_id
+      ? 'queue'
+      : undefined;
+  const [deliveryOverride, setDeliveryOverride] = useState<'steer' | 'queue' | undefined>();
+  const [menuOpen, setMenuOpen] = useState(false);
+  const activeRunId = runtimeState?.active_run_id;
+
+  useEffect(() => {
+    setDeliveryOverride(undefined);
+    setMenuOpen(false);
+  }, [sessionId, activeRunId, runtimeState?.steerable]);
+
+  const delivery = deliveryOverride === 'steer' && !canSteer
+    ? defaultDelivery
+    : deliveryOverride ?? defaultDelivery;
+  const submitCurrentInput = useCallback(() => {
+    handleSendPrompt(delivery);
+  }, [delivery, handleSendPrompt]);
   const canSend = !loading && connected && !!sessionId && !!prompt.trim() && !rateLimitState?.isRateLimited;
 
   const { audioCapabilities } = useUiClientConfig();
@@ -95,28 +121,39 @@ export function ChatInputBar({
     </button>
   ) : null;
 
-  const actionButton = isThinking ? (
-    <button
-      onClick={cancelSession}
-      className="w-8 h-8 rounded-lg flex items-center justify-center transition-all duration-150 bg-status-warning/15 text-status-warning hover:bg-status-warning/25"
-      title="Stop generation (Esc Esc)"
-    >
-      <Square className="w-3.5 h-3.5" />
-    </button>
-  ) : (
-    <button
-      onClick={handleSendPrompt}
-      disabled={!canSend}
-      className="w-8 h-8 rounded-lg flex items-center justify-center transition-all duration-150 hover:bg-accent-primary/10 disabled:opacity-20 disabled:cursor-not-allowed"
-      style={{ color: 'var(--mode-color)' }}
-      title="Send message"
-    >
-      {loading ? (
-        <Loader className="w-3.5 h-3.5 animate-spin" />
-      ) : (
-        <Send className="w-3.5 h-3.5" />
+  const actionButton = (
+    <div className="relative flex items-center gap-1">
+      <button
+        onClick={submitCurrentInput}
+        disabled={!canSend}
+        className="h-8 px-2.5 rounded-lg flex items-center gap-1.5 text-xs font-medium transition-all duration-150 hover:bg-accent-primary/10 disabled:opacity-20 disabled:cursor-not-allowed"
+        style={{ color: 'var(--mode-color)' }}
+        title={delivery === 'steer' ? 'Steer the active run' : delivery === 'queue' ? 'Queue as the next turn' : 'Send message'}
+      >
+        {loading ? <Loader className="w-3.5 h-3.5 animate-spin" /> : delivery === 'queue' ? <Clock3 className="w-3.5 h-3.5" /> : delivery === 'steer' ? <CornerDownRight className="w-3.5 h-3.5" /> : <Send className="w-3.5 h-3.5" />}
+        {!isMobile && <span>{delivery === 'steer' ? 'Steer' : delivery === 'queue' ? 'Queue' : 'Send'}</span>}
+      </button>
+      {isThinking && (
+        <>
+          <button type="button" onClick={() => setMenuOpen((open) => !open)} className="w-7 h-8 rounded-lg flex items-center justify-center text-text-secondary hover:bg-accent-primary/10" aria-label="Choose message delivery">
+            <ChevronDown className="w-3.5 h-3.5" />
+          </button>
+          {menuOpen && (
+            <div className="absolute bottom-10 right-8 z-50 min-w-52 rounded-xl border border-surface-border bg-surface-elevated p-1 shadow-xl">
+              {canSteer && (
+                <button type="button" className="w-full rounded-lg px-3 py-2 text-left text-xs hover:bg-accent-primary/10" onClick={() => { setDeliveryOverride('steer'); setMenuOpen(false); }}>
+                  <span className="font-medium text-text-primary">Steer current run</span><span className="block text-text-secondary mt-0.5">Apply at the next safe boundary</span>
+                </button>
+              )}
+              <button type="button" className="w-full rounded-lg px-3 py-2 text-left text-xs hover:bg-accent-primary/10" onClick={() => { setDeliveryOverride('queue'); setMenuOpen(false); }}>
+                <span className="font-medium text-text-primary">Queue next turn</span><span className="block text-text-secondary mt-0.5">Run after the current turn finishes</span>
+              </button>
+            </div>
+          )}
+          <button onClick={cancelSession} className="w-8 h-8 rounded-lg flex items-center justify-center bg-status-warning/15 text-status-warning hover:bg-status-warning/25" title="Stop current run"><Square className="w-3.5 h-3.5" /></button>
+        </>
       )}
-    </button>
+    </div>
   );
 
   const buttons = (
@@ -131,11 +168,26 @@ export function ChatInputBar({
       className="px-3 md:px-6 py-3 bg-surface-elevated border-t border-surface-border"
       style={{ paddingBottom: `max(12px, env(safe-area-inset-bottom, 12px))` }}
     >
+      {runtimeState?.active_run_id && (
+        <div className="mb-2 flex items-center justify-between gap-3 text-[11px] text-text-secondary">
+          <span>{runtimeState.phase === 'tools' ? 'Running tools - steering applies after this batch' : runtimeState.phase === 'waiting' ? 'Waiting - steering will resume the run' : runtimeState.phase === 'closing' ? 'Finishing - new messages will be queued' : 'Working - send a correction or queue the next turn'}</span>
+          <span className="shrink-0">{runtimeState.pending_steering_count} steering · {runtimeState.queued_input_count} queued</span>
+        </div>
+      )}
+      {pendingInputs.some((item) => !['applied', 'started'].includes(item.state)) && (
+        <div className="mb-2 flex flex-wrap gap-1.5" aria-label="Pending inputs">
+          {pendingInputs.filter((item) => !['applied', 'started'].includes(item.state)).map((item) => (
+            <span key={item.inputId} className="max-w-full truncate rounded-md border border-surface-border bg-surface-canvas/40 px-2 py-1 text-[11px] text-text-secondary" title={item.text}>
+              {item.delivery === 'steer' ? 'Steering' : `Queued${item.position ? ` #${item.position}` : ''}`}: {item.text || '(attachment)'}
+            </span>
+          ))}
+        </div>
+      )}
       <MentionInput
         ref={mentionInputRef}
         value={prompt}
         onChange={setPrompt}
-        onSubmit={handleSendPrompt}
+        onSubmit={submitCurrentInput}
         placeholder={
           !sessionId
             ? "Create a session to start chatting..."

@@ -16,6 +16,7 @@ use crate::acp::protocol::{
 };
 use crate::agent::core::AgentMode;
 use crate::agent::remote::NodeId;
+pub use crate::agent::turn_control::{InputDelivery, SubmitInput, SubmitInputResult};
 use querymt::LLMParams;
 use querymt::chat::ReasoningEffort;
 use serde::{Deserialize, Serialize};
@@ -34,19 +35,82 @@ pub struct Prompt {
     pub req: PromptRequest,
 }
 
+/// Submit explicitly steered or queued input.
+#[derive(Serialize, Deserialize)]
+pub struct SubmitSessionInput {
+    pub input: SubmitInput,
+}
+
 /// Signal cancellation of the running prompt.
 #[derive(Serialize, Deserialize)]
 pub struct Cancel;
 
-/// High-level runtime state for stop/resume orchestration.
+/// High-level runtime state for stop/resume and steering orchestration.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRuntimeStatus {
+    pub phase: SessionRuntimePhase,
+    pub active_run_id: Option<String>,
+    pub steerable: bool,
+    pub pending_steering_count: u32,
+    pub queued_input_count: u32,
+    #[typeshare(serialized_as = "Option<number>")]
+    pub run_started_at_ms: Option<u64>,
+}
+
 #[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SessionRuntimeStatus {
+pub enum SessionRuntimePhase {
     Idle,
-    Running,
+    Starting,
+    Model,
+    Tools,
     Waiting,
+    Closing,
     CancelRequested,
+}
+
+impl SessionRuntimeStatus {
+    #[allow(non_upper_case_globals)]
+    pub const Idle: Self = Self {
+        phase: SessionRuntimePhase::Idle,
+        active_run_id: None,
+        steerable: false,
+        pending_steering_count: 0,
+        queued_input_count: 0,
+        run_started_at_ms: None,
+    };
+
+    #[allow(non_upper_case_globals)]
+    pub const Running: Self = Self {
+        phase: SessionRuntimePhase::Model,
+        active_run_id: None,
+        steerable: false,
+        pending_steering_count: 0,
+        queued_input_count: 0,
+        run_started_at_ms: None,
+    };
+
+    #[allow(non_upper_case_globals)]
+    pub const Waiting: Self = Self {
+        phase: SessionRuntimePhase::Waiting,
+        active_run_id: None,
+        steerable: false,
+        pending_steering_count: 0,
+        queued_input_count: 0,
+        run_started_at_ms: None,
+    };
+
+    #[allow(non_upper_case_globals)]
+    pub const CancelRequested: Self = Self {
+        phase: SessionRuntimePhase::CancelRequested,
+        active_run_id: None,
+        steerable: false,
+        pending_steering_count: 0,
+        queued_input_count: 0,
+        run_started_at_ms: None,
+    };
 }
 
 /// Internal message sent by the spawned prompt task when it finishes.
@@ -55,8 +119,23 @@ pub enum SessionRuntimeStatus {
 /// completions from older queued tasks.
 ///
 /// NOT serializable — only sent by spawned task within the same actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunCompletionDisposition {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 pub(crate) struct PromptFinished {
     pub generation: u64,
+    pub run_id: String,
+    pub disposition: RunCompletionDisposition,
+}
+
+pub(crate) struct RunPhaseChanged {
+    pub generation: u64,
+    pub run_id: String,
+    pub phase: crate::agent::turn_control::RunPhase,
 }
 
 /// Run a scheduled prompt on this session.

@@ -22,6 +22,43 @@ export type AgentEventKind =
 	 * (loading history, snapshotting, building tools, running middleware).
 	 */
 	| { type: "turn_started", data?: undefined }
+	| { type: "run_started", data: {
+	run_id: string;
+	origin: string;
+}}
+	| { type: "run_completed", data: {
+	run_id: string;
+	outcome: string;
+}}
+	| { type: "steering_accepted", data: {
+	run_id: string;
+	input_id: string;
+	position: number;
+}}
+	| { type: "steering_applied", data: {
+	run_id: string;
+	input_id: string;
+	boundary: string;
+	latency_ms: number;
+}}
+	| { type: "steering_discarded", data: {
+	run_id: string;
+	input_id: string;
+	reason: string;
+}}
+	| { type: "input_queued", data: {
+	input_id: string;
+	position: number;
+}}
+	| { type: "queued_input_started", data: {
+	input_id: string;
+	run_id: string;
+}}
+	| { type: "objective_checkpoint", data: {
+	run_id: string;
+	reason: string;
+	action: string;
+}}
 	| { type: "assistant_message_stored", data: {
 	content: string;
 	thinking?: string;
@@ -608,6 +645,7 @@ export interface ControlFeatureInfo {
 	profiles: boolean;
 	auth: boolean;
 	models: boolean;
+	steering: boolean;
 }
 
 export interface CapabilitiesInfo {
@@ -1064,12 +1102,24 @@ export interface SessionLoadSnapshot {
 	delegationUpdates: DelegationUpdateNotification[];
 }
 
-/** High-level runtime state for stop/resume orchestration. */
-export enum SessionRuntimeStatus {
+export enum SessionRuntimePhase {
 	Idle = "idle",
-	Running = "running",
+	Starting = "starting",
+	Model = "model",
+	Tools = "tools",
 	Waiting = "waiting",
+	Closing = "closing",
 	CancelRequested = "cancel_requested",
+}
+
+/** High-level runtime state for stop/resume and steering orchestration. */
+export interface SessionRuntimeStatus {
+	phase: SessionRuntimePhase;
+	active_run_id?: string;
+	steerable: boolean;
+	pending_steering_count: number;
+	queued_input_count: number;
+	run_started_at_ms?: number;
 }
 
 export interface SessionMeta {
@@ -1224,6 +1274,21 @@ export enum StopType {
 	Other = "other",
 }
 
+export type SubmitInputResult = 
+	| { status: "steered", data: {
+	run_id: string;
+	input_id: string;
+	position: number;
+}}
+	| { status: "queued", data: {
+	input_id: string;
+	position: number;
+}}
+	| { status: "started", data: {
+	run_id: string;
+	input_id: string;
+}};
+
 /**
  * Messages from UI client to server.
  * Typeshare-annotated: generated for TypeScript and Swift.
@@ -1247,6 +1312,16 @@ export type UiClientMessage =
 }}
 	| { type: "prompt", data: {
 	prompt: UiPromptBlock[];
+}}
+	| { type: "submit_input", data: {
+	session_id: string;
+	delivery: UiInputDelivery;
+	expected_run_id?: string;
+	client_input_id?: string;
+	prompt: UiPromptBlock[];
+}}
+	| { type: "get_runtime_state", data: {
+	session_id: string;
 }}
 	| { type: "list_sessions", data: {
 	/** Query mode: browse (default), group, or search. */
@@ -1530,6 +1605,11 @@ export type UiClientMessage =
 	format?: string;
 }};
 
+export enum UiInputDelivery {
+	Steer = "steer",
+	Queue = "queue",
+}
+
 /**
  * A block of content in a UI prompt (text or resource reference).
  * Typeshare-annotated: generated for TypeScript and Swift.
@@ -1572,6 +1652,21 @@ export type UiServerMessage =
 	profile_id?: string;
 	session_id: string;
 	event: EventEnvelope;
+}}
+	| { type: "input_submitted", data: {
+	session_id: string;
+	result: SubmitInputResult;
+}}
+	| { type: "input_submission_failed", data: {
+	session_id: string;
+	client_input_id: string;
+	code: string;
+	message: string;
+	active_run_id?: string;
+}}
+	| { type: "runtime_state", data: {
+	session_id: string;
+	state: SessionRuntimeStatus;
 }}
 	| { type: "session_events", data: {
 	session_id: string;

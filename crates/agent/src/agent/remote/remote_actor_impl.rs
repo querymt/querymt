@@ -108,6 +108,11 @@ macro_rules! remote_msg_impl {
 // ── Register all remotely-accessible messages ────────────────────────────
 
 remote_msg_impl!(messages::Prompt, "querymt::Prompt", REG_PROMPT);
+remote_msg_impl!(
+    messages::SubmitSessionInput,
+    "querymt::SubmitSessionInput",
+    REG_SUBMIT_SESSION_INPUT
+);
 remote_msg_impl!(messages::Cancel, "querymt::Cancel", REG_CANCEL);
 remote_msg_impl!(messages::SetMode, "querymt::SetMode", REG_SET_MODE);
 remote_msg_impl!(messages::GetMode, "querymt::GetMode", REG_GET_MODE);
