@@ -570,7 +570,7 @@ export function useUiClient() {
             position: result.data.position,
           });
         } else {
-          updatePendingInput(msg.data.session_id, inputId, { state: 'started' });
+          removePendingInput(msg.data.session_id, inputId);
         }
         break;
       }

@@ -353,8 +353,9 @@ pub(crate) struct TurnState {
 const MAX_QUEUED_PROMPTS: usize = 32;
 
 fn queued_prompt_capacity_error(session_id: &str) -> AgentError {
-    AgentError::AdmissionRejected {
-        reason: format!(
+    AgentError::TurnControl {
+        kind: "queue_full".to_string(),
+        message: format!(
             "session {session_id} queued prompt capacity ({MAX_QUEUED_PROMPTS}) reached"
         ),
     }
