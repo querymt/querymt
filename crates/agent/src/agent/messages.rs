@@ -119,9 +119,17 @@ impl SessionRuntimeStatus {
 /// completions from older queued tasks.
 ///
 /// NOT serializable — only sent by spawned task within the same actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunCompletionDisposition {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 pub(crate) struct PromptFinished {
     pub generation: u64,
     pub run_id: String,
+    pub disposition: RunCompletionDisposition,
 }
 
 pub(crate) struct RunPhaseChanged {

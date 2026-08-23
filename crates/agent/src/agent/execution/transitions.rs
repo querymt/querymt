@@ -209,8 +209,16 @@ pub(super) async fn transition_call_llm(
     exec_ctx: &ExecutionContext,
 ) -> Result<ExecutionState, anyhow::Error> {
     let session_id = &exec_ctx.session_id;
-    let mut request_messages = apply_cache_breakpoints(&context.messages);
+    let (stable_messages, latest_message) = context
+        .messages
+        .split_last()
+        .map(|(latest, stable)| (stable, Some(latest.clone())))
+        .unwrap_or((&[], None));
+    let mut request_messages = apply_cache_breakpoints(stable_messages);
     request_messages.extend(context.fragment_messages());
+    if let Some(latest_message) = latest_message {
+        request_messages.push(latest_message);
+    }
     debug!(
         "CallLlm: session={}, messages={}",
         session_id,

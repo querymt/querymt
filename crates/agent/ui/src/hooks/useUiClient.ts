@@ -459,6 +459,16 @@ export function useUiClient() {
     [],
   );
 
+  const removePendingInput = useCallback((targetSessionId: string, inputId: string) => {
+    setPendingInputsBySession((prev) => {
+      const next = new Map(prev);
+      const items = (next.get(targetSessionId) ?? []).filter((item) => item.inputId !== inputId);
+      if (items.length === 0) next.delete(targetSessionId);
+      else next.set(targetSessionId, items);
+      return next;
+    });
+  }, []);
+
   const pushSessionActionNotice = useCallback((kind: 'success' | 'error', message: string) => {
     const id = Date.now() + Math.floor(Math.random() * 1000);
     setSessionActionNotices((prev) => [...prev, { id, kind, message }]);
@@ -522,6 +532,9 @@ export function useUiClient() {
         pushSessionActionNotice('error', msg.data.code === 'run_closing'
           ? 'The run is finishing. Queue this message for the next turn.'
           : msg.data.message);
+        window.setTimeout(() => {
+          removePendingInput(msg.data.session_id, msg.data.client_input_id);
+        }, 5000);
         if (msg.data.active_run_id) {
           requestAnimationFrame(() => {
             socketRef.current?.send(JSON.stringify({
@@ -637,14 +650,18 @@ export function useUiClient() {
             data: { session_id: d.session_id },
           } satisfies UiClientMessage));
         } else if (eventKind === 'steering_applied') {
-          updatePendingInput(d.session_id, kindData.input_id, { state: 'applied' });
+          removePendingInput(d.session_id, kindData.input_id);
         } else if (eventKind === 'steering_discarded') {
           updatePendingInput(d.session_id, kindData.input_id, {
             state: 'discarded',
             error: kindData.reason,
           });
+          pushSessionActionNotice('error', `Steering was discarded: ${kindData.reason}`);
+          window.setTimeout(() => {
+            removePendingInput(d.session_id, kindData.input_id);
+          }, 5000);
         } else if (eventKind === 'queued_input_started') {
-          updatePendingInput(d.session_id, kindData.input_id, { state: 'started' });
+          removePendingInput(d.session_id, kindData.input_id);
         }
 
         if (eventKind === 'llm_retry_wait' || eventKind === 'llm_retry_resume') {

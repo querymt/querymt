@@ -477,10 +477,24 @@ impl SessionActor {
             steering,
             phase_reporter: phase_tx,
         };
+        let completion_token = self.turn_state.token.clone();
         tokio::spawn(async move {
             let result = execute_prompt_detached(exec).await;
+            let disposition = if completion_token.is_cancelled() {
+                RunCompletionDisposition::Cancelled
+            } else if result.is_err() {
+                RunCompletionDisposition::Failed
+            } else {
+                RunCompletionDisposition::Completed
+            };
             let _ = reply.send(result);
-            let _ = actor_ref.tell(PromptFinished { generation, run_id }).await;
+            let _ = actor_ref
+                .tell(PromptFinished {
+                    generation,
+                    run_id,
+                    disposition,
+                })
+                .await;
         });
     }
 
@@ -527,11 +541,19 @@ impl Message<Cancel> for SessionActor {
     async fn handle(&mut self, _msg: Cancel, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         debug!("Session {}: Cancel received", self.session_id);
         self.turn_state.token.cancel();
-        if let Some(run) = &self.active_run {
-            let steering = run.steering.clone();
-            tokio::spawn(async move {
-                let _ = steering.discard().await;
-            });
+        if let Some(run) = &mut self.active_run {
+            run.phase = RunPhase::Closing;
+            let run_id = run.run_id.clone();
+            for input in run.steering.discard().await {
+                self.config.emit_event(
+                    &self.session_id,
+                    AgentEventKind::SteeringDiscarded {
+                        run_id: run_id.clone(),
+                        input_id: input.input_id,
+                        reason: "run_cancelled".to_string(),
+                    },
+                );
+            }
         }
         self.config
             .emit_event(&self.session_id, AgentEventKind::Cancelled);
@@ -577,15 +599,16 @@ impl Message<PromptFinished> for SessionActor {
             return;
         }
 
+        let outcome = match msg.disposition {
+            RunCompletionDisposition::Completed => "completed",
+            RunCompletionDisposition::Failed => "failed",
+            RunCompletionDisposition::Cancelled => "cancelled",
+        };
         self.config.emit_event(
             &self.session_id,
             AgentEventKind::RunCompleted {
                 run_id: msg.run_id,
-                outcome: if self.turn_state.token.is_cancelled() {
-                    "cancelled".to_string()
-                } else {
-                    "completed".to_string()
-                },
+                outcome: outcome.to_string(),
             },
         );
         self.active_run = None;
@@ -1733,6 +1756,7 @@ impl Message<ScheduledPrompt> for SessionActor {
             }
         });
         let span_session_id = session_id.clone();
+        let completion_token = self.turn_state.token.clone();
 
         // Capture the current span (kameo's `actor.handle_message`) so the
         // spawned task's span tree remains a child of the actor message span.
@@ -1782,10 +1806,18 @@ impl Message<ScheduledPrompt> for SessionActor {
                     }
                 }
 
+                let disposition = if completion_token.is_cancelled() {
+                    RunCompletionDisposition::Cancelled
+                } else if result.is_err() {
+                    RunCompletionDisposition::Failed
+                } else {
+                    RunCompletionDisposition::Completed
+                };
                 if let Err(e) = actor_ref
                     .tell(PromptFinished {
                         generation: prompt_generation,
                         run_id,
+                        disposition,
                     })
                     .await
                 {
@@ -2607,6 +2639,7 @@ mod tests {
             .tell(PromptFinished {
                 generation: 0,
                 run_id: String::new(),
+                disposition: RunCompletionDisposition::Completed,
             })
             .await
             .expect("tell PromptFinished");
@@ -2916,6 +2949,7 @@ mod tests {
             .tell(PromptFinished {
                 generation: 0,
                 run_id: String::new(),
+                disposition: RunCompletionDisposition::Completed,
             })
             .await
             .expect("tell PromptFinished");

@@ -34,6 +34,22 @@ enum WaitEventOutcome {
 /// This function blocks until matching events are received or execution is cancelled.
 /// For delegation waits, policy controls whether we resume on first result (Any)
 /// or wait for all requested delegations (All), with optional timeout cleanup.
+async fn wait_for_pending_steering(exec_ctx: &ExecutionContext) {
+    let Some(inbox) = &exec_ctx.steering else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if inbox.pending_count().await > 0 {
+            return;
+        }
+        inbox.notified().await;
+        if inbox.pending_count().await > 0 {
+            return;
+        }
+    }
+}
+
 pub(super) async fn transition_waiting_for_event(
     config: &AgentConfig,
     wait: &WaitCondition,
@@ -62,13 +78,7 @@ pub(super) async fn transition_waiting_for_event(
                 _ = exec_ctx.cancellation_token.cancelled() => {
                     return Ok(ExecutionState::Cancelled);
                 }
-                _ = async {
-                    if let Some(inbox) = &exec_ctx.steering {
-                        inbox.notified().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
+                _ = wait_for_pending_steering(exec_ctx) => {
                     exec_ctx
                         .suspended_delegations
                         .lock()
@@ -141,13 +151,7 @@ pub(super) async fn transition_waiting_for_event(
             _ = exec_ctx.cancellation_token.cancelled() => {
                 return Ok(ExecutionState::Cancelled);
             }
-            _ = async {
-                if let Some(inbox) = &exec_ctx.steering {
-                    inbox.notified().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {
+            _ = wait_for_pending_steering(exec_ctx) => {
                 exec_ctx
                     .suspended_delegations
                     .lock()
