@@ -50,6 +50,34 @@ struct ChatTemplateContext {
     enable_thinking: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'static str>,
+    #[serde(flatten)]
+    reasoning_preservation: ReasoningPreservationContext,
+}
+
+#[derive(Serialize)]
+struct ReasoningPreservationContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preserve_reasoning: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preserve_thinking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clear_thinking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    truncate_history_thinking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drop_thinking: Option<bool>,
+}
+
+impl ReasoningPreservationContext {
+    fn new(preserve: Option<bool>) -> Self {
+        Self {
+            preserve_reasoning: preserve,
+            preserve_thinking: preserve,
+            clear_thinking: preserve.map(|value| !value),
+            truncate_history_thinking: preserve.map(|value| !value),
+            drop_thinking: preserve.map(|value| !value),
+        }
+    }
 }
 
 fn template_mentions_quoted_value(template: &str, value: &str) -> bool {
@@ -236,6 +264,7 @@ fn render_template(
         eos_token: token_piece(model, model.token_eos()),
         enable_thinking,
         reasoning_effort,
+        reasoning_preservation: ReasoningPreservationContext::new(cfg.preserve_reasoning),
     };
     let template = rewrite_generation_tags(&template);
     let prompt = render_template_source(&template, &context).map_err(|error| {
@@ -398,10 +427,19 @@ mod tests {
 {%- endif -%}
 "#;
 
+    const PRESERVE_REASONING_TEMPLATE: &str = r#"
+{{- preserve_reasoning|default('unset') }}|
+{{- preserve_thinking|default('unset') }}|
+{{- clear_thinking|default('unset') }}|
+{{- truncate_history_thinking|default('unset') }}|
+{{- drop_thinking|default('unset') }}
+"#;
+
     fn context(
         enable_thinking: bool,
         reasoning_effort: Option<&'static str>,
         tools: Option<Value>,
+        preserve_reasoning: Option<bool>,
     ) -> ChatTemplateContext {
         ChatTemplateContext {
             messages: serde_json::json!([]),
@@ -411,6 +449,7 @@ mod tests {
             eos_token: String::new(),
             enable_thinking,
             reasoning_effort,
+            reasoning_preservation: ReasoningPreservationContext::new(preserve_reasoning),
         }
     }
 
@@ -484,7 +523,8 @@ mod tests {
 
     #[test]
     fn omitted_effort_remains_undefined_and_uses_template_default() {
-        let rendered = render_template_source(QWEN_TEMPLATE, &context(true, None, None)).unwrap();
+        let rendered =
+            render_template_source(QWEN_TEMPLATE, &context(true, None, None, None)).unwrap();
         assert_eq!(rendered, "effort=xhigh");
     }
 
@@ -496,10 +536,38 @@ mod tests {
                 true,
                 Some("low"),
                 Some(serde_json::json!([{"name": "tool"}])),
+                None,
             ),
         )
         .unwrap();
         assert_eq!(rendered, "effort=low;tools=1");
+    }
+
+    #[test]
+    fn preserve_reasoning_sets_llama_cpp_compatibility_variables() {
+        let enabled = render_template_source(
+            PRESERVE_REASONING_TEMPLATE,
+            &context(true, None, None, Some(true)),
+        )
+        .unwrap();
+        assert_eq!(enabled, "True|True|False|False|False");
+
+        let disabled = render_template_source(
+            PRESERVE_REASONING_TEMPLATE,
+            &context(true, None, None, Some(false)),
+        )
+        .unwrap();
+        assert_eq!(disabled, "False|False|True|True|True");
+    }
+
+    #[test]
+    fn omitted_preserve_reasoning_keeps_template_variables_undefined() {
+        let rendered = render_template_source(
+            PRESERVE_REASONING_TEMPLATE,
+            &context(true, None, None, None),
+        )
+        .unwrap();
+        assert_eq!(rendered, "unset|unset|unset|unset|unset");
     }
 
     #[test]
@@ -510,7 +578,7 @@ mod tests {
             TemplateReasoningScale::LowMediumXHigh,
         );
         let rendered =
-            render_template_source(QWEN_TEMPLATE, &context(false, effort, None)).unwrap();
+            render_template_source(QWEN_TEMPLATE, &context(false, effort, None, None)).unwrap();
         assert_eq!(rendered, "thinking=disabled");
     }
 }

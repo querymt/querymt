@@ -118,6 +118,7 @@ async fn run(
         log: None,
         enable_thinking: None,
         reasoning_effort: None,
+        preserve_reasoning: None,
         flash_attention: None,
         kv_cache_type_k: None,
         kv_cache_type_v: None,

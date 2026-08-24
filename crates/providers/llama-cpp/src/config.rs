@@ -81,6 +81,11 @@ pub struct LlamaCppConfig {
     /// Portable reasoning effort. The selected chat template determines the
     /// provider-specific value rendered for this level.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Preserve assistant reasoning from earlier turns in the rendered prompt.
+    ///
+    /// `None` leaves the behavior to the chat template, while explicit true or
+    /// false maps to the compatibility variables used by llama.cpp templates.
+    pub preserve_reasoning: Option<bool>,
     /// Flash attention policy. Enables flash attention for faster inference
     /// and is required for KV cache quantization. Supported on Metal (Apple
     /// Silicon) and CUDA backends.
