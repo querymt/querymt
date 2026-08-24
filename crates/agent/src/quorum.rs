@@ -124,13 +124,22 @@ impl AgentQuorum {
     }
 
     pub async fn shutdown(&self) {
+        if let Some(orchestrator) = &self.orchestrator {
+            orchestrator.begin_shutdown();
+        }
         let listener = self
             .listener_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
-        if let Some(handle) = listener {
-            handle.abort();
+        if let Some(mut handle) = listener {
+            tokio::select! {
+                _ = &mut handle => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    handle.abort();
+                    let _ = handle.await;
+                }
+            }
         }
         if let Some(orchestrator) = &self.orchestrator {
             orchestrator.cancel_active_delegations().await;

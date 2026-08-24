@@ -20,7 +20,8 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, instrument};
@@ -108,6 +109,7 @@ pub struct DelegationOrchestrator {
     max_parallel: Arc<tokio::sync::Semaphore>,
     /// Maps delegation_id -> (parent_session_id, cancellation_token, join_handle)
     active_delegations: ActiveDelegations,
+    shutting_down: AtomicBool,
     /// Optional summarizer for generating planning context
     delegation_summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
     delegate_model_overrides: super::DelegateModelOverrideStore,
@@ -136,6 +138,7 @@ impl DelegationOrchestrator {
             config: DelegationOrchestratorConfig::new(cwd),
             max_parallel: Arc::new(tokio::sync::Semaphore::new(5)),
             active_delegations: Arc::new(Mutex::new(HashMap::new())),
+            shutting_down: AtomicBool::new(false),
             delegation_summarizer: None,
             delegate_model_overrides: super::DelegateModelOverrideStore::default(),
             profile_id: None,
@@ -209,7 +212,31 @@ impl DelegationOrchestrator {
         self
     }
 
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    async fn wait_until_registered(&self, delegation_id: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if self
+                    .active_delegations
+                    .lock()
+                    .await
+                    .contains_key(delegation_id)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delegation was not registered");
+    }
+
     pub async fn cancel_active_delegations(&self) {
+        self.begin_shutdown();
         let active = std::mem::take(&mut *self.active_delegations.lock().await);
         for (delegation_id, (_, cancel_token, mut handle)) in active {
             cancel_token.cancel();
@@ -240,7 +267,7 @@ impl DelegationOrchestrator {
         let this = Arc::clone(self);
         let mut rx = fanout.subscribe();
         tokio::spawn(async move {
-            loop {
+            while !this.shutting_down.load(Ordering::Acquire) {
                 match rx.recv().await {
                     Ok(envelope) => {
                         this.handle_envelope(&envelope).await;
@@ -320,6 +347,9 @@ impl DelegationOrchestrator {
         )
     )]
     async fn handle_envelope(&self, envelope: &EventEnvelope) {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
         let session_id = envelope.session_id();
         match envelope.kind() {
             AgentEventKind::DelegationRequested { delegation, .. } => {
@@ -448,12 +478,16 @@ impl DelegationOrchestrator {
                 let active_delegations = self.active_delegations.clone();
                 let active_delegations_for_spawn = active_delegations.clone();
                 let hooks = self.hooks.clone();
+                let (start_tx, start_rx) = oneshot::channel();
 
                 // Store the cancellation token and join handle
                 let delegation_id = delegation.public_id.clone();
                 let cancel_token_clone = cancel_token.clone();
 
                 let handle = tokio::spawn(async move {
+                    if start_rx.await.is_err() {
+                        return;
+                    }
                     let _permit = match max_parallel.acquire_owned().await {
                         Ok(permit) => permit,
                         Err(_) => {
@@ -499,10 +533,32 @@ impl DelegationOrchestrator {
                 });
 
                 let mut active = active_delegations.lock().await;
+                if self.shutting_down.load(Ordering::Acquire) {
+                    handle.abort();
+                    drop(active);
+                    fail_delegation(
+                        DelegationFailureContext {
+                            event_sink: &self.event_sink,
+                            delegator: &self.delegator,
+                            store: &self.store,
+                            hooks: None,
+                            config: &self.config,
+                            parent_session_id: session_id,
+                            delegation_id: &delegation_id,
+                            target_agent_id: None,
+                            objective: None,
+                        },
+                        "Delegation cancelled because the orchestrator is shutting down",
+                    )
+                    .await;
+                    return;
+                }
                 active.insert(
                     delegation_id,
                     (parent_session_id_for_insert, cancel_token_clone, handle),
                 );
+                drop(active);
+                let _ = start_tx.send(());
             }
             AgentEventKind::DelegationCancelRequested { delegation_id } => {
                 tracing::Span::current().record("event_kind", "DelegationCancelRequested");
@@ -1805,6 +1861,98 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_claimed_delegation_registration() {
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("storage"),
+        );
+        let session = storage
+            .create_session(None, None, None, None)
+            .await
+            .expect("session");
+        let delegation = storage
+            .create_delegation(Delegation {
+                id: 0,
+                public_id: String::new(),
+                session_id: session.id,
+                task_id: None,
+                target_agent_id: "coder".to_string(),
+                objective: "test shutdown registration".to_string(),
+                objective_hash: crate::hash::RapidHash::new(b"test shutdown registration"),
+                context: None,
+                constraints: None,
+                expected_output: None,
+                verification_spec: None,
+                planning_summary: None,
+                status: DelegationStatus::Requested,
+                retry_count: 0,
+                created_at: time::OffsetDateTime::now_utc(),
+                completed_at: None,
+            })
+            .await
+            .expect("delegation");
+        let fanout = Arc::new(EventFanout::new());
+        let event_sink = Arc::new(EventSink::new(storage.event_journal(), fanout.clone()));
+        let mut registry = DefaultAgentRegistry::new();
+        registry.register(make_agent_info("coder"), StubAgentHandle::new("coder"));
+        let orchestrator = Arc::new(
+            DelegationOrchestrator::new(
+                StubAgentHandle::new("delegator"),
+                event_sink,
+                storage.session_store().clone(),
+                Arc::new(registry),
+                Arc::new(ToolRegistry::new()),
+                Hooks::default(),
+                None,
+            )
+            .with_max_parallel_delegations(NonZeroUsize::new(1).unwrap()),
+        );
+        let held_permit = orchestrator
+            .max_parallel
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("held permit");
+        let listener = orchestrator.start_listening(&fanout);
+
+        let requested = storage
+            .event_journal()
+            .append_durable(&crate::session::projection::NewDurableEvent {
+                session_id: session.public_id.clone(),
+                origin: crate::events::EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::DelegationRequested {
+                    delegation: delegation.clone(),
+                    tool_call_id: None,
+                },
+            })
+            .await
+            .expect("requested event");
+        fanout.publish(EventEnvelope::Durable(requested));
+        orchestrator
+            .wait_until_registered(&delegation.public_id)
+            .await;
+
+        orchestrator.begin_shutdown();
+        listener.abort();
+        listener.await.expect_err("listener should be aborted");
+        orchestrator.cancel_active_delegations().await;
+        drop(held_permit);
+
+        assert!(orchestrator.active_delegations.lock().await.is_empty());
+        assert_eq!(
+            storage
+                .get_delegation(&delegation.public_id)
+                .await
+                .expect("delegation lookup")
+                .expect("delegation")
+                .status,
+            DelegationStatus::Cancelled
+        );
     }
 
     #[tokio::test]
