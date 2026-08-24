@@ -312,18 +312,6 @@ impl RuntimeContext {
         Ok(stored_delegation)
     }
 
-    /// Update delegation status
-    pub async fn update_delegation_status(
-        &self,
-        delegation_id: &str,
-        status: DelegationStatus,
-    ) -> SessionResult<()> {
-        self.store
-            .update_delegation_status(delegation_id, status)
-            .await?;
-        Ok(())
-    }
-
     /// Update task status
     pub async fn update_task_status(&mut self, status: TaskStatus) -> SessionResult<()> {
         if let Some(task) = &mut self.active_task {

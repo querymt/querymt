@@ -46,6 +46,8 @@ mod maintenance;
 mod tool_calls;
 mod transitions;
 mod wait;
+#[cfg(test)]
+pub(crate) use wait::cleanup_timed_out_delegations;
 
 use crate::acp::protocol::StopReason;
 use crate::agent::execution_context::ExecutionContext;

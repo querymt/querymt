@@ -367,34 +367,57 @@ fn format_wait_all_summary(items: &[String]) -> String {
     msg
 }
 
-async fn cleanup_timed_out_delegations(
+pub(crate) async fn cleanup_timed_out_delegations(
     config: &AgentConfig,
     exec_ctx: &ExecutionContext,
     delegation_ids: &[String],
 ) {
     for delegation_id in delegation_ids {
+        let transitioned = match exec_ctx
+            .state
+            .store
+            .transition_delegation_status(
+                delegation_id,
+                crate::session::domain::DelegationStatus::Running,
+                crate::session::domain::DelegationStatus::Cancelled,
+            )
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => exec_ctx
+                .state
+                .store
+                .transition_delegation_status(
+                    delegation_id,
+                    crate::session::domain::DelegationStatus::Requested,
+                    crate::session::domain::DelegationStatus::Cancelled,
+                )
+                .await
+                .unwrap_or_else(|err| {
+                    warn!(
+                        "Failed to mark requested delegation '{}' as cancelled: {}",
+                        delegation_id, err
+                    );
+                    false
+                }),
+            Err(err) => {
+                warn!(
+                    "Failed to mark timed out delegation '{}' as cancelled: {}",
+                    delegation_id, err
+                );
+                false
+            }
+        };
+        if !transitioned {
+            continue;
+        }
+
         config.emit_event(
             &exec_ctx.session_id,
             AgentEventKind::DelegationCancelRequested {
                 delegation_id: delegation_id.clone(),
             },
         );
-
-        if let Err(err) = exec_ctx
-            .state
-            .store
-            .update_delegation_status(
-                delegation_id,
-                crate::session::domain::DelegationStatus::Cancelled,
-            )
-            .await
-        {
-            warn!(
-                "Failed to mark timed out delegation '{}' as cancelled: {}",
-                delegation_id, err
-            );
-        }
-
         config.emit_event(
             &exec_ctx.session_id,
             AgentEventKind::DelegationCancelled {

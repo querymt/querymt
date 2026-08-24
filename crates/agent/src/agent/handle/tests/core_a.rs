@@ -485,6 +485,30 @@ async fn test_set_profile_config_option_rejects_different_bound_profile() {
 }
 
 #[tokio::test]
+async fn test_profile_handle_rejects_unbound_session_load() {
+    let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
+    let session = f
+        .handle
+        .config
+        .provider
+        .history_store()
+        .create_session(None, None, None, None)
+        .await
+        .expect("create unbound session");
+    let req = crate::acp::protocol::LoadSessionRequest::new(
+        SessionId::from(session.public_id),
+        std::path::PathBuf::new(),
+    );
+
+    let err = f
+        .handle
+        .load_session(req)
+        .await
+        .expect_err("unbound load must fail");
+    assert!(err.to_string().contains("profile binding"));
+}
+
+#[tokio::test]
 async fn test_load_session_reports_persisted_reasoning_effort() {
     let f = RealStorageHandleFixture::new().await;
     let session_id = seed_session_with_reasoning(&f, Some(ReasoningEffort::High)).await;

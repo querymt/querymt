@@ -134,6 +134,8 @@ pub trait AgentHandle: Send + Sync {
 
     // --- Downcasting (transitional) ---
 
+    async fn shutdown(&self) {}
+
     /// For downcasting to concrete types. Transitional — should be eliminated
     /// over time by moving needed methods onto the trait.
     fn as_any(&self) -> &dyn Any;

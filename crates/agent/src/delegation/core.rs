@@ -6,7 +6,9 @@ use crate::hooks::{
     DelegationFailureRequest, DelegationStartRequest, HookNotice, Hooks, PostDelegationRequest,
 };
 use crate::model::{AgentMessage, MessagePart};
-use crate::session::domain::{Delegation, DelegationStatus, ForkOrigin, ForkPointType};
+use crate::session::domain::{
+    Delegation, DelegationClaim, DelegationStatus, ForkOrigin, ForkPointType,
+};
 use crate::session::store::SessionStore;
 use crate::tools::ToolRegistry;
 use crate::verification::VerificationSpec;
@@ -18,7 +20,8 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, instrument};
@@ -106,9 +109,11 @@ pub struct DelegationOrchestrator {
     max_parallel: Arc<tokio::sync::Semaphore>,
     /// Maps delegation_id -> (parent_session_id, cancellation_token, join_handle)
     active_delegations: ActiveDelegations,
+    shutting_down: AtomicBool,
     /// Optional summarizer for generating planning context
     delegation_summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
     delegate_model_overrides: super::DelegateModelOverrideStore,
+    profile_id: Option<String>,
     /// Optional routing snapshot for per-agent routing decisions.
     routing_snapshot: Option<crate::agent::remote::RoutingSnapshotHandle>,
 }
@@ -133,8 +138,10 @@ impl DelegationOrchestrator {
             config: DelegationOrchestratorConfig::new(cwd),
             max_parallel: Arc::new(tokio::sync::Semaphore::new(5)),
             active_delegations: Arc::new(Mutex::new(HashMap::new())),
+            shutting_down: AtomicBool::new(false),
             delegation_summarizer: None,
             delegate_model_overrides: super::DelegateModelOverrideStore::default(),
+            profile_id: None,
             routing_snapshot: None,
         }
     }
@@ -187,6 +194,11 @@ impl DelegationOrchestrator {
         self
     }
 
+    pub fn with_profile_id(mut self, profile_id: impl Into<String>) -> Self {
+        self.profile_id = Some(profile_id.into());
+        self
+    }
+
     /// Set the routing snapshot handle for per-agent routing decisions.
     ///
     /// When set, the orchestrator will consult the routing table before creating
@@ -200,6 +212,53 @@ impl DelegationOrchestrator {
         self
     }
 
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    async fn wait_until_registered(&self, delegation_id: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if self
+                    .active_delegations
+                    .lock()
+                    .await
+                    .contains_key(delegation_id)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delegation was not registered");
+    }
+
+    pub async fn cancel_active_delegations(&self) {
+        self.begin_shutdown();
+        let active = std::mem::take(&mut *self.active_delegations.lock().await);
+        for (delegation_id, (_, cancel_token, mut handle)) in active {
+            cancel_token.cancel();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), &mut handle).await;
+            handle.abort();
+            if let Err(err) = self
+                .store
+                .transition_delegation_status(
+                    &delegation_id,
+                    DelegationStatus::Running,
+                    DelegationStatus::Cancelled,
+                )
+                .await
+            {
+                warn!(
+                    "Failed to persist cancellation for delegation {} during shutdown: {}",
+                    delegation_id, err
+                );
+            }
+        }
+    }
+
     /// Start listening for events on the given `EventFanout`.
     ///
     /// Spawns a background task that subscribes to the fanout and dispatches
@@ -208,7 +267,7 @@ impl DelegationOrchestrator {
         let this = Arc::clone(self);
         let mut rx = fanout.subscribe();
         tokio::spawn(async move {
-            loop {
+            while !this.shutting_down.load(Ordering::Acquire) {
                 match rx.recv().await {
                     Ok(envelope) => {
                         this.handle_envelope(&envelope).await;
@@ -222,6 +281,62 @@ impl DelegationOrchestrator {
         })
     }
 
+    async fn fail_unclaimed_delegation(
+        &self,
+        delegation: &Delegation,
+        parent_session_id: &str,
+        error_message: &str,
+    ) {
+        match self
+            .store
+            .transition_delegation_status(
+                &delegation.public_id,
+                DelegationStatus::Requested,
+                DelegationStatus::Failed,
+            )
+            .await
+        {
+            Ok(true) => {
+                emit_delegation_event(
+                    &self.delegator,
+                    &self.event_sink,
+                    parent_session_id,
+                    AgentEventKind::DelegationFailed {
+                        delegation_id: delegation.public_id.clone(),
+                        error: error_message.to_string(),
+                    },
+                );
+                if self.config.inject_results {
+                    inject_failure(
+                        &self.delegator,
+                        parent_session_id,
+                        &delegation.public_id,
+                        error_message,
+                    )
+                    .await;
+                }
+            }
+            Ok(false) => {}
+            Err(err) => warn!("Failed to persist delegation claim failure: {}", err),
+        }
+    }
+
+    async fn claim_delegation(&self, delegation_id: &str) -> Result<DelegationClaim, String> {
+        let mut last_error = None;
+        for attempt in 0..3 {
+            match self.store.claim_delegation(delegation_id).await {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                    if attempt < 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| "unknown claim error".to_string()))
+    }
+
     /// Process a single event envelope.
     #[instrument(
         name = "delegation.orchestrator.handle_event",
@@ -232,10 +347,121 @@ impl DelegationOrchestrator {
         )
     )]
     async fn handle_envelope(&self, envelope: &EventEnvelope) {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
         let session_id = envelope.session_id();
         match envelope.kind() {
             AgentEventKind::DelegationRequested { delegation, .. } => {
                 tracing::Span::current().record("event_kind", "DelegationRequested");
+                if let Some(profile_id) = self.profile_id.as_deref() {
+                    let mut last_error = None;
+                    let mut binding_result = None;
+                    for attempt in 0..3 {
+                        match self.store.get_profile_binding(session_id).await {
+                            Ok(result) => {
+                                binding_result = Some(result);
+                                break;
+                            }
+                            Err(err) => {
+                                last_error = Some(err);
+                                if attempt < 2 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                }
+                            }
+                        }
+                    }
+
+                    match binding_result {
+                        Some(Some(owner)) if owner == profile_id => {}
+                        Some(Some(_)) => return,
+                        // Live profile sessions must already be bound. Legacy support belongs in
+                        // session loading, where one deterministic profile could be backfilled.
+                        Some(None) => {
+                            error!(
+                                "Ignoring delegation {} from unbound session {}",
+                                delegation.public_id, session_id
+                            );
+                            return;
+                        }
+                        None => {
+                            let error_message = format!(
+                                "Failed to resolve profile owner for delegation {} after retries: {}",
+                                delegation.public_id,
+                                last_error
+                                    .as_ref()
+                                    .map(|e| e.to_string())
+                                    .unwrap_or_else(|| "unknown error".to_string())
+                            );
+                            self.fail_unclaimed_delegation(delegation, session_id, &error_message)
+                                .await;
+                            return;
+                        }
+                    }
+                }
+                match self.claim_delegation(&delegation.public_id).await {
+                    Ok(DelegationClaim::Claimed) => {}
+                    Ok(DelegationClaim::AlreadyClaimed) => {
+                        debug!(
+                            "Delegation {} was already claimed; ignoring duplicate request",
+                            delegation.public_id
+                        );
+                        return;
+                    }
+                    Ok(DelegationClaim::NotFound) => {
+                        emit_delegation_event(
+                            &self.delegator,
+                            &self.event_sink,
+                            session_id,
+                            AgentEventKind::DelegationFailed {
+                                delegation_id: delegation.public_id.clone(),
+                                error: "Delegation record was not found".to_string(),
+                            },
+                        );
+                        return;
+                    }
+                    Ok(DelegationClaim::InvalidState(status)) => {
+                        debug!(
+                            "Delegation {} is already terminal ({status:?}); ignoring request",
+                            delegation.public_id
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        self.fail_unclaimed_delegation(
+                            delegation,
+                            session_id,
+                            &format!("Failed to claim delegation before execution: {err}"),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+
+                let Some(target_handle) =
+                    self.agent_registry.get_handle(&delegation.target_agent_id)
+                else {
+                    fail_delegation(
+                        DelegationFailureContext {
+                            event_sink: &self.event_sink,
+                            delegator: &self.delegator,
+                            store: &self.store,
+                            hooks: None,
+                            config: &self.config,
+                            parent_session_id: session_id,
+                            delegation_id: &delegation.public_id,
+                            target_agent_id: Some(&delegation.target_agent_id),
+                            objective: Some(&delegation.objective),
+                        },
+                        &format!(
+                            "Agent '{}' is not registered with a handle",
+                            delegation.target_agent_id
+                        ),
+                    )
+                    .await;
+                    return;
+                };
+
                 let delegator = self.delegator.clone();
                 let event_sink = self.event_sink.clone();
                 let store = self.store.clone();
@@ -252,17 +478,16 @@ impl DelegationOrchestrator {
                 let active_delegations = self.active_delegations.clone();
                 let active_delegations_for_spawn = active_delegations.clone();
                 let hooks = self.hooks.clone();
+                let (start_tx, start_rx) = oneshot::channel();
 
                 // Store the cancellation token and join handle
                 let delegation_id = delegation.public_id.clone();
                 let cancel_token_clone = cancel_token.clone();
 
-                // Get the agent handle for this agent — try new `get_handle` first,
-                // fall back to `get_agent_handle` for backward compatibility.
-                let target_handle: Option<Arc<dyn crate::agent::handle::AgentHandle>> =
-                    self.agent_registry.get_handle(&delegation.target_agent_id);
-
                 let handle = tokio::spawn(async move {
+                    if start_rx.await.is_err() {
+                        return;
+                    }
                     let _permit = match max_parallel.acquire_owned().await {
                         Ok(permit) => permit,
                         Err(_) => {
@@ -297,48 +522,43 @@ impl DelegationOrchestrator {
                         delegate_model_overrides,
                         routing_snapshot,
                     };
-                    match target_handle {
-                        Some(target) => {
-                            execute_delegation(
-                                ctx,
-                                target,
-                                parent_session_id,
-                                delegation,
-                                cancel_token,
-                            )
-                            .await;
-                        }
-                        None => {
-                            // No AgentHandle registered for this agent.
-                            let error_message = format!(
-                                "Agent '{}' is not registered with a handle. \
-                                 Register it via register_handle() in the AgentRegistry.",
-                                delegation.target_agent_id
-                            );
-                            fail_delegation(
-                                DelegationFailureContext {
-                                    event_sink: &ctx.event_sink,
-                                    delegator: &ctx.delegator,
-                                    store: &ctx.store,
-                                    hooks: Some(&ctx.hooks),
-                                    config: &ctx.config,
-                                    parent_session_id: &parent_session_id,
-                                    delegation_id: &delegation.public_id,
-                                    target_agent_id: Some(&delegation.target_agent_id),
-                                    objective: Some(&delegation.objective),
-                                },
-                                &error_message,
-                            )
-                            .await;
-                        }
-                    }
+                    execute_delegation(
+                        ctx,
+                        target_handle,
+                        parent_session_id,
+                        delegation,
+                        cancel_token,
+                    )
+                    .await;
                 });
 
                 let mut active = active_delegations.lock().await;
+                if self.shutting_down.load(Ordering::Acquire) {
+                    handle.abort();
+                    drop(active);
+                    fail_delegation(
+                        DelegationFailureContext {
+                            event_sink: &self.event_sink,
+                            delegator: &self.delegator,
+                            store: &self.store,
+                            hooks: None,
+                            config: &self.config,
+                            parent_session_id: session_id,
+                            delegation_id: &delegation_id,
+                            target_agent_id: None,
+                            objective: None,
+                        },
+                        "Delegation cancelled because the orchestrator is shutting down",
+                    )
+                    .await;
+                    return;
+                }
                 active.insert(
                     delegation_id,
                     (parent_session_id_for_insert, cancel_token_clone, handle),
                 );
+                drop(active);
+                let _ = start_tx.send(());
             }
             AgentEventKind::DelegationCancelRequested { delegation_id } => {
                 tracing::Span::current().record("event_kind", "DelegationCancelRequested");
@@ -502,14 +722,6 @@ async fn execute_delegation(
             }
         }
         Err(err) => warn!("Delegation start hook failed: {}", err),
-    }
-
-    if let Err(e) = ctx
-        .store
-        .update_delegation_status(&delegation.public_id, DelegationStatus::Running)
-        .await
-    {
-        warn!("Failed to update delegation status to Running: {}", e);
     }
 
     // Snapshot the parent's current per-session setting. UI changes persist this value
@@ -888,11 +1100,27 @@ async fn execute_delegation(
             // Cancellation — cancel the child session
             let _ = session_ref.cancel().await;
 
-            if let Err(e) = ctx.store
-                .update_delegation_status(&delegation_id, DelegationStatus::Cancelled)
+            match ctx
+                .store
+                .transition_delegation_status(
+                    &delegation_id,
+                    DelegationStatus::Running,
+                    DelegationStatus::Cancelled,
+                )
                 .await
             {
-                warn!("Failed to update delegation status to Cancelled: {}", e);
+                Ok(true) => {}
+                Ok(false) => {
+                    let mut active = ctx.active_delegations.lock().await;
+                    active.remove(&delegation_id);
+                    return;
+                }
+                Err(e) => {
+                    warn!("Failed to update delegation status to Cancelled: {}", e);
+                    let mut active = ctx.active_delegations.lock().await;
+                    active.remove(&delegation_id);
+                    return;
+                }
             }
 
             emit_delegation_event(
@@ -1056,12 +1284,27 @@ async fn execute_delegation(
                 Err(err) => warn!("Post-delegation hook failed: {}", err),
             }
 
-            if let Err(e) = ctx
+            match ctx
                 .store
-                .update_delegation_status(&delegation.public_id, DelegationStatus::Complete)
+                .transition_delegation_status(
+                    &delegation.public_id,
+                    DelegationStatus::Running,
+                    DelegationStatus::Complete,
+                )
                 .await
             {
-                warn!("Failed to persist delegation completion: {}", e);
+                Ok(true) => {}
+                Ok(false) => {
+                    let mut active = ctx.active_delegations.lock().await;
+                    active.remove(&delegation_id);
+                    return;
+                }
+                Err(e) => {
+                    warn!("Failed to persist delegation completion: {}", e);
+                    let mut active = ctx.active_delegations.lock().await;
+                    active.remove(&delegation_id);
+                    return;
+                }
             }
 
             emit_delegation_event(
@@ -1124,12 +1367,38 @@ async fn execute_delegation(
 )]
 async fn fail_delegation(ctx: DelegationFailureContext<'_>, error_message: &str) {
     error!("{}", error_message);
-    if let Err(e) = ctx
+    let transitioned = match ctx
         .store
-        .update_delegation_status(ctx.delegation_id, DelegationStatus::Failed)
+        .transition_delegation_status(
+            ctx.delegation_id,
+            DelegationStatus::Running,
+            DelegationStatus::Failed,
+        )
         .await
     {
-        warn!("Failed to persist delegation failure: {}", e);
+        Ok(true) => true,
+        Ok(false) => match ctx
+            .store
+            .transition_delegation_status(
+                ctx.delegation_id,
+                DelegationStatus::Requested,
+                DelegationStatus::Failed,
+            )
+            .await
+        {
+            Ok(transitioned) => transitioned,
+            Err(e) => {
+                warn!("Failed to persist delegation failure: {}", e);
+                false
+            }
+        },
+        Err(e) => {
+            warn!("Failed to persist delegation failure: {}", e);
+            false
+        }
+    };
+    if !transitioned {
+        return;
     }
 
     let mut failure_message = error_message.to_string();
@@ -1517,7 +1786,12 @@ mod tests {
     use crate::agent::handle::AgentHandle;
     use crate::agent::remote::SessionActorRef;
     use crate::event_fanout::EventFanout;
+    use crate::event_sink::EventSink;
     use crate::events::EventEnvelope;
+    use crate::hooks::Hooks;
+    use crate::session::backend::StorageBackend;
+    use crate::session::sqlite_storage::SqliteStorage;
+    use crate::test_utils::MockSessionStore;
     use async_trait::async_trait;
 
     // ── Minimal stub AgentHandle ──────────────────────────────────────────────
@@ -1587,6 +1861,151 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_claimed_delegation_registration() {
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("storage"),
+        );
+        let session = storage
+            .create_session(None, None, None, None)
+            .await
+            .expect("session");
+        let delegation = storage
+            .create_delegation(Delegation {
+                id: 0,
+                public_id: String::new(),
+                session_id: session.id,
+                task_id: None,
+                target_agent_id: "coder".to_string(),
+                objective: "test shutdown registration".to_string(),
+                objective_hash: crate::hash::RapidHash::new(b"test shutdown registration"),
+                context: None,
+                constraints: None,
+                expected_output: None,
+                verification_spec: None,
+                planning_summary: None,
+                status: DelegationStatus::Requested,
+                retry_count: 0,
+                created_at: time::OffsetDateTime::now_utc(),
+                completed_at: None,
+            })
+            .await
+            .expect("delegation");
+        let fanout = Arc::new(EventFanout::new());
+        let event_sink = Arc::new(EventSink::new(storage.event_journal(), fanout.clone()));
+        let mut registry = DefaultAgentRegistry::new();
+        registry.register(make_agent_info("coder"), StubAgentHandle::new("coder"));
+        let orchestrator = Arc::new(
+            DelegationOrchestrator::new(
+                StubAgentHandle::new("delegator"),
+                event_sink,
+                storage.session_store().clone(),
+                Arc::new(registry),
+                Arc::new(ToolRegistry::new()),
+                Hooks::default(),
+                None,
+            )
+            .with_max_parallel_delegations(NonZeroUsize::new(1).unwrap()),
+        );
+        let held_permit = orchestrator
+            .max_parallel
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("held permit");
+        let listener = orchestrator.start_listening(&fanout);
+
+        let requested = storage
+            .event_journal()
+            .append_durable(&crate::session::projection::NewDurableEvent {
+                session_id: session.public_id.clone(),
+                origin: crate::events::EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::DelegationRequested {
+                    delegation: delegation.clone(),
+                    tool_call_id: None,
+                },
+            })
+            .await
+            .expect("requested event");
+        fanout.publish(EventEnvelope::Durable(requested));
+        orchestrator
+            .wait_until_registered(&delegation.public_id)
+            .await;
+
+        orchestrator.begin_shutdown();
+        listener.abort();
+        listener.await.expect_err("listener should be aborted");
+        orchestrator.cancel_active_delegations().await;
+        drop(held_permit);
+
+        assert!(orchestrator.active_delegations.lock().await.is_empty());
+        assert_eq!(
+            storage
+                .get_delegation(&delegation.public_id)
+                .await
+                .expect("delegation lookup")
+                .expect("delegation")
+                .status,
+            DelegationStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_error_does_not_fail_running_winner() {
+        let mut store = MockSessionStore::new();
+        store
+            .expect_transition_delegation_status()
+            .withf(|id, expected, next| {
+                id == "delegation-1"
+                    && *expected == DelegationStatus::Requested
+                    && *next == DelegationStatus::Failed
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(false));
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("storage"),
+        );
+        let fanout = Arc::new(EventFanout::new());
+        let event_sink = Arc::new(EventSink::new(storage.event_journal(), fanout));
+        let orchestrator = DelegationOrchestrator::new(
+            StubAgentHandle::new("delegator"),
+            event_sink,
+            store,
+            Arc::new(DefaultAgentRegistry::new()),
+            Arc::new(ToolRegistry::new()),
+            Hooks::default(),
+            None,
+        );
+        let delegation = Delegation {
+            id: 1,
+            public_id: "delegation-1".to_string(),
+            session_id: 1,
+            task_id: None,
+            target_agent_id: "coder".to_string(),
+            objective: "test".to_string(),
+            objective_hash: crate::hash::RapidHash::new(b"test"),
+            context: None,
+            constraints: None,
+            expected_output: None,
+            verification_spec: None,
+            planning_summary: None,
+            status: DelegationStatus::Requested,
+            retry_count: 0,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+
+        orchestrator
+            .fail_unclaimed_delegation(&delegation, "session-1", "claim failed")
+            .await;
     }
 
     fn make_agent_info(id: &str) -> AgentInfo {

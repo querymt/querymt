@@ -218,6 +218,10 @@ impl AgentRunner {
         self.0.profiles()
     }
 
+    pub async fn shutdown(&self) {
+        self.0.shutdown().await;
+    }
+
     /// Access the underlying `AgentHandle` for advanced use cases.
     pub fn handle(&self) -> std::sync::Arc<crate::agent::LocalAgentHandle> {
         self.0.handle()

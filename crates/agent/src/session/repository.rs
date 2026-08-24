@@ -207,12 +207,19 @@ pub trait DelegationRepository: Send + Sync {
     /// List delegations for a session
     async fn list_delegations(&self, session_id: &str) -> SessionResult<Vec<Delegation>>;
 
-    /// Update delegation status
-    async fn update_delegation_status(
+    /// Atomically transition a requested delegation to running.
+    async fn claim_delegation(
         &self,
         delegation_id: &str,
-        status: DelegationStatus,
-    ) -> SessionResult<()>;
+    ) -> SessionResult<crate::session::domain::DelegationClaim>;
+
+    /// Atomically transition a delegation from the expected status.
+    async fn transition_delegation_status(
+        &self,
+        delegation_id: &str,
+        expected: DelegationStatus,
+        next: DelegationStatus,
+    ) -> SessionResult<bool>;
 
     /// Update delegation
     async fn update_delegation(&self, delegation: Delegation) -> SessionResult<()>;

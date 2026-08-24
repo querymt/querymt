@@ -185,6 +185,14 @@ pub enum DelegationStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationClaim {
+    Claimed,
+    AlreadyClaimed,
+    NotFound,
+    InvalidState(DelegationStatus),
+}
+
 /// Agent-to-agent delegation record
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]

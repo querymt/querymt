@@ -43,8 +43,7 @@ async fn test_agent_with_storage(
         .await
 }
 
-async fn attach_test_profiles(
-    agent: Agent,
+async fn build_test_profile_agent(
     storage: Arc<crate::session::sqlite_storage::SqliteStorage>,
     profile_dir: &std::path::Path,
 ) -> Result<Agent> {
@@ -55,7 +54,80 @@ async fn attach_test_profiles(
             .local_dir(profile_dir)
             .build(),
     );
-    Ok(agent.with_profiles(AgentProfiles::new(
+    let infra = AgentInfra {
+        plugin_registry: Arc::new(registry),
+        storage: Some(storage),
+        session_mcp_attachment_source: None,
+        event_fanout: None,
+    };
+    let profiles = AgentProfiles::new(catalog, "alpha", infra);
+    let runtime = profiles.active_runtime().await?;
+    Ok(runtime.agent().clone().with_profiles(profiles))
+}
+
+async fn build_test_profile_multi_agent(
+    storage: Arc<crate::session::sqlite_storage::SqliteStorage>,
+    profile_dir: &std::path::Path,
+) -> Result<Agent> {
+    let (registry, _temp_dir) = empty_plugin_registry()?;
+    let catalog: Arc<dyn ProfileCatalog> = Arc::new(
+        LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(profile_dir)
+            .build(),
+    );
+    let infra = AgentInfra {
+        plugin_registry: Arc::new(registry),
+        storage: Some(storage),
+        session_mcp_attachment_source: None,
+        event_fanout: Some(Arc::new(crate::event_fanout::EventFanout::new())),
+    };
+    let profiles = AgentProfiles::new(catalog, "team", infra);
+    let runtime = profiles.active_runtime().await?;
+    Ok(runtime.agent().clone().with_profiles(profiles))
+}
+
+#[tokio::test]
+async fn with_profiles_reuses_root_agent_for_active_profile() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    std::fs::write(
+        dir.path().join("alpha.toml"),
+        "[agent]\nprovider = \"test\"\nmodel = \"test-model\"\nsystem = \"inline\"\n",
+    )?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = build_test_profile_agent(storage, dir.path()).await?;
+    let root_handle = agent.handle();
+
+    let runtime = agent
+        .profiles()
+        .expect("profiles attached")
+        .active_runtime()
+        .await?;
+
+    assert!(Arc::ptr_eq(&root_handle, &runtime.agent().handle()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_with_profiles_also_stops_independent_root() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    std::fs::write(
+        dir.path().join("alpha.toml"),
+        "[agent]\nprovider = \"test\"\nmodel = \"test-model\"\nsystem = \"inline\"\n",
+    )?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let root = test_agent_with_storage(Some(storage.clone())).await?;
+    assert!(!root.handle().is_shutdown());
+    let (registry, _temp_dir) = empty_plugin_registry()?;
+    let catalog: Arc<dyn ProfileCatalog> = Arc::new(
+        LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(dir.path())
+            .build(),
+    );
+    let profiles = AgentProfiles::new(
         catalog,
         "alpha",
         AgentInfra {
@@ -64,7 +136,13 @@ async fn attach_test_profiles(
             session_mcp_attachment_source: None,
             event_fanout: None,
         },
-    )))
+    );
+    let root = root.with_profiles(profiles);
+
+    root.shutdown().await;
+
+    assert!(root.handle().is_shutdown());
+    Ok(())
 }
 
 #[tokio::test]
@@ -76,8 +154,7 @@ async fn with_profiles_keeps_watcher_alive() -> Result<()> {
     )?;
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
-    let agent = test_agent_with_storage(Some(storage.clone())).await?;
-    let agent = attach_test_profiles(agent, storage, dir.path()).await?;
+    let agent = build_test_profile_agent(storage, dir.path()).await?;
 
     assert!(agent.profiles().is_some());
     assert!(
@@ -101,8 +178,7 @@ async fn server_inherits_attached_profiles() -> Result<()> {
     )?;
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
-    let agent = test_agent_with_storage(Some(storage.clone())).await?;
-    let agent = attach_test_profiles(agent, storage, dir.path()).await?;
+    let agent = build_test_profile_agent(storage, dir.path()).await?;
 
     let server = agent.server();
     assert!(server.profiles().is_some());
@@ -603,5 +679,60 @@ async fn list_sessions_remote_bookmarks_mode_includes_detached_bookmarks() -> Re
         .expect("remote bookmark should be present");
     assert_eq!(remote.attached, Some(false));
     assert_eq!(remote.node.as_deref(), Some("remote-peer"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_with_profiles_and_quorum_executes_both() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    std::fs::write(
+        dir.path().join("team.toml"),
+        r#"
+[quorum]
+delegation = true
+verification = false
+snapshot_policy = "none"
+
+[planner]
+provider = "test"
+model = "test-planner"
+tools = ["delegate"]
+
+[[delegates]]
+id = "coder"
+provider = "test"
+model = "test-coder"
+tools = []
+"#,
+    )?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = build_test_profile_multi_agent(storage, dir.path()).await?;
+
+    // Verify both profiles and quorum are present
+    assert!(agent.profiles().is_some());
+    assert!(agent.quorum().is_some());
+    assert!(agent.is_multi());
+
+    // Get references before shutdown
+    let planner = agent.planner().expect("planner present");
+    let delegate = agent.delegate("coder").expect("delegate present");
+
+    let planner = planner
+        .as_any()
+        .downcast_ref::<crate::agent::LocalAgentHandle>()
+        .expect("local planner");
+    let delegate = delegate
+        .as_any()
+        .downcast_ref::<crate::agent::LocalAgentHandle>()
+        .expect("local delegate");
+    assert!(!planner.is_shutdown());
+    assert!(!delegate.is_shutdown());
+
+    agent.shutdown().await;
+
+    assert!(planner.is_shutdown());
+    assert!(delegate.is_shutdown());
+
     Ok(())
 }
