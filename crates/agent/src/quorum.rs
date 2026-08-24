@@ -124,7 +124,12 @@ impl AgentQuorum {
     }
 
     pub async fn shutdown(&self) {
-        if let Some(handle) = self.listener_handle.lock().unwrap().take() {
+        let listener = self
+            .listener_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(handle) = listener {
             handle.abort();
         }
         if let Some(orchestrator) = &self.orchestrator {
