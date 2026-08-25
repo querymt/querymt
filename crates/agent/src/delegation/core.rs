@@ -859,7 +859,15 @@ async fn execute_delegation(
             )
             .await
     {
-        let _ = session_ref.shutdown().await;
+        if let Err(shutdown_err) = session_ref.shutdown().await {
+            tracing::warn!(
+                delegation_id = %delegation.public_id,
+                child_session_id = %child_session_id,
+                target_agent_id = %delegation.target_agent_id,
+                error = %shutdown_err,
+                "Failed to shut down delegate session after runtime binding persistence failed"
+            );
+        }
         fail_delegation(
             DelegationFailureContext {
                 event_sink: &ctx.event_sink,

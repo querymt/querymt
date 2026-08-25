@@ -207,14 +207,9 @@ impl LocalAgentHandle {
     ) -> Result<DeleteSessionResponse, Error> {
         let session_id = req.session_id.to_string();
 
-        let is_loaded = {
-            let registry = self.registry.lock().await;
-            registry.get(&session_id).is_some()
-        };
-        if is_loaded {
-            // Closing is best-effort: deleting persisted history is the primary intent.
-            let _ = self.stop_session(&session_id).await;
-        }
+        // Closing is best-effort: deleting persisted history is the primary intent.
+        // Route through the session binding so delegated runtimes are released too.
+        let _ = self.stop_session(&session_id).await;
 
         let exists = self
             .config
@@ -226,6 +221,9 @@ impl LocalAgentHandle {
             .is_some();
         if !exists {
             self.clear_delegate_model_overrides(&session_id).await;
+            if let Some(profiles) = self.profiles() {
+                profiles.forget_session_binding(&session_id).await;
+            }
             return Ok(DeleteSessionResponse::new());
         }
 
@@ -238,6 +236,9 @@ impl LocalAgentHandle {
                 Error::internal_error().data(serde_json::json!({"error": e.to_string()}))
             })?;
         self.clear_delegate_model_overrides(&session_id).await;
+        if let Some(profiles) = self.profiles() {
+            profiles.forget_session_binding(&session_id).await;
+        }
 
         Ok(DeleteSessionResponse::new())
     }
