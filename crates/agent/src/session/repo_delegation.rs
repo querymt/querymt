@@ -233,6 +233,31 @@ impl DelegationRepository for SqliteDelegationRepository {
         .await
     }
 
+    async fn set_delegation_planning_summary(
+        &self,
+        delegation_id: &str,
+        planning_summary: &str,
+    ) -> SessionResult<()> {
+        let delegation_id = delegation_id.to_string();
+        let delegation_id_for_update = delegation_id.clone();
+        let planning_summary = planning_summary.to_string();
+        self.run_blocking(move |conn| {
+            let affected = conn.execute(
+                "UPDATE delegations SET planning_summary = ? WHERE public_id = ?",
+                params![planning_summary, delegation_id_for_update],
+            )?;
+            if affected == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| match e {
+            SessionError::DatabaseError(_) => SessionError::DelegationNotFound(delegation_id),
+            _ => e,
+        })
+    }
+
     async fn update_delegation(&self, delegation: Delegation) -> SessionResult<()> {
         let status_str = delegation.status.to_string();
         let completed_at = delegation.completed_at.as_ref().map(format_rfc3339);

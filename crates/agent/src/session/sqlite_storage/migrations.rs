@@ -52,6 +52,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0010_profile_bindings",
         apply: migration_0010_profile_bindings,
     },
+    Migration {
+        version: "0011_session_runtime_bindings",
+        apply: migration_0011_session_runtime_bindings,
+    },
 ];
 
 pub(super) fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -430,5 +434,10 @@ fn migration_0010_profile_bindings(conn: &mut Connection) -> Result<(), rusqlite
             );
         "#,
     )?;
+    Ok(())
+}
+
+fn migration_0011_session_runtime_bindings(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("ALTER TABLE profile_bindings ADD COLUMN agent_id TEXT;")?;
     Ok(())
 }

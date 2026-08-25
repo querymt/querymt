@@ -2,33 +2,71 @@ use super::utils::format_prefixed_error_chain;
 use super::*;
 
 impl LocalAgentHandle {
+    async fn bound_session_handle(
+        &self,
+        session_id: &str,
+    ) -> Result<
+        Option<(
+            Arc<dyn crate::agent::handle::AgentHandle>,
+            crate::profiles::SessionProfileBinding,
+        )>,
+        Error,
+    > {
+        let Some(profiles) = self.profiles() else {
+            return Ok(None);
+        };
+        let Some(binding) = profiles.session_binding(session_id).await else {
+            return Ok(None);
+        };
+        let runtime = profiles
+            .runtime_for_profile(&binding.profile_id)
+            .await
+            .map_err(|err| {
+                Error::internal_error().data(serde_json::json!({
+                    "message": format_prefixed_error_chain(
+                        &format!("Failed to load profile '{}'", binding.profile_id),
+                        &err,
+                    ),
+                    "profileId": binding.profile_id,
+                    "sessionId": session_id,
+                }))
+            })?;
+        let session_handle = runtime
+            .session_handle(binding.agent_id.as_deref())
+            .ok_or_else(|| {
+                Error::invalid_params().data(serde_json::json!({
+                    "message": "session is bound to an unknown delegate",
+                    "sessionId": session_id,
+                    "profileId": binding.profile_id,
+                    "agentId": binding.agent_id,
+                }))
+            })?;
+        Ok(Some((session_handle, binding)))
+    }
+
     pub(crate) async fn session_ref_for_agent_session(
         &self,
         session_id: &str,
     ) -> Result<SessionActorRef, Error> {
-        if let Some(profiles) = self.profiles()
-            && let Some(binding) = profiles.session_binding(session_id).await
-        {
-            let runtime = profiles
-                .runtime_for_profile(&binding.profile_id)
-                .await
-                .map_err(|err| {
+        if let Some((session_handle, binding)) = self.bound_session_handle(session_id).await? {
+            let local_handle = session_handle
+                .as_any()
+                .downcast_ref::<LocalAgentHandle>()
+                .ok_or_else(|| {
                     Error::internal_error().data(serde_json::json!({
-                        "message": format_prefixed_error_chain(
-                            &format!("Failed to load profile '{}'", binding.profile_id),
-                            &err,
-                        ),
-                        "profileId": binding.profile_id,
+                        "message": "bound session runtime is not local",
                         "sessionId": session_id,
+                        "profileId": binding.profile_id,
+                        "agentId": binding.agent_id,
                     }))
                 })?;
-            let profile_handle = runtime.agent().handle();
-            let registry = profile_handle.registry.lock().await;
+            let registry = local_handle.registry.lock().await;
             return registry.get(session_id).cloned().ok_or_else(|| {
                 Error::invalid_params().data(serde_json::json!({
-                    "message": "unknown session for bound profile",
+                    "message": "unknown session for bound runtime",
                     "sessionId": session_id,
                     "profileId": binding.profile_id,
+                    "agentId": binding.agent_id,
                 }))
             });
         }
@@ -43,6 +81,25 @@ impl LocalAgentHandle {
     }
 
     pub async fn stop_session(&self, session_id: &str) -> Result<(), Error> {
+        if let Some((session_handle, binding)) = self.bound_session_handle(session_id).await? {
+            let local_handle = session_handle
+                .as_any()
+                .downcast_ref::<LocalAgentHandle>()
+                .ok_or_else(|| {
+                    Error::internal_error().data(serde_json::json!({
+                        "message": "bound session runtime is not local",
+                        "sessionId": session_id,
+                        "profileId": binding.profile_id,
+                        "agentId": binding.agent_id,
+                    }))
+                })?;
+            return local_handle.stop_session_in_runtime(session_id).await;
+        }
+
+        self.stop_session_in_runtime(session_id).await
+    }
+
+    async fn stop_session_in_runtime(&self, session_id: &str) -> Result<(), Error> {
         use crate::agent::messages::{SessionRuntimePhase, SessionRuntimeStatus};
 
         const STOP_ESCALATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -70,38 +127,31 @@ impl LocalAgentHandle {
             .get_runtime_status()
             .await
             .unwrap_or(SessionRuntimeStatus::Running);
-        if status.phase == SessionRuntimePhase::Idle {
+        let stopped_gracefully = status.phase == SessionRuntimePhase::Idle
+            || (status.phase == SessionRuntimePhase::CancelRequested && !session_ref.is_remote());
+        if stopped_gracefully {
             tracing::debug!(
-                "Session {} stop: status=Idle, graceful shutdown — returning without force-stop",
                 session_id,
+                phase = ?status.phase,
+                "session stop completed gracefully; releasing runtime resources",
             );
-            return Ok(());
-        }
-        // For remote sessions, CancelRequested doesn't mean the prompt is done —
-        // the provider stream might still be active on the remote node.
-        if status.phase == SessionRuntimePhase::CancelRequested && !session_ref.is_remote() {
-            tracing::debug!(
-                "Session {} stop: status=CancelRequested (local), graceful shutdown — returning without force-stop",
-                session_id,
-            );
-            return Ok(());
-        }
+        } else {
+            if status.phase == SessionRuntimePhase::CancelRequested {
+                tracing::warn!(
+                    "Session {} stop: still CancelRequested after {:?}; escalating to force-stop",
+                    session_id,
+                    STOP_ESCALATION_TIMEOUT
+                );
+            }
 
-        if status.phase == SessionRuntimePhase::CancelRequested {
-            tracing::warn!(
-                "Session {} stop: still CancelRequested after {:?}; escalating to force-stop",
+            self.config.emit_event(
                 session_id,
-                STOP_ESCALATION_TIMEOUT
+                AgentEventKind::SessionForceStopped {
+                    escalated_after_ms: STOP_ESCALATION_TIMEOUT.as_millis() as u64,
+                    reason: "graceful cancellation timeout elapsed".to_string(),
+                },
             );
         }
-
-        self.config.emit_event(
-            session_id,
-            AgentEventKind::SessionForceStopped {
-                escalated_after_ms: STOP_ESCALATION_TIMEOUT.as_millis() as u64,
-                reason: "graceful cancellation timeout elapsed".to_string(),
-            },
-        );
 
         if session_ref.is_remote() {
             #[cfg(feature = "remote")]
@@ -215,8 +265,10 @@ impl LocalAgentHandle {
                 let mut registry = self.registry.lock().await;
                 registry.remove(session_id)
             };
-            if let Some(session_ref) = removed {
-                let _ = session_ref.shutdown().await;
+            if let Some(session_ref) = removed
+                && let Err(err) = session_ref.shutdown().await
+            {
+                tracing::warn!(session_id, error = %err, "failed to shut down session actor");
             }
         }
 

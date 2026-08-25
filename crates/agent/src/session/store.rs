@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRuntimeBinding {
+    pub profile_id: String,
+    pub agent_id: Option<String>,
+}
+
 /// A bookmark for a remote session — enough metadata to re-discover and
 /// re-attach it after a server restart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,11 +263,25 @@ pub trait SessionStore: Send + Sync {
     /// Set the LLM configuration id for a session
     async fn set_session_llm_config(&self, session_id: &str, config_id: i64) -> SessionResult<()>;
 
-    /// Persist the advisory profile binding for a session.
+    /// Persist the profile namespace for a root session.
     async fn set_profile_binding(&self, session_id: &str, profile_id: &str) -> SessionResult<()>;
 
-    /// Retrieve the advisory profile binding for a session.
+    /// Persist the profile namespace and concrete agent that owns a session runtime.
+    async fn set_session_runtime_binding(
+        &self,
+        session_id: &str,
+        profile_id: &str,
+        agent_id: Option<&str>,
+    ) -> SessionResult<()>;
+
+    /// Retrieve the profile namespace for compatibility with profile ownership checks.
     async fn get_profile_binding(&self, session_id: &str) -> SessionResult<Option<String>>;
+
+    /// Retrieve the complete runtime route for a session.
+    async fn get_session_runtime_binding(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<SessionRuntimeBinding>>;
 
     /// Remove the advisory profile binding for a session.
     async fn remove_profile_binding(&self, session_id: &str) -> SessionResult<()>;
@@ -414,6 +434,11 @@ pub trait SessionStore: Send + Sync {
         next: DelegationStatus,
     ) -> SessionResult<bool>;
     async fn update_delegation(&self, delegation: Delegation) -> SessionResult<()>;
+    async fn set_delegation_planning_summary(
+        &self,
+        delegation_id: &str,
+        planning_summary: &str,
+    ) -> SessionResult<()>;
 
     // Undo/Redo methods
 

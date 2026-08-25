@@ -223,4 +223,11 @@ pub trait DelegationRepository: Send + Sync {
 
     /// Update delegation
     async fn update_delegation(&self, delegation: Delegation) -> SessionResult<()>;
+
+    /// Update only the generated planning summary without clobbering lifecycle state.
+    async fn set_delegation_planning_summary(
+        &self,
+        delegation_id: &str,
+        planning_summary: &str,
+    ) -> SessionResult<()>;
 }

@@ -88,16 +88,13 @@ pub struct ProfileDocument {
 
 /// Binding between a session id and the profile runtime that owns it.
 ///
-/// This matters because resume/routing code must know which profile runtime owns a
-/// session; otherwise a session could be resumed under the wrong profile after the
-/// user switches profiles. Bindings are cached in memory and backed by a
-/// best-effort `profile_bindings` side table that maps session id to profile id.
-///
-/// The binding is advisory: missing or unavailable persisted profile ids are
-/// ignored so callers can fall back to the active profile behavior.
+/// This matters because resume/routing code must know which profile runtime and
+/// concrete agent own a session. Root sessions leave `agent_id` unset; delegated
+/// sessions name the sub-agent that must materialize them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionProfileBinding {
     pub profile_id: String,
+    pub agent_id: Option<String>,
     pub profile_fingerprint: Option<String>,
     pub profile_source: Option<String>,
     pub profile_config_kind: Option<String>,
@@ -121,12 +118,23 @@ impl ProfileRuntime {
     pub fn session_binding(&self) -> SessionProfileBinding {
         self.metadata.session_binding()
     }
+
+    pub fn session_handle(
+        &self,
+        agent_id: Option<&str>,
+    ) -> Option<Arc<dyn crate::agent::handle::AgentHandle>> {
+        match agent_id {
+            Some(agent_id) => self.agent.delegate(agent_id),
+            None => Some(self.agent.handle()),
+        }
+    }
 }
 
 impl ProfileMetadata {
     pub fn session_binding(&self) -> SessionProfileBinding {
         SessionProfileBinding {
             profile_id: self.id.clone(),
+            agent_id: None,
             profile_fingerprint: self.fingerprint.clone(),
             profile_source: Some(self.source.storage_label()),
             profile_config_kind: self
@@ -852,7 +860,11 @@ where
         };
         if let Err(err) = storage
             .session_store()
-            .set_profile_binding(&session_id, &binding.profile_id)
+            .set_session_runtime_binding(
+                &session_id,
+                &binding.profile_id,
+                binding.agent_id.as_deref(),
+            )
             .await
         {
             warn!(session_id, profile_id = %binding.profile_id, error = %err, "failed to persist session profile binding");
@@ -867,26 +879,27 @@ where
         let Some(storage) = &self.shared_infra.storage else {
             return None;
         };
-        let profile_id = match storage
+        let route = match storage
             .session_store()
-            .get_profile_binding(session_id)
+            .get_session_runtime_binding(session_id)
             .await
         {
-            Ok(Some(profile_id)) => profile_id,
+            Ok(Some(route)) => route,
             Ok(None) => return None,
             Err(err) => {
                 warn!(session_id, error = %err, "failed to read session profile binding");
                 return None;
             }
         };
-        let runtime = match self.runtime_for_profile(&profile_id).await {
+        let runtime = match self.runtime_for_profile(&route.profile_id).await {
             Ok(runtime) => runtime,
             Err(err) => {
-                warn!(session_id, profile_id, error = %err, "ignoring unavailable persisted session profile binding");
+                warn!(session_id, profile_id = route.profile_id, error = %err, "ignoring unavailable persisted session profile binding");
                 return None;
             }
         };
-        let binding = runtime.session_binding();
+        let mut binding = runtime.session_binding();
+        binding.agent_id = route.agent_id;
         self.session_bindings
             .lock()
             .await

@@ -484,6 +484,153 @@ async fn test_set_profile_config_option_rejects_different_bound_profile() {
     assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
 }
 
+async fn register_profile_bound_delegate_session(
+    f: &HandleFixture,
+    runtime: &Arc<crate::profiles::ProfileRuntime>,
+    session_id: &str,
+) -> (Arc<dyn AgentHandle>, SessionActorRef) {
+    let delegate_handle = runtime.agent().delegate("coder").expect("coder delegate");
+    let local_handle = delegate_handle
+        .as_any()
+        .downcast_ref::<LocalAgentHandle>()
+        .expect("local delegate");
+    let actor = SessionActor::new(
+        local_handle.config.clone(),
+        session_id.to_string(),
+        crate::agent::core::SessionRuntime::new(
+            None,
+            std::collections::HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        ),
+    );
+    let actor_ref: SessionActorRef = SessionActor::spawn(actor).into();
+    local_handle
+        .registry
+        .lock()
+        .await
+        .insert(session_id.to_string(), actor_ref.clone());
+    let mut binding = runtime.session_binding();
+    binding.agent_id = Some("coder".to_string());
+    f.handle
+        .profiles()
+        .expect("profiles configured")
+        .set_session_binding(session_id, binding)
+        .await;
+    (delegate_handle, actor_ref)
+}
+
+#[tokio::test]
+async fn test_profile_bound_delegate_session_resolves_delegate_actor() {
+    let (f, _profile_dir) =
+        profile_fixture_with_files(&[("quorum.toml", QUORUM_PROFILE_TOML)]).await;
+    let runtime = f
+        .handle
+        .profiles()
+        .expect("profiles configured")
+        .runtime_for_profile("quorum")
+        .await
+        .expect("quorum runtime");
+    let session_id = "delegate-session";
+    register_profile_bound_delegate_session(&f, &runtime, session_id).await;
+
+    let resolved = f
+        .handle
+        .session_ref_for_agent_session(session_id)
+        .await
+        .expect("delegate actor should resolve");
+
+    assert_eq!(resolved.get_mode().await.unwrap(), AgentMode::Build);
+}
+
+#[tokio::test]
+async fn test_close_profile_bound_delegate_session_stops_delegate_actor() {
+    let (f, _profile_dir) =
+        profile_fixture_with_files(&[("quorum.toml", QUORUM_PROFILE_TOML)]).await;
+    let runtime = f
+        .handle
+        .profiles()
+        .expect("profiles configured")
+        .runtime_for_profile("quorum")
+        .await
+        .expect("quorum runtime");
+    let session_id = "delegate-close-session";
+    let (delegate_handle, actor_ref) =
+        register_profile_bound_delegate_session(&f, &runtime, session_id).await;
+
+    SendAgent::close_session(
+        &f.handle,
+        CloseSessionRequest::new(SessionId::from(session_id.to_string())),
+    )
+    .await
+    .expect("close delegate session");
+
+    let delegate_handle = delegate_handle
+        .as_any()
+        .downcast_ref::<LocalAgentHandle>()
+        .expect("local delegate");
+    assert!(
+        delegate_handle
+            .registry
+            .lock()
+            .await
+            .get(session_id)
+            .is_none()
+    );
+    assert!(
+        actor_ref.get_mode().await.is_err(),
+        "delegate actor should stop"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_profile_bound_delegate_session_releases_runtime() {
+    let (f, _profile_dir) =
+        profile_fixture_with_files(&[("quorum.toml", QUORUM_PROFILE_TOML)]).await;
+    let runtime = f
+        .handle
+        .profiles()
+        .expect("profiles configured")
+        .runtime_for_profile("quorum")
+        .await
+        .expect("quorum runtime");
+    let session_id = "delegate-delete-session";
+    let (delegate_handle, actor_ref) =
+        register_profile_bound_delegate_session(&f, &runtime, session_id).await;
+
+    SendAgent::delete_session(
+        &f.handle,
+        DeleteSessionRequest::new(SessionId::from(session_id.to_string())),
+    )
+    .await
+    .expect("delete delegate session");
+
+    let delegate_handle = delegate_handle
+        .as_any()
+        .downcast_ref::<LocalAgentHandle>()
+        .expect("local delegate");
+    assert!(
+        delegate_handle
+            .registry
+            .lock()
+            .await
+            .get(session_id)
+            .is_none()
+    );
+    assert!(
+        actor_ref.get_mode().await.is_err(),
+        "delegate actor should stop"
+    );
+    assert!(
+        f.handle
+            .profiles()
+            .expect("profiles configured")
+            .session_binding(session_id)
+            .await
+            .is_none(),
+        "delete should forget the runtime binding"
+    );
+}
+
 #[tokio::test]
 async fn test_profile_handle_rejects_unbound_session_load() {
     let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;

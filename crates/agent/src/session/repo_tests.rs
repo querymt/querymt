@@ -872,6 +872,34 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn planning_summary_update_preserves_running_status() {
+            let (_session_public_id, session_id, repo) = make_session_and_repo().await;
+            let created = repo
+                .create_delegation(make_delegation(session_id, "agent-x", "summarize safely"))
+                .await
+                .unwrap();
+            assert_eq!(
+                repo.claim_delegation(&created.public_id).await.unwrap(),
+                DelegationClaim::Claimed
+            );
+
+            repo.set_delegation_planning_summary(&created.public_id, "planning context")
+                .await
+                .unwrap();
+
+            let fetched = repo
+                .get_delegation(&created.public_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(fetched.status, DelegationStatus::Running);
+            assert_eq!(
+                fetched.planning_summary.as_deref(),
+                Some("planning context")
+            );
+        }
+
+        #[tokio::test]
         async fn guarded_transition_rejects_stale_terminal_update() {
             let (_session_public_id, session_id, repo) = make_session_and_repo().await;
             let created = repo

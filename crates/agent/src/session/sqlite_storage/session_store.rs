@@ -584,14 +584,27 @@ impl SessionStore for SqliteStorage {
     }
 
     async fn set_profile_binding(&self, session_id: &str, profile_id: &str) -> SessionResult<()> {
+        self.set_session_runtime_binding(session_id, profile_id, None)
+            .await
+    }
+
+    async fn set_session_runtime_binding(
+        &self,
+        session_id: &str,
+        profile_id: &str,
+        agent_id: Option<&str>,
+    ) -> SessionResult<()> {
         let session_id = session_id.to_string();
         let profile_id = profile_id.to_string();
+        let agent_id = agent_id.map(str::to_string);
         self.run_blocking(move |conn| {
             conn.execute(
-                "INSERT INTO profile_bindings (session_id, profile_id)
-                 VALUES (?1, ?2)
-                 ON CONFLICT(session_id) DO UPDATE SET profile_id = excluded.profile_id",
-                params![session_id, profile_id],
+                "INSERT INTO profile_bindings (session_id, profile_id, agent_id)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    profile_id = excluded.profile_id,
+                    agent_id = excluded.agent_id",
+                params![session_id, profile_id, agent_id],
             )?;
             Ok(())
         })
@@ -605,6 +618,27 @@ impl SessionStore for SqliteStorage {
                 "SELECT profile_id FROM profile_bindings WHERE session_id = ?1",
                 params![session_id],
                 |row| row.get(0),
+            )
+            .optional()
+        })
+        .await
+    }
+
+    async fn get_session_runtime_binding(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<crate::session::store::SessionRuntimeBinding>> {
+        let session_id = session_id.to_string();
+        self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT profile_id, agent_id FROM profile_bindings WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(crate::session::store::SessionRuntimeBinding {
+                        profile_id: row.get(0)?,
+                        agent_id: row.get(1)?,
+                    })
+                },
             )
             .optional()
         })
@@ -1097,6 +1131,16 @@ impl SessionStore for SqliteStorage {
     async fn update_delegation(&self, delegation: Delegation) -> SessionResult<()> {
         let repo = SqliteDelegationRepository::new(self.conn.clone());
         repo.update_delegation(delegation).await
+    }
+
+    async fn set_delegation_planning_summary(
+        &self,
+        delegation_id: &str,
+        planning_summary: &str,
+    ) -> SessionResult<()> {
+        let repo = SqliteDelegationRepository::new(self.conn.clone());
+        repo.set_delegation_planning_summary(delegation_id, planning_summary)
+            .await
     }
 
     async fn peek_revert_state(&self, session_id: &str) -> SessionResult<Option<RevertState>> {
