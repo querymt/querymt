@@ -22,13 +22,34 @@ impl LocalAgentHandle {
                         "sessionId": session_id,
                     }))
                 })?;
-            let profile_handle = runtime.agent().handle();
-            let registry = profile_handle.registry.lock().await;
+            let session_handle = runtime
+                .session_handle(binding.agent_id.as_deref())
+                .ok_or_else(|| {
+                    Error::invalid_params().data(serde_json::json!({
+                        "message": "session is bound to an unknown delegate",
+                        "sessionId": session_id,
+                        "profileId": binding.profile_id,
+                        "agentId": binding.agent_id,
+                    }))
+                })?;
+            let local_handle = session_handle
+                .as_any()
+                .downcast_ref::<LocalAgentHandle>()
+                .ok_or_else(|| {
+                    Error::internal_error().data(serde_json::json!({
+                        "message": "bound session runtime is not local",
+                        "sessionId": session_id,
+                        "profileId": binding.profile_id,
+                        "agentId": binding.agent_id,
+                    }))
+                })?;
+            let registry = local_handle.registry.lock().await;
             return registry.get(session_id).cloned().ok_or_else(|| {
                 Error::invalid_params().data(serde_json::json!({
-                    "message": "unknown session for bound profile",
+                    "message": "unknown session for bound runtime",
                     "sessionId": session_id,
                     "profileId": binding.profile_id,
+                    "agentId": binding.agent_id,
                 }))
             });
         }

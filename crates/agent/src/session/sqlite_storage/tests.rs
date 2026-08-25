@@ -139,6 +139,34 @@ async fn connect_with_options_without_migration_keeps_db_unmodified() {
 }
 
 #[tokio::test]
+async fn session_runtime_binding_round_trips_profile_and_delegate() {
+    let storage = SqliteStorage::connect(":memory:".into())
+        .await
+        .expect("in-memory storage");
+
+    storage
+        .set_session_runtime_binding("delegate-session", "quorum", Some("coder"))
+        .await
+        .expect("persist runtime binding");
+
+    let binding = storage
+        .get_session_runtime_binding("delegate-session")
+        .await
+        .expect("load runtime binding")
+        .expect("runtime binding");
+    assert_eq!(binding.profile_id, "quorum");
+    assert_eq!(binding.agent_id.as_deref(), Some("coder"));
+    assert_eq!(
+        storage
+            .get_profile_binding("delegate-session")
+            .await
+            .expect("load compatibility profile binding")
+            .as_deref(),
+        Some("quorum")
+    );
+}
+
+#[tokio::test]
 async fn custom_model_crud_round_trip() {
     use crate::session::store::CustomModel;
 

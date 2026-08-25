@@ -426,6 +426,18 @@ impl LocalAgentHandle {
                         "sessionId": session_id,
                     }))
                 })?;
+            if let Some(agent_id) = binding.agent_id.as_deref() {
+                let delegate_handle = runtime.session_handle(Some(agent_id)).ok_or_else(|| {
+                    Error::invalid_params().data(serde_json::json!({
+                        "message": "Session is bound to an unknown delegate",
+                        "profileId": binding.profile_id,
+                        "agentId": agent_id,
+                        "sessionId": session_id,
+                    }))
+                })?;
+                return delegate_handle.load_session(req).await;
+            }
+
             let profile_handle = runtime.agent().handle();
             let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
             if let Some(bridge) = bridge {

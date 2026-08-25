@@ -52,10 +52,20 @@ mock! {
             session_id: &'b str,
             profile_id: &'c str,
         ) -> SessionResult<()>;
+        async fn set_session_runtime_binding<'a, 'b, 'c, 'd>(
+            &'a self,
+            session_id: &'b str,
+            profile_id: &'c str,
+            agent_id: Option<&'d str>,
+        ) -> SessionResult<()>;
         async fn get_profile_binding<'a, 'b>(
             &'a self,
             session_id: &'b str,
         ) -> SessionResult<Option<String>>;
+        async fn get_session_runtime_binding<'a, 'b>(
+            &'a self,
+            session_id: &'b str,
+        ) -> SessionResult<Option<crate::session::store::SessionRuntimeBinding>>;
         async fn remove_profile_binding<'a, 'b>(
             &'a self,
             session_id: &'b str,
@@ -170,6 +180,11 @@ mock! {
             next: DelegationStatus,
         ) -> SessionResult<bool>;
         async fn update_delegation(&self, delegation: Delegation) -> SessionResult<()>;
+        async fn set_delegation_planning_summary<'a, 'b, 'c>(
+            &'a self,
+            delegation_id: &'b str,
+            planning_summary: &'c str,
+        ) -> SessionResult<()>;
         async fn peek_revert_state(
             &self,
             session_id: &str,

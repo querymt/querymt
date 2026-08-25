@@ -471,6 +471,7 @@ impl DelegationOrchestrator {
                 let delegation_summarizer = self.delegation_summarizer.clone();
                 let delegate_model_overrides = self.delegate_model_overrides.clone();
                 let routing_snapshot = self.routing_snapshot.clone();
+                let profile_id = self.profile_id.clone();
                 let parent_session_id = session_id.to_string();
                 let parent_session_id_for_insert = parent_session_id.clone();
                 let delegation = delegation.clone();
@@ -520,6 +521,7 @@ impl DelegationOrchestrator {
                         active_delegations: active_delegations_for_spawn,
                         delegation_summarizer,
                         delegate_model_overrides,
+                        profile_id,
                         routing_snapshot,
                     };
                     execute_delegation(
@@ -633,6 +635,7 @@ struct DelegationContext {
     active_delegations: ActiveDelegations,
     delegation_summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
     delegate_model_overrides: super::DelegateModelOverrideStore,
+    profile_id: Option<String>,
     routing_snapshot: Option<crate::agent::remote::RoutingSnapshotHandle>,
 }
 
@@ -846,6 +849,36 @@ async fn execute_delegation(
         }
     };
 
+    if let Some(profile_id) = ctx.profile_id.as_deref()
+        && let Err(err) = ctx
+            .store
+            .set_session_runtime_binding(
+                &child_session_id,
+                profile_id,
+                Some(&delegation.target_agent_id),
+            )
+            .await
+    {
+        let _ = session_ref.shutdown().await;
+        fail_delegation(
+            DelegationFailureContext {
+                event_sink: &ctx.event_sink,
+                delegator: &ctx.delegator,
+                store: &ctx.store,
+                hooks: Some(&ctx.hooks),
+                config: &ctx.config,
+                parent_session_id: &parent_session_id,
+                delegation_id: &delegation.public_id,
+                target_agent_id: Some(&delegation.target_agent_id),
+                objective: Some(&delegation.objective),
+            },
+            &format!("Failed to persist delegate session route: {err}"),
+        )
+        .await;
+        ctx.active_delegations.lock().await.remove(&delegation_id);
+        return;
+    }
+
     // Record child session info on the parent span.
     let span = tracing::Span::current();
     span.record("child_session_id", child_session_id.as_str());
@@ -1052,10 +1085,12 @@ async fn execute_delegation(
             .await;
 
             if let Some(summary) = summary {
-                // Persist to delegation record
-                let mut updated_delegation = delegation.clone();
-                updated_delegation.planning_summary = Some(summary.clone());
-                if let Err(e) = ctx.store.update_delegation(updated_delegation).await {
+                // Persist only the summary; the event copy still has the pre-claim status.
+                if let Err(e) = ctx
+                    .store
+                    .set_delegation_planning_summary(&delegation.public_id, &summary)
+                    .await
+                {
                     warn!("Failed to persist delegation summary: {}", e);
                 }
 

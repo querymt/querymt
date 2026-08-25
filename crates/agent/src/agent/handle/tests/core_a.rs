@@ -485,6 +485,55 @@ async fn test_set_profile_config_option_rejects_different_bound_profile() {
 }
 
 #[tokio::test]
+async fn test_profile_bound_delegate_session_resolves_delegate_actor() {
+    let (f, _profile_dir) =
+        profile_fixture_with_files(&[("quorum.toml", QUORUM_PROFILE_TOML)]).await;
+    let runtime = f
+        .handle
+        .profiles()
+        .expect("profiles configured")
+        .runtime_for_profile("quorum")
+        .await
+        .expect("quorum runtime");
+    let delegate_handle = runtime.agent().delegate("coder").expect("coder delegate");
+    let delegate_handle = delegate_handle
+        .as_any()
+        .downcast_ref::<LocalAgentHandle>()
+        .expect("local delegate");
+    let session_id = "delegate-session";
+    let actor = SessionActor::new(
+        delegate_handle.config.clone(),
+        session_id.to_string(),
+        crate::agent::core::SessionRuntime::new(
+            None,
+            std::collections::HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        ),
+    );
+    let actor_ref = SessionActor::spawn(actor);
+    delegate_handle
+        .registry
+        .lock()
+        .await
+        .insert(session_id.to_string(), actor_ref);
+    let mut binding = runtime.session_binding();
+    binding.agent_id = Some("coder".to_string());
+    f.handle
+        .profiles()
+        .expect("profiles configured")
+        .set_session_binding(session_id, binding)
+        .await;
+
+    let resolved = f
+        .handle
+        .session_ref_for_agent_session(session_id)
+        .await
+        .expect("delegate actor should resolve");
+
+    assert_eq!(resolved.get_mode().await.unwrap(), AgentMode::Build);
+}
+
+#[tokio::test]
 async fn test_profile_handle_rejects_unbound_session_load() {
     let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
     let session = f
