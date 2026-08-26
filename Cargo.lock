@@ -88,7 +88,7 @@ dependencies = [
  "serde_json",
  "shell-words",
  "tracing",
- "uuid 1.24.1",
+ "uuid 1.25.0",
  "windows-sys 0.61.2",
 ]
 
@@ -1585,7 +1585,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a347dcabdae9c31b0825fd6a8bed285ec9c2acb89c47827126d52fa4f59cece3"
 dependencies = [
  "fnv",
- "uuid 1.24.1",
+ "uuid 1.25.0",
  "web-time",
 ]
 
@@ -2774,7 +2774,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.119",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -2840,7 +2840,7 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bef552e6f588e446098f6ba40d89ac146c8c7b64aade83c051ee00bb5d2bc18d"
 dependencies = [
- "uuid 1.24.1",
+ "uuid 1.25.0",
 ]
 
 [[package]]
@@ -3554,7 +3554,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq 3.3.0",
  "url",
- "uuid 1.24.1",
+ "uuid 1.25.0",
  "wasi-common",
  "wasmtime",
  "wiggle",
@@ -5629,7 +5629,7 @@ dependencies = [
  "tokio-util",
  "tokio_with_wasm",
  "tracing",
- "uuid 1.24.1",
+ "uuid 1.25.0",
  "xet-client",
  "xet-core-structures",
  "xet-data",
@@ -6844,7 +6844,7 @@ dependencies = [
  "tokio-stream",
  "toml 0.8.23",
  "tracing",
- "uuid 1.24.1",
+ "uuid 1.25.0",
  "zip 7.2.0",
 ]
 
@@ -7137,7 +7137,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "url",
- "uuid 1.24.1",
+ "uuid 1.25.0",
 ]
 
 [[package]]
@@ -8278,7 +8278,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "uuid 1.24.1",
+ "uuid 1.25.0",
 ]
 
 [[package]]
@@ -8381,7 +8381,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "urlencoding",
- "uuid 1.24.1",
+ "uuid 1.25.0",
  "variantly",
  "vob",
 ]
@@ -8426,7 +8426,7 @@ dependencies = [
  "tokio-tungstenite 0.28.0",
  "tracing",
  "utoipa",
- "uuid 1.24.1",
+ "uuid 1.25.0",
 ]
 
 [[package]]
@@ -8564,7 +8564,7 @@ dependencies = [
  "portable-atomic",
  "smallvec 1.15.1",
  "tagptr",
- "uuid 1.24.1",
+ "uuid 1.25.0",
 ]
 
 [[package]]
@@ -9461,7 +9461,7 @@ dependencies = [
  "toml 0.8.23",
  "ureq 2.12.1",
  "url",
- "uuid 1.24.1",
+ "uuid 1.25.0",
  "walkdir",
 ]
 
@@ -11316,7 +11316,7 @@ dependencies = [
  "toml 1.1.4+spec-1.1.0",
  "tracing",
  "url",
- "uuid 1.24.1",
+ "uuid 1.25.0",
  "which 8.0.5",
 ]
 
@@ -11413,7 +11413,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "typeshare",
- "uuid 1.24.1",
+ "uuid 1.25.0",
  "whatlang",
 ]
 
@@ -11551,7 +11551,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
- "uuid 1.24.1",
+ "uuid 1.25.0",
 ]
 
 [[package]]
@@ -12462,7 +12462,7 @@ dependencies = [
  "smallvec 1.15.1",
  "sqlite-wasm-rs",
  "time",
- "uuid 1.24.1",
+ "uuid 1.25.0",
 ]
 
 [[package]]
@@ -14488,7 +14488,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -15919,9 +15919,9 @@ dependencies = [
 
 [[package]]
 name = "uuid"
-version = "1.24.1"
+version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cefc03fd367c0c6d4305de1b312cf00248c4114f4a0418ce6a6af769e3b0bd9"
+checksum = "f053576934f05a761a402421fbbe3d425d9366f75f978806a037b3ca481abecc"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
@@ -17578,7 +17578,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "uuid 1.24.1",
+ "uuid 1.25.0",
  "web-time",
  "xet-runtime",
 ]
@@ -17608,7 +17608,7 @@ dependencies = [
  "tokio_with_wasm",
  "tracing",
  "url",
- "uuid 1.24.1",
+ "uuid 1.25.0",
  "web-time",
  "xet-client",
  "xet-core-structures",
