@@ -23,7 +23,7 @@ tools = [
   "edit", "read_tool", "write_file", "multiedit", "replace_symbol",
   "glob", "search_text", "ls", "index", "get_symbol", "get_function", "skill",
   "shell",
-  "create_task", "todowrite", "todoread",
+  "create_task", "read_task", "update_task", "complete_task", "todowrite", "todoread",
   "question",
   "browse",
 ]

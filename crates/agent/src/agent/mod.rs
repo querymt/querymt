@@ -21,6 +21,7 @@ pub mod file_proxy;
 pub mod handle;
 pub mod mcp;
 pub mod messages;
+pub mod objective;
 pub mod protocol;
 pub mod remote;
 pub mod session_actor;

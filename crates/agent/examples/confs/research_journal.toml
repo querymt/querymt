@@ -50,7 +50,7 @@ tools = [
   "knowledge_stats",
 
   # Task management
-  "create_task", "todowrite", "todoread",
+  "create_task", "read_task", "update_task", "complete_task", "todowrite", "todoread",
 
   # User interaction
   "question",

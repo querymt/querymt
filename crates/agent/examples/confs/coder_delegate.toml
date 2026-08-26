@@ -32,7 +32,7 @@ tools = [
   # Execution
   "shell",
   # Task management
-  "create_task", "todowrite", "todoread",
+  "create_task", "read_task", "update_task", "complete_task", "todowrite", "todoread",
   # Sub-agent delegation
   "delegate",
   # User interaction

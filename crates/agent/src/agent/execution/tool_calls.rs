@@ -216,7 +216,13 @@ pub(super) async fn execute_tool_call(
         }
     });
 
-    let tool_context = exec_ctx.tool_context(config.agent_registry.clone(), Some(elicitation_tx));
+    let tool_context = exec_ctx
+        .tool_context(config.agent_registry.clone(), Some(elicitation_tx))
+        .with_task_service(crate::session::TaskService::new(
+            exec_ctx.state.store.clone(),
+            exec_ctx.session_id.clone(),
+            call.id.clone(),
+        ));
 
     // Check tool permission using the per-session tool config so that runtime
     // mutations (SetAllowedTools / SetDeniedTools) are respected. Also look up

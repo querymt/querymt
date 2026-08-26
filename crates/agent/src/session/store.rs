@@ -5,7 +5,7 @@ use crate::model::AgentMessage;
 use crate::session::domain::{
     Alternative, AlternativeStatus, Artifact, Decision, DecisionStatus, Delegation,
     DelegationStatus, ForkInfo, ForkOrigin, ForkPointType, IntentSnapshot, ProgressEntry,
-    ProgressKind, Task, TaskStatus,
+    ProgressKind, Task, TaskKind, TaskStatus,
 };
 use crate::session::error::{SessionError, SessionResult};
 use async_trait::async_trait;
@@ -108,6 +108,14 @@ pub struct CustomModel {
     pub created_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub updated_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskPatch {
+    pub expected_deliverable: Option<String>,
+    pub acceptance_criteria: Option<String>,
+    pub status: Option<crate::session::domain::TaskStatus>,
+    pub cancellation_reason: Option<String>,
 }
 
 /// Stored session-scoped execution configuration snapshot.
@@ -347,6 +355,67 @@ pub trait SessionStore: Send + Sync {
     // Task repository methods
     async fn create_task(&self, task: Task) -> SessionResult<Task>;
     async fn get_task(&self, task_id: &str) -> SessionResult<Option<Task>>;
+    async fn get_current_task(&self, session_id: &str) -> SessionResult<Option<Task>> {
+        let session = self.get_session(session_id).await?;
+        let Some(current_id) = session.and_then(|session| session.active_task_id) else {
+            return Ok(None);
+        };
+        Ok(self
+            .list_tasks(session_id)
+            .await?
+            .into_iter()
+            .find(|task| task.id == current_id)
+            .filter(|task| matches!(task.status, TaskStatus::Active)))
+    }
+    async fn get_task_for_session(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> SessionResult<Option<Task>> {
+        let session = self.get_session(session_id).await?;
+        let Some(session) = session else {
+            return Ok(None);
+        };
+        Ok(self
+            .get_task(task_id)
+            .await?
+            .filter(|task| task.session_id == session.id))
+    }
+    async fn create_and_bind_current_task(
+        &self,
+        _session_id: &str,
+        _kind: TaskKind,
+        _expected_deliverable: String,
+        _acceptance_criteria: Option<String>,
+        _creation_key: &str,
+    ) -> SessionResult<Task> {
+        Err(SessionError::InvalidOperation(
+            "atomic task creation is unsupported".to_string(),
+        ))
+    }
+    async fn patch_task_for_session(
+        &self,
+        _session_id: &str,
+        _task_id: &str,
+        _expected_revision: u64,
+        _patch: TaskPatch,
+        _reason: &str,
+    ) -> SessionResult<Task> {
+        Err(SessionError::InvalidOperation(
+            "atomic task patch is unsupported".to_string(),
+        ))
+    }
+    async fn complete_task_for_session(
+        &self,
+        _session_id: &str,
+        _task_id: &str,
+        _expected_revision: u64,
+        _completion_evidence: &str,
+    ) -> SessionResult<Task> {
+        Err(SessionError::InvalidOperation(
+            "atomic task completion is unsupported".to_string(),
+        ))
+    }
     async fn list_tasks(&self, session_id: &str) -> SessionResult<Vec<Task>>;
     async fn update_task_status(&self, task_id: &str, status: TaskStatus) -> SessionResult<()>;
     async fn update_task(&self, task: Task) -> SessionResult<()>;

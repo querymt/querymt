@@ -56,7 +56,7 @@ tools = [
   "read_tool", "index", "search_text", "glob", "ls",
 
   # Task management
-  "create_task", "todowrite", "todoread",
+  "create_task", "read_task", "update_task", "complete_task", "todowrite", "todoread",
 
   # User interaction
   "question",

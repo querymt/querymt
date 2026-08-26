@@ -1,5 +1,4 @@
 use crate::middleware::{ExecutionState, MiddlewareDriver, Result};
-use crate::session::domain::{DelegationStatus, TaskKind, TaskStatus};
 use crate::session::store::SessionStore;
 use async_trait::async_trait;
 use log::{debug, trace};
@@ -15,13 +14,13 @@ use std::sync::Arc;
 /// `FinishReason::Stop` is received. This middleware serves as a fallback for
 /// cases where finish_reason is not available or unknown.
 pub struct TaskAutoCompletionMiddleware {
-    store: Arc<dyn SessionStore>,
+    _store: Arc<dyn SessionStore>,
 }
 
 impl TaskAutoCompletionMiddleware {
     pub fn new(store: Arc<dyn SessionStore>) -> Self {
         debug!("Creating TaskAutoCompletionMiddleware");
-        Self { store }
+        Self { _store: store }
     }
 }
 
@@ -33,143 +32,10 @@ impl MiddlewareDriver for TaskAutoCompletionMiddleware {
         _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
     ) -> Result<ExecutionState> {
         trace!(
-            "TaskAutoCompletionMiddleware::on_after_llm entering state: {}",
+            "TaskAutoCompletionMiddleware is observational; explicit complete_task controls completion for state {}",
             state.name()
         );
-
-        match state {
-            ExecutionState::AfterLlm {
-                ref response,
-                ref context,
-            } => {
-                // First check: did the LLM response have tool calls?
-                if response.has_tool_calls() {
-                    trace!("TaskAutoCompletionMiddleware: LLM response has tool calls, skipping");
-                    return Ok(state);
-                }
-
-                // Get session to find active task
-                let session = match self.store.get_session(&context.session_id).await {
-                    Ok(Some(s)) => s,
-                    Ok(None) => {
-                        debug!(
-                            "TaskAutoCompletionMiddleware: session not found: {}",
-                            context.session_id
-                        );
-                        return Ok(state);
-                    }
-                    Err(e) => {
-                        debug!(
-                            "TaskAutoCompletionMiddleware: error fetching session: {}",
-                            e
-                        );
-                        return Ok(state);
-                    }
-                };
-
-                let Some(task_internal_id) = session.active_task_id else {
-                    trace!("TaskAutoCompletionMiddleware: no active task, skipping");
-                    return Ok(state);
-                };
-
-                let tasks = match self.store.list_tasks(&context.session_id).await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        debug!("TaskAutoCompletionMiddleware: error listing tasks: {}", e);
-                        return Ok(state);
-                    }
-                };
-
-                let Some(task) = tasks.into_iter().find(|task| task.id == task_internal_id) else {
-                    trace!(
-                        "TaskAutoCompletionMiddleware: task not found: {}",
-                        task_internal_id
-                    );
-                    return Ok(state);
-                };
-
-                let task_public_id = task.public_id.clone();
-
-                // Only auto-complete Active tasks
-                if task.status != TaskStatus::Active {
-                    trace!(
-                        "TaskAutoCompletionMiddleware: task status is {:?}, not Active",
-                        task.status
-                    );
-                    return Ok(state);
-                }
-
-                // Recurring tasks are never auto-completed to Done.
-                // The SchedulerActor handles cycle completion and re-arming.
-                if task.kind == TaskKind::Recurring {
-                    debug!(
-                        "TaskAutoCompletionMiddleware: skipping auto-completion for recurring task: {}",
-                        task_public_id
-                    );
-                    return Ok(state);
-                }
-
-                // Check if all delegations are complete
-                let delegations = match self.store.list_delegations(&context.session_id).await {
-                    Ok(d) => d,
-                    Err(e) => {
-                        debug!(
-                            "TaskAutoCompletionMiddleware: error fetching delegations: {}",
-                            e
-                        );
-                        return Ok(state);
-                    }
-                };
-
-                let task_delegations: Vec<_> = delegations
-                    .into_iter()
-                    .filter(|d| d.task_id == Some(task_internal_id))
-                    .collect();
-
-                // Check if all delegations are in terminal state (if any exist)
-                // If there are no delegations, we still auto-complete since the model
-                // may have determined the work is already done without needing delegations
-                let all_delegations_done = task_delegations.is_empty()
-                    || task_delegations.iter().all(|d| {
-                        matches!(
-                            d.status,
-                            DelegationStatus::Complete | DelegationStatus::Failed
-                        )
-                    });
-
-                if all_delegations_done {
-                    debug!(
-                        "TaskAutoCompletionMiddleware: all delegations complete, auto-completing task: {}",
-                        task_public_id
-                    );
-
-                    if let Err(e) = self
-                        .store
-                        .update_task_status(&task_public_id, TaskStatus::Done)
-                        .await
-                    {
-                        debug!(
-                            "TaskAutoCompletionMiddleware: failed to update task status: {}",
-                            e
-                        );
-                    } else {
-                        debug!(
-                            "TaskAutoCompletionMiddleware: task {} marked as Done",
-                            task_public_id
-                        );
-                    }
-                }
-
-                Ok(state)
-            }
-            _ => {
-                trace!(
-                    "TaskAutoCompletionMiddleware: pass-through for state {}",
-                    state.name()
-                );
-                Ok(state)
-            }
-        }
+        Ok(state)
     }
 
     fn reset(&self) {

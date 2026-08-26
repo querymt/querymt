@@ -24,7 +24,7 @@ model = "${PLANNER_MODEL:-gpt-4}"
 
 tools = [
     "delegate",
-    "create_task",
+    "create_task", "read_task", "update_task", "complete_task",
     "read_tool",
     "index",
     "search_text",

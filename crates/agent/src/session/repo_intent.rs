@@ -55,7 +55,7 @@ impl SqliteIntentRepository {
 }
 
 fn map_row_to_snapshot(row: &Row) -> rusqlite::Result<IntentSnapshot> {
-    let created_at_str: String = row.get(6)?;
+    let created_at_str: String = row.get(9)?;
     Ok(IntentSnapshot {
         id: row.get(0)?,
         session_id: row.get(1)?,
@@ -63,6 +63,9 @@ fn map_row_to_snapshot(row: &Row) -> rusqlite::Result<IntentSnapshot> {
         summary: row.get(3)?,
         constraints: row.get(4)?,
         next_step_hint: row.get(5)?,
+        revision: row.get::<_, i64>(6)? as u64,
+        source: row.get(7)?,
+        source_ref: row.get(8)?,
         created_at: OffsetDateTime::parse(
             &created_at_str,
             &time::format_description::well_known::Rfc3339,
@@ -80,6 +83,9 @@ impl IntentRepository for SqliteIntentRepository {
             summary,
             constraints,
             next_step_hint,
+            revision,
+            source,
+            source_ref,
             created_at,
             ..
         } = snapshot;
@@ -89,8 +95,8 @@ impl IntentRepository for SqliteIntentRepository {
 
         self.run_blocking(move |conn| {
             conn.execute(
-                "INSERT INTO intent_snapshots (session_id, task_id, summary, constraints, next_step_hint, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                params![session_id, task_id, summary, constraints, next_step_hint, created_at_str],
+                "INSERT INTO intent_snapshots (session_id, task_id, summary, constraints, next_step_hint, revision, source, source_ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![session_id, task_id, summary, constraints, next_step_hint, revision as i64, source, source_ref, created_at_str],
             )?;
 
             // Refresh the session's FTS row so the title (derived from the
@@ -122,7 +128,7 @@ impl IntentRepository for SqliteIntentRepository {
         let snapshot_id_owned = snapshot_id.to_string();
         self.run_blocking(move |conn| {
             conn.query_row(
-                "SELECT id, session_id, task_id, summary, constraints, next_step_hint, created_at FROM intent_snapshots WHERE id = ?",
+                "SELECT id, session_id, task_id, summary, constraints, next_step_hint, revision, source, source_ref, created_at FROM intent_snapshots WHERE id = ?",
                 params![snapshot_id_owned],
                 map_row_to_snapshot,
             )
@@ -135,7 +141,7 @@ impl IntentRepository for SqliteIntentRepository {
         let internal_session_id = self.resolve_session_internal_id(session_id).await?;
         self.run_blocking(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, session_id, task_id, summary, constraints, next_step_hint, created_at FROM intent_snapshots WHERE session_id = ? ORDER BY created_at ASC",
+                "SELECT id, session_id, task_id, summary, constraints, next_step_hint, revision, source, source_ref, created_at FROM intent_snapshots WHERE session_id = ? ORDER BY created_at ASC",
             )?;
             let snapshots_iter = stmt.query_map(params![internal_session_id], |row| {
                 map_row_to_snapshot(row)
@@ -152,7 +158,7 @@ impl IntentRepository for SqliteIntentRepository {
         let internal_session_id = self.resolve_session_internal_id(session_id).await?;
         self.run_blocking(move |conn| {
             conn.query_row(
-                "SELECT id, session_id, task_id, summary, constraints, next_step_hint, created_at FROM intent_snapshots WHERE session_id = ? ORDER BY created_at ASC LIMIT 1",
+                "SELECT id, session_id, task_id, summary, constraints, next_step_hint, revision, source, source_ref, created_at FROM intent_snapshots WHERE session_id = ? ORDER BY created_at ASC LIMIT 1",
                 params![internal_session_id],
                 map_row_to_snapshot,
             )
@@ -168,7 +174,7 @@ impl IntentRepository for SqliteIntentRepository {
         let internal_session_id = self.resolve_session_internal_id(session_id).await?;
         self.run_blocking(move |conn| {
             conn.query_row(
-                "SELECT id, session_id, task_id, summary, constraints, next_step_hint, created_at FROM intent_snapshots WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
+                "SELECT id, session_id, task_id, summary, constraints, next_step_hint, revision, source, source_ref, created_at FROM intent_snapshots WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
                 params![internal_session_id],
                 map_row_to_snapshot,
             )

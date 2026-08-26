@@ -5,7 +5,7 @@ use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::tools::{Tool, ToolContext, ToolError};
+use crate::tools::{Tool, ToolContext, ToolError, ToolExecutionClass};
 
 /// A single option in a question
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +107,10 @@ impl Tool for QuestionTool {
                 }),
             },
         }
+    }
+
+    fn execution_class(&self) -> ToolExecutionClass {
+        ToolExecutionClass::ClarificationBoundary
     }
 
     async fn call(

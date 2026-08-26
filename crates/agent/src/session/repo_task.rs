@@ -4,7 +4,7 @@ use crate::session::domain::{Task, TaskKind, TaskStatus};
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::repository::TaskRepository;
 use async_trait::async_trait;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -85,6 +85,42 @@ impl FromStr for TaskStatus {
     }
 }
 
+pub(crate) fn map_task_row(row: &Row) -> rusqlite::Result<Task> {
+    let kind_str: String = row.get(3)?;
+    let status_str: String = row.get(4)?;
+    let completed_at_str: Option<String> = row.get(10)?;
+    let created_at_str: String = row.get(11)?;
+    let updated_at_str: String = row.get(12)?;
+    Ok(Task {
+        id: row.get(0)?,
+        public_id: row.get(1)?,
+        session_id: row.get(2)?,
+        kind: TaskKind::from_str(&kind_str).map_err(|_| rusqlite::Error::InvalidQuery)?,
+        status: TaskStatus::from_str(&status_str).map_err(|_| rusqlite::Error::InvalidQuery)?,
+        expected_deliverable: row.get(5)?,
+        acceptance_criteria: row.get(6)?,
+        revision: row.get::<_, i64>(7)? as u64,
+        creation_key: row.get(8)?,
+        completion_evidence: row.get(9)?,
+        completed_at: completed_at_str
+            .map(|value| {
+                OffsetDateTime::parse(&value, &time::format_description::well_known::Rfc3339)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)
+            })
+            .transpose()?,
+        created_at: OffsetDateTime::parse(
+            &created_at_str,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        updated_at: OffsetDateTime::parse(
+            &updated_at_str,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+    })
+}
+
 #[async_trait]
 impl TaskRepository for SqliteTaskRepository {
     async fn create_task(&self, mut task: Task) -> SessionResult<Task> {
@@ -95,7 +131,7 @@ impl TaskRepository for SqliteTaskRepository {
             }
 
             conn.execute(
-                "INSERT INTO tasks (public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO tasks (public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, revision, creation_key, completion_evidence, completed_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     task.public_id,
                     task.session_id,
@@ -103,6 +139,10 @@ impl TaskRepository for SqliteTaskRepository {
                     task.status.to_string(),
                     task.expected_deliverable,
                     task.acceptance_criteria,
+                    task.revision as i64,
+                    task.creation_key,
+                    task.completion_evidence,
+                    task.completed_at.and_then(|value| value.format(&time::format_description::well_known::Rfc3339).ok()),
                     task.created_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
                     task.updated_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
                 ],
@@ -119,13 +159,14 @@ impl TaskRepository for SqliteTaskRepository {
         let task_id_str = task_id.to_string();
         self.run_blocking(move |conn| {
             conn.query_row(
-                "SELECT id, public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, created_at, updated_at FROM tasks WHERE public_id = ?",
+                "SELECT id, public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, revision, creation_key, completion_evidence, completed_at, created_at, updated_at FROM tasks WHERE public_id = ?",
                 params![task_id_str],
                 |row| {
                     let kind_str: String = row.get(3)?;
                     let status_str: String = row.get(4)?;
-                    let created_at_str: String = row.get(7)?;
-                    let updated_at_str: String = row.get(8)?;
+                    let completed_at_str: Option<String> = row.get(10)?;
+                    let created_at_str: String = row.get(11)?;
+                    let updated_at_str: String = row.get(12)?;
 
                     Ok(Task {
                         id: row.get(0)?,
@@ -135,6 +176,10 @@ impl TaskRepository for SqliteTaskRepository {
                         status: TaskStatus::from_str(&status_str).map_err(|_| rusqlite::Error::InvalidQuery)?,
                         expected_deliverable: row.get(5)?,
                         acceptance_criteria: row.get(6)?,
+                        revision: row.get::<_, i64>(7)? as u64,
+                        creation_key: row.get(8)?,
+                        completion_evidence: row.get(9)?,
+                        completed_at: completed_at_str.map(|value| OffsetDateTime::parse(&value, &time::format_description::well_known::Rfc3339).map_err(|_| rusqlite::Error::InvalidQuery)).transpose()?,
                         created_at: OffsetDateTime::parse(&created_at_str, &time::format_description::well_known::Rfc3339).map_err(|_| rusqlite::Error::InvalidQuery)?,
                         updated_at: OffsetDateTime::parse(&updated_at_str, &time::format_description::well_known::Rfc3339).map_err(|_| rusqlite::Error::InvalidQuery)?,
                     })
@@ -158,13 +203,14 @@ impl TaskRepository for SqliteTaskRepository {
             let internal_id = internal_id.ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?;
 
             let mut stmt = conn.prepare(
-                "SELECT id, public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, created_at, updated_at FROM tasks WHERE session_id = ? ORDER BY created_at ASC",
+                "SELECT id, public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, revision, creation_key, completion_evidence, completed_at, created_at, updated_at FROM tasks WHERE session_id = ? ORDER BY created_at ASC",
             )?;
             let tasks_iter = stmt.query_map(params![internal_id], |row| {
                 let kind_str: String = row.get(3)?;
                 let status_str: String = row.get(4)?;
-                let created_at_str: String = row.get(7)?;
-                let updated_at_str: String = row.get(8)?;
+                let completed_at_str: Option<String> = row.get(10)?;
+                let created_at_str: String = row.get(11)?;
+                let updated_at_str: String = row.get(12)?;
 
                 Ok(Task {
                     id: row.get(0)?,
@@ -174,6 +220,10 @@ impl TaskRepository for SqliteTaskRepository {
                     status: TaskStatus::from_str(&status_str).map_err(|_| rusqlite::Error::InvalidQuery)?,
                     expected_deliverable: row.get(5)?,
                     acceptance_criteria: row.get(6)?,
+                    revision: row.get::<_, i64>(7)? as u64,
+                    creation_key: row.get(8)?,
+                    completion_evidence: row.get(9)?,
+                    completed_at: completed_at_str.map(|value| OffsetDateTime::parse(&value, &time::format_description::well_known::Rfc3339).map_err(|_| rusqlite::Error::InvalidQuery)).transpose()?,
                     created_at: OffsetDateTime::parse(&created_at_str, &time::format_description::well_known::Rfc3339).map_err(|_| rusqlite::Error::InvalidQuery)?,
                     updated_at: OffsetDateTime::parse(&updated_at_str, &time::format_description::well_known::Rfc3339).map_err(|_| rusqlite::Error::InvalidQuery)?,
                 })
@@ -188,7 +238,7 @@ impl TaskRepository for SqliteTaskRepository {
         let task_id_str = task_id.to_string();
         self.run_blocking(move |conn| {
             let affected = conn.execute(
-                "UPDATE tasks SET status = ?, updated_at = ? WHERE public_id = ?",
+                "UPDATE tasks SET status = ?, revision = revision + 1, updated_at = ? WHERE public_id = ?",
                 params![
                     status.to_string(),
                     OffsetDateTime::now_utc()
@@ -213,7 +263,7 @@ impl TaskRepository for SqliteTaskRepository {
         let task_id = task.public_id.clone();
         self.run_blocking(move |conn| {
             let affected = conn.execute(
-                "UPDATE tasks SET kind = ?, status = ?, expected_deliverable = ?, acceptance_criteria = ?, updated_at = ? WHERE public_id = ?",
+                "UPDATE tasks SET kind = ?, status = ?, expected_deliverable = ?, acceptance_criteria = ?, revision = revision + 1, updated_at = ? WHERE public_id = ?",
                 params![
                     task.kind.to_string(),
                     task.status.to_string(),

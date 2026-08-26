@@ -1087,6 +1087,7 @@ impl SchedulerActor {
         // Send ScheduledPrompt to the SessionActor
         let scheduled_prompt = ScheduledPrompt {
             schedule_public_id: schedule_public_id.to_string(),
+            task_public_id: schedule.task_public_id.clone(),
             prompt_text,
             execution_limits: schedule.config.execution_limits.clone(),
         };

@@ -98,6 +98,48 @@ fn migration_0004_adds_session_kind_column() {
 }
 
 #[test]
+fn migration_0012_adds_task_and_intent_revision_columns() {
+    let mut conn = Connection::open_in_memory().expect("in-memory db");
+    apply_migrations(&mut conn).expect("apply migrations");
+
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version = '0012_task_and_intent_revisions'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query migration");
+    assert_eq!(recorded, 1);
+
+    let task_columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(tasks)")
+        .expect("task columns")
+        .query_map([], |row| row.get(1))
+        .expect("query task columns")
+        .collect::<Result<_, _>>()
+        .expect("collect task columns");
+    for expected in [
+        "revision",
+        "creation_key",
+        "completion_evidence",
+        "completed_at",
+    ] {
+        assert!(task_columns.iter().any(|column| column == expected));
+    }
+
+    let intent_columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(intent_snapshots)")
+        .expect("intent columns")
+        .query_map([], |row| row.get(1))
+        .expect("query intent columns")
+        .collect::<Result<_, _>>()
+        .expect("collect intent columns");
+    for expected in ["revision", "source", "source_ref"] {
+        assert!(intent_columns.iter().any(|column| column == expected));
+    }
+}
+
+#[test]
 fn migrations_are_idempotent() {
     let mut conn = Connection::open_in_memory().expect("in-memory db");
     apply_migrations(&mut conn).expect("first migration run");
@@ -116,6 +158,103 @@ fn migrations_are_idempotent() {
 
     assert_eq!(count_after_first, MIGRATIONS.len() as i64);
     assert_eq!(count_after_first, count_after_second);
+}
+
+#[tokio::test]
+async fn task_lifecycle_is_atomic_revisioned_and_explicit() {
+    use crate::session::domain::{TaskKind, TaskStatus};
+    use crate::session::store::TaskPatch;
+
+    let storage = SqliteStorage::connect(":memory:".into())
+        .await
+        .expect("in-memory storage");
+    let session = storage
+        .create_session(None, None, None, None)
+        .await
+        .expect("create session");
+
+    let created = storage
+        .create_and_bind_current_task(
+            &session.public_id,
+            TaskKind::Finite,
+            "deliver the fix".to_string(),
+            Some("tests pass".to_string()),
+            "call-1",
+        )
+        .await
+        .expect("create task");
+    assert_eq!(created.revision, 1);
+    assert_eq!(
+        storage
+            .get_current_task(&session.public_id)
+            .await
+            .expect("read current")
+            .expect("current task")
+            .public_id,
+        created.public_id
+    );
+
+    let duplicate = storage
+        .create_and_bind_current_task(
+            &session.public_id,
+            TaskKind::Finite,
+            "ignored duplicate".to_string(),
+            None,
+            "call-1",
+        )
+        .await
+        .expect("idempotent create");
+    assert_eq!(duplicate.public_id, created.public_id);
+
+    let updated = storage
+        .patch_task_for_session(
+            &session.public_id,
+            &created.public_id,
+            1,
+            TaskPatch {
+                acceptance_criteria: Some("all relevant tests pass".to_string()),
+                ..TaskPatch::default()
+            },
+            "clarify criteria",
+        )
+        .await
+        .expect("update task");
+    assert_eq!(updated.revision, 2);
+    assert!(
+        storage
+            .patch_task_for_session(
+                &session.public_id,
+                &created.public_id,
+                1,
+                TaskPatch::default(),
+                "stale update",
+            )
+            .await
+            .is_err()
+    );
+
+    let completed = storage
+        .complete_task_for_session(
+            &session.public_id,
+            &created.public_id,
+            2,
+            "cargo test passed",
+        )
+        .await
+        .expect("complete task");
+    assert_eq!(completed.status, TaskStatus::Done);
+    assert_eq!(
+        completed.completion_evidence.as_deref(),
+        Some("cargo test passed")
+    );
+    assert!(completed.completed_at.is_some());
+    assert!(
+        storage
+            .get_current_task(&session.public_id)
+            .await
+            .expect("read cleared current")
+            .is_none()
+    );
 }
 
 #[tokio::test]

@@ -164,18 +164,27 @@ impl ViewStore for SqliteStorage {
             .last()
             .map(|s| redactor.redact(&s.summary, policy));
 
-        // Get active task
+        // Resolve the selected task through the session pointer, not active status alone.
+        let session = SqliteSessionRepository::new(self.conn.clone())
+            .get_session(session_id)
+            .await?;
         let tasks = task_repo.list_tasks(session_id).await?;
-        let active_task = tasks
-            .iter()
-            .find(|t| matches!(t.status, TaskStatus::Active))
-            .map(|t| RedactedTask {
-                id: t.public_id.clone(),
-                status: format!("{:?}", t.status),
-                expected_deliverable: t
+        let active_task = session
+            .and_then(|session| session.active_task_id)
+            .and_then(|current_id| {
+                tasks
+                    .iter()
+                    .find(|task| task.id == current_id && matches!(task.status, TaskStatus::Active))
+            })
+            .map(|task| RedactedTask {
+                id: task.public_id.clone(),
+                status: format!("{:?}", task.status),
+                revision: task.revision,
+                current_task: true,
+                expected_deliverable: task
                     .expected_deliverable
                     .as_ref()
-                    .map(|d| redactor.redact(d, policy)),
+                    .map(|deliverable| redactor.redact(deliverable, policy)),
             });
 
         // Get recent progress (last 10 entries)

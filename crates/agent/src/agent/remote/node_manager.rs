@@ -484,6 +484,10 @@ mod remote_impl {
                 status: TaskStatus::Active,
                 expected_deliverable: Some(prompt.to_string()),
                 acceptance_criteria: None,
+                revision: 1,
+                creation_key: None,
+                completion_evidence: None,
+                completed_at: None,
                 created_at: now,
                 updated_at: now,
             };

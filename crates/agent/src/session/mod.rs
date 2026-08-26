@@ -10,6 +10,8 @@ pub mod schema;
 pub mod sqlite_storage;
 pub use sqlite_storage::SqliteStorage;
 pub mod store;
+pub mod task_service;
+pub use task_service::TaskService;
 
 // Compaction system (3-layer)
 pub mod compaction;

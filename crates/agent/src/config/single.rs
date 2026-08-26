@@ -135,7 +135,8 @@ pub struct AgentSettings {
     ///
     /// Built-in tools: `read_tool`, `index`, `edit`, `write_file`, `delete_file`,
     /// `shell`, `glob`, `search_text`, `ls`, `web_fetch`, `browse`, `mdq`,
-    /// `question`, `delegate`, `create_task`, `todowrite`, `todoread`,
+    /// `question`, `delegate`, `create_task`, `read_task`, `update_task`, `complete_task`,
+    /// `todowrite`, `todoread`,
     /// `semantic_edit`, `multiedit`, `get_function`, `get_symbol`,
     /// `replace_symbol`, `find_symbol_references`,
     /// `knowledge_consolidate`, `knowledge_ingest`, `knowledge_list_unconsolidated`,
@@ -146,7 +147,7 @@ pub struct AgentSettings {
     #[serde(default)]
     #[schemars(extend("examples" = [
         ["read_tool", "index", "edit", "write_file", "shell", "glob", "search_text"],
-        ["read_tool", "index", "edit", "write_file", "shell", "glob", "search_text", "ls", "web_fetch", "question", "create_task", "todowrite", "todoread"],
+        ["read_tool", "index", "edit", "write_file", "shell", "glob", "search_text", "ls", "web_fetch", "question", "create_task", "read_task", "update_task", "complete_task", "todowrite", "todoread"],
         ["read_tool", "index", "glob", "search_text", "filesystem.*"]
     ]))]
     pub tools: Vec<String>,

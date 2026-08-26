@@ -9,27 +9,42 @@ use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::{
     Alternative, AlternativeStatus, Artifact, Decision, DecisionStatus, Delegation,
     DelegationStatus, ForkInfo, ForkOrigin, ForkPointType, IntentSnapshot, ProgressEntry,
-    ProgressKind, RevertState, Task, TaskStatus,
+    ProgressKind, RevertState, Task, TaskKind, TaskStatus,
 };
-use crate::session::error::SessionResult;
+use crate::session::error::{SessionError, SessionResult};
 use crate::session::repo_artifact::SqliteArtifactRepository;
 use crate::session::repo_decision::SqliteDecisionRepository;
 use crate::session::repo_delegation::SqliteDelegationRepository;
 use crate::session::repo_intent::SqliteIntentRepository;
 use crate::session::repo_progress::SqliteProgressRepository;
 use crate::session::repo_session::SqliteSessionRepository;
-use crate::session::repo_task::SqliteTaskRepository;
+use crate::session::repo_task::{SqliteTaskRepository, map_task_row};
 use crate::session::repository::{
     ArtifactRepository, DecisionRepository, DelegationRepository, IntentRepository,
     ProgressRepository, SessionRepository, TaskRepository,
 };
 use crate::session::store::{
     CustomModel, LLMConfig, RemoteSessionBookmark, Session, SessionExecutionConfig, SessionStore,
-    extract_llm_config_values,
+    TaskPatch, extract_llm_config_values,
 };
 
 use super::SqliteStorage;
 use super::row_parsers::{parse_llm_config_row, parse_llm_params};
+
+fn map_task_lifecycle_error(error: SessionError) -> SessionError {
+    match error {
+        SessionError::DatabaseError(message) if message.contains("revision_conflict") => {
+            SessionError::InvalidOperation("task revision conflict".to_string())
+        }
+        SessionError::DatabaseError(message) if message.contains("invalid_task_transition") => {
+            SessionError::InvalidOperation("invalid task status transition".to_string())
+        }
+        SessionError::DatabaseError(message) if message.contains("Query returned no rows") => {
+            SessionError::TaskNotFound("task is not owned by this session".to_string())
+        }
+        other => other,
+    }
+}
 
 #[async_trait]
 impl SessionStore for SqliteStorage {
@@ -926,6 +941,181 @@ impl SessionStore for SqliteStorage {
     async fn get_task(&self, task_id: &str) -> SessionResult<Option<Task>> {
         let repo = SqliteTaskRepository::new(self.conn.clone());
         repo.get_task(task_id).await
+    }
+
+    async fn create_and_bind_current_task(
+        &self,
+        session_id: &str,
+        kind: TaskKind,
+        expected_deliverable: String,
+        acceptance_criteria: Option<String>,
+        creation_key: &str,
+    ) -> SessionResult<Task> {
+        let session_id = session_id.to_string();
+        let creation_key = creation_key.to_string();
+        self.run_blocking(move |conn| {
+            let tx = conn.transaction()?;
+            let session_internal_id: i64 = tx.query_row(
+                "SELECT id FROM sessions WHERE public_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )?;
+            if let Some(existing) = tx
+                .query_row(
+                    "SELECT id, public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, revision, creation_key, completion_evidence, completed_at, created_at, updated_at FROM tasks WHERE session_id = ?1 AND creation_key = ?2",
+                    params![session_internal_id, creation_key],
+                    map_task_row,
+                )
+                .optional()?
+            {
+                return Ok(existing);
+            }
+            let current_id: Option<i64> = tx.query_row(
+                "SELECT active_task_id FROM sessions WHERE id = ?1",
+                params![session_internal_id],
+                |row| row.get(0),
+            )?;
+            if current_id.is_some() {
+                return Err(rusqlite::Error::InvalidParameterName(
+                    "current_task_conflict".to_string(),
+                ));
+            }
+            let public_id = Uuid::now_v7().to_string();
+            let now = OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default();
+            tx.execute(
+                "INSERT INTO tasks (public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, revision, creation_key, created_at, updated_at) VALUES (?1, ?2, ?3, 'active', ?4, ?5, 1, ?6, ?7, ?7)",
+                params![public_id, session_internal_id, kind.to_string(), expected_deliverable, acceptance_criteria, creation_key, now],
+            )?;
+            let task_id = tx.last_insert_rowid();
+            tx.execute(
+                "UPDATE sessions SET active_task_id = ?1 WHERE id = ?2",
+                params![task_id, session_internal_id],
+            )?;
+            let task = tx.query_row(
+                "SELECT id, public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, revision, creation_key, completion_evidence, completed_at, created_at, updated_at FROM tasks WHERE id = ?1",
+                params![task_id],
+                map_task_row,
+            )?;
+            tx.commit()?;
+            Ok(task)
+        })
+        .await
+        .map_err(|error| match error {
+            SessionError::DatabaseError(message) if message.contains("current_task_conflict") => {
+                SessionError::InvalidOperation("a different current task already exists".to_string())
+            }
+            other => other,
+        })
+    }
+
+    async fn patch_task_for_session(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        expected_revision: u64,
+        patch: TaskPatch,
+        reason: &str,
+    ) -> SessionResult<Task> {
+        if reason.trim().is_empty() {
+            return Err(SessionError::InvalidOperation(
+                "task update reason is required".to_string(),
+            ));
+        }
+        let session_id = session_id.to_string();
+        let task_id = task_id.to_string();
+        self.run_blocking(move |conn| {
+            let tx = conn.transaction()?;
+            let session_internal_id: i64 = tx.query_row("SELECT id FROM sessions WHERE public_id = ?1", params![session_id], |row| row.get(0))?;
+            let current = tx.query_row(
+                "SELECT id, public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, revision, creation_key, completion_evidence, completed_at, created_at, updated_at FROM tasks WHERE public_id = ?1 AND session_id = ?2",
+                params![task_id, session_internal_id], map_task_row,
+            ).optional()?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            if current.revision != expected_revision {
+                return Err(rusqlite::Error::InvalidParameterName("revision_conflict".to_string()));
+            }
+            let status = patch.status.unwrap_or(current.status);
+            if matches!(status, TaskStatus::Done) || matches!(current.status, TaskStatus::Done | TaskStatus::Cancelled) {
+                return Err(rusqlite::Error::InvalidParameterName("invalid_task_transition".to_string()));
+            }
+            let deliverable = patch.expected_deliverable.or(current.expected_deliverable);
+            let criteria = patch.acceptance_criteria.or(current.acceptance_criteria);
+            let evidence = if status == TaskStatus::Cancelled {
+                patch.cancellation_reason
+            } else {
+                current.completion_evidence
+            };
+            let now = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default();
+            tx.execute(
+                "UPDATE tasks SET expected_deliverable = ?1, acceptance_criteria = ?2, status = ?3, completion_evidence = ?4, revision = revision + 1, updated_at = ?5 WHERE id = ?6 AND revision = ?7",
+                params![deliverable, criteria, status.to_string(), evidence, now, current.id, expected_revision as i64],
+            )?;
+            if status == TaskStatus::Active {
+                let selected: Option<i64> = tx.query_row(
+                    "SELECT active_task_id FROM sessions WHERE id = ?1",
+                    params![session_internal_id],
+                    |row| row.get(0),
+                )?;
+                if selected.is_some_and(|selected_id| selected_id != current.id) {
+                    return Err(rusqlite::Error::InvalidParameterName(
+                        "current_task_conflict".to_string(),
+                    ));
+                }
+                tx.execute(
+                    "UPDATE sessions SET active_task_id = ?1 WHERE id = ?2",
+                    params![current.id, session_internal_id],
+                )?;
+            } else {
+                tx.execute("UPDATE sessions SET active_task_id = NULL WHERE id = ?1 AND active_task_id = ?2", params![session_internal_id, current.id])?;
+            }
+            let task = tx.query_row(
+                "SELECT id, public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, revision, creation_key, completion_evidence, completed_at, created_at, updated_at FROM tasks WHERE id = ?1",
+                params![current.id], map_task_row,
+            )?;
+            tx.commit()?;
+            Ok(task)
+        }).await.map_err(map_task_lifecycle_error)
+    }
+
+    async fn complete_task_for_session(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        expected_revision: u64,
+        completion_evidence: &str,
+    ) -> SessionResult<Task> {
+        if completion_evidence.trim().is_empty() {
+            return Err(SessionError::InvalidOperation(
+                "completion evidence is required".to_string(),
+            ));
+        }
+        let session_id = session_id.to_string();
+        let task_id = task_id.to_string();
+        let evidence = completion_evidence.to_string();
+        self.run_blocking(move |conn| {
+            let tx = conn.transaction()?;
+            let session_internal_id: i64 = tx.query_row("SELECT id FROM sessions WHERE public_id = ?1", params![session_id], |row| row.get(0))?;
+            let current = tx.query_row(
+                "SELECT id, public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, revision, creation_key, completion_evidence, completed_at, created_at, updated_at FROM tasks WHERE public_id = ?1 AND session_id = ?2",
+                params![task_id, session_internal_id], map_task_row,
+            ).optional()?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            if current.revision != expected_revision {
+                return Err(rusqlite::Error::InvalidParameterName("revision_conflict".to_string()));
+            }
+            if current.kind == TaskKind::Recurring || matches!(current.status, TaskStatus::Done | TaskStatus::Cancelled) {
+                return Err(rusqlite::Error::InvalidParameterName("invalid_task_transition".to_string()));
+            }
+            let now = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default();
+            tx.execute("UPDATE tasks SET status = 'done', completion_evidence = ?1, completed_at = ?2, updated_at = ?2, revision = revision + 1 WHERE id = ?3 AND revision = ?4", params![evidence, now, current.id, expected_revision as i64])?;
+            tx.execute("UPDATE sessions SET active_task_id = NULL WHERE id = ?1 AND active_task_id = ?2", params![session_internal_id, current.id])?;
+            let task = tx.query_row(
+                "SELECT id, public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, revision, creation_key, completion_evidence, completed_at, created_at, updated_at FROM tasks WHERE id = ?1",
+                params![current.id], map_task_row,
+            )?;
+            tx.commit()?;
+            Ok(task)
+        }).await.map_err(map_task_lifecycle_error)
     }
 
     async fn list_tasks(&self, session_id: &str) -> SessionResult<Vec<Task>> {

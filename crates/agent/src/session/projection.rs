@@ -49,6 +49,8 @@ pub struct RedactedView {
 pub struct RedactedTask {
     pub id: String,
     pub status: String,
+    pub revision: u64,
+    pub current_task: bool,
     pub expected_deliverable: Option<String>,
 }
 
@@ -705,8 +707,10 @@ mod tests {
             current_intent: Some("doing X".to_string()),
             active_task: Some(RedactedTask {
                 id: "task-1".to_string(),
-                status: "active".to_string(),
-                expected_deliverable: Some("output.txt".to_string()),
+                status: "Active".to_string(),
+                revision: 1,
+                current_task: true,
+                expected_deliverable: Some("deliver".to_string()),
             }),
             recent_progress: vec![RedactedProgress {
                 kind: "tool_call".to_string(),

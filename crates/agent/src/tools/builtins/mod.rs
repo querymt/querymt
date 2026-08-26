@@ -25,6 +25,7 @@ pub mod read_tool;
 pub mod replace_symbol;
 pub mod search_text;
 pub mod shell;
+pub mod task;
 pub mod todo;
 pub mod web_fetch;
 pub mod write_file;
@@ -59,6 +60,7 @@ pub use read_tool::ReadTool;
 pub use replace_symbol::ReplaceSymbolTool;
 pub use search_text::SearchTextTool;
 pub use shell::ShellTool;
+pub use task::{CompleteTaskTool, ReadTaskTool, UpdateTaskTool};
 pub use todo::{TodoReadTool, TodoWriteTool};
 pub use web_fetch::WebFetchTool;
 pub use write_file::WriteFileTool;
@@ -74,6 +76,9 @@ pub fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(BrowseTool::new()),
         Arc::new(CreateTaskTool::new()),
+        Arc::new(ReadTaskTool::new()),
+        Arc::new(UpdateTaskTool::new()),
+        Arc::new(CompleteTaskTool::new()),
         Arc::new(DelegateTool::new()),
         Arc::new(DeleteFileTool::new()),
         Arc::new(EditTool::new()),

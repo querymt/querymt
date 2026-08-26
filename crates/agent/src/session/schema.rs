@@ -91,6 +91,10 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             status TEXT NOT NULL,
             expected_deliverable TEXT,
             acceptance_criteria TEXT,
+            revision INTEGER NOT NULL DEFAULT 1,
+            creation_key TEXT,
+            completion_evidence TEXT,
+            completed_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
@@ -99,6 +103,8 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_public_id ON tasks(public_id);
         CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
         CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status) WHERE status IN ('active', 'paused');
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_session_creation_key
+            ON tasks(session_id, creation_key) WHERE creation_key IS NOT NULL;
 
         -- Delegations - external agent references
         CREATE TABLE IF NOT EXISTS delegations (
@@ -182,6 +188,9 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             summary TEXT NOT NULL,
             constraints TEXT,
             next_step_hint TEXT,
+            revision INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'legacy',
+            source_ref TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
             FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL

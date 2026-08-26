@@ -149,6 +149,8 @@ pub(crate) struct RunPhaseChanged {
 pub struct ScheduledPrompt {
     /// Public ID of the schedule that triggered this execution.
     pub schedule_public_id: String,
+    /// Public ID of the recurring task that triggered this execution.
+    pub task_public_id: String,
     /// Prompt text derived from the task's `expected_deliverable`.
     pub prompt_text: String,
     /// Optional per-cycle execution limits (max_steps, max_cost_usd).
