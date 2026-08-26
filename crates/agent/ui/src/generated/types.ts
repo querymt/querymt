@@ -54,10 +54,33 @@ export type AgentEventKind =
 	input_id: string;
 	run_id: string;
 }}
+	| { type: "objective_initialized", data: {
+	run_id: string;
+	revision: number;
+	source: string;
+	source_ref?: string;
+}}
+	| { type: "objective_updated", data: {
+	run_id: string;
+	revision: number;
+	source: string;
+	source_ref?: string;
+}}
 	| { type: "objective_checkpoint", data: {
 	run_id: string;
 	reason: string;
 	action: string;
+	objective_revision?: number;
+	current_task_id?: string;
+	current_task_revision?: number;
+}}
+	| { type: "task_completion_guard_triggered", data: {
+	run_id: string;
+	task_id: string;
+}}
+	| { type: "task_completion_guard_exhausted", data: {
+	run_id: string;
+	task_id: string;
 }}
 	| { type: "assistant_message_stored", data: {
 	content: string;
@@ -494,18 +517,25 @@ export interface Task {
 	status: TaskStatus;
 	expected_deliverable?: string;
 	acceptance_criteria?: string;
+	revision: number;
+	creation_key?: string;
+	completion_evidence?: string;
+	completed_at?: string;
 	created_at: string;
 	updated_at: string;
 }
 
 /** Snapshot of current user intent at a point in time (internal only) */
 export interface IntentSnapshot {
-	/** Authoritative summary of what the user wants */
+	/** Stable descriptive summary used for continuity and search, not execution authority. */
 	summary: string;
-	/** Constraints or boundaries */
+	/** Durable descriptive constraints known to the session. */
 	constraints?: string;
-	/** Hint for next action */
+	/** Latest accepted user directive useful for recovery. */
 	next_step_hint?: string;
+	revision: number;
+	source: string;
+	source_ref?: string;
 	created_at: string;
 }
 

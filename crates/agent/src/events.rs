@@ -183,12 +183,14 @@ pub enum AgentEventKind {
     },
     ObjectiveInitialized {
         run_id: String,
+        #[typeshare(serialized_as = "number")]
         revision: u64,
         source: String,
         source_ref: Option<String>,
     },
     ObjectiveUpdated {
         run_id: String,
+        #[typeshare(serialized_as = "number")]
         revision: u64,
         source: String,
         source_ref: Option<String>,
@@ -198,10 +200,12 @@ pub enum AgentEventKind {
         reason: String,
         action: String,
         #[serde(default)]
+        #[typeshare(serialized_as = "Option<number>")]
         objective_revision: Option<u64>,
         #[serde(default)]
         current_task_id: Option<String>,
         #[serde(default)]
+        #[typeshare(serialized_as = "Option<number>")]
         current_task_revision: Option<u64>,
     },
     TaskCompletionGuardTriggered {

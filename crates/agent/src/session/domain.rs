@@ -42,6 +42,7 @@ pub struct Task {
     pub status: TaskStatus,
     pub expected_deliverable: Option<String>,
     pub acceptance_criteria: Option<String>,
+    #[typeshare(serialized_as = "number")]
     pub revision: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub creation_key: Option<String>,
@@ -78,6 +79,7 @@ pub struct IntentSnapshot {
     pub constraints: Option<String>,
     /// Latest accepted user directive useful for recovery.
     pub next_step_hint: Option<String>,
+    #[typeshare(serialized_as = "number")]
     pub revision: u64,
     pub source: String,
     pub source_ref: Option<String>,
