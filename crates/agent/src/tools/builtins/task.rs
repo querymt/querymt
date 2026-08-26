@@ -27,6 +27,7 @@ fn task_content(
     )])
 }
 
+#[derive(Default)]
 pub struct ReadTaskTool;
 
 impl ReadTaskTool {
@@ -71,6 +72,7 @@ impl ToolTrait for ReadTaskTool {
     }
 }
 
+#[derive(Default)]
 pub struct UpdateTaskTool;
 
 impl UpdateTaskTool {
@@ -184,7 +186,9 @@ impl ToolTrait for UpdateTaskTool {
     }
 }
 
+#[derive(Default)]
 pub struct CompleteTaskTool;
+
 impl CompleteTaskTool {
     pub fn new() -> Self {
         Self

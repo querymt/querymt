@@ -49,6 +49,10 @@ async fn test_hybrid_id_scheme() {
         status: TaskStatus::Active,
         expected_deliverable: None,
         acceptance_criteria: None,
+        revision: 1,
+        creation_key: None,
+        completion_evidence: None,
+        completed_at: None,
         created_at: OffsetDateTime::now_utc(),
         updated_at: OffsetDateTime::now_utc(),
     };
@@ -111,6 +115,10 @@ async fn test_foreign_key_constraints() {
         status: TaskStatus::Active,
         expected_deliverable: None,
         acceptance_criteria: None,
+        revision: 1,
+        creation_key: None,
+        completion_evidence: None,
+        completed_at: None,
         created_at: OffsetDateTime::now_utc(),
         updated_at: OffsetDateTime::now_utc(),
     };

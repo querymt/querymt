@@ -369,10 +369,9 @@ pub(crate) async fn execute_cycle_state_machine(
                     );
                 } else if last_objective_checkpoint_step > 0
                     && steps > last_objective_checkpoint_step
+                    && let Some(objective) = exec_ctx.run_objective.as_mut()
                 {
-                    if let Some(objective) = exec_ctx.run_objective.as_mut() {
-                        objective.set_progress_review(None);
-                    }
+                    objective.set_progress_review(None);
                 }
                 let context = refresh_objective_fragment(&context, exec_ctx);
                 let state = ExecutionState::BeforeLlmCall { context };
