@@ -1721,6 +1721,36 @@ async fn acquire_execution_permit_with_timeout(
     }
 }
 
+async fn validate_execution_task(
+    exec_ctx: &mut ExecutionContext,
+    session_id: &str,
+) -> Result<Option<crate::session::domain::Task>, AgentError> {
+    let crate::agent::execution_context::ExecutionOrigin::Scheduled { task_public_id, .. } =
+        &exec_ctx.execution_origin
+    else {
+        return Ok(None);
+    };
+
+    let task = exec_ctx
+        .state
+        .store
+        .get_task_for_session(session_id, task_public_id)
+        .await
+        .map_err(AgentError::from)?
+        .ok_or_else(|| {
+            AgentError::Internal(format!(
+                "scheduled task not found in session: {task_public_id}"
+            ))
+        })?;
+    if task.status != crate::session::domain::TaskStatus::Active {
+        return Err(AgentError::Internal(format!(
+            "scheduled task is not active: {task_public_id}"
+        )));
+    }
+    exec_ctx.state.active_task = Some(task.clone());
+    Ok(Some(task))
+}
+
 #[instrument(
     name = "agent.prompt.execute",
     skip(exec),
@@ -1859,6 +1889,9 @@ async fn execute_prompt_detached(
     .with_steering(steering)
     .with_phase_reporter(phase_reporter);
 
+    // Validate before hooks, prompt events, history, or intent projection can mutate.
+    let scheduled_task = validate_execution_task(&mut exec_ctx, &session_id).await?;
+
     // 4. Slash command expansion (before storing user messages)
     let mut req = req;
     if let Some(crate::acp::protocol::ContentBlock::Text(text_content)) = req.prompt.first()
@@ -1959,8 +1992,15 @@ async fn execute_prompt_detached(
         },
     );
 
-    maybe_update_session_intent(&config, &session_id, &mut exec_ctx, &user_text, &message_id)
-        .await?;
+    if let Err(error) =
+        maybe_update_session_intent(&config, &session_id, &mut exec_ctx, &user_text, &message_id)
+            .await
+    {
+        warn!(
+            "Failed to update intent projection after storing prompt {}: {}",
+            message_id, error
+        );
+    }
 
     let origin_label = match &exec_ctx.execution_origin {
         crate::agent::execution_context::ExecutionOrigin::Interactive => "interactive".to_string(),
@@ -1968,29 +2008,6 @@ async fn execute_prompt_detached(
             schedule_public_id,
             task_public_id,
         } => format!("scheduled:{schedule_public_id}:{task_public_id}"),
-    };
-    let scheduled_task = match &exec_ctx.execution_origin {
-        crate::agent::execution_context::ExecutionOrigin::Scheduled { task_public_id, .. } => {
-            let task = exec_ctx
-                .state
-                .store
-                .get_task_for_session(&session_id, task_public_id)
-                .await
-                .map_err(AgentError::from)?
-                .ok_or_else(|| {
-                    AgentError::Internal(format!(
-                        "scheduled task not found in session: {task_public_id}"
-                    ))
-                })?;
-            if task.status != crate::session::domain::TaskStatus::Active {
-                return Err(AgentError::Internal(format!(
-                    "scheduled task is not active: {task_public_id}"
-                )));
-            }
-            exec_ctx.state.active_task = Some(task.clone());
-            Some(task)
-        }
-        crate::agent::execution_context::ExecutionOrigin::Interactive => None,
     };
     let objective_task = match &exec_ctx.execution_origin {
         crate::agent::execution_context::ExecutionOrigin::Scheduled { .. } => {
@@ -2276,6 +2293,7 @@ mod tests {
         _session_id: String,
         _temp_dir: tempfile::TempDir,
         intent_writes: Arc<AtomicUsize>,
+        history_writes: Arc<AtomicUsize>,
     }
 
     impl ActorFixture {
@@ -2323,6 +2341,7 @@ mod tests {
             let session = mock_session(session_id);
             let mut store = MockSessionStore::new();
             let intent_writes = Arc::new(AtomicUsize::new(0));
+            let history_writes = Arc::new(AtomicUsize::new(0));
             let current_intent = Arc::new(std::sync::Mutex::new(None));
             let session_clone = session.clone();
             store
@@ -2362,6 +2381,15 @@ mod tests {
             store
                 .expect_list_sessions()
                 .returning(|| Ok(vec![]))
+                .times(0..);
+            store.expect_get_task().returning(|_| Ok(None)).times(0..);
+            let writes_for_history = history_writes.clone();
+            store
+                .expect_add_message()
+                .returning(move |_, _| {
+                    writes_for_history.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
                 .times(0..);
             let writes_for_create = intent_writes.clone();
             let intent_for_create = current_intent.clone();
@@ -2418,8 +2446,30 @@ mod tests {
                 _session_id: session_id.to_string(),
                 _temp_dir: temp_dir,
                 intent_writes,
+                history_writes,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_scheduled_task_does_not_write_history_or_intent() {
+        let fixture = ActorFixture::new().await;
+        let mut exec_ctx = fixture
+            .execution_context("test-session")
+            .await
+            .with_execution_origin(
+                crate::agent::execution_context::ExecutionOrigin::Scheduled {
+                    schedule_public_id: "schedule-1".to_string(),
+                    task_public_id: "missing-task".to_string(),
+                },
+            );
+
+        let result = validate_execution_task(&mut exec_ctx, "test-session").await;
+
+        assert!(result.is_err());
+        assert_eq!(fixture.history_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.intent_writes.load(Ordering::SeqCst), 0);
+        assert!(exec_ctx.state.current_intent.is_none());
     }
 
     #[tokio::test]
