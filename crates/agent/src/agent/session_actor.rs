@@ -1722,18 +1722,17 @@ async fn acquire_execution_permit_with_timeout(
 }
 
 async fn validate_execution_task(
-    exec_ctx: &mut ExecutionContext,
+    store: &dyn crate::session::store::SessionStore,
+    execution_origin: &crate::agent::execution_context::ExecutionOrigin,
     session_id: &str,
 ) -> Result<Option<crate::session::domain::Task>, AgentError> {
     let crate::agent::execution_context::ExecutionOrigin::Scheduled { task_public_id, .. } =
-        &exec_ctx.execution_origin
+        execution_origin
     else {
         return Ok(None);
     };
 
-    let task = exec_ctx
-        .state
-        .store
+    let task = store
         .get_task_for_session(session_id, task_public_id)
         .await
         .map_err(AgentError::from)?
@@ -1747,7 +1746,6 @@ async fn validate_execution_task(
             "scheduled task is not active: {task_public_id}"
         )));
     }
-    exec_ctx.state.active_task = Some(task.clone());
     Ok(Some(task))
 }
 
@@ -1838,6 +1836,10 @@ async fn execute_prompt_detached(
         }
     };
 
+    let history_store = config.provider.history_store();
+    let scheduled_task =
+        validate_execution_task(&*history_store, &execution_origin, &session_id).await?;
+
     // Clean up revert state if a new prompt is sent while in reverted state.
     // Also prunes the event journal so undone turns don't reappear on reload.
     // IMPORTANT: this must run BEFORE loading RuntimeContext so that
@@ -1889,8 +1891,9 @@ async fn execute_prompt_detached(
     .with_steering(steering)
     .with_phase_reporter(phase_reporter);
 
-    // Validate before hooks, prompt events, history, or intent projection can mutate.
-    let scheduled_task = validate_execution_task(&mut exec_ctx, &session_id).await?;
+    if let Some(task) = &scheduled_task {
+        exec_ctx.state.active_task = Some(task.clone());
+    }
 
     // 4. Slash command expansion (before storing user messages)
     let mut req = req;
@@ -2454,7 +2457,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_scheduled_task_does_not_write_history_or_intent() {
         let fixture = ActorFixture::new().await;
-        let mut exec_ctx = fixture
+        let exec_ctx = fixture
             .execution_context("test-session")
             .await
             .with_execution_origin(
@@ -2464,7 +2467,12 @@ mod tests {
                 },
             );
 
-        let result = validate_execution_task(&mut exec_ctx, "test-session").await;
+        let result = validate_execution_task(
+            &*exec_ctx.state.store,
+            &exec_ctx.execution_origin,
+            "test-session",
+        )
+        .await;
 
         assert!(result.is_err());
         assert_eq!(fixture.history_writes.load(Ordering::SeqCst), 0);
