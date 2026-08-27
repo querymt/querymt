@@ -109,6 +109,10 @@ struct CacheMetadata {
     retrieved_at_unix: u64,
 }
 
+fn cache_metadata_has_integrity_digest(metadata: &CacheMetadata) -> bool {
+    metadata.file_sha256.is_some()
+}
+
 fn build_auth(reference: &Reference) -> RegistryAuth {
     let server = reference
         .resolve_registry()
@@ -720,7 +724,10 @@ impl OciDownloader {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
 
-        if !force_update && let Some(meta) = &local_metadata {
+        if !force_update
+            && let Some(meta) = &local_metadata
+            && cache_metadata_has_integrity_digest(meta)
+        {
             let blob_path = get_blob_path(cache_path, &meta.manifest_digest, &meta.filename);
             if blob_path.exists() {
                 log::debug!("Found cached OCI plugin. Using local version.");
@@ -794,7 +801,9 @@ impl OciDownloader {
 
         match client.pull_manifest(&reference, &auth).await {
             Ok((live_manifest, live_digest)) => {
-                if let Some(meta) = &local_metadata {
+                if let Some(meta) = &local_metadata
+                    && cache_metadata_has_integrity_digest(meta)
+                {
                     let blob_path =
                         get_blob_path(cache_path, &meta.manifest_digest, &meta.filename);
                     if meta.manifest_digest == live_digest && blob_path.exists() {
@@ -939,7 +948,13 @@ impl OciDownloader {
 
                 log::debug!("Populated OCI blob cache at: {}", blob_path.display());
 
-                let file_sha256 = sha256_file(&blob_path)?;
+                let hash_path = blob_path.clone();
+                let file_sha256 = tokio::task::spawn_blocking(move || {
+                    sha256_file(&hash_path).map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|error| format!("OCI plugin hashing task failed: {error}"))?
+                .map_err(|error| format!("Failed to hash OCI plugin: {error}"))?;
                 let new_metadata = CacheMetadata {
                     manifest_digest: live_digest.to_string(),
                     filename: filename.clone(),
@@ -1186,6 +1201,21 @@ mod tests {
                 .to_string()
                 .contains("Invalid plugin type")
         );
+    }
+
+    #[test]
+    fn cache_metadata_without_file_digest_is_not_eligible_for_cache_hit() {
+        let mut metadata = CacheMetadata {
+            manifest_digest: "sha256:abc".to_string(),
+            filename: "plugin.wasm".to_string(),
+            plugin_type_str: "extism".to_string(),
+            file_sha256: None,
+            annotations: BTreeMap::new(),
+            retrieved_at_unix: 1234567890,
+        };
+        assert!(!cache_metadata_has_integrity_digest(&metadata));
+        metadata.file_sha256 = Some("digest".to_string());
+        assert!(cache_metadata_has_integrity_digest(&metadata));
     }
 
     #[test]

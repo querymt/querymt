@@ -1,7 +1,6 @@
 use rusqlite::Connection;
 
 use crate::events::{AgentEventKind, EventOrigin};
-use crate::session::SessionError;
 use crate::session::domain::ForkOrigin;
 use crate::session::projection::{
     EventJournal, NewDurableEvent, RecentModelEntry, SessionScope, ViewStore,
@@ -285,7 +284,14 @@ async fn session_runtime_binding_round_trips_profile_and_delegate() {
         .expect("in-memory storage");
 
     storage
-        .set_session_runtime_binding("delegate-session", "quorum", Some("coder"))
+        .set_session_runtime_binding(
+            "delegate-session",
+            "quorum",
+            Some("coder"),
+            Some("profile-sha"),
+            Some("lock-sha"),
+            Some("{}"),
+        )
         .await
         .expect("persist runtime binding");
 
@@ -305,27 +311,66 @@ async fn session_runtime_binding_round_trips_profile_and_delegate() {
         Some("quorum")
     );
 
+    assert_eq!(binding.profile_fingerprint.as_deref(), Some("profile-sha"));
+    assert_eq!(binding.provider_lock_digest.as_deref(), Some("lock-sha"));
+    assert_eq!(binding.provider_locks_json.as_deref(), Some("{}"));
+}
+
+#[tokio::test]
+async fn session_runtime_binding_transaction_rolls_back_on_failure() {
+    let storage = SqliteStorage::connect(":memory:".into())
+        .await
+        .expect("in-memory storage");
     storage
-        .set_session_provider_lock(
-            "delegate-session",
-            Some("profile-sha"),
-            Some("lock-sha"),
+        .set_session_runtime_binding(
+            "session-1",
+            "old-profile",
+            None,
+            Some("old-fingerprint"),
+            Some("old-lock"),
             Some("{}"),
         )
         .await
-        .expect("update existing provider lock");
-    let binding = storage
-        .get_session_runtime_binding("delegate-session")
+        .expect("seed binding");
+    storage
+        .run_blocking(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER reject_provider_lock_update
+                 BEFORE UPDATE ON profile_bindings
+                 WHEN NEW.provider_locks_json = 'reject'
+                 BEGIN
+                    SELECT RAISE(ABORT, 'rejected provider lock');
+                 END;",
+            )
+        })
         .await
-        .expect("load updated binding")
-        .expect("updated binding");
-    assert_eq!(binding.provider_lock_digest.as_deref(), Some("lock-sha"));
+        .expect("install failure trigger");
 
-    let error = storage
-        .set_session_provider_lock("missing-session", None, Some("lock-sha"), None)
+    storage
+        .set_session_runtime_binding(
+            "session-1",
+            "new-profile",
+            Some("coder"),
+            Some("new-fingerprint"),
+            Some("new-lock"),
+            Some("reject"),
+        )
         .await
-        .expect_err("missing binding must fail");
-    assert!(matches!(error, SessionError::SessionNotFound(id) if id == "missing-session"));
+        .expect_err("transaction must fail");
+
+    let binding = storage
+        .get_session_runtime_binding("session-1")
+        .await
+        .expect("load binding")
+        .expect("original binding remains");
+    assert_eq!(binding.profile_id, "old-profile");
+    assert_eq!(binding.agent_id, None);
+    assert_eq!(
+        binding.profile_fingerprint.as_deref(),
+        Some("old-fingerprint")
+    );
+    assert_eq!(binding.provider_lock_digest.as_deref(), Some("old-lock"));
+    assert_eq!(binding.provider_locks_json.as_deref(), Some("{}"));
 }
 
 #[tokio::test]

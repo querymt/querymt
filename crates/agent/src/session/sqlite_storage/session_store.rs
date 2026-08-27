@@ -602,7 +602,7 @@ impl SessionStore for SqliteStorage {
     }
 
     async fn set_profile_binding(&self, session_id: &str, profile_id: &str) -> SessionResult<()> {
-        self.set_session_runtime_binding(session_id, profile_id, None)
+        self.set_session_runtime_binding(session_id, profile_id, None, None, None, None)
             .await
     }
 
@@ -611,48 +611,41 @@ impl SessionStore for SqliteStorage {
         session_id: &str,
         profile_id: &str,
         agent_id: Option<&str>,
-    ) -> SessionResult<()> {
-        let session_id = session_id.to_string();
-        let profile_id = profile_id.to_string();
-        let agent_id = agent_id.map(str::to_string);
-        self.run_blocking(move |conn| {
-            conn.execute(
-                "INSERT INTO profile_bindings (session_id, profile_id, agent_id)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(session_id) DO UPDATE SET
-                    profile_id = excluded.profile_id,
-                    agent_id = excluded.agent_id",
-                params![session_id, profile_id, agent_id],
-            )?;
-            Ok(())
-        })
-        .await
-    }
-
-    async fn set_session_provider_lock(
-        &self,
-        session_id: &str,
         profile_fingerprint: Option<&str>,
         provider_lock_digest: Option<&str>,
         provider_locks_json: Option<&str>,
     ) -> SessionResult<()> {
         let session_id = session_id.to_string();
+        let profile_id = profile_id.to_string();
+        let agent_id = agent_id.map(str::to_string);
         let profile_fingerprint = profile_fingerprint.map(str::to_string);
         let provider_lock_digest = provider_lock_digest.map(str::to_string);
         let provider_locks_json = provider_locks_json.map(str::to_string);
-        let lookup_id = session_id.clone();
-        let updated = self
-            .run_blocking(move |conn| {
-                conn.execute(
-                    "UPDATE profile_bindings SET profile_fingerprint = ?2, provider_lock_digest = ?3, provider_locks_json = ?4 WHERE session_id = ?1",
-                    params![session_id, profile_fingerprint, provider_lock_digest, provider_locks_json],
-                )
-            })
-            .await?;
-        if updated == 0 {
-            return Err(crate::session::SessionError::SessionNotFound(lookup_id));
-        }
-        Ok(())
+        self.run_blocking(move |conn| {
+            let transaction = conn.transaction()?;
+            transaction.execute(
+                "INSERT INTO profile_bindings (
+                    session_id, profile_id, agent_id, profile_fingerprint,
+                    provider_lock_digest, provider_locks_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    profile_id = excluded.profile_id,
+                    agent_id = excluded.agent_id,
+                    profile_fingerprint = excluded.profile_fingerprint,
+                    provider_lock_digest = excluded.provider_lock_digest,
+                    provider_locks_json = excluded.provider_locks_json",
+                params![
+                    session_id,
+                    profile_id,
+                    agent_id,
+                    profile_fingerprint,
+                    provider_lock_digest,
+                    provider_locks_json
+                ],
+            )?;
+            transaction.commit()
+        })
+        .await
     }
 
     async fn get_profile_binding(&self, session_id: &str) -> SessionResult<Option<String>> {

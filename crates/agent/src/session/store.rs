@@ -277,24 +277,16 @@ pub trait SessionStore: Send + Sync {
     /// Persist the profile namespace for a root session.
     async fn set_profile_binding(&self, session_id: &str, profile_id: &str) -> SessionResult<()>;
 
-    /// Persist the profile namespace and concrete agent that owns a session runtime.
+    /// Persist the complete profile runtime route and provider lock atomically.
     async fn set_session_runtime_binding(
         &self,
         session_id: &str,
         profile_id: &str,
         agent_id: Option<&str>,
+        profile_fingerprint: Option<&str>,
+        provider_lock_digest: Option<&str>,
+        provider_locks_json: Option<&str>,
     ) -> SessionResult<()>;
-
-    /// Persist the exact provider lock used by a profile-owned session.
-    async fn set_session_provider_lock(
-        &self,
-        _session_id: &str,
-        _profile_fingerprint: Option<&str>,
-        _provider_lock_digest: Option<&str>,
-        _provider_locks_json: Option<&str>,
-    ) -> SessionResult<()> {
-        Ok(())
-    }
 
     /// Retrieve the profile namespace for compatibility with profile ownership checks.
     async fn get_profile_binding(&self, session_id: &str) -> SessionResult<Option<String>>;

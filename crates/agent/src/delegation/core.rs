@@ -856,6 +856,9 @@ async fn execute_delegation(
                 &child_session_id,
                 profile_id,
                 Some(&delegation.target_agent_id),
+                None,
+                None,
+                None,
             )
             .await
     {

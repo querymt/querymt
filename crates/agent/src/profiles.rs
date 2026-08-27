@@ -1057,20 +1057,13 @@ where
                 &session_id,
                 &binding.profile_id,
                 binding.agent_id.as_deref(),
-            )
-            .await
-        {
-            warn!(session_id, profile_id = %binding.profile_id, error = %err, "failed to persist session profile binding");
-        } else if let Err(err) = store
-            .set_session_provider_lock(
-                &session_id,
                 binding.profile_fingerprint.as_deref(),
                 binding.provider_lock_digest.as_deref(),
                 binding.provider_locks_json.as_deref(),
             )
             .await
         {
-            warn!(session_id, profile_id = %binding.profile_id, error = %err, "failed to persist session provider lock");
+            warn!(session_id, profile_id = %binding.profile_id, error = %err, "failed to persist session profile binding");
         }
     }
 
