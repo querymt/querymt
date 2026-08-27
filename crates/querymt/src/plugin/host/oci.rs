@@ -113,6 +113,12 @@ fn cache_metadata_has_integrity_digest(metadata: &CacheMetadata) -> bool {
     metadata.file_sha256.is_some()
 }
 
+fn eligible_cached_blob(cache_path: &Path, metadata: &CacheMetadata) -> Option<PathBuf> {
+    cache_metadata_has_integrity_digest(metadata)
+        .then(|| get_blob_path(cache_path, &metadata.manifest_digest, &metadata.filename))
+        .filter(|path| path.exists())
+}
+
 fn build_auth(reference: &Reference) -> RegistryAuth {
     let server = reference
         .resolve_registry()
@@ -1064,13 +1070,16 @@ impl OciDownloader {
                     }
                 }
 
-                if let Some(meta) = local_metadata {
-                    let blob_path =
-                        get_blob_path(cache_path, &meta.manifest_digest, &meta.filename);
-                    if blob_path.exists() {
-                        log::debug!("OFFLINE CACHE HIT: Using stale local version.");
-                        return load_from_cache(&meta, &blob_path);
-                    }
+                if let Some(meta) = local_metadata
+                    && let Some(blob_path) = eligible_cached_blob(cache_path, &meta)
+                {
+                    log::debug!("OFFLINE CACHE HIT: Using stale local version.");
+                    let cached = tokio::task::spawn_blocking(move || {
+                        load_from_cache(&meta, &blob_path).map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| format!("OCI cache validation task failed: {error}"))?;
+                    return cached.map_err(Into::into);
                 }
                 Err("No internet connection and no cached version available for this image.".into())
             }
@@ -1201,6 +1210,28 @@ mod tests {
                 .to_string()
                 .contains("Invalid plugin type")
         );
+    }
+
+    #[test]
+    fn offline_cache_rejects_legacy_metadata_without_file_digest() {
+        let temp_dir = tempfile::tempdir().expect("cache tempdir");
+        let metadata = CacheMetadata {
+            manifest_digest: "sha256:abc".to_string(),
+            filename: "plugin.wasm".to_string(),
+            plugin_type_str: "extism".to_string(),
+            file_sha256: None,
+            annotations: BTreeMap::new(),
+            retrieved_at_unix: 1234567890,
+        };
+        let blob_path = get_blob_path(
+            temp_dir.path(),
+            &metadata.manifest_digest,
+            &metadata.filename,
+        );
+        fs::create_dir_all(blob_path.parent().expect("blob parent")).expect("create blob dir");
+        fs::write(&blob_path, b"legacy cache").expect("write cached blob");
+
+        assert_eq!(eligible_cached_blob(temp_dir.path(), &metadata), None);
     }
 
     #[test]

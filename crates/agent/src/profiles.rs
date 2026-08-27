@@ -701,9 +701,14 @@ fn validate_profile_provider_requirements(
                 "Profile '{profile_id}' provider '{logical_name}' must use an oci:// artifact"
             ));
         };
-        let Some((_, digest)) = reference.rsplit_once("@sha256:") else {
+        let Some((image, digest)) = reference.rsplit_once("@sha256:") else {
             return Err(anyhow!(
                 "Profile '{profile_id}' provider '{logical_name}' must pin an immutable @sha256 digest"
+            ));
+        };
+        if image.trim().is_empty() {
+            return Err(anyhow!(
+                "Profile '{profile_id}' provider '{logical_name}' has an empty OCI image reference"
             ));
         };
         if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -1622,6 +1627,26 @@ model = "model.gguf"
         )
         .expect_err("tag must be rejected");
         assert!(error.to_string().contains("immutable @sha256"));
+
+        providers.insert(
+            "llama_cpp".to_string(),
+            ProfileProviderRequirement {
+                artifact: format!("oci://@sha256:{}", "a".repeat(64)),
+                factory: "llama_cpp".to_string(),
+                kind: "native".to_string(),
+                plugin_api: None,
+                features: Vec::new(),
+                signer: None,
+            },
+        );
+        let error = validate_profile_provider_requirements(
+            "locked",
+            ProfileProviderMode::Locked,
+            &providers,
+            &config,
+        )
+        .expect_err("empty OCI image reference must be rejected");
+        assert!(error.to_string().contains("empty OCI image reference"));
 
         providers.clear();
         let error = validate_profile_provider_requirements(
