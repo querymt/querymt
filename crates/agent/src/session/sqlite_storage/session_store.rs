@@ -640,14 +640,19 @@ impl SessionStore for SqliteStorage {
         let profile_fingerprint = profile_fingerprint.map(str::to_string);
         let provider_lock_digest = provider_lock_digest.map(str::to_string);
         let provider_locks_json = provider_locks_json.map(str::to_string);
-        self.run_blocking(move |conn| {
-            conn.execute(
-                "UPDATE profile_bindings SET profile_fingerprint = ?2, provider_lock_digest = ?3, provider_locks_json = ?4 WHERE session_id = ?1",
-                params![session_id, profile_fingerprint, provider_lock_digest, provider_locks_json],
-            )?;
-            Ok(())
-        })
-        .await
+        let lookup_id = session_id.clone();
+        let updated = self
+            .run_blocking(move |conn| {
+                conn.execute(
+                    "UPDATE profile_bindings SET profile_fingerprint = ?2, provider_lock_digest = ?3, provider_locks_json = ?4 WHERE session_id = ?1",
+                    params![session_id, profile_fingerprint, provider_lock_digest, provider_locks_json],
+                )
+            })
+            .await?;
+        if updated == 0 {
+            return Err(crate::session::SessionError::SessionNotFound(lookup_id));
+        }
+        Ok(())
     }
 
     async fn get_profile_binding(&self, session_id: &str) -> SessionResult<Option<String>> {

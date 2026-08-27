@@ -540,7 +540,7 @@ impl LocalProfileCatalog {
     ) -> Result<ProfileFileMetadata> {
         let content = match &metadata.source {
             ProfileSource::Embedded { key } if key == DEFAULT_EMBEDDED_PROFILE_KEY => {
-                std::fs::read_to_string(DEFAULT_EMBEDDED_PROFILE_PATH)?
+                tokio::fs::read_to_string(DEFAULT_EMBEDDED_PROFILE_PATH).await?
             }
             ProfileSource::EmbeddedToml { key } => self
                 .embedded_toml_profiles
@@ -548,7 +548,7 @@ impl LocalProfileCatalog {
                 .ok_or_else(|| anyhow!("Unknown embedded TOML profile '{key}'"))?
                 .toml
                 .clone(),
-            ProfileSource::LocalPath { path } => std::fs::read_to_string(path)?,
+            ProfileSource::LocalPath { path } => tokio::fs::read_to_string(path).await?,
             ProfileSource::Embedded { key } => {
                 return Err(anyhow!("Unknown embedded profile '{key}'"));
             }
@@ -1289,15 +1289,18 @@ async fn build_profile_runtime(
     mut shared_infra: AgentInfra,
 ) -> Result<ProfileRuntime> {
     let metadata = document.metadata;
-    let provider_lock =
-        resolved_profile_provider_lock(document.provider_mode, &document.providers)?;
-    if document.provider_mode != ProfileProviderMode::Legacy {
-        shared_infra.plugin_registry = provision_profile_registry(
+    let provider_lock = if document.provider_mode == ProfileProviderMode::Legacy {
+        None
+    } else {
+        let registry = provision_profile_registry(
             document.provider_mode,
             &document.providers,
             shared_infra.plugin_registry.clone(),
         )?;
-    }
+        let lock = resolved_profile_provider_lock(document.provider_mode, &registry.config)?;
+        shared_infra.plugin_registry = registry;
+        lock
+    };
     let agent = match document.config {
         Config::Single(config) => {
             Agent::from_single_config_with_infra(*config, shared_infra).await?
@@ -1326,24 +1329,28 @@ async fn build_profile_runtime(
 
 fn resolved_profile_provider_lock(
     mode: ProfileProviderMode,
-    providers: &BTreeMap<String, ProfileProviderRequirement>,
+    config: &PluginConfig,
 ) -> Result<Option<ResolvedProfileProviderLock>> {
     if mode == ProfileProviderMode::Legacy {
         return Ok(None);
     }
-    let entries = providers
+    let entries = config
+        .providers
         .iter()
-        .map(|(logical_name, requirement)| {
+        .map(|provider| {
             (
-                logical_name.clone(),
+                provider.name.clone(),
                 ResolvedProviderLockEntry {
-                    logical_name: logical_name.clone(),
-                    factory: requirement.factory.clone(),
-                    artifact: requirement.artifact.clone(),
-                    kind: requirement.kind.clone(),
-                    plugin_api: requirement.plugin_api,
-                    features: requirement.features.clone(),
-                    signer: requirement.signer.clone(),
+                    logical_name: provider.name.clone(),
+                    factory: provider
+                        .factory
+                        .clone()
+                        .unwrap_or_else(|| provider.name.clone()),
+                    artifact: provider.path.clone(),
+                    kind: provider.kind.clone().unwrap_or_default(),
+                    plugin_api: provider.plugin_api,
+                    features: provider.features.clone(),
+                    signer: provider.signer.clone(),
                 },
             )
         })

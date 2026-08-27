@@ -2,14 +2,12 @@ use crate::model_heuristics::ModelDefaults;
 use crate::session::error::SessionError;
 use querymt::LLMParams;
 use querymt::error::LLMError;
-use querymt::plugin::LLMProviderFactory;
 use querymt::plugin::host::ProviderBinding;
 use querymt::provider_config::{
     ConfigOverrideMode, ProviderConfigBuilder,
     ResolvedProviderConfig as SharedResolvedProviderConfig,
 };
 use serde_json::Value;
-use std::sync::Arc;
 
 pub(crate) enum ProviderConfigMode<'a> {
     Runtime {
@@ -90,11 +88,11 @@ fn missing_credentials_error(provider_name: &str, env_var_name: Option<&str>) ->
 pub(crate) async fn resolve_provider_config(
     binding: &ProviderBinding,
     initial_config: &LLMParams,
-    factory: &Arc<dyn LLMProviderFactory>,
-    provider_name: &str,
     mode: ProviderConfigMode<'_>,
 ) -> Result<ResolvedProviderConfig, SessionError> {
     let mut builder = ProviderConfigBuilder::from_binding(binding);
+    let factory = &binding.factory;
+    let provider_name = binding.logical_name.as_str();
     let mut use_oauth_resolver = false;
 
     match mode {
@@ -220,6 +218,7 @@ mod tests {
     use querymt::error::LLMError;
     use querymt::plugin::host::{PluginRegistry, ProviderBinding};
     use querymt::plugin::{HTTPLLMProviderFactory, LLMProviderFactory};
+    #[cfg(test)]
     use std::sync::Arc;
 
     struct DummyHttpProvider;
@@ -352,15 +351,10 @@ mod tests {
         );
 
         let binding = binding(&registry, factory.clone());
-        let resolved = resolve_provider_config(
-            &binding,
-            &initial,
-            &factory,
-            "xiaomi",
-            ProviderConfigMode::CatalogListing,
-        )
-        .await
-        .expect("resolved config");
+        let resolved =
+            resolve_provider_config(&binding, &initial, ProviderConfigMode::CatalogListing)
+                .await
+                .expect("resolved config");
 
         #[cfg(feature = "oauth")]
         {
@@ -389,15 +383,10 @@ mod tests {
         #[cfg(feature = "oauth")]
         {
             let binding = binding(&registry, factory.clone());
-            let resolved = resolve_provider_config(
-                &binding,
-                &initial,
-                &factory,
-                "xiaomi",
-                ProviderConfigMode::CatalogListing,
-            )
-            .await
-            .expect("resolved config");
+            let resolved =
+                resolve_provider_config(&binding, &initial, ProviderConfigMode::CatalogListing)
+                    .await
+                    .expect("resolved config");
 
             assert_eq!(
                 resolved.builder_config["base_url"],
@@ -408,15 +397,9 @@ mod tests {
         #[cfg(not(feature = "oauth"))]
         {
             let binding = binding(&registry, factory.clone());
-            let _ = resolve_provider_config(
-                &binding,
-                &initial,
-                &factory,
-                "xiaomi",
-                ProviderConfigMode::CatalogListing,
-            )
-            .await
-            .expect("resolved config");
+            let _ = resolve_provider_config(&binding, &initial, ProviderConfigMode::CatalogListing)
+                .await
+                .expect("resolved config");
         }
     }
 
@@ -431,12 +414,10 @@ mod tests {
             r#"{"properties":{"api_key":{},"model":{}}}"#,
         );
 
-        let binding = binding(&registry, factory.clone());
+        let binding = binding(&registry, factory);
         let resolved = resolve_provider_config(
             &binding,
             &initial,
-            &factory,
-            "xiaomi",
             ProviderConfigMode::Runtime {
                 model: "gpt-4o-mini",
                 params: None,

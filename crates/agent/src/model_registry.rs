@@ -9,10 +9,8 @@
 
 use futures_util::future;
 use moka::future::Cache;
-use querymt::plugin::LLMProviderFactory;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Duration;
 use typeshare::typeshare;
 
@@ -191,7 +189,7 @@ pub(crate) async fn enumerate_local_models(config: &AgentConfig) -> Vec<ModelEnt
             let config = config.clone();
             async move {
                 let provider_name = factory.name().to_string();
-                let mut models = fetch_catalog_models(&config, &factory, &provider_name).await;
+                let mut models = fetch_catalog_models(&config, &provider_name).await;
                 let catalog_count = models.len();
 
                 if factory.supports_custom_models() {
@@ -238,31 +236,23 @@ pub(crate) async fn enumerate_local_models(config: &AgentConfig) -> Vec<ModelEnt
 
 // ── Provider-level helpers ────────────────────────────────────────────────────
 
-async fn fetch_catalog_models(
-    config: &AgentConfig,
-    factory: &Arc<dyn LLMProviderFactory>,
-    provider_name: &str,
-) -> Vec<ModelEntry> {
-    let registry = config.provider.plugin_registry();
-    let binding =
-        match querymt::plugin::host::ProviderResolver::resolve(registry.as_ref(), provider_name)
-            .await
-        {
-            Ok(binding) => binding,
-            Err(err) => {
-                log::debug!(
-                    "fetch_catalog_models: skipping provider='{}' because resolution failed: {}",
-                    provider_name,
-                    err
-                );
-                return Vec::new();
-            }
-        };
+async fn fetch_catalog_models(config: &AgentConfig, provider_name: &str) -> Vec<ModelEntry> {
+    let resolver = config.provider.provider_resolver();
+    let binding = match resolver.resolve(provider_name).await {
+        Ok(binding) => binding,
+        Err(err) => {
+            log::debug!(
+                "fetch_catalog_models: skipping provider='{}' because resolution failed: {}",
+                provider_name,
+                err
+            );
+            return Vec::new();
+        }
+    };
+    let factory = binding.factory.clone();
     let resolved = match resolve_provider_config(
         &binding,
         config.provider.initial_config(),
-        factory,
-        provider_name,
         ProviderConfigMode::CatalogListing,
     )
     .await

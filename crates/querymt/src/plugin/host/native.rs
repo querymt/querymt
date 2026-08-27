@@ -141,19 +141,24 @@ impl NativeLoader {
             unsafe {
                 let api = lib.get::<PluginApiFn>(b"querymt_plugin_api").map_err(|_| {
                     LLMError::PluginError(format!(
-                        "Locked native plugin {} does not export querymt_plugin_api",
+                        "Native plugin {} does not export required querymt_plugin_api",
                         path.display()
                     ))
                 })?;
                 if required_api != NATIVE_PLUGIN_API || api() != required_api {
                     return Err(LLMError::PluginError(format!(
-                        "Locked native plugin {} uses API {}, profile requires {}, host supports {}",
+                        "Native plugin {} uses API {}, configuration requires {}, host supports {}",
                         path.display(),
                         api(),
                         required_api,
                         NATIVE_PLUGIN_API
                     )));
                 }
+            }
+        }
+
+        if locked {
+            unsafe {
                 let plugin_name =
                     lib.get::<PluginNameFn>(b"querymt_plugin_name")
                         .map_err(|_| {

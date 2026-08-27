@@ -25,6 +25,7 @@ use sigstore::trust::{ManualTrustRoot, TrustRoot};
 use std::collections::BTreeMap;
 use std::env::consts::{ARCH, OS};
 use std::fs;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -541,8 +542,17 @@ fn persist_with_fallback(
 }
 
 fn sha256_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let bytes = fs::read(path)?;
-    Ok(hex::encode(Sha256::digest(bytes)))
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn load_from_cache(
@@ -720,7 +730,13 @@ impl OciDownloader {
                     bytes_total: None,
                     percent: Some(100.0),
                 });
-                return load_from_cache(meta, &blob_path);
+                let meta = meta.clone();
+                let cached = tokio::task::spawn_blocking(move || {
+                    load_from_cache(&meta, &blob_path).map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|error| format!("OCI cache validation task failed: {error}"))?;
+                return cached.map_err(Into::into);
             }
         }
 
@@ -789,7 +805,13 @@ impl OciDownloader {
                             bytes_total: None,
                             percent: Some(100.0),
                         });
-                        return load_from_cache(meta, &blob_path);
+                        let meta = meta.clone();
+                        let cached = tokio::task::spawn_blocking(move || {
+                            load_from_cache(&meta, &blob_path).map_err(|error| error.to_string())
+                        })
+                        .await
+                        .map_err(|error| format!("OCI cache validation task failed: {error}"))?;
+                        return cached.map_err(Into::into);
                     }
                 }
 

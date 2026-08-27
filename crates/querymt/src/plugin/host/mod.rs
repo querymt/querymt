@@ -2,7 +2,7 @@ use crate::{LLMBuilder, builder::BoundRegistry, error::LLMError, plugin::LLMProv
 use async_trait::async_trait;
 use futures::lock::Mutex;
 use futures::stream::{FuturesUnordered, StreamExt};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -20,6 +20,16 @@ pub use config::{PluginConfig, ProviderConfig};
 pub enum PluginType {
     Wasm,
     Native,
+}
+
+fn expected_scalar_feature(features: &[String]) -> Result<Option<&str>, String> {
+    match features {
+        [] => Ok(None),
+        [feature] => Ok(Some(feature.as_str())),
+        features => Err(format!(
+            "declares multiple features {features:?}, but OCI artifacts expose one scalar feature tag"
+        )),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -86,16 +96,7 @@ pub struct PluginRegistry {
 
 impl PluginRegistry {
     fn static_config(&self, provider: &str) -> Result<Value, LLMError> {
-        Ok(self
-            .config
-            .providers
-            .iter()
-            .find(|entry| entry.name == provider)
-            .and_then(|entry| entry.config.as_ref())
-            .map(serde_json::to_value)
-            .transpose()?
-            .filter(Value::is_object)
-            .unwrap_or_else(|| Value::Object(Map::new())))
+        crate::provider_config::provider_static_config_json(self, provider)
     }
 
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, LLMError> {
@@ -319,6 +320,7 @@ impl PluginRegistry {
         }
 
         if provider_cfg.locked {
+            #[cfg(feature = "extism_host")]
             if let Some(expected_signer) = provider_cfg.signer.as_deref()
                 && self.oci_downloader.trusted_github_repository() != Some(expected_signer)
             {
@@ -361,15 +363,22 @@ impl PluginRegistry {
                     provider_cfg.name, expected_kind, actual_kind
                 )));
             }
-            for feature in &provider_cfg.features {
+            let expected_feature =
+                expected_scalar_feature(&provider_cfg.features).map_err(|error| {
+                    LLMError::PluginError(format!(
+                        "Locked provider '{}' {error}",
+                        provider_cfg.name
+                    ))
+                })?;
+            if let Some(expected_feature) = expected_feature {
                 let actual = provider_plugin
                     .annotations
                     .get("mt.query.plugin.feature")
                     .map(String::as_str);
-                if actual != Some(feature.as_str()) {
+                if actual != Some(expected_feature) {
                     return Err(LLMError::PluginError(format!(
                         "Locked provider '{}' requires feature '{}', but artifact reports {:?}",
-                        provider_cfg.name, feature, actual
+                        provider_cfg.name, expected_feature, actual
                     )));
                 }
             }
@@ -483,11 +492,19 @@ impl ProviderResolver for PluginRegistry {
             .get(logical_name)
             .await
             .ok_or_else(|| LLMError::InvalidRequest(format!("Unknown provider: {logical_name}")))?;
+        let implementation_id = Some(
+            self.config
+                .providers
+                .iter()
+                .find(|provider| provider.name == logical_name)
+                .map(|provider| provider.path.clone())
+                .unwrap_or_else(|| format!("static:{}", factory.name())),
+        );
         Ok(ProviderBinding {
             logical_name: logical_name.to_string(),
             factory,
             static_config: self.static_config(logical_name)?,
-            implementation_id: None,
+            implementation_id,
         })
     }
 
@@ -501,6 +518,18 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn scalar_feature_contract_rejects_multiple_configured_features() {
+        assert_eq!(expected_scalar_feature(&[]).expect("empty features"), None);
+        assert_eq!(
+            expected_scalar_feature(&["cuda12.8".to_string()]).expect("single feature"),
+            Some("cuda12.8")
+        );
+        let error = expected_scalar_feature(&["cuda12.8".to_string(), "dflash2".to_string()])
+            .expect_err("multiple features must be rejected");
+        assert!(error.contains("one scalar feature tag"));
+    }
 
     fn unique_tmp_path(suffix: &str) -> PathBuf {
         let pid = std::process::id();

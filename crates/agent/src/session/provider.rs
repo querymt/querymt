@@ -105,6 +105,10 @@ impl SessionProvider {
         self
     }
 
+    pub(crate) fn provider_resolver(&self) -> Arc<dyn ProviderResolver> {
+        self.provider_resolver.clone()
+    }
+
     /// Set the agent identifier used for `{{ agent_id }}` in system prompt
     /// templates.  Call at build time before wrapping in `Arc`.
     pub fn with_agent_id(mut self, id: Option<String>) -> Self {
@@ -530,8 +534,6 @@ impl SessionProvider {
         let resolved_cfg = resolve_provider_config(
             &binding,
             &self.initial_config,
-            &factory,
-            provider_name,
             ProviderConfigMode::Runtime {
                 model,
                 params,

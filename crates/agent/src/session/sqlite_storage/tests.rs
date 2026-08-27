@@ -1,6 +1,7 @@
 use rusqlite::Connection;
 
 use crate::events::{AgentEventKind, EventOrigin};
+use crate::session::SessionError;
 use crate::session::domain::ForkOrigin;
 use crate::session::projection::{
     EventJournal, NewDurableEvent, RecentModelEntry, SessionScope, ViewStore,
@@ -303,6 +304,28 @@ async fn session_runtime_binding_round_trips_profile_and_delegate() {
             .as_deref(),
         Some("quorum")
     );
+
+    storage
+        .set_session_provider_lock(
+            "delegate-session",
+            Some("profile-sha"),
+            Some("lock-sha"),
+            Some("{}"),
+        )
+        .await
+        .expect("update existing provider lock");
+    let binding = storage
+        .get_session_runtime_binding("delegate-session")
+        .await
+        .expect("load updated binding")
+        .expect("updated binding");
+    assert_eq!(binding.provider_lock_digest.as_deref(), Some("lock-sha"));
+
+    let error = storage
+        .set_session_provider_lock("missing-session", None, Some("lock-sha"), None)
+        .await
+        .expect_err("missing binding must fail");
+    assert!(matches!(error, SessionError::SessionNotFound(id) if id == "missing-session"));
 }
 
 #[tokio::test]

@@ -137,13 +137,10 @@ pub fn provider_static_config_json(
         .unwrap_or_else(|| Value::Object(Map::new())))
 }
 
-pub fn resolve_registry_provider_config(
-    registry: &PluginRegistry,
-    provider_name: &str,
+fn apply_api_key_env_fallback(
+    builder: &mut ProviderConfigBuilder,
     factory: &dyn LLMProviderFactory,
-) -> Result<ResolvedProviderConfig, LLMError> {
-    let mut builder = ProviderConfigBuilder::from_registry_provider(registry, provider_name)?;
-
+) {
     if !builder.contains_non_empty_str("api_key")
         && let Some(http_factory) = factory.as_http()
         && let Some(env_var_name) = http_factory.api_key_name()
@@ -152,7 +149,15 @@ pub fn resolve_registry_provider_config(
     {
         builder.set_if_missing("api_key", Value::String(api_key));
     }
+}
 
+pub fn resolve_registry_provider_config(
+    registry: &PluginRegistry,
+    provider_name: &str,
+    factory: &dyn LLMProviderFactory,
+) -> Result<ResolvedProviderConfig, LLMError> {
+    let mut builder = ProviderConfigBuilder::from_registry_provider(registry, provider_name)?;
+    apply_api_key_env_fallback(&mut builder, factory);
     builder.prune_for_factory(factory)
 }
 
@@ -161,14 +166,7 @@ pub fn resolve_binding_provider_config(
 ) -> Result<ResolvedProviderConfig, LLMError> {
     let mut builder = ProviderConfigBuilder::from_binding(binding);
     let factory = binding.factory.as_ref();
-    if !builder.contains_non_empty_str("api_key")
-        && let Some(http_factory) = factory.as_http()
-        && let Some(env_var_name) = http_factory.api_key_name()
-        && let Ok(api_key) = env::var(&env_var_name)
-        && !api_key.trim().is_empty()
-    {
-        builder.set_if_missing("api_key", Value::String(api_key));
-    }
+    apply_api_key_env_fallback(&mut builder, factory);
     builder.prune_for_factory(factory)
 }
 
