@@ -1096,6 +1096,7 @@ pub(super) async fn transition_processing_tool_calls(
                 .map(|tool| tool.execution_class())
                 .unwrap_or(crate::tools::ToolExecutionClass::ParallelSafe);
             let result = super::tool_calls::execute_tool_call(config, call, exec_ctx, bridge).await;
+            let mut clarification_applied = false;
             match result {
                 Ok(tool_result) => {
                     if execution_class == crate::tools::ToolExecutionClass::ClarificationBoundary
@@ -1108,36 +1109,43 @@ pub(super) async fn transition_processing_tool_calls(
                             .collect::<Vec<_>>()
                             .join("\n");
                         if !clarification.trim().is_empty() {
-                            if let Some(objective) = exec_ctx.run_objective.as_mut() {
-                                objective.amend(crate::agent::objective::ObjectiveDirective {
-                                    text: clarification.clone(),
-                                    source: crate::agent::objective::ObjectiveSource::ClarificationAnswer,
-                                    source_ref: Some(call.id.clone()),
-                                    accepted_at_ms: None,
-                                    application_boundary: Some("clarification_boundary".to_string()),
-                                });
-                            }
                             let summary = exec_ctx
                                 .state
                                 .current_intent
                                 .as_ref()
                                 .map(|intent| intent.summary.clone())
                                 .unwrap_or_else(|| clarification.clone());
-                            if let Err(error) = exec_ctx
+                            match exec_ctx
                                 .state
                                 .update_intent_projection(
                                     summary,
                                     None,
-                                    Some(clarification),
+                                    Some(clarification.clone()),
                                     "clarification_answer".to_string(),
                                     Some(call.id.clone()),
                                 )
                                 .await
                             {
-                                warn!(
+                                Ok(_) => {
+                                    clarification_applied = true;
+                                    if let Some(objective) = exec_ctx.run_objective.as_mut() {
+                                        objective.amend(
+                                            crate::agent::objective::ObjectiveDirective {
+                                                text: clarification.clone(),
+                                                source: crate::agent::objective::ObjectiveSource::ClarificationAnswer,
+                                                source_ref: Some(call.id.clone()),
+                                                accepted_at_ms: None,
+                                                application_boundary: Some(
+                                                    "clarification_boundary".to_string(),
+                                                ),
+                                            },
+                                        );
+                                    }
+                                }
+                                Err(error) => warn!(
                                     "Failed to persist clarification intent projection for tool call {}: {}",
                                     call.id, error
-                                );
+                                ),
                             }
                         }
                     }
@@ -1158,7 +1166,9 @@ pub(super) async fn transition_processing_tool_calls(
                 unprocessed_start = Some(call_index + 1);
                 break;
             }
-            if execution_class == crate::tools::ToolExecutionClass::ClarificationBoundary {
+            if execution_class == crate::tools::ToolExecutionClass::ClarificationBoundary
+                && clarification_applied
+            {
                 unprocessed_start = Some(call_index + 1);
                 break;
             }

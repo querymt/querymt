@@ -1971,18 +1971,35 @@ async fn execute_prompt_detached(
     };
     let scheduled_task = match &exec_ctx.execution_origin {
         crate::agent::execution_context::ExecutionOrigin::Scheduled { task_public_id, .. } => {
-            exec_ctx
+            let task = exec_ctx
                 .state
                 .store
                 .get_task_for_session(&session_id, task_public_id)
                 .await
-                .map_err(|error| AgentError::Internal(error.to_string()))?
+                .map_err(AgentError::from)?
+                .ok_or_else(|| {
+                    AgentError::Internal(format!(
+                        "scheduled task not found in session: {task_public_id}"
+                    ))
+                })?;
+            if task.status != crate::session::domain::TaskStatus::Active {
+                return Err(AgentError::Internal(format!(
+                    "scheduled task is not active: {task_public_id}"
+                )));
+            }
+            exec_ctx.state.active_task = Some(task.clone());
+            Some(task)
         }
         crate::agent::execution_context::ExecutionOrigin::Interactive => None,
     };
-    let objective_task = scheduled_task
-        .as_ref()
-        .or(exec_ctx.state.active_task.as_ref());
+    let objective_task = match &exec_ctx.execution_origin {
+        crate::agent::execution_context::ExecutionOrigin::Scheduled { .. } => {
+            scheduled_task.as_ref()
+        }
+        crate::agent::execution_context::ExecutionOrigin::Interactive => {
+            exec_ctx.state.active_task.as_ref()
+        }
+    };
     let objective = crate::agent::objective::RunObjective::new(
         run_id.clone(),
         crate::agent::utils::render_prompt_for_llm(&req.prompt, Some(16 * 1024)),
