@@ -1,5 +1,8 @@
 use crate::error::LLMError;
-use crate::plugin::{LLMProviderFactory, host::PluginRegistry};
+use crate::plugin::{
+    LLMProviderFactory,
+    host::{PluginRegistry, ProviderBinding},
+};
 use serde_json::{Map, Value};
 use std::env;
 
@@ -36,6 +39,12 @@ impl ProviderConfigBuilder {
         Ok(Self {
             config: provider_static_config_json(registry, provider_name)?,
         })
+    }
+
+    pub fn from_binding(binding: &ProviderBinding) -> Self {
+        Self {
+            config: binding.static_config.clone(),
+        }
     }
 
     pub fn merge_value(&mut self, value: &Value, mode: ConfigOverrideMode) {
@@ -144,6 +153,22 @@ pub fn resolve_registry_provider_config(
         builder.set_if_missing("api_key", Value::String(api_key));
     }
 
+    builder.prune_for_factory(factory)
+}
+
+pub fn resolve_binding_provider_config(
+    binding: &ProviderBinding,
+) -> Result<ResolvedProviderConfig, LLMError> {
+    let mut builder = ProviderConfigBuilder::from_binding(binding);
+    let factory = binding.factory.as_ref();
+    if !builder.contains_non_empty_str("api_key")
+        && let Some(http_factory) = factory.as_http()
+        && let Some(env_var_name) = http_factory.api_key_name()
+        && let Ok(api_key) = env::var(&env_var_name)
+        && !api_key.trim().is_empty()
+    {
+        builder.set_if_missing("api_key", Value::String(api_key));
+    }
     builder.prune_for_factory(factory)
 }
 

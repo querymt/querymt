@@ -244,8 +244,22 @@ async fn fetch_catalog_models(
     provider_name: &str,
 ) -> Vec<ModelEntry> {
     let registry = config.provider.plugin_registry();
+    let binding =
+        match querymt::plugin::host::ProviderResolver::resolve(registry.as_ref(), provider_name)
+            .await
+        {
+            Ok(binding) => binding,
+            Err(err) => {
+                log::debug!(
+                    "fetch_catalog_models: skipping provider='{}' because resolution failed: {}",
+                    provider_name,
+                    err
+                );
+                return Vec::new();
+            }
+        };
     let resolved = match resolve_provider_config(
-        &registry,
+        &binding,
         config.provider.initial_config(),
         factory,
         provider_name,

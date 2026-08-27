@@ -86,6 +86,18 @@ impl LLMProviderFactory for LlamaCppFactory {
 
 #[cfg(feature = "native")]
 #[unsafe(no_mangle)]
+pub extern "C" fn querymt_plugin_api() -> u32 {
+    1
+}
+
+#[cfg(feature = "native")]
+#[unsafe(no_mangle)]
+pub extern "C" fn querymt_plugin_name() -> *const std::os::raw::c_char {
+    c"llama_cpp".as_ptr()
+}
+
+#[cfg(feature = "native")]
+#[unsafe(no_mangle)]
 // SAFETY: While trait objects aren't technically FFI-safe, this is a well-established
 // plugin pattern where both sides of the FFI boundary are Rust code compiled with the
 // same ABI. The host process will cast this back to `Box<dyn LLMProviderFactory>` using

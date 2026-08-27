@@ -8,8 +8,12 @@ use crate::config::{Config, load_config};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+#[cfg(feature = "plugin-loaders")]
+use querymt::dynamic::PluginRegistryDynamicExt;
+use querymt::plugin::host::{PluginConfig, PluginRegistry, ProviderConfig};
 use rust_embed::RustEmbed;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
@@ -65,13 +69,45 @@ pub struct ProfileMetadata {
 }
 
 /// Optional top-level `[profile]` TOML metadata used only by local catalogs.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileProviderMode {
+    #[default]
+    Legacy,
+    Overlay,
+    Locked,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileProviderRequirement {
+    pub artifact: String,
+    pub factory: String,
+    #[serde(default = "default_native_provider_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub plugin_api: Option<u32>,
+    #[serde(default)]
+    pub features: Vec<String>,
+    #[serde(default)]
+    pub signer: Option<String>,
+}
+
+fn default_native_provider_kind() -> String {
+    "native".to_string()
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProfileFileMetadata {
     pub id: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default, rename = "provider_mode")]
+    pub provider_mode: ProfileProviderMode,
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProfileProviderRequirement>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -83,6 +119,8 @@ struct ProfileMetadataEnvelope {
 #[derive(Debug)]
 pub struct ProfileDocument {
     pub metadata: ProfileMetadata,
+    pub provider_mode: ProfileProviderMode,
+    pub providers: BTreeMap<String, ProfileProviderRequirement>,
     pub config: Config,
 }
 
@@ -98,12 +136,32 @@ pub struct SessionProfileBinding {
     pub profile_fingerprint: Option<String>,
     pub profile_source: Option<String>,
     pub profile_config_kind: Option<String>,
+    pub provider_lock_digest: Option<String>,
+    pub provider_locks_json: Option<String>,
 }
 
 /// Materialized runtime for a selected profile.
 pub struct ProfileRuntime {
     pub metadata: ProfileMetadata,
     pub agent: Agent,
+    pub provider_lock: Option<ResolvedProfileProviderLock>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedProviderLockEntry {
+    pub logical_name: String,
+    pub factory: String,
+    pub artifact: String,
+    pub kind: String,
+    pub plugin_api: Option<u32>,
+    pub features: Vec<String>,
+    pub signer: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolvedProfileProviderLock {
+    pub digest: String,
+    pub providers: BTreeMap<String, ResolvedProviderLockEntry>,
 }
 
 impl ProfileRuntime {
@@ -116,7 +174,12 @@ impl ProfileRuntime {
     }
 
     pub fn session_binding(&self) -> SessionProfileBinding {
-        self.metadata.session_binding()
+        let mut binding = self.metadata.session_binding();
+        if let Some(lock) = &self.provider_lock {
+            binding.provider_lock_digest = Some(lock.digest.clone());
+            binding.provider_locks_json = serde_json::to_string(lock).ok();
+        }
+        binding
     }
 
     pub fn session_handle(
@@ -140,6 +203,8 @@ impl ProfileMetadata {
             profile_config_kind: self
                 .config_kind
                 .map(|kind| kind.storage_label().to_string()),
+            provider_lock_digest: None,
+            provider_locks_json: None,
         }
     }
 }
@@ -469,6 +534,28 @@ impl LocalProfileCatalog {
         })
     }
 
+    async fn load_profile_file_metadata(
+        &self,
+        metadata: &ProfileMetadata,
+    ) -> Result<ProfileFileMetadata> {
+        let content = match &metadata.source {
+            ProfileSource::Embedded { key } if key == DEFAULT_EMBEDDED_PROFILE_KEY => {
+                std::fs::read_to_string(DEFAULT_EMBEDDED_PROFILE_PATH)?
+            }
+            ProfileSource::EmbeddedToml { key } => self
+                .embedded_toml_profiles
+                .get(key)
+                .ok_or_else(|| anyhow!("Unknown embedded TOML profile '{key}'"))?
+                .toml
+                .clone(),
+            ProfileSource::LocalPath { path } => std::fs::read_to_string(path)?,
+            ProfileSource::Embedded { key } => {
+                return Err(anyhow!("Unknown embedded profile '{key}'"));
+            }
+        };
+        Ok(parse_profile_file_metadata(&content)?.unwrap_or_default())
+    }
+
     async fn load_metadata_source(&self, metadata: &ProfileMetadata) -> Result<Config> {
         match &metadata.source {
             ProfileSource::Embedded { key } if key == DEFAULT_EMBEDDED_PROFILE_KEY => {
@@ -573,16 +660,122 @@ impl ProfileCatalog for LocalProfileCatalog {
         match matches.as_slice() {
             [] => Err(anyhow!("Profile '{id}' was not found")),
             [metadata] => {
+                let profile_spec = self.load_profile_file_metadata(metadata).await?;
                 let config = self.load_metadata_source(metadata).await?;
+                validate_profile_provider_requirements(
+                    &metadata.id,
+                    profile_spec.provider_mode,
+                    &profile_spec.providers,
+                    &config,
+                )?;
                 let mut metadata = metadata.clone();
                 metadata.config_kind = Some(ProfileConfigKind::from_config(&config));
-                Ok(ProfileDocument { metadata, config })
+                Ok(ProfileDocument {
+                    metadata,
+                    provider_mode: profile_spec.provider_mode,
+                    providers: profile_spec.providers,
+                    config,
+                })
             }
             _ => Err(anyhow!(
                 "Duplicate profile id '{id}' found; rename one [profile].id or local TOML filename"
             )),
         }
     }
+}
+
+fn validate_profile_provider_requirements(
+    profile_id: &str,
+    mode: ProfileProviderMode,
+    providers: &BTreeMap<String, ProfileProviderRequirement>,
+    config: &Config,
+) -> Result<()> {
+    for (logical_name, requirement) in providers {
+        if logical_name.trim().is_empty() || requirement.factory.trim().is_empty() {
+            return Err(anyhow!(
+                "Profile '{profile_id}' has a provider requirement with an empty name or factory"
+            ));
+        }
+        let Some(reference) = requirement.artifact.strip_prefix("oci://") else {
+            return Err(anyhow!(
+                "Profile '{profile_id}' provider '{logical_name}' must use an oci:// artifact"
+            ));
+        };
+        let Some((_, digest)) = reference.rsplit_once("@sha256:") else {
+            return Err(anyhow!(
+                "Profile '{profile_id}' provider '{logical_name}' must pin an immutable @sha256 digest"
+            ));
+        };
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(anyhow!(
+                "Profile '{profile_id}' provider '{logical_name}' has an invalid SHA-256 digest"
+            ));
+        }
+        if !matches!(requirement.kind.as_str(), "native" | "wasm") {
+            return Err(anyhow!(
+                "Profile '{profile_id}' provider '{logical_name}' has unsupported kind '{}'",
+                requirement.kind
+            ));
+        }
+    }
+
+    let references = profile_provider_references(config);
+    if mode == ProfileProviderMode::Locked {
+        for (path, provider) in references {
+            if !providers.contains_key(&provider) {
+                return Err(anyhow!(
+                    "Profile '{profile_id}' is locked, but {path} refers to undeclared provider '{provider}'"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn profile_provider_references(config: &Config) -> Vec<(String, String)> {
+    let mut references = Vec::new();
+    match config {
+        Config::Single(config) => {
+            references.push(("agent.provider".to_string(), config.agent.provider.clone()));
+            if let Some(provider) = &config.agent.execution.compaction.provider {
+                references.push((
+                    "agent.execution.compaction.provider".to_string(),
+                    provider.clone(),
+                ));
+            }
+        }
+        Config::Multi(config) => {
+            references.push((
+                "planner.provider".to_string(),
+                config.planner.provider.clone(),
+            ));
+            if let Some(provider) = &config.planner.execution.compaction.provider {
+                references.push((
+                    "planner.execution.compaction.provider".to_string(),
+                    provider.clone(),
+                ));
+            }
+            for (index, delegate) in config.delegates.iter().enumerate() {
+                references.push((
+                    format!("delegates[{index}].provider"),
+                    delegate.provider.clone(),
+                ));
+                if let Some(provider) = &delegate.execution.compaction.provider {
+                    references.push((
+                        format!("delegates[{index}].execution.compaction.provider"),
+                        provider.clone(),
+                    ));
+                }
+            }
+            if let Some(summary) = &config.quorum.delegation_summary {
+                references.push((
+                    "quorum.delegation_summary.provider".to_string(),
+                    summary.provider.clone(),
+                ));
+            }
+        }
+    }
+    references
 }
 
 impl ProfileConfigKind {
@@ -858,8 +1051,8 @@ where
             warn!(session_id, profile_id = %binding.profile_id, "session profile binding is memory-only because shared storage is unavailable");
             return;
         };
-        if let Err(err) = storage
-            .session_store()
+        let store = storage.session_store();
+        if let Err(err) = store
             .set_session_runtime_binding(
                 &session_id,
                 &binding.profile_id,
@@ -868,6 +1061,16 @@ where
             .await
         {
             warn!(session_id, profile_id = %binding.profile_id, error = %err, "failed to persist session profile binding");
+        } else if let Err(err) = store
+            .set_session_provider_lock(
+                &session_id,
+                binding.profile_fingerprint.as_deref(),
+                binding.provider_lock_digest.as_deref(),
+                binding.provider_locks_json.as_deref(),
+            )
+            .await
+        {
+            warn!(session_id, profile_id = %binding.profile_id, error = %err, "failed to persist session provider lock");
         }
     }
 
@@ -899,7 +1102,21 @@ where
             }
         };
         let mut binding = runtime.session_binding();
+        if let Some(expected) = route.provider_lock_digest.as_deref()
+            && binding.provider_lock_digest.as_deref() != Some(expected)
+        {
+            warn!(
+                session_id,
+                profile_id = route.profile_id,
+                expected_provider_lock = expected,
+                current_provider_lock = ?binding.provider_lock_digest,
+                "refusing to resume session with a different profile provider lock"
+            );
+            return None;
+        }
         binding.agent_id = route.agent_id;
+        binding.profile_fingerprint = route.profile_fingerprint.or(binding.profile_fingerprint);
+        binding.provider_locks_json = route.provider_locks_json.or(binding.provider_locks_json);
         self.session_bindings
             .lock()
             .await
@@ -1069,9 +1286,18 @@ impl ProfileRuntimeManager<Arc<dyn ProfileCatalog>> {
 
 async fn build_profile_runtime(
     document: ProfileDocument,
-    shared_infra: AgentInfra,
+    mut shared_infra: AgentInfra,
 ) -> Result<ProfileRuntime> {
     let metadata = document.metadata;
+    let provider_lock =
+        resolved_profile_provider_lock(document.provider_mode, &document.providers)?;
+    if document.provider_mode != ProfileProviderMode::Legacy {
+        shared_infra.plugin_registry = provision_profile_registry(
+            document.provider_mode,
+            &document.providers,
+            shared_infra.plugin_registry.clone(),
+        )?;
+    }
     let agent = match document.config {
         Config::Single(config) => {
             Agent::from_single_config_with_infra(*config, shared_infra).await?
@@ -1091,7 +1317,82 @@ async fn build_profile_runtime(
         }
     };
 
-    Ok(ProfileRuntime { metadata, agent })
+    Ok(ProfileRuntime {
+        metadata,
+        agent,
+        provider_lock,
+    })
+}
+
+fn resolved_profile_provider_lock(
+    mode: ProfileProviderMode,
+    providers: &BTreeMap<String, ProfileProviderRequirement>,
+) -> Result<Option<ResolvedProfileProviderLock>> {
+    if mode == ProfileProviderMode::Legacy {
+        return Ok(None);
+    }
+    let entries = providers
+        .iter()
+        .map(|(logical_name, requirement)| {
+            (
+                logical_name.clone(),
+                ResolvedProviderLockEntry {
+                    logical_name: logical_name.clone(),
+                    factory: requirement.factory.clone(),
+                    artifact: requirement.artifact.clone(),
+                    kind: requirement.kind.clone(),
+                    plugin_api: requirement.plugin_api,
+                    features: requirement.features.clone(),
+                    signer: requirement.signer.clone(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let canonical = serde_json::to_vec(&entries)?;
+    Ok(Some(ResolvedProfileProviderLock {
+        digest: format!("sha256:{}", hex::encode(Sha256::digest(canonical))),
+        providers: entries,
+    }))
+}
+
+fn provision_profile_registry(
+    mode: ProfileProviderMode,
+    providers: &BTreeMap<String, ProfileProviderRequirement>,
+    global: Arc<PluginRegistry>,
+) -> Result<Arc<PluginRegistry>> {
+    let mut entries = providers
+        .iter()
+        .map(|(logical_name, requirement)| ProviderConfig {
+            name: logical_name.clone(),
+            path: requirement.artifact.clone(),
+            config: None,
+            locked: true,
+            factory: Some(requirement.factory.clone()),
+            plugin_api: requirement.plugin_api,
+            kind: Some(requirement.kind.clone()),
+            features: requirement.features.clone(),
+            signer: requirement.signer.clone(),
+        })
+        .collect::<Vec<_>>();
+    if mode == ProfileProviderMode::Overlay {
+        entries.extend(
+            global
+                .config
+                .providers
+                .iter()
+                .filter(|entry| !providers.contains_key(&entry.name))
+                .cloned(),
+        );
+    }
+    let config = PluginConfig {
+        providers: entries,
+        #[cfg(feature = "plugin-loaders")]
+        oci: global.config.oci.clone(),
+    };
+    let registry = PluginRegistry::from_config_with_cache_path(config, global.cache_path.clone())?;
+    #[cfg(feature = "plugin-loaders")]
+    let registry = registry.with_dynamic_loaders();
+    Ok(Arc::new(registry))
 }
 
 fn should_reload_profiles(event: &notify::Event) -> bool {
@@ -1258,6 +1559,83 @@ mod tests {
             Err(LLMError::ProviderError(message)) => message,
             other => panic!("expected provider error from mesh lookup; got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn locked_profile_requires_declared_digest_pinned_provider() {
+        let content = r#"
+[profile]
+id = "locked"
+provider_mode = "locked"
+
+[profile.providers.llama_cpp]
+artifact = "oci://ghcr.io/querymt/llama-cpp@sha256:35b306b544905162426a5a6f23f6676a0fe2f846fd7bc82e394c5fa83f01b45f"
+factory = "llama_cpp"
+kind = "native"
+features = ["cuda12.8"]
+
+[agent]
+provider = "llama_cpp"
+model = "model.gguf"
+"#;
+        let metadata = parse_profile_file_metadata(content)
+            .expect("metadata")
+            .expect("profile");
+        let config =
+            crate::config::load_config(crate::config::ConfigSource::Toml(content.to_string()))
+                .await
+                .expect("config");
+        validate_profile_provider_requirements(
+            "locked",
+            metadata.provider_mode,
+            &metadata.providers,
+            &config,
+        )
+        .expect("valid locked profile");
+    }
+
+    #[test]
+    fn locked_profile_rejects_mutable_tag_and_undeclared_provider() {
+        let config = Config::Single(Box::new(
+            toml::from_str::<crate::config::SingleAgentConfig>(
+                "[agent]\nprovider = \"llama_cpp\"\nmodel = \"model.gguf\"",
+            )
+            .expect("config"),
+        ));
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "other".to_string(),
+            ProfileProviderRequirement {
+                artifact: "oci://ghcr.io/querymt/llama-cpp:latest".to_string(),
+                factory: "llama_cpp".to_string(),
+                kind: "native".to_string(),
+                plugin_api: None,
+                features: Vec::new(),
+                signer: None,
+            },
+        );
+        let error = validate_profile_provider_requirements(
+            "locked",
+            ProfileProviderMode::Locked,
+            &providers,
+            &config,
+        )
+        .expect_err("tag must be rejected");
+        assert!(error.to_string().contains("immutable @sha256"));
+
+        providers.clear();
+        let error = validate_profile_provider_requirements(
+            "locked",
+            ProfileProviderMode::Locked,
+            &providers,
+            &config,
+        )
+        .expect_err("undeclared provider must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("undeclared provider 'llama_cpp'")
+        );
     }
 
     #[test]

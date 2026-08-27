@@ -629,6 +629,27 @@ impl SessionStore for SqliteStorage {
         .await
     }
 
+    async fn set_session_provider_lock(
+        &self,
+        session_id: &str,
+        profile_fingerprint: Option<&str>,
+        provider_lock_digest: Option<&str>,
+        provider_locks_json: Option<&str>,
+    ) -> SessionResult<()> {
+        let session_id = session_id.to_string();
+        let profile_fingerprint = profile_fingerprint.map(str::to_string);
+        let provider_lock_digest = provider_lock_digest.map(str::to_string);
+        let provider_locks_json = provider_locks_json.map(str::to_string);
+        self.run_blocking(move |conn| {
+            conn.execute(
+                "UPDATE profile_bindings SET profile_fingerprint = ?2, provider_lock_digest = ?3, provider_locks_json = ?4 WHERE session_id = ?1",
+                params![session_id, profile_fingerprint, provider_lock_digest, provider_locks_json],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn get_profile_binding(&self, session_id: &str) -> SessionResult<Option<String>> {
         let session_id = session_id.to_string();
         self.run_blocking(move |conn| {
@@ -649,12 +670,15 @@ impl SessionStore for SqliteStorage {
         let session_id = session_id.to_string();
         self.run_blocking(move |conn| {
             conn.query_row(
-                "SELECT profile_id, agent_id FROM profile_bindings WHERE session_id = ?1",
+                "SELECT profile_id, agent_id, profile_fingerprint, provider_lock_digest, provider_locks_json FROM profile_bindings WHERE session_id = ?1",
                 params![session_id],
                 |row| {
                     Ok(crate::session::store::SessionRuntimeBinding {
                         profile_id: row.get(0)?,
                         agent_id: row.get(1)?,
+                        profile_fingerprint: row.get(2)?,
+                        provider_lock_digest: row.get(3)?,
+                        provider_locks_json: row.get(4)?,
                     })
                 },
             )

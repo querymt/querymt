@@ -18,6 +18,9 @@ use time::OffsetDateTime;
 pub struct SessionRuntimeBinding {
     pub profile_id: String,
     pub agent_id: Option<String>,
+    pub profile_fingerprint: Option<String>,
+    pub provider_lock_digest: Option<String>,
+    pub provider_locks_json: Option<String>,
 }
 
 /// A bookmark for a remote session — enough metadata to re-discover and
@@ -281,6 +284,17 @@ pub trait SessionStore: Send + Sync {
         profile_id: &str,
         agent_id: Option<&str>,
     ) -> SessionResult<()>;
+
+    /// Persist the exact provider lock used by a profile-owned session.
+    async fn set_session_provider_lock(
+        &self,
+        _session_id: &str,
+        _profile_fingerprint: Option<&str>,
+        _provider_lock_digest: Option<&str>,
+        _provider_locks_json: Option<&str>,
+    ) -> SessionResult<()> {
+        Ok(())
+    }
 
     /// Retrieve the profile namespace for compatibility with profile ownership checks.
     async fn get_profile_binding(&self, session_id: &str) -> SessionResult<Option<String>>;

@@ -2,10 +2,14 @@ use crate::{LLMBuilder, builder::BoundRegistry, error::LLMError, plugin::LLMProv
 use async_trait::async_trait;
 use futures::lock::Mutex;
 use futures::stream::{FuturesUnordered, StreamExt};
+use serde_json::{Map, Value};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+};
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
@@ -22,6 +26,30 @@ pub enum PluginType {
 pub struct ProviderPlugin {
     pub plugin_type: PluginType,
     pub file_path: PathBuf,
+    /// Immutable OCI manifest digest when the plugin came from an OCI artifact.
+    pub manifest_digest: Option<String>,
+    /// SHA-256 of the extracted plugin file, used to detect cache tampering.
+    pub file_sha256: Option<String>,
+    /// OCI annotations from the selected platform manifest.
+    pub annotations: BTreeMap<String, String>,
+}
+
+#[derive(Clone)]
+pub struct ProviderBinding {
+    pub logical_name: String,
+    pub factory: Arc<dyn LLMProviderFactory>,
+    pub static_config: Value,
+    /// Reproducible implementation identity for profile-pinned providers.
+    pub implementation_id: Option<String>,
+}
+
+#[async_trait]
+pub trait ProviderResolver: Send + Sync {
+    async fn resolve(&self, logical_name: &str) -> Result<ProviderBinding, LLMError>;
+
+    fn allows_remote_fallback(&self) -> bool {
+        true
+    }
 }
 
 #[async_trait]
@@ -53,9 +81,23 @@ pub struct PluginRegistry {
     pub oci_downloader: Arc<oci::OciDownloader>,
     pub config: config::PluginConfig,
     pub cache_path: PathBuf,
+    allow_remote_fallback: bool,
 }
 
 impl PluginRegistry {
+    fn static_config(&self, provider: &str) -> Result<Value, LLMError> {
+        Ok(self
+            .config
+            .providers
+            .iter()
+            .find(|entry| entry.name == provider)
+            .and_then(|entry| entry.config.as_ref())
+            .map(serde_json::to_value)
+            .transpose()?
+            .filter(Value::is_object)
+            .unwrap_or_else(|| Value::Object(Map::new())))
+    }
+
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, LLMError> {
         let config =
             PluginConfig::from_path(path).map_err(|e| LLMError::PluginError(e.to_string()))?;
@@ -92,6 +134,7 @@ impl PluginRegistry {
         std::fs::create_dir_all(&cache_path)
             .map_err(|e| LLMError::InvalidRequest(format!("{:#}", e)))?;
 
+        let allow_remote_fallback = !config.providers.iter().any(|provider| provider.locked);
         Ok(PluginRegistry {
             loaders: HashMap::new(),
             factories: RwLock::new(HashMap::new()),
@@ -100,6 +143,7 @@ impl PluginRegistry {
             oci_downloader: Arc::new(oci::OciDownloader::new(config.oci.clone())),
             config,
             cache_path,
+            allow_remote_fallback,
         })
     }
 
@@ -120,6 +164,7 @@ impl PluginRegistry {
                 oci: None,
             },
             cache_path: PathBuf::new(),
+            allow_remote_fallback: true,
         }
     }
 
@@ -267,6 +312,66 @@ impl PluginRegistry {
             provider_plugin = ProviderPlugin {
                 plugin_type,
                 file_path: file_path.to_path_buf(),
+                manifest_digest: None,
+                file_sha256: None,
+                annotations: BTreeMap::new(),
+            }
+        }
+
+        if provider_cfg.locked {
+            if let Some(expected_signer) = provider_cfg.signer.as_deref()
+                && self.oci_downloader.trusted_github_repository() != Some(expected_signer)
+            {
+                return Err(LLMError::PluginError(format!(
+                    "Locked provider '{}' requires signer '{}', but the host trust policy allows {:?}",
+                    provider_cfg.name,
+                    expected_signer,
+                    self.oci_downloader.trusted_github_repository()
+                )));
+            }
+            let expected_digest = provider_cfg
+                .path
+                .rsplit_once("@sha256:")
+                .map(|(_, digest)| format!("sha256:{digest}"))
+                .ok_or_else(|| {
+                    LLMError::PluginError(format!(
+                        "Locked provider '{}' must use an immutable @sha256 OCI reference",
+                        provider_cfg.name
+                    ))
+                })?;
+            if provider_plugin.manifest_digest.as_deref() != Some(expected_digest.as_str()) {
+                return Err(LLMError::PluginError(format!(
+                    "Locked provider '{}' resolved digest {:?}, expected '{}'",
+                    provider_cfg.name, provider_plugin.manifest_digest, expected_digest
+                )));
+            }
+            let expected_kind = provider_cfg.kind.as_deref().ok_or_else(|| {
+                LLMError::PluginError(format!(
+                    "Locked provider '{}' is missing an expected plugin kind",
+                    provider_cfg.name
+                ))
+            })?;
+            let actual_kind = match provider_plugin.plugin_type {
+                PluginType::Native => "native",
+                PluginType::Wasm => "wasm",
+            };
+            if expected_kind != actual_kind {
+                return Err(LLMError::PluginError(format!(
+                    "Locked provider '{}' expected kind '{}', but artifact contains '{}'",
+                    provider_cfg.name, expected_kind, actual_kind
+                )));
+            }
+            for feature in &provider_cfg.features {
+                let actual = provider_plugin
+                    .annotations
+                    .get("mt.query.plugin.feature")
+                    .map(String::as_str);
+                if actual != Some(feature.as_str()) {
+                    return Err(LLMError::PluginError(format!(
+                        "Locked provider '{}' requires feature '{}', but artifact reports {:?}",
+                        provider_cfg.name, feature, actual
+                    )));
+                }
             }
         }
 
@@ -371,6 +476,26 @@ impl PluginRegistry {
     }
 }
 
+#[async_trait]
+impl ProviderResolver for PluginRegistry {
+    async fn resolve(&self, logical_name: &str) -> Result<ProviderBinding, LLMError> {
+        let factory = self
+            .get(logical_name)
+            .await
+            .ok_or_else(|| LLMError::InvalidRequest(format!("Unknown provider: {logical_name}")))?;
+        Ok(ProviderBinding {
+            logical_name: logical_name.to_string(),
+            factory,
+            static_config: self.static_config(logical_name)?,
+            implementation_id: None,
+        })
+    }
+
+    fn allows_remote_fallback(&self) -> bool {
+        self.allow_remote_fallback
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,6 +584,12 @@ mod tests {
                 name: "local-plugin".to_string(),
                 path: "/some/local/plugin.wasm".to_string(),
                 config: None,
+                locked: false,
+                factory: None,
+                plugin_api: None,
+                kind: None,
+                features: Vec::new(),
+                signer: None,
             }],
             oci: None,
         };
@@ -480,6 +611,12 @@ mod tests {
                 name: "fake-plugin".to_string(),
                 path: "oci://localhost:9999/fake/image:latest".to_string(),
                 config: None,
+                locked: false,
+                factory: None,
+                plugin_api: None,
+                kind: None,
+                features: Vec::new(),
+                signer: None,
             }],
             oci: None,
         };

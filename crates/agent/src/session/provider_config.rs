@@ -3,7 +3,7 @@ use crate::session::error::SessionError;
 use querymt::LLMParams;
 use querymt::error::LLMError;
 use querymt::plugin::LLMProviderFactory;
-use querymt::plugin::host::PluginRegistry;
+use querymt::plugin::host::ProviderBinding;
 use querymt::provider_config::{
     ConfigOverrideMode, ProviderConfigBuilder,
     ResolvedProviderConfig as SharedResolvedProviderConfig,
@@ -88,13 +88,13 @@ fn missing_credentials_error(provider_name: &str, env_var_name: Option<&str>) ->
 }
 
 pub(crate) async fn resolve_provider_config(
-    registry: &PluginRegistry,
+    binding: &ProviderBinding,
     initial_config: &LLMParams,
     factory: &Arc<dyn LLMProviderFactory>,
     provider_name: &str,
     mode: ProviderConfigMode<'_>,
 ) -> Result<ResolvedProviderConfig, SessionError> {
-    let mut builder = ProviderConfigBuilder::from_registry_provider(registry, provider_name)?;
+    let mut builder = ProviderConfigBuilder::from_binding(binding);
     let mut use_oauth_resolver = false;
 
     match mode {
@@ -218,7 +218,7 @@ mod tests {
     use querymt::chat::{ChatMessage, ChatResponse, Tool};
     use querymt::completion::{CompletionRequest, CompletionResponse};
     use querymt::error::LLMError;
-    use querymt::plugin::host::PluginRegistry;
+    use querymt::plugin::host::{PluginRegistry, ProviderBinding};
     use querymt::plugin::{HTTPLLMProviderFactory, LLMProviderFactory};
     use std::sync::Arc;
 
@@ -316,6 +316,18 @@ mod tests {
         registry
     }
 
+    fn binding(registry: &PluginRegistry, factory: Arc<dyn LLMProviderFactory>) -> ProviderBinding {
+        ProviderBinding {
+            logical_name: "xiaomi".to_string(),
+            factory,
+            static_config: querymt::provider_config::provider_static_config_json(
+                registry, "xiaomi",
+            )
+            .expect("static config"),
+            implementation_id: None,
+        }
+    }
+
     fn adapted_factory(
         api_key_name: Option<&str>,
         schema: &'static str,
@@ -339,8 +351,9 @@ mod tests {
             r#"{"properties":{"base_url":{},"api_key":{}}}"#,
         );
 
+        let binding = binding(&registry, factory.clone());
         let resolved = resolve_provider_config(
-            &registry,
+            &binding,
             &initial,
             &factory,
             "xiaomi",
@@ -375,8 +388,9 @@ mod tests {
 
         #[cfg(feature = "oauth")]
         {
+            let binding = binding(&registry, factory.clone());
             let resolved = resolve_provider_config(
-                &registry,
+                &binding,
                 &initial,
                 &factory,
                 "xiaomi",
@@ -393,8 +407,9 @@ mod tests {
 
         #[cfg(not(feature = "oauth"))]
         {
+            let binding = binding(&registry, factory.clone());
             let _ = resolve_provider_config(
-                &registry,
+                &binding,
                 &initial,
                 &factory,
                 "xiaomi",
@@ -416,8 +431,9 @@ mod tests {
             r#"{"properties":{"api_key":{},"model":{}}}"#,
         );
 
+        let binding = binding(&registry, factory.clone());
         let resolved = resolve_provider_config(
-            &registry,
+            &binding,
             &initial,
             &factory,
             "xiaomi",

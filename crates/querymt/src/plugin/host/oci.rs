@@ -22,6 +22,7 @@ use sigstore::errors::SigstoreVerifyConstraintsError;
 use sigstore::registry::{Auth, OciReference};
 use sigstore::trust::sigstore::SigstoreTrustRoot;
 use sigstore::trust::{ManualTrustRoot, TrustRoot};
+use std::collections::BTreeMap;
 use std::env::consts::{ARCH, OS};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -98,6 +99,11 @@ struct CacheMetadata {
     filename: String,
     /// The discovered plugin type, e.g., "native" or "extism"
     plugin_type_str: String,
+    /// SHA-256 of the extracted plugin file.
+    #[serde(default)]
+    file_sha256: Option<String>,
+    #[serde(default)]
+    annotations: BTreeMap<String, String>,
     /// When this metadata was last updated
     retrieved_at_unix: u64,
 }
@@ -534,6 +540,11 @@ fn persist_with_fallback(
     }
 }
 
+fn sha256_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let bytes = fs::read(path)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
 fn load_from_cache(
     meta: &CacheMetadata,
     blob_path: &Path,
@@ -543,10 +554,25 @@ fn load_from_cache(
         "native" => PluginType::Native,
         _ => return Err("Invalid plugin type in cache metadata".into()),
     };
+    let file_sha256 = sha256_file(blob_path)?;
+    if let Some(expected) = &meta.file_sha256
+        && expected != &file_sha256
+    {
+        return Err(format!(
+            "cached OCI plugin integrity check failed for {}: expected {}, got {}",
+            blob_path.display(),
+            expected,
+            file_sha256
+        )
+        .into());
+    }
 
     Ok(ProviderPlugin {
         plugin_type,
         file_path: blob_path.to_path_buf(),
+        manifest_digest: Some(meta.manifest_digest.clone()),
+        file_sha256: Some(file_sha256),
+        annotations: meta.annotations.clone(),
     })
 }
 
@@ -640,6 +666,10 @@ impl OciDownloader {
             config: config.unwrap_or_default(),
             trust_root: tokio::sync::OnceCell::new(),
         }
+    }
+
+    pub fn trusted_github_repository(&self) -> Option<&str> {
+        self.config.github_workflow_repository.as_deref()
     }
 
     /// Returns a reference to the cached trust root, initializing it on first
@@ -887,6 +917,7 @@ impl OciDownloader {
 
                 log::debug!("Populated OCI blob cache at: {}", blob_path.display());
 
+                let file_sha256 = sha256_file(&blob_path)?;
                 let new_metadata = CacheMetadata {
                     manifest_digest: live_digest.to_string(),
                     filename: filename.clone(),
@@ -894,6 +925,8 @@ impl OciDownloader {
                         PluginType::Wasm => "extism".to_string(),
                         PluginType::Native => "native".to_string(),
                     },
+                    file_sha256: Some(file_sha256.clone()),
+                    annotations: image_manifest.annotations.clone().unwrap_or_default(),
                     retrieved_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
                 };
                 fs::write(metadata_path, serde_json::to_vec(&new_metadata)?)?;
@@ -909,6 +942,9 @@ impl OciDownloader {
                 Ok(ProviderPlugin {
                     plugin_type: discovered_type,
                     file_path: blob_path,
+                    manifest_digest: Some(live_digest.to_string()),
+                    file_sha256: Some(file_sha256),
+                    annotations: image_manifest.annotations.clone().unwrap_or_default(),
                 })
             }
             Err(e) => {
@@ -1069,6 +1105,8 @@ mod tests {
             manifest_digest: "sha256:abc".to_string(),
             filename: "plugin.wasm".to_string(),
             plugin_type_str: "extism".to_string(),
+            file_sha256: None,
+            annotations: BTreeMap::new(),
             retrieved_at_unix: 1234567890,
         };
 
@@ -1088,6 +1126,8 @@ mod tests {
             manifest_digest: "sha256:def".to_string(),
             filename: "plugin.so".to_string(),
             plugin_type_str: "native".to_string(),
+            file_sha256: None,
+            annotations: BTreeMap::new(),
             retrieved_at_unix: 1234567890,
         };
 
@@ -1107,6 +1147,8 @@ mod tests {
             manifest_digest: "sha256:ghi".to_string(),
             filename: "plugin".to_string(),
             plugin_type_str: "invalid".to_string(),
+            file_sha256: None,
+            annotations: BTreeMap::new(),
             retrieved_at_unix: 1234567890,
         };
 
@@ -1130,6 +1172,8 @@ mod tests {
             manifest_digest: "sha256:test123".to_string(),
             filename: "test.wasm".to_string(),
             plugin_type_str: "extism".to_string(),
+            file_sha256: None,
+            annotations: BTreeMap::new(),
             retrieved_at_unix: 1234567890,
         };
 

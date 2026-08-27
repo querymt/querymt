@@ -10,6 +10,7 @@ use crate::{
 use async_trait::async_trait;
 use libloading::Library;
 use std::ffi::CStr;
+use std::os::raw::c_char;
 use std::path::Path;
 use std::sync::Arc;
 #[cfg(feature = "tracing")]
@@ -89,6 +90,10 @@ unsafe extern "C" fn host_log_callback(
     log::log!(target: target_str, log_level, "{}", message_str);
 }
 
+pub const NATIVE_PLUGIN_API: u32 = 1;
+type PluginApiFn = unsafe extern "C" fn() -> u32;
+type PluginNameFn = unsafe extern "C" fn() -> *const c_char;
+
 pub struct NativeLoader;
 
 #[async_trait]
@@ -109,7 +114,13 @@ impl PluginLoader for NativeLoader {
             plugin.file_path.display()
         );
 
-        let provider = self.load_library(&plugin_cfg.name, &plugin.file_path)?;
+        let expected_name = plugin_cfg.factory.as_deref().unwrap_or(&plugin_cfg.name);
+        let provider = self.load_library(
+            expected_name,
+            &plugin.file_path,
+            plugin_cfg.locked,
+            plugin_cfg.plugin_api,
+        )?;
         Ok(provider)
     }
 }
@@ -119,10 +130,48 @@ impl NativeLoader {
         &self,
         name: &str,
         path: &Path,
+        locked: bool,
+        required_api: Option<u32>,
     ) -> Result<Arc<dyn LLMProviderFactory>, LLMError> {
         let lib = unsafe {
             Arc::new(Library::new(path).map_err(|e| LLMError::PluginError(format!("{:#}", e)))?)
         };
+
+        if let Some(required_api) = required_api {
+            unsafe {
+                let api = lib.get::<PluginApiFn>(b"querymt_plugin_api").map_err(|_| {
+                    LLMError::PluginError(format!(
+                        "Locked native plugin {} does not export querymt_plugin_api",
+                        path.display()
+                    ))
+                })?;
+                if required_api != NATIVE_PLUGIN_API || api() != required_api {
+                    return Err(LLMError::PluginError(format!(
+                        "Locked native plugin {} uses API {}, profile requires {}, host supports {}",
+                        path.display(),
+                        api(),
+                        required_api,
+                        NATIVE_PLUGIN_API
+                    )));
+                }
+                let plugin_name =
+                    lib.get::<PluginNameFn>(b"querymt_plugin_name")
+                        .map_err(|_| {
+                            LLMError::PluginError(format!(
+                                "Locked native plugin {} does not export querymt_plugin_name",
+                                path.display()
+                            ))
+                        })?;
+                let ptr = plugin_name();
+                if ptr.is_null() || CStr::from_ptr(ptr).to_string_lossy() != name {
+                    return Err(LLMError::PluginError(format!(
+                        "Locked native plugin {} descriptor does not match expected factory '{}'",
+                        path.display(),
+                        name
+                    )));
+                }
+            }
+        }
 
         let factory: Box<dyn LLMProviderFactory> = unsafe {
             if let Ok(async_ctor) = lib.get::<FactoryCtor>(b"plugin_factory") {
@@ -155,6 +204,14 @@ impl NativeLoader {
 
         let factory_name = factory.name();
         if factory_name != name {
+            if locked {
+                return Err(LLMError::PluginError(format!(
+                    "Locked plugin name mismatch in {}: expected '{}', but plugin reports '{}'",
+                    path.display(),
+                    name,
+                    factory_name
+                )));
+            }
             log::warn!(
                 "Plugin name mismatch in {}: config name is '{}', but plugin reports '{}'. Using config name.",
                 path.display(),

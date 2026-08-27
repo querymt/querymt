@@ -9,18 +9,31 @@ use std::{
 #[cfg(feature = "extism_host")]
 use super::oci::OciDownloaderConfig;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PluginConfig {
     pub providers: Vec<ProviderConfig>,
     #[cfg(feature = "extism_host")]
     pub oci: Option<OciDownloaderConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
     pub path: String,
     pub config: Option<HashMap<String, toml::Value>>,
+    /// Locked entries come from a profile and must match the expected implementation.
+    #[serde(default)]
+    pub locked: bool,
+    #[serde(default)]
+    pub factory: Option<String>,
+    #[serde(default)]
+    pub plugin_api: Option<u32>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub features: Vec<String>,
+    #[serde(default)]
+    pub signer: Option<String>,
 }
 
 impl PluginConfig {
