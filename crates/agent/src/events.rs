@@ -186,6 +186,7 @@ pub enum AgentEventKind {
         #[typeshare(serialized_as = "number")]
         revision: u64,
         source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         source_ref: Option<String>,
     },
     ObjectiveUpdated {
@@ -193,18 +194,19 @@ pub enum AgentEventKind {
         #[typeshare(serialized_as = "number")]
         revision: u64,
         source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         source_ref: Option<String>,
     },
     ObjectiveCheckpoint {
         run_id: String,
         reason: String,
         action: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         #[typeshare(serialized_as = "Option<number>")]
         objective_revision: Option<u64>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         current_task_id: Option<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         #[typeshare(serialized_as = "Option<number>")]
         current_task_revision: Option<u64>,
     },

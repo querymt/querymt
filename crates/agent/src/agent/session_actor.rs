@@ -2235,6 +2235,7 @@ mod tests {
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
     use crate::session::backend::StorageBackend;
+    use crate::session::domain::IntentSnapshot;
     use crate::session::runtime::RuntimeContext;
     use crate::session::store::SessionStore;
     use crate::test_utils::{
@@ -2246,6 +2247,7 @@ mod tests {
     use querymt::error::{LLMErrorPayload, ProviderErrorKind, ProviderFailure};
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
 
@@ -2256,6 +2258,7 @@ mod tests {
         actor_ref: kameo::actor::ActorRef<SessionActor>,
         _session_id: String,
         _temp_dir: tempfile::TempDir,
+        intent_writes: Arc<AtomicUsize>,
     }
 
     impl ActorFixture {
@@ -2302,6 +2305,8 @@ mod tests {
             let llm_config = mock_llm_config();
             let session = mock_session(session_id);
             let mut store = MockSessionStore::new();
+            let intent_writes = Arc::new(AtomicUsize::new(0));
+            let current_intent = Arc::new(std::sync::Mutex::new(None));
             let session_clone = session.clone();
             store
                 .expect_get_session()
@@ -2341,6 +2346,25 @@ mod tests {
                 .expect_list_sessions()
                 .returning(|| Ok(vec![]))
                 .times(0..);
+            let writes_for_create = intent_writes.clone();
+            let intent_for_create = current_intent.clone();
+            store
+                .expect_create_intent_snapshot()
+                .returning(move |snapshot| {
+                    writes_for_create.fetch_add(1, Ordering::SeqCst);
+                    *intent_for_create.lock().expect("intent lock") = Some(snapshot);
+                    Ok(())
+                })
+                .times(0..);
+            let intent_for_get = current_intent.clone();
+            store
+                .expect_get_current_intent_snapshot()
+                .returning(move |_| Ok(intent_for_get.lock().expect("intent lock").clone()))
+                .times(0..);
+            store
+                .expect_set_current_intent_snapshot()
+                .returning(|_, _| Ok(()))
+                .times(0..);
 
             let mock_storage = Arc::new(
                 crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
@@ -2376,8 +2400,106 @@ mod tests {
                 actor_ref,
                 _session_id: session_id.to_string(),
                 _temp_dir: temp_dir,
+                intent_writes,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn intent_projection_initializes_summary_without_next_step() {
+        let fixture = ActorFixture::new().await;
+        let mut exec_ctx = fixture.execution_context("test-session").await;
+
+        maybe_update_session_intent(
+            &fixture.config,
+            "test-session",
+            &mut exec_ctx,
+            "Implement the fix",
+            "message-1",
+        )
+        .await
+        .expect("update intent projection");
+
+        let intent = exec_ctx.state.current_intent.expect("current intent");
+        assert_eq!(intent.summary, "Implement the fix");
+        assert_eq!(intent.next_step_hint, None);
+        assert_eq!(fixture.intent_writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn intent_projection_preserves_summary_and_updates_next_step() {
+        let fixture = ActorFixture::new().await;
+        let mut exec_ctx = fixture.execution_context("test-session").await;
+        exec_ctx.state.current_intent = Some(IntentSnapshot {
+            id: 1,
+            session_id: 1,
+            task_id: None,
+            summary: "Implement the fix".to_string(),
+            constraints: None,
+            next_step_hint: None,
+            revision: 1,
+            source: "user_prompt".to_string(),
+            source_ref: Some("message-1".to_string()),
+            created_at: time::OffsetDateTime::now_utc(),
+        });
+
+        maybe_update_session_intent(
+            &fixture.config,
+            "test-session",
+            &mut exec_ctx,
+            "Also add integration tests",
+            "message-2",
+        )
+        .await
+        .expect("update intent projection");
+
+        let intent = exec_ctx.state.current_intent.expect("current intent");
+        assert_eq!(intent.summary, "Implement the fix");
+        assert_eq!(
+            intent.next_step_hint.as_deref(),
+            Some("Also add integration tests")
+        );
+        assert_eq!(fixture.intent_writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn intent_projection_skips_duplicate_summary_and_next_step() {
+        let fixture = ActorFixture::new().await;
+        let mut exec_ctx = fixture.execution_context("test-session").await;
+        exec_ctx.state.current_intent = Some(IntentSnapshot {
+            id: 1,
+            session_id: 1,
+            task_id: None,
+            summary: "Implement the fix".to_string(),
+            constraints: None,
+            next_step_hint: Some("Continue".to_string()),
+            revision: 2,
+            source: "user_prompt".to_string(),
+            source_ref: Some("message-2".to_string()),
+            created_at: time::OffsetDateTime::now_utc(),
+        });
+
+        for duplicate in ["Implement the fix", "Continue"] {
+            maybe_update_session_intent(
+                &fixture.config,
+                "test-session",
+                &mut exec_ctx,
+                duplicate,
+                "duplicate-message",
+            )
+            .await
+            .expect("skip duplicate projection");
+        }
+
+        assert_eq!(fixture.intent_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            exec_ctx
+                .state
+                .current_intent
+                .as_ref()
+                .and_then(|intent| intent.next_step_hint.as_deref()),
+            Some("Continue")
+        );
     }
 
     #[tokio::test]

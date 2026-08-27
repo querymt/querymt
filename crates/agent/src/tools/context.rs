@@ -45,7 +45,7 @@ pub trait ToolContext: Send + Sync {
         Some(self.session_id().to_string())
     }
 
-    /// Optional knowledge store access for knowledge tools.
+    /// Optional session-scoped task lifecycle access for task tools.
     fn task_service(&self) -> Option<crate::session::TaskService> {
         None
     }

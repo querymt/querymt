@@ -5,48 +5,6 @@ use log::{debug, trace};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-/// Middleware that auto-completes tasks when:
-/// 1. Agent's last turn had no tool calls
-/// 2. All delegations for the task are complete or failed (if any exist)
-/// 3. Task is still in Active status
-///
-/// NOTE: Primary task completion is now handled in `transition_after_llm` when
-/// `FinishReason::Stop` is received. This middleware serves as a fallback for
-/// cases where finish_reason is not available or unknown.
-pub struct TaskAutoCompletionMiddleware {
-    _store: Arc<dyn SessionStore>,
-}
-
-impl TaskAutoCompletionMiddleware {
-    pub fn new(store: Arc<dyn SessionStore>) -> Self {
-        debug!("Creating TaskAutoCompletionMiddleware");
-        Self { _store: store }
-    }
-}
-
-#[async_trait]
-impl MiddlewareDriver for TaskAutoCompletionMiddleware {
-    async fn on_after_llm(
-        &self,
-        state: ExecutionState,
-        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        trace!(
-            "TaskAutoCompletionMiddleware is observational; explicit complete_task controls completion for state {}",
-            state.name()
-        );
-        Ok(state)
-    }
-
-    fn reset(&self) {
-        trace!("TaskAutoCompletionMiddleware::reset");
-    }
-
-    fn name(&self) -> &'static str {
-        "TaskAutoCompletionMiddleware"
-    }
-}
-
 /// Middleware that detects and warns about duplicate/repetitive tool calls
 /// Helps prevent agents from calling the same tool repeatedly with identical arguments
 pub struct DuplicateToolCallMiddleware {
@@ -173,24 +131,6 @@ mod tests {
     use super::*;
     use crate::test_utils::mocks::MockSessionStore;
 
-    // ── TaskAutoCompletionMiddleware ─────────────────────────────────────────
-
-    #[test]
-    fn task_auto_completion_name() {
-        let mut mock = MockSessionStore::new();
-        mock.expect_get_session().never();
-        let m = TaskAutoCompletionMiddleware::new(Arc::new(mock));
-        assert_eq!(m.name(), "TaskAutoCompletionMiddleware");
-    }
-
-    #[test]
-    fn task_auto_completion_reset_does_not_panic() {
-        let mut mock = MockSessionStore::new();
-        mock.expect_get_session().never();
-        let m = TaskAutoCompletionMiddleware::new(Arc::new(mock));
-        m.reset();
-    }
-
     // ── DuplicateToolCallMiddleware ──────────────────────────────────────────
 
     #[test]
@@ -214,25 +154,6 @@ mod tests {
         m.reset();
         let cache = m.last_check.lock();
         assert!(cache.is_empty(), "reset() should clear the cache");
-    }
-
-    #[tokio::test]
-    async fn task_auto_completion_passes_through_non_after_llm_state() {
-        let mut mock = MockSessionStore::new();
-        mock.expect_get_session().never();
-        let m = TaskAutoCompletionMiddleware::new(Arc::new(mock));
-
-        use crate::middleware::{AgentStats, ConversationContext, ExecutionState};
-        let ctx = Arc::new(ConversationContext::new(
-            "sess-1".into(),
-            Arc::from([]),
-            Arc::new(AgentStats::default()),
-            "mock".into(),
-            "mock-model".into(),
-        ));
-        let state = ExecutionState::BeforeLlmCall { context: ctx };
-        let result = m.on_after_llm(state, None).await;
-        assert!(result.is_ok());
     }
 
     #[tokio::test]

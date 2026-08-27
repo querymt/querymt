@@ -39,6 +39,9 @@ fn map_task_lifecycle_error(error: SessionError) -> SessionError {
         SessionError::DatabaseError(message) if message.contains("invalid_task_transition") => {
             SessionError::InvalidOperation("invalid task status transition".to_string())
         }
+        SessionError::DatabaseError(message) if message.contains("current_task_conflict") => {
+            SessionError::InvalidOperation("a different current task already exists".to_string())
+        }
         SessionError::DatabaseError(message) if message.contains("Query returned no rows") => {
             SessionError::TaskNotFound("task is not owned by this session".to_string())
         }
@@ -1023,11 +1026,10 @@ impl SessionStore for SqliteStorage {
                 "task update reason is required".to_string(),
             ));
         }
-        let session_id = session_id.to_string();
+        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
         let task_id = task_id.to_string();
         self.run_blocking(move |conn| {
             let tx = conn.transaction()?;
-            let session_internal_id: i64 = tx.query_row("SELECT id FROM sessions WHERE public_id = ?1", params![session_id], |row| row.get(0))?;
             let current = tx.query_row(
                 "SELECT id, public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, revision, creation_key, completion_evidence, completed_at, created_at, updated_at FROM tasks WHERE public_id = ?1 AND session_id = ?2",
                 params![task_id, session_internal_id], map_task_row,
@@ -1090,12 +1092,11 @@ impl SessionStore for SqliteStorage {
                 "completion evidence is required".to_string(),
             ));
         }
-        let session_id = session_id.to_string();
+        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
         let task_id = task_id.to_string();
         let evidence = completion_evidence.to_string();
         self.run_blocking(move |conn| {
             let tx = conn.transaction()?;
-            let session_internal_id: i64 = tx.query_row("SELECT id FROM sessions WHERE public_id = ?1", params![session_id], |row| row.get(0))?;
             let current = tx.query_row(
                 "SELECT id, public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, revision, creation_key, completion_evidence, completed_at, created_at, updated_at FROM tasks WHERE public_id = ?1 AND session_id = ?2",
                 params![task_id, session_internal_id], map_task_row,

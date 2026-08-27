@@ -38,9 +38,7 @@ pub use limits::{
     LimitsConfig, LimitsMiddleware, MaxStepsMiddleware, PriceLimitMiddleware, TurnLimitMiddleware,
 };
 pub use presets::MiddlewarePresets;
-pub use specialized::{
-    AgentModeMiddleware, DuplicateToolCallMiddleware, TaskAutoCompletionMiddleware,
-};
+pub use specialized::{AgentModeMiddleware, DuplicateToolCallMiddleware};
 
 #[cfg(test)]
 mod driver_tests;

@@ -1084,12 +1084,23 @@ pub(super) async fn transition_processing_tool_calls(
             exec_ctx.session_id
         );
         let mut all_results = (**results).to_vec();
-        let mut skipped_after_clarification = None;
+        let mut unprocessed_start = if already_cancelled { Some(0) } else { None };
+        let mut cancelled = already_cancelled;
         for (call_index, call) in remaining_calls.iter().enumerate() {
+            if already_cancelled {
+                break;
+            }
+            let execution_class = config
+                .tool_registry
+                .find(&call.function.name)
+                .map(|tool| tool.execution_class())
+                .unwrap_or(crate::tools::ToolExecutionClass::ParallelSafe);
             let result = super::tool_calls::execute_tool_call(config, call, exec_ctx, bridge).await;
             match result {
                 Ok(tool_result) => {
-                    if call.function.name == "question" && !tool_result.is_error {
+                    if execution_class == crate::tools::ToolExecutionClass::ClarificationBoundary
+                        && !tool_result.is_error
+                    {
                         let clarification = tool_result
                             .content
                             .iter()
@@ -1112,7 +1123,7 @@ pub(super) async fn transition_processing_tool_calls(
                                 .as_ref()
                                 .map(|intent| intent.summary.clone())
                                 .unwrap_or_else(|| clarification.clone());
-                            exec_ctx
+                            if let Err(error) = exec_ctx
                                 .state
                                 .update_intent_projection(
                                     summary,
@@ -1121,7 +1132,13 @@ pub(super) async fn transition_processing_tool_calls(
                                     "clarification_answer".to_string(),
                                     Some(call.id.clone()),
                                 )
-                                .await?;
+                                .await
+                            {
+                                warn!(
+                                    "Failed to persist clarification intent projection for tool call {}: {}",
+                                    call.id, error
+                                );
+                            }
                         }
                     }
                     all_results.push(tool_result)
@@ -1137,50 +1154,56 @@ pub(super) async fn transition_processing_tool_calls(
                 )),
             }
             if exec_ctx.cancellation_token.is_cancelled() {
+                cancelled = true;
+                unprocessed_start = Some(call_index + 1);
                 break;
             }
-            if config
-                .tool_registry
-                .find(&call.function.name)
-                .is_some_and(|tool| {
-                    matches!(
-                        tool.execution_class(),
-                        crate::tools::ToolExecutionClass::ClarificationBoundary
-                    )
-                })
-            {
-                skipped_after_clarification = Some(call_index + 1);
+            if execution_class == crate::tools::ToolExecutionClass::ClarificationBoundary {
+                unprocessed_start = Some(call_index + 1);
                 break;
             }
         }
-        if let Some(start) = skipped_after_clarification {
+        if let Some(start) = unprocessed_start {
             for call in remaining_calls.iter().skip(start) {
+                let message = if cancelled {
+                    "Error: Cancelled by user"
+                } else {
+                    "Skipped because a user clarification changed the run objective; the model must reconsider this action."
+                };
                 all_results.push(ToolResult::new(
                     call.id.clone(),
-                    vec![querymt::chat::Content::text(
-                        "Skipped because a user clarification changed the run objective; the model must reconsider this action."
-                            .to_string(),
-                    )],
+                    vec![querymt::chat::Content::text(message.to_string())],
                     true,
                     Some(call.function.name.clone()),
                     Some(call.function.arguments.clone()),
                 ));
             }
         }
-        exec_ctx.state.load_working_context().await?;
-        if let Some(objective) = exec_ctx.run_objective.as_mut() {
-            objective.set_task(
-                exec_ctx.state.active_task.as_ref(),
-                crate::agent::objective::ObjectiveSource::TaskUpdated,
-            );
+        match exec_ctx.state.load_working_context().await {
+            Ok(()) => {
+                if let Some(objective) = exec_ctx.run_objective.as_mut() {
+                    objective.set_task(
+                        exec_ctx.state.active_task.as_ref(),
+                        crate::agent::objective::ObjectiveSource::TaskUpdated,
+                    );
+                }
+            }
+            Err(error) => warn!(
+                "Failed to refresh working context after serial tool execution: {}",
+                error
+            ),
         }
-        return super::tool_calls::store_all_tool_results(
+        let next_state = super::tool_calls::store_all_tool_results(
             config,
             &Arc::from(all_results.into_boxed_slice()),
             context,
             exec_ctx,
         )
-        .await;
+        .await?;
+        if cancelled {
+            return Ok(ExecutionState::Cancelled);
+        }
+        return Ok(next_state);
     }
 
     debug!(

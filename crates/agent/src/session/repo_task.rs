@@ -161,29 +161,7 @@ impl TaskRepository for SqliteTaskRepository {
             conn.query_row(
                 "SELECT id, public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, revision, creation_key, completion_evidence, completed_at, created_at, updated_at FROM tasks WHERE public_id = ?",
                 params![task_id_str],
-                |row| {
-                    let kind_str: String = row.get(3)?;
-                    let status_str: String = row.get(4)?;
-                    let completed_at_str: Option<String> = row.get(10)?;
-                    let created_at_str: String = row.get(11)?;
-                    let updated_at_str: String = row.get(12)?;
-
-                    Ok(Task {
-                        id: row.get(0)?,
-                        public_id: row.get(1)?,
-                        session_id: row.get(2)?,
-                        kind: TaskKind::from_str(&kind_str).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                        status: TaskStatus::from_str(&status_str).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                        expected_deliverable: row.get(5)?,
-                        acceptance_criteria: row.get(6)?,
-                        revision: row.get::<_, i64>(7)? as u64,
-                        creation_key: row.get(8)?,
-                        completion_evidence: row.get(9)?,
-                        completed_at: completed_at_str.map(|value| OffsetDateTime::parse(&value, &time::format_description::well_known::Rfc3339).map_err(|_| rusqlite::Error::InvalidQuery)).transpose()?,
-                        created_at: OffsetDateTime::parse(&created_at_str, &time::format_description::well_known::Rfc3339).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                        updated_at: OffsetDateTime::parse(&updated_at_str, &time::format_description::well_known::Rfc3339).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    })
-                },
+                map_task_row,
             )
             .optional()
         })
@@ -205,29 +183,7 @@ impl TaskRepository for SqliteTaskRepository {
             let mut stmt = conn.prepare(
                 "SELECT id, public_id, session_id, kind, status, expected_deliverable, acceptance_criteria, revision, creation_key, completion_evidence, completed_at, created_at, updated_at FROM tasks WHERE session_id = ? ORDER BY created_at ASC",
             )?;
-            let tasks_iter = stmt.query_map(params![internal_id], |row| {
-                let kind_str: String = row.get(3)?;
-                let status_str: String = row.get(4)?;
-                let completed_at_str: Option<String> = row.get(10)?;
-                let created_at_str: String = row.get(11)?;
-                let updated_at_str: String = row.get(12)?;
-
-                Ok(Task {
-                    id: row.get(0)?,
-                    public_id: row.get(1)?,
-                    session_id: row.get(2)?,
-                    kind: TaskKind::from_str(&kind_str).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    status: TaskStatus::from_str(&status_str).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    expected_deliverable: row.get(5)?,
-                    acceptance_criteria: row.get(6)?,
-                    revision: row.get::<_, i64>(7)? as u64,
-                    creation_key: row.get(8)?,
-                    completion_evidence: row.get(9)?,
-                    completed_at: completed_at_str.map(|value| OffsetDateTime::parse(&value, &time::format_description::well_known::Rfc3339).map_err(|_| rusqlite::Error::InvalidQuery)).transpose()?,
-                    created_at: OffsetDateTime::parse(&created_at_str, &time::format_description::well_known::Rfc3339).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    updated_at: OffsetDateTime::parse(&updated_at_str, &time::format_description::well_known::Rfc3339).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                })
-            })?;
+            let tasks_iter = stmt.query_map(params![internal_id], map_task_row)?;
 
             tasks_iter.collect::<Result<Vec<_>, _>>()
         })

@@ -92,6 +92,16 @@ pub struct RunObjective {
 }
 
 impl RunObjective {
+    fn disposition_for_task(task: Option<&Task>) -> CompletionDisposition {
+        match task.map(|task| task.status) {
+            Some(TaskStatus::Active) => CompletionDisposition::Active,
+            Some(TaskStatus::Paused) => CompletionDisposition::Paused,
+            Some(TaskStatus::Done) => CompletionDisposition::Completed,
+            Some(TaskStatus::Cancelled) => CompletionDisposition::Cancelled,
+            None => CompletionDisposition::Untracked,
+        }
+    }
+
     pub fn new(
         run_id: String,
         instruction: String,
@@ -99,12 +109,8 @@ impl RunObjective {
         current_task: Option<&Task>,
         historical_intent: Option<IntentSnapshot>,
     ) -> Self {
+        let completion_disposition = Self::disposition_for_task(current_task);
         let current_task = current_task.map(TaskCommitment::from);
-        let completion_disposition = if current_task.is_some() {
-            CompletionDisposition::Active
-        } else {
-            CompletionDisposition::Untracked
-        };
         Self {
             run_id,
             revision: 1,
@@ -135,13 +141,7 @@ impl RunObjective {
 
     pub fn set_task(&mut self, task: Option<&Task>, source: ObjectiveSource) {
         self.current_task = task.map(TaskCommitment::from);
-        self.completion_disposition = match task.map(|task| task.status) {
-            Some(TaskStatus::Active) => CompletionDisposition::Active,
-            Some(TaskStatus::Paused) => CompletionDisposition::Paused,
-            Some(TaskStatus::Done) => CompletionDisposition::Completed,
-            Some(TaskStatus::Cancelled) => CompletionDisposition::Cancelled,
-            None => CompletionDisposition::Untracked,
-        };
+        self.completion_disposition = Self::disposition_for_task(task);
         self.revision = self.revision.saturating_add(1);
         self.amendments.push(ObjectiveAmendment {
             revision: self.revision,
