@@ -181,10 +181,42 @@ pub enum AgentEventKind {
         input_id: String,
         run_id: String,
     },
+    ObjectiveInitialized {
+        run_id: String,
+        #[typeshare(serialized_as = "number")]
+        revision: u64,
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_ref: Option<String>,
+    },
+    ObjectiveUpdated {
+        run_id: String,
+        #[typeshare(serialized_as = "number")]
+        revision: u64,
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_ref: Option<String>,
+    },
     ObjectiveCheckpoint {
         run_id: String,
         reason: String,
         action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        objective_revision: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_task_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        current_task_revision: Option<u64>,
+    },
+    TaskCompletionGuardTriggered {
+        run_id: String,
+        task_id: String,
+    },
+    TaskCompletionGuardExhausted {
+        run_id: String,
+        task_id: String,
     },
     AssistantMessageStored {
         content: String,

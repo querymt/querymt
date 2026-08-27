@@ -892,6 +892,9 @@ mod node_manager_tests {
                 summary: "Remote title from snapshot".to_string(),
                 constraints: None,
                 next_step_hint: None,
+                revision: 1,
+                source: "test".to_string(),
+                source_ref: None,
                 created_at: time::OffsetDateTime::now_utc(),
             })
             .await

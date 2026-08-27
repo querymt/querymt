@@ -81,7 +81,10 @@ impl RuntimeContext {
         self.session_internal_id = Some(session.id);
 
         if let Some(task_id) = session.active_task_id {
-            self.active_task = self.load_task_by_internal_id(task_id).await?;
+            self.active_task = self
+                .load_task_by_internal_id(task_id)
+                .await?
+                .filter(|task| matches!(task.status, TaskStatus::Active));
         } else {
             self.active_task = None;
         }
@@ -108,6 +111,24 @@ impl RuntimeContext {
         constraints: Option<String>,
         next_step_hint: Option<String>,
     ) -> SessionResult<IntentSnapshot> {
+        self.update_intent_projection(
+            summary,
+            constraints,
+            next_step_hint,
+            "legacy".to_string(),
+            None,
+        )
+        .await
+    }
+
+    pub async fn update_intent_projection(
+        &mut self,
+        summary: String,
+        constraints: Option<String>,
+        next_step_hint: Option<String>,
+        source: String,
+        source_ref: Option<String>,
+    ) -> SessionResult<IntentSnapshot> {
         let session_internal_id = self.ensure_session_internal_id().await?;
 
         let snapshot = IntentSnapshot {
@@ -117,6 +138,13 @@ impl RuntimeContext {
             summary,
             constraints,
             next_step_hint,
+            revision: self
+                .current_intent
+                .as_ref()
+                .map_or(0, |intent| intent.revision)
+                .saturating_add(1),
+            source,
+            source_ref,
             created_at: OffsetDateTime::now_utc(),
         };
 
@@ -155,6 +183,10 @@ impl RuntimeContext {
             status: TaskStatus::Active,
             expected_deliverable,
             acceptance_criteria,
+            revision: 1,
+            creation_key: None,
+            completion_evidence: None,
+            completed_at: None,
             created_at: OffsetDateTime::now_utc(),
             updated_at: OffsetDateTime::now_utc(),
         };
@@ -498,6 +530,9 @@ impl SessionForkHelper {
                 "This is a forked session. Focus on the fork instructions.".to_string(),
             ),
             next_step_hint: None,
+            revision: 1,
+            source: "fork".to_string(),
+            source_ref: None,
             created_at: OffsetDateTime::now_utc(),
         };
 

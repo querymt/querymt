@@ -47,7 +47,7 @@ tools = [
   "knowledge_stats",
 
   # Task tracking
-  "create_task", "todowrite", "todoread",
+  "create_task", "read_task", "update_task", "complete_task", "todowrite", "todoread",
 ]
 
 system = [

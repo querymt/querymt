@@ -2,6 +2,7 @@
 
 use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::core::{AgentMode, SessionRuntime, ToolConfig};
+use crate::agent::objective::RunObjective;
 use crate::knowledge::KnowledgeStore;
 use crate::model::AgentMessage;
 use crate::session::error::SessionResult;
@@ -28,6 +29,8 @@ pub enum ExecutionOrigin {
     Scheduled {
         /// Public ID of the schedule that triggered this execution.
         schedule_public_id: String,
+        /// Public ID of the recurring task that triggered this execution.
+        task_public_id: String,
     },
 }
 
@@ -84,10 +87,8 @@ pub(crate) struct ExecutionContext {
     pub turn_mode: AgentMode,
     /// Inbox bound to this run for boundary-safe steering.
     pub steering: Option<Arc<crate::agent::turn_control::SteeringInbox>>,
-    /// Original complete prompt, retained for objective anchoring.
-    pub initial_prompt: Vec<crate::acp::protocol::ContentBlock>,
-    /// Latest steering summaries applied during this run.
-    pub steering_summaries: Vec<String>,
+    /// The single source of instruction authority for this run.
+    pub run_objective: Option<RunObjective>,
     /// Reports execution phase changes back to the owning session actor.
     pub phase_reporter:
         Option<tokio::sync::mpsc::UnboundedSender<crate::agent::turn_control::RunPhase>>,
@@ -118,8 +119,7 @@ impl ExecutionContext {
             turn_id: None,
             turn_mode: AgentMode::Build,
             steering: None,
-            initial_prompt: Vec::new(),
-            steering_summaries: Vec::new(),
+            run_objective: None,
             phase_reporter: None,
             suspended_delegations: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         }
@@ -176,8 +176,8 @@ impl ExecutionContext {
         self
     }
 
-    pub fn with_initial_prompt(mut self, prompt: Vec<crate::acp::protocol::ContentBlock>) -> Self {
-        self.initial_prompt = prompt;
+    pub fn with_run_objective(mut self, objective: RunObjective) -> Self {
+        self.run_objective = Some(objective);
         self
     }
 

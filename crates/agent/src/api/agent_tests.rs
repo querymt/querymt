@@ -363,6 +363,9 @@ async fn acp_list_sessions_orders_by_updated_at_and_paginates() -> Result<()> {
             summary: "This title comes from the initial intent snapshot and should be truncated if it gets too long for the ACP session list".to_string(),
             constraints: None,
             next_step_hint: None,
+            revision: 1,
+            source: "test".to_string(),
+            source_ref: None,
             created_at: time::OffsetDateTime::now_utc(),
         })
         .await?;

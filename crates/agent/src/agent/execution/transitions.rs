@@ -17,7 +17,6 @@ use crate::middleware::{
     calculate_context_tokens,
 };
 use crate::model::{AgentMessage, MessagePart};
-use crate::session::domain::{TaskKind, TaskStatus};
 use anyhow::Context as _;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
@@ -928,6 +927,7 @@ pub(super) async fn transition_after_llm(
     messages.push(assistant_msg.to_chat_message());
 
     let mut updated_stats = (*context.stats).clone();
+    updated_stats.steps += 1;
     if let Some(token_usage) = &response.usage {
         updated_stats.total_input_tokens += token_usage.input_tokens as u64;
         updated_stats.total_output_tokens += token_usage.output_tokens as u64;
@@ -935,7 +935,6 @@ pub(super) async fn transition_after_llm(
         updated_stats.cache_read_tokens += token_usage.cache_read as u64;
         updated_stats.cache_write_tokens += token_usage.cache_write as u64;
         updated_stats.context_tokens = calculate_context_tokens(Some(token_usage)) as usize;
-        updated_stats.steps += 1;
 
         if let Some(pricing) = exec_ctx.session_handle.get_pricing() {
             updated_stats.update_costs(&pricing);
@@ -969,37 +968,9 @@ pub(super) async fn transition_after_llm(
             }
         }
 
-        Some(FinishReason::Stop) => {
-            if let Some(task) = exec_ctx.state.active_task.as_ref() {
-                match task.kind {
-                    TaskKind::Recurring => {
-                        // Do NOT mark Done. The SchedulerActor handles cycle
-                        // completion and next_run_at computation. The task stays
-                        // Active so the next scheduled cycle can re-use it.
-                        debug!(
-                            "Recurring task {} cycle completed (not marking Done)",
-                            task.public_id
-                        );
-                    }
-                    TaskKind::Finite => {
-                        if let Err(e) = exec_ctx.state.update_task_status(TaskStatus::Done).await {
-                            debug!("Failed to auto-complete finite task on stop: {}", e);
-                        } else if let Some(task) = exec_ctx.state.active_task.clone() {
-                            config.emit_event(
-                                &exec_ctx.session_id,
-                                AgentEventKind::TaskStatusChanged { task },
-                            );
-                        }
-                    }
-                    TaskKind::Evolving => {
-                        debug!("Evolving task remains active after an ordinary model stop");
-                    }
-                }
-            }
-            Ok(ExecutionState::Complete {
-                context: new_context,
-            })
-        }
+        Some(FinishReason::Stop) => Ok(ExecutionState::Complete {
+            context: new_context,
+        }),
 
         Some(FinishReason::Length) => Ok(ExecutionState::Stopped {
             message: "Model hit token limit".into(),
@@ -1090,6 +1061,156 @@ pub(super) async fn transition_processing_tool_calls(
                 .await?;
 
         if already_cancelled {
+            return Ok(ExecutionState::Cancelled);
+        }
+        return Ok(next_state);
+    }
+
+    let requires_serial = remaining_calls.iter().any(|call| {
+        config
+            .tool_registry
+            .find(&call.function.name)
+            .is_some_and(|tool| {
+                !matches!(
+                    tool.execution_class(),
+                    crate::tools::ToolExecutionClass::ParallelSafe
+                )
+            })
+    });
+    if requires_serial {
+        debug!(
+            "Executing {} stateful tool calls serially for session {}",
+            remaining_calls.len(),
+            exec_ctx.session_id
+        );
+        let mut all_results = (**results).to_vec();
+        let mut unprocessed_start = if already_cancelled { Some(0) } else { None };
+        let mut cancelled = already_cancelled;
+        for (call_index, call) in remaining_calls.iter().enumerate() {
+            if already_cancelled {
+                break;
+            }
+            let execution_class = config
+                .tool_registry
+                .find(&call.function.name)
+                .map(|tool| tool.execution_class())
+                .unwrap_or(crate::tools::ToolExecutionClass::ParallelSafe);
+            let result = super::tool_calls::execute_tool_call(config, call, exec_ctx, bridge).await;
+            let mut clarification_applied = false;
+            match result {
+                Ok(tool_result) => {
+                    if execution_class == crate::tools::ToolExecutionClass::ClarificationBoundary
+                        && !tool_result.is_error
+                    {
+                        let clarification = tool_result
+                            .content
+                            .iter()
+                            .filter_map(|block| block.as_text())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !clarification.trim().is_empty() {
+                            let summary = exec_ctx
+                                .state
+                                .current_intent
+                                .as_ref()
+                                .map(|intent| intent.summary.clone())
+                                .unwrap_or_else(|| clarification.clone());
+                            match exec_ctx
+                                .state
+                                .update_intent_projection(
+                                    summary,
+                                    None,
+                                    Some(clarification.clone()),
+                                    "clarification_answer".to_string(),
+                                    Some(call.id.clone()),
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    clarification_applied = true;
+                                    if let Some(objective) = exec_ctx.run_objective.as_mut() {
+                                        objective.amend(
+                                            crate::agent::objective::ObjectiveDirective {
+                                                text: clarification.clone(),
+                                                source: crate::agent::objective::ObjectiveSource::ClarificationAnswer,
+                                                source_ref: Some(call.id.clone()),
+                                                accepted_at_ms: None,
+                                                application_boundary: Some(
+                                                    "clarification_boundary".to_string(),
+                                                ),
+                                            },
+                                        );
+                                    }
+                                }
+                                Err(error) => warn!(
+                                    "Failed to persist clarification intent projection for tool call {}: {}",
+                                    call.id, error
+                                ),
+                            }
+                        }
+                    }
+                    all_results.push(tool_result)
+                }
+                Err(error) => all_results.push(ToolResult::new(
+                    call.id.clone(),
+                    vec![querymt::chat::Content::text(format!(
+                        "Error: internal tool execution failed: {error}"
+                    ))],
+                    true,
+                    Some(call.function.name.clone()),
+                    Some(call.function.arguments.clone()),
+                )),
+            }
+            if exec_ctx.cancellation_token.is_cancelled() {
+                cancelled = true;
+                unprocessed_start = Some(call_index + 1);
+                break;
+            }
+            if execution_class == crate::tools::ToolExecutionClass::ClarificationBoundary
+                && clarification_applied
+            {
+                unprocessed_start = Some(call_index + 1);
+                break;
+            }
+        }
+        if let Some(start) = unprocessed_start {
+            for call in remaining_calls.iter().skip(start) {
+                let message = if cancelled {
+                    "Error: Cancelled by user"
+                } else {
+                    "Skipped because a user clarification changed the run objective; the model must reconsider this action."
+                };
+                all_results.push(ToolResult::new(
+                    call.id.clone(),
+                    vec![querymt::chat::Content::text(message.to_string())],
+                    true,
+                    Some(call.function.name.clone()),
+                    Some(call.function.arguments.clone()),
+                ));
+            }
+        }
+        match exec_ctx.state.load_working_context().await {
+            Ok(()) => {
+                if let Some(objective) = exec_ctx.run_objective.as_mut() {
+                    objective.set_task(
+                        exec_ctx.state.active_task.as_ref(),
+                        crate::agent::objective::ObjectiveSource::TaskUpdated,
+                    );
+                }
+            }
+            Err(error) => warn!(
+                "Failed to refresh working context after serial tool execution: {}",
+                error
+            ),
+        }
+        let next_state = super::tool_calls::store_all_tool_results(
+            config,
+            &Arc::from(all_results.into_boxed_slice()),
+            context,
+            exec_ctx,
+        )
+        .await?;
+        if cancelled {
             return Ok(ExecutionState::Cancelled);
         }
         return Ok(next_state);

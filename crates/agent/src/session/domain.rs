@@ -42,6 +42,19 @@ pub struct Task {
     pub status: TaskStatus,
     pub expected_deliverable: Option<String>,
     pub acceptance_criteria: Option<String>,
+    #[typeshare(serialized_as = "number")]
+    pub revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creation_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_evidence: Option<String>,
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[typeshare(serialized_as = "Option<string>")]
+    pub completed_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339")]
     #[typeshare(serialized_as = "string")]
     pub created_at: OffsetDateTime,
@@ -60,12 +73,16 @@ pub struct IntentSnapshot {
     pub session_id: i64,
     #[serde(skip)]
     pub task_id: Option<i64>,
-    /// Authoritative summary of what the user wants
+    /// Stable descriptive summary used for continuity and search, not execution authority.
     pub summary: String,
-    /// Constraints or boundaries
+    /// Durable descriptive constraints known to the session.
     pub constraints: Option<String>,
-    /// Hint for next action
+    /// Latest accepted user directive useful for recovery.
     pub next_step_hint: Option<String>,
+    #[typeshare(serialized_as = "number")]
+    pub revision: u64,
+    pub source: String,
+    pub source_ref: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     #[typeshare(serialized_as = "string")]
     pub created_at: OffsetDateTime,
@@ -407,6 +424,10 @@ mod tests {
             status: TaskStatus::Active,
             expected_deliverable: Some("deliver X".to_string()),
             acceptance_criteria: Some("X is correct".to_string()),
+            revision: 1,
+            creation_key: None,
+            completion_evidence: None,
+            completed_at: None,
             created_at: now(),
             updated_at: now(),
         };
@@ -427,6 +448,10 @@ mod tests {
             status: TaskStatus::Active,
             expected_deliverable: None,
             acceptance_criteria: None,
+            revision: 1,
+            creation_key: None,
+            completion_evidence: None,
+            completed_at: None,
             created_at: now(),
             updated_at: now(),
         };

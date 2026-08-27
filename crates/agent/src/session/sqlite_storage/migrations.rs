@@ -56,6 +56,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0011_session_runtime_bindings",
         apply: migration_0011_session_runtime_bindings,
     },
+    Migration {
+        version: "0012_task_and_intent_revisions",
+        apply: migration_0012_task_and_intent_revisions,
+    },
 ];
 
 pub(super) fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -438,6 +442,33 @@ fn migration_0010_profile_bindings(conn: &mut Connection) -> Result<(), rusqlite
 }
 
 fn migration_0011_session_runtime_bindings(conn: &mut Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch("ALTER TABLE profile_bindings ADD COLUMN agent_id TEXT;")?;
-    Ok(())
+    match conn.execute("ALTER TABLE profile_bindings ADD COLUMN agent_id TEXT", []) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn migration_0012_task_and_intent_revisions(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.transaction()?;
+    for statement in [
+        "ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE tasks ADD COLUMN creation_key TEXT",
+        "ALTER TABLE tasks ADD COLUMN completion_evidence TEXT",
+        "ALTER TABLE tasks ADD COLUMN completed_at TEXT",
+        "ALTER TABLE intent_snapshots ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE intent_snapshots ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy'",
+        "ALTER TABLE intent_snapshots ADD COLUMN source_ref TEXT",
+    ] {
+        match tx.execute(statement, []) {
+            Ok(_) => {}
+            Err(error) if error.to_string().contains("duplicate column name") => {}
+            Err(error) => return Err(error),
+        }
+    }
+    tx.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_session_creation_key
+         ON tasks(session_id, creation_key) WHERE creation_key IS NOT NULL;",
+    )?;
+    tx.commit()
 }

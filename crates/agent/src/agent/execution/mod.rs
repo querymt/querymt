@@ -68,36 +68,12 @@ pub enum CycleOutcome {
     Stopped(StopReason),
 }
 
-fn render_objective_anchor(exec_ctx: &ExecutionContext) -> String {
-    let mut sections = vec![format!(
-        "Original requested outcome:\n{}",
-        crate::agent::utils::render_prompt_for_llm(&exec_ctx.initial_prompt, Some(16 * 1024))
-    )];
-    if let Some(task) = &exec_ctx.state.active_task {
-        if let Some(deliverable) = &task.expected_deliverable {
-            sections.push(format!("Active task deliverable: {deliverable}"));
-        }
-        if let Some(criteria) = &task.acceptance_criteria {
-            sections.push(format!("Acceptance criteria: {criteria}"));
-        }
-    }
-    if let Some(intent) = &exec_ctx.state.current_intent {
-        sections.push(format!("Current intent: {}", intent.summary));
-        if let Some(constraints) = &intent.constraints {
-            sections.push(format!("Constraints: {constraints}"));
-        }
-    }
-    if !exec_ctx.steering_summaries.is_empty() {
-        sections.push(format!(
-            "Latest steering (highest priority):\n{}",
-            exec_ctx.steering_summaries.join("\n")
-        ));
-    }
-    sections.push(
-        "Stay within this scope. Finish once sufficient evidence exists. Ask the user rather than silently replacing the objective."
-            .to_string(),
-    );
-    format!("[Active objective]\n{}", sections.join("\n\n"))
+fn render_run_objective(exec_ctx: &ExecutionContext) -> String {
+    exec_ctx
+        .run_objective
+        .as_ref()
+        .map(crate::agent::objective::RunObjective::render)
+        .unwrap_or_else(|| "[Run objective unavailable]".to_string())
 }
 
 fn refresh_objective_fragment(
@@ -105,8 +81,8 @@ fn refresh_objective_fragment(
     exec_ctx: &ExecutionContext,
 ) -> Arc<crate::middleware::ConversationContext> {
     Arc::new(context.upsert_fragment(
-        "active_objective",
-        render_objective_anchor(exec_ctx),
+        "run_objective",
+        render_run_objective(exec_ctx),
         crate::middleware::ContextPriority::High,
     ))
 }
@@ -150,10 +126,42 @@ async fn apply_pending_steering(
         exec_ctx.add_message(message.clone()).await?;
         messages.push(message.to_chat_message());
         if !display.trim().is_empty() {
-            exec_ctx.steering_summaries.push(display);
-            if exec_ctx.steering_summaries.len() > 2 {
-                exec_ctx.steering_summaries.remove(0);
-            }
+            let summary = exec_ctx
+                .state
+                .current_intent
+                .as_ref()
+                .map(|intent| intent.summary.clone())
+                .unwrap_or_else(|| display.clone());
+            exec_ctx
+                .state
+                .update_intent_projection(
+                    summary,
+                    None,
+                    Some(display.clone()),
+                    "steering".to_string(),
+                    Some(input.input_id.clone()),
+                )
+                .await?;
+        }
+        if !display.trim().is_empty()
+            && let Some(objective) = exec_ctx.run_objective.as_mut()
+        {
+            let revision = objective.amend(crate::agent::objective::ObjectiveDirective {
+                text: display,
+                source: crate::agent::objective::ObjectiveSource::Steering,
+                source_ref: Some(input.input_id.clone()),
+                accepted_at_ms: Some(input.accepted_at_ms),
+                application_boundary: Some(boundary.to_string()),
+            });
+            config.emit_event(
+                &exec_ctx.session_id,
+                AgentEventKind::ObjectiveUpdated {
+                    run_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+                    revision,
+                    source: "steering".to_string(),
+                    source_ref: Some(input.input_id.clone()),
+                },
+            );
         }
         config.emit_event(
             &exec_ctx.session_id,
@@ -276,6 +284,7 @@ pub(crate) async fn execute_cycle_state_machine(
     };
     let mut event_rx = config.event_sink.fanout().subscribe();
     let mut stop_hook_continuations = 0u8;
+    let mut task_completion_guard_continuations = 0u8;
     let mut last_objective_checkpoint_step = 0usize;
 
     state = driver
@@ -325,31 +334,46 @@ pub(crate) async fn execute_cycle_state_machine(
                 )
                 .await?
                 .unwrap_or(context);
-                let mut context = refresh_objective_fragment(&context, exec_ctx);
                 let steps = context.stats.steps;
                 let checkpoint_due = (steps >= 7 && last_objective_checkpoint_step == 0)
                     || (last_objective_checkpoint_step > 0
                         && steps.saturating_sub(last_objective_checkpoint_step) >= 4);
                 if checkpoint_due {
                     last_objective_checkpoint_step = steps;
-                    context = Arc::new(context.upsert_fragment(
-                        "objective_checkpoint",
-                        "Re-evaluate the active objective before taking more actions. If the gathered evidence is sufficient, answer now. Otherwise identify exactly one missing fact and take only the action needed to resolve it. Do not expand scope without explaining why it is required.".to_string(),
-                        crate::middleware::ContextPriority::High,
-                    ));
+                    if let Some(objective) = exec_ctx.run_objective.as_mut() {
+                        objective.set_progress_review(Some(
+                            crate::agent::objective::ProgressReview {
+                                reason: "periodic_progress_review".to_string(),
+                                step: steps,
+                            },
+                        ));
+                    }
                     config.emit_event(
                         &exec_ctx.session_id,
                         AgentEventKind::ObjectiveCheckpoint {
                             run_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
-                            reason: "exploration_budget".to_string(),
-                            action: "refocus".to_string(),
+                            reason: "periodic_progress_review".to_string(),
+                            action: "review_progress".to_string(),
+                            objective_revision: exec_ctx.run_objective.as_ref().map(|o| o.revision),
+                            current_task_id: exec_ctx
+                                .state
+                                .active_task
+                                .as_ref()
+                                .map(|t| t.public_id.clone()),
+                            current_task_revision: exec_ctx
+                                .state
+                                .active_task
+                                .as_ref()
+                                .map(|t| t.revision),
                         },
                     );
                 } else if last_objective_checkpoint_step > 0
                     && steps > last_objective_checkpoint_step
+                    && let Some(objective) = exec_ctx.run_objective.as_mut()
                 {
-                    context = Arc::new(context.remove_fragment("objective_checkpoint"));
+                    objective.set_progress_review(None);
                 }
+                let context = refresh_objective_fragment(&context, exec_ctx);
                 let state = ExecutionState::BeforeLlmCall { context };
                 let state = driver
                     .run_step_start(state, Some(&exec_ctx.runtime))
@@ -570,6 +594,35 @@ pub(crate) async fn execute_cycle_state_machine(
                                 };
                                 continue;
                             }
+                        }
+
+                        if let Some(task) = exec_ctx.state.active_task.as_ref()
+                            && task.status == crate::session::domain::TaskStatus::Active
+                            && task.kind == crate::session::domain::TaskKind::Finite
+                        {
+                            if task_completion_guard_continuations == 0 {
+                                task_completion_guard_continuations = 1;
+                                config.emit_event(
+                                    &exec_ctx.session_id,
+                                    AgentEventKind::TaskCompletionGuardTriggered {
+                                        run_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+                                        task_id: task.public_id.clone(),
+                                    },
+                                );
+                                state = ExecutionState::BeforeLlmCall {
+                                    context: Arc::new(completed_context.inject_message(
+                                        "<system-reminder>\nThe current finite task remains active. Continue the work, call complete_task with concrete evidence, pause or cancel it with a real reason, or ask the user for required information. An ordinary response stop does not complete the task.\n\nThis message was generated by the QueryMT task-completion runtime, not by the user.\n</system-reminder>".to_string(),
+                                    )),
+                                };
+                                continue;
+                            }
+                            config.emit_event(
+                                &exec_ctx.session_id,
+                                AgentEventKind::TaskCompletionGuardExhausted {
+                                    run_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+                                    task_id: task.public_id.clone(),
+                                },
+                            );
                         }
 
                         if config.execution_policy.pruning.enabled

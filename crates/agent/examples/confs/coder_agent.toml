@@ -18,7 +18,7 @@ provider = "anthropic"
 model = "claude-opus-4-5"
 #provider = "codex"
 #model = "gpt-5.2-codex"
-tools = ["delegate", "create_task", "todowrite", "todoread", "question", "search_text", "glob", "ls", "index", "read_tool", "shell", "skill"]
+tools = ["delegate", "create_task", "read_task", "update_task", "complete_task", "todowrite", "todoread", "question", "search_text", "glob", "ls", "index", "read_tool", "shell", "skill"]
 system = [
   { file = "../prompts/default_system.txt" }
 ]

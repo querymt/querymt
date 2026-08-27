@@ -80,6 +80,7 @@ pub struct AgentToolContext {
     knowledge_store: Option<Arc<dyn KnowledgeStore>>,
     scope_policy: Arc<dyn ScopePolicy>,
     event_sink: Option<Arc<EventSink>>,
+    task_service: Option<crate::session::TaskService>,
 }
 
 impl AgentToolContext {
@@ -99,6 +100,7 @@ impl AgentToolContext {
             knowledge_store: None,
             scope_policy: Arc::new(crate::knowledge::PermissiveScopePolicy),
             event_sink: None,
+            task_service: None,
         }
     }
 
@@ -135,6 +137,11 @@ impl AgentToolContext {
         self.event_sink = Some(sink);
     }
 
+    pub fn with_task_service(mut self, service: crate::session::TaskService) -> Self {
+        self.task_service = Some(service);
+        self
+    }
+
     /// Create a basic context for testing or simple operations
     pub fn basic(session_id: String, cwd: Option<PathBuf>) -> Self {
         Self::new(session_id, cwd, None, None)
@@ -157,6 +164,10 @@ impl ToolContext for AgentToolContext {
 
     fn session_public_id(&self) -> Option<String> {
         Some(self.session_id.clone())
+    }
+
+    fn task_service(&self) -> Option<crate::session::TaskService> {
+        self.task_service.clone()
     }
 
     fn knowledge_store(&self) -> Option<Arc<dyn KnowledgeStore>> {

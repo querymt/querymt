@@ -251,6 +251,10 @@ mod tests {
                 status,
                 expected_deliverable: Some("deliver X".to_string()),
                 acceptance_criteria: Some("X is done".to_string()),
+                revision: 1,
+                creation_key: None,
+                completion_evidence: None,
+                completed_at: None,
                 created_at: now(),
                 updated_at: now(),
             }
@@ -360,6 +364,9 @@ mod tests {
                 summary: summary.to_string(),
                 constraints: Some("no side effects".to_string()),
                 next_step_hint: None,
+                revision: 1,
+                source: "test".to_string(),
+                source_ref: None,
                 created_at: now(),
             }
         }

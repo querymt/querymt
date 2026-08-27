@@ -1,6 +1,8 @@
 //! Create task tool implementation using ToolContext
 
-use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError, ToolExecutionClass,
+};
 use async_trait::async_trait;
 use querymt::chat::{Content, FunctionTool, Tool};
 use serde_json::{Value, json};
@@ -55,33 +57,45 @@ impl ToolTrait for CreateTaskTool {
     }
 
     fn required_capabilities(&self) -> &'static [CapabilityRequirement] {
-        &[]
+        &[CapabilityRequirement::SessionState]
+    }
+
+    fn execution_class(&self) -> ToolExecutionClass {
+        ToolExecutionClass::SerialStateful
     }
 
     async fn call(
         &self,
         args: Value,
-        _context: &dyn ToolContext,
+        context: &dyn ToolContext,
     ) -> Result<Vec<Content>, ToolError> {
         // Validate arguments
         let kind_str = args["kind"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidRequest("Missing 'kind' field".into()))?;
 
-        if !matches!(kind_str, "finite" | "recurring" | "evolving") {
-            return Err(ToolError::InvalidRequest(format!(
-                "Invalid task kind '{}'. Must be 'finite', 'recurring', or 'evolving'",
-                kind_str
-            )));
-        }
-
-        let _expected_deliverable = args["expected_deliverable"].as_str().ok_or_else(|| {
+        let kind = super::task::parse_task_kind(kind_str)?;
+        let expected_deliverable = args["expected_deliverable"].as_str().ok_or_else(|| {
             ToolError::InvalidRequest("Missing 'expected_deliverable' field".into())
         })?;
-
-        // The actual task creation is handled by the agent loop via events
-        // This tool just validates and returns success
-        Ok(vec![Content::text("Task creation request recorded.")])
+        let service = context
+            .task_service()
+            .ok_or_else(|| ToolError::SessionError("task service is unavailable".to_string()))?;
+        let task = service
+            .create(
+                kind,
+                expected_deliverable.to_string(),
+                args.get("acceptance_criteria")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            )
+            .await
+            .map_err(|error| ToolError::SessionError(error.to_string()))?;
+        context.emit_event(crate::events::AgentEventKind::TaskCreated { task: task.clone() });
+        Ok(vec![Content::text(
+            serde_json::to_string_pretty(&task)
+                .map_err(|error| ToolError::SessionError(error.to_string()))?,
+        )])
     }
 }
 
@@ -89,13 +103,32 @@ impl ToolTrait for CreateTaskTool {
 mod tests {
     use super::*;
     use crate::tools::AgentToolContext;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[tokio::test]
     async fn test_create_task_validation() {
         let temp_dir = TempDir::new().unwrap();
-        let context =
-            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let storage = Arc::new(
+            crate::session::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap(),
+        );
+        use crate::session::store::SessionStore;
+        storage
+            .create_session(None, None, None, None)
+            .await
+            .unwrap();
+        let session = storage.list_sessions().await.unwrap().remove(0);
+        let context = AgentToolContext::basic(
+            session.public_id.clone(),
+            Some(temp_dir.path().to_path_buf()),
+        )
+        .with_task_service(crate::session::TaskService::new(
+            storage,
+            session.public_id,
+            "test-call".to_string(),
+        ));
         let tool = CreateTaskTool::new();
 
         // Test valid request

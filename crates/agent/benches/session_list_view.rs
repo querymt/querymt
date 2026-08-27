@@ -67,6 +67,9 @@ fn seed_scenario(rt: &Runtime, session_count: usize, intents_per_session: usize)
                         ),
                         constraints: None,
                         next_step_hint: None,
+                        revision: intent_idx as u64 + 1,
+                        source: "benchmark".to_string(),
+                        source_ref: None,
                         created_at: OffsetDateTime::now_utc(),
                     })
                     .await

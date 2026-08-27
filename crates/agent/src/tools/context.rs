@@ -13,8 +13,10 @@ use crate::knowledge::{KnowledgeStore, ScopePolicy};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum CapabilityRequirement {
-    /// Requires filesystem access (cwd must be set)
+    /// Requires filesystem access (cwd must be set).
     Filesystem,
+    /// Mutates durable session control-plane state.
+    SessionState,
 }
 
 /// Unified error type for all tools
@@ -43,7 +45,11 @@ pub trait ToolContext: Send + Sync {
         Some(self.session_id().to_string())
     }
 
-    /// Optional knowledge store access for knowledge tools.
+    /// Optional session-scoped task lifecycle access for task tools.
+    fn task_service(&self) -> Option<crate::session::TaskService> {
+        None
+    }
+
     fn knowledge_store(&self) -> Option<Arc<dyn KnowledgeStore>> {
         None
     }
@@ -201,6 +207,13 @@ pub trait ToolContext: Send + Sync {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolExecutionClass {
+    ParallelSafe,
+    SerialStateful,
+    ClarificationBoundary,
+}
+
 /// Unified tool trait that replaces BuiltInTool
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -213,6 +226,10 @@ pub trait Tool: Send + Sync {
     /// Capabilities this tool requires. Default: empty.
     fn required_capabilities(&self) -> &'static [CapabilityRequirement] {
         &[]
+    }
+
+    fn execution_class(&self) -> ToolExecutionClass {
+        ToolExecutionClass::ParallelSafe
     }
 
     /// Execute the tool with given arguments and context

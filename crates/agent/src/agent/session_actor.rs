@@ -15,7 +15,6 @@ use crate::agent::turn_control::{
 };
 use crate::agent::undo::{RedoResult, UndoError, UndoResult};
 use crate::agent::utils::{format_prompt_user_text_only, render_prompt_for_display};
-use crate::elicitation::ElicitationAction;
 use crate::error::AgentError;
 use crate::events::{AgentEventKind, SessionLimits};
 use crate::hooks::HookNotice;
@@ -28,7 +27,7 @@ use kameo::reply::DelegatedReply;
 use log::{debug, info, warn};
 use querymt::chat::{ChatRole, ReasoningEffort};
 use querymt::error::LLMError;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -48,9 +47,6 @@ fn parse_transport_model_id(model_id: &str, fallback_provider: &str) -> (String,
 }
 
 const ATTACHMENTS_PLACEHOLDER: &str = "(attachments included)";
-// TODO: use it once figured out intent updates
-#[allow(dead_code)]
-const INTENT_CONFIRMATION_TIMEOUT_SECS: u64 = 45;
 
 fn emit_hook_notices(config: &AgentConfig, session_id: &str, notices: Vec<HookNotice>) {
     for notice in notices {
@@ -63,13 +59,6 @@ fn emit_hook_notices(config: &AgentConfig, session_id: &str, notices: Vec<HookNo
             },
         );
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IntentUpdateDecision {
-    NoChange,
-    Update,
-    AskUser,
 }
 
 fn summarize_intent_candidate(input: &str) -> Option<String> {
@@ -89,218 +78,52 @@ fn summarize_intent_candidate(input: &str) -> Option<String> {
     ))
 }
 
-fn normalize_intent_text(text: &str) -> String {
-    text.trim()
-        .to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn decide_intent_update(current_intent: &str, candidate: &str) -> IntentUpdateDecision {
-    let candidate_trimmed = candidate.trim();
-    if candidate_trimmed.is_empty() {
-        return IntentUpdateDecision::NoChange;
-    }
-
-    let normalized_current = normalize_intent_text(current_intent);
-    let normalized_candidate = normalize_intent_text(candidate_trimmed);
-
-    if normalized_current == normalized_candidate {
-        return IntentUpdateDecision::NoChange;
-    }
-
-    let low_signal_prefixes = [
-        "do this",
-        "do that",
-        "i want that",
-        "i want this",
-        "can you",
-        "could you",
-        "please",
-    ];
-    if low_signal_prefixes
-        .iter()
-        .any(|prefix| normalized_candidate.starts_with(prefix))
-        && normalized_candidate.split_whitespace().count() <= 10
-    {
-        return IntentUpdateDecision::NoChange;
-    }
-
-    let current_words: HashSet<&str> = normalized_current.split_whitespace().collect();
-    let candidate_words: HashSet<&str> = normalized_candidate.split_whitespace().collect();
-    let overlap = candidate_words.intersection(&current_words).count();
-
-    let explicit_shift_markers = [
-        "new goal",
-        "change of plan",
-        "instead",
-        "let's switch",
-        "let us switch",
-        "different objective",
-        "pivot",
-    ];
-    if explicit_shift_markers
-        .iter()
-        .any(|marker| normalized_candidate.contains(marker))
-    {
-        return IntentUpdateDecision::AskUser;
-    }
-
-    let explicit_update_markers = [
-        "session objective:",
-        "objective:",
-        "intent:",
-        "my goal is",
-        "the goal is",
-    ];
-    if explicit_update_markers
-        .iter()
-        .any(|marker| normalized_candidate.contains(marker))
-    {
-        return IntentUpdateDecision::Update;
-    }
-
-    if overlap == 0 && candidate_words.len() >= 6 {
-        return IntentUpdateDecision::AskUser;
-    }
-
-    if candidate_words.len() >= 16 {
-        return IntentUpdateDecision::AskUser;
-    }
-
-    IntentUpdateDecision::NoChange
-}
-
-// TODO: use it once figured out intent updates
-#[allow(dead_code)]
-async fn request_intent_update_confirmation(
-    config: &AgentConfig,
-    session_id: &str,
-    current_intent: &str,
-    proposed_intent: &str,
-) -> Result<bool, AgentError> {
-    let elicitation_id = Uuid::new_v4().to_string();
-    let (response_tx, response_rx) = oneshot::channel();
-
-    crate::elicitation::insert_pending_elicitation(
-        &config.pending_elicitations,
-        elicitation_id.clone(),
-        session_id.to_string(),
-        response_tx,
-    )
-    .await;
-
-    let requested_schema = serde_json::json!({
-        "type": "object",
-        "properties": {
-            "selection": {
-                "type": "string",
-                "title": "Intent",
-                "description": "Choose whether to update the session objective.",
-                "oneOf": [
-                    {
-                        "const": "update",
-                        "title": "Update objective"
-                    },
-                    {
-                        "const": "keep",
-                        "title": "Keep current objective"
-                    }
-                ]
-            }
-        },
-        "required": ["selection"]
-    });
-
-    config
-        .event_sink
-        .emit_durable(
-            session_id,
-            AgentEventKind::ElicitationRequested {
-                elicitation_id: elicitation_id.clone(),
-                session_id: session_id.to_string(),
-                message: format!(
-                    "This prompt may change the session objective.\n\nCurrent objective:\n{}\n\nProposed objective:\n{}",
-                    current_intent, proposed_intent
-                ),
-                requested_schema,
-                source: "builtin:intent_update".to_string(),
-            },
-        )
-        .await
-        .map_err(|e| AgentError::Internal(e.to_string()))?;
-
-    let response = tokio::time::timeout(
-        std::time::Duration::from_secs(INTENT_CONFIRMATION_TIMEOUT_SECS),
-        response_rx,
-    )
-    .await;
-
-    if response.is_err() {
-        let mut pending = config.pending_elicitations.lock().await;
-        pending.remove(&elicitation_id);
-    }
-
-    let Some(response) = response.ok().and_then(|received| received.ok()) else {
-        return Ok(false);
-    };
-
-    if response.action != ElicitationAction::Accept {
-        return Ok(false);
-    }
-
-    let selection = response
-        .content
-        .as_ref()
-        .and_then(|content| content.get("selection"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("keep");
-
-    Ok(selection == "update")
-}
-
 async fn maybe_update_session_intent(
-    config: &AgentConfig,
-    session_id: &str,
+    _config: &AgentConfig,
+    _session_id: &str,
     exec_ctx: &mut ExecutionContext,
     user_text: &str,
+    source_ref: &str,
 ) -> Result<(), AgentError> {
     let Some(candidate) = summarize_intent_candidate(user_text) else {
         return Ok(());
     };
+    if exec_ctx
+        .state
+        .current_intent
+        .as_ref()
+        .is_some_and(|intent| {
+            intent.summary == candidate
+                || intent.next_step_hint.as_deref() == Some(candidate.as_str())
+        })
+    {
+        return Ok(());
+    }
 
-    let Some(current_intent) = exec_ctx
+    let summary = exec_ctx
         .state
         .current_intent
         .as_ref()
         .map(|intent| intent.summary.clone())
-    else {
-        exec_ctx
-            .state
-            .update_intent_snapshot(candidate, None, None)
-            .await
-            .map_err(|e| AgentError::Internal(e.to_string()))?;
-        return Ok(());
-    };
-
-    match decide_intent_update(&current_intent, &candidate) {
-        IntentUpdateDecision::NoChange => Ok(()),
-        IntentUpdateDecision::Update => {
-            exec_ctx
-                .state
-                .update_intent_snapshot(candidate, None, None)
-                .await
-                .map_err(|e| AgentError::Internal(e.to_string()))?;
-            Ok(())
-        }
-        IntentUpdateDecision::AskUser => {
-            // TODO(intent): Re-enable explicit user confirmation for intent shifts
-            // once we have a better UX/policy for ambiguous objective changes.
-            let _ = (config, session_id, current_intent);
-            Ok(())
-        }
-    }
+        .unwrap_or_else(|| candidate.clone());
+    let constraints = exec_ctx
+        .state
+        .current_intent
+        .as_ref()
+        .and_then(|intent| intent.constraints.clone());
+    let next_step_hint = exec_ctx.state.current_intent.as_ref().map(|_| candidate);
+    exec_ctx
+        .state
+        .update_intent_projection(
+            summary,
+            constraints,
+            next_step_hint,
+            "user_prompt".to_string(),
+            Some(source_ref.to_string()),
+        )
+        .await
+        .map_err(|e| AgentError::Internal(e.to_string()))?;
+    Ok(())
 }
 
 /// Per-session actor. Each session gets its own actor with isolated state.
@@ -1754,6 +1577,7 @@ impl Message<ScheduledPrompt> for SessionActor {
         let mode = self.mode;
         let tool_config = self.tool_config.clone();
         let schedule_public_id = msg.schedule_public_id.clone();
+        let task_public_id = msg.task_public_id.clone();
         let actor_ref = ctx.actor_ref().clone();
         let (phase_reporter, mut phase_rx) = tokio::sync::mpsc::unbounded_channel();
         let phase_actor = actor_ref.clone();
@@ -1793,6 +1617,7 @@ impl Message<ScheduledPrompt> for SessionActor {
                     tool_config,
                     execution_origin: crate::agent::execution_context::ExecutionOrigin::Scheduled {
                         schedule_public_id: schedule_public_id.clone(),
+                        task_public_id: task_public_id.clone(),
                     },
                     run_id: run_id.clone(),
                     steering,
@@ -1901,6 +1726,38 @@ async fn acquire_execution_permit_with_timeout(
     }
 }
 
+fn normalized_run_instruction(prompt: &[crate::acp::protocol::ContentBlock]) -> String {
+    crate::agent::utils::render_prompt_for_llm(prompt, None)
+}
+
+async fn validate_execution_task(
+    store: &dyn crate::session::store::SessionStore,
+    execution_origin: &crate::agent::execution_context::ExecutionOrigin,
+    session_id: &str,
+) -> Result<Option<crate::session::domain::Task>, AgentError> {
+    let crate::agent::execution_context::ExecutionOrigin::Scheduled { task_public_id, .. } =
+        execution_origin
+    else {
+        return Ok(None);
+    };
+
+    let task = store
+        .get_task_for_session(session_id, task_public_id)
+        .await
+        .map_err(AgentError::from)?
+        .ok_or_else(|| {
+            AgentError::Internal(format!(
+                "scheduled task not found in session: {task_public_id}"
+            ))
+        })?;
+    if task.status != crate::session::domain::TaskStatus::Active {
+        return Err(AgentError::Internal(format!(
+            "scheduled task is not active: {task_public_id}"
+        )));
+    }
+    Ok(Some(task))
+}
+
 #[instrument(
     name = "agent.prompt.execute",
     skip(exec),
@@ -1988,6 +1845,10 @@ async fn execute_prompt_detached(
         }
     };
 
+    let history_store = config.provider.history_store();
+    let scheduled_task =
+        validate_execution_task(&*history_store, &execution_origin, &session_id).await?;
+
     // Clean up revert state if a new prompt is sent while in reverted state.
     // Also prunes the event journal so undone turns don't reappear on reload.
     // IMPORTANT: this must run BEFORE loading RuntimeContext so that
@@ -2019,8 +1880,6 @@ async fn execute_prompt_detached(
         .await
         .map_err(|e| AgentError::Internal(e.to_string()))?;
 
-    let initial_prompt = req.prompt.clone();
-
     // Create execution context — attach the cancellation token so it propagates
     // into individual tool calls for cooperative cancellation.
     // The knowledge store is propagated so knowledge tools can access it.
@@ -2039,8 +1898,11 @@ async fn execute_prompt_detached(
     .with_turn_id(run_id.clone())
     .with_turn_mode(mode)
     .with_steering(steering)
-    .with_initial_prompt(initial_prompt)
     .with_phase_reporter(phase_reporter);
+
+    if let Some(task) = &scheduled_task {
+        exec_ctx.state.active_task = Some(task.clone());
+    }
 
     // 4. Slash command expansion (before storing user messages)
     let mut req = req;
@@ -2112,10 +1974,8 @@ async fn execute_prompt_detached(
         },
     );
 
-    maybe_update_session_intent(&config, &session_id, &mut exec_ctx, &user_text).await?;
-
     let agent_msg = AgentMessage {
-        id: message_id,
+        id: message_id.clone(),
         session_id: session_id.clone(),
         role: ChatRole::User,
         parts: vec![MessagePart::Prompt {
@@ -2143,6 +2003,49 @@ async fn execute_prompt_detached(
             content: display_content.clone(),
         },
     );
+
+    if let Err(error) =
+        maybe_update_session_intent(&config, &session_id, &mut exec_ctx, &user_text, &message_id)
+            .await
+    {
+        warn!(
+            "Failed to update intent projection after storing prompt {}: {}",
+            message_id, error
+        );
+    }
+
+    let origin_label = match &exec_ctx.execution_origin {
+        crate::agent::execution_context::ExecutionOrigin::Interactive => "interactive".to_string(),
+        crate::agent::execution_context::ExecutionOrigin::Scheduled {
+            schedule_public_id,
+            task_public_id,
+        } => format!("scheduled:{schedule_public_id}:{task_public_id}"),
+    };
+    let objective_task = match &exec_ctx.execution_origin {
+        crate::agent::execution_context::ExecutionOrigin::Scheduled { .. } => {
+            scheduled_task.as_ref()
+        }
+        crate::agent::execution_context::ExecutionOrigin::Interactive => {
+            exec_ctx.state.active_task.as_ref()
+        }
+    };
+    let objective = crate::agent::objective::RunObjective::new(
+        run_id.clone(),
+        normalized_run_instruction(&req.prompt),
+        origin_label,
+        objective_task,
+        exec_ctx.state.current_intent.clone(),
+    );
+    config.emit_event(
+        &session_id,
+        AgentEventKind::ObjectiveInitialized {
+            run_id: run_id.clone(),
+            revision: objective.revision,
+            source: "run_prompt".to_string(),
+            source_ref: Some(message_id.clone()),
+        },
+    );
+    exec_ctx = exec_ctx.with_run_objective(objective);
 
     config.emit_event(&session_id, AgentEventKind::TurnStarted);
 
@@ -2374,23 +2277,27 @@ pub(crate) async fn ensure_pre_turn_snapshot_ready(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use kameo::actor::Spawn;
+    use querymt::LLMParams;
+    use querymt::error::{LLMErrorPayload, ProviderErrorKind, ProviderFailure};
+    use tokio::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
     use crate::session::backend::StorageBackend;
+    use crate::session::domain::IntentSnapshot;
     use crate::session::runtime::RuntimeContext;
     use crate::session::store::SessionStore;
     use crate::test_utils::{
         MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
         mock_plugin_registry, mock_session,
     };
-    use kameo::actor::Spawn;
-    use querymt::LLMParams;
-    use querymt::error::{LLMErrorPayload, ProviderErrorKind, ProviderFailure};
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-    use tokio_util::sync::CancellationToken;
 
     // ── Shared fixture ───────────────────────────────────────────────────────
 
@@ -2399,6 +2306,8 @@ mod tests {
         actor_ref: kameo::actor::ActorRef<SessionActor>,
         _session_id: String,
         _temp_dir: tempfile::TempDir,
+        intent_writes: Arc<AtomicUsize>,
+        history_writes: Arc<AtomicUsize>,
     }
 
     impl ActorFixture {
@@ -2445,6 +2354,9 @@ mod tests {
             let llm_config = mock_llm_config();
             let session = mock_session(session_id);
             let mut store = MockSessionStore::new();
+            let intent_writes = Arc::new(AtomicUsize::new(0));
+            let history_writes = Arc::new(AtomicUsize::new(0));
+            let current_intent = Arc::new(std::sync::Mutex::new(None));
             let session_clone = session.clone();
             store
                 .expect_get_session()
@@ -2484,6 +2396,34 @@ mod tests {
                 .expect_list_sessions()
                 .returning(|| Ok(vec![]))
                 .times(0..);
+            store.expect_get_task().returning(|_| Ok(None)).times(0..);
+            let writes_for_history = history_writes.clone();
+            store
+                .expect_add_message()
+                .returning(move |_, _| {
+                    writes_for_history.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .times(0..);
+            let writes_for_create = intent_writes.clone();
+            let intent_for_create = current_intent.clone();
+            store
+                .expect_create_intent_snapshot()
+                .returning(move |snapshot| {
+                    writes_for_create.fetch_add(1, Ordering::SeqCst);
+                    *intent_for_create.lock().expect("intent lock") = Some(snapshot);
+                    Ok(())
+                })
+                .times(0..);
+            let intent_for_get = current_intent.clone();
+            store
+                .expect_get_current_intent_snapshot()
+                .returning(move |_| Ok(intent_for_get.lock().expect("intent lock").clone()))
+                .times(0..);
+            store
+                .expect_set_current_intent_snapshot()
+                .returning(|_, _| Ok(()))
+                .times(0..);
 
             let mock_storage = Arc::new(
                 crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
@@ -2519,8 +2459,153 @@ mod tests {
                 actor_ref,
                 _session_id: session_id.to_string(),
                 _temp_dir: temp_dir,
+                intent_writes,
+                history_writes,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_scheduled_task_does_not_write_history_or_intent() {
+        let fixture = ActorFixture::new().await;
+        let exec_ctx = fixture
+            .execution_context("test-session")
+            .await
+            .with_execution_origin(
+                crate::agent::execution_context::ExecutionOrigin::Scheduled {
+                    schedule_public_id: "schedule-1".to_string(),
+                    task_public_id: "missing-task".to_string(),
+                },
+            );
+
+        let result = validate_execution_task(
+            &*exec_ctx.state.store,
+            &exec_ctx.execution_origin,
+            "test-session",
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(fixture.history_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.intent_writes.load(Ordering::SeqCst), 0);
+        assert!(exec_ctx.state.current_intent.is_none());
+    }
+
+    #[tokio::test]
+    async fn intent_projection_initializes_summary_without_next_step() {
+        let fixture = ActorFixture::new().await;
+        let mut exec_ctx = fixture.execution_context("test-session").await;
+
+        maybe_update_session_intent(
+            &fixture.config,
+            "test-session",
+            &mut exec_ctx,
+            "Implement the fix",
+            "message-1",
+        )
+        .await
+        .expect("update intent projection");
+
+        let intent = exec_ctx.state.current_intent.expect("current intent");
+        assert_eq!(intent.summary, "Implement the fix");
+        assert_eq!(intent.next_step_hint, None);
+        assert_eq!(fixture.intent_writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn normalized_run_instruction_preserves_text_beyond_16_kib() {
+        let required_sentence = "REQUIRED: retain this instruction after the boundary.";
+        let prompt = vec![crate::acp::protocol::ContentBlock::Text(
+            crate::acp::protocol::TextContent::new(format!(
+                "{}{}",
+                "x".repeat(16 * 1024 + 1),
+                required_sentence
+            )),
+        )];
+
+        let instruction = normalized_run_instruction(&prompt);
+
+        assert!(instruction.contains(required_sentence));
+    }
+
+    #[tokio::test]
+    async fn intent_projection_preserves_summary_constraints_and_updates_next_step() {
+        let fixture = ActorFixture::new().await;
+        let mut exec_ctx = fixture.execution_context("test-session").await;
+        exec_ctx.state.current_intent = Some(IntentSnapshot {
+            id: 1,
+            session_id: 1,
+            task_id: None,
+            summary: "Implement the fix".to_string(),
+            constraints: Some("Keep API compatibility".to_string()),
+            next_step_hint: None,
+            revision: 1,
+            source: "user_prompt".to_string(),
+            source_ref: Some("message-1".to_string()),
+            created_at: time::OffsetDateTime::now_utc(),
+        });
+
+        maybe_update_session_intent(
+            &fixture.config,
+            "test-session",
+            &mut exec_ctx,
+            "Also add integration tests",
+            "message-2",
+        )
+        .await
+        .expect("update intent projection");
+
+        let intent = exec_ctx.state.current_intent.expect("current intent");
+        assert_eq!(intent.summary, "Implement the fix");
+        assert_eq!(
+            intent.constraints.as_deref(),
+            Some("Keep API compatibility")
+        );
+        assert_eq!(
+            intent.next_step_hint.as_deref(),
+            Some("Also add integration tests")
+        );
+        assert_eq!(fixture.intent_writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn intent_projection_skips_duplicate_summary_and_next_step() {
+        let fixture = ActorFixture::new().await;
+        let mut exec_ctx = fixture.execution_context("test-session").await;
+        exec_ctx.state.current_intent = Some(IntentSnapshot {
+            id: 1,
+            session_id: 1,
+            task_id: None,
+            summary: "Implement the fix".to_string(),
+            constraints: None,
+            next_step_hint: Some("Continue".to_string()),
+            revision: 2,
+            source: "user_prompt".to_string(),
+            source_ref: Some("message-2".to_string()),
+            created_at: time::OffsetDateTime::now_utc(),
+        });
+
+        for duplicate in ["Implement the fix", "Continue"] {
+            maybe_update_session_intent(
+                &fixture.config,
+                "test-session",
+                &mut exec_ctx,
+                duplicate,
+                "duplicate-message",
+            )
+            .await
+            .expect("skip duplicate projection");
+        }
+
+        assert_eq!(fixture.intent_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            exec_ctx
+                .state
+                .current_intent
+                .as_ref()
+                .and_then(|intent| intent.next_step_hint.as_deref()),
+            Some("Continue")
+        );
     }
 
     #[tokio::test]
@@ -3172,34 +3257,6 @@ mod tests {
             None,
             "attachment-only prompts should not become intent"
         );
-    }
-
-    #[test]
-    fn decide_intent_update_respects_low_signal_clarifications() {
-        let decision = decide_intent_update("Build a Rust CLI to parse logs", "can you fix this?");
-        assert_eq!(
-            decision,
-            IntentUpdateDecision::NoChange,
-            "short clarification prompts should not rewrite session objective"
-        );
-    }
-
-    #[test]
-    fn decide_intent_update_auto_updates_on_explicit_objective_marker() {
-        let decision = decide_intent_update(
-            "Build a Rust CLI to parse logs",
-            "objective: migrate this to a TypeScript dashboard",
-        );
-        assert_eq!(decision, IntentUpdateDecision::Update);
-    }
-
-    #[test]
-    fn decide_intent_update_asks_on_explicit_shift_language() {
-        let decision = decide_intent_update(
-            "Build a Rust CLI to parse logs",
-            "Instead, let's switch to building a web UI for analytics.",
-        );
-        assert_eq!(decision, IntentUpdateDecision::AskUser);
     }
 
     #[test]
