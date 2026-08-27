@@ -106,12 +106,17 @@ async fn maybe_update_session_intent(
         .as_ref()
         .map(|intent| intent.summary.clone())
         .unwrap_or_else(|| candidate.clone());
+    let constraints = exec_ctx
+        .state
+        .current_intent
+        .as_ref()
+        .and_then(|intent| intent.constraints.clone());
     let next_step_hint = exec_ctx.state.current_intent.as_ref().map(|_| candidate);
     exec_ctx
         .state
         .update_intent_projection(
             summary,
-            None,
+            constraints,
             next_step_hint,
             "user_prompt".to_string(),
             Some(source_ref.to_string()),
@@ -1721,6 +1726,10 @@ async fn acquire_execution_permit_with_timeout(
     }
 }
 
+fn normalized_run_instruction(prompt: &[crate::acp::protocol::ContentBlock]) -> String {
+    crate::agent::utils::render_prompt_for_llm(prompt, None)
+}
+
 async fn validate_execution_task(
     store: &dyn crate::session::store::SessionStore,
     execution_origin: &crate::agent::execution_context::ExecutionOrigin,
@@ -2022,7 +2031,7 @@ async fn execute_prompt_detached(
     };
     let objective = crate::agent::objective::RunObjective::new(
         run_id.clone(),
-        crate::agent::utils::render_prompt_for_llm(&req.prompt, Some(16 * 1024)),
+        normalized_run_instruction(&req.prompt),
         origin_label,
         objective_task,
         exec_ctx.state.current_intent.clone(),
@@ -2268,6 +2277,16 @@ pub(crate) async fn ensure_pre_turn_snapshot_ready(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use kameo::actor::Spawn;
+    use querymt::LLMParams;
+    use querymt::error::{LLMErrorPayload, ProviderErrorKind, ProviderFailure};
+    use tokio::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
@@ -2279,14 +2298,6 @@ mod tests {
         MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
         mock_plugin_registry, mock_session,
     };
-    use kameo::actor::Spawn;
-    use querymt::LLMParams;
-    use querymt::error::{LLMErrorPayload, ProviderErrorKind, ProviderFailure};
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::Mutex;
-    use tokio_util::sync::CancellationToken;
 
     // ── Shared fixture ───────────────────────────────────────────────────────
 
@@ -2501,8 +2512,24 @@ mod tests {
         assert_eq!(fixture.intent_writes.load(Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn normalized_run_instruction_preserves_text_beyond_16_kib() {
+        let required_sentence = "REQUIRED: retain this instruction after the boundary.";
+        let prompt = vec![crate::acp::protocol::ContentBlock::Text(
+            crate::acp::protocol::TextContent::new(format!(
+                "{}{}",
+                "x".repeat(16 * 1024 + 1),
+                required_sentence
+            )),
+        )];
+
+        let instruction = normalized_run_instruction(&prompt);
+
+        assert!(instruction.contains(required_sentence));
+    }
+
     #[tokio::test]
-    async fn intent_projection_preserves_summary_and_updates_next_step() {
+    async fn intent_projection_preserves_summary_constraints_and_updates_next_step() {
         let fixture = ActorFixture::new().await;
         let mut exec_ctx = fixture.execution_context("test-session").await;
         exec_ctx.state.current_intent = Some(IntentSnapshot {
@@ -2510,7 +2537,7 @@ mod tests {
             session_id: 1,
             task_id: None,
             summary: "Implement the fix".to_string(),
-            constraints: None,
+            constraints: Some("Keep API compatibility".to_string()),
             next_step_hint: None,
             revision: 1,
             source: "user_prompt".to_string(),
@@ -2530,6 +2557,10 @@ mod tests {
 
         let intent = exec_ctx.state.current_intent.expect("current intent");
         assert_eq!(intent.summary, "Implement the fix");
+        assert_eq!(
+            intent.constraints.as_deref(),
+            Some("Keep API compatibility")
+        );
         assert_eq!(
             intent.next_step_hint.as_deref(),
             Some("Also add integration tests")
