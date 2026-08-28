@@ -7,7 +7,7 @@ use crate::session::provider_config::{ProviderConfigMode, resolve_provider_confi
 use crate::session::store::{LLMConfig, Session, SessionExecutionConfig, SessionStore};
 use arc_swap::ArcSwap;
 use querymt::LLMParams;
-use querymt::plugin::host::PluginRegistry;
+use querymt::plugin::host::{PluginRegistry, ProviderResolver};
 use querymt::providers::ModelPricing;
 use querymt::{
     LLMProvider,
@@ -54,6 +54,7 @@ fn is_non_billable_oauth_provider(provider: &str) -> bool {
 /// next `run_prompt` call), not mid-turn.
 pub struct SessionProvider {
     plugin_registry: Arc<PluginRegistry>,
+    provider_resolver: Arc<dyn ProviderResolver>,
     history_store: Arc<dyn SessionStore>,
     initial_config: LLMParams,
     /// Lock-free single-entry provider cache keyed on `LLMConfig.id`.
@@ -84,8 +85,10 @@ impl SessionProvider {
         store: Arc<dyn SessionStore>,
         initial_config: LLMParams,
     ) -> Self {
+        let provider_resolver: Arc<dyn ProviderResolver> = plugin_registry.clone();
         Self {
             plugin_registry,
+            provider_resolver,
             history_store: store,
             initial_config,
             cached_provider: Arc::new(ArcSwap::from_pointee(None)),
@@ -95,6 +98,15 @@ impl SessionProvider {
             #[cfg(feature = "remote")]
             allow_mesh_fallback: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn with_provider_resolver(mut self, resolver: Arc<dyn ProviderResolver>) -> Self {
+        self.provider_resolver = resolver;
+        self
+    }
+
+    pub(crate) fn provider_resolver(&self) -> Arc<dyn ProviderResolver> {
+        self.provider_resolver.clone()
     }
 
     /// Set the agent identifier used for `{{ agent_id }}` in system prompt
@@ -413,6 +425,12 @@ impl SessionProvider {
         if let Some(node_id) = req.provider_node_id
             && node_id != "local"
         {
+            if !self.provider_resolver.allows_remote_fallback() {
+                return Err(SessionError::InvalidOperation(format!(
+                    "Provider '{}' is profile-locked and cannot be routed to mesh node '{}'",
+                    provider_name, node_id
+                )));
+            }
             let mesh_guard = self.mesh.load();
             let mesh = mesh_guard.as_deref().ok_or_else(|| {
                 SessionError::InvalidOperation(format!(
@@ -451,26 +469,26 @@ impl SessionProvider {
         }
 
         // ── Case 2: Try local provider ─────────────────────────────────────────
-        let plugin_registry = &self.plugin_registry;
-        let factory = plugin_registry.get(provider_name).await;
+        let binding = self.provider_resolver.resolve(provider_name).await;
 
         #[cfg(not(feature = "remote"))]
-        let factory = factory.ok_or_else(|| {
-            SessionError::InvalidOperation(format!("Unknown provider: {}", provider_name))
-        })?;
+        let binding = binding.map_err(SessionError::ProviderError)?;
 
         // With the remote feature enabled we may optionally fall back to the mesh
         // (Case 3 below), so we don't error-out immediately.
         #[cfg(feature = "remote")]
-        let factory = match factory {
-            Some(f) => f,
-            None => {
+        let binding = match binding {
+            Ok(binding) => binding,
+            Err(local_error) => {
                 // ── Case 3: Not available locally → optional mesh fallback ─────
                 let allow_mesh_fallback = self.allow_mesh_fallback.load(Ordering::Relaxed);
                 let mesh_guard = self.mesh.load();
                 let mesh_handle = mesh_guard.as_deref();
 
-                if allow_mesh_fallback && let Some(mesh) = mesh_handle {
+                if self.provider_resolver.allows_remote_fallback()
+                    && allow_mesh_fallback
+                    && let Some(mesh) = mesh_handle
+                {
                     log::debug!(
                         "build_provider: provider '{}' not found locally, searching mesh",
                         provider_name
@@ -508,18 +526,14 @@ impl SessionProvider {
                         ));
                     }
                 }
-                return Err(SessionError::InvalidOperation(format!(
-                    "Unknown provider: {}",
-                    provider_name
-                )));
+                return Err(SessionError::ProviderError(local_error));
             }
         };
 
+        let factory = binding.factory.clone();
         let resolved_cfg = resolve_provider_config(
-            plugin_registry,
+            &binding,
             &self.initial_config,
-            &factory,
-            provider_name,
             ProviderConfigMode::Runtime {
                 model,
                 params,
@@ -621,6 +635,7 @@ impl Clone for SessionProvider {
     fn clone(&self) -> Self {
         Self {
             plugin_registry: self.plugin_registry.clone(),
+            provider_resolver: self.provider_resolver.clone(),
             history_store: Arc::clone(&self.history_store),
             initial_config: self.initial_config.clone(),
             cached_provider: Arc::clone(&self.cached_provider),

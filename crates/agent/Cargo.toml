@@ -83,6 +83,7 @@ regex.workspace = true
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
 base64.workspace = true
 hex = "0.4"
+sha2 = "0.11"
 infer = "0.22"
 rayon = "1.11"
 

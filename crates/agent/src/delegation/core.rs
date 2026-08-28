@@ -850,14 +850,14 @@ async fn execute_delegation(
     };
 
     if let Some(profile_id) = ctx.profile_id.as_deref()
-        && let Err(err) = ctx
-            .store
-            .set_session_runtime_binding(
-                &child_session_id,
-                profile_id,
-                Some(&delegation.target_agent_id),
-            )
-            .await
+        && let Err(err) = persist_delegate_runtime_binding(
+            ctx.store.as_ref(),
+            &parent_session_id,
+            &child_session_id,
+            profile_id,
+            &delegation.target_agent_id,
+        )
+        .await
     {
         if let Err(shutdown_err) = session_ref.shutdown().await {
             tracing::warn!(
@@ -1400,6 +1400,29 @@ async fn execute_delegation(
     }
 }
 
+async fn persist_delegate_runtime_binding(
+    store: &dyn SessionStore,
+    parent_session_id: &str,
+    child_session_id: &str,
+    profile_id: &str,
+    agent_id: &str,
+) -> crate::session::error::SessionResult<()> {
+    let parent_binding = store.get_session_runtime_binding(parent_session_id).await?;
+    let matching_binding = parent_binding
+        .as_ref()
+        .filter(|binding| binding.profile_id == profile_id);
+    store
+        .set_session_runtime_binding(
+            child_session_id,
+            profile_id,
+            Some(agent_id),
+            matching_binding.and_then(|binding| binding.profile_fingerprint.as_deref()),
+            matching_binding.and_then(|binding| binding.provider_lock_digest.as_deref()),
+            matching_binding.and_then(|binding| binding.provider_locks_json.as_deref()),
+        )
+        .await
+}
+
 #[instrument(
     name = "delegation.fail",
     skip(ctx),
@@ -1836,6 +1859,74 @@ mod tests {
     use crate::session::sqlite_storage::SqliteStorage;
     use crate::test_utils::MockSessionStore;
     use async_trait::async_trait;
+
+    #[tokio::test]
+    async fn locked_profile_delegation_persists_restorable_provider_lock() {
+        let storage = SqliteStorage::connect(":memory:".into())
+            .await
+            .expect("in-memory storage");
+        storage
+            .set_session_runtime_binding(
+                "parent",
+                "locked-profile",
+                None,
+                Some("profile-fingerprint"),
+                Some("provider-lock"),
+                Some("{\"llama_cpp\":{}}"),
+            )
+            .await
+            .expect("persist parent binding");
+
+        persist_delegate_runtime_binding(&storage, "parent", "child", "locked-profile", "coder")
+            .await
+            .expect("persist delegate binding");
+
+        let restored = storage
+            .get_session_runtime_binding("child")
+            .await
+            .expect("restore delegate binding")
+            .expect("delegate binding");
+        assert_eq!(restored.profile_id, "locked-profile");
+        assert_eq!(restored.agent_id.as_deref(), Some("coder"));
+        assert_eq!(
+            restored.profile_fingerprint.as_deref(),
+            Some("profile-fingerprint")
+        );
+        assert_eq!(
+            restored.provider_lock_digest.as_deref(),
+            Some("provider-lock")
+        );
+        assert_eq!(
+            restored.provider_locks_json.as_deref(),
+            Some("{\"llama_cpp\":{}}")
+        );
+    }
+
+    #[tokio::test]
+    async fn unbound_profile_delegation_persists_null_provider_lock() {
+        let storage = SqliteStorage::connect(":memory:".into())
+            .await
+            .expect("in-memory storage");
+        persist_delegate_runtime_binding(
+            &storage,
+            "missing-parent",
+            "child",
+            "legacy-profile",
+            "coder",
+        )
+        .await
+        .expect("persist legacy delegate binding");
+
+        let restored = storage
+            .get_session_runtime_binding("child")
+            .await
+            .expect("restore delegate binding")
+            .expect("delegate binding");
+        assert_eq!(restored.profile_id, "legacy-profile");
+        assert_eq!(restored.profile_fingerprint, None);
+        assert_eq!(restored.provider_lock_digest, None);
+        assert_eq!(restored.provider_locks_json, None);
+    }
 
     // ── Minimal stub AgentHandle ──────────────────────────────────────────────
 

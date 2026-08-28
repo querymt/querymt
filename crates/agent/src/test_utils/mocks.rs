@@ -52,11 +52,14 @@ mock! {
             session_id: &'b str,
             profile_id: &'c str,
         ) -> SessionResult<()>;
-        async fn set_session_runtime_binding<'a, 'b, 'c, 'd>(
+        async fn set_session_runtime_binding<'a, 'b, 'c, 'd, 'e, 'f, 'g>(
             &'a self,
             session_id: &'b str,
             profile_id: &'c str,
             agent_id: Option<&'d str>,
+            profile_fingerprint: Option<&'e str>,
+            provider_lock_digest: Option<&'f str>,
+            provider_locks_json: Option<&'g str>,
         ) -> SessionResult<()>;
         async fn get_profile_binding<'a, 'b>(
             &'a self,

@@ -10,8 +10,11 @@ use crate::{
         Tool, ToolChoice,
     },
     error::LLMError,
-    plugin::{LLMProviderFactory, host::PluginRegistry},
-    provider_config::prune_config_by_schema,
+    plugin::{
+        LLMProviderFactory,
+        host::{PluginRegistry, ProviderResolver},
+    },
+    provider_config::{prune_config_by_schema, resolve_binding_provider_config},
     tool_decorator::{CallFunctionTool, ToolEnabledProvider},
 };
 use serde::Serialize;
@@ -153,14 +156,21 @@ impl LLMBuilder<Unbound> {
         self,
         registry: &PluginRegistry,
     ) -> Result<Box<dyn LLMProvider>, LLMError> {
-        self.build_with_registry(registry).await
+        self.build_with_resolver(registry).await
+    }
+
+    pub async fn build_with_resolver(
+        self,
+        resolver: &dyn ProviderResolver,
+    ) -> Result<Box<dyn LLMProvider>, LLMError> {
+        self.build_from_resolver(resolver).await
     }
 }
 
 impl<'a> LLMBuilder<BoundRegistry<'a>> {
     pub async fn build(self) -> Result<Box<dyn LLMProvider>, LLMError> {
         let registry = self.state.registry;
-        self.build_with_registry(registry).await
+        self.build_from_resolver(registry).await
     }
 }
 
@@ -355,19 +365,17 @@ impl<State> LLMBuilder<State> {
         self
     }
 
-    #[cfg_attr(feature = "tracing", instrument(name = "llm_builder.build", skip(self, registry), fields(provider = self.provider.as_deref().unwrap_or("unknown"))))]
-    async fn build_with_registry(
+    #[cfg_attr(feature = "tracing", instrument(name = "llm_builder.build", skip(self, resolver), fields(provider = self.provider.as_deref().unwrap_or("unknown"))))]
+    async fn build_from_resolver(
         self,
-        registry: &PluginRegistry,
+        resolver: &dyn ProviderResolver,
     ) -> Result<Box<dyn LLMProvider>, LLMError> {
         let provider_name = self
             .provider
             .clone()
             .ok_or_else(|| LLMError::InvalidRequest("No provider specified".to_string()))?;
-        let factory: Arc<dyn LLMProviderFactory> =
-            registry.get(&provider_name).await.ok_or_else(|| {
-                LLMError::InvalidRequest(format!("Unknown provider: {}", provider_name))
-            })?;
+        let binding = resolver.resolve(&provider_name).await?;
+        let factory: Arc<dyn LLMProviderFactory> = binding.factory.clone();
 
         let tool_list: Vec<Tool> = self
             .tool_registry
@@ -375,11 +383,7 @@ impl<State> LLMBuilder<State> {
             .map(|t| t.descriptor())
             .collect();
 
-        let resolved_cfg = crate::provider_config::resolve_registry_provider_config(
-            registry,
-            &provider_name,
-            factory.as_ref(),
-        )?;
+        let resolved_cfg = resolve_binding_provider_config(&binding)?;
 
         let mut full_cfg = match resolved_cfg.full_config {
             Value::Object(map) => map,

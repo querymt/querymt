@@ -602,7 +602,7 @@ impl SessionStore for SqliteStorage {
     }
 
     async fn set_profile_binding(&self, session_id: &str, profile_id: &str) -> SessionResult<()> {
-        self.set_session_runtime_binding(session_id, profile_id, None)
+        self.set_session_runtime_binding(session_id, profile_id, None, None, None, None)
             .await
     }
 
@@ -611,20 +611,39 @@ impl SessionStore for SqliteStorage {
         session_id: &str,
         profile_id: &str,
         agent_id: Option<&str>,
+        profile_fingerprint: Option<&str>,
+        provider_lock_digest: Option<&str>,
+        provider_locks_json: Option<&str>,
     ) -> SessionResult<()> {
         let session_id = session_id.to_string();
         let profile_id = profile_id.to_string();
         let agent_id = agent_id.map(str::to_string);
+        let profile_fingerprint = profile_fingerprint.map(str::to_string);
+        let provider_lock_digest = provider_lock_digest.map(str::to_string);
+        let provider_locks_json = provider_locks_json.map(str::to_string);
         self.run_blocking(move |conn| {
-            conn.execute(
-                "INSERT INTO profile_bindings (session_id, profile_id, agent_id)
-                 VALUES (?1, ?2, ?3)
+            let transaction = conn.transaction()?;
+            transaction.execute(
+                "INSERT INTO profile_bindings (
+                    session_id, profile_id, agent_id, profile_fingerprint,
+                    provider_lock_digest, provider_locks_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(session_id) DO UPDATE SET
                     profile_id = excluded.profile_id,
-                    agent_id = excluded.agent_id",
-                params![session_id, profile_id, agent_id],
+                    agent_id = excluded.agent_id,
+                    profile_fingerprint = excluded.profile_fingerprint,
+                    provider_lock_digest = excluded.provider_lock_digest,
+                    provider_locks_json = excluded.provider_locks_json",
+                params![
+                    session_id,
+                    profile_id,
+                    agent_id,
+                    profile_fingerprint,
+                    provider_lock_digest,
+                    provider_locks_json
+                ],
             )?;
-            Ok(())
+            transaction.commit()
         })
         .await
     }
@@ -649,12 +668,15 @@ impl SessionStore for SqliteStorage {
         let session_id = session_id.to_string();
         self.run_blocking(move |conn| {
             conn.query_row(
-                "SELECT profile_id, agent_id FROM profile_bindings WHERE session_id = ?1",
+                "SELECT profile_id, agent_id, profile_fingerprint, provider_lock_digest, provider_locks_json FROM profile_bindings WHERE session_id = ?1",
                 params![session_id],
                 |row| {
                     Ok(crate::session::store::SessionRuntimeBinding {
                         profile_id: row.get(0)?,
                         agent_id: row.get(1)?,
+                        profile_fingerprint: row.get(2)?,
+                        provider_lock_digest: row.get(3)?,
+                        provider_locks_json: row.get(4)?,
                     })
                 },
             )

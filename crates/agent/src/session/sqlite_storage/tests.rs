@@ -284,7 +284,14 @@ async fn session_runtime_binding_round_trips_profile_and_delegate() {
         .expect("in-memory storage");
 
     storage
-        .set_session_runtime_binding("delegate-session", "quorum", Some("coder"))
+        .set_session_runtime_binding(
+            "delegate-session",
+            "quorum",
+            Some("coder"),
+            Some("profile-sha"),
+            Some("lock-sha"),
+            Some("{}"),
+        )
         .await
         .expect("persist runtime binding");
 
@@ -303,6 +310,67 @@ async fn session_runtime_binding_round_trips_profile_and_delegate() {
             .as_deref(),
         Some("quorum")
     );
+
+    assert_eq!(binding.profile_fingerprint.as_deref(), Some("profile-sha"));
+    assert_eq!(binding.provider_lock_digest.as_deref(), Some("lock-sha"));
+    assert_eq!(binding.provider_locks_json.as_deref(), Some("{}"));
+}
+
+#[tokio::test]
+async fn session_runtime_binding_transaction_rolls_back_on_failure() {
+    let storage = SqliteStorage::connect(":memory:".into())
+        .await
+        .expect("in-memory storage");
+    storage
+        .set_session_runtime_binding(
+            "session-1",
+            "old-profile",
+            None,
+            Some("old-fingerprint"),
+            Some("old-lock"),
+            Some("{}"),
+        )
+        .await
+        .expect("seed binding");
+    storage
+        .run_blocking(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER reject_provider_lock_update
+                 BEFORE UPDATE ON profile_bindings
+                 WHEN NEW.provider_locks_json = 'reject'
+                 BEGIN
+                    SELECT RAISE(ABORT, 'rejected provider lock');
+                 END;",
+            )
+        })
+        .await
+        .expect("install failure trigger");
+
+    storage
+        .set_session_runtime_binding(
+            "session-1",
+            "new-profile",
+            Some("coder"),
+            Some("new-fingerprint"),
+            Some("new-lock"),
+            Some("reject"),
+        )
+        .await
+        .expect_err("transaction must fail");
+
+    let binding = storage
+        .get_session_runtime_binding("session-1")
+        .await
+        .expect("load binding")
+        .expect("original binding remains");
+    assert_eq!(binding.profile_id, "old-profile");
+    assert_eq!(binding.agent_id, None);
+    assert_eq!(
+        binding.profile_fingerprint.as_deref(),
+        Some("old-fingerprint")
+    );
+    assert_eq!(binding.provider_lock_digest.as_deref(), Some("old-lock"));
+    assert_eq!(binding.provider_locks_json.as_deref(), Some("{}"));
 }
 
 #[tokio::test]

@@ -10,6 +10,7 @@ use crate::{
 use async_trait::async_trait;
 use libloading::Library;
 use std::ffi::CStr;
+use std::os::raw::c_char;
 use std::path::Path;
 use std::sync::Arc;
 #[cfg(feature = "tracing")]
@@ -89,6 +90,10 @@ unsafe extern "C" fn host_log_callback(
     log::log!(target: target_str, log_level, "{}", message_str);
 }
 
+pub const NATIVE_PLUGIN_API: u32 = 1;
+type PluginApiFn = unsafe extern "C" fn() -> u32;
+type PluginNameFn = unsafe extern "C" fn() -> *const c_char;
+
 pub struct NativeLoader;
 
 #[async_trait]
@@ -109,20 +114,80 @@ impl PluginLoader for NativeLoader {
             plugin.file_path.display()
         );
 
-        let provider = self.load_library(&plugin_cfg.name, &plugin.file_path)?;
+        let expected_name = plugin_cfg.factory.as_deref().unwrap_or(&plugin_cfg.name);
+        let provider = self.load_library(
+            expected_name,
+            &plugin.file_path,
+            plugin_cfg.locked,
+            plugin_cfg.plugin_api,
+        )?;
         Ok(provider)
     }
 }
 
 impl NativeLoader {
+    fn validate_descriptor(
+        lib: &Library,
+        name: &str,
+        path: &Path,
+        locked: bool,
+        required_api: Option<u32>,
+    ) -> Result<(), LLMError> {
+        if let Some(required_api) = required_api {
+            unsafe {
+                let api = lib.get::<PluginApiFn>(b"querymt_plugin_api").map_err(|_| {
+                    LLMError::PluginError(format!(
+                        "Native plugin {} does not export required querymt_plugin_api",
+                        path.display()
+                    ))
+                })?;
+                if required_api != NATIVE_PLUGIN_API || api() != required_api {
+                    return Err(LLMError::PluginError(format!(
+                        "Native plugin {} uses API {}, configuration requires {}, host supports {}",
+                        path.display(),
+                        api(),
+                        required_api,
+                        NATIVE_PLUGIN_API
+                    )));
+                }
+            }
+        }
+
+        if locked {
+            unsafe {
+                let plugin_name =
+                    lib.get::<PluginNameFn>(b"querymt_plugin_name")
+                        .map_err(|_| {
+                            LLMError::PluginError(format!(
+                                "Locked native plugin {} does not export querymt_plugin_name",
+                                path.display()
+                            ))
+                        })?;
+                let ptr = plugin_name();
+                if ptr.is_null() || CStr::from_ptr(ptr).to_string_lossy() != name {
+                    return Err(LLMError::PluginError(format!(
+                        "Locked native plugin {} descriptor does not match expected factory '{}'",
+                        path.display(),
+                        name
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn load_library(
         &self,
         name: &str,
         path: &Path,
+        locked: bool,
+        required_api: Option<u32>,
     ) -> Result<Arc<dyn LLMProviderFactory>, LLMError> {
         let lib = unsafe {
             Arc::new(Library::new(path).map_err(|e| LLMError::PluginError(format!("{:#}", e)))?)
         };
+        Self::validate_descriptor(&lib, name, path, locked, required_api)?;
 
         let factory: Box<dyn LLMProviderFactory> = unsafe {
             if let Ok(async_ctor) = lib.get::<FactoryCtor>(b"plugin_factory") {
@@ -155,6 +220,14 @@ impl NativeLoader {
 
         let factory_name = factory.name();
         if factory_name != name {
+            if locked {
+                return Err(LLMError::PluginError(format!(
+                    "Locked plugin name mismatch in {}: expected '{}', but plugin reports '{}'",
+                    path.display(),
+                    name,
+                    factory_name
+                )));
+            }
             log::warn!(
                 "Plugin name mismatch in {}: config name is '{}', but plugin reports '{}'. Using config name.",
                 path.display(),
@@ -179,7 +252,111 @@ impl NativeLoader {
 
         Ok(Arc::new(NativeFactoryWrapper {
             factory_impl: factory,
-            _library: Arc::clone(&lib),
+            _library: lib,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn compile_fixture(dir: &Path, name: &str, source: &str) -> PathBuf {
+        let source_path = dir.join(format!("{name}.rs"));
+        fs::write(&source_path, source).expect("write native fixture source");
+        let library_path = dir.join(format!(
+            "{}{}{}",
+            std::env::consts::DLL_PREFIX,
+            name,
+            std::env::consts::DLL_SUFFIX
+        ));
+        let output = Command::new("rustc")
+            .args(["--crate-type", "cdylib", "--edition", "2024"])
+            .arg(&source_path)
+            .arg("-o")
+            .arg(&library_path)
+            .output()
+            .expect("compile native fixture");
+        assert!(
+            output.status.success(),
+            "fixture compilation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        library_path
+    }
+
+    fn validate_fixture(
+        source: &str,
+        locked: bool,
+        required_api: Option<u32>,
+    ) -> Result<(), LLMError> {
+        let dir = tempfile::tempdir().expect("fixture tempdir");
+        let path = compile_fixture(dir.path(), "descriptor_fixture", source);
+        let library = unsafe { Library::new(&path).expect("load native fixture") };
+        NativeLoader::validate_descriptor(
+            &library,
+            "expected_provider",
+            &path,
+            locked,
+            required_api,
+        )
+    }
+
+    #[test]
+    fn configured_api_rejects_missing_export() {
+        let error = validate_fixture("", false, Some(NATIVE_PLUGIN_API))
+            .expect_err("missing API export must fail");
+        assert!(error.to_string().contains("querymt_plugin_api"));
+    }
+
+    #[test]
+    fn configured_api_rejects_mismatch() {
+        let error = validate_fixture(
+            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_api() -> u32 { 99 }",
+            false,
+            Some(NATIVE_PLUGIN_API),
+        )
+        .expect_err("mismatched API must fail");
+        assert!(error.to_string().contains("uses API 99"));
+    }
+
+    #[test]
+    fn configured_api_accepts_match() {
+        validate_fixture(
+            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_api() -> u32 { 1 }",
+            false,
+            Some(NATIVE_PLUGIN_API),
+        )
+        .expect("matching API must pass");
+    }
+
+    #[test]
+    fn locked_plugin_rejects_missing_name() {
+        let error = validate_fixture("", true, None).expect_err("missing name export must fail");
+        assert!(error.to_string().contains("querymt_plugin_name"));
+    }
+
+    #[test]
+    fn locked_plugin_rejects_name_mismatch() {
+        let error = validate_fixture(
+            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_name() -> *const std::ffi::c_char { c\"other_provider\".as_ptr() }",
+            true,
+            None,
+        )
+        .expect_err("mismatched name must fail");
+        assert!(error.to_string().contains("expected_provider"));
+    }
+
+    #[test]
+    fn locked_plugin_accepts_expected_name() {
+        validate_fixture(
+            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_name() -> *const std::ffi::c_char { c\"expected_provider\".as_ptr() }",
+            true,
+            None,
+        )
+        .expect("matching name must pass");
     }
 }

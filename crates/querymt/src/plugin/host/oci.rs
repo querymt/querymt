@@ -22,8 +22,10 @@ use sigstore::errors::SigstoreVerifyConstraintsError;
 use sigstore::registry::{Auth, OciReference};
 use sigstore::trust::sigstore::SigstoreTrustRoot;
 use sigstore::trust::{ManualTrustRoot, TrustRoot};
+use std::collections::BTreeMap;
 use std::env::consts::{ARCH, OS};
 use std::fs;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -98,8 +100,23 @@ struct CacheMetadata {
     filename: String,
     /// The discovered plugin type, e.g., "native" or "extism"
     plugin_type_str: String,
+    /// SHA-256 of the extracted plugin file.
+    #[serde(default)]
+    file_sha256: Option<String>,
+    #[serde(default)]
+    annotations: BTreeMap<String, String>,
     /// When this metadata was last updated
     retrieved_at_unix: u64,
+}
+
+fn cache_metadata_has_integrity_digest(metadata: &CacheMetadata) -> bool {
+    metadata.file_sha256.is_some()
+}
+
+fn eligible_cached_blob(cache_path: &Path, metadata: &CacheMetadata) -> Option<PathBuf> {
+    cache_metadata_has_integrity_digest(metadata)
+        .then(|| get_blob_path(cache_path, &metadata.manifest_digest, &metadata.filename))
+        .filter(|path| path.exists())
 }
 
 fn build_auth(reference: &Reference) -> RegistryAuth {
@@ -534,6 +551,20 @@ fn persist_with_fallback(
     }
 }
 
+fn sha256_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let mut reader = BufReader::new(fs::File::open(path)?);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 fn load_from_cache(
     meta: &CacheMetadata,
     blob_path: &Path,
@@ -543,10 +574,25 @@ fn load_from_cache(
         "native" => PluginType::Native,
         _ => return Err("Invalid plugin type in cache metadata".into()),
     };
+    let file_sha256 = sha256_file(blob_path)?;
+    if let Some(expected) = &meta.file_sha256
+        && expected != &file_sha256
+    {
+        return Err(format!(
+            "cached OCI plugin integrity check failed for {}: expected {}, got {}",
+            blob_path.display(),
+            expected,
+            file_sha256
+        )
+        .into());
+    }
 
     Ok(ProviderPlugin {
         plugin_type,
         file_path: blob_path.to_path_buf(),
+        manifest_digest: Some(meta.manifest_digest.clone()),
+        file_sha256: Some(file_sha256),
+        annotations: meta.annotations.clone(),
     })
 }
 
@@ -642,6 +688,10 @@ impl OciDownloader {
         }
     }
 
+    pub fn trusted_github_repository(&self) -> Option<&str> {
+        self.config.github_workflow_repository.as_deref()
+    }
+
     /// Returns a reference to the cached trust root, initializing it on first
     /// call. The expensive TUF metadata fetch (`SigstoreTrustRoot::new`) only
     /// happens once; subsequent calls return the cached value immediately.
@@ -680,7 +730,10 @@ impl OciDownloader {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
 
-        if !force_update && let Some(meta) = &local_metadata {
+        if !force_update
+            && let Some(meta) = &local_metadata
+            && cache_metadata_has_integrity_digest(meta)
+        {
             let blob_path = get_blob_path(cache_path, &meta.manifest_digest, &meta.filename);
             if blob_path.exists() {
                 log::debug!("Found cached OCI plugin. Using local version.");
@@ -690,7 +743,13 @@ impl OciDownloader {
                     bytes_total: None,
                     percent: Some(100.0),
                 });
-                return load_from_cache(meta, &blob_path);
+                let meta = meta.clone();
+                let cached = tokio::task::spawn_blocking(move || {
+                    load_from_cache(&meta, &blob_path).map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|error| format!("OCI cache validation task failed: {error}"))?;
+                return cached.map_err(Into::into);
             }
         }
 
@@ -748,7 +807,9 @@ impl OciDownloader {
 
         match client.pull_manifest(&reference, &auth).await {
             Ok((live_manifest, live_digest)) => {
-                if let Some(meta) = &local_metadata {
+                if let Some(meta) = &local_metadata
+                    && cache_metadata_has_integrity_digest(meta)
+                {
                     let blob_path =
                         get_blob_path(cache_path, &meta.manifest_digest, &meta.filename);
                     if meta.manifest_digest == live_digest && blob_path.exists() {
@@ -759,7 +820,13 @@ impl OciDownloader {
                             bytes_total: None,
                             percent: Some(100.0),
                         });
-                        return load_from_cache(meta, &blob_path);
+                        let meta = meta.clone();
+                        let cached = tokio::task::spawn_blocking(move || {
+                            load_from_cache(&meta, &blob_path).map_err(|error| error.to_string())
+                        })
+                        .await
+                        .map_err(|error| format!("OCI cache validation task failed: {error}"))?;
+                        return cached.map_err(Into::into);
                     }
                 }
 
@@ -887,6 +954,13 @@ impl OciDownloader {
 
                 log::debug!("Populated OCI blob cache at: {}", blob_path.display());
 
+                let hash_path = blob_path.clone();
+                let file_sha256 = tokio::task::spawn_blocking(move || {
+                    sha256_file(&hash_path).map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|error| format!("OCI plugin hashing task failed: {error}"))?
+                .map_err(|error| format!("Failed to hash OCI plugin: {error}"))?;
                 let new_metadata = CacheMetadata {
                     manifest_digest: live_digest.to_string(),
                     filename: filename.clone(),
@@ -894,6 +968,8 @@ impl OciDownloader {
                         PluginType::Wasm => "extism".to_string(),
                         PluginType::Native => "native".to_string(),
                     },
+                    file_sha256: Some(file_sha256.clone()),
+                    annotations: image_manifest.annotations.clone().unwrap_or_default(),
                     retrieved_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
                 };
                 fs::write(metadata_path, serde_json::to_vec(&new_metadata)?)?;
@@ -909,6 +985,9 @@ impl OciDownloader {
                 Ok(ProviderPlugin {
                     plugin_type: discovered_type,
                     file_path: blob_path,
+                    manifest_digest: Some(live_digest.to_string()),
+                    file_sha256: Some(file_sha256),
+                    annotations: image_manifest.annotations.clone().unwrap_or_default(),
                 })
             }
             Err(e) => {
@@ -991,13 +1070,16 @@ impl OciDownloader {
                     }
                 }
 
-                if let Some(meta) = local_metadata {
-                    let blob_path =
-                        get_blob_path(cache_path, &meta.manifest_digest, &meta.filename);
-                    if blob_path.exists() {
-                        log::debug!("OFFLINE CACHE HIT: Using stale local version.");
-                        return load_from_cache(&meta, &blob_path);
-                    }
+                if let Some(meta) = local_metadata
+                    && let Some(blob_path) = eligible_cached_blob(cache_path, &meta)
+                {
+                    log::debug!("OFFLINE CACHE HIT: Using stale local version.");
+                    let cached = tokio::task::spawn_blocking(move || {
+                        load_from_cache(&meta, &blob_path).map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| format!("OCI cache validation task failed: {error}"))?;
+                    return cached.map_err(Into::into);
                 }
                 Err("No internet connection and no cached version available for this image.".into())
             }
@@ -1069,6 +1151,8 @@ mod tests {
             manifest_digest: "sha256:abc".to_string(),
             filename: "plugin.wasm".to_string(),
             plugin_type_str: "extism".to_string(),
+            file_sha256: None,
+            annotations: BTreeMap::new(),
             retrieved_at_unix: 1234567890,
         };
 
@@ -1088,6 +1172,8 @@ mod tests {
             manifest_digest: "sha256:def".to_string(),
             filename: "plugin.so".to_string(),
             plugin_type_str: "native".to_string(),
+            file_sha256: None,
+            annotations: BTreeMap::new(),
             retrieved_at_unix: 1234567890,
         };
 
@@ -1107,6 +1193,8 @@ mod tests {
             manifest_digest: "sha256:ghi".to_string(),
             filename: "plugin".to_string(),
             plugin_type_str: "invalid".to_string(),
+            file_sha256: None,
+            annotations: BTreeMap::new(),
             retrieved_at_unix: 1234567890,
         };
 
@@ -1125,11 +1213,50 @@ mod tests {
     }
 
     #[test]
+    fn offline_cache_rejects_legacy_metadata_without_file_digest() {
+        let temp_dir = tempfile::tempdir().expect("cache tempdir");
+        let metadata = CacheMetadata {
+            manifest_digest: "sha256:abc".to_string(),
+            filename: "plugin.wasm".to_string(),
+            plugin_type_str: "extism".to_string(),
+            file_sha256: None,
+            annotations: BTreeMap::new(),
+            retrieved_at_unix: 1234567890,
+        };
+        let blob_path = get_blob_path(
+            temp_dir.path(),
+            &metadata.manifest_digest,
+            &metadata.filename,
+        );
+        fs::create_dir_all(blob_path.parent().expect("blob parent")).expect("create blob dir");
+        fs::write(&blob_path, b"legacy cache").expect("write cached blob");
+
+        assert_eq!(eligible_cached_blob(temp_dir.path(), &metadata), None);
+    }
+
+    #[test]
+    fn cache_metadata_without_file_digest_is_not_eligible_for_cache_hit() {
+        let mut metadata = CacheMetadata {
+            manifest_digest: "sha256:abc".to_string(),
+            filename: "plugin.wasm".to_string(),
+            plugin_type_str: "extism".to_string(),
+            file_sha256: None,
+            annotations: BTreeMap::new(),
+            retrieved_at_unix: 1234567890,
+        };
+        assert!(!cache_metadata_has_integrity_digest(&metadata));
+        metadata.file_sha256 = Some("digest".to_string());
+        assert!(cache_metadata_has_integrity_digest(&metadata));
+    }
+
+    #[test]
     fn test_cache_metadata_serialization() {
         let meta = CacheMetadata {
             manifest_digest: "sha256:test123".to_string(),
             filename: "test.wasm".to_string(),
             plugin_type_str: "extism".to_string(),
+            file_sha256: None,
+            annotations: BTreeMap::new(),
             retrieved_at_unix: 1234567890,
         };
 

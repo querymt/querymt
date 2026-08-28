@@ -60,6 +60,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0012_task_and_intent_revisions",
         apply: migration_0012_task_and_intent_revisions,
     },
+    Migration {
+        version: "0013_session_provider_locks",
+        apply: migration_0013_session_provider_locks,
+    },
 ];
 
 pub(super) fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -447,6 +451,21 @@ fn migration_0011_session_runtime_bindings(conn: &mut Connection) -> Result<(), 
         Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn migration_0013_session_provider_locks(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    for statement in [
+        "ALTER TABLE profile_bindings ADD COLUMN profile_fingerprint TEXT",
+        "ALTER TABLE profile_bindings ADD COLUMN provider_lock_digest TEXT",
+        "ALTER TABLE profile_bindings ADD COLUMN provider_locks_json TEXT",
+    ] {
+        match conn.execute(statement, []) {
+            Ok(_) => {}
+            Err(error) if error.to_string().contains("duplicate column name") => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn migration_0012_task_and_intent_revisions(conn: &mut Connection) -> Result<(), rusqlite::Error> {
