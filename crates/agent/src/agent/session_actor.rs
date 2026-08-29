@@ -21,7 +21,7 @@ use crate::agent::utils::{format_prompt_user_text_only, render_prompt_for_displa
 use crate::error::AgentError;
 use crate::events::{AgentEventKind, SessionLimits};
 use crate::hooks::HookNotice;
-use crate::model::{AgentMessage, MessagePart};
+use crate::model::{AgentMessage, MessagePart, prompt_contains_images, validate_prompt_blocks};
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::LLMConfig;
 use kameo::Actor;
@@ -36,6 +36,15 @@ use tokio::sync::{OwnedSemaphorePermit, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span, instrument};
 use uuid::Uuid;
+
+fn client_prompt_id_from_meta(meta: Option<&crate::acp::protocol::Meta>) -> Option<String> {
+    meta.and_then(|meta| meta.get("querymt"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|querymt| querymt.get("client_prompt_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+}
 
 fn parse_transport_model_id(model_id: &str, fallback_provider: &str) -> (String, String) {
     if let Some(slash_pos) = model_id.find('/') {
@@ -1444,6 +1453,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                 received: input.session_id,
             }));
         }
+        validate_prompt_blocks(&input.prompt)?;
         let input_id = input
             .client_input_id
             .clone()
@@ -1553,6 +1563,9 @@ impl Message<Prompt> for SessionActor {
     type Reply = DelegatedReply<Result<PromptResponse, AgentError>>;
 
     async fn handle(&mut self, msg: Prompt, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        if let Err(error) = validate_prompt_blocks(&msg.req.prompt) {
+            return ctx.spawn(async move { Err(AgentError::from(error)) });
+        }
         let (reply, receiver) = oneshot::channel();
         if self.active_run.is_some() {
             if self.queued_prompts.len() >= MAX_QUEUED_PROMPTS {
@@ -1800,7 +1813,42 @@ async fn acquire_execution_permit_with_timeout(
 }
 
 fn normalized_run_instruction(prompt: &[crate::acp::protocol::ContentBlock]) -> String {
-    crate::agent::utils::render_prompt_for_llm(prompt, None)
+    render_prompt_for_display(prompt)
+}
+
+fn validate_model_image_support(
+    prompt: &[crate::acp::protocol::ContentBlock],
+    llm_config: Option<&LLMConfig>,
+) -> Result<(), AgentError> {
+    if !prompt_contains_images(prompt) {
+        return Ok(());
+    }
+    let Some(llm_config) = llm_config else {
+        return Ok(());
+    };
+    if !model_supports_images(
+        crate::model_info::get_model_info(&llm_config.provider, &llm_config.model).as_ref(),
+    ) {
+        return Err(AgentError::InvalidPromptContent {
+            message: format!(
+                "selected model {}/{} does not support image attachments",
+                llm_config.provider, llm_config.model
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn model_supports_images(model_info: Option<&querymt::providers::ModelInfo>) -> bool {
+    model_info.is_none_or(|info| {
+        info.capabilities.attachment
+            || info
+                .capabilities
+                .modalities
+                .input
+                .iter()
+                .any(|modality| modality == "image")
+    })
 }
 
 async fn validate_execution_task(
@@ -1873,6 +1921,8 @@ async fn execute_prompt_detached(
         session_id,
         req.prompt.len()
     );
+    let client_prompt_id = client_prompt_id_from_meta(req.meta.as_ref());
+    validate_prompt_blocks(&req.prompt)?;
 
     // Acquire execution permit (blocking with timeout)
     let _permit = match acquire_execution_permit_with_timeout(
@@ -1945,6 +1995,9 @@ async fn execute_prompt_detached(
         .with_session(&session_id)
         .await
         .map_err(|e| AgentError::Internal(e.to_string()))?;
+
+    // Slash-command expansion can alter text, but never attachment capability.
+    validate_model_image_support(&req.prompt, session_handle.llm_config())?;
 
     // Create and load RuntimeContext
     let mut runtime_context =
@@ -2077,6 +2130,26 @@ async fn execute_prompt_detached(
         return Err(AgentError::Internal(e.to_string()));
     }
 
+    for block in &req.prompt {
+        config.emit_event(
+            &session_id,
+            AgentEventKind::UserPromptBlock {
+                message_id: message_id.clone(),
+                client_prompt_id: client_prompt_id.clone(),
+                block: block.clone(),
+            },
+        );
+    }
+    config
+        .emit_event_persisted(
+            &session_id,
+            AgentEventKind::PromptReceived {
+                content: display_content.clone(),
+                message_id: Some(message_id.clone()),
+            },
+        )
+        .await
+        .map_err(|error| AgentError::Internal(error.to_string()))?;
     config.emit_event(
         &session_id,
         AgentEventKind::UserMessageStored {
@@ -2620,6 +2693,31 @@ mod tests {
         let instruction = normalized_run_instruction(&prompt);
 
         assert!(instruction.contains(required_sentence));
+    }
+
+    #[test]
+    fn model_image_capability_allows_unknown_and_rejects_known_text_only() {
+        let text_only = querymt::providers::ModelInfo {
+            id: "text-only".to_string(),
+            name: "Text only".to_string(),
+            ..Default::default()
+        };
+        let multimodal = querymt::providers::ModelInfo {
+            id: "vision".to_string(),
+            name: "Vision".to_string(),
+            capabilities: querymt::providers::ModelCapabilities {
+                modalities: querymt::providers::Modalities {
+                    input: vec!["text".to_string(), "image".to_string()],
+                    output: vec!["text".to_string()],
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(model_supports_images(None));
+        assert!(!model_supports_images(Some(&text_only)));
+        assert!(model_supports_images(Some(&multimodal)));
     }
 
     #[tokio::test]
@@ -3216,6 +3314,19 @@ mod tests {
     }
 
     // ── Token state machine tests ─────────────────────────────────────────────
+
+    #[test]
+    fn client_prompt_id_uses_querymt_metadata_namespace() {
+        let meta = serde_json::Map::from_iter([(
+            "querymt".to_string(),
+            serde_json::json!({"client_prompt_id": "client-123"}),
+        )]);
+        assert_eq!(
+            client_prompt_id_from_meta(Some(&meta)).as_deref(),
+            Some("client-123")
+        );
+        assert!(client_prompt_id_from_meta(None).is_none());
+    }
 
     #[test]
     fn parse_transport_model_id_splits_on_first_slash() {

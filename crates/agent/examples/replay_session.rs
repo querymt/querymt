@@ -239,7 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
         })
         .map(|m| m.to_chat_message())
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     println!("💬 Message History: {} messages", chat_messages.len());
     for (i, msg) in chat_messages.iter().enumerate() {

@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use either::*;
 use http::{
     Method, Request, Response,
@@ -913,6 +914,28 @@ fn extract_reasoning_content<'a>(msg: &'a ChatMessage, include: bool) -> Option<
     msg.thinking().map(Cow::Borrowed)
 }
 
+fn content_text_with_fallbacks<'a>(content: impl IntoIterator<Item = &'a Content>) -> String {
+    content
+        .into_iter()
+        .filter_map(|block| match block {
+            Content::Text { text } => Some(text.clone()),
+            Content::Image { mime_type, data } => Some(format!(
+                "[Image attachment: {mime_type}, {} bytes]",
+                data.len()
+            )),
+            Content::ImageUrl { .. } => Some("[Image URL attachment]".to_string()),
+            Content::Pdf { data } => Some(format!("[PDF attachment: {} bytes]", data.len())),
+            Content::Audio { mime_type, data } => Some(format!(
+                "[Audio attachment: {mime_type}, {} bytes]",
+                data.len()
+            )),
+            Content::ResourceLink { uri, .. } => Some(format!("[Attached resource: {uri}]")),
+            Content::Thinking { .. } | Content::ToolUse { .. } | Content::ToolResult { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Convert a ChatMessage with Vec<Content> blocks into one or more OpenAI API messages.
 ///
 /// Most messages map 1:1, but ToolResult blocks each become a separate `role: "tool"` message.
@@ -937,22 +960,17 @@ fn convert_chat_message_to_openai<'a>(
     // it inside the final tool response: some OpenAI-compatible APIs reject a
     // user message interleaved between an assistant tool call and its responses.
     if has_tool_results {
-        let supplemental_text = chat_msg
-            .content
-            .iter()
-            .filter(|block| !block.is_tool_result())
-            .filter_map(Content::as_text)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let supplemental_text = content_text_with_fallbacks(
+            chat_msg
+                .content
+                .iter()
+                .filter(|block| !block.is_tool_result()),
+        );
         let last_tool_result_index = chat_msg.content.iter().rposition(Content::is_tool_result);
 
         for (index, block) in chat_msg.content.iter().enumerate() {
             if let Content::ToolResult { id, content, .. } = block {
-                let mut text = content
-                    .iter()
-                    .filter_map(Content::as_text)
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let mut text = content_text_with_fallbacks(content);
                 if Some(index) == last_tool_result_index && !supplemental_text.is_empty() {
                     if !text.is_empty() {
                         text.push_str("\n\n");
@@ -973,8 +991,8 @@ fn convert_chat_message_to_openai<'a>(
 
     // Emit tool use blocks as tool_calls on an assistant message
     if has_tool_use {
-        // Collect any text blocks as the message content
-        let text: String = chat_msg.text();
+        // Preserve non-tool blocks as text or bounded attachment markers.
+        let text = content_text_with_fallbacks(&chat_msg.content);
         let content_val = if text.is_empty() {
             None
         } else {
@@ -1020,14 +1038,20 @@ fn convert_chat_message_to_openai<'a>(
         return;
     }
 
-    // Normal message: text, images, etc.
-    // Check for image URLs — use content array format
-    let has_images = chat_msg
-        .content
-        .iter()
-        .any(|b| matches!(b, Content::ImageUrl { .. } | Content::Image { .. }));
+    // Use content-array format whenever the message contains non-text input so
+    // ordering is retained and unsupported binary kinds receive explicit markers.
+    let has_structured_content = chat_msg.content.iter().any(|block| {
+        matches!(
+            block,
+            Content::ImageUrl { .. }
+                | Content::Image { .. }
+                | Content::Pdf { .. }
+                | Content::Audio { .. }
+                | Content::ResourceLink { .. }
+        )
+    });
 
-    if has_images {
+    if has_structured_content {
         let content_blocks: Vec<MessageContent<'a>> = chat_msg
             .content
             .iter()
@@ -1048,7 +1072,48 @@ fn convert_chat_message_to_openai<'a>(
                     tool_call_id: None,
                     tool_output: None,
                 }),
-                _ => None,
+                Content::Image { mime_type, data } => {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+                    Some(MessageContent {
+                        message_type: Some(Cow::Borrowed("image_url")),
+                        text: None,
+                        image_url: Some(ImageUrlContent {
+                            url: Cow::Owned(format!("data:{mime_type};base64,{encoded}")),
+                        }),
+                        tool_call_id: None,
+                        tool_output: None,
+                    })
+                }
+                Content::Pdf { data } => Some(MessageContent {
+                    message_type: Some(Cow::Borrowed("text")),
+                    text: Some(Cow::Owned(format!(
+                        "[PDF attachment: {} bytes]",
+                        data.len()
+                    ))),
+                    image_url: None,
+                    tool_call_id: None,
+                    tool_output: None,
+                }),
+                Content::Audio { mime_type, data } => Some(MessageContent {
+                    message_type: Some(Cow::Borrowed("text")),
+                    text: Some(Cow::Owned(format!(
+                        "[Audio attachment: {mime_type}, {} bytes]",
+                        data.len()
+                    ))),
+                    image_url: None,
+                    tool_call_id: None,
+                    tool_output: None,
+                }),
+                Content::ResourceLink { uri, .. } => Some(MessageContent {
+                    message_type: Some(Cow::Borrowed("text")),
+                    text: Some(Cow::Owned(format!("[Attached resource: {uri}]"))),
+                    image_url: None,
+                    tool_call_id: None,
+                    tool_output: None,
+                }),
+                Content::Thinking { .. } | Content::ToolUse { .. } | Content::ToolResult { .. } => {
+                    None
+                }
             })
             .collect();
 
@@ -1537,9 +1602,117 @@ mod tests {
 
     use super::{
         MultipartForm, OpenAIChatResponse, OpenAIToolUseState, classify_openai_http_error,
-        openai_parse_chat, openai_parse_list_models, parse_openai_sse_chunk,
+        convert_chat_message_to_openai, openai_parse_chat, openai_parse_list_models,
+        parse_openai_sse_chunk,
     };
     use crate::OpenAI;
+
+    #[test]
+    fn raw_images_serialize_as_ordered_data_urls() {
+        use querymt::chat::{ChatMessage, ChatRole, Content};
+
+        let message = ChatMessage {
+            role: ChatRole::User,
+            content: vec![
+                Content::text("before"),
+                Content::image("image/png", vec![1, 2, 3]),
+                Content::text("after"),
+            ],
+            cache: None,
+        };
+        let mut converted = Vec::new();
+        convert_chat_message_to_openai(&message, &mut converted, true);
+        let value = serde_json::to_value(&converted[0]).unwrap();
+        let content = value["content"].as_array().unwrap();
+
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["text"], "before");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AQID");
+        assert_eq!(content[2]["text"], "after");
+    }
+
+    #[test]
+    fn image_only_message_is_not_dropped() {
+        use querymt::chat::{ChatMessage, ChatRole, Content};
+
+        let message = ChatMessage {
+            role: ChatRole::User,
+            content: vec![Content::image("image/jpeg", vec![0xff, 0xd8])],
+            cache: None,
+        };
+        let mut converted = Vec::new();
+        convert_chat_message_to_openai(&message, &mut converted, true);
+        let value = serde_json::to_value(&converted[0]).unwrap();
+
+        assert_eq!(
+            value["content"][0]["image_url"]["url"],
+            "data:image/jpeg;base64,/9g="
+        );
+    }
+
+    #[test]
+    fn pdf_only_message_uses_explicit_size_marker() {
+        use querymt::chat::{ChatMessage, ChatRole, Content};
+
+        let message = ChatMessage {
+            role: ChatRole::User,
+            content: vec![Content::pdf(vec![0x25, 0x50, 0x44, 0x46])],
+            cache: None,
+        };
+        let mut converted = Vec::new();
+        convert_chat_message_to_openai(&message, &mut converted, true);
+        let value = serde_json::to_value(&converted[0]).unwrap();
+
+        assert_eq!(value["content"].as_array().unwrap().len(), 1);
+        assert_eq!(value["content"][0]["type"], "text");
+        assert_eq!(value["content"][0]["text"], "[PDF attachment: 4 bytes]");
+    }
+
+    #[test]
+    fn mixed_image_pdf_and_text_preserve_order_without_filtering() {
+        use querymt::chat::{ChatMessage, ChatRole, Content};
+
+        let message = ChatMessage {
+            role: ChatRole::User,
+            content: vec![
+                Content::text("before"),
+                Content::image("image/png", vec![1, 2, 3]),
+                Content::pdf(vec![0x25, 0x50]),
+                Content::text("after"),
+            ],
+            cache: None,
+        };
+        let mut converted = Vec::new();
+        convert_chat_message_to_openai(&message, &mut converted, true);
+        let value = serde_json::to_value(&converted[0]).unwrap();
+        let content = value["content"].as_array().unwrap();
+
+        assert_eq!(content.len(), 4);
+        assert_eq!(content[0]["text"], "before");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AQID");
+        assert_eq!(content[2]["text"], "[PDF attachment: 2 bytes]");
+        assert_eq!(content[3]["text"], "after");
+    }
+
+    #[test]
+    fn tool_result_pdf_uses_explicit_marker() {
+        use querymt::chat::{ChatMessage, ChatRole, Content};
+
+        let message = ChatMessage {
+            role: ChatRole::User,
+            content: vec![Content::tool_result(
+                "call-1",
+                vec![Content::pdf(vec![0x25, 0x50, 0x44, 0x46])],
+            )],
+            cache: None,
+        };
+        let mut converted = Vec::new();
+        convert_chat_message_to_openai(&message, &mut converted, true);
+        let value = serde_json::to_value(&converted[0]).unwrap();
+
+        assert_eq!(value["role"], "tool");
+        assert_eq!(value["content"], "[PDF attachment: 4 bytes]");
+    }
 
     #[test]
     fn multipart_form_encodes_text_and_file_parts() {

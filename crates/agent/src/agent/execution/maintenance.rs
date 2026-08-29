@@ -96,6 +96,9 @@ pub(super) async fn run_ai_compaction(
                 .iter()
                 .map(|p| match p {
                     MessagePart::Text { content } => content.len() / 4,
+                    MessagePart::Prompt { blocks } | MessagePart::Steering { blocks, .. } => {
+                        crate::agent::utils::render_prompt_for_llm(blocks, None).len() / 4
+                    }
                     MessagePart::ToolResult { content, .. } => {
                         content
                             .iter()
@@ -298,8 +301,9 @@ pub(super) async fn run_ai_compaction(
         .and_then(|cfg| cfg.max_prompt_bytes);
     let chat_messages: Vec<querymt::chat::ChatMessage> = filtered_messages
         .iter()
-        .map(|m| m.to_chat_message_with_max_prompt_bytes(prompt_limit))
-        .collect();
+        .map(|message| message.to_chat_message_with_max_prompt_bytes(prompt_limit))
+        .collect::<Result<_, _>>()
+        .map_err(|error| anyhow::anyhow!("Invalid prompt content after compaction: {error}"))?;
 
     let new_context_tokens = config
         .compaction

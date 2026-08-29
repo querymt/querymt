@@ -94,6 +94,9 @@ pub enum AgentError {
     #[error("turn control error: {message}")]
     TurnControl { kind: String, message: String },
 
+    #[error("invalid prompt content: {message}")]
+    InvalidPromptContent { message: String },
+
     // --- Serialization ---
     #[error("serialization error: {0}")]
     Serialization(String),
@@ -135,6 +138,12 @@ impl From<AgentError> for AcpError {
             return AcpError::new(-32602, message.clone()).data(serde_json::json!({
                 "category": "turn_control",
                 "kind": kind,
+                "message": message,
+            }));
+        }
+        if let AgentError::InvalidPromptContent { message } = &e {
+            return AcpError::new(-32602, message.clone()).data(serde_json::json!({
+                "category": "prompt_content",
                 "message": message,
             }));
         }
@@ -181,6 +190,14 @@ impl From<crate::agent::turn_control::TurnControlError> for AgentError {
     }
 }
 
+impl From<crate::model::PromptContentError> for AgentError {
+    fn from(error: crate::model::PromptContentError) -> Self {
+        Self::InvalidPromptContent {
+            message: error.to_string(),
+        }
+    }
+}
+
 impl From<anyhow::Error> for AgentError {
     fn from(e: anyhow::Error) -> Self {
         AgentError::Internal(e.to_string())
@@ -215,6 +232,15 @@ mod tests {
     use agent_client_protocol::ErrorCode;
 
     // ── From<AgentError> for AcpError ──────────────────────────────────────
+
+    #[test]
+    fn invalid_prompt_content_maps_to_invalid_params() {
+        let error: AcpError = AgentError::InvalidPromptContent {
+            message: "invalid base64 attachment data".to_string(),
+        }
+        .into();
+        assert_eq!(error.code, ErrorCode::InvalidParams);
+    }
 
     #[test]
     fn provider_required_maps_to_internal_error() {

@@ -779,26 +779,23 @@ impl SessionHandle {
             .await
     }
 
-    /// Get the session history converted to standard ChatMessages for the LLM
-    pub async fn history(&self) -> Vec<ChatMessage> {
-        match self.get_effective_agent_history().await {
-            Ok(agent_msgs) => agent_msgs
-                .iter()
-                .map(|m| {
-                    m.to_chat_message_with_target(
+    /// Get the session history converted to standard ChatMessages for the LLM.
+    pub async fn history(&self) -> SessionResult<Vec<ChatMessage>> {
+        let agent_msgs = self.get_effective_agent_history().await?;
+        agent_msgs
+            .iter()
+            .map(|message| {
+                message
+                    .to_chat_message_with_target(
                         self.llm_config.as_ref().map(|cfg| cfg.provider.as_str()),
                         self.llm_config.as_ref().map(|cfg| cfg.model.as_str()),
                         self.execution_config
                             .as_ref()
                             .and_then(|cfg| cfg.max_prompt_bytes),
                     )
-                })
-                .collect(),
-            Err(err) => {
-                log::warn!("Failed to load session history: {}", err);
-                Vec::new()
-            }
-        }
+                    .map_err(|error| SessionError::InvalidOperation(error.to_string()))
+            })
+            .collect()
     }
 
     /// Persist an AgentMessage to the store
@@ -837,7 +834,7 @@ impl SessionHandle {
         }
 
         // 2. Fetch full history for context
-        let llm_messages = self.history().await;
+        let llm_messages = self.history().await?;
 
         // 3. Call LLM
         let response = self.submit_request(&llm_messages).await?;

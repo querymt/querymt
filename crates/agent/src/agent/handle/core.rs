@@ -493,7 +493,10 @@ impl LocalAgentHandle {
             let mut response = LoadSessionResponse::new()
                 .modes(crate::agent::session_registry::mode_state(current_mode))
                 .config_options(config_options);
-            if let Some(meta) = profile_handle.session_load_snapshot_meta(&session_id).await {
+            if let Some(meta) = profile_handle
+                .session_load_snapshot_meta(&session_id)
+                .await?
+            {
                 response = response.meta(meta);
             }
             return Ok(response);
@@ -519,7 +522,7 @@ impl LocalAgentHandle {
             let mut response = LoadSessionResponse::new()
                 .modes(crate::agent::session_registry::mode_state(current_mode))
                 .config_options(config_options);
-            if let Some(meta) = self.session_load_snapshot_meta(&session_id).await {
+            if let Some(meta) = self.session_load_snapshot_meta(&session_id).await? {
                 response = response.meta(meta);
             }
             return Ok(response);
@@ -566,7 +569,7 @@ impl LocalAgentHandle {
         let mut response = LoadSessionResponse::new()
             .modes(crate::agent::session_registry::mode_state(current_mode))
             .config_options(config_options);
-        if let Some(meta) = self.session_load_snapshot_meta(&session_id).await {
+        if let Some(meta) = self.session_load_snapshot_meta(&session_id).await? {
             response = response.meta(meta);
         }
 
@@ -576,17 +579,27 @@ impl LocalAgentHandle {
     async fn session_load_snapshot_meta(
         &self,
         session_id: &str,
-    ) -> Option<serde_json::Map<String, serde_json::Value>> {
-        let view_store = self.config.storage.view_store()?;
+    ) -> std::result::Result<Option<serde_json::Map<String, serde_json::Value>>, Error> {
+        let Some(view_store) = self.config.storage.view_store() else {
+            return Ok(None);
+        };
         let snapshot = crate::session::load_session_snapshot(self, view_store, session_id)
             .await
-            .ok()?;
+            .map_err(|error| {
+                Error::internal_error().data(serde_json::json!({
+                    "message": format!("Failed to build session load snapshot: {error}"),
+                    "sessionId": session_id,
+                }))
+            })?;
+        let snapshot = serde_json::to_value(snapshot).map_err(|error| {
+            Error::internal_error().data(serde_json::json!({
+                "message": format!("Failed to serialize session load snapshot: {error}"),
+                "sessionId": session_id,
+            }))
+        })?;
         let mut meta = serde_json::Map::new();
-        meta.insert(
-            "querymt/sessionLoadSnapshot.v1".to_string(),
-            serde_json::to_value(snapshot).ok()?,
-        );
-        Some(meta)
+        meta.insert("querymt/sessionLoadSnapshot.v1".to_string(), snapshot);
+        Ok(Some(meta))
     }
 
     /// Gracefully shutdown the agent and all background tasks.
