@@ -163,3 +163,7 @@ harness = false
 [[bench]]
 name = "session_list_view"
 harness = false
+
+[[bench]]
+name = "session_load"
+harness = false
