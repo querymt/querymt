@@ -21,7 +21,9 @@
 //!                                        └───────────────────────────┘
 //! ```
 
-use crate::acp::client_bridge::{ClientBridgeMessage, ClientBridgeSender};
+use crate::acp::client_bridge::{
+    ClientBridgeMessage, ClientBridgeSender, NotificationForwardingState,
+};
 use crate::acp::protocol::{
     AgentRequest, AuthenticateRequest, CancelNotification, ClientNotification, ClientRequest,
     CloseSessionRequest, DeleteSessionRequest, ExtRequest, ForkSessionRequest, InitializeRequest,
@@ -185,18 +187,21 @@ async fn run_bridge_task(
     connection: ConnectionTo<acp::Client>,
 ) {
     log::info!("Client bridge task started");
+    let mut notification_forwarding = NotificationForwardingState::default();
 
     while let Some(msg) = rx.recv().await {
         match msg {
             ClientBridgeMessage::Notification(notif) => {
                 let _span = info_span!("acp.notification").entered();
                 log::debug!("Bridge: forwarding session notification");
-                if let Err(e) = connection.send_notification(notif) {
+                let result = connection.send_notification(notif);
+                if let Err(e) = &result {
                     log::error!("Bridge: session_notification failed: {:?}", e);
                 }
+                notification_forwarding.record_result(result);
             }
             ClientBridgeMessage::Flush { response_tx } => {
-                let _ = response_tx.send(());
+                let _ = response_tx.send(notification_forwarding.take_flush_result());
             }
             ClientBridgeMessage::ExtNotification(notif) => {
                 let _span = info_span!("acp.ext_notification").entered();
