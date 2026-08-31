@@ -196,7 +196,7 @@ async fn run_bridge_task(
                 }
             }
             ClientBridgeMessage::Flush { response_tx } => {
-                let _ = response_tx.send(());
+                let _ = response_tx.send(Ok(()));
             }
             ClientBridgeMessage::ExtNotification(notif) => {
                 let _span = info_span!("acp.ext_notification").entered();

@@ -37,10 +37,7 @@
 //! ./qmtcode --mesh
 //! ```
 
-use clap::ArgAction;
-#[cfg(any(feature = "api", feature = "dashboard"))]
-use clap::ArgGroup;
-use clap::Parser;
+use clap::{ArgAction, ArgGroup, Parser};
 use querymt_agent::prelude::*;
 use querymt_agent::profiles::{
     DEFAULT_EMBEDDED_PROFILE_KEY, LocalProfileCatalog, ProfileCatalog, ProfileConfigKind,

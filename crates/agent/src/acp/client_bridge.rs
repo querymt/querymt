@@ -53,7 +53,9 @@ pub enum ClientBridgeMessage {
     Notification(SessionNotification),
 
     /// Barrier acknowledged after every preceding bridge message has been forwarded.
-    Flush { response_tx: oneshot::Sender<()> },
+    Flush {
+        response_tx: oneshot::Sender<Result<(), String>>,
+    },
 
     /// Fire-and-forget ACP extension notification payload.
     ExtNotification(ExtNotification),
@@ -146,7 +148,8 @@ impl ClientBridgeSender {
             .map_err(|_| Error::from(crate::error::AgentError::ClientBridgeClosed))?;
         response_rx
             .await
-            .map_err(|_| Error::from(crate::error::AgentError::ClientBridgeClosed))
+            .map_err(|_| Error::from(crate::error::AgentError::ClientBridgeClosed))?
+            .map_err(|message| Error::internal_error().data(message))
     }
 
     pub async fn notify_ext(&self, notification: ExtNotification) -> Result<(), Error> {
@@ -248,5 +251,43 @@ impl ClientBridgeSender {
         response_rx
             .await
             .map_err(|_| Error::internal_error().data("Elicitation response channel dropped"))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acp::protocol::{ContentBlock, ContentChunk, SessionId, SessionUpdate, TextContent};
+
+    #[tokio::test]
+    async fn flush_is_ordered_after_preceding_notifications() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let sender = ClientBridgeSender::new(tx);
+        let notification = SessionNotification::new(
+            SessionId::from("session-1"),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new("history"),
+            ))),
+        );
+
+        sender
+            .notify(notification)
+            .await
+            .expect("enqueue notification");
+        let flush = tokio::spawn({
+            let sender = sender.clone();
+            async move { sender.flush().await }
+        });
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(ClientBridgeMessage::Notification(_))
+        ));
+        let Some(ClientBridgeMessage::Flush { response_tx }) = rx.recv().await else {
+            panic!("flush must follow the notification");
+        };
+        assert!(!flush.is_finished());
+        response_tx.send(Ok(())).expect("acknowledge flush");
+        flush.await.expect("flush task").expect("flush succeeds");
     }
 }
