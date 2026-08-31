@@ -746,8 +746,12 @@ impl SessionActor {
         let store = self.config.provider.history_store();
         let mut proposed = previous.clone();
         proposed.reasoning_effort = effort;
+        let mut mode_models = previous.mode_models.clone();
+        mode_models
+            .entry(previous.active_mode.as_str().to_string())
+            .or_insert_with(|| previous.effective_model.clone());
         let mut updated = HashMap::new();
-        for (mode, binding) in &previous.mode_models {
+        for (mode, binding) in &mode_models {
             let current = store
                 .get_llm_config(binding.llm_config_id)
                 .await?
@@ -773,7 +777,6 @@ impl SessionActor {
         proposed.mode_models = updated;
         proposed.effective_model = proposed
             .binding_for(previous.active_mode)
-            .or(Some(&previous.effective_model))
             .cloned()
             .ok_or_else(|| AgentError::Internal("active mode has no model binding".to_string()))?;
         self.commit_control_transition(previous, proposed).await
