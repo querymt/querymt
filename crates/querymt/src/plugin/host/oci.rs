@@ -568,30 +568,36 @@ fn sha256_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
 fn load_from_cache(
     meta: &CacheMetadata,
     blob_path: &Path,
+    verify_file_hash: bool,
 ) -> Result<ProviderPlugin, Box<dyn std::error::Error>> {
     let plugin_type = match meta.plugin_type_str.as_str() {
         "extism" => PluginType::Wasm,
         "native" => PluginType::Native,
         _ => return Err("Invalid plugin type in cache metadata".into()),
     };
-    let file_sha256 = sha256_file(blob_path)?;
-    if let Some(expected) = &meta.file_sha256
-        && expected != &file_sha256
-    {
-        return Err(format!(
-            "cached OCI plugin integrity check failed for {}: expected {}, got {}",
-            blob_path.display(),
-            expected,
-            file_sha256
-        )
-        .into());
-    }
+    let file_sha256 = if verify_file_hash {
+        let actual = sha256_file(blob_path)?;
+        if let Some(expected) = &meta.file_sha256
+            && expected != &actual
+        {
+            return Err(format!(
+                "cached OCI plugin integrity check failed for {}: expected {}, got {}",
+                blob_path.display(),
+                expected,
+                actual
+            )
+            .into());
+        }
+        Some(actual)
+    } else {
+        meta.file_sha256.clone()
+    };
 
     Ok(ProviderPlugin {
         plugin_type,
         file_path: blob_path.to_path_buf(),
         manifest_digest: Some(meta.manifest_digest.clone()),
-        file_sha256: Some(file_sha256),
+        file_sha256,
         annotations: meta.annotations.clone(),
     })
 }
@@ -712,6 +718,8 @@ impl OciDownloader {
         progress: Option<OciProgressCallback>,
     ) -> Result<ProviderPlugin, Box<dyn std::error::Error>> {
         let progress: OciProgressCallback = progress.unwrap_or_else(|| Arc::new(|_| {}));
+        let reference = Reference::try_from(image_reference)?;
+        let verify_cached_file = force_update || reference.digest().is_some();
 
         let sanitized_tag_path = image_reference.replace(['/', ':'], "_");
         let manifests_cache_dir = cache_path.join("manifests");
@@ -736,7 +744,11 @@ impl OciDownloader {
         {
             let blob_path = get_blob_path(cache_path, &meta.manifest_digest, &meta.filename);
             if blob_path.exists() {
-                log::debug!("Found cached OCI plugin. Using local version.");
+                if verify_cached_file {
+                    log::debug!("Found cached OCI plugin; verifying cached file SHA-256.");
+                } else {
+                    log::debug!("Found cached OCI plugin; using fast cache validation.");
+                }
                 progress(OciDownloadProgress {
                     phase: OciDownloadPhase::Completed,
                     bytes_downloaded: 0,
@@ -745,7 +757,8 @@ impl OciDownloader {
                 });
                 let meta = meta.clone();
                 let cached = tokio::task::spawn_blocking(move || {
-                    load_from_cache(&meta, &blob_path).map_err(|error| error.to_string())
+                    load_from_cache(&meta, &blob_path, verify_cached_file)
+                        .map_err(|error| error.to_string())
                 })
                 .await
                 .map_err(|error| format!("OCI cache validation task failed: {error}"))?;
@@ -758,7 +771,6 @@ impl OciDownloader {
         let client_config = oci_client::client::ClientConfig::default();
         let client = Client::new(client_config);
 
-        let reference = Reference::try_from(image_reference)?;
         let auth = build_auth(&reference);
 
         // --- Signature verification phase ---
@@ -822,7 +834,8 @@ impl OciDownloader {
                         });
                         let meta = meta.clone();
                         let cached = tokio::task::spawn_blocking(move || {
-                            load_from_cache(&meta, &blob_path).map_err(|error| error.to_string())
+                            load_from_cache(&meta, &blob_path, verify_cached_file)
+                                .map_err(|error| error.to_string())
                         })
                         .await
                         .map_err(|error| format!("OCI cache validation task failed: {error}"))?;
@@ -1075,7 +1088,8 @@ impl OciDownloader {
                 {
                     log::debug!("OFFLINE CACHE HIT: Using stale local version.");
                     let cached = tokio::task::spawn_blocking(move || {
-                        load_from_cache(&meta, &blob_path).map_err(|error| error.to_string())
+                        load_from_cache(&meta, &blob_path, verify_cached_file)
+                            .map_err(|error| error.to_string())
                     })
                     .await
                     .map_err(|error| format!("OCI cache validation task failed: {error}"))?;
@@ -1160,7 +1174,7 @@ mod tests {
         let blob_path = temp_dir.path().join("plugin.wasm");
         fs::write(&blob_path, b"dummy").unwrap();
 
-        let result = load_from_cache(&meta, &blob_path).unwrap();
+        let result = load_from_cache(&meta, &blob_path, false).unwrap();
 
         assert!(matches!(result.plugin_type, PluginType::Wasm));
         assert_eq!(result.file_path, blob_path);
@@ -1181,10 +1195,66 @@ mod tests {
         let blob_path = temp_dir.path().join("plugin.so");
         fs::write(&blob_path, b"dummy").unwrap();
 
-        let result = load_from_cache(&meta, &blob_path).unwrap();
+        let result = load_from_cache(&meta, &blob_path, false).unwrap();
 
         assert!(matches!(result.plugin_type, PluginType::Native));
         assert_eq!(result.file_path, blob_path);
+    }
+
+    #[test]
+    fn fast_cache_validation_reuses_recorded_hash_without_reading_file() {
+        let recorded_hash = "publisher-validated-hash".to_string();
+        let meta = CacheMetadata {
+            manifest_digest: "sha256:def".to_string(),
+            filename: "plugin.so".to_string(),
+            plugin_type_str: "native".to_string(),
+            file_sha256: Some(recorded_hash.clone()),
+            annotations: BTreeMap::new(),
+            retrieved_at_unix: 1234567890,
+        };
+        let missing_blob_path = Path::new("/does/not/exist/plugin.so");
+
+        let result = load_from_cache(&meta, missing_blob_path, false).unwrap();
+
+        assert_eq!(result.file_sha256, Some(recorded_hash));
+    }
+
+    #[test]
+    fn strict_cache_validation_accepts_matching_hash() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let blob_path = temp_dir.path().join("plugin.so");
+        fs::write(&blob_path, b"cached plugin").unwrap();
+        let meta = CacheMetadata {
+            manifest_digest: "sha256:def".to_string(),
+            filename: "plugin.so".to_string(),
+            plugin_type_str: "native".to_string(),
+            file_sha256: Some(sha256_file(&blob_path).unwrap()),
+            annotations: BTreeMap::new(),
+            retrieved_at_unix: 1234567890,
+        };
+
+        let result = load_from_cache(&meta, &blob_path, true).unwrap();
+
+        assert_eq!(result.file_sha256, meta.file_sha256);
+    }
+
+    #[test]
+    fn strict_cache_validation_rejects_modified_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let blob_path = temp_dir.path().join("plugin.so");
+        fs::write(&blob_path, b"modified plugin").unwrap();
+        let meta = CacheMetadata {
+            manifest_digest: "sha256:def".to_string(),
+            filename: "plugin.so".to_string(),
+            plugin_type_str: "native".to_string(),
+            file_sha256: Some("0".repeat(64)),
+            annotations: BTreeMap::new(),
+            retrieved_at_unix: 1234567890,
+        };
+
+        let error = load_from_cache(&meta, &blob_path, true).unwrap_err();
+
+        assert!(error.to_string().contains("integrity check failed"));
     }
 
     #[test]
@@ -1201,7 +1271,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let blob_path = temp_dir.path().join("plugin");
 
-        let result = load_from_cache(&meta, &blob_path);
+        let result = load_from_cache(&meta, &blob_path, false);
 
         assert!(result.is_err());
         assert!(
