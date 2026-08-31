@@ -64,6 +64,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0013_session_provider_locks",
         apply: migration_0013_session_provider_locks,
     },
+    Migration {
+        version: "0014_session_control",
+        apply: migration_0014_session_control,
+    },
 ];
 
 pub(super) fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -85,7 +89,7 @@ pub(super) fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Er
 
         (migration.apply)(conn)?;
         conn.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             params![
                 migration.version,
                 OffsetDateTime::now_utc().unix_timestamp()
@@ -466,6 +470,35 @@ fn migration_0013_session_provider_locks(conn: &mut Connection) -> Result<(), ru
         }
     }
     Ok(())
+}
+
+fn migration_0014_session_control(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        r#"
+            CREATE TABLE IF NOT EXISTS session_control_states (
+                session_id INTEGER PRIMARY KEY,
+                active_mode TEXT NOT NULL,
+                reasoning_effort TEXT,
+                revision INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS session_mode_model_bindings (
+                session_id INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                llm_config_id INTEGER NOT NULL,
+                provider_node_id TEXT,
+                PRIMARY KEY(session_id, mode),
+                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+                FOREIGN KEY(llm_config_id) REFERENCES llm_configs(id) ON DELETE RESTRICT
+            );
+        "#,
+    )
 }
 
 fn migration_0012_task_and_intent_revisions(conn: &mut Connection) -> Result<(), rusqlite::Error> {

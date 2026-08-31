@@ -25,6 +25,7 @@ pub(crate) mod objective;
 pub mod protocol;
 pub mod remote;
 pub mod session_actor;
+pub mod session_control;
 pub mod session_materializer;
 pub mod session_mcp;
 pub mod session_registry;
@@ -49,6 +50,9 @@ pub use agent_config::AgentConfig;
 pub use handle::{AgentHandle, LocalAgentHandle};
 pub use remote::SessionActorRef;
 pub use session_actor::SessionActor;
+pub use session_control::{
+    SessionControlState, SessionControlTransition, SessionModelBinding, SessionModelSelection,
+};
 pub use session_materializer::{PreparedSession, SessionMaterializer};
 pub use session_registry::SessionRegistry;
 

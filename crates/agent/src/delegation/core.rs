@@ -969,17 +969,15 @@ async fn execute_delegation(
             },
             None => None,
         };
-        let model_request = crate::agent::messages::SetSessionModel {
-            req: crate::acp::protocol::SetSessionModelRequest::new(
-                child_session_id.clone(),
-                model_override.model_id.clone(),
-            ),
-            #[cfg(feature = "remote")]
+        #[cfg(feature = "remote")]
+        let provider_node_id = provider_node_id.map(|node_id| node_id.to_string());
+        #[cfg(not(feature = "remote"))]
+        let provider_node_id = None;
+        let model_selection = crate::agent::session_control::SessionModelSelection {
+            model_id: model_override.model_id.clone(),
             provider_node_id,
-            #[cfg(not(feature = "remote"))]
-            provider_node_id: None,
         };
-        if let Err(err) = session_ref.set_session_model_with_node(model_request).await {
+        if let Err(err) = session_ref.set_session_model(model_selection).await {
             let error_message = format!(
                 "Failed to apply model '{}' to delegate '{}': {err}",
                 model_override.model_id, delegation.target_agent_id

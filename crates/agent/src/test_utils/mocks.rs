@@ -1,5 +1,6 @@
 //! Mock implementations for testing
 
+use crate::agent::session_control::SessionControlState;
 use crate::session::domain::{
     Alternative, AlternativeStatus, Artifact, Decision, DecisionStatus, Delegation,
     DelegationStatus, ForkInfo, ForkOrigin, IntentSnapshot, ProgressEntry, ProgressKind, Task,
@@ -47,6 +48,13 @@ mock! {
         async fn get_llm_config(&self, id: i64) -> SessionResult<Option<LLMConfig>>;
         async fn get_session_llm_config(&self, session_id: &str) -> SessionResult<Option<LLMConfig>>;
         async fn set_session_llm_config(&self, session_id: &str, config_id: i64) -> SessionResult<()>;
+        async fn get_session_control(&self, session_id: &str) -> SessionResult<Option<SessionControlState>>;
+        async fn commit_session_control(
+            &self,
+            session_id: &str,
+            expected_revision: u64,
+            state: &SessionControlState,
+        ) -> SessionResult<SessionControlState>;
         async fn set_profile_binding<'a, 'b, 'c>(
             &'a self,
             session_id: &'b str,

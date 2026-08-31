@@ -116,6 +116,11 @@ remote_msg_impl!(
 remote_msg_impl!(messages::Cancel, "querymt::Cancel", REG_CANCEL);
 remote_msg_impl!(messages::SetMode, "querymt::SetMode", REG_SET_MODE);
 remote_msg_impl!(messages::GetMode, "querymt::GetMode", REG_GET_MODE);
+remote_msg_impl!(
+    messages::GetSessionControl,
+    "querymt::GetSessionControl",
+    REG_GET_SESSION_CONTROL
+);
 remote_msg_impl!(messages::Undo, "querymt::Undo", REG_UNDO);
 remote_msg_impl!(messages::Redo, "querymt::Redo", REG_REDO);
 remote_msg_impl!(

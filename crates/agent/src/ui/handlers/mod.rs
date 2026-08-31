@@ -435,14 +435,24 @@ pub async fn handle_ui_message(
         UiClientMessage::DisconnectOAuth { provider } => {
             handle_disconnect_oauth(state, conn_id, &provider, tx).await;
         }
-        UiClientMessage::SetAgentMode { mode } => {
-            handle_set_agent_mode(state, conn_id, &mode, tx).await;
+        UiClientMessage::SetAgentMode { mode, session_id } => {
+            handle_set_agent_mode(state, conn_id, session_id.as_deref(), &mode, tx).await;
         }
         UiClientMessage::GetAgentMode => {
             handle_get_agent_mode(state, conn_id, tx).await;
         }
-        UiClientMessage::SetReasoningEffort { reasoning_effort } => {
-            handle_set_reasoning_effort(state, conn_id, &reasoning_effort, tx).await;
+        UiClientMessage::SetReasoningEffort {
+            reasoning_effort,
+            session_id,
+        } => {
+            handle_set_reasoning_effort(
+                state,
+                conn_id,
+                session_id.as_deref(),
+                &reasoning_effort,
+                tx,
+            )
+            .await;
         }
         UiClientMessage::GetReasoningEffort => {
             handle_get_reasoning_effort(state, conn_id, tx).await;

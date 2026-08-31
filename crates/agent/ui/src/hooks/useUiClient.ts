@@ -2106,7 +2106,7 @@ export function useUiClient() {
 
   const setAgentMode = useCallback((mode: string) => {
     setAgentModeState(mode);  // Optimistic update
-    sendMessage({ type: 'set_agent_mode', data: { mode } });
+    sendMessage({ type: 'set_agent_mode', data: { mode, session_id: sessionIdRef.current ?? undefined } });
   }, []);
 
   const cycleAgentMode = useCallback(() => {
@@ -2117,7 +2117,10 @@ export function useUiClient() {
 
   const setReasoningEffort = useCallback((effort: string | null) => {
     setReasoningEffortState(effort);  // Optimistic update
-    sendMessage({ type: 'set_reasoning_effort', data: { reasoning_effort: effort ?? 'auto' } });
+    sendMessage({
+      type: 'set_reasoning_effort',
+      data: { reasoning_effort: effort ?? 'auto', session_id: sessionIdRef.current ?? undefined },
+    });
   }, []);
 
   const cycleReasoningEffort = useCallback(() => {

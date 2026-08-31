@@ -4,12 +4,15 @@
 //! `Cancel`, `SetMode`, and other messages between turns.
 
 use crate::acp::client_bridge::ClientBridgeSender;
-use crate::acp::protocol::{ExtResponse, PromptResponse, SetSessionModelResponse, StopReason};
+use crate::acp::protocol::{ExtResponse, PromptResponse, StopReason};
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, SessionRuntime, ToolConfig};
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::messages::*;
+use crate::agent::session_control::{
+    SessionControlState, SessionControlTransition, SessionModelBinding,
+};
 use crate::agent::turn_control::{
     ActiveRun, InputDelivery, RunPhase, SubmitInputResult, TurnControlError,
 };
@@ -139,6 +142,7 @@ pub struct SessionActor {
     pub(crate) runtime: Arc<SessionRuntime>,
     pub(crate) mode: AgentMode,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    pub(crate) control_state: Option<SessionControlState>,
     pub(crate) tool_config: ToolConfig,
 
     // ── Cancellation ─────────────────────────────────────────────
@@ -217,6 +221,7 @@ impl SessionActor {
             runtime,
             mode,
             reasoning_effort,
+            control_state: None,
             tool_config,
             turn_state: TurnState::new(),
             bridge: None,
@@ -232,6 +237,14 @@ impl SessionActor {
     /// Override the reasoning effort restored for this session.
     pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
         self.reasoning_effort = effort;
+        self
+    }
+
+    /// Restore the complete persisted control state before the actor is spawned.
+    pub fn with_control_state(mut self, state: SessionControlState) -> Self {
+        self.mode = state.active_mode;
+        self.reasoning_effort = state.reasoning_effort;
+        self.control_state = Some(state);
         self
     }
 
@@ -463,14 +476,10 @@ impl Message<PromptFinished> for SessionActor {
 // ── SetMode ──────────────────────────────────────────────────────────────
 
 impl Message<SetMode> for SessionActor {
-    type Reply = ();
+    type Reply = SetModeReply;
 
     async fn handle(&mut self, msg: SetMode, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        self.mode = msg.mode;
-        self.config.emit_event(
-            &self.session_id,
-            AgentEventKind::SessionModeChanged { mode: msg.mode },
-        );
+        self.transition_mode(msg.mode).await
     }
 }
 
@@ -491,42 +500,14 @@ impl Message<GetMode> for SessionActor {
 // ── SetReasoningEffort ────────────────────────────────────────────────────
 
 impl Message<SetReasoningEffort> for SessionActor {
-    type Reply = Result<(), AgentError>;
+    type Reply = SetReasoningEffortReply;
 
     async fn handle(
         &mut self,
         msg: SetReasoningEffort,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // Store in-memory (None = cleared / provider default)
-        self.reasoning_effort = msg.effort;
-
-        // Always update the LLM config row so the provider picks up the change
-        // (including clearing: None serializes as absent, removing the field).
-        let current_config = self
-            .config
-            .provider
-            .history_store()
-            .get_session_llm_config(&self.session_id)
-            .await
-            .map_err(|e| AgentError::Internal(e.to_string()))?;
-
-        if let Some(current) = current_config {
-            // Reconstruct LLMParams from the stored config
-            let mut params = if let Some(ref params_json) = current.params {
-                serde_json::from_value::<querymt::LLMParams>(params_json.clone())
-                    .unwrap_or_default()
-            } else {
-                querymt::LLMParams::new()
-            };
-            // Set provider/model back (stripped during storage) and apply new effort
-            params = params.provider(&current.provider).model(&current.model);
-            params.reasoning_effort = msg.effort;
-
-            self.set_llm_config_impl(params).await?;
-        }
-
-        Ok(())
+        self.transition_reasoning_effort(msg.effort).await
     }
 }
 
@@ -575,7 +556,17 @@ impl Message<SetLlmConfig> for SessionActor {
         msg: SetLlmConfig,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.set_llm_config_impl(msg.config).await
+        let model_id = format!(
+            "{}/{}",
+            msg.config
+                .provider
+                .as_deref()
+                .ok_or(AgentError::ProviderRequired)?,
+            msg.config.model.as_deref().unwrap_or_default()
+        );
+        self.transition_model_with_config(model_id, msg.provider_node_id, msg.config)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -641,98 +632,221 @@ impl SessionActor {
         );
         Ok(())
     }
+
+    async fn ensure_control_state(&mut self) -> Result<SessionControlState, AgentError> {
+        if let Some(state) = &self.control_state {
+            return Ok(state.clone());
+        }
+
+        let store = self.config.provider.history_store();
+        if let Some(state) = store.get_session_control(&self.session_id).await? {
+            self.mode = state.active_mode;
+            self.reasoning_effort = state.reasoning_effort;
+            self.control_state = Some(state.clone());
+            return Ok(state);
+        }
+
+        let config = match store.get_session_llm_config(&self.session_id).await? {
+            Some(config) => config,
+            None => {
+                store
+                    .create_or_get_llm_config(self.config.provider.initial_config())
+                    .await?
+            }
+        };
+        let provider_node_id = store.get_session_provider_node_id(&self.session_id).await?;
+        let binding = SessionModelBinding {
+            model_id: format!("{}/{}", config.provider, config.model),
+            provider: config.provider,
+            model: config.model,
+            llm_config_id: config.id,
+            provider_node_id,
+        };
+        let mut mode_models = HashMap::new();
+        for mode in [AgentMode::Build, AgentMode::Plan, AgentMode::Review] {
+            mode_models.insert(mode.as_str().to_string(), binding.clone());
+        }
+        let state = SessionControlState {
+            revision: 1,
+            active_mode: self.mode,
+            reasoning_effort: self.reasoning_effort,
+            effective_model: binding,
+            mode_models,
+        };
+        let state = store
+            .commit_session_control(&self.session_id, 0, &state)
+            .await?;
+        self.control_state = Some(state.clone());
+        Ok(state)
+    }
+
+    async fn commit_control_transition(
+        &mut self,
+        previous: SessionControlState,
+        mut proposed: SessionControlState,
+    ) -> Result<SessionControlTransition, AgentError> {
+        proposed.revision = previous.revision.saturating_add(1);
+        let current = self
+            .config
+            .provider
+            .history_store()
+            .commit_session_control(&self.session_id, previous.revision, &proposed)
+            .await?;
+
+        self.mode = current.active_mode;
+        self.reasoning_effort = current.reasoning_effort;
+        self.control_state = Some(current.clone());
+
+        if previous.active_mode != current.active_mode {
+            self.config.emit_event(
+                &self.session_id,
+                AgentEventKind::SessionModeChanged {
+                    mode: current.active_mode,
+                },
+            );
+        }
+        if previous.effective_model != current.effective_model {
+            let binding = &current.effective_model;
+            let context_limit =
+                crate::model_info::get_model_info(&binding.provider, &binding.model)
+                    .and_then(|model| model.context_limit());
+            self.config.emit_event(
+                &self.session_id,
+                AgentEventKind::ProviderChanged {
+                    provider: binding.provider.clone(),
+                    model: binding.model.clone(),
+                    config_id: binding.llm_config_id,
+                    context_limit,
+                    provider_node_id: binding.provider_node_id.clone(),
+                },
+            );
+        }
+
+        Ok(SessionControlTransition { previous, current })
+    }
+
+    async fn transition_mode(
+        &mut self,
+        mode: AgentMode,
+    ) -> Result<SessionControlTransition, AgentError> {
+        let previous = self.ensure_control_state().await?;
+        let mut proposed = previous.clone();
+        let binding = proposed
+            .binding_for(mode)
+            .cloned()
+            .unwrap_or_else(|| previous.effective_model.clone());
+        proposed.set_binding(mode, binding.clone());
+        proposed.active_mode = mode;
+        proposed.effective_model = binding;
+        self.commit_control_transition(previous, proposed).await
+    }
+
+    async fn transition_model(
+        &mut self,
+        selection: crate::agent::session_control::SessionModelSelection,
+    ) -> Result<SessionControlTransition, AgentError> {
+        let previous = self.ensure_control_state().await?;
+        let (provider, model) =
+            parse_transport_model_id(&selection.model_id, &previous.effective_model.provider);
+        let mut params = querymt::LLMParams::new().provider(&provider).model(&model);
+        for prompt_part in self.get_session_system_prompt().await {
+            params = params.system(prompt_part);
+        }
+        params.reasoning_effort = previous.reasoning_effort;
+        self.transition_model_with_config(selection.model_id, selection.provider_node_id, params)
+            .await
+    }
+
+    async fn transition_model_with_config(
+        &mut self,
+        model_id: String,
+        provider_node_id: Option<String>,
+        params: querymt::LLMParams,
+    ) -> Result<SessionControlTransition, AgentError> {
+        let previous = self.ensure_control_state().await?;
+        let config = self
+            .config
+            .provider
+            .history_store()
+            .create_or_get_llm_config(&params)
+            .await?;
+        let binding = SessionModelBinding {
+            model_id,
+            provider: config.provider,
+            model: config.model,
+            llm_config_id: config.id,
+            provider_node_id,
+        };
+        let mut proposed = previous.clone();
+        proposed.set_binding(previous.active_mode, binding.clone());
+        proposed.effective_model = binding;
+        self.commit_control_transition(previous, proposed).await
+    }
+
+    async fn transition_reasoning_effort(
+        &mut self,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<SessionControlTransition, AgentError> {
+        let previous = self.ensure_control_state().await?;
+        let store = self.config.provider.history_store();
+        let mut proposed = previous.clone();
+        proposed.reasoning_effort = effort;
+        let mut updated = HashMap::new();
+        for (mode, binding) in &previous.mode_models {
+            let current = store
+                .get_llm_config(binding.llm_config_id)
+                .await?
+                .ok_or_else(|| {
+                    AgentError::Internal(format!(
+                        "missing LLM config {} for mode {mode}",
+                        binding.llm_config_id
+                    ))
+                })?;
+            let mut params = current
+                .params
+                .as_ref()
+                .and_then(|value| serde_json::from_value::<querymt::LLMParams>(value.clone()).ok())
+                .unwrap_or_default()
+                .provider(&current.provider)
+                .model(&current.model);
+            params.reasoning_effort = effort;
+            let config = store.create_or_get_llm_config(&params).await?;
+            let mut binding = binding.clone();
+            binding.llm_config_id = config.id;
+            updated.insert(mode.clone(), binding);
+        }
+        proposed.mode_models = updated;
+        proposed.effective_model = proposed
+            .binding_for(proposed.active_mode)
+            .cloned()
+            .ok_or_else(|| AgentError::Internal("active mode has no model binding".to_string()))?;
+        self.commit_control_transition(previous, proposed).await
+    }
+}
+
+impl Message<GetSessionControl> for SessionActor {
+    type Reply = GetSessionControlReply;
+
+    async fn handle(
+        &mut self,
+        _msg: GetSessionControl,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.ensure_control_state().await
+    }
 }
 
 // ── SetSessionModel ──────────────────────────────────────────────────────
 
 impl Message<SetSessionModel> for SessionActor {
-    type Reply = Result<SetSessionModelResponse, AgentError>;
+    type Reply = SetSessionModelReply;
 
     async fn handle(
         &mut self,
         msg: SetSessionModel,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        use crate::acp::protocol::SetSessionModelResponse;
-
-        let session_id = msg.req.session_id.to_string();
-        let _session = self
-            .config
-            .provider
-            .history_store()
-            .get_session(&session_id)
-            .await
-            .map_err(|e| AgentError::Internal(e.to_string()))?
-            .ok_or_else(|| AgentError::SessionNotFound {
-                session_id: session_id.clone(),
-            })?;
-
-        let model_id = msg.req.model_id.to_string();
-        let current_config = self
-            .config
-            .provider
-            .history_store()
-            .get_session_llm_config(&session_id)
-            .await
-            .map_err(|e| AgentError::Internal(e.to_string()))?;
-        let fallback_provider = current_config
-            .as_ref()
-            .map(|c| c.provider.as_str())
-            .unwrap_or("anthropic");
-
-        let (provider, model) = parse_transport_model_id(&model_id, fallback_provider);
-
-        let system_prompt = self.get_session_system_prompt().await;
-        let mut llm_config_input = querymt::LLMParams::new()
-            .provider(provider.clone())
-            .model(model.clone());
-        for prompt_part in system_prompt {
-            llm_config_input = llm_config_input.system(prompt_part);
-        }
-
-        let llm_config = self
-            .config
-            .provider
-            .history_store()
-            .create_or_get_llm_config(&llm_config_input)
-            .await
-            .map_err(|e| AgentError::Internal(e.to_string()))?;
-
-        self.config
-            .provider
-            .history_store()
-            .set_session_llm_config(&session_id, llm_config.id)
-            .await
-            .map_err(|e| AgentError::Internal(e.to_string()))?;
-
-        // Persist the provider_node_id so the session knows where to route LLM calls.
-        let provider_node_id = msg.provider_node_id.as_ref().map(ToString::to_string);
-        if let Err(e) = self
-            .config
-            .provider
-            .history_store()
-            .set_session_provider_node_id(&session_id, provider_node_id.as_deref())
-            .await
-        {
-            log::warn!("SetSessionModel: failed to persist provider_node_id: {}", e);
-        }
-
-        let context_limit =
-            crate::model_info::get_model_info(&llm_config.provider, &llm_config.model)
-                .and_then(|m| m.context_limit());
-
-        self.config.emit_event(
-            &session_id,
-            AgentEventKind::ProviderChanged {
-                provider: llm_config.provider.clone(),
-                model: llm_config.model.clone(),
-                config_id: llm_config.id,
-                context_limit,
-                provider_node_id,
-            },
-        );
-
-        Ok(SetSessionModelResponse::new())
+        self.transition_model(msg.selection).await
     }
 }
 
@@ -2367,6 +2481,14 @@ mod tests {
                 .expect_get_session_llm_config()
                 .returning(move |_| Ok(Some(llm_for_mock.clone())))
                 .times(0..);
+            store
+                .expect_get_session_control()
+                .returning(|_| Ok(None))
+                .times(0..);
+            store
+                .expect_commit_session_control()
+                .returning(|_, _, state| Ok(state.clone()))
+                .times(0..);
             let llm_config_for_mock = llm_config.clone();
             store
                 .expect_get_llm_config()
@@ -2914,6 +3036,14 @@ mod tests {
             .expect_get_session_llm_config()
             .returning(move |_| Ok(Some(remote_config_for_get.clone())))
             .times(1..);
+        store
+            .expect_get_session_control()
+            .returning(|_| Ok(None))
+            .times(1);
+        store
+            .expect_commit_session_control()
+            .returning(|_, _, state| Ok(state.clone()))
+            .times(2);
         let remote_config_for_id = remote_config.clone();
         store
             .expect_get_llm_config()
@@ -2943,12 +3073,11 @@ mod tests {
                     provider_node_id: Some("12D3KooWRemoteNode".to_string()),
                 })
             })
-            .times(1);
+            .times(3);
         store
             .expect_set_session_llm_config()
-            .withf(|session_id, config_id| session_id == "remote-session" && *config_id == 43)
             .returning(|_, _| Ok(()))
-            .times(1);
+            .times(0);
         store
             .expect_set_session_provider_node_id()
             .returning(|_, _| Ok(()))

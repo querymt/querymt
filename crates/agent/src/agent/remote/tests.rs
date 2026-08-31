@@ -52,14 +52,27 @@ async fn test_agent_config() -> (Arc<AgentConfig>, TempDir) {
     (config, temp_dir)
 }
 
-/// Spawn a `SessionActor` with default runtime and return a `SessionActorRef::Local`.
-fn spawn_test_session(config: Arc<AgentConfig>, session_id: &str) -> SessionActorRef {
+/// Persist and spawn a `SessionActor` with default runtime.
+async fn spawn_test_session(config: Arc<AgentConfig>, session_id: &str) -> SessionActorRef {
+    let store = config.provider.history_store();
+    let session = store
+        .create_session(Some(session_id.to_string()), None, None, None)
+        .await
+        .expect("create test session");
+    let llm_config = store
+        .create_or_get_llm_config(&LLMParams::new().provider("mock").model("mock"))
+        .await
+        .expect("create test LLM config");
+    store
+        .set_session_llm_config(&session.public_id, llm_config.id)
+        .await
+        .expect("bind test LLM config");
     let runtime = SessionRuntime::new(
         None,
         HashMap::new(),
         crate::agent::core::McpToolState::empty(),
     );
-    let actor = SessionActor::new(config, session_id.to_string(), runtime);
+    let actor = SessionActor::new(config, session.public_id, runtime);
     let actor_ref = SessionActor::spawn(actor);
     SessionActorRef::Local(actor_ref)
 }
@@ -71,7 +84,7 @@ fn spawn_test_session(config: Arc<AgentConfig>, session_id: &str) -> SessionActo
 #[tokio::test]
 async fn test_local_ref_is_not_remote() {
     let (config, _td) = test_agent_config().await;
-    let session_ref = spawn_test_session(config, "test-local-1");
+    let session_ref = spawn_test_session(config, "test-local-1").await;
     assert!(!session_ref.is_remote());
     assert_eq!(session_ref.node_label(), "local");
 }
@@ -79,7 +92,7 @@ async fn test_local_ref_is_not_remote() {
 #[tokio::test]
 async fn test_local_ref_get_mode_default_is_build() {
     let (config, _td) = test_agent_config().await;
-    let session_ref = spawn_test_session(config, "test-mode-1");
+    let session_ref = spawn_test_session(config, "test-mode-1").await;
     let mode = session_ref
         .get_mode()
         .await
@@ -90,7 +103,7 @@ async fn test_local_ref_get_mode_default_is_build() {
 #[tokio::test]
 async fn test_local_ref_set_mode_roundtrip() {
     let (config, _td) = test_agent_config().await;
-    let session_ref = spawn_test_session(config, "test-mode-2");
+    let session_ref = spawn_test_session(config, "test-mode-2").await;
 
     session_ref
         .set_mode(AgentMode::Plan)
@@ -108,9 +121,49 @@ async fn test_local_ref_set_mode_roundtrip() {
 }
 
 #[tokio::test]
+async fn test_local_ref_mode_model_bindings_are_session_scoped() {
+    let (config, _td) = test_agent_config().await;
+    let first = spawn_test_session(config.clone(), "binding-first").await;
+    let second = spawn_test_session(config, "binding-second").await;
+
+    first
+        .set_session_model(crate::agent::session_control::SessionModelSelection {
+            model_id: "mock/build-model".to_string(),
+            provider_node_id: None,
+        })
+        .await
+        .expect("set first build model");
+    first.set_mode(AgentMode::Plan).await.expect("enter plan");
+    first
+        .set_session_model(crate::agent::session_control::SessionModelSelection {
+            model_id: "mock/plan-model".to_string(),
+            provider_node_id: None,
+        })
+        .await
+        .expect("set first plan model");
+
+    let build = first
+        .set_mode(AgentMode::Build)
+        .await
+        .expect("return to build");
+    assert_eq!(build.current.effective_model.model, "build-model");
+    let plan = first
+        .set_mode(AgentMode::Plan)
+        .await
+        .expect("return to plan");
+    assert_eq!(plan.current.effective_model.model, "plan-model");
+
+    let second_state = second
+        .get_session_control()
+        .await
+        .expect("second control state");
+    assert_eq!(second_state.effective_model.model, "mock");
+}
+
+#[tokio::test]
 async fn test_local_ref_cancel_idle_session() {
     let (config, _td) = test_agent_config().await;
-    let session_ref = spawn_test_session(config, "test-cancel-1");
+    let session_ref = spawn_test_session(config, "test-cancel-1").await;
     // Cancel on idle session should succeed (no-op)
     session_ref.cancel().await.expect("cancel on idle session");
 }
@@ -118,14 +171,14 @@ async fn test_local_ref_cancel_idle_session() {
 #[tokio::test]
 async fn test_local_ref_shutdown() {
     let (config, _td) = test_agent_config().await;
-    let session_ref = spawn_test_session(config, "test-shutdown-1");
+    let session_ref = spawn_test_session(config, "test-shutdown-1").await;
     session_ref.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
 async fn test_local_ref_get_session_limits_none() {
     let (config, _td) = test_agent_config().await;
-    let session_ref = spawn_test_session(config, "test-limits-1");
+    let session_ref = spawn_test_session(config, "test-limits-1").await;
     let limits = session_ref
         .get_session_limits()
         .await
@@ -136,7 +189,7 @@ async fn test_local_ref_get_session_limits_none() {
 #[tokio::test]
 async fn test_local_ref_get_llm_config() {
     let (config, _td) = test_agent_config().await;
-    let session_ref = spawn_test_session(config, "test-llm-1");
+    let session_ref = spawn_test_session(config, "test-llm-1").await;
     // Session doesn't exist in the DB → handler returns an error.
     // We just verify the message round-trips without panic.
     let result = session_ref.get_llm_config().await;
@@ -146,7 +199,7 @@ async fn test_local_ref_get_llm_config() {
 #[tokio::test]
 async fn test_local_ref_subscribe_unsubscribe_events() {
     let (config, _td) = test_agent_config().await;
-    let session_ref = spawn_test_session(config, "test-events-1");
+    let session_ref = spawn_test_session(config, "test-events-1").await;
 
     // Subscribe with a dummy relay_actor_id
     session_ref
@@ -163,7 +216,7 @@ async fn test_local_ref_subscribe_unsubscribe_events() {
 #[tokio::test]
 async fn test_local_ref_get_history() {
     let (config, _td) = test_agent_config().await;
-    let session_ref = spawn_test_session(config, "test-history-1");
+    let session_ref = spawn_test_session(config, "test-history-1").await;
     // Session doesn't exist in the DB → handler returns an error.
     // We just verify the message round-trips without panic.
     let result = session_ref.get_history().await;
@@ -186,7 +239,7 @@ async fn test_registry_initially_empty() {
 #[tokio::test]
 async fn test_registry_insert_and_get() {
     let (config, _td) = test_agent_config().await;
-    let session_ref = spawn_test_session(config.clone(), "reg-1");
+    let session_ref = spawn_test_session(config.clone(), "reg-1").await;
 
     let mut registry = SessionRegistry::new(config);
     registry.insert("reg-1".to_string(), session_ref);
@@ -200,7 +253,7 @@ async fn test_registry_insert_and_get() {
 #[tokio::test]
 async fn test_registry_insert_and_remove() {
     let (config, _td) = test_agent_config().await;
-    let session_ref = spawn_test_session(config.clone(), "reg-2");
+    let session_ref = spawn_test_session(config.clone(), "reg-2").await;
 
     let mut registry = SessionRegistry::new(config);
     registry.insert("reg-2".to_string(), session_ref);
@@ -223,9 +276,9 @@ async fn test_registry_remove_nonexistent() {
 #[tokio::test]
 async fn test_registry_session_ids() {
     let (config, _td) = test_agent_config().await;
-    let ref1 = spawn_test_session(config.clone(), "id-a");
-    let ref2 = spawn_test_session(config.clone(), "id-b");
-    let ref3 = spawn_test_session(config.clone(), "id-c");
+    let ref1 = spawn_test_session(config.clone(), "id-a").await;
+    let ref2 = spawn_test_session(config.clone(), "id-b").await;
+    let ref3 = spawn_test_session(config.clone(), "id-c").await;
 
     let mut registry = SessionRegistry::new(config);
     registry.insert("id-a".to_string(), ref1);
@@ -240,8 +293,8 @@ async fn test_registry_session_ids() {
 #[tokio::test]
 async fn test_registry_overwrite() {
     let (config, _td) = test_agent_config().await;
-    let ref1 = spawn_test_session(config.clone(), "ow-1");
-    let ref2 = spawn_test_session(config.clone(), "ow-1-replacement");
+    let ref1 = spawn_test_session(config.clone(), "ow-1").await;
+    let ref2 = spawn_test_session(config.clone(), "ow-1-replacement").await;
 
     let mut registry = SessionRegistry::new(config);
     registry.insert("ow-1".to_string(), ref1);
@@ -1432,7 +1485,7 @@ async fn test_from_actor_ref_into_local() {
 #[tokio::test]
 async fn test_session_actor_ref_clone() {
     let (config, _td) = test_agent_config().await;
-    let session_ref = spawn_test_session(config, "clone-test");
+    let session_ref = spawn_test_session(config, "clone-test").await;
     let cloned = session_ref.clone();
 
     // Both should work independently
@@ -1448,7 +1501,7 @@ async fn test_session_actor_ref_clone() {
 #[tokio::test]
 async fn test_registry_get_returns_working_ref() {
     let (config, _td) = test_agent_config().await;
-    let session_ref = spawn_test_session(config.clone(), "reg-work-1");
+    let session_ref = spawn_test_session(config.clone(), "reg-work-1").await;
 
     let mut registry = SessionRegistry::new(config);
     registry.insert("reg-work-1".to_string(), session_ref);

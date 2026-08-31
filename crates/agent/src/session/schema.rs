@@ -180,6 +180,30 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_session_execution_configs_session
             ON session_execution_configs(session_id);
 
+        -- Authoritative per-session mode/model/reasoning control state.
+        CREATE TABLE IF NOT EXISTS session_control_states (
+            session_id INTEGER PRIMARY KEY,
+            active_mode TEXT NOT NULL,
+            reasoning_effort TEXT,
+            revision INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS session_mode_model_bindings (
+            session_id INTEGER NOT NULL,
+            mode TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            llm_config_id INTEGER NOT NULL,
+            provider_node_id TEXT,
+            PRIMARY KEY(session_id, mode),
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY(llm_config_id) REFERENCES llm_configs(id) ON DELETE RESTRICT
+        );
+
         -- Intent snapshots - internal state tracking
         CREATE TABLE IF NOT EXISTS intent_snapshots (
             id INTEGER PRIMARY KEY,

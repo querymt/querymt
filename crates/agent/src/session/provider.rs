@@ -667,6 +667,8 @@ pub struct SessionHandle {
     session: Session,
     /// LLM config resolved once at construction time (turn-pinned).
     llm_config: Option<LLMConfig>,
+    /// Provider route resolved once at construction time (turn-pinned).
+    provider_node_id: Option<String>,
     /// Session execution config resolved once at construction time (turn-pinned).
     execution_config: Option<SessionExecutionConfig>,
     /// Lazily cached LLM provider for this turn.
@@ -679,6 +681,7 @@ impl Clone for SessionHandle {
             provider: self.provider.clone(),
             session: self.session.clone(),
             llm_config: self.llm_config.clone(),
+            provider_node_id: self.provider_node_id.clone(),
             execution_config: self.execution_config.clone(),
             // Each clone gets its own OnceCell; the first `.provider()` call
             // will still hit the global cache (cheap Arc::clone on hit) so
@@ -696,6 +699,10 @@ impl SessionHandle {
         } else {
             None
         };
+        let provider_node_id = provider
+            .history_store
+            .get_session_provider_node_id(&session.public_id)
+            .await?;
         let execution_config = provider
             .history_store
             .get_session_execution_config(&session.public_id)
@@ -704,6 +711,7 @@ impl SessionHandle {
             provider,
             session,
             llm_config,
+            provider_node_id,
             execution_config,
             cached_llm_provider: tokio::sync::OnceCell::new(),
         })
@@ -727,9 +735,15 @@ impl SessionHandle {
     pub async fn provider(&self) -> SessionResult<Arc<dyn LLMProvider>> {
         self.cached_llm_provider
             .get_or_try_init(|| async {
-                self.provider
-                    .build_provider_for_session(&self.session.public_id)
-                    .await
+                let config = self.llm_config.as_ref().ok_or_else(|| {
+                    SessionError::InvalidOperation("Session has no LLM config".to_string())
+                })?;
+                let request = ProviderRequest::new(&config.provider, &config.model)
+                    .with_params(config.params.as_ref())
+                    .with_session_id(&self.session.public_id);
+                #[cfg(feature = "remote")]
+                let request = request.with_provider_node_id(self.provider_node_id.as_deref());
+                self.provider.build_provider(request).await
             })
             .await
             .map(Arc::clone)

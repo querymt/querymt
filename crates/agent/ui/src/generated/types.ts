@@ -1454,12 +1454,14 @@ export type UiClientMessage =
 	/** Set the agent's operating mode (build/plan/review) */
 	| { type: "set_agent_mode", data: {
 	mode: string;
+	session_id?: string;
 }}
 	/** Get the current agent mode */
 	| { type: "get_agent_mode", data?: undefined }
 	/** Set the reasoning effort level for the current session */
 	| { type: "set_reasoning_effort", data: {
 	reasoning_effort: string;
+	session_id?: string;
 }}
 	/** Get the current reasoning effort level */
 	| { type: "get_reasoning_effort", data?: undefined }

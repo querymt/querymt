@@ -5,7 +5,6 @@ import { useUiStore } from '../store/uiStore';
 import { useIsMobile } from '../hooks/useIsMobile';
 import { useGlobalKeyboardShortcuts } from '../hooks/useGlobalKeyboardShortcuts';
 import { useThemeSync } from '../hooks/useThemeSync';
-import { useAutoModelSwitch } from '../hooks/useAutoModelSwitch';
 import { SessionTimerProvider } from '../context/SessionTimerContext';
 import { getDashboardThemes } from '../utils/dashboardThemes';
 
@@ -171,14 +170,6 @@ export function AppShell() {
   });
 
   useThemeSync(agentMode, selectedTheme);
-
-  useAutoModelSwitch({
-    agentMode,
-    sessionId,
-    activeAgentId,
-    agentModels,
-    setSessionModel,
-  });
 
   // --- Effects ---
 
