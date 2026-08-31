@@ -13,6 +13,15 @@ export type AgentEventKind =
 	content: string;
 	message_id?: string;
 }}
+	/**
+	 * Transient structured prompt block for live ACP delivery. Durable prompt
+	 * content remains in MessagePart::Prompt rather than the event journal.
+	 */
+	| { type: "user_prompt_block", data: {
+	message_id: string;
+	client_prompt_id?: string;
+	block: any;
+}}
 	| { type: "user_message_stored", data: {
 	content: string;
 }}
@@ -1126,10 +1135,19 @@ export interface StreamCursor {
 	remote_seq_by_source: Record<string, number>;
 }
 
+export interface UserPromptRecord {
+	messageId: string;
+	/** Zero-based position in persisted message history; this is not an event sequence. */
+	messageOrder: number;
+	timestamp: number;
+	blocks: any;
+}
+
 export interface SessionLoadSnapshot {
 	audit: AuditView;
 	cursor: StreamCursor;
 	delegationUpdates: DelegationUpdateNotification[];
+	userPrompts?: UserPromptRecord[];
 }
 
 export enum SessionRuntimePhase {

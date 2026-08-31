@@ -770,7 +770,7 @@ pub enum UiServerMessage {
         agent_id: String,
         profile_id: Option<String>,
         session_id: String,
-        event: EventEnvelope,
+        event: Box<EventEnvelope>,
     },
     InputSubmitted {
         session_id: String,
