@@ -93,6 +93,28 @@ pub enum ClientBridgeMessage {
     },
 }
 
+#[derive(Default)]
+pub(crate) struct NotificationForwardingState {
+    pending_error: Option<String>,
+}
+
+impl NotificationForwardingState {
+    pub(crate) fn record_result<E: std::fmt::Debug>(&mut self, result: Result<(), E>) {
+        if let Err(error) = result
+            && self.pending_error.is_none()
+        {
+            self.pending_error = Some(format!("session notification forwarding failed: {error:?}"));
+        }
+    }
+
+    pub(crate) fn take_flush_result(&mut self) -> Result<(), String> {
+        match self.pending_error.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Send-side handle for the client bridge.
 ///
 /// This type is `Send + Sync` and can be cloned and used from multi-threaded contexts.
@@ -289,5 +311,38 @@ mod tests {
         assert!(!flush.is_finished());
         response_tx.send(Ok(())).expect("acknowledge flush");
         flush.await.expect("flush task").expect("flush succeeds");
+    }
+
+    #[tokio::test]
+    async fn forwarding_failure_is_returned_by_next_flush() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let sender = ClientBridgeSender::new(tx);
+        let flush = tokio::spawn({
+            let sender = sender.clone();
+            async move { sender.flush().await }
+        });
+        let Some(ClientBridgeMessage::Flush { response_tx }) = rx.recv().await else {
+            panic!("expected flush message");
+        };
+        let mut forwarding = NotificationForwardingState::default();
+        forwarding.record_result::<&str>(Err("connection closed"));
+        response_tx
+            .send(forwarding.take_flush_result())
+            .expect("acknowledge failed flush");
+
+        let error = flush
+            .await
+            .expect("flush task")
+            .expect_err("flush must report forwarding failure");
+        assert!(error.to_string().contains("connection closed"));
+        assert!(forwarding.take_flush_result().is_ok());
+    }
+
+    #[test]
+    fn fully_forwarded_notifications_keep_flush_successful() {
+        let mut forwarding = NotificationForwardingState::default();
+        forwarding.record_result::<&str>(Ok(()));
+        forwarding.record_result::<&str>(Ok(()));
+        assert!(forwarding.take_flush_result().is_ok());
     }
 }
