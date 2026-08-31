@@ -20,7 +20,7 @@ mod websocket_tests;
 pub use transport::AcpTransport;
 pub use websocket::serve_websocket;
 
-pub use stdio::serve_stdio;
+pub use stdio::{AcpSessionLoadOutcome, load_session_with_replay, serve_stdio};
 
 // Existing manual JSON-RPC implementation (for dashboard compatibility)
 use crate::acp::shared::{

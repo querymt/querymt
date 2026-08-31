@@ -24,14 +24,19 @@ use opentelemetry_sdk::propagation::TraceContextPropagator;
 ///
 /// Returns `None` when `_meta` has no `traceparent` or extraction failed.
 pub fn extract_acp_trace_context(meta: &serde_json::Value) -> Option<opentelemetry::Context> {
-    let meta_map = meta.as_object()?;
+    extract_acp_trace_context_from_meta(meta.as_object()?)
+}
 
-    if !meta_map.contains_key("traceparent") {
+/// Extract W3C trace context directly from a typed ACP `_meta` map.
+pub fn extract_acp_trace_context_from_meta(
+    meta: &serde_json::Map<String, serde_json::Value>,
+) -> Option<opentelemetry::Context> {
+    if !meta.contains_key("traceparent") {
         return None;
     }
 
     let propagator = TraceContextPropagator::new();
-    let carrier = JsonMetaCarrier(meta_map);
+    let carrier = JsonMetaCarrier(meta);
     let parent_cx = propagator.extract(&carrier);
 
     if parent_cx.has_active_span() {
@@ -55,5 +60,38 @@ impl opentelemetry::propagation::Extractor for JsonMetaCarrier<'_> {
 
     fn keys(&self) -> Vec<&str> {
         self.0.keys().map(|s| s.as_str()).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry::trace::TraceContextExt;
+
+    #[test]
+    fn typed_acp_meta_extracts_w3c_parent_and_tracestate() {
+        let meta = serde_json::json!({
+            "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            "tracestate": "vendor=value",
+            "other": "preserved"
+        });
+        let context = extract_acp_trace_context_from_meta(meta.as_object().unwrap())
+            .expect("valid trace context");
+        let span = context.span();
+        assert_eq!(
+            span.span_context().trace_id().to_string(),
+            "0af7651916cd43dd8448eb211c80319c"
+        );
+        assert_eq!(
+            span.span_context().span_id().to_string(),
+            "b7ad6b7169203331"
+        );
+        assert_eq!(span.span_context().trace_state().header(), "vendor=value");
+    }
+
+    #[test]
+    fn malformed_typed_acp_meta_is_ignored() {
+        let meta = serde_json::json!({ "traceparent": "invalid" });
+        assert!(extract_acp_trace_context_from_meta(meta.as_object().unwrap()).is_none());
     }
 }

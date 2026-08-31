@@ -52,6 +52,9 @@ pub enum ClientBridgeMessage {
     /// No response is expected.
     Notification(SessionNotification),
 
+    /// Barrier acknowledged after every preceding bridge message has been forwarded.
+    Flush { response_tx: oneshot::Sender<()> },
+
     /// Fire-and-forget ACP extension notification payload.
     ExtNotification(ExtNotification),
 
@@ -131,6 +134,17 @@ impl ClientBridgeSender {
     pub async fn notify(&self, notification: SessionNotification) -> Result<(), Error> {
         self.tx
             .send(ClientBridgeMessage::Notification(notification))
+            .await
+            .map_err(|_| Error::from(crate::error::AgentError::ClientBridgeClosed))
+    }
+
+    pub async fn flush(&self) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(ClientBridgeMessage::Flush { response_tx })
+            .await
+            .map_err(|_| Error::from(crate::error::AgentError::ClientBridgeClosed))?;
+        response_rx
             .await
             .map_err(|_| Error::from(crate::error::AgentError::ClientBridgeClosed))
     }

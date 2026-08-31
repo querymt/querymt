@@ -2,6 +2,9 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use querymt::LLMParams;
 use querymt::plugin::host::PluginRegistry;
 use querymt_agent::acp::protocol::{LoadSessionRequest, SessionId};
+use querymt_agent::acp::{
+    load_session_with_replay, shared::replay_agent_events_to_session_notifications,
+};
 use querymt_agent::agent::{AgentConfig, AgentConfigBuilder, LocalAgentHandle};
 use querymt_agent::events::{AgentEventKind, EventOrigin, ExecutionMetrics};
 use querymt_agent::session::domain::{
@@ -21,7 +24,9 @@ use tokio::runtime::Runtime;
 const REFERENCE_EVENTS: usize = 4_183;
 const REFERENCE_PROGRESS: usize = 1_061;
 const REFERENCE_TOOL_CALLS: usize = 732;
-const REFERENCE_LLM_REQUESTS: usize = 329;
+const REFERENCE_LLM_REQUEST_STARTS: usize = 330;
+const REFERENCE_LLM_REQUEST_ENDS: usize = 329;
+const REFERENCE_PROMPTS: usize = 16;
 const REFERENCE_ASSISTANT_MESSAGES: usize = 329;
 const REFERENCE_SNAPSHOTS: usize = 221;
 const REFERENCE_TASKS: usize = 8;
@@ -252,7 +257,11 @@ async fn seed_scenario(spec: SyntheticSessionSpec) -> Scenario {
             AgentEventKind::ToolCallStart {
                 tool_call_id: call_id.clone(),
                 tool_name: "read_tool".to_string(),
-                arguments: repeated_payload("arguments", index, 480),
+                arguments: serde_json::json!({
+                    "path": format!("src/generated_{index}.rs"),
+                    "padding": repeated_payload("arguments", index, 400),
+                })
+                .to_string(),
             },
         )
         .await;
@@ -263,14 +272,21 @@ async fn seed_scenario(spec: SyntheticSessionSpec) -> Scenario {
                 tool_call_id: call_id,
                 tool_name: "read_tool".to_string(),
                 is_error: false,
-                result: repeated_payload("tool-result", index, 3_550),
+                result: if index % 4 == 0 {
+                    serde_json::json!({
+                        "content": repeated_payload("tool-result", index, 3_450),
+                    })
+                    .to_string()
+                } else {
+                    repeated_payload("tool-result", index, 3_550)
+                },
             },
         )
         .await;
         event_count += 2;
     }
 
-    for index in 0..spec.scaled(REFERENCE_LLM_REQUESTS) {
+    for index in 0..spec.scaled(REFERENCE_LLM_REQUEST_STARTS) {
         payload_bytes += append_event(
             store.as_ref(),
             &session_id,
@@ -279,6 +295,9 @@ async fn seed_scenario(spec: SyntheticSessionSpec) -> Scenario {
             },
         )
         .await;
+        event_count += 1;
+    }
+    for index in 0..spec.scaled(REFERENCE_LLM_REQUEST_ENDS) {
         payload_bytes += append_event(
             store.as_ref(),
             &session_id,
@@ -296,7 +315,20 @@ async fn seed_scenario(spec: SyntheticSessionSpec) -> Scenario {
             },
         )
         .await;
-        event_count += 2;
+        event_count += 1;
+    }
+
+    for index in 0..spec.scaled(REFERENCE_PROMPTS) {
+        payload_bytes += append_event(
+            store.as_ref(),
+            &session_id,
+            AgentEventKind::PromptReceived {
+                content: repeated_payload("prompt", index, 420),
+                message_id: Some(format!("prompt-message-{index:06}")),
+            },
+        )
+        .await;
+        event_count += 1;
     }
 
     for index in 0..spec.scaled(REFERENCE_ASSISTANT_MESSAGES) {
@@ -364,6 +396,14 @@ async fn seed_scenario(spec: SyntheticSessionSpec) -> Scenario {
     assert_eq!(audit.tasks.len(), spec.scaled(REFERENCE_TASKS));
     assert_eq!(audit.intent_snapshots.len(), spec.scaled(REFERENCE_INTENTS));
     assert_eq!(audit.artifacts.len(), spec.scaled(REFERENCE_ARTIFACTS));
+    let replay_count =
+        replay_agent_events_to_session_notifications(&session_id, audit.events.clone()).len();
+    assert_eq!(
+        replay_count,
+        spec.scaled(REFERENCE_TOOL_CALLS) * 2
+            + spec.scaled(REFERENCE_ASSISTANT_MESSAGES)
+            + spec.scaled(REFERENCE_PROMPTS)
+    );
 
     let config = make_agent_config(&tmp_dir, store.clone());
     let snapshot_handle = Arc::new(LocalAgentHandle::from_config(config.clone()));
@@ -448,7 +488,7 @@ fn bench_session_load(c: &mut Criterion) {
         group.throughput(Throughput::Elements(scenario.spec.event_count() as u64));
 
         group.bench_with_input(
-            BenchmarkId::new("audit_view", &parameter),
+            BenchmarkId::new("primitive/audit_view", &parameter),
             scenario,
             |b, scenario| {
                 b.to_async(&rt).iter(|| async {
@@ -463,7 +503,7 @@ fn bench_session_load(c: &mut Criterion) {
         );
 
         group.bench_with_input(
-            BenchmarkId::new("snapshot", &parameter),
+            BenchmarkId::new("primitive/snapshot", &parameter),
             scenario,
             |b, scenario| {
                 b.to_async(&rt).iter(|| async {
@@ -480,7 +520,7 @@ fn bench_session_load(c: &mut Criterion) {
         );
 
         group.bench_with_input(
-            BenchmarkId::new("snapshot_serialize", &parameter),
+            BenchmarkId::new("primitive/snapshot_serialize", &parameter),
             scenario,
             |b, scenario| {
                 b.to_async(&rt).iter(|| async {
@@ -497,7 +537,7 @@ fn bench_session_load(c: &mut Criterion) {
         );
 
         group.bench_with_input(
-            BenchmarkId::new("actor_cold", &parameter),
+            BenchmarkId::new("acp/core_cold", &parameter),
             scenario,
             |b, scenario| {
                 b.iter_custom(|iterations| {
@@ -525,7 +565,7 @@ fn bench_session_load(c: &mut Criterion) {
         rt.block_on(warm_handle.load_session(load_request(&scenario.session_id)))
             .expect("warm synthetic session actor");
         group.bench_with_input(
-            BenchmarkId::new("actor_warm", &parameter),
+            BenchmarkId::new("acp/core_warm", &parameter),
             scenario,
             |b, scenario| {
                 b.to_async(&rt).iter(|| async {
@@ -539,7 +579,124 @@ fn bench_session_load(c: &mut Criterion) {
         );
 
         group.bench_with_input(
-            BenchmarkId::new("desktop_core_cold", &parameter),
+            BenchmarkId::new("acp/replay_cold", &parameter),
+            scenario,
+            |b, scenario| {
+                b.iter_custom(|iterations| {
+                    rt.block_on(async {
+                        let mut elapsed = Duration::ZERO;
+                        for _ in 0..iterations {
+                            let handle =
+                                Arc::new(LocalAgentHandle::from_config(scenario.config.clone()));
+                            let started = Instant::now();
+                            let outcome = load_session_with_replay(
+                                &handle,
+                                load_request(&scenario.session_id),
+                            )
+                            .await
+                            .expect("ACP-load synthetic session with replay");
+                            elapsed += started.elapsed();
+                            black_box(outcome);
+                            remove_loaded_actor(&handle, &scenario.session_id).await;
+                        }
+                        elapsed
+                    })
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("acp/replay_serialize_cold", &parameter),
+            scenario,
+            |b, scenario| {
+                b.iter_custom(|iterations| {
+                    rt.block_on(async {
+                        let mut elapsed = Duration::ZERO;
+                        for _ in 0..iterations {
+                            let handle =
+                                Arc::new(LocalAgentHandle::from_config(scenario.config.clone()));
+                            let started = Instant::now();
+                            let outcome = load_session_with_replay(
+                                &handle,
+                                load_request(&scenario.session_id),
+                            )
+                            .await
+                            .expect("ACP-load synthetic session with replay");
+                            let response = serde_json::to_vec(&outcome.response)
+                                .expect("serialize ACP load response");
+                            let notifications: usize = outcome
+                                .notifications
+                                .iter()
+                                .map(|notification| {
+                                    serde_json::to_vec(notification)
+                                        .expect("serialize ACP replay notification")
+                                        .len()
+                                })
+                                .sum();
+                            elapsed += started.elapsed();
+                            black_box((response, notifications));
+                            remove_loaded_actor(&handle, &scenario.session_id).await;
+                        }
+                        elapsed
+                    })
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("acp/wire_codec_cold", &parameter),
+            scenario,
+            |b, scenario| {
+                b.iter_custom(|iterations| {
+                    rt.block_on(async {
+                        let mut elapsed = Duration::ZERO;
+                        for iteration in 0..iterations {
+                            let handle =
+                                Arc::new(LocalAgentHandle::from_config(scenario.config.clone()));
+                            let started = Instant::now();
+                            let outcome = load_session_with_replay(
+                                &handle,
+                                load_request(&scenario.session_id),
+                            )
+                            .await
+                            .expect("ACP-load synthetic session for wire codec");
+                            let mut wire_bytes = 0usize;
+                            for notification in outcome.notifications {
+                                let line = serde_json::to_vec(&serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "session/update",
+                                    "params": notification,
+                                }))
+                                .expect("encode ACP notification wire line");
+                                wire_bytes += line.len() + 1;
+                                black_box(
+                                    serde_json::from_slice::<serde_json::Value>(&line)
+                                        .expect("decode ACP notification wire line"),
+                                );
+                            }
+                            let response_line = serde_json::to_vec(&serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": iteration,
+                                "result": outcome.response,
+                            }))
+                            .expect("encode ACP response wire line");
+                            wire_bytes += response_line.len() + 1;
+                            black_box(
+                                serde_json::from_slice::<serde_json::Value>(&response_line)
+                                    .expect("decode ACP response wire line"),
+                            );
+                            elapsed += started.elapsed();
+                            black_box(wire_bytes);
+                            remove_loaded_actor(&handle, &scenario.session_id).await;
+                        }
+                        elapsed
+                    })
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("dashboard/core_cold", &parameter),
             scenario,
             |b, scenario| {
                 b.iter_custom(|iterations| {

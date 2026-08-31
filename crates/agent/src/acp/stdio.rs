@@ -25,7 +25,7 @@ use crate::acp::client_bridge::{ClientBridgeMessage, ClientBridgeSender};
 use crate::acp::protocol::{
     AgentRequest, AuthenticateRequest, CancelNotification, ClientNotification, ClientRequest,
     CloseSessionRequest, DeleteSessionRequest, ExtRequest, ForkSessionRequest, InitializeRequest,
-    ListSessionsRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
+    ListSessionsRequest, LoadSessionRequest, LoadSessionResponse, NewSessionRequest, PromptRequest,
     ResumeSessionRequest, SessionId, SessionNotification, SetSessionConfigOptionRequest,
     SetSessionModeRequest, SetSessionModelRequest,
 };
@@ -41,7 +41,121 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-use tracing::info_span;
+use tracing::{Instrument, info_span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+/// Result of the native ACP session/load core and history replay preparation.
+#[derive(Debug)]
+pub struct AcpSessionLoadOutcome {
+    pub response: LoadSessionResponse,
+    pub notifications: Vec<SessionNotification>,
+    pub event_count: usize,
+}
+
+fn session_load_span(req: &LoadSessionRequest) -> tracing::Span {
+    let session_id = req.session_id.to_string();
+    let span = info_span!(
+        "acp.load_session",
+        rpc.system = "jsonrpc",
+        rpc.method = "session/load",
+        session.id = %session_id,
+        session.load.event_count = tracing::field::Empty,
+        session.load.replay_notification_count = tracing::field::Empty,
+    );
+    if let Some(meta) = req.meta.as_ref()
+        && let Some(parent) = crate::acp::trace_context::extract_acp_trace_context_from_meta(meta)
+    {
+        let _ = span.set_parent(parent);
+    }
+
+    span
+}
+
+async fn prepare_session_load(
+    agent: &Arc<crate::agent::LocalAgentHandle>,
+    req: LoadSessionRequest,
+) -> Result<AcpSessionLoadOutcome, acp::Error> {
+    let session_id = req.session_id.to_string();
+    let response = agent
+        .load_session(req)
+        .instrument(info_span!("agent.session_load", session.id = %session_id))
+        .await?;
+    let session_ref = {
+        let registry = agent.registry.lock().await;
+        registry.get(&session_id).cloned()
+    };
+    let events = match session_ref {
+        Some(session_ref) => match session_ref
+            .get_event_stream()
+            .instrument(info_span!("session.event_stream.load", session.id = %session_id))
+            .await
+        {
+            Ok(events) => events,
+            Err(err) => {
+                tracing::warn!(session.id = %session_id, error = %err, "failed to load ACP replay events");
+                Vec::new()
+            }
+        },
+        None => {
+            tracing::warn!(session.id = %session_id, "loaded session has no runtime ref for ACP replay");
+            Vec::new()
+        }
+    };
+    let event_count = events.len();
+    let notifications = async { replay_agent_events_to_session_notifications(&session_id, events) }
+        .instrument(info_span!("acp.replay.translate", session.id = %session_id))
+        .await;
+    tracing::Span::current().record("session.load.event_count", event_count as i64);
+    tracing::Span::current().record(
+        "session.load.replay_notification_count",
+        notifications.len() as i64,
+    );
+    Ok(AcpSessionLoadOutcome {
+        response,
+        notifications,
+        event_count,
+    })
+}
+
+/// Execute the same load and replay preparation used by the native ACP stdio route.
+pub async fn load_session_with_replay(
+    agent: &Arc<crate::agent::LocalAgentHandle>,
+    req: LoadSessionRequest,
+) -> Result<AcpSessionLoadOutcome, acp::Error> {
+    let span = session_load_span(&req);
+    prepare_session_load(agent, req).instrument(span).await
+}
+
+async fn load_session_and_enqueue_replay(
+    agent: &Arc<crate::agent::LocalAgentHandle>,
+    bridge_sender: &ClientBridgeSender,
+    req: LoadSessionRequest,
+) -> Result<LoadSessionResponse, acp::Error> {
+    let span = session_load_span(&req);
+    async {
+        let outcome = prepare_session_load(agent, req).await?;
+        let enqueue_span = info_span!(
+            "acp.replay.enqueue",
+            event_count = outcome.event_count,
+            notification_count = outcome.notifications.len(),
+        );
+        async {
+            for notification in outcome.notifications {
+                bridge_sender.notify(notification).await?;
+            }
+            bridge_sender
+                .flush()
+                .instrument(info_span!("acp.replay.flush"))
+                .await?;
+            Ok::<_, acp::Error>(())
+        }
+        .instrument(enqueue_span)
+        .await?;
+        Ok(outcome.response)
+    }
+    .instrument(span)
+    .await
+}
 
 fn agent_ext_request(
     method: &'static str,
@@ -80,6 +194,9 @@ async fn run_bridge_task(
                 if let Err(e) = connection.send_notification(notif) {
                     log::error!("Bridge: session_notification failed: {:?}", e);
                 }
+            }
+            ClientBridgeMessage::Flush { response_tx } => {
+                let _ = response_tx.send(());
             }
             ClientBridgeMessage::ExtNotification(notif) => {
                 let _span = info_span!("acp.ext_notification").entered();
@@ -505,44 +622,9 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
                 let agent = agent.clone();
                 let bridge_sender = bridge_sender.clone();
                 async move |req: LoadSessionRequest, responder, _cx| {
-                    let session_id = req.session_id.to_string();
-                    let response = agent.load_session(req).await;
-                    if response.is_ok() {
-                        let session_ref = {
-                            let registry = agent.registry.lock().await;
-                            registry.get(&session_id).cloned()
-                        };
-                        match session_ref {
-                            Some(session_ref) => match session_ref.get_event_stream().await {
-                                Ok(events) => {
-                                    for notification in replay_agent_events_to_session_notifications(&session_id, events) {
-                                        if let Err(err) = bridge_sender.notify(notification).await {
-                                            log::warn!(
-                                                "Failed to send session/load replay notification for {}: {}",
-                                                session_id,
-                                                err
-                                            );
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    log::warn!(
-                                        "Failed to load session/load replay events for {}: {}",
-                                        session_id,
-                                        err
-                                    );
-                                }
-                            },
-                            None => {
-                                log::warn!(
-                                    "Loaded session {} but no runtime session ref was available for replay",
-                                    session_id
-                                );
-                            }
-                        }
-                    }
-                    responder.respond_with_result(response)
+                    responder.respond_with_result(
+                        load_session_and_enqueue_replay(&agent, &bridge_sender, req).await,
+                    )
                 }
             },
             acp::on_receive_request!(),
