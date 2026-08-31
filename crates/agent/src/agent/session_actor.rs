@@ -772,7 +772,8 @@ impl SessionActor {
         }
         proposed.mode_models = updated;
         proposed.effective_model = proposed
-            .binding_for(proposed.active_mode)
+            .binding_for(previous.active_mode)
+            .or(Some(&previous.effective_model))
             .cloned()
             .ok_or_else(|| AgentError::Internal("active mode has no model binding".to_string()))?;
         self.commit_control_transition(previous, proposed).await

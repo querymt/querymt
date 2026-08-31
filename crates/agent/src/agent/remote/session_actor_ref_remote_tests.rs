@@ -11,13 +11,15 @@
 #[cfg(all(test, feature = "remote"))]
 #[allow(clippy::module_inception)]
 mod session_actor_ref_remote_tests {
+    use std::collections::HashMap;
+
+    use kameo::actor::Spawn;
+    use querymt::LLMParams;
+
     use crate::agent::core::{AgentMode, SessionRuntime};
     use crate::agent::remote::SessionActorRef;
     use crate::agent::remote::test_helpers::fixtures::{AgentConfigFixture, get_test_mesh};
     use crate::agent::session_actor::SessionActor;
-    use kameo::actor::Spawn;
-    use querymt::LLMParams;
-    use std::collections::HashMap;
 
     /// Set up a remote `SessionActorRef` for one test.
     ///
