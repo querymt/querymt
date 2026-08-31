@@ -1754,6 +1754,28 @@ model = "model.gguf"
     }
 
     #[test]
+    fn embedded_single_coder_uses_todos_without_durable_task_tools() {
+        let value: toml::Value = toml::from_str(STANDARD_SINGLE_CODER_CONFIG)
+            .expect("embedded config should parse as TOML");
+        let tools = value
+            .get("agent")
+            .and_then(toml::Value::as_table)
+            .and_then(|agent| agent.get("tools"))
+            .and_then(toml::Value::as_array)
+            .expect("embedded config should contain [agent].tools");
+        let tools: Vec<&str> = tools
+            .iter()
+            .map(|tool| tool.as_str().expect("tool name must be a string"))
+            .collect();
+
+        assert!(tools.contains(&"todowrite"));
+        assert!(tools.contains(&"todoread"));
+        for durable_tool in ["create_task", "read_task", "update_task", "complete_task"] {
+            assert!(!tools.contains(&durable_tool));
+        }
+    }
+
+    #[test]
     fn embedded_profile_config_inlines_standard_prompt_refs() {
         let config = embedded_profile_config("single_coder.toml", STANDARD_SINGLE_CODER_CONFIG)
             .expect("embedded config should load");

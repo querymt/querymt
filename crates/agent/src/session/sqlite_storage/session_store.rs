@@ -1063,13 +1063,21 @@ impl SessionStore for SqliteStorage {
             if matches!(status, TaskStatus::Done) || matches!(current.status, TaskStatus::Done | TaskStatus::Cancelled) {
                 return Err(rusqlite::Error::InvalidParameterName("invalid_task_transition".to_string()));
             }
-            let deliverable = patch.expected_deliverable.or(current.expected_deliverable);
-            let criteria = patch.acceptance_criteria.or(current.acceptance_criteria);
+            let deliverable = patch.expected_deliverable.or_else(|| current.expected_deliverable.clone());
+            let criteria = patch.acceptance_criteria.or_else(|| current.acceptance_criteria.clone());
             let evidence = if status == TaskStatus::Cancelled {
                 patch.cancellation_reason
             } else {
-                current.completion_evidence
+                current.completion_evidence.clone()
             };
+            if deliverable == current.expected_deliverable
+                && criteria == current.acceptance_criteria
+                && status == current.status
+                && evidence == current.completion_evidence
+            {
+                tx.commit()?;
+                return Ok(current);
+            }
             let now = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default();
             tx.execute(
                 "UPDATE tasks SET expected_deliverable = ?1, acceptance_criteria = ?2, status = ?3, completion_evidence = ?4, revision = revision + 1, updated_at = ?5 WHERE id = ?6 AND revision = ?7",

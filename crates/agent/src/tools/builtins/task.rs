@@ -181,6 +181,13 @@ impl ToolTrait for UpdateTaskTool {
             )
             .await
             .map_err(|error| ToolError::SessionError(error.to_string()))?;
+        if task.revision == expected_revision {
+            return Ok(vec![Content::text(format!(
+                "Task unchanged; no revision was created. Current task state:\n{}",
+                serde_json::to_string_pretty(&task)
+                    .map_err(|error| ToolError::Other(error.into()))?
+            ))]);
+        }
         context.emit_event(crate::events::AgentEventKind::TaskUpdated { task: task.clone() });
         task_content(&task, task.status == TaskStatus::Active)
     }

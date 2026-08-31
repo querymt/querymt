@@ -220,6 +220,25 @@ async fn task_lifecycle_is_atomic_revisioned_and_explicit() {
         .await
         .expect("update task");
     assert_eq!(updated.revision, 2);
+
+    let unchanged = storage
+        .patch_task_for_session(
+            &session.public_id,
+            &created.public_id,
+            2,
+            TaskPatch {
+                expected_deliverable: updated.expected_deliverable.clone(),
+                acceptance_criteria: updated.acceptance_criteria.clone(),
+                status: Some(updated.status),
+                ..TaskPatch::default()
+            },
+            "repeat current state",
+        )
+        .await
+        .expect("no-op update");
+    assert_eq!(unchanged.revision, 2);
+    assert_eq!(unchanged.updated_at, updated.updated_at);
+
     assert!(
         storage
             .patch_task_for_session(

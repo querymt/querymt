@@ -29,7 +29,7 @@ tools = [
   # Execution
   "shell",
   # Task management
-  "create_task", "read_task", "update_task", "complete_task", "todowrite", "todoread",
+  "todowrite", "todoread",
   # User interaction
   "question",
   # Web browsingCode intelligence

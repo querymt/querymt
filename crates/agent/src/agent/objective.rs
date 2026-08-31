@@ -140,8 +140,13 @@ impl RunObjective {
     }
 
     pub fn set_task(&mut self, task: Option<&Task>, source: ObjectiveSource) {
-        self.current_task = task.map(TaskCommitment::from);
-        self.completion_disposition = Self::disposition_for_task(task);
+        let next_task = task.map(TaskCommitment::from);
+        let next_disposition = Self::disposition_for_task(task);
+        if self.current_task == next_task && self.completion_disposition == next_disposition {
+            return;
+        }
+        self.current_task = next_task;
+        self.completion_disposition = next_disposition;
         self.revision = self.revision.saturating_add(1);
         self.amendments.push(ObjectiveAmendment {
             revision: self.revision,
@@ -254,5 +259,37 @@ mod tests {
         let rendered = objective.render();
         assert!(rendered.contains("does not alter scope or precedence"));
         assert!(!rendered.contains("exactly one"));
+    }
+
+    #[test]
+    fn unchanged_task_does_not_create_an_objective_revision() {
+        let now = time::OffsetDateTime::now_utc();
+        let task = Task {
+            id: 1,
+            public_id: "task-1".into(),
+            session_id: 1,
+            kind: crate::session::domain::TaskKind::Finite,
+            status: TaskStatus::Active,
+            expected_deliverable: Some("Implement the fix".into()),
+            acceptance_criteria: Some("Tests pass".into()),
+            revision: 1,
+            creation_key: Some("call-1".into()),
+            completion_evidence: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut objective = RunObjective::new(
+            "run-1".into(),
+            "Implement the fix".into(),
+            "interactive".into(),
+            Some(&task),
+            None,
+        );
+
+        objective.set_task(Some(&task), ObjectiveSource::TaskUpdated);
+
+        assert_eq!(objective.revision, 1);
+        assert!(objective.amendments.is_empty());
     }
 }
