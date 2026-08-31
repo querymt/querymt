@@ -15,12 +15,15 @@ use crate::agent::session_registry::SessionRegistry;
 use crate::events::{AgentEvent, AgentEventKind, EventOrigin};
 use crate::session::backend::StorageBackend;
 use crate::session::sqlite_storage::SqliteStorage;
+use crate::test_utils::{
+    MockLlmProvider, SharedLlmProvider, TestProviderFactory, mock_plugin_registry,
+};
 use kameo::actor::Spawn;
 use querymt::LLMParams;
-use querymt::plugin::host::PluginRegistry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
+use tokio::sync::Mutex;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Test helpers
@@ -31,10 +34,12 @@ use tempfile::TempDir;
 /// Returns `(Arc<AgentConfig>, TempDir)` — the `TempDir` must be kept alive for
 /// the duration of the test.
 async fn test_agent_config() -> (Arc<AgentConfig>, TempDir) {
-    let temp_dir = TempDir::new().expect("create temp dir");
-    let config_path = temp_dir.path().join("providers.toml");
-    std::fs::write(&config_path, "providers = []\n").expect("write providers.toml");
-    let registry = PluginRegistry::from_path(&config_path).expect("create plugin registry");
+    let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
+    let factory = Arc::new(TestProviderFactory::new(SharedLlmProvider {
+        inner: provider,
+        tools: vec![].into_boxed_slice(),
+    }));
+    let (registry, temp_dir) = mock_plugin_registry(factory).expect("create plugin registry");
     let plugin_registry = Arc::new(registry);
 
     let storage = Arc::new(
@@ -190,10 +195,13 @@ async fn test_local_ref_get_session_limits_none() {
 async fn test_local_ref_get_llm_config() {
     let (config, _td) = test_agent_config().await;
     let session_ref = spawn_test_session(config, "test-llm-1").await;
-    // Session doesn't exist in the DB → handler returns an error.
-    // We just verify the message round-trips without panic.
-    let result = session_ref.get_llm_config().await;
-    assert!(result.is_err(), "no session in DB → should return error");
+    let config = session_ref
+        .get_llm_config()
+        .await
+        .expect("get LLM config")
+        .expect("test session should have an LLM config");
+    assert_eq!(config.provider, "mock");
+    assert_eq!(config.model, "mock");
 }
 
 #[tokio::test]
@@ -217,10 +225,8 @@ async fn test_local_ref_subscribe_unsubscribe_events() {
 async fn test_local_ref_get_history() {
     let (config, _td) = test_agent_config().await;
     let session_ref = spawn_test_session(config, "test-history-1").await;
-    // Session doesn't exist in the DB → handler returns an error.
-    // We just verify the message round-trips without panic.
-    let result = session_ref.get_history().await;
-    assert!(result.is_err(), "no session in DB → should return error");
+    let history = session_ref.get_history().await.expect("get history");
+    assert!(history.is_empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

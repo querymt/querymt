@@ -818,13 +818,23 @@ impl SessionMaterializer {
                 initial_reasoning_effort
             }
         };
-        let control_state = self
+        let control_state = match self
             .config
             .provider
             .history_store()
             .get_session_control(&session_id)
             .await
-            .map_err(|error| Error::internal_error().data(error.to_string()))?;
+        {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    error = %error,
+                    "failed to load persisted session control; rebuilding from session state"
+                );
+                None
+            }
+        };
         let runtime = SessionRuntime::new(cwd.clone(), mcp_services, tool_state);
         #[cfg(feature = "remote")]
         let mut actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone())

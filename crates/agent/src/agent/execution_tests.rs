@@ -93,6 +93,10 @@ impl TestHarness {
             .returning(|_| Ok(None))
             .times(0..);
         store
+            .expect_get_session_control()
+            .returning(|_| Ok(None))
+            .times(0..);
+        store
             .expect_get_session_provider_node_id()
             .returning(|_| Ok(None))
             .times(0..);

@@ -8,10 +8,19 @@ impl LocalAgentHandle {
     ) -> Result<SetSessionModelResponse, Error> {
         let session_id = req.session_id.to_string();
         let session_ref = self.session_ref_for_agent_session(&session_id).await?;
+        #[cfg(feature = "remote")]
+        let provider_node_id = if session_ref.is_remote() {
+            self.mesh()
+                .map(|mesh| crate::agent::remote::NodeId::from_peer_id(*mesh.peer_id()).to_string())
+        } else {
+            None
+        };
+        #[cfg(not(feature = "remote"))]
+        let provider_node_id = None;
         session_ref
             .set_session_model(crate::agent::session_control::SessionModelSelection {
                 model_id: req.model_id.to_string(),
-                provider_node_id: None,
+                provider_node_id,
             })
             .await
             .map_err(Error::from)?;
@@ -87,7 +96,17 @@ impl LocalAgentHandle {
                 let session_ref = self.session_ref_for_agent_session(&session_id).await?;
 
                 #[cfg(feature = "remote")]
-                let provider_node_id = provider_node_id.map(|node_id| node_id.to_string());
+                let provider_node_id =
+                    provider_node_id
+                        .map(|node_id| node_id.to_string())
+                        .or_else(|| {
+                            session_ref.is_remote().then(|| {
+                                self.mesh().map(|mesh| {
+                                    crate::agent::remote::NodeId::from_peer_id(*mesh.peer_id())
+                                        .to_string()
+                                })
+                            })?
+                        });
                 #[cfg(not(feature = "remote"))]
                 let provider_node_id = None;
 

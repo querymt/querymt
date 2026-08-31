@@ -542,7 +542,10 @@ impl Message<SetProvider> for SessionActor {
         for prompt_part in system_prompt {
             config = config.system(prompt_part);
         }
-        self.set_llm_config_impl(config).await
+        let model_id = format!("{}/{}", msg.provider, msg.model);
+        self.transition_model_with_config(model_id, None, config)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -571,68 +574,6 @@ impl Message<SetLlmConfig> for SessionActor {
 }
 
 impl SessionActor {
-    async fn set_llm_config_impl(&self, config: querymt::LLMParams) -> Result<(), AgentError> {
-        let provider_name = config
-            .provider
-            .as_ref()
-            .ok_or(AgentError::ProviderRequired)?;
-
-        let is_known_local_provider = self
-            .config
-            .provider
-            .plugin_registry()
-            .get(provider_name)
-            .await
-            .is_some();
-
-        if !is_known_local_provider {
-            let provider_node_id = self
-                .config
-                .provider
-                .history_store()
-                .get_session_provider_node_id(&self.session_id)
-                .await
-                .map_err(|e| AgentError::Internal(e.to_string()))?;
-
-            if provider_node_id.is_none() {
-                return Err(AgentError::UnknownProvider {
-                    name: provider_name.clone(),
-                });
-            }
-        }
-
-        let llm_config = self
-            .config
-            .provider
-            .history_store()
-            .create_or_get_llm_config(&config)
-            .await
-            .map_err(|e| AgentError::Internal(e.to_string()))?;
-
-        self.config
-            .provider
-            .history_store()
-            .set_session_llm_config(&self.session_id, llm_config.id)
-            .await
-            .map_err(|e| AgentError::Internal(e.to_string()))?;
-
-        let context_limit =
-            crate::model_info::get_model_info(&llm_config.provider, &llm_config.model)
-                .and_then(|m| m.context_limit());
-
-        self.config.emit_event(
-            &self.session_id,
-            AgentEventKind::ProviderChanged {
-                provider: llm_config.provider.clone(),
-                model: llm_config.model.clone(),
-                config_id: llm_config.id,
-                context_limit,
-                provider_node_id: None,
-            },
-        );
-        Ok(())
-    }
-
     async fn ensure_control_state(&mut self) -> Result<SessionControlState, AgentError> {
         if let Some(state) = &self.control_state {
             return Ok(state.clone());
@@ -764,6 +705,20 @@ impl SessionActor {
         params: querymt::LLMParams,
     ) -> Result<SessionControlTransition, AgentError> {
         let previous = self.ensure_control_state().await?;
+        let provider_name = params
+            .provider
+            .as_ref()
+            .ok_or(AgentError::ProviderRequired)?;
+        let plugin_registry = self.config.provider.plugin_registry();
+        let is_known_local_provider = plugin_registry
+            .list_provider_names()
+            .contains(&provider_name.as_str())
+            || plugin_registry.get(provider_name).await.is_some();
+        if !is_known_local_provider && provider_node_id.is_none() {
+            return Err(AgentError::UnknownProvider {
+                name: provider_name.clone(),
+            });
+        }
         let config = self
             .config
             .provider

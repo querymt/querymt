@@ -125,7 +125,7 @@ remote_msg_impl!(messages::Undo, "querymt::Undo", REG_UNDO);
 remote_msg_impl!(messages::Redo, "querymt::Redo", REG_REDO);
 remote_msg_impl!(
     messages::SetSessionModel,
-    "querymt::SetSessionModel",
+    "querymt::SetSessionModelSelection",
     REG_SET_SESSION_MODEL
 );
 remote_msg_impl!(messages::GetHistory, "querymt::GetHistory", REG_GET_HISTORY);

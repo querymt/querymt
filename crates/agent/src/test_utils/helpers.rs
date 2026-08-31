@@ -149,6 +149,18 @@ pub fn empty_plugin_registry() -> Result<(PluginRegistry, TempDir)> {
 /// # Returns
 /// A tuple of (PluginRegistry, TempDir) - the TempDir must be kept alive
 /// for the duration of the test.
+pub fn register_mock_provider(registry: &PluginRegistry) {
+    let provider = Arc::new(tokio::sync::Mutex::new(
+        crate::test_utils::MockLlmProvider::new(),
+    ));
+    registry.register_static(Arc::new(TestProviderFactory::new(
+        crate::test_utils::SharedLlmProvider {
+            inner: provider,
+            tools: vec![].into_boxed_slice(),
+        },
+    )));
+}
+
 pub fn mock_plugin_registry(
     factory: Arc<TestProviderFactory>,
 ) -> Result<(PluginRegistry, TempDir)> {

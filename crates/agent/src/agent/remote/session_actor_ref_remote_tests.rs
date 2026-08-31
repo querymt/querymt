@@ -16,8 +16,8 @@ mod session_actor_ref_remote_tests {
     use crate::agent::remote::test_helpers::fixtures::{AgentConfigFixture, get_test_mesh};
     use crate::agent::session_actor::SessionActor;
     use kameo::actor::Spawn;
+    use querymt::LLMParams;
     use std::collections::HashMap;
-    use uuid::Uuid;
 
     /// Set up a remote `SessionActorRef` for one test.
     ///
@@ -28,8 +28,20 @@ mod session_actor_ref_remote_tests {
     ) -> (SessionActorRef, kameo::actor::ActorRef<SessionActor>) {
         let mesh = get_test_mesh().await;
         let f = AgentConfigFixture::new().await;
-        let test_id = Uuid::now_v7().to_string();
-        let session_id = format!("remote-e-{}-{}", label, test_id);
+        let store = f.config.provider.history_store();
+        let session = store
+            .create_session(Some(format!("remote-e-{label}")), None, None, None)
+            .await
+            .expect("create test session");
+        let session_id = session.public_id;
+        let llm_config = store
+            .create_or_get_llm_config(&LLMParams::new().provider("mock").model("mock"))
+            .await
+            .expect("create test LLM config");
+        store
+            .set_session_llm_config(&session_id, llm_config.id)
+            .await
+            .expect("bind test LLM config");
 
         let runtime = SessionRuntime::new(
             None,
@@ -141,27 +153,24 @@ mod session_actor_ref_remote_tests {
     // ── E.6 ──────────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_remote_ref_get_history_empty_session_errors() {
+    async fn test_remote_ref_get_history_empty_session() {
         let (session_ref, _local) = remote_session_ref("e6").await;
-        // Session actor exists but no DB row was written → should return Err.
-        let result = session_ref.get_history().await;
-        assert!(
-            result.is_err(),
-            "get_history without a DB row should return Err"
-        );
+        let history = session_ref.get_history().await.expect("get history");
+        assert!(history.is_empty());
     }
 
     // ── E.7 ──────────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_remote_ref_get_llm_config_no_db_errors() {
+    async fn test_remote_ref_get_llm_config() {
         let (session_ref, _local) = remote_session_ref("e7").await;
-        let result = session_ref.get_llm_config().await;
-        // No session row in DB → handler returns Err.
-        assert!(
-            result.is_err(),
-            "get_llm_config without a DB row should return Err"
-        );
+        let config = session_ref
+            .get_llm_config()
+            .await
+            .expect("get LLM config")
+            .expect("test session should have an LLM config");
+        assert_eq!(config.provider, "mock");
+        assert_eq!(config.model, "mock");
     }
 
     // ── E.8 ──────────────────────────────────────────────────────────────────

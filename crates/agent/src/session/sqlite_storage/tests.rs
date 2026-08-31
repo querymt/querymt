@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use querymt::LLMParams;
 use rusqlite::Connection;
 
 use crate::agent::core::AgentMode;
@@ -8,8 +11,6 @@ use crate::session::projection::{
     EventJournal, NewDurableEvent, RecentModelEntry, SessionScope, ViewStore,
 };
 use crate::session::store::SessionStore;
-use querymt::LLMParams;
-use std::collections::HashMap;
 
 use super::SqliteStorage;
 use super::migrations::{MIGRATIONS, apply_migrations};
@@ -217,6 +218,65 @@ async fn session_control_commit_is_revisioned_and_session_scoped() {
         .await
         .expect_err("stale revision must fail");
     assert!(stale.to_string().contains("revision conflict"));
+}
+
+#[tokio::test]
+async fn set_session_llm_config_rejects_changes_after_control_initialization() {
+    let storage = SqliteStorage::connect(":memory:".into())
+        .await
+        .expect("in-memory storage");
+    let session = storage
+        .create_session(None, None, None, None)
+        .await
+        .expect("session");
+    let config_a = storage
+        .create_or_get_llm_config(&LLMParams::new().provider("mock").model("model-a"))
+        .await
+        .expect("config A");
+    let config_b = storage
+        .create_or_get_llm_config(&LLMParams::new().provider("mock").model("model-b"))
+        .await
+        .expect("config B");
+    storage
+        .set_session_llm_config(&session.public_id, config_a.id)
+        .await
+        .expect("initialize config");
+    let binding = SessionModelBinding {
+        model_id: "mock/model-a".to_string(),
+        provider: "mock".to_string(),
+        model: "model-a".to_string(),
+        llm_config_id: config_a.id,
+        provider_node_id: None,
+    };
+    storage
+        .commit_session_control(
+            &session.public_id,
+            0,
+            &SessionControlState {
+                revision: 1,
+                active_mode: AgentMode::Build,
+                reasoning_effort: None,
+                effective_model: binding.clone(),
+                mode_models: HashMap::from([("build".to_string(), binding)]),
+            },
+        )
+        .await
+        .expect("initialize control state");
+
+    let error = storage
+        .set_session_llm_config(&session.public_id, config_b.id)
+        .await
+        .expect_err("direct config changes must be rejected after control initialization");
+    assert!(error.to_string().contains("session control"));
+    assert_eq!(
+        storage
+            .get_session(&session.public_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .llm_config_id,
+        Some(config_a.id)
+    );
 }
 
 #[tokio::test]

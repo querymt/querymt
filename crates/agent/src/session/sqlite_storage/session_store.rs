@@ -596,6 +596,19 @@ impl SessionStore for SqliteStorage {
         let session_internal_id = self.resolve_session_internal_id(session_id).await?;
 
         self.run_blocking(move |conn| {
+            let control_initialized = conn
+                .query_row(
+                    "SELECT 1 FROM session_control_states WHERE session_id = ?1",
+                    params![session_internal_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if control_initialized {
+                return Err(rusqlite::Error::InvalidParameterName(
+                    "session_control_initialized".to_string(),
+                ));
+            }
             let affected = conn.execute(
                 "UPDATE sessions SET llm_config_id = ?, updated_at = ? WHERE id = ?",
                 params![
@@ -613,9 +626,14 @@ impl SessionStore for SqliteStorage {
         })
         .await
         .map_err(|e| match e {
-            crate::session::error::SessionError::DatabaseError(_) => {
-                crate::session::error::SessionError::SessionNotFound(session_id.to_string())
+            SessionError::DatabaseError(message)
+                if message.contains("session_control_initialized") =>
+            {
+                SessionError::InvalidOperation(
+                    "session LLM config must be changed through session control".to_string(),
+                )
             }
+            SessionError::DatabaseError(_) => SessionError::SessionNotFound(session_id.to_string()),
             _ => e,
         })
     }
@@ -673,10 +691,14 @@ impl SessionStore for SqliteStorage {
 
             let effective_config_id = effective_config_id.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
             let effective_model = bindings
-                .values()
-                .find(|binding| binding.llm_config_id == effective_config_id && binding.provider_node_id == effective_node)
+                .get(active_mode.as_str())
                 .cloned()
-                .or_else(|| bindings.get(active_mode.as_str()).cloned())
+                .or_else(|| {
+                    bindings
+                        .values()
+                        .find(|binding| binding.llm_config_id == effective_config_id && binding.provider_node_id == effective_node)
+                        .cloned()
+                })
                 .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
 
             Ok(Some(SessionControlState {
