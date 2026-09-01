@@ -235,6 +235,88 @@ impl DelegationOrchestrator {
         .expect("delegation was not registered");
     }
 
+    /// Submit a delegation to an already resolved handle.
+    ///
+    /// Slash commands use this entry point so profile targets and remote handles
+    /// share the same execution, persistence, hook, and completion pipeline as
+    /// tool-originated delegations.
+    pub async fn submit_resolved(
+        &self,
+        parent_session_id: String,
+        delegation: Delegation,
+        target_handle: Arc<dyn crate::agent::handle::AgentHandle>,
+        child_profile_binding: Option<crate::profiles::SessionProfileBinding>,
+        inject_results: bool,
+    ) -> Result<(), String> {
+        match self.claim_delegation(&delegation.public_id).await? {
+            DelegationClaim::Claimed => {}
+            DelegationClaim::AlreadyClaimed => return Err("delegation was already claimed".into()),
+            DelegationClaim::NotFound => return Err("delegation record was not found".into()),
+            DelegationClaim::InvalidState(status) => {
+                return Err(format!("delegation is in invalid state {status:?}"));
+            }
+        }
+
+        let delegator = self.delegator.clone();
+        let event_sink = self.event_sink.clone();
+        let store = self.store.clone();
+        let tool_registry = self.tool_registry.clone();
+        let mut config = self.config.clone();
+        config.inject_results = inject_results;
+        let max_parallel = self.max_parallel.clone();
+        let delegation_summarizer = self.delegation_summarizer.clone();
+        let delegate_model_overrides = self.delegate_model_overrides.clone();
+        let routing_snapshot = self.routing_snapshot.clone();
+        let profile_id = self.profile_id.clone();
+        let parent_for_active = parent_session_id.clone();
+        let active_delegations = self.active_delegations.clone();
+        let active_for_task = active_delegations.clone();
+        let hooks = self.hooks.clone();
+        let delegation_id = delegation.public_id.clone();
+        let cancel_token = CancellationToken::new();
+        let cancel_for_active = cancel_token.clone();
+        let (start_tx, start_rx) = oneshot::channel();
+
+        let handle = tokio::spawn(async move {
+            if start_rx.await.is_err() {
+                return;
+            }
+            let _permit = match max_parallel.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+            execute_delegation(
+                DelegationContext {
+                    delegator,
+                    event_sink,
+                    store,
+                    tool_registry,
+                    hooks,
+                    config,
+                    active_delegations: active_for_task,
+                    delegation_summarizer,
+                    delegate_model_overrides,
+                    profile_id,
+                    child_profile_binding,
+                    inject_results: Some(inject_results),
+                    routing_snapshot,
+                },
+                target_handle,
+                parent_session_id,
+                delegation,
+                cancel_token,
+            )
+            .await;
+        });
+
+        self.active_delegations.lock().await.insert(
+            delegation_id,
+            (parent_for_active, cancel_for_active, handle),
+        );
+        let _ = start_tx.send(());
+        Ok(())
+    }
+
     pub async fn cancel_active_delegations(&self) {
         self.begin_shutdown();
         let active = std::mem::take(&mut *self.active_delegations.lock().await);
@@ -522,6 +604,8 @@ impl DelegationOrchestrator {
                         delegation_summarizer,
                         delegate_model_overrides,
                         profile_id,
+                        child_profile_binding: None,
+                        inject_results: None,
                         routing_snapshot,
                     };
                     execute_delegation(
@@ -636,6 +720,8 @@ struct DelegationContext {
     delegation_summarizer: Option<Arc<super::summarizer::DelegationSummarizer>>,
     delegate_model_overrides: super::DelegateModelOverrideStore,
     profile_id: Option<String>,
+    child_profile_binding: Option<crate::profiles::SessionProfileBinding>,
+    inject_results: Option<bool>,
     routing_snapshot: Option<crate::agent::remote::RoutingSnapshotHandle>,
 }
 
@@ -849,8 +935,19 @@ async fn execute_delegation(
         }
     };
 
-    if let Some(profile_id) = ctx.profile_id.as_deref()
-        && let Err(err) = persist_delegate_runtime_binding(
+    let runtime_binding_result = if let Some(binding) = ctx.child_profile_binding.as_ref() {
+        ctx.store
+            .set_session_runtime_binding(
+                &child_session_id,
+                &binding.profile_id,
+                binding.agent_id.as_deref(),
+                binding.profile_fingerprint.as_deref(),
+                binding.provider_lock_digest.as_deref(),
+                binding.provider_locks_json.as_deref(),
+            )
+            .await
+    } else if let Some(profile_id) = ctx.profile_id.as_deref() {
+        persist_delegate_runtime_binding(
             ctx.store.as_ref(),
             &parent_session_id,
             &child_session_id,
@@ -858,7 +955,10 @@ async fn execute_delegation(
             &delegation.target_agent_id,
         )
         .await
-    {
+    } else {
+        Ok(())
+    };
+    if let Err(err) = runtime_binding_result {
         if let Err(shutdown_err) = session_ref.shutdown().await {
             tracing::warn!(
                 delegation_id = %delegation.public_id,
@@ -1358,7 +1458,7 @@ async fn execute_delegation(
                 },
             );
 
-            if ctx.config.inject_results {
+            if ctx.inject_results.unwrap_or(ctx.config.inject_results) {
                 inject_results(
                     &ctx.delegator,
                     &parent_session_id,

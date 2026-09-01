@@ -59,6 +59,7 @@ impl LocalAgentHandle {
             oauth_service,
             profiles: ArcSwap::from_pointee(None),
             scheduler_handle: Arc::new(parking_lot::Mutex::new(None)),
+            slash_delegation_orchestrator: OnceCell::new(),
             shutdown_done: AtomicBool::new(false),
         }
     }
@@ -74,6 +75,282 @@ impl LocalAgentHandle {
 
     pub fn profiles(&self) -> Option<ProfileRuntime> {
         self.profiles.load_full().as_ref().clone()
+    }
+
+    async fn slash_delegation_orchestrator(
+        &self,
+    ) -> Arc<crate::delegation::DelegationOrchestrator> {
+        self.slash_delegation_orchestrator
+            .get_or_init(|| async {
+                let orchestrator = Arc::new(crate::delegation::DelegationOrchestrator::new(
+                    Arc::new(Self::from_config(self.config.clone())),
+                    self.config.event_sink.clone(),
+                    self.config.storage.session_store(),
+                    self.config.agent_registry.clone(),
+                    Arc::new(self.config.tool_registry.clone()),
+                    self.config.hooks.clone(),
+                    None,
+                ));
+                orchestrator.start_listening(self.config.event_sink.fanout());
+                orchestrator
+            })
+            .await
+            .clone()
+    }
+
+    pub(super) async fn submit_slash_delegation(
+        &self,
+        parent_session_id: String,
+        command: crate::slash_commands::DelegateSlashCommand,
+        delegation: crate::session::domain::Delegation,
+    ) -> Result<(), Error> {
+        use crate::slash_commands::DelegateTarget;
+
+        let (target, binding) = match &command.target {
+            DelegateTarget::Agent(id) => {
+                let handle = self.config.agent_registry.get_handle(id).ok_or_else(|| {
+                    let available = self
+                        .config
+                        .agent_registry
+                        .list_agents()
+                        .into_iter()
+                        .map(|agent| agent.id)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Error::invalid_params().data(serde_json::json!({
+                        "message": format!("Agent '{id}' is not registered"),
+                        "availableAgents": available,
+                    }))
+                })?;
+                (handle, None)
+            }
+            DelegateTarget::Profile(id) => {
+                let profiles = self.profiles().ok_or_else(|| {
+                    Error::invalid_params().data(serde_json::json!({
+                        "message": "Profile delegation requires an attached profile catalog",
+                    }))
+                })?;
+                let runtime = profiles.runtime_for_profile(id).await.map_err(|err| {
+                    Error::invalid_params().data(serde_json::json!({
+                        "message": format!("Failed to load profile '{id}': {err}"),
+                    }))
+                })?;
+                let mut binding = runtime.session_binding();
+                binding.agent_id = None;
+                (
+                    runtime.agent().handle() as Arc<dyn AgentHandle>,
+                    Some(binding),
+                )
+            }
+        };
+
+        self.slash_delegation_orchestrator()
+            .await
+            .submit_resolved(parent_session_id, delegation, target, binding, false)
+            .await
+            .map_err(|err| Error::internal_error().data(err))
+    }
+
+    pub(super) async fn execute_delegate_slash_command(
+        &self,
+        req: PromptRequest,
+        session_ref: crate::agent::remote::SessionActorRef,
+        command: crate::slash_commands::DelegateSlashCommand,
+    ) -> Result<PromptResponse, Error> {
+        use crate::acp::protocol::{ContentBlock, StopReason, TextContent};
+        use crate::events::AgentEventKind;
+        use crate::model::{AgentMessage, MessagePart};
+        use querymt::chat::ChatRole;
+
+        let session_id = req.session_id.to_string();
+        let display_content = crate::agent::utils::render_prompt_for_display(&req.prompt);
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let user_message = AgentMessage {
+            id: message_id.clone(),
+            session_id: session_id.clone(),
+            role: ChatRole::User,
+            parts: vec![MessagePart::Prompt {
+                blocks: req.prompt.clone(),
+            }],
+            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        self.config
+            .provider
+            .history_store()
+            .add_message(&session_id, user_message)
+            .await
+            .map_err(|err| Error::internal_error().data(err.to_string()))?;
+        self.config.emit_event(
+            &session_id,
+            AgentEventKind::PromptReceived {
+                content: display_content.clone(),
+                message_id: Some(message_id),
+            },
+        );
+        self.config.emit_event(
+            &session_id,
+            AgentEventKind::UserMessageStored {
+                content: display_content,
+            },
+        );
+
+        let runtime = crate::session::runtime::RuntimeContext::new(
+            self.config.provider.history_store(),
+            session_id.clone(),
+        )
+        .await
+        .map_err(|err| Error::internal_error().data(err.to_string()))?;
+        let delegation = runtime
+            .record_delegation(
+                command.target.id().to_string(),
+                command.objective.clone(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .map_err(|err| Error::internal_error().data(err.to_string()))?;
+        let delegation_id = delegation.public_id.clone();
+        let mut events = self.config.event_sink.fanout().subscribe();
+        self.submit_slash_delegation(session_id.clone(), command.clone(), delegation.clone())
+            .await?;
+        self.config.emit_event(
+            &session_id,
+            AgentEventKind::DelegationRequested {
+                delegation,
+                tool_call_id: None,
+            },
+        );
+        if command.mode == crate::slash_commands::DelegateMode::Async {
+            let acknowledgement = format!(
+                "Delegation queued.\n\nTarget: {}\nDelegation ID: {}",
+                command.target, delegation_id
+            );
+            self.store_slash_command_reply(&session_id, acknowledgement)
+                .await?;
+            let child_prompt = session_ref.clone();
+            tokio::spawn(async move {
+                while let Ok(event) = events.recv().await {
+                    if event.session_id() != session_id {
+                        continue;
+                    }
+                    let content = match event.kind() {
+                        AgentEventKind::DelegationCompleted {
+                            delegation_id: completed_id,
+                            result,
+                        } if completed_id == &delegation_id => {
+                            Some(crate::delegation::format_delegation_completion_message(
+                                completed_id,
+                                result.as_deref().unwrap_or("No summary provided."),
+                            ))
+                        }
+                        AgentEventKind::DelegationFailed {
+                            delegation_id: failed_id,
+                            error,
+                        } if failed_id == &delegation_id => Some(
+                            crate::delegation::format_delegation_failure_message(failed_id, error),
+                        ),
+                        AgentEventKind::DelegationCancelled {
+                            delegation_id: cancelled_id,
+                        } if cancelled_id == &delegation_id => Some(format!(
+                            "Delegation cancelled.\n\nDelegation ID: {cancelled_id}"
+                        )),
+                        _ => None,
+                    };
+                    if let Some(content) = content {
+                        let _ = child_prompt
+                            .prompt(PromptRequest::new(
+                                session_id.clone(),
+                                vec![ContentBlock::Text(TextContent::new(content))],
+                            ))
+                            .await;
+                        break;
+                    }
+                }
+            });
+            return Ok(PromptResponse::new(StopReason::EndTurn));
+        }
+
+        loop {
+            let event = events
+                .recv()
+                .await
+                .map_err(|err| Error::internal_error().data(err.to_string()))?;
+            if event.session_id() != session_id {
+                continue;
+            }
+            let content = match event.kind() {
+                AgentEventKind::DelegationCompleted {
+                    delegation_id: completed_id,
+                    result,
+                } if completed_id == &delegation_id => {
+                    Some(crate::delegation::format_delegation_completion_message(
+                        completed_id,
+                        result.as_deref().unwrap_or("No summary provided."),
+                    ))
+                }
+                AgentEventKind::DelegationFailed {
+                    delegation_id: failed_id,
+                    error,
+                } if failed_id == &delegation_id => Some(
+                    crate::delegation::format_delegation_failure_message(failed_id, error),
+                ),
+                AgentEventKind::DelegationCancelled {
+                    delegation_id: cancelled_id,
+                } if cancelled_id == &delegation_id => Some(format!(
+                    "Delegation cancelled.\n\nDelegation ID: {cancelled_id}"
+                )),
+                _ => None,
+            };
+            if let Some(content) = content {
+                return session_ref
+                    .prompt(PromptRequest::new(
+                        session_id,
+                        vec![ContentBlock::Text(TextContent::new(content))],
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    async fn store_slash_command_reply(
+        &self,
+        session_id: &str,
+        content: String,
+    ) -> Result<(), Error> {
+        let message_id = uuid::Uuid::new_v4().to_string();
+        self.config
+            .provider
+            .history_store()
+            .add_message(
+                session_id,
+                crate::model::AgentMessage {
+                    id: message_id.clone(),
+                    session_id: session_id.to_string(),
+                    role: querymt::chat::ChatRole::Assistant,
+                    parts: vec![crate::model::MessagePart::Text {
+                        content: content.clone(),
+                    }],
+                    created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+                    parent_message_id: None,
+                    source_provider: None,
+                    source_model: None,
+                },
+            )
+            .await
+            .map_err(|err| Error::internal_error().data(err.to_string()))?;
+        self.config.emit_event(
+            session_id,
+            crate::events::AgentEventKind::AssistantMessageStored {
+                content,
+                thinking: None,
+                message_id: Some(message_id),
+            },
+        );
+        Ok(())
     }
 
     pub(super) async fn session_config_options(
@@ -601,6 +878,10 @@ impl LocalAgentHandle {
             scheduler.request_shutdown();
         }
         self.clear_scheduler_handle();
+
+        if let Some(orchestrator) = self.slash_delegation_orchestrator.get() {
+            orchestrator.cancel_active_delegations().await;
+        }
 
         #[cfg(feature = "remote")]
         self.clear_mesh();

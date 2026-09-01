@@ -2,11 +2,12 @@ use crate::acp::protocol::{
     AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, SessionId,
     SessionNotification, SessionUpdate, UnstructuredCommandInput,
 };
+use crate::slash_commands::builtin_commands::delegate;
 use crate::slash_commands::registry::SlashCommandRegistry;
 
 /// Convert the registry into an ACP `AvailableCommandsUpdate`.
 pub fn registry_to_acp_update(registry: &SlashCommandRegistry) -> AvailableCommandsUpdate {
-    let commands: Vec<AvailableCommand> = registry
+    let mut commands: Vec<AvailableCommand> = registry
         .all()
         .map(|cmd| {
             let mut acp_cmd = AvailableCommand::new(format!("/{}", cmd.name), &cmd.description);
@@ -20,6 +21,14 @@ pub fn registry_to_acp_update(registry: &SlashCommandRegistry) -> AvailableComma
             acp_cmd
         })
         .collect();
+    commands.push(
+        AvailableCommand::new(format!("/{}", delegate::NAME), delegate::DESCRIPTION).input(
+            AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                delegate::ARGUMENT_HINT,
+            )),
+        ),
+    );
+    commands.sort_by(|left, right| left.name.cmp(&right.name));
 
     AvailableCommandsUpdate::new(commands)
 }
@@ -61,10 +70,12 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_registry() {
+    fn test_empty_registry_still_advertises_builtins() {
         let registry = SlashCommandRegistry::new();
         let update = registry_to_acp_update(&registry);
-        assert!(update.available_commands.is_empty());
+        assert_eq!(update.available_commands.len(), 1);
+        assert_eq!(update.available_commands[0].name, "/delegate");
+        assert!(update.available_commands[0].input.is_some());
     }
 
     #[test]
@@ -73,10 +84,13 @@ mod tests {
         registry.register(make_command("review", "Review changes", Some("[scope]")));
 
         let update = registry_to_acp_update(&registry);
-        assert_eq!(update.available_commands.len(), 1);
+        assert_eq!(update.available_commands.len(), 2);
 
-        let cmd = &update.available_commands[0];
-        assert_eq!(cmd.name, "/review");
+        let cmd = update
+            .available_commands
+            .iter()
+            .find(|command| command.name == "/review")
+            .unwrap();
         assert_eq!(cmd.description, "Review changes");
         assert!(cmd.input.is_some());
     }
@@ -87,10 +101,14 @@ mod tests {
         registry.register(make_command("help", "Show help", None));
 
         let update = registry_to_acp_update(&registry);
-        assert_eq!(update.available_commands.len(), 1);
-        assert_eq!(update.available_commands[0].name, "/help");
+        assert_eq!(update.available_commands.len(), 2);
+        let command = update
+            .available_commands
+            .iter()
+            .find(|command| command.name == "/help")
+            .unwrap();
         // No argument hint and no $ARGUMENTS in template
-        assert!(update.available_commands[0].input.is_none());
+        assert!(command.input.is_none());
     }
 
     #[test]

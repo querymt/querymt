@@ -66,10 +66,8 @@ use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 #[cfg(feature = "remote")]
-use tokio::sync::OnceCell;
-#[cfg(feature = "remote")]
 use tokio::sync::Semaphore;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, OnceCell, broadcast};
 
 /// Trait capturing the interface consumers actually use for agent interaction.
 ///
@@ -226,6 +224,9 @@ pub struct LocalAgentHandle {
     /// Handle to the scheduler actor, set after `start_scheduler()` succeeds.
     /// `None` if scheduling is not enabled or lease was not acquired.
     pub(crate) scheduler_handle: SchedulerHandleSlot,
+
+    /// Lazily-created orchestrator for direct slash-command delegations.
+    slash_delegation_orchestrator: OnceCell<Arc<crate::delegation::DelegationOrchestrator>>,
 
     /// Guard to ensure `shutdown()` only runs its body once.
     shutdown_done: AtomicBool,

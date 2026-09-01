@@ -1,3 +1,4 @@
+use crate::slash_commands::builtin_commands::delegate;
 use crate::slash_commands::discovery;
 use crate::slash_commands::types::{
     SlashCommand, SlashCommandDiagnostic, SlashCommandScriptsConfig, SlashCommandSource,
@@ -66,7 +67,12 @@ impl SlashCommandRegistry {
         })
     }
 
-    /// List all visible command names (sorted).
+    /// Return whether a built-in or discovered command exists.
+    pub fn contains(&self, name: &str) -> bool {
+        name == delegate::NAME || self.get(name).is_some()
+    }
+
+    /// List all visible discovered command names (sorted).
     pub fn names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self
             .by_name
@@ -91,7 +97,7 @@ impl SlashCommandRegistry {
         self.names().len()
     }
 
-    /// Whether the registry has no visible commands.
+    /// Whether the registry has no visible discovered commands.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

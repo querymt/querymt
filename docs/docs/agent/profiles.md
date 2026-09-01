@@ -208,6 +208,18 @@ Profile names are resolved as:
 
 ## Using Profiles
 
+### Profiles as Subagents
+
+Profiles can be selected as subagents with the built-in slash command:
+
+```text
+/delegate --wait profile:reviewer Review the current changes
+/delegate --async profile:coder Implement the authentication tests
+/delegate --wait profile:multi-agent Investigate and fix the integration suite
+```
+
+Single-agent profiles run their configured agent. Multi-agent profiles run their planner, which can delegate further using its own local or remote delegate configuration. Use `agent:<id>` instead when targeting a registered agent directly, including a fully remote agent.
+
 ### CLI Usage
 
 #### List All Profiles
