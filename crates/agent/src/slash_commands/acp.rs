@@ -9,6 +9,7 @@ use crate::slash_commands::registry::SlashCommandRegistry;
 pub fn registry_to_acp_update(registry: &SlashCommandRegistry) -> AvailableCommandsUpdate {
     let mut commands: Vec<AvailableCommand> = registry
         .all()
+        .filter(|cmd| cmd.name != delegate::NAME)
         .map(|cmd| {
             let mut acp_cmd = AvailableCommand::new(format!("/{}", cmd.name), &cmd.description);
 
@@ -109,6 +110,30 @@ mod tests {
             .unwrap();
         // No argument hint and no $ARGUMENTS in template
         assert!(command.input.is_none());
+    }
+
+    #[test]
+    fn test_discovered_delegate_is_replaced_by_builtin() {
+        let mut registry = SlashCommandRegistry::new();
+        registry.register(make_command("delegate", "Discovered delegate", None));
+        registry.register(make_command("review", "Review changes", None));
+
+        let update = registry_to_acp_update(&registry);
+        assert_eq!(
+            update
+                .available_commands
+                .iter()
+                .filter(|command| command.name == "/delegate")
+                .count(),
+            1
+        );
+        assert_eq!(update.available_commands.len(), 2);
+        let delegate = update
+            .available_commands
+            .iter()
+            .find(|command| command.name == "/delegate")
+            .unwrap();
+        assert_eq!(delegate.description, super::delegate::DESCRIPTION);
     }
 
     #[test]

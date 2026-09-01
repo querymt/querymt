@@ -82,15 +82,18 @@ impl LocalAgentHandle {
     ) -> Arc<crate::delegation::DelegationOrchestrator> {
         self.slash_delegation_orchestrator
             .get_or_init(|| async {
-                let orchestrator = Arc::new(crate::delegation::DelegationOrchestrator::new(
-                    Arc::new(Self::from_config(self.config.clone())),
-                    self.config.event_sink.clone(),
-                    self.config.storage.session_store(),
-                    self.config.agent_registry.clone(),
-                    Arc::new(self.config.tool_registry.clone()),
-                    self.config.hooks.clone(),
-                    None,
-                ));
+                let orchestrator = Arc::new(
+                    crate::delegation::DelegationOrchestrator::new(
+                        Arc::new(Self::from_config(self.config.clone())),
+                        self.config.event_sink.clone(),
+                        self.config.storage.session_store(),
+                        self.config.agent_registry.clone(),
+                        Arc::new(self.config.tool_registry.clone()),
+                        self.config.hooks.clone(),
+                        None,
+                    )
+                    .with_wait_timeout_secs(self.config.delegation_wait_timeout_secs),
+                );
                 orchestrator.start_listening(self.config.event_sink.fanout());
                 orchestrator
             })
@@ -103,7 +106,7 @@ impl LocalAgentHandle {
         parent_session_id: String,
         command: crate::slash_commands::DelegateSlashCommand,
         delegation: crate::session::domain::Delegation,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         use crate::slash_commands::DelegateTarget;
 
         let (target, binding) = match &command.target {
@@ -144,11 +147,12 @@ impl LocalAgentHandle {
             }
         };
 
-        self.slash_delegation_orchestrator()
-            .await
+        let orchestrator = self.slash_delegation_orchestrator().await;
+        orchestrator
             .submit_resolved(parent_session_id, delegation, target, binding, false)
             .await
-            .map_err(|err| Error::internal_error().data(err))
+            .map_err(|err| Error::internal_error().data(err))?;
+        Ok(orchestrator.wait_timeout_secs())
     }
 
     pub(super) async fn execute_delegate_slash_command(
@@ -215,7 +219,8 @@ impl LocalAgentHandle {
             .map_err(|err| Error::internal_error().data(err.to_string()))?;
         let delegation_id = delegation.public_id.clone();
         let mut events = self.config.event_sink.fanout().subscribe();
-        self.submit_slash_delegation(session_id.clone(), command.clone(), delegation.clone())
+        let wait_timeout_secs = self
+            .submit_slash_delegation(session_id.clone(), command.clone(), delegation.clone())
             .await?;
         self.config.emit_event(
             &session_id,
@@ -232,88 +237,42 @@ impl LocalAgentHandle {
             self.store_slash_command_reply(&session_id, acknowledgement)
                 .await?;
             let child_prompt = session_ref.clone();
+            let config = self.config.clone();
             tokio::spawn(async move {
-                while let Ok(event) = events.recv().await {
-                    if event.session_id() != session_id {
-                        continue;
-                    }
-                    let content = match event.kind() {
-                        AgentEventKind::DelegationCompleted {
-                            delegation_id: completed_id,
-                            result,
-                        } if completed_id == &delegation_id => {
-                            Some(crate::delegation::format_delegation_completion_message(
-                                completed_id,
-                                result.as_deref().unwrap_or("No summary provided."),
-                            ))
-                        }
-                        AgentEventKind::DelegationFailed {
-                            delegation_id: failed_id,
-                            error,
-                        } if failed_id == &delegation_id => Some(
-                            crate::delegation::format_delegation_failure_message(failed_id, error),
-                        ),
-                        AgentEventKind::DelegationCancelled {
-                            delegation_id: cancelled_id,
-                        } if cancelled_id == &delegation_id => Some(format!(
-                            "Delegation cancelled.\n\nDelegation ID: {cancelled_id}"
-                        )),
-                        _ => None,
-                    };
-                    if let Some(content) = content {
-                        let _ = child_prompt
-                            .prompt(PromptRequest::new(
-                                session_id.clone(),
-                                vec![ContentBlock::Text(TextContent::new(content))],
-                            ))
-                            .await;
-                        break;
-                    }
+                if let Ok(content) = wait_for_slash_delegation_result(
+                    &config,
+                    wait_timeout_secs,
+                    &mut events,
+                    &session_id,
+                    &delegation_id,
+                )
+                .await
+                {
+                    let _ = child_prompt
+                        .prompt(PromptRequest::new(
+                            session_id,
+                            vec![ContentBlock::Text(TextContent::new(content))],
+                        ))
+                        .await;
                 }
             });
             return Ok(PromptResponse::new(StopReason::EndTurn));
         }
 
-        loop {
-            let event = events
-                .recv()
-                .await
-                .map_err(|err| Error::internal_error().data(err.to_string()))?;
-            if event.session_id() != session_id {
-                continue;
-            }
-            let content = match event.kind() {
-                AgentEventKind::DelegationCompleted {
-                    delegation_id: completed_id,
-                    result,
-                } if completed_id == &delegation_id => {
-                    Some(crate::delegation::format_delegation_completion_message(
-                        completed_id,
-                        result.as_deref().unwrap_or("No summary provided."),
-                    ))
-                }
-                AgentEventKind::DelegationFailed {
-                    delegation_id: failed_id,
-                    error,
-                } if failed_id == &delegation_id => Some(
-                    crate::delegation::format_delegation_failure_message(failed_id, error),
-                ),
-                AgentEventKind::DelegationCancelled {
-                    delegation_id: cancelled_id,
-                } if cancelled_id == &delegation_id => Some(format!(
-                    "Delegation cancelled.\n\nDelegation ID: {cancelled_id}"
-                )),
-                _ => None,
-            };
-            if let Some(content) = content {
-                return session_ref
-                    .prompt(PromptRequest::new(
-                        session_id,
-                        vec![ContentBlock::Text(TextContent::new(content))],
-                    ))
-                    .await;
-            }
-        }
+        let content = wait_for_slash_delegation_result(
+            &self.config,
+            wait_timeout_secs,
+            &mut events,
+            &session_id,
+            &delegation_id,
+        )
+        .await?;
+        session_ref
+            .prompt(PromptRequest::new(
+                session_id,
+                vec![ContentBlock::Text(TextContent::new(content))],
+            ))
+            .await
     }
 
     async fn store_slash_command_reply(
@@ -889,6 +848,82 @@ impl LocalAgentHandle {
         self.config.shutdown().await;
 
         log::info!("LocalAgentHandle: Shutdown requested");
+    }
+}
+
+async fn wait_for_slash_delegation_result(
+    config: &Arc<AgentConfig>,
+    timeout_secs: u64,
+    events: &mut tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>,
+    session_id: &str,
+    delegation_id: &str,
+) -> Result<String, Error> {
+    use crate::events::AgentEventKind;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let deadline = (timeout_secs > 0)
+        .then(|| tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs));
+
+    loop {
+        let received = if let Some(deadline) = deadline {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(received) => received,
+                Err(_) => {
+                    config.emit_event(
+                        session_id,
+                        AgentEventKind::DelegationCancelRequested {
+                            delegation_id: delegation_id.to_string(),
+                        },
+                    );
+                    return Ok(crate::delegation::format_delegation_failure_message(
+                        delegation_id,
+                        &format!("Timed out after {timeout_secs}s while waiting for delegation"),
+                    ));
+                }
+            }
+        } else {
+            events.recv().await
+        };
+
+        let event = match received {
+            Ok(event) => event,
+            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Closed) => {
+                return Err(Error::internal_error()
+                    .data("Event stream closed while waiting for delegation"));
+            }
+        };
+        if event.session_id() != session_id {
+            continue;
+        }
+
+        match event.kind() {
+            AgentEventKind::DelegationCompleted {
+                delegation_id: completed_id,
+                result,
+            } if completed_id == delegation_id => {
+                return Ok(crate::delegation::format_delegation_completion_message(
+                    completed_id,
+                    result.as_deref().unwrap_or("No summary provided."),
+                ));
+            }
+            AgentEventKind::DelegationFailed {
+                delegation_id: failed_id,
+                error,
+            } if failed_id == delegation_id => {
+                return Ok(crate::delegation::format_delegation_failure_message(
+                    failed_id, error,
+                ));
+            }
+            AgentEventKind::DelegationCancelled {
+                delegation_id: cancelled_id,
+            } if cancelled_id == delegation_id => {
+                return Ok(format!(
+                    "Delegation cancelled.\n\nDelegation ID: {cancelled_id}"
+                ));
+            }
+            _ => {}
+        }
     }
 }
 

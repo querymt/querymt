@@ -216,6 +216,10 @@ impl DelegationOrchestrator {
         self.shutting_down.store(true, Ordering::Release);
     }
 
+    pub fn wait_timeout_secs(&self) -> u64 {
+        self.config.wait_timeout_secs
+    }
+
     #[cfg(test)]
     async fn wait_until_registered(&self, delegation_id: &str) {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -248,6 +252,16 @@ impl DelegationOrchestrator {
         child_profile_binding: Option<crate::profiles::SessionProfileBinding>,
         inject_results: bool,
     ) -> Result<(), String> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            self.fail_unclaimed_delegation(
+                &delegation,
+                &parent_session_id,
+                "Delegation cancelled because the orchestrator is shutting down",
+            )
+            .await;
+            return Err("delegation orchestrator is shutting down".into());
+        }
+
         match self.claim_delegation(&delegation.public_id).await? {
             DelegationClaim::Claimed => {}
             DelegationClaim::AlreadyClaimed => return Err("delegation was already claimed".into()),
@@ -283,7 +297,24 @@ impl DelegationOrchestrator {
             }
             let _permit = match max_parallel.acquire_owned().await {
                 Ok(permit) => permit,
-                Err(_) => return,
+                Err(_) => {
+                    fail_delegation(
+                        DelegationFailureContext {
+                            event_sink: &event_sink,
+                            delegator: &delegator,
+                            store: &store,
+                            hooks: Some(&hooks),
+                            config: &config,
+                            parent_session_id: &parent_session_id,
+                            delegation_id: &delegation.public_id,
+                            target_agent_id: Some(&delegation.target_agent_id),
+                            objective: Some(&delegation.objective),
+                        },
+                        "Delegation queue closed before execution could start",
+                    )
+                    .await;
+                    return;
+                }
             };
             execute_delegation(
                 DelegationContext {
@@ -309,10 +340,32 @@ impl DelegationOrchestrator {
             .await;
         });
 
-        self.active_delegations.lock().await.insert(
+        let mut active = self.active_delegations.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            handle.abort();
+            drop(active);
+            fail_delegation(
+                DelegationFailureContext {
+                    event_sink: &self.event_sink,
+                    delegator: &self.delegator,
+                    store: &self.store,
+                    hooks: None,
+                    config: &self.config,
+                    parent_session_id: &parent_for_active,
+                    delegation_id: &delegation_id,
+                    target_agent_id: None,
+                    objective: None,
+                },
+                "Delegation cancelled because the orchestrator is shutting down",
+            )
+            .await;
+            return Err("delegation orchestrator is shutting down".into());
+        }
+        active.insert(
             delegation_id,
             (parent_for_active, cancel_for_active, handle),
         );
+        drop(active);
         let _ = start_tx.send(());
         Ok(())
     }
