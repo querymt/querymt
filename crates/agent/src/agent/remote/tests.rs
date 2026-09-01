@@ -58,7 +58,10 @@ async fn test_agent_config() -> (Arc<AgentConfig>, TempDir) {
 }
 
 /// Persist and spawn a `SessionActor` with default runtime.
-async fn spawn_test_session(config: Arc<AgentConfig>, session_id: &str) -> SessionActorRef {
+async fn spawn_test_session_with_id(
+    config: Arc<AgentConfig>,
+    session_id: &str,
+) -> (SessionActorRef, String) {
     let store = config.provider.history_store();
     let session = store
         .create_session(Some(session_id.to_string()), None, None, None)
@@ -72,14 +75,19 @@ async fn spawn_test_session(config: Arc<AgentConfig>, session_id: &str) -> Sessi
         .set_session_llm_config(&session.public_id, llm_config.id)
         .await
         .expect("bind test LLM config");
+    let public_id = session.public_id;
     let runtime = SessionRuntime::new(
         None,
         HashMap::new(),
         crate::agent::core::McpToolState::empty(),
     );
-    let actor = SessionActor::new(config, session.public_id, runtime);
+    let actor = SessionActor::new(config, public_id.clone(), runtime);
     let actor_ref = SessionActor::spawn(actor);
-    SessionActorRef::Local(actor_ref)
+    (SessionActorRef::Local(actor_ref), public_id)
+}
+
+async fn spawn_test_session(config: Arc<AgentConfig>, session_id: &str) -> SessionActorRef {
+    spawn_test_session_with_id(config, session_id).await.0
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -128,8 +136,10 @@ async fn test_local_ref_set_mode_roundtrip() {
 #[tokio::test]
 async fn test_local_ref_mode_model_bindings_are_session_scoped() {
     let (config, _td) = test_agent_config().await;
-    let first = spawn_test_session(config.clone(), "binding-first").await;
-    let second = spawn_test_session(config, "binding-second").await;
+    let (first, first_session_id) =
+        spawn_test_session_with_id(config.clone(), "binding-first").await;
+    let second = spawn_test_session(config.clone(), "binding-second").await;
+    let remote_node = "12D3KooWRemotePlanNode";
 
     first
         .set_session_model(crate::agent::session_control::SessionModelSelection {
@@ -142,21 +152,73 @@ async fn test_local_ref_mode_model_bindings_are_session_scoped() {
     first
         .set_session_model(crate::agent::session_control::SessionModelSelection {
             model_id: "mock/plan-model".to_string(),
-            provider_node_id: None,
+            provider_node_id: Some(remote_node.to_string()),
         })
         .await
-        .expect("set first plan model");
+        .expect("set first remote plan model");
 
-    let build = first
+    for _ in 0..2 {
+        let build = first
+            .set_mode(AgentMode::Build)
+            .await
+            .expect("return to build");
+        assert_eq!(build.current.effective_model.model, "build-model");
+        assert_eq!(build.current.effective_model.provider_node_id, None);
+
+        let plan = first
+            .set_mode(AgentMode::Plan)
+            .await
+            .expect("return to plan");
+        assert_eq!(plan.current.effective_model.model, "plan-model");
+        assert_eq!(
+            plan.current.effective_model.provider_node_id.as_deref(),
+            Some(remote_node)
+        );
+    }
+
+    first.shutdown().await.expect("shutdown first actor");
+    let runtime = SessionRuntime::new(
+        None,
+        HashMap::new(),
+        crate::agent::core::McpToolState::empty(),
+    );
+    let resumed = SessionActorRef::Local(SessionActor::spawn(SessionActor::new(
+        config,
+        first_session_id,
+        runtime,
+    )));
+
+    let resumed_plan = resumed
+        .get_session_control()
+        .await
+        .expect("load persisted plan control state");
+    assert_eq!(resumed_plan.active_mode, AgentMode::Plan);
+    assert_eq!(resumed_plan.effective_model.model, "plan-model");
+    assert_eq!(
+        resumed_plan.effective_model.provider_node_id.as_deref(),
+        Some(remote_node)
+    );
+
+    let resumed_build = resumed
         .set_mode(AgentMode::Build)
         .await
-        .expect("return to build");
-    assert_eq!(build.current.effective_model.model, "build-model");
-    let plan = first
+        .expect("restore persisted build model");
+    assert_eq!(resumed_build.current.effective_model.model, "build-model");
+    assert_eq!(resumed_build.current.effective_model.provider_node_id, None);
+
+    let resumed_plan = resumed
         .set_mode(AgentMode::Plan)
         .await
-        .expect("return to plan");
-    assert_eq!(plan.current.effective_model.model, "plan-model");
+        .expect("restore persisted remote plan model");
+    assert_eq!(resumed_plan.current.effective_model.model, "plan-model");
+    assert_eq!(
+        resumed_plan
+            .current
+            .effective_model
+            .provider_node_id
+            .as_deref(),
+        Some(remote_node)
+    );
 
     let second_state = second
         .get_session_control()
