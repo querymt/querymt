@@ -70,7 +70,6 @@ export function MobileDropdownMenu(props: MobileDropdownMenuProps) {
           remoteNodes={props.remoteNodes}
           currentWorkspace={props.currentWorkspace}
           recentModelsByWorkspace={props.recentModelsByWorkspace}
-          agentMode={props.agentMode}
           reasoningEffort={props.reasoningEffort}
           onRefresh={props.refreshAllModels}
           onSetSessionModel={props.setSessionModel}

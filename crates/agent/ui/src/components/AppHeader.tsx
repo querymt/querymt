@@ -204,7 +204,6 @@ export function AppHeader(props: AppHeaderProps) {
                 remoteNodes={remoteNodes}
                 currentWorkspace={props.currentWorkspace}
                 recentModelsByWorkspace={props.recentModelsByWorkspace}
-                agentMode={agentMode}
                 reasoningEffort={props.reasoningEffort}
                 onRefresh={props.refreshAllModels}
                 onSetSessionModel={props.setSessionModel}

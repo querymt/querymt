@@ -1,5 +1,10 @@
+use std::collections::HashMap;
+
+use querymt::LLMParams;
 use rusqlite::Connection;
 
+use crate::agent::core::AgentMode;
+use crate::agent::session_control::{SessionControlState, SessionModelBinding};
 use crate::events::{AgentEventKind, EventOrigin};
 use crate::session::domain::ForkOrigin;
 use crate::session::projection::{
@@ -137,6 +142,219 @@ fn migration_0012_adds_task_and_intent_revision_columns() {
     for expected in ["revision", "source", "source_ref"] {
         assert!(intent_columns.iter().any(|column| column == expected));
     }
+}
+
+#[test]
+fn migration_0014_adds_session_control_tables() {
+    let mut conn = Connection::open_in_memory().expect("in-memory db");
+    apply_migrations(&mut conn).expect("apply migrations");
+
+    for table in ["session_control_states", "session_mode_model_bindings"] {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .expect("query control table");
+        assert_eq!(count, 1, "missing {table}");
+    }
+}
+
+#[tokio::test]
+async fn session_control_commit_is_revisioned_and_session_scoped() {
+    let storage = SqliteStorage::connect(":memory:".into())
+        .await
+        .expect("in-memory storage");
+    let first = storage
+        .create_session(None, None, None, None)
+        .await
+        .expect("first session");
+    let second = storage
+        .create_session(None, None, None, None)
+        .await
+        .expect("second session");
+    let config = storage
+        .create_or_get_llm_config(&LLMParams::new().provider("mock").model("model-a"))
+        .await
+        .expect("LLM config");
+    for session in [&first, &second] {
+        storage
+            .set_session_llm_config(&session.public_id, config.id)
+            .await
+            .expect("bind LLM config");
+    }
+    let binding = SessionModelBinding {
+        model_id: "mock/model-a".to_string(),
+        provider: "mock".to_string(),
+        model: "model-a".to_string(),
+        llm_config_id: config.id,
+        provider_node_id: None,
+    };
+    let state = SessionControlState {
+        revision: 1,
+        active_mode: AgentMode::Build,
+        reasoning_effort: None,
+        effective_model: binding.clone(),
+        mode_models: HashMap::from([
+            ("build".to_string(), binding.clone()),
+            ("plan".to_string(), binding),
+        ]),
+    };
+    storage
+        .commit_session_control(&first.public_id, 0, &state)
+        .await
+        .expect("commit first state");
+    assert!(
+        storage
+            .get_session_control(&second.public_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let stale = storage
+        .commit_session_control(&first.public_id, 0, &state)
+        .await
+        .expect_err("stale revision must fail");
+    assert!(stale.to_string().contains("revision conflict"));
+}
+
+#[tokio::test]
+async fn set_session_llm_config_rejects_changes_after_control_initialization() {
+    let storage = SqliteStorage::connect(":memory:".into())
+        .await
+        .expect("in-memory storage");
+    let session = storage
+        .create_session(None, None, None, None)
+        .await
+        .expect("session");
+    let config_a = storage
+        .create_or_get_llm_config(&LLMParams::new().provider("mock").model("model-a"))
+        .await
+        .expect("config A");
+    let config_b = storage
+        .create_or_get_llm_config(&LLMParams::new().provider("mock").model("model-b"))
+        .await
+        .expect("config B");
+    storage
+        .set_session_llm_config(&session.public_id, config_a.id)
+        .await
+        .expect("initialize config");
+    let binding = SessionModelBinding {
+        model_id: "mock/model-a".to_string(),
+        provider: "mock".to_string(),
+        model: "model-a".to_string(),
+        llm_config_id: config_a.id,
+        provider_node_id: None,
+    };
+    storage
+        .commit_session_control(
+            &session.public_id,
+            0,
+            &SessionControlState {
+                revision: 1,
+                active_mode: AgentMode::Build,
+                reasoning_effort: None,
+                effective_model: binding.clone(),
+                mode_models: HashMap::from([("build".to_string(), binding)]),
+            },
+        )
+        .await
+        .expect("initialize control state");
+
+    let error = storage
+        .set_session_llm_config(&session.public_id, config_b.id)
+        .await
+        .expect_err("direct config changes must be rejected after control initialization");
+    assert!(error.to_string().contains("session control"));
+    assert_eq!(
+        storage
+            .get_session(&session.public_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .llm_config_id,
+        Some(config_a.id)
+    );
+}
+
+#[tokio::test]
+async fn fork_copies_session_control_bindings_independently() {
+    use crate::model::{AgentMessage, MessagePart};
+    use querymt::chat::ChatRole;
+
+    let storage = SqliteStorage::connect(":memory:".into())
+        .await
+        .expect("in-memory storage");
+    let source = storage
+        .create_session(None, None, None, None)
+        .await
+        .expect("source session");
+    let config = storage
+        .create_or_get_llm_config(&LLMParams::new().provider("mock").model("source-model"))
+        .await
+        .expect("source config");
+    storage
+        .set_session_llm_config(&source.public_id, config.id)
+        .await
+        .expect("bind source config");
+    let mut message = AgentMessage::new(source.public_id.clone(), ChatRole::User);
+    message.parts.push(MessagePart::Text {
+        content: "fork here".to_string(),
+    });
+    let message_id = message.id.clone();
+    storage
+        .add_message(&source.public_id, message)
+        .await
+        .expect("source message");
+
+    let binding = SessionModelBinding {
+        model_id: "mock/source-model".to_string(),
+        provider: "mock".to_string(),
+        model: "source-model".to_string(),
+        llm_config_id: config.id,
+        provider_node_id: None,
+    };
+    let source_state = SessionControlState {
+        revision: 1,
+        active_mode: AgentMode::Plan,
+        reasoning_effort: None,
+        effective_model: binding.clone(),
+        mode_models: HashMap::from([("plan".to_string(), binding)]),
+    };
+    storage
+        .commit_session_control(&source.public_id, 0, &source_state)
+        .await
+        .expect("source control state");
+
+    let fork_id = storage
+        .fork_session(&source.public_id, &message_id, ForkOrigin::User)
+        .await
+        .expect("fork session");
+    let fork_state = storage
+        .get_session_control(&fork_id)
+        .await
+        .expect("load fork control")
+        .expect("fork control exists");
+    assert_eq!(fork_state, source_state);
+
+    let mut changed_fork = fork_state;
+    changed_fork.revision += 1;
+    changed_fork.active_mode = AgentMode::Build;
+    storage
+        .commit_session_control(&fork_id, 1, &changed_fork)
+        .await
+        .expect("change fork control");
+    assert_eq!(
+        storage
+            .get_session_control(&source.public_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .active_mode,
+        AgentMode::Plan
+    );
 }
 
 #[test]

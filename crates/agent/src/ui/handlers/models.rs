@@ -441,8 +441,6 @@ pub async fn handle_set_session_model(
     #[cfg(feature = "remote")] node_id: Option<&str>,
     #[cfg(not(feature = "remote"))] _node_id: Option<&str>,
 ) -> Result<(), String> {
-    use crate::agent::messages::SetSessionModel;
-
     ensure_session_loaded(state, session_id, None, "set_session_model").await?;
 
     let Some(session_ref) = session_ref_for_set_model(state, session_id).await? else {
@@ -469,18 +467,11 @@ pub async fn handle_set_session_model(
     #[cfg(not(feature = "remote"))]
     let effective_node_id: Option<crate::agent::remote::NodeId> = None;
 
-    let req = crate::acp::protocol::SetSessionModelRequest::new(
-        session_id.to_string(),
-        model_id.to_string(),
-    );
-    // Attach the provider_node_id field so the SessionActor can store it in LLMConfig.
-    let msg = SetSessionModel {
-        req,
-        provider_node_id: effective_node_id,
-    };
-
     session_ref
-        .set_session_model_with_node(msg)
+        .set_session_model(crate::agent::session_control::SessionModelSelection {
+            model_id: model_id.to_string(),
+            provider_node_id: effective_node_id.map(|node_id| node_id.to_string()),
+        })
         .await
         .map_err(|e| e.to_string())?;
     state.agent.invalidate_model_cache().await;

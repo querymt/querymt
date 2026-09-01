@@ -554,6 +554,7 @@ async fn test_load_session_hydrates_runtime_actor() -> Result<()> {
 #[tokio::test]
 async fn test_set_session_model_hydrates_persisted_session() -> Result<()> {
     let f = TestServerState::new().await;
+    crate::test_utils::register_mock_provider(f.agent.config.provider.plugin_registry().as_ref());
     let worktree = TempDir::new()?;
     let canonical_worktree = fs::canonicalize(worktree.path())?;
     fs::write(canonical_worktree.join("model-test.txt"), "hydrated cwd")?;

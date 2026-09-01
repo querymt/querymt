@@ -19,6 +19,7 @@ class MockWebSocket {
   onmessage: ((event: MessageEvent) => void) | null = null;
   
   readyState = WebSocket.OPEN;
+  sent: string[] = [];
   
   constructor(public url: string) {
     MockWebSocket.instance = this;
@@ -27,7 +28,9 @@ class MockWebSocket {
     });
   }
   
-  send(_data: string) {}
+  send(data: string) {
+    this.sent.push(data);
+  }
   
   close() {
     this.readyState = WebSocket.CLOSED;
@@ -155,6 +158,59 @@ describe('useUiClient - agentModels tracking', () => {
     expect(result.current.agentModels['primary'].provider).toBe('openai');
     expect(result.current.agentModels['primary'].model).toBe('gpt-4-turbo');
     expect(result.current.agentModels['primary'].contextLimit).toBe(128000);
+  });
+
+  it('sends only the mode change when switching modes', async () => {
+    const { result } = renderHook(() => useUiClient());
+
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    await act(async () => {
+      MockWebSocket.instance?.simulateMessage({
+        type: 'session_loaded',
+        data: {
+          session_id: 'session-remote-plan',
+          agent_id: 'primary',
+          audit: {
+            session_id: 'session-remote-plan',
+            events: [{
+              seq: 1,
+              timestamp: Date.now() / 1000,
+              kind: {
+                type: 'provider_changed',
+                data: {
+                  provider: 'llama_cpp',
+                  model: 'remote-plan-model',
+                  provider_node_id: 'nas-node',
+                },
+              },
+            }],
+            tasks: [],
+            intent_snapshots: [],
+            decisions: [],
+            progress_entries: [],
+            artifacts: [],
+            delegations: [],
+            generated_at: new Date().toISOString(),
+          },
+          undo_stack: [],
+          cursor: {},
+        },
+      });
+    });
+
+    const socket = MockWebSocket.instance!;
+    socket.sent = [];
+
+    await act(async () => {
+      result.current.setAgentMode('plan');
+      await Promise.resolve();
+    });
+
+    expect(socket.sent.map((message) => JSON.parse(message))).toEqual([{
+      type: 'set_agent_mode',
+      data: { mode: 'plan', session_id: 'session-remote-plan' },
+    }]);
   });
 
   it('should not append connection-level error messages into the active session timeline', async () => {

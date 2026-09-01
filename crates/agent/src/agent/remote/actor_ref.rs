@@ -5,13 +5,14 @@
 //! `actor_ref.ask(msg).await`. For the `Remote` variant (behind the `remote`
 //! feature), each method delegates to `remote_ref.ask(&msg).await`.
 
-use crate::acp::protocol::{
-    Error as AcpError, PromptRequest, PromptResponse, SetSessionModelResponse,
-};
+use crate::acp::protocol::{Error as AcpError, PromptRequest, PromptResponse};
 use crate::agent::core::AgentMode;
 use crate::agent::file_proxy::{FileProxyError, GetFileIndexResponse, ReadRemoteFileResponse};
 use crate::agent::messages;
 use crate::agent::session_actor::SessionActor;
+use crate::agent::session_control::{
+    SessionControlState, SessionControlTransition, SessionModelSelection,
+};
 use crate::agent::undo::{RedoResult, UndoError, UndoResult};
 use crate::error::AgentError;
 use crate::events::SessionLimits;
@@ -276,18 +277,26 @@ impl SessionActorRef {
     }
 
     /// Set the agent mode for this session.
-    pub async fn set_mode(&self, mode: AgentMode) -> Result<(), AgentError> {
+    pub async fn set_mode(&self, mode: AgentMode) -> Result<SessionControlTransition, AgentError> {
         match self {
             Self::Local(actor_ref) => actor_ref
-                .tell(messages::SetMode { mode })
+                .ask(messages::SetMode { mode })
                 .await
                 .map_err(|e| AgentError::RemoteActor(e.to_string())),
 
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
-                .tell(&messages::SetMode { mode })
+                .ask(&messages::SetMode { mode })
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_MODEL_REPLY_TIMEOUT)
                 .send()
-                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+                .await
+                .map_err(|e| {
+                    Self::map_agent_timeout_remote_send_error(
+                        e,
+                        "SetMode timed out on remote session",
+                    )
+                }),
         }
     }
 
@@ -320,12 +329,12 @@ impl SessionActorRef {
     pub async fn set_reasoning_effort(
         &self,
         effort: Option<ReasoningEffort>,
-    ) -> Result<(), AgentError> {
+    ) -> Result<SessionControlTransition, AgentError> {
         match self {
             Self::Local(actor_ref) => actor_ref
                 .ask(messages::SetReasoningEffort { effort })
                 .await
-                .map_err(|e| AgentError::RemoteActor(e.to_string()))?,
+                .map_err(|e| AgentError::RemoteActor(e.to_string())),
 
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
@@ -339,9 +348,62 @@ impl SessionActorRef {
                         e,
                         "SetReasoningEffort timed out on remote session",
                     )
-                })?,
+                }),
         }
-        Ok(())
+    }
+
+    /// Get the complete authoritative session control state.
+    pub async fn get_session_control(&self) -> Result<SessionControlState, AgentError> {
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(messages::GetSessionControl)
+                .await
+                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+            #[cfg(feature = "remote")]
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&messages::GetSessionControl)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
+                .send()
+                .await
+                .map_err(|e| {
+                    Self::map_agent_timeout_remote_send_error(
+                        e,
+                        "GetSessionControl timed out on remote session",
+                    )
+                }),
+        }
+    }
+
+    /// Apply a complete LLM configuration through the same atomic control path.
+    pub async fn set_llm_config(
+        &self,
+        config: querymt::LLMParams,
+        provider_node_id: Option<String>,
+    ) -> Result<(), AgentError> {
+        let msg = messages::SetLlmConfig {
+            config,
+            provider_node_id,
+        };
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(msg)
+                .await
+                .map_err(|error| AgentError::RemoteActor(error.to_string())),
+            #[cfg(feature = "remote")]
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&msg)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_MODEL_REPLY_TIMEOUT)
+                .send()
+                .await
+                .map_err(|error| {
+                    Self::map_agent_timeout_remote_send_error(
+                        error,
+                        "SetLlmConfig timed out on remote session",
+                    )
+                }),
+        }
     }
 
     /// Get the current reasoning effort.
@@ -444,31 +506,17 @@ impl SessionActorRef {
         }
     }
 
-    /// Set session model via ACP protocol.
+    /// Set the effective model and remember it for the current session mode.
     pub async fn set_session_model(
         &self,
-        req: crate::acp::protocol::SetSessionModelRequest,
-    ) -> Result<SetSessionModelResponse, AcpError> {
-        self.set_session_model_with_node(messages::SetSessionModel {
-            req,
-            provider_node_id: None,
-        })
-        .await
-    }
-
-    /// Set session model with an optional provider node (for mesh-remote providers).
-    ///
-    /// Routes directly through the `SessionActorRef` so remote sessions work correctly,
-    /// unlike the old path that went through a stub and returned an error.
-    pub async fn set_session_model_with_node(
-        &self,
-        msg: messages::SetSessionModel,
-    ) -> Result<SetSessionModelResponse, AcpError> {
+        selection: SessionModelSelection,
+    ) -> Result<SessionControlTransition, AgentError> {
+        let msg = messages::SetSessionModel { selection };
         match self {
             Self::Local(actor_ref) => actor_ref
                 .ask(msg)
                 .await
-                .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
+                .map_err(|e| AgentError::RemoteActor(e.to_string())),
 
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
@@ -478,13 +526,10 @@ impl SessionActorRef {
                 .send()
                 .await
                 .map_err(|e| {
-                    AcpError::from(match e {
-                        kameo::error::RemoteSendError::HandlerError(err) => err,
-                        kameo::error::RemoteSendError::ReplyTimeout => AgentError::SessionTimeout {
-                            details: "SetSessionModel timed out on remote session".to_string(),
-                        },
-                        other => AgentError::RemoteActor(other.to_string()),
-                    })
+                    Self::map_agent_timeout_remote_send_error(
+                        e,
+                        "SetSessionModel timed out on remote session",
+                    )
                 }),
         }
     }

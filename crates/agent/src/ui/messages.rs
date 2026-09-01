@@ -314,12 +314,16 @@ pub enum UiClientMessage {
     /// Set the agent's operating mode (build/plan/review)
     SetAgentMode {
         mode: String,
+        #[serde(default)]
+        session_id: Option<String>,
     },
     /// Get the current agent mode
     GetAgentMode,
     /// Set the reasoning effort level for the current session
     SetReasoningEffort {
         reasoning_effort: String,
+        #[serde(default)]
+        session_id: Option<String>,
     },
     /// Get the current reasoning effort level
     GetReasoningEffort,

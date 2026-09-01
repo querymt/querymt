@@ -46,10 +46,6 @@ export interface UiState {
   delegationsPanelCollapsed: boolean;
   setDelegationsPanelCollapsed: (collapsed: boolean) => void;
   
-  // Agent mode -> model preferences (persisted to localStorage)
-  modeModelPreferences: Record<string, { provider: string; model: string }>;
-  setModeModelPreference: (mode: string, provider: string, model: string) => void;
-
   // Dashboard theme (persisted to localStorage)
   selectedTheme: DashboardThemeId;
   setSelectedTheme: (themeId: DashboardThemeId) => void;
@@ -153,7 +149,6 @@ export const useUiStore = create<UiState>((set, get) => ({
   statsDrawerOpen: false,
   delegationDrawerOpen: false,
   sessionViewCache: new Map(),
-  modeModelPreferences: {},
   selectedTheme: (() => {
     try {
       const raw = localStorage.getItem('dashboardTheme');
@@ -191,14 +186,6 @@ export const useUiStore = create<UiState>((set, get) => ({
   setCreateScheduleDialogOpen: (open) => set({ createScheduleDialogOpen: open }),
   
   setDelegationsPanelCollapsed: (collapsed) => set({ delegationsPanelCollapsed: collapsed }),
-  
-  setModeModelPreference: (mode, provider, model) => {
-    set((state) => {
-      const updated = { ...state.modeModelPreferences, [mode]: { provider, model } };
-      localStorage.setItem('modeModelPreferences', JSON.stringify(updated));
-      return { modeModelPreferences: updated };
-    });
-  },
 
   setSelectedTheme: (themeId) => {
     const normalizedThemeId = normalizeDashboardThemeId(themeId) ?? DEFAULT_DASHBOARD_THEME_ID;
@@ -351,15 +338,13 @@ export const useUiStore = create<UiState>((set, get) => ({
   loadPersistedState: () => {
     const todoRailCollapsed = localStorage.getItem('todoRailCollapsed') === 'true';
     const schedulePanelCollapsed = localStorage.getItem('schedulePanelCollapsed') !== 'false'; // default collapsed
-    const modeModelPreferencesRaw = localStorage.getItem('modeModelPreferences');
-    const modeModelPreferences = modeModelPreferencesRaw ? JSON.parse(modeModelPreferencesRaw) : {};
     const followNewMessages = localStorage.getItem('followNewMessages') !== 'false';
     const perfMode = localStorage.getItem('perfMode') === 'true';
     const selectedThemeRaw = localStorage.getItem('dashboardTheme');
     const selectedTheme = selectedThemeRaw
       ? (normalizeDashboardThemeId(selectedThemeRaw) ?? DEFAULT_DASHBOARD_THEME_ID)
       : DEFAULT_DASHBOARD_THEME_ID;
-    set({ todoRailCollapsed, schedulePanelCollapsed, modeModelPreferences, followNewMessages, selectedTheme });
+    set({ todoRailCollapsed, schedulePanelCollapsed, followNewMessages, selectedTheme });
     // Apply perf-mode class after loading persisted state
     if (perfMode) {
       document.documentElement.classList.add('perf-mode');

@@ -10,11 +10,13 @@ use crate::session::domain::ForkOrigin;
 use crate::session::projection::SessionScope;
 #[cfg(feature = "remote")]
 use crate::session::store::RemoteSessionBookmark;
-use crate::test_utils::empty_plugin_registry;
+use crate::test_utils::{
+    MockLlmProvider, SharedLlmProvider, TestProviderFactory, mock_plugin_registry,
+};
 use crate::ui::handlers::{
     ListSessionsRequest, handle_cancel_session, handle_delete_session, handle_elicitation_response,
     handle_fork_session, handle_list_session_children, handle_list_sessions, handle_load_session,
-    handle_ui_message,
+    handle_set_agent_mode, handle_set_reasoning_effort, handle_ui_message,
 };
 use crate::ui::messages::UiClientMessage;
 #[cfg(feature = "remote")]
@@ -144,7 +146,12 @@ async fn attach_profiles(
     active_profile_id: &str,
     profile_dir: &Path,
 ) -> ProfileRuntimeHandle {
-    let (registry, _config_dir) = empty_plugin_registry().expect("empty plugin registry");
+    let provider = Arc::new(tokio::sync::Mutex::new(MockLlmProvider::new()));
+    let factory = Arc::new(TestProviderFactory::new(SharedLlmProvider {
+        inner: provider,
+        tools: vec![].into_boxed_slice(),
+    }));
+    let (registry, _config_dir) = mock_plugin_registry(factory).expect("mock plugin registry");
     let infra = AgentInfra {
         plugin_registry: Arc::new(registry),
         storage: Some(fixture.agent.storage.clone()),
@@ -296,6 +303,95 @@ async fn attach_remote_session_with_node_id(
             remote_node_id.map(str::to_string),
         )
         .await;
+}
+
+async fn create_control_test_session(
+    fixture: &crate::test_utils::TestServerState,
+    name: &str,
+) -> Result<String> {
+    let store = fixture.agent.storage.session_store();
+    let session = store
+        .create_session(Some(name.to_string()), None, None, None)
+        .await?;
+    let config = store
+        .create_or_get_llm_config(&querymt::LLMParams::new().provider("mock").model("mock"))
+        .await?;
+    store
+        .set_session_llm_config(&session.public_id, config.id)
+        .await?;
+    insert_test_actor(&fixture.state.agent, &session.public_id).await;
+    Ok(session.public_id)
+}
+
+#[tokio::test]
+async fn handle_set_agent_mode_targets_requested_session() -> Result<()> {
+    let fixture = crate::test_utils::TestServerState::new().await;
+    let session_a = create_control_test_session(&fixture, "active-a").await?;
+    let session_b = create_control_test_session(&fixture, "requested-b").await?;
+    let (tx, _rx) = fixture.add_connection("conn-explicit-mode").await;
+    fixture
+        .state
+        .connections
+        .lock()
+        .await
+        .get_mut("conn-explicit-mode")
+        .unwrap()
+        .sessions
+        .insert("primary".to_string(), session_a.clone());
+
+    handle_set_agent_mode(
+        &fixture.state,
+        "conn-explicit-mode",
+        Some(&session_b),
+        "plan",
+        &tx,
+    )
+    .await;
+
+    let registry = fixture.state.agent.registry.lock().await;
+    let a = registry.get(&session_a).unwrap().clone();
+    let b = registry.get(&session_b).unwrap().clone();
+    drop(registry);
+    assert_eq!(a.get_mode().await?, crate::agent::core::AgentMode::Build);
+    assert_eq!(b.get_mode().await?, crate::agent::core::AgentMode::Plan);
+    Ok(())
+}
+
+#[tokio::test]
+async fn handle_set_reasoning_effort_targets_requested_session() -> Result<()> {
+    let fixture = crate::test_utils::TestServerState::new().await;
+    let session_a = create_control_test_session(&fixture, "active-a").await?;
+    let session_b = create_control_test_session(&fixture, "requested-b").await?;
+    let (tx, _rx) = fixture.add_connection("conn-explicit-effort").await;
+    fixture
+        .state
+        .connections
+        .lock()
+        .await
+        .get_mut("conn-explicit-effort")
+        .unwrap()
+        .sessions
+        .insert("primary".to_string(), session_a.clone());
+
+    handle_set_reasoning_effort(
+        &fixture.state,
+        "conn-explicit-effort",
+        Some(&session_b),
+        "high",
+        &tx,
+    )
+    .await;
+
+    let registry = fixture.state.agent.registry.lock().await;
+    let a = registry.get(&session_a).unwrap().clone();
+    let b = registry.get(&session_b).unwrap().clone();
+    drop(registry);
+    assert_eq!(a.get_reasoning_effort().await?, None);
+    assert_eq!(
+        b.get_reasoning_effort().await?,
+        Some(querymt::chat::ReasoningEffort::High)
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -1078,6 +1174,7 @@ async fn handle_set_session_model_prefers_attached_remote_over_profile_local_act
     write_profile(dir.path(), "alpha.toml");
     write_profile(dir.path(), "beta.toml");
     let profiles = attach_profiles(&mut f, "alpha", dir.path()).await;
+    crate::test_utils::register_mock_provider(f.agent.config.provider.plugin_registry().as_ref());
     let session_id = f
         .agent
         .storage

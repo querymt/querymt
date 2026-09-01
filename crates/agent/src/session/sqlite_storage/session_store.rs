@@ -5,6 +5,8 @@ use rusqlite::{OptionalExtension, params};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::agent::core::AgentMode;
+use crate::agent::session_control::{SessionControlState, SessionModelBinding};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::{
     Alternative, AlternativeStatus, Artifact, Decision, DecisionStatus, Delegation,
@@ -27,6 +29,7 @@ use crate::session::store::{
     CustomModel, LLMConfig, RemoteSessionBookmark, Session, SessionExecutionConfig, SessionStore,
     TaskPatch, extract_llm_config_values,
 };
+use std::collections::HashMap;
 
 use super::SqliteStorage;
 use super::row_parsers::{parse_llm_config_row, parse_llm_params};
@@ -478,6 +481,22 @@ impl SessionStore for SqliteStorage {
                 )?;
             }
 
+            // Forks inherit an independent copy of the source session's control state.
+            tx.execute(
+                "INSERT INTO session_control_states
+                 (session_id, active_mode, reasoning_effort, revision, created_at, updated_at)
+                 SELECT ?1, active_mode, reasoning_effort, revision, ?2, ?2
+                 FROM session_control_states WHERE session_id = ?3",
+                params![new_session_internal_id, now, source_session_internal_id],
+            )?;
+            tx.execute(
+                "INSERT INTO session_mode_model_bindings
+                 (session_id, mode, model_id, provider, model, llm_config_id, provider_node_id)
+                 SELECT ?1, mode, model_id, provider, model, llm_config_id, provider_node_id
+                 FROM session_mode_model_bindings WHERE session_id = ?2",
+                params![new_session_internal_id, source_session_internal_id],
+            )?;
+
             tx.commit()?;
             Ok(new_session_public_id)
         })
@@ -577,6 +596,19 @@ impl SessionStore for SqliteStorage {
         let session_internal_id = self.resolve_session_internal_id(session_id).await?;
 
         self.run_blocking(move |conn| {
+            let control_initialized = conn
+                .query_row(
+                    "SELECT 1 FROM session_control_states WHERE session_id = ?1",
+                    params![session_internal_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if control_initialized {
+                return Err(rusqlite::Error::InvalidParameterName(
+                    "session_control_initialized".to_string(),
+                ));
+            }
             let affected = conn.execute(
                 "UPDATE sessions SET llm_config_id = ?, updated_at = ? WHERE id = ?",
                 params![
@@ -594,10 +626,163 @@ impl SessionStore for SqliteStorage {
         })
         .await
         .map_err(|e| match e {
-            crate::session::error::SessionError::DatabaseError(_) => {
-                crate::session::error::SessionError::SessionNotFound(session_id.to_string())
+            SessionError::DatabaseError(message)
+                if message.contains("session_control_initialized") =>
+            {
+                SessionError::InvalidOperation(
+                    "session LLM config must be changed through session control".to_string(),
+                )
             }
+            SessionError::DatabaseError(_) => SessionError::SessionNotFound(session_id.to_string()),
             _ => e,
+        })
+    }
+
+    async fn get_session_control(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<SessionControlState>> {
+        let session_id = session_id.to_string();
+        self.run_blocking(move |conn| {
+            let Some((session_internal_id, active_mode, reasoning_effort, revision, effective_config_id, effective_node)) = conn
+                .query_row(
+                    "SELECT s.id, c.active_mode, c.reasoning_effort, c.revision, s.llm_config_id, s.provider_node_id
+                     FROM sessions s
+                     JOIN session_control_states c ON c.session_id = s.id
+                     WHERE s.public_id = ?1",
+                    params![session_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, i64>(3)? as u64, row.get::<_, Option<i64>>(4)?, row.get::<_, Option<String>>(5)?)),
+                )
+                .optional()?
+            else {
+                return Ok(None);
+            };
+
+            let active_mode = active_mode.parse::<AgentMode>().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                )
+            })?;
+            let reasoning_effort = reasoning_effort
+                .map(|value| serde_json::from_str(&format!("\"{value}\"")))
+                .transpose()
+                .map_err(|error| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error)))?;
+
+            let mut stmt = conn.prepare(
+                "SELECT mode, model_id, provider, model, llm_config_id, provider_node_id
+                 FROM session_mode_model_bindings WHERE session_id = ?1",
+            )?;
+            let bindings = stmt
+                .query_map(params![session_internal_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        SessionModelBinding {
+                            model_id: row.get(1)?,
+                            provider: row.get(2)?,
+                            model: row.get(3)?,
+                            llm_config_id: row.get(4)?,
+                            provider_node_id: row.get(5)?,
+                        },
+                    ))
+                })?
+                .collect::<Result<HashMap<_, _>, _>>()?;
+
+            let effective_config_id = effective_config_id.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            let effective_model = bindings
+                .get(active_mode.as_str())
+                .cloned()
+                .or_else(|| {
+                    bindings
+                        .values()
+                        .find(|binding| binding.llm_config_id == effective_config_id && binding.provider_node_id == effective_node)
+                        .cloned()
+                })
+                .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+
+            Ok(Some(SessionControlState {
+                revision,
+                active_mode,
+                reasoning_effort,
+                effective_model,
+                mode_models: bindings,
+            }))
+        })
+        .await
+    }
+
+    async fn commit_session_control(
+        &self,
+        session_id: &str,
+        expected_revision: u64,
+        state: &SessionControlState,
+    ) -> SessionResult<SessionControlState> {
+        let session_id = session_id.to_string();
+        let state = state.clone();
+        let committed = self
+            .run_blocking(move |conn| {
+                let tx = conn.transaction()?;
+                let session_internal_id: i64 = tx.query_row(
+                    "SELECT id FROM sessions WHERE public_id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )?;
+                let current_revision = tx
+                    .query_row(
+                        "SELECT revision FROM session_control_states WHERE session_id = ?1",
+                        params![session_internal_id],
+                        |row| row.get::<_, i64>(0).map(|revision| revision as u64),
+                    )
+                    .optional()?
+                    .unwrap_or(0);
+                if current_revision != expected_revision {
+                    return Err(rusqlite::Error::InvalidParameterName(format!(
+                        "session_control_revision_conflict:{current_revision}"
+                    )));
+                }
+
+                let now = OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default();
+                let reasoning_effort = state
+                    .reasoning_effort
+                    .map(|effort| serde_json::to_value(effort).unwrap_or_default().as_str().unwrap_or_default().to_string());
+                tx.execute(
+                    "INSERT INTO session_control_states (session_id, active_mode, reasoning_effort, revision, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                     ON CONFLICT(session_id) DO UPDATE SET active_mode = excluded.active_mode,
+                        reasoning_effort = excluded.reasoning_effort, revision = excluded.revision,
+                        updated_at = excluded.updated_at",
+                    params![session_internal_id, state.active_mode.as_str(), reasoning_effort, state.revision as i64, now],
+                )?;
+                tx.execute(
+                    "DELETE FROM session_mode_model_bindings WHERE session_id = ?1",
+                    params![session_internal_id],
+                )?;
+                for (mode, binding) in &state.mode_models {
+                    tx.execute(
+                        "INSERT INTO session_mode_model_bindings
+                         (session_id, mode, model_id, provider, model, llm_config_id, provider_node_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![session_internal_id, mode, binding.model_id, binding.provider, binding.model, binding.llm_config_id, binding.provider_node_id],
+                    )?;
+                }
+                tx.execute(
+                    "UPDATE sessions SET llm_config_id = ?1, provider_node_id = ?2, updated_at = ?3 WHERE id = ?4",
+                    params![state.effective_model.llm_config_id, state.effective_model.provider_node_id, now, session_internal_id],
+                )?;
+                tx.commit()?;
+                Ok(state)
+            })
+            .await;
+        committed.map_err(|error| match error {
+            SessionError::DatabaseError(message)
+                if message.contains("session_control_revision_conflict") =>
+            {
+                SessionError::InvalidOperation("session control revision conflict".to_string())
+            }
+            other => other,
         })
     }
 

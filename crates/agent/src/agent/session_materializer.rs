@@ -818,9 +818,26 @@ impl SessionMaterializer {
                 initial_reasoning_effort
             }
         };
+        let control_state = match self
+            .config
+            .provider
+            .history_store()
+            .get_session_control(&session_id)
+            .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    error = %error,
+                    "failed to load persisted session control; rebuilding from session state"
+                );
+                None
+            }
+        };
         let runtime = SessionRuntime::new(cwd.clone(), mcp_services, tool_state);
         #[cfg(feature = "remote")]
-        let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone())
+        let mut actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone())
             .with_reasoning_effort(reasoning_effort)
             .with_mesh(if _options.attach_mesh_handle {
                 // Use the mesh handle from the materializer's shared state
@@ -829,8 +846,11 @@ impl SessionMaterializer {
                 None
             });
         #[cfg(not(feature = "remote"))]
-        let actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone())
+        let mut actor = SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone())
             .with_reasoning_effort(reasoning_effort);
+        if let Some(control_state) = control_state {
+            actor = actor.with_control_state(control_state);
+        }
         let actor_ref = SessionActor::spawn(actor);
 
         // Bridge will be set during registration if available

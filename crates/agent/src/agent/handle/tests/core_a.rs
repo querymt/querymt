@@ -82,6 +82,89 @@ async fn test_initialize_advertises_session_capabilities() {
 
 #[cfg(feature = "remote")]
 #[tokio::test]
+async fn test_acp_set_model_routes_local_provider_back_to_caller() {
+    use crate::agent::core::SessionRuntime;
+    use crate::agent::remote::scope::{MeshScopeId, scoped_session};
+
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let fixture = RealStorageHandleFixture::new().await;
+    fixture.handle.set_mesh(mesh.clone());
+    let store = fixture.storage.session_store();
+    let session = store
+        .create_session(None, None, None, None)
+        .await
+        .expect("create session");
+    let config = store
+        .create_or_get_llm_config(&LLMParams::new().provider("mock").model("mock-model"))
+        .await
+        .expect("create config");
+    store
+        .set_session_llm_config(&session.public_id, config.id)
+        .await
+        .expect("bind config");
+
+    let actor = SessionActor::new(
+        fixture.handle.config.clone(),
+        session.public_id.clone(),
+        SessionRuntime::new(
+            None,
+            std::collections::HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        ),
+    )
+    .with_mesh(Some(mesh.clone()));
+    let local_ref = SessionActor::spawn(actor);
+    let dht_name = scoped_session(&MeshScopeId::lan_default(), &session.public_id);
+    mesh.register_actor(local_ref, dht_name.clone()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let remote_ref = mesh
+        .lookup_actor::<SessionActor>(&dht_name)
+        .await
+        .expect("DHT lookup")
+        .expect("remote actor");
+    fixture
+        .handle
+        .attach_remote_session(
+            session.public_id.clone(),
+            remote_ref,
+            "remote-peer".to_string(),
+            None,
+            None,
+        )
+        .await;
+
+    SendAgent::set_session_model(
+        &fixture.handle,
+        crate::acp::protocol::SetSessionModelRequest::new(
+            SessionId::from(session.public_id.clone()),
+            crate::acp::protocol::ModelId::from("mock/local-only".to_string()),
+        ),
+    )
+    .await
+    .expect("set remote session model");
+
+    let session_ref = fixture
+        .handle
+        .registry
+        .lock()
+        .await
+        .get(&session.public_id)
+        .expect("attached session")
+        .clone();
+    let control = session_ref
+        .get_session_control()
+        .await
+        .expect("session control");
+    assert_eq!(control.effective_model.provider, "mock");
+    assert_eq!(control.effective_model.model, "local-only");
+    assert_eq!(
+        control.effective_model.provider_node_id,
+        Some(crate::agent::remote::NodeId::from_peer_id(*mesh.peer_id()).to_string())
+    );
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
 async fn test_cancel_known_remote_session_routes_cancel_to_session_ref() {
     use crate::agent::core::SessionRuntime;
     use crate::agent::remote::scope::{MeshScopeId, scoped_session};

@@ -70,58 +70,29 @@ impl LocalAgentHandle {
         self.config.provider.initial_config().system.clone()
     }
 
-    /// Switch provider configuration for a session (advanced form)
+    /// Switch provider configuration for a session (advanced form).
     pub async fn set_llm_config(&self, session_id: &str, config: LLMParams) -> Result<(), Error> {
-        use crate::error::AgentError;
-        let provider_name = config
+        let provider = config
             .provider
             .as_ref()
-            .ok_or_else(|| Error::from(AgentError::ProviderRequired))?;
-
+            .ok_or_else(|| Error::from(crate::error::AgentError::ProviderRequired))?;
         if self
             .config
             .provider
             .plugin_registry()
-            .get(provider_name)
+            .get(provider)
             .await
             .is_none()
         {
-            return Err(Error::from(AgentError::UnknownProvider {
-                name: provider_name.clone(),
+            return Err(Error::from(crate::error::AgentError::UnknownProvider {
+                name: provider.clone(),
             }));
         }
-
-        let llm_config = self
-            .config
-            .provider
-            .history_store()
-            .create_or_get_llm_config(&config)
+        let session_ref = self.session_ref_for_agent_session(session_id).await?;
+        session_ref
+            .set_llm_config(config, None)
             .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?;
-
-        self.config
-            .provider
-            .history_store()
-            .set_session_llm_config(session_id, llm_config.id)
-            .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?;
-
-        // Fetch context limit from model info
-        let context_limit =
-            crate::model_info::get_model_info(&llm_config.provider, &llm_config.model)
-                .and_then(|m| m.context_limit());
-
-        self.emit_event(
-            session_id,
-            crate::events::AgentEventKind::ProviderChanged {
-                provider: llm_config.provider.clone(),
-                model: llm_config.model.clone(),
-                config_id: llm_config.id,
-                context_limit,
-                provider_node_id: None,
-            },
-        );
-        Ok(())
+            .map_err(Error::from)
     }
 
     /// Get current LLM config for a session

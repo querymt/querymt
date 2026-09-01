@@ -667,6 +667,8 @@ pub struct SessionHandle {
     session: Session,
     /// LLM config resolved once at construction time (turn-pinned).
     llm_config: Option<LLMConfig>,
+    /// Provider route resolved once at construction time (turn-pinned).
+    provider_node_id: Option<String>,
     /// Session execution config resolved once at construction time (turn-pinned).
     execution_config: Option<SessionExecutionConfig>,
     /// Lazily cached LLM provider for this turn.
@@ -679,6 +681,7 @@ impl Clone for SessionHandle {
             provider: self.provider.clone(),
             session: self.session.clone(),
             llm_config: self.llm_config.clone(),
+            provider_node_id: self.provider_node_id.clone(),
             execution_config: self.execution_config.clone(),
             // Each clone gets its own OnceCell; the first `.provider()` call
             // will still hit the global cache (cheap Arc::clone on hit) so
@@ -690,8 +693,26 @@ impl Clone for SessionHandle {
 
 impl SessionHandle {
     pub async fn new(provider: Arc<SessionProvider>, session: Session) -> SessionResult<Self> {
+        // Initialized sessions expose the effective config and route in one atomic snapshot.
+        let control_state = provider
+            .history_store
+            .get_session_control(&session.public_id)
+            .await?;
+        let (config_id, provider_node_id) = match control_state {
+            Some(state) => (
+                Some(state.effective_model.llm_config_id),
+                state.effective_model.provider_node_id,
+            ),
+            None => (
+                session.llm_config_id,
+                provider
+                    .history_store
+                    .get_session_provider_node_id(&session.public_id)
+                    .await?,
+            ),
+        };
         // Eagerly resolve the LLM config so callers never need a separate DB fetch.
-        let llm_config = if let Some(config_id) = session.llm_config_id {
+        let llm_config = if let Some(config_id) = config_id {
             provider.get_llm_config(config_id).await?
         } else {
             None
@@ -704,6 +725,7 @@ impl SessionHandle {
             provider,
             session,
             llm_config,
+            provider_node_id,
             execution_config,
             cached_llm_provider: tokio::sync::OnceCell::new(),
         })
@@ -727,9 +749,15 @@ impl SessionHandle {
     pub async fn provider(&self) -> SessionResult<Arc<dyn LLMProvider>> {
         self.cached_llm_provider
             .get_or_try_init(|| async {
-                self.provider
-                    .build_provider_for_session(&self.session.public_id)
-                    .await
+                let config = self.llm_config.as_ref().ok_or_else(|| {
+                    SessionError::InvalidOperation("Session has no LLM config".to_string())
+                })?;
+                let request = ProviderRequest::new(&config.provider, &config.model)
+                    .with_params(config.params.as_ref())
+                    .with_session_id(&self.session.public_id);
+                #[cfg(feature = "remote")]
+                let request = request.with_provider_node_id(self.provider_node_id.as_deref());
+                self.provider.build_provider(request).await
             })
             .await
             .map(Arc::clone)
@@ -1132,9 +1160,73 @@ pub mod tests {
     use querymt::completion::{CompletionRequest, CompletionResponse};
     use querymt::error::LLMError;
     use querymt::plugin::LLMProviderFactory;
+    use std::collections::HashMap;
     use std::pin::Pin;
+
+    use crate::agent::core::AgentMode;
+    use crate::agent::session_control::{SessionControlState, SessionModelBinding};
+    use crate::test_utils::{MockSessionStore, empty_plugin_registry, mock_session};
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
+
+    #[tokio::test]
+    async fn handle_construction_uses_atomic_control_snapshot_during_model_transition() {
+        let mut session = mock_session("transitioning-session");
+        session.llm_config_id = Some(1);
+        let config_b = LLMConfig {
+            id: 2,
+            name: None,
+            provider: "remote-provider".to_string(),
+            model: "model-b".to_string(),
+            params: None,
+            created_at: None,
+            updated_at: None,
+            provider_node_id: None,
+        };
+        let binding_b = SessionModelBinding {
+            model_id: "remote-provider/model-b".to_string(),
+            provider: config_b.provider.clone(),
+            model: config_b.model.clone(),
+            llm_config_id: config_b.id,
+            provider_node_id: Some("node-b".to_string()),
+        };
+        let control = SessionControlState {
+            revision: 2,
+            active_mode: AgentMode::Build,
+            reasoning_effort: None,
+            effective_model: binding_b.clone(),
+            mode_models: HashMap::from([("build".to_string(), binding_b)]),
+        };
+        let mut store = MockSessionStore::new();
+        store
+            .expect_get_session_control()
+            .withf(|id| id == "transitioning-session")
+            .return_once(move |_| Ok(Some(control)))
+            .times(1);
+        store
+            .expect_get_llm_config()
+            .withf(|id| *id == 2)
+            .return_once(move |_| Ok(Some(config_b)))
+            .times(1);
+        store.expect_get_session_provider_node_id().times(0);
+        store
+            .expect_get_session_execution_config()
+            .returning(|_| Ok(None))
+            .times(1);
+        let (registry, _temp_dir) = empty_plugin_registry().expect("plugin registry");
+        let provider = Arc::new(SessionProvider::new(
+            Arc::new(registry),
+            Arc::new(store),
+            LLMParams::new().provider("mock").model("model-a"),
+        ));
+
+        let handle = SessionHandle::new(provider, session)
+            .await
+            .expect("construct handle");
+
+        assert_eq!(handle.llm_config().unwrap().id, 2);
+        assert_eq!(handle.provider_node_id.as_deref(), Some("node-b"));
+    }
 
     /// Mock LLM provider for testing
     pub struct MockProvider {

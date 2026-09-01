@@ -39,7 +39,6 @@ interface ModelPickerPopoverProps {
   remoteNodes?: RemoteNodeInfo[];
   currentWorkspace: string | null;
   recentModelsByWorkspace: Record<string, RecentModelEntry[]>;
-  agentMode: string;
   reasoningEffort: string | null;
   onRefresh: () => void;
   onSetSessionModel: (sessionId: string, modelId: string, node?: string) => void;
@@ -171,7 +170,6 @@ interface ModelPickerPanelProps {
   currentNode?: string;
   currentWorkspace: string | null;
   recentModelsByWorkspace: Record<string, RecentModelEntry[]>;
-  agentMode: string;
   reasoningEffort: string | null;
   onRefresh: () => void;
   onSetSessionModel: (sessionId: string, modelId: string, node?: string) => void;
@@ -201,7 +199,6 @@ const ModelPickerPanel = memo(function ModelPickerPanel({
   currentNode,
   currentWorkspace,
   recentModelsByWorkspace,
-  agentMode,
   reasoningEffort,
   onRefresh,
   onSetSessionModel,
@@ -222,7 +219,6 @@ const ModelPickerPanel = memo(function ModelPickerPanel({
   const [hfRepo, setHfRepo] = useState('');
   const [hfFilename, setHfFilename] = useState('');
   const [filePath, setFilePath] = useState('');
-  const { setModeModelPreference } = useUiStore();
 
   // When the popover opens, auto-select the current model and scroll to top.
   useEffect(() => {
@@ -346,10 +342,6 @@ const ModelPickerPanel = memo(function ModelPickerPanel({
       if (sessionIds.size === 0) return;
       sessionIds.forEach((id) => onSetSessionModel(id, modelId, entry.node));
 
-      if (!entry.node) {
-        setModeModelPreference(agentMode, entry.provider, entry.model);
-      }
-
       onOpenChange(false);
     },
     [
@@ -360,8 +352,6 @@ const ModelPickerPanel = memo(function ModelPickerPanel({
       sessionId,
       onSetSessionModel,
       onOpenChange,
-      agentMode,
-      setModeModelPreference,
     ],
   );
 
@@ -712,7 +702,6 @@ export const ModelPickerPopover = memo(function ModelPickerPopover({
   remoteNodes,
   currentWorkspace,
   recentModelsByWorkspace,
-  agentMode,
   reasoningEffort,
   onRefresh,
   onSetSessionModel,
@@ -754,7 +743,6 @@ export const ModelPickerPopover = memo(function ModelPickerPopover({
     currentNode,
     currentWorkspace,
     recentModelsByWorkspace,
-    agentMode,
     reasoningEffort,
     onRefresh,
     onSetSessionModel,

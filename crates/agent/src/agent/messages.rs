@@ -11,11 +11,11 @@
 //! contain non-serializable types.
 
 use crate::acp::client_bridge::ClientBridgeSender;
-use crate::acp::protocol::{
-    ExtNotification as AcpExtNotification, ExtRequest, PromptRequest, SetSessionModelRequest,
-};
+use crate::acp::protocol::{ExtNotification as AcpExtNotification, ExtRequest, PromptRequest};
 use crate::agent::core::AgentMode;
-use crate::agent::remote::NodeId;
+use crate::agent::session_control::{
+    SessionControlState, SessionControlTransition, SessionModelSelection,
+};
 pub use crate::agent::turn_control::{InputDelivery, SubmitInput, SubmitInputResult};
 use querymt::LLMParams;
 use querymt::chat::ReasoningEffort;
@@ -171,6 +171,10 @@ pub struct SetMode {
 #[derive(Serialize, Deserialize)]
 pub struct GetMode;
 
+/// Get the complete authoritative control state for this session.
+#[derive(Serialize, Deserialize)]
+pub struct GetSessionControl;
+
 /// Set the reasoning effort level for this session.
 /// `None` clears the explicit override and restores model/provider defaults.
 #[derive(Serialize, Deserialize)]
@@ -193,16 +197,21 @@ pub struct SetProvider {
 #[derive(Serialize, Deserialize)]
 pub struct SetLlmConfig {
     pub config: LLMParams,
+    #[serde(default)]
+    pub provider_node_id: Option<String>,
 }
 
-/// Set session model via ACP protocol.
+/// Set the effective model and remember it for the current session mode.
 #[derive(Serialize, Deserialize)]
 pub struct SetSessionModel {
-    pub req: SetSessionModelRequest,
-    /// Mesh node that owns the provider. `None` = local, `Some(peer_id)` = remote node.
-    #[serde(default)]
-    pub provider_node_id: Option<NodeId>,
+    pub selection: SessionModelSelection,
 }
+
+/// Serializable reply aliases keep remote actor signatures explicit.
+pub type SetModeReply = Result<SessionControlTransition, crate::error::AgentError>;
+pub type SetReasoningEffortReply = Result<SessionControlTransition, crate::error::AgentError>;
+pub type SetSessionModelReply = Result<SessionControlTransition, crate::error::AgentError>;
+pub type GetSessionControlReply = Result<SessionControlState, crate::error::AgentError>;
 
 /// Set the tool policy for this session.
 #[derive(Serialize, Deserialize)]
@@ -472,25 +481,21 @@ mod tests {
     #[test]
     #[cfg(feature = "remote")]
     fn set_session_model_serializes() {
-        let req = SetSessionModelRequest::new("s1".to_string(), "anthropic/claude-3".to_string());
         let peer_id = libp2p::identity::Keypair::generate_ed25519()
             .public()
             .to_peer_id()
             .to_string();
         let msg = SetSessionModel {
-            req,
-            provider_node_id: Some(
-                crate::agent::remote::NodeId::parse(&peer_id).expect("valid peer id"),
-            ),
+            selection: SessionModelSelection {
+                model_id: "anthropic/claude-3".to_string(),
+                provider_node_id: Some(peer_id.clone()),
+            },
         };
         let json = serde_json::to_string(&msg).unwrap();
         let rt: SetSessionModel = serde_json::from_str(&json).unwrap();
-        assert_eq!(rt.req.session_id, "s1".into());
+        assert_eq!(rt.selection.model_id, "anthropic/claude-3");
         assert_eq!(
-            rt.provider_node_id
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref(),
+            rt.selection.provider_node_id.as_deref(),
             Some(peer_id.as_str())
         );
     }
@@ -636,7 +641,10 @@ mod tests {
     #[test]
     fn set_llm_config_message_serializes() {
         let config = querymt::LLMParams::new().provider("openai").model("gpt-4");
-        let msg = SetLlmConfig { config };
+        let msg = SetLlmConfig {
+            config,
+            provider_node_id: None,
+        };
         let json = serde_json::to_string(&msg).unwrap();
         let _rt: SetLlmConfig = serde_json::from_str(&json).unwrap();
     }

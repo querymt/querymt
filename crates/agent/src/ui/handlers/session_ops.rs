@@ -1229,12 +1229,15 @@ pub async fn handle_elicitation_response(
 pub async fn handle_set_agent_mode(
     state: &ServerState,
     conn_id: &str,
+    requested_session_id: Option<&str>,
     mode: &str,
     tx: &mpsc::Sender<String>,
 ) {
     match mode.parse::<AgentMode>() {
         Ok(new_mode) => {
-            let session_id = {
+            let session_id = if let Some(session_id) = requested_session_id {
+                Some(session_id.to_string())
+            } else {
                 let connections = state.connections.lock().await;
                 connections
                     .get(conn_id)
@@ -1343,6 +1346,7 @@ pub async fn handle_get_agent_mode(state: &ServerState, conn_id: &str, tx: &mpsc
 pub async fn handle_set_reasoning_effort(
     state: &ServerState,
     conn_id: &str,
+    requested_session_id: Option<&str>,
     effort_str: &str,
     tx: &mpsc::Sender<String>,
 ) {
@@ -1362,7 +1366,9 @@ pub async fn handle_set_reasoning_effort(
         }
     };
 
-    let session_id = {
+    let session_id = if let Some(session_id) = requested_session_id {
+        Some(session_id.to_string())
+    } else {
         let connections = state.connections.lock().await;
         connections
             .get(conn_id)

@@ -1,5 +1,6 @@
 //! Defines the generic storage interface for session persistence.
 
+use crate::agent::session_control::SessionControlState;
 use crate::config::{CompactionConfig, PruningConfig, RateLimitConfig, ToolOutputConfig};
 use crate::model::AgentMessage;
 use crate::session::domain::{
@@ -271,8 +272,24 @@ pub trait SessionStore: Send + Sync {
     /// Retrieve the LLM configuration for a session
     async fn get_session_llm_config(&self, session_id: &str) -> SessionResult<Option<LLMConfig>>;
 
-    /// Set the LLM configuration id for a session
+    /// Set the LLM configuration id for a session.
+    ///
+    /// Interactive mode/model/reasoning changes must use `commit_session_control` instead.
     async fn set_session_llm_config(&self, session_id: &str, config_id: i64) -> SessionResult<()>;
+
+    /// Load the persisted mode/model/reasoning state for a session.
+    async fn get_session_control(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<SessionControlState>>;
+
+    /// Atomically commit control state, mode bindings, effective model, and provider route.
+    async fn commit_session_control(
+        &self,
+        session_id: &str,
+        expected_revision: u64,
+        state: &SessionControlState,
+    ) -> SessionResult<SessionControlState>;
 
     /// Persist the profile namespace for a root session.
     async fn set_profile_binding(&self, session_id: &str, profile_id: &str) -> SessionResult<()>;
