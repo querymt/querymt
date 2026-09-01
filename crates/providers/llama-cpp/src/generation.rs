@@ -216,7 +216,7 @@ pub(crate) fn generate(
         model.new_context_with_samplers(
             &*backend,
             ctx_params,
-            [(0, build_standard_sampler(&sampling_params))],
+            [(0, build_standard_sampler(model, &sampling_params))],
         )
     } else {
         model.new_context(&*backend, ctx_params)
@@ -386,7 +386,7 @@ pub(crate) fn generate(
     // UNIFIED GENERATION PHASE (identical for both paths)
 
     let params = sampling_params;
-    let mut sampler = build_standard_sampler(&params);
+    let mut sampler = build_standard_sampler(model, &params);
     let allow_fallback = !backend_sampling && !params.is_explicit();
     let mut fallback_used = false;
 
@@ -700,7 +700,7 @@ pub(crate) fn generate_streaming_with_thinking(
     let mut stream_state = result.streaming_state();
 
     let params = SamplingParams::from_config(cfg, temperature);
-    let mut sampler = build_standard_sampler(&params);
+    let mut sampler = build_standard_sampler(model, &params);
     let allow_fallback = !params.is_explicit();
     let mut fallback_used = false;
 

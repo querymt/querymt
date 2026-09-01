@@ -36,8 +36,9 @@ pub struct LlamaCppConfig {
     /// 0.0 = disabled. Typical range: 0.0–2.0.
     pub frequency_penalty: Option<f32>,
     /// Number of last tokens to consider for repeat/presence/frequency penalties.
-    /// -1 = full context, 0 = disabled. Defaults to 64 when any penalty is set
-    /// but this is not explicitly configured.
+    /// Matches native llama.cpp semantics: 0 disables penalties and negative values
+    /// are clamped to 0. Defaults to 64 when any penalty is set but this is not
+    /// explicitly configured.
     pub penalty_last_n: Option<i32>,
     /// System prompt to prepend to chat requests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -185,8 +185,9 @@ pub(crate) fn run_mtp(
     spec.begin(&tokens)
         .map_err(|e| LLMError::ProviderError(format!("MTP begin failed: {e}")))?;
 
-    let mut sampler = sampler
-        .unwrap_or_else(|| build_standard_sampler(&SamplingParams::from_config(cfg, temperature)));
+    let mut sampler = sampler.unwrap_or_else(|| {
+        build_standard_sampler(model, &SamplingParams::from_config(cfg, temperature))
+    });
     let mut committed_prefix = tokens;
     let mut pending_position = committed_prefix.len() as i32;
     let mut pending = sampler.sample(spec.target_context(), batch.n_tokens() - 1);
