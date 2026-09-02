@@ -1005,7 +1005,8 @@ pub(super) async fn transition_after_llm(
 
 /// Transition from ProcessingToolCalls to BeforeLlmCall or WaitingForEvent.
 ///
-/// This executes remaining tool calls in parallel, collects results, and either:
+/// This executes parallel-safe runs concurrently while preserving stateful and
+/// clarification boundaries, then either:
 /// - Returns to BeforeLlmCall with results (normal flow)
 /// - Enters WaitingForEvent if a delegation was initiated
 ///
@@ -1027,7 +1028,9 @@ pub(super) async fn transition_after_llm(
     fields(
         session_id = %exec_ctx.session_id,
         remaining_calls = remaining_calls.len(),
-        completed_results = results.len()
+        completed_results = results.len(),
+        execution_mode = tracing::field::Empty,
+        state_reload_ms = tracing::field::Empty,
     )
 )]
 pub(super) async fn transition_processing_tool_calls(
@@ -1066,40 +1069,89 @@ pub(super) async fn transition_processing_tool_calls(
         return Ok(next_state);
     }
 
-    let requires_serial = remaining_calls.iter().any(|call| {
+    let execution_class = |call: &MiddlewareToolCall| {
         config
             .tool_registry
             .find(&call.function.name)
-            .is_some_and(|tool| {
-                !matches!(
-                    tool.execution_class(),
-                    crate::tools::ToolExecutionClass::ParallelSafe
-                )
-            })
-    });
-    if requires_serial {
+            .map(|tool| tool.execution_class())
+            .unwrap_or(crate::tools::ToolExecutionClass::ParallelSafe)
+    };
+    let has_execution_boundary = remaining_calls
+        .iter()
+        .any(|call| execution_class(call) != crate::tools::ToolExecutionClass::ParallelSafe);
+    if has_execution_boundary {
+        tracing::Span::current().record("execution_mode", "mixed_boundary");
         debug!(
-            "Executing {} stateful tool calls serially for session {}",
-            remaining_calls.len(),
+            "Executing mixed tool batch with stateful boundaries for session {}",
             exec_ctx.session_id
         );
         let mut all_results = (**results).to_vec();
         let mut unprocessed_start = if already_cancelled { Some(0) } else { None };
         let mut cancelled = already_cancelled;
-        for (call_index, call) in remaining_calls.iter().enumerate() {
-            if already_cancelled {
-                break;
+        let mut stateful_executed = false;
+        let mut call_index = 0;
+
+        while call_index < remaining_calls.len() && !cancelled {
+            let class = execution_class(&remaining_calls[call_index]);
+            if class == crate::tools::ToolExecutionClass::ParallelSafe {
+                let group_end = remaining_calls[call_index..]
+                    .iter()
+                    .position(|call| {
+                        execution_class(call) != crate::tools::ToolExecutionClass::ParallelSafe
+                    })
+                    .map_or(remaining_calls.len(), |offset| call_index + offset);
+                let exec_ctx_ref: &ExecutionContext = exec_ctx;
+                let futures = remaining_calls[call_index..group_end].iter().map(|call| {
+                    let call = call.clone();
+                    let cancel = exec_ctx_ref.cancellation_token.clone();
+                    async move {
+                        tokio::select! {
+                            result = super::tool_calls::execute_tool_call(
+                                config, &call, exec_ctx_ref, bridge,
+                            ) => result,
+                            _ = cancel.cancelled() => Ok(ToolResult::new(
+                                call.id.clone(),
+                                vec![querymt::chat::Content::text("Error: Cancelled by user")],
+                                true,
+                                Some(call.function.name.clone()),
+                                Some(call.function.arguments.clone()),
+                            )),
+                        }
+                    }
+                });
+                for (result, call) in join_all(futures)
+                    .await
+                    .into_iter()
+                    .zip(remaining_calls[call_index..group_end].iter())
+                {
+                    match result {
+                        Ok(tool_result) => all_results.push(tool_result),
+                        Err(error) => all_results.push(ToolResult::new(
+                            call.id.clone(),
+                            vec![querymt::chat::Content::text(format!(
+                                "Error: internal tool execution failed: {error}"
+                            ))],
+                            true,
+                            Some(call.function.name.clone()),
+                            Some(call.function.arguments.clone()),
+                        )),
+                    }
+                }
+                call_index = group_end;
+                if exec_ctx.cancellation_token.is_cancelled() {
+                    cancelled = true;
+                    unprocessed_start = Some(call_index);
+                }
+                continue;
             }
-            let execution_class = config
-                .tool_registry
-                .find(&call.function.name)
-                .map(|tool| tool.execution_class())
-                .unwrap_or(crate::tools::ToolExecutionClass::ParallelSafe);
+
+            let call = &remaining_calls[call_index];
+            stateful_executed |= class == crate::tools::ToolExecutionClass::SerialStateful;
             let result = super::tool_calls::execute_tool_call(config, call, exec_ctx, bridge).await;
             let mut clarification_applied = false;
             match result {
                 Ok(tool_result) => {
-                    if execution_class == crate::tools::ToolExecutionClass::ClarificationBoundary
+                    if class == crate::tools::ToolExecutionClass::ClarificationBoundary
                         && !tool_result.is_error
                     {
                         let clarification = tool_result
@@ -1161,18 +1213,16 @@ pub(super) async fn transition_processing_tool_calls(
                     Some(call.function.arguments.clone()),
                 )),
             }
+            call_index += 1;
             if exec_ctx.cancellation_token.is_cancelled() {
                 cancelled = true;
-                unprocessed_start = Some(call_index + 1);
-                break;
-            }
-            if execution_class == crate::tools::ToolExecutionClass::ClarificationBoundary
-                && clarification_applied
-            {
-                unprocessed_start = Some(call_index + 1);
+                unprocessed_start = Some(call_index);
+            } else if clarification_applied {
+                unprocessed_start = Some(call_index);
                 break;
             }
         }
+
         if let Some(start) = unprocessed_start {
             for call in remaining_calls.iter().skip(start) {
                 let message = if cancelled {
@@ -1189,19 +1239,26 @@ pub(super) async fn transition_processing_tool_calls(
                 ));
             }
         }
-        match exec_ctx.state.load_working_context().await {
-            Ok(()) => {
-                if let Some(objective) = exec_ctx.run_objective.as_mut() {
-                    objective.set_task(
-                        exec_ctx.state.active_task.as_ref(),
-                        crate::agent::objective::ObjectiveSource::TaskUpdated,
-                    );
+        if stateful_executed {
+            let reload_started = std::time::Instant::now();
+            match exec_ctx.state.load_working_context().await {
+                Ok(()) => {
+                    if let Some(objective) = exec_ctx.run_objective.as_mut() {
+                        objective.set_task(
+                            exec_ctx.state.active_task.as_ref(),
+                            crate::agent::objective::ObjectiveSource::TaskUpdated,
+                        );
+                    }
                 }
+                Err(error) => warn!(
+                    "Failed to refresh working context after stateful tool execution: {}",
+                    error
+                ),
             }
-            Err(error) => warn!(
-                "Failed to refresh working context after serial tool execution: {}",
-                error
-            ),
+            tracing::Span::current().record(
+                "state_reload_ms",
+                reload_started.elapsed().as_millis() as u64,
+            );
         }
         let next_state = super::tool_calls::store_all_tool_results(
             config,
@@ -1216,6 +1273,7 @@ pub(super) async fn transition_processing_tool_calls(
         return Ok(next_state);
     }
 
+    tracing::Span::current().record("execution_mode", "parallel");
     debug!(
         "Executing {} tool calls in parallel for session {}",
         remaining_calls.len(),

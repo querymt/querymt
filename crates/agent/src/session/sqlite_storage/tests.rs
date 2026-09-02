@@ -495,6 +495,74 @@ async fn task_lifecycle_is_atomic_revisioned_and_explicit() {
 }
 
 #[tokio::test]
+async fn intent_projection_insert_and_binding_are_atomic() {
+    use crate::session::domain::IntentSnapshot;
+    use time::OffsetDateTime;
+
+    let storage = SqliteStorage::connect(":memory:".into())
+        .await
+        .expect("in-memory storage");
+    let session = storage
+        .create_session(None, None, None, None)
+        .await
+        .expect("create session");
+    let snapshot = IntentSnapshot {
+        id: 0,
+        session_id: session.id,
+        task_id: None,
+        summary: "implement the fix".to_string(),
+        constraints: None,
+        next_step_hint: None,
+        revision: 1,
+        source: "user_prompt".to_string(),
+        source_ref: Some("message-1".to_string()),
+        created_at: OffsetDateTime::now_utc(),
+    };
+
+    let stored = storage
+        .create_and_set_current_intent_snapshot(&session.public_id, snapshot)
+        .await
+        .expect("persist intent projection");
+    assert!(stored.id > 0);
+    assert_eq!(
+        storage
+            .get_session(&session.public_id)
+            .await
+            .expect("read session")
+            .expect("session")
+            .current_intent_snapshot_id,
+        Some(stored.id)
+    );
+
+    let missing = IntentSnapshot {
+        id: 0,
+        session_id: session.id,
+        task_id: None,
+        summary: "must roll back".to_string(),
+        constraints: None,
+        next_step_hint: None,
+        revision: 2,
+        source: "user_prompt".to_string(),
+        source_ref: Some("message-2".to_string()),
+        created_at: OffsetDateTime::now_utc(),
+    };
+    assert!(
+        storage
+            .create_and_set_current_intent_snapshot("missing-session", missing)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        storage
+            .list_intent_snapshots(&session.public_id)
+            .await
+            .expect("list snapshots")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn connect_with_options_without_migration_keeps_db_unmodified() {
     let tmp = tempfile::NamedTempFile::new().expect("temp db file");
     let path = tmp.path().to_path_buf();

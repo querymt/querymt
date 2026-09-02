@@ -148,18 +148,9 @@ impl RuntimeContext {
             created_at: OffsetDateTime::now_utc(),
         };
 
-        self.store.create_intent_snapshot(snapshot.clone()).await?;
         let latest_snapshot = self
             .store
-            .get_current_intent_snapshot(&self.session_id)
-            .await?
-            .ok_or_else(|| {
-                SessionError::IntentSnapshotNotFound("latest snapshot missing".to_string())
-            })?;
-
-        let snapshot_id_str = latest_snapshot.id.to_string();
-        self.store
-            .set_current_intent_snapshot(&self.session_id, Some(&snapshot_id_str))
+            .create_and_set_current_intent_snapshot(&self.session_id, snapshot)
             .await?;
         self.current_intent = Some(latest_snapshot.clone());
 

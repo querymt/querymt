@@ -446,6 +446,24 @@ pub trait SessionStore: Send + Sync {
 
     // Intent repository methods
     async fn create_intent_snapshot(&self, snapshot: IntentSnapshot) -> SessionResult<()>;
+    /// Persist an intent snapshot, bind it as current, and return the stored row.
+    /// Backends should override this to perform the operation atomically.
+    async fn create_and_set_current_intent_snapshot(
+        &self,
+        session_id: &str,
+        snapshot: IntentSnapshot,
+    ) -> SessionResult<IntentSnapshot> {
+        self.create_intent_snapshot(snapshot).await?;
+        let stored = self
+            .get_current_intent_snapshot(session_id)
+            .await?
+            .ok_or_else(|| {
+                SessionError::IntentSnapshotNotFound("latest snapshot missing".to_string())
+            })?;
+        self.set_current_intent_snapshot(session_id, Some(&stored.id.to_string()))
+            .await?;
+        Ok(stored)
+    }
     async fn get_intent_snapshot(&self, snapshot_id: &str)
     -> SessionResult<Option<IntentSnapshot>>;
     async fn list_intent_snapshots(&self, session_id: &str) -> SessionResult<Vec<IntentSnapshot>>;
