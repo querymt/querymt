@@ -1,3 +1,17 @@
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use mockall::Sequence;
+use querymt::LLMParams;
+use querymt::chat::{Content, FunctionTool, Tool};
+use querymt::error::LLMError;
+use serde_json::json;
+use tempfile::TempDir;
+use time::OffsetDateTime;
+use tokio::sync::{Mutex, oneshot};
+
 use crate::acp::protocol::StopReason;
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::ToolPolicy;
@@ -15,18 +29,6 @@ use crate::test_utils::{
     mock_session,
 };
 use crate::tools::{Tool as AgentTool, ToolContext, ToolError, ToolExecutionClass, ToolRegistry};
-use async_trait::async_trait;
-use mockall::Sequence;
-use querymt::LLMParams;
-use querymt::chat::{Content, FunctionTool, Tool};
-use querymt::error::LLMError;
-use serde_json::json;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
-use tempfile::TempDir;
-use time::OffsetDateTime;
-use tokio::sync::{Mutex, oneshot};
 
 // Mock implementations moved to crate::test_utils::mocks
 
@@ -356,11 +358,12 @@ async fn run_completion_guard_case(
     policy_enabled: bool,
     tools: Vec<Tool>,
     status: TaskStatus,
+    kind: TaskKind,
     expected_requests: usize,
 ) {
     let mut harness = TestHarness::new_with_tools(vec![], None, tools).await;
     harness.enable_task_completion_guard(policy_enabled);
-    harness.set_task(status, TaskKind::Finite);
+    harness.set_task(status, kind);
     harness
         .provider_mut()
         .await
@@ -377,6 +380,7 @@ async fn completion_guard_continues_exactly_once_in_execution_flow() {
         true,
         vec![provider_tool("complete_task")],
         TaskStatus::Active,
+        TaskKind::Finite,
         2,
     )
     .await;
@@ -388,6 +392,7 @@ async fn completion_guard_does_not_continue_when_disabled() {
         false,
         vec![provider_tool("complete_task")],
         TaskStatus::Active,
+        TaskKind::Finite,
         1,
     )
     .await;
@@ -399,15 +404,37 @@ async fn completion_guard_does_not_continue_without_complete_task() {
         true,
         vec![provider_tool("update_task")],
         TaskStatus::Active,
+        TaskKind::Finite,
         1,
     )
     .await;
 }
 
 #[tokio::test]
+async fn completion_guard_does_not_continue_for_non_finite_task() {
+    for kind in [TaskKind::Recurring, TaskKind::Evolving] {
+        run_completion_guard_case(
+            true,
+            vec![provider_tool("complete_task")],
+            TaskStatus::Active,
+            kind,
+            1,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn completion_guard_does_not_continue_for_non_active_task() {
     for status in [TaskStatus::Done, TaskStatus::Paused, TaskStatus::Cancelled] {
-        run_completion_guard_case(true, vec![provider_tool("complete_task")], status, 1).await;
+        run_completion_guard_case(
+            true,
+            vec![provider_tool("complete_task")],
+            status,
+            TaskKind::Finite,
+            1,
+        )
+        .await;
     }
 }
 
@@ -567,14 +594,14 @@ async fn mixed_scheduler_runs_contiguous_parallel_groups_before_stateful_boundar
     let mut harness = TestHarness::new(vec![], None).await;
     let log = Arc::new(StdMutex::new(Vec::new()));
     harness.with_builtin_tools(vec![
+        scheduling_tool("parallel_a", ToolExecutionClass::ParallelSafe, 5, "a", &log),
         scheduling_tool(
-            "parallel_a",
+            "parallel_b",
             ToolExecutionClass::ParallelSafe,
             30,
-            "a",
+            "b",
             &log,
         ),
-        scheduling_tool("parallel_b", ToolExecutionClass::ParallelSafe, 5, "b", &log),
         scheduling_tool("serial", ToolExecutionClass::SerialStateful, 0, "s", &log),
         scheduling_tool("parallel_c", ToolExecutionClass::ParallelSafe, 0, "c", &log),
     ]);
@@ -605,6 +632,7 @@ async fn mixed_scheduler_runs_contiguous_parallel_groups_before_stateful_boundar
     let position = |entry: &str| log.iter().position(|item| item == entry).unwrap();
     assert!(position("start:parallel_b") < position("end:parallel_a"));
     assert!(position("end:parallel_a") < position("start:serial"));
+    assert!(position("end:parallel_b") < position("start:serial"));
     assert!(position("end:serial") < position("start:parallel_c"));
 }
 
@@ -694,12 +722,18 @@ async fn mixed_scheduler_cancellation_stores_one_result_per_call() {
         1
     );
     let stored = harness.stored_messages.lock().unwrap();
-    let result_count = stored
+    let result_call_ids: BTreeSet<_> = stored
         .iter()
         .flat_map(|message| message.parts.iter())
-        .filter(|part| matches!(part, crate::model::MessagePart::ToolResult { .. }))
-        .count();
-    assert_eq!(result_count, 3);
+        .filter_map(|part| match part {
+            crate::model::MessagePart::ToolResult { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        result_call_ids,
+        BTreeSet::from(["call-a", "call-b", "call-cancel"])
+    );
 }
 
 #[tokio::test]
