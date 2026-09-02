@@ -243,6 +243,10 @@ fn default_rate_limit_max_wait_secs() -> u64 {
     DEFAULT_RATE_LIMIT_MAX_WAIT_SECS
 }
 
+fn default_task_completion_guard() -> bool {
+    false
+}
+
 /// Configuration for rate limit retry behavior
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -511,7 +515,8 @@ impl Default for SnapshotBackendConfig {
 /// - **Layer 3** `compaction`: AI-powered summarisation triggered when the
 ///   context window fills. Condenses history to free space.
 ///
-/// Also controls `snapshot` (undo/redo via git) and `rate_limit` (429 retry).
+/// Also controls `snapshot` (undo/redo via git), `rate_limit` (429 retry), and
+/// whether an unfinished finite task forces an additional model request.
 ///
 /// ```toml
 /// [agent.execution.tool_output]
@@ -540,9 +545,12 @@ pub struct ExecutionPolicy {
     pub snapshot: SnapshotBackendConfig,
     /// Rate limit retry configuration
     pub rate_limit: RateLimitConfig,
+    /// Force one additional model request when a finite task remains active.
+    #[serde(default = "default_task_completion_guard")]
+    pub task_completion_guard: bool,
 }
 
-/// Runtime execution policy — the 4 configs that survive to `AgentConfig`
+/// Runtime execution policy — the configs that survive to `AgentConfig`
 /// (excludes `SnapshotBackendConfig` which is consumed at build time).
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeExecutionPolicy {
@@ -550,6 +558,7 @@ pub struct RuntimeExecutionPolicy {
     pub pruning: PruningConfig,
     pub compaction: CompactionConfig,
     pub rate_limit: RateLimitConfig,
+    pub task_completion_guard: bool,
 }
 
 impl From<&ExecutionPolicy> for RuntimeExecutionPolicy {
@@ -559,6 +568,7 @@ impl From<&ExecutionPolicy> for RuntimeExecutionPolicy {
             pruning: ep.pruning.clone(),
             compaction: ep.compaction.clone(),
             rate_limit: ep.rate_limit.clone(),
+            task_completion_guard: ep.task_completion_guard,
         }
     }
 }
@@ -569,6 +579,19 @@ impl From<&ExecutionPolicy> for RuntimeExecutionPolicy {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn task_completion_guard_is_opt_in() {
+        let default_policy = ExecutionPolicy::default();
+        assert!(!default_policy.task_completion_guard);
+
+        let policy: ExecutionPolicy = serde_json::from_value(json!({
+            "task_completion_guard": true
+        }))
+        .expect("deserialize execution policy");
+        assert!(policy.task_completion_guard);
+        assert!(RuntimeExecutionPolicy::from(&policy).task_completion_guard);
+    }
 
     #[test]
     fn rate_limit_default_allows_two_stream_recreations() {

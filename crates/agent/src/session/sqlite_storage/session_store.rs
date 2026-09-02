@@ -34,6 +34,53 @@ use std::collections::HashMap;
 use super::SqliteStorage;
 use super::row_parsers::{parse_llm_config_row, parse_llm_params};
 
+fn insert_intent_snapshot(
+    conn: &rusqlite::Connection,
+    mut snapshot: IntentSnapshot,
+) -> rusqlite::Result<IntentSnapshot> {
+    let created_at = snapshot
+        .created_at
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    conn.execute(
+        "INSERT INTO intent_snapshots (session_id, task_id, summary, constraints, next_step_hint, revision, source, source_ref, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            snapshot.session_id,
+            snapshot.task_id,
+            &snapshot.summary,
+            &snapshot.constraints,
+            &snapshot.next_step_hint,
+            snapshot.revision as i64,
+            &snapshot.source,
+            &snapshot.source_ref,
+            created_at,
+        ],
+    )?;
+    snapshot.id = conn.last_insert_rowid();
+
+    // The title derives from the first intent; keep its search projection current.
+    let fts_row_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions_fts WHERE rowid = ?)",
+        params![snapshot.session_id],
+        |row| row.get(0),
+    )?;
+    if fts_row_exists {
+        conn.execute(
+            r#"INSERT INTO sessions_fts(sessions_fts, rowid) VALUES ('delete', ?1)"#,
+            params![snapshot.session_id],
+        )?;
+    }
+    conn.execute(
+        r#"INSERT INTO sessions_fts(rowid, public_id, name, cwd, title)
+           SELECT s.id, s.public_id, COALESCE(s.name, ''), COALESCE(s.cwd, ''),
+                  COALESCE((SELECT i.summary FROM intent_snapshots i WHERE i.session_id = s.id ORDER BY i.id ASC LIMIT 1), '')
+           FROM sessions s WHERE s.id = ?1"#,
+        params![snapshot.session_id],
+    )?;
+
+    Ok(snapshot)
+}
+
 fn map_task_lifecycle_error(error: SessionError) -> SessionError {
     match error {
         SessionError::DatabaseError(message) if message.contains("revision_conflict") => {
@@ -1358,6 +1405,47 @@ impl SessionStore for SqliteStorage {
     async fn create_intent_snapshot(&self, snapshot: IntentSnapshot) -> SessionResult<()> {
         let repo = SqliteIntentRepository::new(self.conn.clone());
         repo.create_intent_snapshot(snapshot).await
+    }
+
+    async fn create_and_set_current_intent_snapshot(
+        &self,
+        session_id: &str,
+        snapshot: IntentSnapshot,
+    ) -> SessionResult<IntentSnapshot> {
+        let session_id = session_id.to_string();
+        let query_session_id = session_id.clone();
+        self.run_blocking(move |conn| {
+            let tx = conn.transaction()?;
+            let internal_session_id: i64 = tx.query_row(
+                "SELECT id FROM sessions WHERE public_id = ?",
+                params![query_session_id],
+                |row| row.get(0),
+            )?;
+            if internal_session_id != snapshot.session_id {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            let stored = insert_intent_snapshot(&tx, snapshot)?;
+            let updated_at = stored
+                .created_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default();
+            let updated = tx.execute(
+                "UPDATE sessions SET current_intent_snapshot_id = ?, updated_at = ? WHERE public_id = ?",
+                params![stored.id, updated_at, query_session_id],
+            )?;
+            if updated == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            tx.commit()?;
+            Ok(stored)
+        })
+        .await
+        .map_err(|error| match error {
+            SessionError::DatabaseError(message) if message.contains("Query returned no rows") => {
+                SessionError::SessionNotFound(session_id)
+            }
+            other => other,
+        })
     }
 
     async fn get_intent_snapshot(

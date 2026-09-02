@@ -446,6 +446,17 @@ pub trait SessionStore: Send + Sync {
 
     // Intent repository methods
     async fn create_intent_snapshot(&self, snapshot: IntentSnapshot) -> SessionResult<()>;
+    /// Atomically persist an intent snapshot and bind it as current.
+    /// Backends without transactional support must reject this operation.
+    async fn create_and_set_current_intent_snapshot(
+        &self,
+        _session_id: &str,
+        _snapshot: IntentSnapshot,
+    ) -> SessionResult<IntentSnapshot> {
+        Err(SessionError::InvalidOperation(
+            "atomic intent snapshot activation is not supported by this backend".to_string(),
+        ))
+    }
     async fn get_intent_snapshot(&self, snapshot_id: &str)
     -> SessionResult<Option<IntentSnapshot>>;
     async fn list_intent_snapshots(&self, session_id: &str) -> SessionResult<Vec<IntentSnapshot>>;

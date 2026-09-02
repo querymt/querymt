@@ -1,3 +1,17 @@
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use mockall::Sequence;
+use querymt::LLMParams;
+use querymt::chat::{Content, FunctionTool, Tool};
+use querymt::error::LLMError;
+use serde_json::json;
+use tempfile::TempDir;
+use time::OffsetDateTime;
+use tokio::sync::{Mutex, oneshot};
+
 use crate::acp::protocol::StopReason;
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::ToolPolicy;
@@ -5,6 +19,7 @@ use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
 use crate::events::AgentEventKind;
 use crate::session::backend::StorageBackend;
+use crate::session::domain::{Task, TaskKind, TaskStatus};
 use crate::session::provider::SessionHandle;
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::SessionStore;
@@ -13,15 +28,7 @@ use crate::test_utils::{
     TestProviderFactory, mock_llm_config, mock_plugin_registry, mock_querymt_tool_call,
     mock_session,
 };
-use mockall::Sequence;
-use querymt::LLMParams;
-use querymt::chat::{Content, FunctionTool, Tool};
-use querymt::error::LLMError;
-use serde_json::json;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
-use tempfile::TempDir;
-use tokio::sync::{Mutex, oneshot};
+use crate::tools::{Tool as AgentTool, ToolContext, ToolError, ToolExecutionClass, ToolRegistry};
 
 // Mock implementations moved to crate::test_utils::mocks
 
@@ -30,6 +37,7 @@ struct TestHarness {
     session_id: String,
     exec_ctx: ExecutionContext,
     provider: Arc<Mutex<MockLlmProvider>>,
+    stored_messages: Arc<StdMutex<Vec<crate::model::AgentMessage>>>,
     _temp_dir: TempDir,
 }
 
@@ -65,6 +73,7 @@ impl TestHarness {
         let llm_config = mock_llm_config();
         let history = Arc::new(history);
         let delegation_sender = Arc::new(StdMutex::new(delegation_sender));
+        let stored_messages = Arc::new(StdMutex::new(Vec::new()));
 
         store
             .expect_get_session()
@@ -100,9 +109,13 @@ impl TestHarness {
             .expect_get_session_provider_node_id()
             .returning(|_| Ok(None))
             .times(0..);
+        let stored_messages_for_mock = stored_messages.clone();
         store
             .expect_add_message()
-            .returning(|_, _| Ok(()))
+            .returning(move |_, message| {
+                stored_messages_for_mock.lock().unwrap().push(message);
+                Ok(())
+            })
             .times(0..);
         store
             .expect_append_progress_entry()
@@ -111,6 +124,13 @@ impl TestHarness {
         store
             .expect_get_current_intent_snapshot()
             .returning(|_| Ok(None))
+            .times(0..);
+        store
+            .expect_create_and_set_current_intent_snapshot()
+            .returning(|_, mut snapshot| {
+                snapshot.id = 1;
+                Ok(snapshot)
+            })
             .times(0..);
         store
             .expect_list_delegations()
@@ -192,6 +212,7 @@ impl TestHarness {
             session_id,
             exec_ctx,
             provider,
+            stored_messages,
             _temp_dir: temp_dir,
         }
     }
@@ -209,6 +230,211 @@ impl TestHarness {
 
     async fn provider_mut(&self) -> tokio::sync::MutexGuard<'_, MockLlmProvider> {
         self.provider.lock().await
+    }
+
+    fn with_builtin_tools(&mut self, tools: Vec<Arc<dyn AgentTool>>) {
+        let mut registry = ToolRegistry::new();
+        registry.extend(tools);
+        self.config = Arc::new(
+            crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+                self.config.storage.clone(),
+                self.config.provider.clone(),
+                self.config.event_sink.journal().clone(),
+            )
+            .with_tool_policy(ToolPolicy::BuiltInOnly)
+            .with_tool_registry(registry)
+            .build(),
+        );
+        self.exec_ctx.tool_config.policy = ToolPolicy::BuiltInOnly;
+    }
+
+    fn enable_task_completion_guard(&mut self, enabled: bool) {
+        let mut policy = self.config.execution_policy.clone();
+        policy.task_completion_guard = enabled;
+        self.config = Arc::new(
+            crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+                self.config.storage.clone(),
+                self.config.provider.clone(),
+                self.config.event_sink.journal().clone(),
+            )
+            .with_tool_policy(ToolPolicy::ProviderOnly)
+            .with_execution_policy(policy)
+            .build(),
+        );
+    }
+
+    fn set_task(&mut self, status: TaskStatus, kind: TaskKind) {
+        let now = OffsetDateTime::now_utc();
+        self.exec_ctx.state.active_task = Some(Task {
+            id: 1,
+            public_id: "task-1".to_string(),
+            session_id: 1,
+            kind,
+            status,
+            expected_deliverable: Some("finish work".to_string()),
+            acceptance_criteria: None,
+            revision: 1,
+            creation_key: None,
+            completion_evidence: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+}
+
+struct SchedulingTool {
+    name: &'static str,
+    class: ToolExecutionClass,
+    delay_ms: u64,
+    result: &'static str,
+    log: Arc<StdMutex<Vec<String>>>,
+    cancel_on_start: bool,
+}
+
+#[async_trait]
+impl AgentTool for SchedulingTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn definition(&self) -> Tool {
+        provider_tool(self.name)
+    }
+
+    fn execution_class(&self) -> ToolExecutionClass {
+        self.class
+    }
+
+    async fn call(
+        &self,
+        _args: serde_json::Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<Content>, ToolError> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("start:{}", self.name));
+        if self.cancel_on_start {
+            context.cancellation_token().cancel();
+        }
+        if self.delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+        }
+        self.log.lock().unwrap().push(format!("end:{}", self.name));
+        Ok(vec![Content::text(self.result)])
+    }
+}
+
+fn scheduling_tool(
+    name: &'static str,
+    class: ToolExecutionClass,
+    delay_ms: u64,
+    result: &'static str,
+    log: &Arc<StdMutex<Vec<String>>>,
+) -> Arc<dyn AgentTool> {
+    Arc::new(SchedulingTool {
+        name,
+        class,
+        delay_ms,
+        result,
+        log: log.clone(),
+        cancel_on_start: false,
+    })
+}
+
+fn provider_tool(name: &str) -> Tool {
+    Tool {
+        tool_type: "function".to_string(),
+        function: FunctionTool {
+            name: name.to_string(),
+            description: "test tool".to_string(),
+            parameters: json!({"type": "object", "properties": {}}),
+        },
+    }
+}
+
+async fn run_completion_guard_case(
+    policy_enabled: bool,
+    tools: Vec<Tool>,
+    status: TaskStatus,
+    kind: TaskKind,
+    expected_requests: usize,
+) {
+    let mut harness = TestHarness::new_with_tools(vec![], None, tools).await;
+    harness.enable_task_completion_guard(policy_enabled);
+    harness.set_task(status, kind);
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .returning(|_, _| Ok(Box::new(MockChatResponse::text_only("done"))))
+        .times(expected_requests);
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+}
+
+#[tokio::test]
+async fn completion_guard_continues_exactly_once_in_execution_flow() {
+    run_completion_guard_case(
+        true,
+        vec![provider_tool("complete_task")],
+        TaskStatus::Active,
+        TaskKind::Finite,
+        2,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn completion_guard_does_not_continue_when_disabled() {
+    run_completion_guard_case(
+        false,
+        vec![provider_tool("complete_task")],
+        TaskStatus::Active,
+        TaskKind::Finite,
+        1,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn completion_guard_does_not_continue_without_complete_task() {
+    run_completion_guard_case(
+        true,
+        vec![provider_tool("update_task")],
+        TaskStatus::Active,
+        TaskKind::Finite,
+        1,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn completion_guard_does_not_continue_for_non_finite_task() {
+    for kind in [TaskKind::Recurring, TaskKind::Evolving] {
+        run_completion_guard_case(
+            true,
+            vec![provider_tool("complete_task")],
+            TaskStatus::Active,
+            kind,
+            1,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn completion_guard_does_not_continue_for_non_active_task() {
+    for status in [TaskStatus::Done, TaskStatus::Paused, TaskStatus::Cancelled] {
+        run_completion_guard_case(
+            true,
+            vec![provider_tool("complete_task")],
+            status,
+            TaskKind::Finite,
+            1,
+        )
+        .await;
     }
 }
 
@@ -360,6 +586,153 @@ async fn test_parallel_tool_results_in_single_user_message() {
         tool_result_count, 3,
         "expected 3 tool results in the single user message, got {}",
         tool_result_count
+    );
+}
+
+#[tokio::test]
+async fn mixed_scheduler_runs_contiguous_parallel_groups_before_stateful_boundaries() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    harness.with_builtin_tools(vec![
+        scheduling_tool("parallel_a", ToolExecutionClass::ParallelSafe, 5, "a", &log),
+        scheduling_tool(
+            "parallel_b",
+            ToolExecutionClass::ParallelSafe,
+            30,
+            "b",
+            &log,
+        ),
+        scheduling_tool("serial", ToolExecutionClass::SerialStateful, 0, "s", &log),
+        scheduling_tool("parallel_c", ToolExecutionClass::ParallelSafe, 0, "c", &log),
+    ]);
+    let calls = vec![
+        mock_querymt_tool_call("call-a", "parallel_a", "{}"),
+        mock_querymt_tool_call("call-b", "parallel_b", "{}"),
+        mock_querymt_tool_call("call-s", "serial", "{}"),
+        mock_querymt_tool_call("call-c", "parallel_c", "{}"),
+    ];
+    let mut seq = Sequence::new();
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |_, _| Ok(Box::new(MockChatResponse::with_tools("", calls.clone()))));
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(|_, _| Ok(Box::new(MockChatResponse::text_only("done"))));
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+    let log = log.lock().unwrap().clone();
+    let position = |entry: &str| log.iter().position(|item| item == entry).unwrap();
+    assert!(position("start:parallel_b") < position("end:parallel_a"));
+    assert!(position("end:parallel_a") < position("start:serial"));
+    assert!(position("end:parallel_b") < position("start:serial"));
+    assert!(position("end:serial") < position("start:parallel_c"));
+}
+
+#[tokio::test]
+async fn mixed_scheduler_skips_suffix_after_clarification_boundary() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    harness.with_builtin_tools(vec![
+        scheduling_tool(
+            "clarify",
+            ToolExecutionClass::ClarificationBoundary,
+            0,
+            "use option b",
+            &log,
+        ),
+        scheduling_tool(
+            "suffix",
+            ToolExecutionClass::ParallelSafe,
+            0,
+            "suffix",
+            &log,
+        ),
+    ]);
+    let calls = vec![
+        mock_querymt_tool_call("call-q", "clarify", "{}"),
+        mock_querymt_tool_call("call-suffix", "suffix", "{}"),
+    ];
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .returning(move |_, _| Ok(Box::new(MockChatResponse::with_tools("", calls.clone()))))
+        .times(1);
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .returning(|_, _| Ok(Box::new(MockChatResponse::text_only("done"))))
+        .times(1);
+    let outcome = harness.run().await;
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+    assert!(
+        !log.lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.contains("suffix"))
+    );
+}
+
+#[tokio::test]
+async fn mixed_scheduler_cancellation_stores_one_result_per_call() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let cancelling: Arc<dyn AgentTool> = Arc::new(SchedulingTool {
+        name: "cancel",
+        class: ToolExecutionClass::SerialStateful,
+        delay_ms: 0,
+        result: "cancelled",
+        log: log.clone(),
+        cancel_on_start: true,
+    });
+    harness.with_builtin_tools(vec![
+        cancelling,
+        scheduling_tool("after_a", ToolExecutionClass::ParallelSafe, 0, "a", &log),
+        scheduling_tool("after_b", ToolExecutionClass::ParallelSafe, 0, "b", &log),
+    ]);
+    let calls = vec![
+        mock_querymt_tool_call("call-cancel", "cancel", "{}"),
+        mock_querymt_tool_call("call-a", "after_a", "{}"),
+        mock_querymt_tool_call("call-b", "after_b", "{}"),
+    ];
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .returning(move |_, _| Ok(Box::new(MockChatResponse::with_tools("", calls.clone()))))
+        .times(1);
+
+    assert_eq!(harness.run().await, CycleOutcome::Cancelled);
+    assert_eq!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.starts_with("start:"))
+            .count(),
+        1
+    );
+    let stored = harness.stored_messages.lock().unwrap();
+    let result_call_ids: BTreeSet<_> = stored
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .filter_map(|part| match part {
+            crate::model::MessagePart::ToolResult { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        result_call_ids,
+        BTreeSet::from(["call-a", "call-b", "call-cancel"])
     );
 }
 

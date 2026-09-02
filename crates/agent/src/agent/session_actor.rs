@@ -1845,12 +1845,15 @@ async fn validate_execution_task(
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "none".to_string())
-        )
+        ),
+        admission_ms = tracing::field::Empty,
+        intent_projection_ms = tracing::field::Empty,
     )
 )]
 async fn execute_prompt_detached(
     exec: DetachedPromptExecution,
 ) -> Result<PromptResponse, AgentError> {
+    let admission_started = std::time::Instant::now();
     let DetachedPromptExecution {
         req,
         session_id,
@@ -2077,6 +2080,7 @@ async fn execute_prompt_detached(
         },
     );
 
+    let intent_started = std::time::Instant::now();
     if let Err(error) =
         maybe_update_session_intent(&config, &session_id, &mut exec_ctx, &user_text, &message_id)
             .await
@@ -2086,6 +2090,10 @@ async fn execute_prompt_detached(
             message_id, error
         );
     }
+    tracing::Span::current().record(
+        "intent_projection_ms",
+        intent_started.elapsed().as_millis() as u64,
+    );
 
     let origin_label = match &exec_ctx.execution_origin {
         crate::agent::execution_context::ExecutionOrigin::Interactive => "interactive".to_string(),
@@ -2172,6 +2180,10 @@ async fn execute_prompt_detached(
         *runtime.pre_turn_snapshot_task.lock() = None;
     }
 
+    tracing::Span::current().record(
+        "admission_ms",
+        admission_started.elapsed().as_millis() as u64,
+    );
     debug!(
         "Session {}: entering execute_cycle_state_machine, cancelled={}",
         session_id,
@@ -2489,21 +2501,18 @@ mod tests {
             let writes_for_create = intent_writes.clone();
             let intent_for_create = current_intent.clone();
             store
-                .expect_create_intent_snapshot()
-                .returning(move |snapshot| {
+                .expect_create_and_set_current_intent_snapshot()
+                .returning(move |_, mut snapshot| {
                     writes_for_create.fetch_add(1, Ordering::SeqCst);
-                    *intent_for_create.lock().expect("intent lock") = Some(snapshot);
-                    Ok(())
+                    snapshot.id = 1;
+                    *intent_for_create.lock().expect("intent lock") = Some(snapshot.clone());
+                    Ok(snapshot)
                 })
                 .times(0..);
             let intent_for_get = current_intent.clone();
             store
                 .expect_get_current_intent_snapshot()
                 .returning(move |_| Ok(intent_for_get.lock().expect("intent lock").clone()))
-                .times(0..);
-            store
-                .expect_set_current_intent_snapshot()
-                .returning(|_, _| Ok(()))
                 .times(0..);
 
             let mock_storage = Arc::new(
