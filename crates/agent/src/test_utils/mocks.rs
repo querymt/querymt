@@ -126,6 +126,11 @@ mock! {
         async fn update_task(&self, task: Task) -> SessionResult<()>;
         async fn delete_task(&self, task_id: &str) -> SessionResult<()>;
         async fn create_intent_snapshot(&self, snapshot: IntentSnapshot) -> SessionResult<()>;
+        async fn create_and_set_current_intent_snapshot(
+            &self,
+            session_id: &str,
+            snapshot: IntentSnapshot,
+        ) -> SessionResult<IntentSnapshot>;
         async fn get_intent_snapshot(&self, snapshot_id: &str) -> SessionResult<Option<IntentSnapshot>>;
         async fn list_intent_snapshots(&self, session_id: &str) -> SessionResult<Vec<IntentSnapshot>>;
         async fn get_initial_intent_snapshot(&self, session_id: &str) -> SessionResult<Option<IntentSnapshot>>;

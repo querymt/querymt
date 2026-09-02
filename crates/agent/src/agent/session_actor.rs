@@ -2501,21 +2501,18 @@ mod tests {
             let writes_for_create = intent_writes.clone();
             let intent_for_create = current_intent.clone();
             store
-                .expect_create_intent_snapshot()
-                .returning(move |snapshot| {
+                .expect_create_and_set_current_intent_snapshot()
+                .returning(move |_, mut snapshot| {
                     writes_for_create.fetch_add(1, Ordering::SeqCst);
-                    *intent_for_create.lock().expect("intent lock") = Some(snapshot);
-                    Ok(())
+                    snapshot.id = 1;
+                    *intent_for_create.lock().expect("intent lock") = Some(snapshot.clone());
+                    Ok(snapshot)
                 })
                 .times(0..);
             let intent_for_get = current_intent.clone();
             store
                 .expect_get_current_intent_snapshot()
                 .returning(move |_| Ok(intent_for_get.lock().expect("intent lock").clone()))
-                .times(0..);
-            store
-                .expect_set_current_intent_snapshot()
-                .returning(|_, _| Ok(()))
                 .times(0..);
 
             let mock_storage = Arc::new(

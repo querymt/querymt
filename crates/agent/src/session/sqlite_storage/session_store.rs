@@ -59,19 +59,24 @@ fn insert_intent_snapshot(
     snapshot.id = conn.last_insert_rowid();
 
     // The title derives from the first intent; keep its search projection current.
-    conn.execute(
-        r#"INSERT INTO sessions_fts(sessions_fts, rowid) VALUES ('delete', ?1)"#,
+    let fts_row_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions_fts WHERE rowid = ?)",
         params![snapshot.session_id],
-    )
-    .ok();
+        |row| row.get(0),
+    )?;
+    if fts_row_exists {
+        conn.execute(
+            r#"INSERT INTO sessions_fts(sessions_fts, rowid) VALUES ('delete', ?1)"#,
+            params![snapshot.session_id],
+        )?;
+    }
     conn.execute(
         r#"INSERT INTO sessions_fts(rowid, public_id, name, cwd, title)
            SELECT s.id, s.public_id, COALESCE(s.name, ''), COALESCE(s.cwd, ''),
                   COALESCE((SELECT i.summary FROM intent_snapshots i WHERE i.session_id = s.id ORDER BY i.id ASC LIMIT 1), '')
            FROM sessions s WHERE s.id = ?1"#,
         params![snapshot.session_id],
-    )
-    .ok();
+    )?;
 
     Ok(snapshot)
 }
