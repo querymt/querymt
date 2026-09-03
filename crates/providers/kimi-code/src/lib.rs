@@ -199,7 +199,27 @@ impl ChatStreamParser for KimiCodeStreamParser {
             String::from_utf8_lossy(chunk)
         );
         let normalized = KimiCode::normalize_sse_data_prefix(chunk);
-        parse_openai_sse_chunk(&normalized, &mut self.tool_states)
+        let mut chunks = parse_openai_sse_chunk(&normalized, &mut self.tool_states)?;
+
+        // Kimi may omit tool call IDs and internally address those calls as
+        // `<function-name>:<index>`. Persist that ID so the subsequent tool
+        // response uses the same identifier when the conversation is replayed.
+        for chunk in &mut chunks {
+            match chunk {
+                StreamChunk::ToolUseStart { index, id, name } if id.is_empty() => {
+                    *id = format!("{name}:{index}");
+                    if let Some(state) = self.tool_states.get_mut(index) {
+                        state.id.clone_from(id);
+                    }
+                }
+                StreamChunk::ToolUseComplete { index, tool_call } if tool_call.id.is_empty() => {
+                    tool_call.id = format!("{}:{index}", tool_call.function.name);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(chunks)
     }
 }
 
@@ -700,6 +720,65 @@ mod tests {
             has_done,
             "expected Done with FinishReason::ToolCalls in {events3:?}"
         );
+    }
+
+    #[test]
+    fn missing_tool_call_id_is_stable_across_response_and_replay() {
+        use querymt::chat::{Content, StreamChunk};
+
+        let provider = test_provider();
+        let mut parser = provider
+            .chat_stream_parser()
+            .expect("stream parser should initialize");
+
+        let start = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"ls","arguments":"{\"path\":\".\"}"}}]}}]}
+
+"#;
+        let start_events = parser.parse_chunk(start).unwrap();
+        assert!(matches!(
+            &start_events[0],
+            StreamChunk::ToolUseStart { index: 0, id, name }
+                if id == "ls:0" && name == "ls"
+        ));
+
+        let finish = br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+"#;
+        let complete = parser
+            .parse_chunk(finish)
+            .unwrap()
+            .into_iter()
+            .find_map(|chunk| match chunk {
+                StreamChunk::ToolUseComplete { tool_call, .. } => Some(tool_call),
+                _ => None,
+            })
+            .expect("tool call should complete");
+        assert_eq!(complete.id, "ls:0");
+
+        let messages = vec![
+            ChatMessage::assistant()
+                .tool_use(
+                    complete.id.clone(),
+                    complete.function.name,
+                    serde_json::from_str(&complete.function.arguments).unwrap(),
+                )
+                .build(),
+            ChatMessage::user()
+                .tool_result(
+                    complete.id,
+                    Some("ls".to_string()),
+                    false,
+                    vec![Content::text("specs.md")],
+                )
+                .build(),
+        ];
+        let request = provider.chat_stream_request(&messages, None).unwrap();
+        let body: Value = serde_json::from_slice(request.body()).unwrap();
+        let api_messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(api_messages.len(), 2);
+        assert_eq!(api_messages[0]["tool_calls"][0]["id"], "ls:0");
+        assert_eq!(api_messages[1]["tool_call_id"], "ls:0");
     }
 
     #[test]
