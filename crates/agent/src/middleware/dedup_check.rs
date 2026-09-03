@@ -1082,8 +1082,11 @@ mod tests {
             call_id: "1".to_string(),
             content: vec![querymt::chat::Content::text("ok")],
             is_error: false,
+            execution_is_error: false,
+            tool_source: "builtin".to_string(),
             tool_name: Some("write_file".to_string()),
             tool_arguments: None,
+            hook_contexts: Vec::new(),
             snapshot_part: Some(MessagePart::Snapshot {
                 root_hash: crate::hash::RapidHash::new(b"test"),
                 changed_paths: DiffPaths {

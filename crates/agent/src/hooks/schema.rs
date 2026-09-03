@@ -11,6 +11,8 @@ pub const PERMISSION_REQUEST_INPUT_FIXTURE: &str = "permission-request.command.i
 pub const PERMISSION_REQUEST_OUTPUT_FIXTURE: &str = "permission-request.command.output.schema.json";
 pub const POST_TOOL_USE_INPUT_FIXTURE: &str = "post-tool-use.command.input.schema.json";
 pub const POST_TOOL_USE_OUTPUT_FIXTURE: &str = "post-tool-use.command.output.schema.json";
+pub const CONTEXT_INPUT_FIXTURE: &str = "context.command.input.schema.json";
+pub const CONTEXT_OUTPUT_FIXTURE: &str = "context.command.output.schema.json";
 pub const USER_PROMPT_SUBMIT_INPUT_FIXTURE: &str = "user-prompt-submit.command.input.schema.json";
 pub const USER_PROMPT_SUBMIT_OUTPUT_FIXTURE: &str = "user-prompt-submit.command.output.schema.json";
 pub const SESSION_START_INPUT_FIXTURE: &str = "session-start.command.input.schema.json";
@@ -29,6 +31,8 @@ pub const POST_DELEGATION_INPUT_FIXTURE: &str = "post-delegation.command.input.s
 pub const POST_DELEGATION_OUTPUT_FIXTURE: &str = "post-delegation.command.output.schema.json";
 pub const DELEGATION_FAILURE_INPUT_FIXTURE: &str = "delegation-failure.command.input.schema.json";
 pub const DELEGATION_FAILURE_OUTPUT_FIXTURE: &str = "delegation-failure.command.output.schema.json";
+pub const SESSION_END_INPUT_FIXTURE: &str = "session-end.command.input.schema.json";
+pub const SESSION_END_OUTPUT_FIXTURE: &str = "session-end.command.output.schema.json";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(transparent)]
@@ -148,9 +152,31 @@ pub struct PermissionRequestHookSpecificOutputWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ToolOutputPatchWire {
+    #[serde(default)]
+    pub content: Option<Vec<Value>>,
+    #[serde(default)]
+    pub is_error: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PostToolUseHookSpecificOutputWire {
     #[schemars(schema_with = "post_tool_use_hook_event_name_schema")]
     pub hook_event_name: String,
+    #[serde(default)]
+    pub updated_output: Option<ToolOutputPatchWire>,
+    #[serde(default)]
+    pub additional_context: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContextHookSpecificOutputWire {
+    #[schemars(schema_with = "context_hook_event_name_schema")]
+    pub hook_event_name: String,
+    #[serde(default)]
+    pub messages: Option<Vec<Value>>,
     #[serde(default)]
     pub additional_context: Option<String>,
 }
@@ -184,9 +210,17 @@ pub struct StopHookSpecificOutputWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct CompactionOutputWire {
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PreCompactionHookSpecificOutputWire {
     #[schemars(schema_with = "pre_compaction_hook_event_name_schema")]
     pub hook_event_name: String,
+    #[serde(default)]
+    pub compaction: Option<CompactionOutputWire>,
     #[serde(default)]
     pub additional_context: Option<String>,
 }
@@ -256,6 +290,16 @@ pub struct PostToolUseCommandOutputWire {
     pub reason: Option<String>,
     #[serde(default)]
     pub hook_specific_output: Option<PostToolUseHookSpecificOutputWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(rename = "context.command.output")]
+pub struct ContextCommandOutputWire {
+    #[serde(flatten)]
+    pub universal: HookUniversalOutputWire,
+    #[serde(default)]
+    pub hook_specific_output: Option<ContextHookSpecificOutputWire>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -364,6 +408,14 @@ pub struct DelegationFailureCommandOutputWire {
     pub hook_specific_output: Option<DelegationLifecycleHookSpecificOutputWire>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(rename = "session-end.command.output")]
+pub struct SessionEndCommandOutputWire {
+    #[serde(default)]
+    pub system_message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(rename = "pre-tool-use.command.input")]
@@ -401,6 +453,15 @@ pub struct PermissionRequestCommandInput {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct StructuredToolResultWire {
+    pub content: Vec<Value>,
+    pub is_error: bool,
+    pub execution_is_error: bool,
+    pub tool_source: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(rename = "post-tool-use.command.input")]
 pub struct PostToolUseCommandInput {
     pub session_id: String,
@@ -415,7 +476,27 @@ pub struct PostToolUseCommandInput {
     pub tool_name: String,
     pub tool_input: Value,
     pub tool_response: Value,
+    pub tool_result: StructuredToolResultWire,
     pub tool_use_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(rename = "context.command.input")]
+pub struct ContextCommandInput {
+    pub session_id: String,
+    pub turn_id: String,
+    pub transcript_path: NullableString,
+    pub cwd: String,
+    #[schemars(schema_with = "context_hook_event_name_schema")]
+    pub hook_event_name: String,
+    pub model: String,
+    #[schemars(schema_with = "permission_mode_schema")]
+    pub permission_mode: String,
+    pub trigger: String,
+    pub context_window: u32,
+    pub estimated_tokens: u32,
+    pub messages: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -481,6 +562,8 @@ pub struct PreCompactionCommandInput {
     pub trigger: String,
     pub token_estimate: u32,
     pub message_count: u32,
+    pub messages: Vec<Value>,
+    pub candidate_summary: NullableString,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -571,6 +654,21 @@ pub struct PostDelegationCommandInput {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(rename = "delegation-failure.command.input")]
+pub struct SessionEndCommandInput {
+    pub session_id: String,
+    pub transcript_path: NullableString,
+    pub cwd: String,
+    #[schemars(schema_with = "session_end_hook_event_name_schema")]
+    pub hook_event_name: String,
+    pub model: String,
+    #[schemars(schema_with = "permission_mode_schema")]
+    pub permission_mode: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(rename = "delegation-failure.command.input")]
 pub struct DelegationFailureCommandInput {
     pub session_id: String,
     pub turn_id: String,
@@ -616,6 +714,14 @@ pub fn write_schema_fixtures(schema_root: &Path) -> anyhow::Result<()> {
     write_schema(
         &generated_dir.join(POST_TOOL_USE_OUTPUT_FIXTURE),
         schema_json::<PostToolUseCommandOutputWire>()?,
+    )?;
+    write_schema(
+        &generated_dir.join(CONTEXT_INPUT_FIXTURE),
+        schema_json::<ContextCommandInput>()?,
+    )?;
+    write_schema(
+        &generated_dir.join(CONTEXT_OUTPUT_FIXTURE),
+        schema_json::<ContextCommandOutputWire>()?,
     )?;
     write_schema(
         &generated_dir.join(USER_PROMPT_SUBMIT_INPUT_FIXTURE),
@@ -689,6 +795,14 @@ pub fn write_schema_fixtures(schema_root: &Path) -> anyhow::Result<()> {
         &generated_dir.join(DELEGATION_FAILURE_OUTPUT_FIXTURE),
         schema_json::<DelegationFailureCommandOutputWire>()?,
     )?;
+    write_schema(
+        &generated_dir.join(SESSION_END_INPUT_FIXTURE),
+        schema_json::<SessionEndCommandInput>()?,
+    )?;
+    write_schema(
+        &generated_dir.join(SESSION_END_OUTPUT_FIXTURE),
+        schema_json::<SessionEndCommandOutputWire>()?,
+    )?;
 
     Ok(())
 }
@@ -753,6 +867,10 @@ fn post_tool_use_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
     string_const_schema("post_tool_use")
 }
 
+fn context_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
+    string_const_schema("context")
+}
+
 fn user_prompt_submit_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
     string_const_schema("user_prompt_submit")
 }
@@ -787,6 +905,10 @@ fn post_delegation_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema 
 
 fn delegation_failure_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
     string_const_schema("delegation_failure")
+}
+
+fn session_end_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
+    string_const_schema("session_end")
 }
 
 fn delegation_lifecycle_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {

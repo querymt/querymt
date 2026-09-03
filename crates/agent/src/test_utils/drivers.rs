@@ -499,7 +499,11 @@ impl MiddlewareDriver for BeforeLlmCallToCallLlmDriver {
         match state {
             ExecutionState::BeforeLlmCall { context } => Ok(ExecutionState::CallLlm {
                 context,
-                tools: Arc::from([]),
+                request: Arc::new(crate::middleware::PreparedModelRequest {
+                    messages: Arc::from([]),
+                    tools: Arc::from([]),
+                    estimated_tokens: 0,
+                }),
             }),
             other => Ok(other),
         }

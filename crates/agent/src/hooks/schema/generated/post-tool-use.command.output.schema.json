@@ -21,11 +21,43 @@
         "hook_event_name": {
           "const": "post_tool_use",
           "type": "string"
+        },
+        "updated_output": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ToolOutputPatchWire"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
         "hook_event_name"
       ],
+      "type": "object"
+    },
+    "ToolOutputPatchWire": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "default": null,
+          "items": true,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "is_error": {
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     }
   },

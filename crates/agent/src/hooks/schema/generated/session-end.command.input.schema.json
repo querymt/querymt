@@ -10,24 +10,12 @@
     }
   },
   "properties": {
-    "candidate_summary": {
-      "$ref": "#/definitions/NullableString"
-    },
     "cwd": {
       "type": "string"
     },
     "hook_event_name": {
-      "const": "pre_compaction",
+      "const": "session_end",
       "type": "string"
-    },
-    "message_count": {
-      "format": "uint32",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "messages": {
-      "items": true,
-      "type": "array"
     },
     "model": {
       "type": "string"
@@ -40,38 +28,25 @@
       ],
       "type": "string"
     },
+    "reason": {
+      "type": "string"
+    },
     "session_id": {
       "type": "string"
     },
-    "token_estimate": {
-      "format": "uint32",
-      "minimum": 0,
-      "type": "integer"
-    },
     "transcript_path": {
       "$ref": "#/definitions/NullableString"
-    },
-    "trigger": {
-      "type": "string"
-    },
-    "turn_id": {
-      "type": "string"
     }
   },
   "required": [
     "session_id",
-    "turn_id",
     "transcript_path",
     "cwd",
     "hook_event_name",
     "model",
     "permission_mode",
-    "trigger",
-    "token_estimate",
-    "message_count",
-    "messages",
-    "candidate_summary"
+    "reason"
   ],
-  "title": "pre-compaction.command.input",
+  "title": "delegation-failure.command.input",
   "type": "object"
 }

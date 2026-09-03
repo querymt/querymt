@@ -10,20 +10,22 @@
     }
   },
   "properties": {
-    "candidate_summary": {
-      "$ref": "#/definitions/NullableString"
+    "context_window": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
     },
     "cwd": {
       "type": "string"
     },
-    "hook_event_name": {
-      "const": "pre_compaction",
-      "type": "string"
-    },
-    "message_count": {
+    "estimated_tokens": {
       "format": "uint32",
       "minimum": 0,
       "type": "integer"
+    },
+    "hook_event_name": {
+      "const": "context",
+      "type": "string"
     },
     "messages": {
       "items": true,
@@ -42,11 +44,6 @@
     },
     "session_id": {
       "type": "string"
-    },
-    "token_estimate": {
-      "format": "uint32",
-      "minimum": 0,
-      "type": "integer"
     },
     "transcript_path": {
       "$ref": "#/definitions/NullableString"
@@ -67,11 +64,10 @@
     "model",
     "permission_mode",
     "trigger",
-    "token_estimate",
-    "message_count",
-    "messages",
-    "candidate_summary"
+    "context_window",
+    "estimated_tokens",
+    "messages"
   ],
-  "title": "pre-compaction.command.input",
+  "title": "context.command.input",
   "type": "object"
 }

@@ -2034,14 +2034,6 @@ async fn execute_prompt_detached(
         );
         return Err(AgentError::Internal(reason));
     }
-    if !hook_result.additional_contexts.is_empty() {
-        log::debug!(
-            "Session {}: ignoring {} hook additional_context item(s) for MVP",
-            session_id,
-            hook_result.additional_contexts.len()
-        );
-    }
-
     config.emit_event(
         &session_id,
         AgentEventKind::PromptReceived {
@@ -2050,13 +2042,25 @@ async fn execute_prompt_detached(
         },
     );
 
+    let mut parts = vec![MessagePart::Prompt {
+        blocks: req.prompt.clone(),
+    }];
+    parts.extend(
+        hook_result
+            .context_contributions
+            .into_iter()
+            .map(|context| MessagePart::HookContext {
+                event_name: context.event_name,
+                handler_id: context.handler_id,
+                tool_use_id: context.tool_use_id,
+                content: context.content,
+            }),
+    );
     let agent_msg = AgentMessage {
         id: message_id.clone(),
         session_id: session_id.clone(),
         role: ChatRole::User,
-        parts: vec![MessagePart::Prompt {
-            blocks: req.prompt.clone(),
-        }],
+        parts,
         created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
         parent_message_id: None,
         source_provider: None,

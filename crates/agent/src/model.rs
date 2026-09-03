@@ -38,6 +38,13 @@ pub enum MessagePart {
         cost: Option<f64>,
     },
     ToolUse(ToolCall),
+    HookContext {
+        event_name: String,
+        handler_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<String>,
+        content: String,
+    },
     ToolResult {
         call_id: String,
         content: Vec<Content>,
@@ -90,6 +97,7 @@ impl MessagePart {
             MessagePart::StepStart { .. } => "step_start",
             MessagePart::StepFinish { .. } => "step_finish",
             MessagePart::ToolUse(_) => "tool_use",
+            MessagePart::HookContext { .. } => "hook_context",
             MessagePart::ToolResult { .. } => "tool_result",
             MessagePart::Patch { .. } => "patch",
             MessagePart::Snapshot { .. } => "snapshot",
@@ -212,6 +220,21 @@ impl AgentMessage {
                         serde_json::from_str(&tc.function.arguments)
                             .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
                     ));
+                }
+                MessagePart::HookContext {
+                    event_name,
+                    handler_id,
+                    tool_use_id,
+                    content,
+                } => {
+                    let tool_label = tool_use_id
+                        .as_deref()
+                        .map(|id| format!(" tool_use_id={}", id))
+                        .unwrap_or_default();
+                    blocks.push(Content::text(format!(
+                        "<hook-context event={} handler={}{}>\n{}\n</hook-context>",
+                        event_name, handler_id, tool_label, content
+                    )));
                 }
                 MessagePart::ToolResult {
                     call_id,

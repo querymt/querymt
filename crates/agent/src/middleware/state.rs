@@ -109,6 +109,14 @@ pub struct ContextFragment {
 
 /// Context passed to middleware during state transitions
 #[derive(Debug, Clone)]
+pub struct PreparedModelRequest {
+    pub messages: Arc<[ChatMessage]>,
+    pub tools: Arc<[querymt::chat::Tool]>,
+    pub estimated_tokens: usize,
+}
+
+/// Context passed to middleware during state transitions
+#[derive(Debug, Clone)]
 pub struct ConversationContext {
     pub session_id: Arc<str>,
     pub messages: Arc<[ChatMessage]>,
@@ -221,7 +229,29 @@ impl ConversationContext {
 
     pub fn request_messages(&self) -> Vec<ChatMessage> {
         let mut messages = self.messages.to_vec();
-        messages.extend(self.fragment_messages());
+        let fragments = self.fragment_messages();
+        if fragments.is_empty() {
+            return messages;
+        }
+
+        // Keep the latest durable turn last. This preserves delegation and other
+        // resumed-turn feedback while still avoiding a message between tool use
+        // and its immediately following result.
+        if let Some(last) = messages.last()
+            && last.role == ChatRole::User
+            && last.content.iter().any(Content::is_tool_result)
+        {
+            let mut latest = messages.pop().expect("latest message was present");
+            latest
+                .content
+                .extend(fragments.into_iter().flat_map(|fragment| fragment.content));
+            messages.push(latest);
+        } else if let Some(latest) = messages.pop() {
+            messages.extend(fragments);
+            messages.push(latest);
+        } else {
+            messages.extend(fragments);
+        }
         messages
     }
 
@@ -310,8 +340,11 @@ pub struct ToolResult {
     pub call_id: String,
     pub content: Vec<Content>,
     pub is_error: bool,
+    pub execution_is_error: bool,
+    pub tool_source: String,
     pub tool_name: Option<String>,
     pub tool_arguments: Option<String>,
+    pub hook_contexts: Vec<crate::hooks::HookContextContribution>,
     pub snapshot_part: Option<MessagePart>,
 }
 
@@ -327,10 +360,27 @@ impl ToolResult {
             call_id,
             content,
             is_error,
+            execution_is_error: is_error,
+            tool_source: "unknown".to_string(),
             tool_name,
             tool_arguments,
+            hook_contexts: Vec::new(),
             snapshot_part: None,
         }
+    }
+
+    pub fn with_execution(mut self, is_error: bool, source: impl Into<String>) -> Self {
+        self.execution_is_error = is_error;
+        self.tool_source = source.into();
+        self
+    }
+
+    pub fn with_hook_contexts(
+        mut self,
+        contexts: Vec<crate::hooks::HookContextContribution>,
+    ) -> Self {
+        self.hook_contexts = contexts;
+        self
     }
 
     pub fn with_snapshot(mut self, part: MessagePart) -> Self {
@@ -398,7 +448,7 @@ pub enum ExecutionState {
     /// Ready to call the LLM with tools
     CallLlm {
         context: Arc<ConversationContext>,
-        tools: Arc<[querymt::chat::Tool]>,
+        request: Arc<PreparedModelRequest>,
     },
 
     /// After receiving LLM response
@@ -470,6 +520,61 @@ impl ExecutionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_messages_keep_latest_feedback_after_context_fragments() {
+        let latest = ChatMessage {
+            role: ChatRole::User,
+            content: vec![Content::text("Delegation completed")],
+            cache: None,
+        };
+        let context = ConversationContext::new(
+            Arc::from("session"),
+            Arc::from([latest]),
+            Arc::new(AgentStats::default()),
+            Arc::from("provider"),
+            Arc::from("model"),
+        )
+        .upsert_fragment(
+            "run_objective",
+            "objective".to_string(),
+            ContextPriority::High,
+        );
+
+        let messages = context.request_messages();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text(), "objective");
+        assert_eq!(messages[1].text(), "Delegation completed");
+    }
+
+    #[test]
+    fn request_messages_append_fragments_after_tool_results() {
+        let latest = ChatMessage {
+            role: ChatRole::User,
+            content: vec![Content::tool_result(
+                "call-1".to_string(),
+                vec![Content::text("result")],
+            )],
+            cache: None,
+        };
+        let context = ConversationContext::new(
+            Arc::from("session"),
+            Arc::from([latest]),
+            Arc::new(AgentStats::default()),
+            Arc::from("provider"),
+            Arc::from("model"),
+        )
+        .upsert_fragment(
+            "run_objective",
+            "objective".to_string(),
+            ContextPriority::High,
+        );
+
+        let messages = context.request_messages();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content[0].is_tool_result());
+        assert_eq!(messages[0].content[1].as_text(), Some("objective"));
+    }
 
     #[test]
     fn test_tool_result_with_snapshot() {

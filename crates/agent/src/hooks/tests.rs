@@ -1,11 +1,14 @@
-use super::engine::{Hooks, PostToolUseRequest, PreToolUseRequest, StopRequest};
+use super::engine::{
+    ContextHookRequest, Hooks, PostToolUseRequest, PreCompactionRequest, PreToolUseRequest,
+    StopRequest,
+};
 use super::schema;
 use crate::hooks::config::{HookHandlerConfig, HooksConfig, MatcherGroupConfig};
 use crate::hooks::schema::{
     PermissionRequestCommandOutputWire, PreCompactionCommandOutputWire,
     PreDelegationCommandOutputWire, PreToolUseCommandInput, StopCommandOutputWire,
 };
-use crate::hooks::{HookCommandConfig, HookEventConfig};
+use crate::hooks::{HookCommandConfig, HookEventConfig, HookMcpToolConfig};
 use schemars::JsonSchema;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -27,6 +30,8 @@ fn generated_hook_schemas_match_expected_fixtures() {
         schema::PERMISSION_REQUEST_OUTPUT_FIXTURE,
         schema::POST_TOOL_USE_INPUT_FIXTURE,
         schema::POST_TOOL_USE_OUTPUT_FIXTURE,
+        schema::CONTEXT_INPUT_FIXTURE,
+        schema::CONTEXT_OUTPUT_FIXTURE,
         schema::USER_PROMPT_SUBMIT_INPUT_FIXTURE,
         schema::USER_PROMPT_SUBMIT_OUTPUT_FIXTURE,
         schema::SESSION_START_INPUT_FIXTURE,
@@ -45,6 +50,8 @@ fn generated_hook_schemas_match_expected_fixtures() {
         schema::POST_DELEGATION_OUTPUT_FIXTURE,
         schema::DELEGATION_FAILURE_INPUT_FIXTURE,
         schema::DELEGATION_FAILURE_OUTPUT_FIXTURE,
+        schema::SESSION_END_INPUT_FIXTURE,
+        schema::SESSION_END_OUTPUT_FIXTURE,
     ] {
         let generated = std::fs::read(generated_dir.join(file_name)).expect("generated fixture");
         let expected = std::fs::read(expected_dir.join(file_name)).expect("expected fixture");
@@ -153,9 +160,11 @@ fn hooks_config_accepts_command_hooks() {
         session_start: vec![MatcherGroupConfig {
             matcher: None,
             hooks: vec![HookHandlerConfig::Command(HookCommandConfig {
+                id: None,
                 command: "echo ok".to_string(),
                 timeout_sec: Some(5),
                 status_message: Some("check".to_string()),
+                additional_context_limit: None,
                 env: BTreeMap::new(),
             })],
         }],
@@ -178,6 +187,7 @@ fn hook_event_labels_are_stable() {
         "permission_request"
     );
     assert_eq!(HookEventConfig::PostToolUse.label(), "post_tool_use");
+    assert_eq!(HookEventConfig::Context.label(), "context");
     assert_eq!(HookEventConfig::Stop.label(), "stop");
     assert_eq!(HookEventConfig::PreCompaction.label(), "pre_compaction");
     assert_eq!(HookEventConfig::PostCompaction.label(), "post_compaction");
@@ -188,6 +198,7 @@ fn hook_event_labels_are_stable() {
         HookEventConfig::DelegationFailure.label(),
         "delegation_failure"
     );
+    assert_eq!(HookEventConfig::SessionEnd.label(), "session_end");
 }
 
 #[tokio::test]
@@ -207,9 +218,11 @@ printf '{"continue":true,"decision":"block","reason":"blocked from script"}'
         pre_tool_use: vec![MatcherGroupConfig {
             matcher: Some("^shell$".to_string()),
             hooks: vec![HookHandlerConfig::Command(HookCommandConfig {
+                id: None,
                 command: format!("sh {}", script.display()),
                 timeout_sec: Some(5),
                 status_message: None,
+                additional_context_limit: None,
                 env: BTreeMap::new(),
             })],
         }],
@@ -220,6 +233,7 @@ printf '{"continue":true,"decision":"block","reason":"blocked from script"}'
         .expect("hooks")
         .run_pre_tool_use(PreToolUseRequest {
             session_id: "s1".to_string(),
+            mcp_tool_state: None,
             turn_id: "t1".to_string(),
             cwd: Some(dir.path().to_path_buf()),
             model: "mock".to_string(),
@@ -252,9 +266,11 @@ printf 'this is not json'
         post_tool_use: vec![MatcherGroupConfig {
             matcher: Some("^shell$".to_string()),
             hooks: vec![HookHandlerConfig::Command(HookCommandConfig {
+                id: None,
                 command: format!("sh {}", script.display()),
                 timeout_sec: Some(5),
                 status_message: None,
+                additional_context_limit: None,
                 env: BTreeMap::new(),
             })],
         }],
@@ -265,13 +281,17 @@ printf 'this is not json'
         .expect("hooks")
         .run_post_tool_use(PostToolUseRequest {
             session_id: "s1".to_string(),
+            mcp_tool_state: None,
             turn_id: "t1".to_string(),
             cwd: Some(dir.path().to_path_buf()),
             model: "mock".to_string(),
             permission_mode: "default".to_string(),
             tool_name: "shell".to_string(),
             tool_input: json!({"command": "echo hi"}),
-            tool_response: json!("ok"),
+            content: vec![querymt::chat::Content::text("ok")],
+            is_error: false,
+            execution_is_error: false,
+            tool_source: "builtin".to_string(),
             tool_use_id: "tool1".to_string(),
         })
         .await
@@ -306,9 +326,11 @@ printf '{"continue":false,"reason":"continue please","hook_specific_output":{"ho
         stop: vec![MatcherGroupConfig {
             matcher: None,
             hooks: vec![HookHandlerConfig::Command(HookCommandConfig {
+                id: None,
                 command: format!("sh {}", script.display()),
                 timeout_sec: Some(5),
                 status_message: None,
+                additional_context_limit: None,
                 env: BTreeMap::new(),
             })],
         }],
@@ -334,6 +356,227 @@ printf '{"continue":false,"reason":"continue please","hook_specific_output":{"ho
         result.additional_contexts,
         vec!["one more pass".to_string()]
     );
+}
+
+#[test]
+fn hooks_config_accepts_mcp_tool_hooks() {
+    let config = HooksConfig {
+        enabled: true,
+        context: vec![MatcherGroupConfig {
+            matcher: None,
+            hooks: vec![HookHandlerConfig::McpTool(HookMcpToolConfig {
+                id: Some("retriever".into()),
+                server: "memory".into(),
+                tool: "retrieve".into(),
+                input: Some(json!({"query":"$event.model"})),
+                timeout_sec: Some(5),
+                status_message: Some("Retrieving context".into()),
+                additional_context_limit: Some(500),
+            })],
+        }],
+        ..HooksConfig::default()
+    };
+    Hooks::new(config).expect("valid MCP hook config");
+}
+
+#[test]
+fn mcp_input_templates_only_resolve_explicit_event_paths() {
+    let event = json!({"model":"test-model","nested":{"value":7}});
+    let resolved = super::engine::resolve_mcp_input_template_for_test(
+        &json!({"query":"$event.model","value":"$event.nested.value"}),
+        &event,
+    )
+    .unwrap();
+    assert_eq!(resolved, json!({"query":"test-model","value":7}));
+    assert!(
+        super::engine::resolve_mcp_input_template_for_test(
+            &json!({"bad":"$event.missing"}),
+            &event,
+        )
+        .is_err()
+    );
+}
+
+fn command_hook(command: String) -> HookHandlerConfig {
+    HookHandlerConfig::Command(HookCommandConfig {
+        id: None,
+        command,
+        timeout_sec: Some(5),
+        status_message: None,
+        additional_context_limit: None,
+        env: BTreeMap::new(),
+    })
+}
+
+#[tokio::test]
+async fn exit_two_blocks_with_stderr_and_surfaces_system_message() {
+    let config = HooksConfig {
+        enabled: true,
+        pre_tool_use: vec![MatcherGroupConfig {
+            matcher: Some("^shell$".into()),
+            hooks: vec![command_hook(
+                "printf '{\"system_message\":\"ignored stdout\"}'; printf 'policy denied' >&2; exit 2"
+                    .into(),
+            )],
+        }],
+        ..HooksConfig::default()
+    };
+    let result = Hooks::new(config)
+        .unwrap()
+        .run_pre_tool_use(PreToolUseRequest {
+            session_id: "s".into(),
+            mcp_tool_state: None,
+            turn_id: "t".into(),
+            cwd: None,
+            model: "m".into(),
+            permission_mode: "default".into(),
+            tool_name: "shell".into(),
+            tool_input: json!({"command":"true"}),
+            tool_use_id: "u".into(),
+        })
+        .await
+        .unwrap();
+    assert!(result.should_block);
+    assert_eq!(result.block_reason.as_deref(), Some("policy denied"));
+    assert_eq!(result.notices[0].message, "ignored stdout");
+}
+
+#[tokio::test]
+async fn pre_tool_rewrites_chain_in_order() {
+    let second = r#"input=$(cat); case "$input" in *first*) printf '%s' '{"hook_specific_output":{"hook_event_name":"pre_tool_use","permission_decision":"allow","updated_input":{"command":"second"}}}' ;; *) exit 9 ;; esac"#;
+    let config = HooksConfig {
+        enabled: true,
+        pre_tool_use: vec![MatcherGroupConfig {
+            matcher: Some("^shell$".into()),
+            hooks: vec![
+                command_hook("printf '%s' '{\"hook_specific_output\":{\"hook_event_name\":\"pre_tool_use\",\"permission_decision\":\"allow\",\"updated_input\":{\"command\":\"first\"}}}'".into()),
+                command_hook(second.into()),
+            ],
+        }],
+        ..HooksConfig::default()
+    };
+    let result = Hooks::new(config)
+        .unwrap()
+        .run_pre_tool_use(PreToolUseRequest {
+            session_id: "s".into(),
+            mcp_tool_state: None,
+            turn_id: "t".into(),
+            cwd: None,
+            model: "m".into(),
+            permission_mode: "default".into(),
+            tool_name: "shell".into(),
+            tool_input: json!({"command":"original"}),
+            tool_use_id: "u".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.updated_input, Some(json!({"command":"second"})));
+}
+
+#[tokio::test]
+async fn post_tool_patches_chain_and_preserve_execution_truth() {
+    let second = r#"input=$(cat); case "$input" in *redacted*) printf '%s' '{"hook_specific_output":{"hook_event_name":"post_tool_use","updated_output":{"is_error":true}}}' ;; *) exit 9 ;; esac"#;
+    let config = HooksConfig {
+        enabled: true,
+        post_tool_use: vec![MatcherGroupConfig {
+            matcher: Some("^shell$".into()),
+            hooks: vec![
+                command_hook("printf '%s' '{\"hook_specific_output\":{\"hook_event_name\":\"post_tool_use\",\"updated_output\":{\"content\":[{\"type\":\"text\",\"text\":\"redacted\"}]}}}'".into()),
+                command_hook(second.into()),
+            ],
+        }],
+        ..HooksConfig::default()
+    };
+    let result = Hooks::new(config)
+        .unwrap()
+        .run_post_tool_use(PostToolUseRequest {
+            session_id: "s".into(),
+            mcp_tool_state: None,
+            turn_id: "t".into(),
+            cwd: None,
+            model: "m".into(),
+            permission_mode: "default".into(),
+            tool_name: "shell".into(),
+            tool_input: json!({}),
+            content: vec![querymt::chat::Content::text("secret")],
+            is_error: false,
+            execution_is_error: false,
+            tool_source: "builtin".into(),
+            tool_use_id: "u".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.content.unwrap()[0].as_text(), Some("redacted"));
+    assert_eq!(result.is_error, Some(true));
+}
+
+#[tokio::test]
+async fn context_replacement_is_request_only_and_chained() {
+    let config = HooksConfig {
+        enabled: true,
+        context: vec![MatcherGroupConfig {
+            matcher: None,
+            hooks: vec![command_hook("printf '%s' '{\"hook_specific_output\":{\"hook_event_name\":\"context\",\"messages\":[{\"role\":\"User\",\"content\":[{\"type\":\"text\",\"text\":\"projected\"}],\"cache\":null}],\"additional_context\":\"memory\"}}'".into())],
+        }],
+        ..HooksConfig::default()
+    };
+    let stored = vec![querymt::chat::ChatMessage {
+        role: querymt::chat::ChatRole::User,
+        content: vec![querymt::chat::Content::text("stored")],
+        cache: None,
+    }];
+    let result = Hooks::new(config)
+        .unwrap()
+        .run_context(ContextHookRequest {
+            session_id: "s".into(),
+            mcp_tool_state: None,
+            turn_id: "t".into(),
+            cwd: None,
+            model: "m".into(),
+            permission_mode: "default".into(),
+            trigger: "user_prompt".into(),
+            context_window: 1000,
+            messages: stored.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored[0].content[0].as_text(), Some("stored"));
+    let projected = result.messages.unwrap();
+    assert_eq!(projected[0].content[0].as_text(), Some("projected"));
+    assert!(
+        projected[0].content[1]
+            .as_text()
+            .unwrap()
+            .contains("memory")
+    );
+}
+
+#[tokio::test]
+async fn pre_compaction_accepts_custom_summary() {
+    let config = HooksConfig {
+        enabled: true,
+        pre_compaction: vec![MatcherGroupConfig {
+            matcher: None,
+            hooks: vec![command_hook("printf '%s' '{\"hook_specific_output\":{\"hook_event_name\":\"pre_compaction\",\"compaction\":{\"summary\":\"custom summary\"}}}'".into())],
+        }],
+        ..HooksConfig::default()
+    };
+    let result = Hooks::new(config)
+        .unwrap()
+        .run_pre_compaction(PreCompactionRequest {
+            session_id: "s".into(),
+            turn_id: "t".into(),
+            cwd: None,
+            model: "m".into(),
+            permission_mode: "default".into(),
+            trigger: "context_threshold".into(),
+            token_estimate: 100,
+            message_count: 2,
+            messages: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.custom_summary.as_deref(), Some("custom summary"));
 }
 
 fn assert_matches_schema<T>(value: &serde_json::Value)

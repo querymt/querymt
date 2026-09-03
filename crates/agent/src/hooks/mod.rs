@@ -8,16 +8,18 @@ pub mod schema;
 mod tests;
 
 pub use config::{
-    HookCommandConfig, HookEventConfig, HookHandlerConfig, HooksConfig, MatcherGroupConfig,
+    HookCommandConfig, HookEventConfig, HookHandlerConfig, HookMcpToolConfig, HooksConfig,
+    MatcherGroupConfig,
 };
 pub use engine::{
-    DelegationFailureRequest, DelegationFailureResult, DelegationStartRequest,
-    DelegationStartResult, HookNotice, Hooks, PermissionRequestDecision, PermissionRequestRequest,
-    PermissionRequestResult, PostCompactionRequest, PostCompactionResult, PostDelegationRequest,
-    PostDelegationResult, PostToolUseRequest, PostToolUseResult, PreCompactionRequest,
-    PreCompactionResult, PreDelegationRequest, PreDelegationResult, PreToolUseRequest,
-    PreToolUseResult, SessionStartRequest, SessionStartResult, StopRequest, StopResult,
-    UpdatedDelegation, UserPromptSubmitRequest, UserPromptSubmitResult,
+    ContextHookRequest, ContextHookResult, DelegationFailureRequest, DelegationFailureResult,
+    DelegationStartRequest, DelegationStartResult, HookContextContribution, HookNotice, Hooks,
+    PermissionRequestDecision, PermissionRequestRequest, PermissionRequestResult,
+    PostCompactionRequest, PostCompactionResult, PostDelegationRequest, PostDelegationResult,
+    PostToolUseRequest, PostToolUseResult, PreCompactionRequest, PreCompactionResult,
+    PreDelegationRequest, PreDelegationResult, PreToolUseRequest, PreToolUseResult,
+    SessionEndRequest, SessionEndResult, SessionStartRequest, SessionStartResult, StopRequest,
+    StopResult, UpdatedDelegation, UserPromptSubmitRequest, UserPromptSubmitResult,
 };
 
 pub fn permission_mode_label(mode: crate::agent::core::AgentMode) -> &'static str {

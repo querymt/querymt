@@ -129,6 +129,10 @@ pub(super) async fn run_ai_compaction(
             trigger: "context_threshold".to_string(),
             token_estimate: token_estimate_u32,
             message_count,
+            messages: messages
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()?,
         })
         .await?;
     for notice in pre_hook.notices {
@@ -166,12 +170,6 @@ pub(super) async fn run_ai_compaction(
         },
     );
 
-    let llm_provider = exec_ctx
-        .session_handle
-        .provider()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to get LLM provider: {}", e))?;
-
     let llm_config = exec_ctx
         .llm_config()
         .ok_or_else(|| anyhow::anyhow!("No LLM config for session"))?;
@@ -183,25 +181,37 @@ pub(super) async fn run_ai_compaction(
         .as_ref()
         .unwrap_or(&llm_config.model);
 
-    let retry_config = crate::session::compaction::RetryConfig {
-        max_retries: config.execution_policy.compaction.retry.max_retries,
-        initial_backoff_ms: config.execution_policy.compaction.retry.initial_backoff_ms,
-        backoff_multiplier: config.execution_policy.compaction.retry.backoff_multiplier,
+    let mut result = if let Some(summary) = pre_hook.custom_summary {
+        crate::session::compaction::CompactionResult {
+            summary_token_count: summary.len() / 4,
+            summary,
+            original_token_count: token_estimate,
+        }
+    } else {
+        let llm_provider = exec_ctx
+            .session_handle
+            .provider()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get LLM provider: {}", e))?;
+        let retry_config = crate::session::compaction::RetryConfig {
+            max_retries: config.execution_policy.compaction.retry.max_retries,
+            initial_backoff_ms: config.execution_policy.compaction.retry.initial_backoff_ms,
+            backoff_multiplier: config.execution_policy.compaction.retry.backoff_multiplier,
+        };
+        config
+            .compaction
+            .process(
+                &messages,
+                llm_provider,
+                model,
+                &retry_config,
+                exec_ctx
+                    .execution_config()
+                    .and_then(|cfg| cfg.max_prompt_bytes),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Compaction failed: {}", e))?
     };
-
-    let mut result = config
-        .compaction
-        .process(
-            &messages,
-            llm_provider,
-            model,
-            &retry_config,
-            exec_ctx
-                .execution_config()
-                .and_then(|cfg| cfg.max_prompt_bytes),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("Compaction failed: {}", e))?;
 
     let post_hook = config
         .hooks

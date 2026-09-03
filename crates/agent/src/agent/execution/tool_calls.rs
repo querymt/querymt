@@ -63,6 +63,7 @@ pub(super) async fn execute_tool_call(
         .hooks
         .run_pre_tool_use(PreToolUseRequest {
             session_id: exec_ctx.session_id.clone(),
+            mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
             turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: exec_ctx
@@ -88,13 +89,10 @@ pub(super) async fn execute_tool_call(
     if let Some(updated_input) = hook_result.updated_input {
         args = updated_input;
     }
-    if !hook_result.additional_contexts.is_empty() {
-        log::debug!(
-            "Session {}: ignoring {} pre-tool-use hook additional_context item(s) for MVP",
-            exec_ctx.session_id,
-            hook_result.additional_contexts.len()
-        );
-    }
+    let hook_allows_interactive = matches!(
+        hook_result.permission_decision,
+        Some(crate::hooks::engine::PreToolPermissionDecision::Allow)
+    );
     if hook_result.should_block {
         let reason = hook_result
             .block_reason
@@ -105,7 +103,25 @@ pub(super) async fn execute_tool_call(
             true,
             Some(call.function.name.clone()),
             Some(serde_json::to_string(&args).unwrap_or_else(|_| call.function.arguments.clone())),
-        ));
+        )
+        .with_execution(true, "blocked")
+        .with_hook_contexts(hook_result.context_contributions));
+    }
+
+    if let Err(error) = validate_tool_arguments(config, exec_ctx, &call.function.name, &args).await
+    {
+        return Ok(ToolResult::new(
+            call.id.clone(),
+            vec![Content::text(format!(
+                "Error: invalid tool arguments: {}",
+                error
+            ))],
+            true,
+            Some(call.function.name.clone()),
+            Some(serde_json::to_string(&args).unwrap_or_else(|_| call.function.arguments.clone())),
+        )
+        .with_execution(true, "validation")
+        .with_hook_contexts(hook_result.context_contributions));
     }
 
     let arguments_json =
@@ -288,23 +304,24 @@ pub(super) async fn execute_tool_call(
                 Ok(res) => (res, false, "mcp"),
                 Err(e) => (vec![Content::text(format!("Error: {}", e))], true, "mcp"),
             }
-        } else if !ensure_tool_permission(
-            config,
-            exec_ctx,
-            &call.id,
-            &call.function.name,
-            &args,
-            bridge,
-            exec_ctx.turn_id().unwrap_or_default(),
-        )
-        .instrument(info_span!(
-            "agent.tool.permission_wait",
-            tool_name = %call.function.name,
-            tool_call_id = %call.id,
-            session_id = %exec_ctx.session_id,
-        ))
-        .await
-        .map_err(|e| anyhow::anyhow!("Permission check failed: {}", e))?
+        } else if !hook_allows_interactive
+            && !ensure_tool_permission(
+                config,
+                exec_ctx,
+                &call.id,
+                &call.function.name,
+                &args,
+                bridge,
+                exec_ctx.turn_id().unwrap_or_default(),
+            )
+            .instrument(info_span!(
+                "agent.tool.permission_wait",
+                tool_name = %call.function.name,
+                tool_call_id = %call.id,
+                session_id = %exec_ctx.session_id,
+            ))
+            .await
+            .map_err(|e| anyhow::anyhow!("Permission check failed: {}", e))?
         {
             (
                 vec![Content::text("Error: permission denied")],
@@ -336,70 +353,16 @@ pub(super) async fn execute_tool_call(
     span.record("tool_source", tool_source);
     span.record("is_error", is_error);
 
-    // Apply Layer 1 truncation to text content blocks.
-    let result_blocks = if !is_error {
-        use crate::tools::builtins::helpers::{
-            TruncationDirection, format_truncation_message_with_overflow, save_overflow_output,
-            truncate_output,
-        };
-        let tc = &config.execution_policy.tool_output;
-
-        let raw_text: String = raw_result_blocks
-            .iter()
-            .filter_map(|b| b.as_text())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let truncation = truncate_output(
-            &raw_text,
-            tc.max_lines,
-            tc.max_bytes,
-            TruncationDirection::Head,
-        );
-
-        if truncation.was_truncated {
-            let overflow = save_overflow_output(
-                &raw_text,
-                &tc.overflow_storage,
-                &exec_ctx.session_id,
-                &call.id,
-                None,
-            );
-
-            let tool_hint = config
-                .tool_registry
-                .find(&call.function.name)
-                .and_then(|t| t.truncation_hint());
-
-            let suffix = format_truncation_message_with_overflow(
-                &truncation,
-                TruncationDirection::Head,
-                Some(&overflow),
-                tool_hint,
-            );
-
-            let mut blocks: Vec<Content> = raw_result_blocks
-                .into_iter()
-                .filter(|b| b.as_text().is_none())
-                .collect();
-            blocks.insert(
-                0,
-                Content::text(format!("{}{}", truncation.content, suffix)),
-            );
-            blocks
-        } else {
-            raw_result_blocks
-        }
-    } else {
-        raw_result_blocks
-    };
-
-    let mut result_blocks = result_blocks;
+    // Post hooks inspect the complete canonical output; truncation is applied once
+    // after the transformation pipeline.
+    let execution_is_error = is_error;
+    let mut result_blocks = raw_result_blocks;
     let mut is_error = is_error;
     let post_hook = config
         .hooks
         .run_post_tool_use(PostToolUseRequest {
             session_id: exec_ctx.session_id.clone(),
+            mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
             turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: exec_ctx
@@ -409,13 +372,10 @@ pub(super) async fn execute_tool_call(
             permission_mode: exec_ctx.permission_mode().to_string(),
             tool_name: call.function.name.clone(),
             tool_input: args.clone(),
-            tool_response: serde_json::Value::String(
-                result_blocks
-                    .iter()
-                    .filter_map(|b| b.as_text())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
+            content: result_blocks.clone(),
+            is_error,
+            execution_is_error,
+            tool_source: tool_source.to_string(),
             tool_use_id: call.id.clone(),
         })
         .await?;
@@ -429,22 +389,20 @@ pub(super) async fn execute_tool_call(
             },
         );
     }
-    if !post_hook.additional_contexts.is_empty() {
-        log::debug!(
-            "Session {}: ignoring {} post-tool-use hook additional_context item(s) for MVP",
-            exec_ctx.session_id,
-            post_hook.additional_contexts.len()
-        );
+    if let Some(content) = post_hook.content {
+        result_blocks = content;
     }
-    if post_hook.should_block {
-        is_error = true;
-        result_blocks = vec![Content::text(format!(
-            "Error: {}",
-            post_hook
-                .block_reason
-                .unwrap_or_else(|| "tool result blocked by hook".to_string())
-        ))];
+    if let Some(model_is_error) = post_hook.is_error {
+        is_error = model_is_error;
     }
+    result_blocks = truncate_model_tool_output(
+        config,
+        exec_ctx,
+        &call.id,
+        &call.function.name,
+        result_blocks,
+        is_error,
+    );
 
     // Extract text summary for event (display purposes)
     let result_text: String = result_blocks
@@ -507,13 +465,17 @@ pub(super) async fn execute_tool_call(
         SnapshotState::None => None,
     };
 
+    let mut hook_contexts = hook_result.context_contributions;
+    hook_contexts.extend(post_hook.context_contributions);
     let mut tool_result = ToolResult::new(
         call.id.clone(),
         result_blocks,
         is_error,
         Some(call.function.name.clone()),
         Some(arguments_json.clone()),
-    );
+    )
+    .with_execution(execution_is_error, tool_source)
+    .with_hook_contexts(hook_contexts);
     if let Some(part) = snapshot_part {
         tool_result = tool_result.with_snapshot(part);
     }
@@ -521,6 +483,110 @@ pub(super) async fn execute_tool_call(
     Span::current().record("has_snapshot", tool_result.snapshot_part.is_some());
 
     Ok(tool_result)
+}
+
+async fn validate_tool_arguments(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let schema = config
+        .tool_registry
+        .find(tool_name)
+        .map(|tool| tool.definition().function.parameters)
+        .or_else(|| {
+            exec_ctx
+                .runtime
+                .mcp_tool_state
+                .load()
+                .tool_defs
+                .iter()
+                .find(|tool| tool.function.name == tool_name)
+                .map(|tool| tool.function.parameters.clone())
+        });
+    let schema = match schema {
+        Some(schema) => Some(schema),
+        None => exec_ctx
+            .session_handle
+            .provider()
+            .await
+            .ok()
+            .and_then(|provider| {
+                provider.tools().and_then(|tools| {
+                    tools
+                        .iter()
+                        .find(|tool| tool.function.name == tool_name)
+                        .map(|tool| tool.function.parameters.clone())
+                })
+            }),
+    };
+    let Some(schema) = schema else {
+        return Ok(());
+    };
+    let validator = jsonschema::validator_for(&schema)
+        .map_err(|error| anyhow::anyhow!("invalid tool schema: {}", error))?;
+    validator
+        .validate(arguments)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+fn truncate_model_tool_output(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+    call_id: &str,
+    tool_name: &str,
+    blocks: Vec<Content>,
+    is_error: bool,
+) -> Vec<Content> {
+    if is_error {
+        return blocks;
+    }
+    use crate::tools::builtins::helpers::{
+        TruncationDirection, format_truncation_message_with_overflow, save_overflow_output,
+        truncate_output,
+    };
+    let policy = &config.execution_policy.tool_output;
+    let raw_text = blocks
+        .iter()
+        .filter_map(Content::as_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let truncation = truncate_output(
+        &raw_text,
+        policy.max_lines,
+        policy.max_bytes,
+        TruncationDirection::Head,
+    );
+    if !truncation.was_truncated {
+        return blocks;
+    }
+    let overflow = save_overflow_output(
+        &raw_text,
+        &policy.overflow_storage,
+        &exec_ctx.session_id,
+        call_id,
+        None,
+    );
+    let hint = config
+        .tool_registry
+        .find(tool_name)
+        .and_then(|tool| tool.truncation_hint());
+    let suffix = format_truncation_message_with_overflow(
+        &truncation,
+        TruncationDirection::Head,
+        Some(&overflow),
+        hint,
+    );
+    let mut result: Vec<Content> = blocks
+        .into_iter()
+        .filter(|block| block.as_text().is_none())
+        .collect();
+    result.insert(
+        0,
+        Content::text(format!("{}{}", truncation.content, suffix)),
+    );
+    result
 }
 
 /// Check if a tool call requires permission and request it if needed.
@@ -581,6 +647,7 @@ pub(super) async fn ensure_tool_permission(
         .hooks
         .run_permission_request(crate::hooks::PermissionRequestRequest {
             session_id: exec_ctx.session_id.clone(),
+            mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
             turn_id: turn_id.to_string(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: exec_ctx
@@ -741,7 +808,7 @@ pub(super) async fn record_tool_side_effects(
     result: &mut ToolResult,
     exec_ctx: &ExecutionContext,
 ) -> Result<Option<WaitCondition>, anyhow::Error> {
-    if result.is_error {
+    if result.execution_is_error {
         return Ok(None);
     }
 
@@ -961,6 +1028,18 @@ pub(super) async fn store_all_tool_results(
             compacted_at: None,
         })
         .collect();
+    let hook_context_parts = adjusted_results.iter().flat_map(|result| {
+        result
+            .hook_contexts
+            .iter()
+            .map(|context| MessagePart::HookContext {
+                event_name: context.event_name.clone(),
+                handler_id: context.handler_id.clone(),
+                tool_use_id: context.tool_use_id.clone(),
+                content: context.content.clone(),
+            })
+    });
+    result_parts.extend(hook_context_parts);
     let snapshot_parts: Vec<_> = adjusted_results
         .iter()
         .filter_map(|result| result.snapshot_part.clone())

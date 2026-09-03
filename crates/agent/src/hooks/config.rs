@@ -12,6 +12,7 @@ pub struct HooksConfig {
     pub pre_tool_use: Vec<MatcherGroupConfig>,
     pub permission_request: Vec<MatcherGroupConfig>,
     pub post_tool_use: Vec<MatcherGroupConfig>,
+    pub context: Vec<MatcherGroupConfig>,
     pub stop: Vec<MatcherGroupConfig>,
     pub pre_compaction: Vec<MatcherGroupConfig>,
     pub post_compaction: Vec<MatcherGroupConfig>,
@@ -19,6 +20,7 @@ pub struct HooksConfig {
     pub delegation_start: Vec<MatcherGroupConfig>,
     pub post_delegation: Vec<MatcherGroupConfig>,
     pub delegation_failure: Vec<MatcherGroupConfig>,
+    pub session_end: Vec<MatcherGroupConfig>,
     #[schemars(skip)]
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
@@ -35,15 +37,30 @@ pub struct MatcherGroupConfig {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HookHandlerConfig {
     Command(HookCommandConfig),
+    McpTool(HookMcpToolConfig),
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct HookCommandConfig {
+    pub id: Option<String>,
     pub command: String,
     pub timeout_sec: Option<u64>,
     pub status_message: Option<String>,
+    pub additional_context_limit: Option<u32>,
     pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct HookMcpToolConfig {
+    pub id: Option<String>,
+    pub server: String,
+    pub tool: String,
+    pub input: Option<serde_json::Value>,
+    pub timeout_sec: Option<u64>,
+    pub status_message: Option<String>,
+    pub additional_context_limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -53,6 +70,7 @@ pub enum HookEventConfig {
     PreToolUse,
     PermissionRequest,
     PostToolUse,
+    Context,
     Stop,
     PreCompaction,
     PostCompaction,
@@ -60,6 +78,7 @@ pub enum HookEventConfig {
     DelegationStart,
     PostDelegation,
     DelegationFailure,
+    SessionEnd,
 }
 
 impl HookEventConfig {
@@ -70,6 +89,7 @@ impl HookEventConfig {
             Self::PreToolUse => "pre_tool_use",
             Self::PermissionRequest => "permission_request",
             Self::PostToolUse => "post_tool_use",
+            Self::Context => "context",
             Self::Stop => "stop",
             Self::PreCompaction => "pre_compaction",
             Self::PostCompaction => "post_compaction",
@@ -77,8 +97,26 @@ impl HookEventConfig {
             Self::DelegationStart => "delegation_start",
             Self::PostDelegation => "post_delegation",
             Self::DelegationFailure => "delegation_failure",
+            Self::SessionEnd => "session_end",
         }
     }
+}
+
+fn validate_handler_fields(
+    event: HookEventConfig,
+    id: Option<&str>,
+    additional_context_limit: Option<u32>,
+) -> anyhow::Result<()> {
+    if id.is_some_and(|id| id.trim().is_empty()) {
+        anyhow::bail!("{} hook id must not be empty", event.label());
+    }
+    if additional_context_limit == Some(0) {
+        anyhow::bail!(
+            "{} hook additional_context_limit must be greater than zero",
+            event.label()
+        );
+    }
+    Ok(())
 }
 
 impl HooksConfig {
@@ -89,6 +127,7 @@ impl HooksConfig {
             HookEventConfig::PreToolUse => &self.pre_tool_use,
             HookEventConfig::PermissionRequest => &self.permission_request,
             HookEventConfig::PostToolUse => &self.post_tool_use,
+            HookEventConfig::Context => &self.context,
             HookEventConfig::Stop => &self.stop,
             HookEventConfig::PreCompaction => &self.pre_compaction,
             HookEventConfig::PostCompaction => &self.post_compaction,
@@ -96,6 +135,7 @@ impl HooksConfig {
             HookEventConfig::DelegationStart => &self.delegation_start,
             HookEventConfig::PostDelegation => &self.post_delegation,
             HookEventConfig::DelegationFailure => &self.delegation_failure,
+            HookEventConfig::SessionEnd => &self.session_end,
         }
     }
 
@@ -112,6 +152,7 @@ impl HooksConfig {
             HookEventConfig::PreToolUse,
             HookEventConfig::PermissionRequest,
             HookEventConfig::PostToolUse,
+            HookEventConfig::Context,
             HookEventConfig::Stop,
             HookEventConfig::PreCompaction,
             HookEventConfig::PostCompaction,
@@ -119,6 +160,7 @@ impl HooksConfig {
             HookEventConfig::DelegationStart,
             HookEventConfig::PostDelegation,
             HookEventConfig::DelegationFailure,
+            HookEventConfig::SessionEnd,
         ] {
             for (group_idx, group) in self.groups_for(event).iter().enumerate() {
                 if group.hooks.is_empty() {
@@ -134,6 +176,36 @@ impl HooksConfig {
                             if cmd.command.trim().is_empty() {
                                 anyhow::bail!("{} hook command must not be empty", event.label());
                             }
+                            validate_handler_fields(
+                                event,
+                                cmd.id.as_deref(),
+                                cmd.additional_context_limit,
+                            )?;
+                        }
+                        HookHandlerConfig::McpTool(mcp) => {
+                            if !matches!(
+                                event,
+                                HookEventConfig::PreToolUse
+                                    | HookEventConfig::PermissionRequest
+                                    | HookEventConfig::PostToolUse
+                                    | HookEventConfig::Context
+                            ) {
+                                anyhow::bail!(
+                                    "{} does not have execution-scoped MCP access",
+                                    event.label()
+                                );
+                            }
+                            if mcp.server.trim().is_empty() || mcp.tool.trim().is_empty() {
+                                anyhow::bail!(
+                                    "{} MCP hook server and tool must not be empty",
+                                    event.label()
+                                );
+                            }
+                            validate_handler_fields(
+                                event,
+                                mcp.id.as_deref(),
+                                mcp.additional_context_limit,
+                            )?;
                         }
                     }
                 }
