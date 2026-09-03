@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tracing::Instrument;
 
 #[derive(Debug, Clone, Default)]
 pub struct Hooks {
@@ -427,6 +428,7 @@ impl Hooks {
         if !self.is_enabled() {
             return Ok(SessionEndResult::default());
         }
+        let session_id = request.session_id.clone();
         let input = SessionEndCommandInput {
             session_id: request.session_id,
             transcript_path: NullableString::from_string(None),
@@ -436,16 +438,25 @@ impl Hooks {
             permission_mode: request.permission_mode,
             reason: request.reason,
         };
-        let mut result = SessionEndResult::default();
-        for outcome in self
+        let outcomes = self
             .run_event(
                 HookEventConfig::SessionEnd,
                 None,
                 input.clone(),
                 request.cwd.as_deref(),
             )
-            .await?
-        {
+            .await;
+        self.pending_session_stop
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(&session_id);
+        self.pending_session_context
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(&session_id);
+
+        let mut result = SessionEndResult::default();
+        for outcome in outcomes? {
             result.notices.extend(outcome.notices);
             if outcome.hard_block_reason.is_some() {
                 result
@@ -1504,20 +1515,23 @@ impl Hooks {
             exit_code = tracing::field::Empty,
             duration_ms = tracing::field::Empty,
         );
-        let _entered = span.enter();
-        let output = match &handler.kind {
-            ResolvedHookKind::Command(command) => {
-                run_command_hook(
-                    &spec_from_command(command),
-                    cwd.unwrap_or_else(|| Path::new(".")),
-                    &stdin_json,
-                )
-                .await?
+        let output = async {
+            match &handler.kind {
+                ResolvedHookKind::Command(command) => {
+                    run_command_hook(
+                        &spec_from_command(command),
+                        cwd.unwrap_or_else(|| Path::new(".")),
+                        &stdin_json,
+                    )
+                    .await
+                }
+                ResolvedHookKind::McpTool(config) => {
+                    run_mcp_hook(config, input, mcp_tool_state).await
+                }
             }
-            ResolvedHookKind::McpTool(config) => {
-                run_mcp_hook(config, input, mcp_tool_state).await?
-            }
-        };
+        }
+        .instrument(span.clone())
+        .await?;
         record_hook_output(&span, &output, started.elapsed());
 
         let mut notices = Vec::new();
@@ -1781,7 +1795,7 @@ fn limit_context(context: Option<String>, token_limit: Option<u32>) -> Option<St
     if context.chars().count() <= max_chars {
         return Some(context);
     }
-    let half = max_chars.saturating_sub(80) / 2;
+    let half = (max_chars.saturating_sub(80) / 2).max(1);
     let head: String = context.chars().take(half).collect();
     let tail: String = context
         .chars()

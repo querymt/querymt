@@ -409,6 +409,52 @@ fn command_hook(command: String) -> HookHandlerConfig {
 }
 
 #[tokio::test]
+async fn session_end_system_message_becomes_notice() {
+    let config = HooksConfig {
+        enabled: true,
+        session_end: vec![MatcherGroupConfig {
+            matcher: None,
+            hooks: vec![command_hook(
+                "printf '%s' '{\"system_message\":\"session closed\"}'".into(),
+            )],
+        }],
+        ..HooksConfig::default()
+    };
+
+    let input = crate::hooks::schema::SessionEndCommandInput {
+        session_id: "s".into(),
+        transcript_path: crate::hooks::schema::NullableString::from_string(None),
+        cwd: ".".into(),
+        hook_event_name: "session_end".into(),
+        model: "m".into(),
+        permission_mode: "default".into(),
+        reason: "close".into(),
+    };
+    assert_matches_schema::<crate::hooks::schema::SessionEndCommandInput>(
+        &serde_json::to_value(input).unwrap(),
+    );
+    let output = json!({"system_message":"session closed"});
+    assert_matches_schema::<crate::hooks::schema::SessionEndCommandOutputWire>(&output);
+
+    let result = Hooks::new(config)
+        .unwrap()
+        .run_session_end(super::engine::SessionEndRequest {
+            session_id: "s".into(),
+            cwd: None,
+            model: "m".into(),
+            permission_mode: "default".into(),
+            reason: "close".into(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.notices.len(), 1);
+    assert_eq!(result.notices[0].event_name, "session_end");
+    assert_eq!(result.notices[0].message, "session closed");
+    assert!(!result.notices[0].is_error);
+}
+
+#[tokio::test]
 async fn exit_two_blocks_with_stderr_and_surfaces_system_message() {
     let config = HooksConfig {
         enabled: true,

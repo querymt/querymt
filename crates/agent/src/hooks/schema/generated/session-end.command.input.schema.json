@@ -47,6 +47,6 @@
     "permission_mode",
     "reason"
   ],
-  "title": "delegation-failure.command.input",
+  "title": "session-end.command.input",
   "type": "object"
 }

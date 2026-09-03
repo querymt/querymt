@@ -653,7 +653,7 @@ pub struct PostDelegationCommandInput {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(rename = "delegation-failure.command.input")]
+#[schemars(rename = "session-end.command.input")]
 pub struct SessionEndCommandInput {
     pub session_id: String,
     pub transcript_path: NullableString,

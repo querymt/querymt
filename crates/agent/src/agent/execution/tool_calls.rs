@@ -304,24 +304,26 @@ pub(super) async fn execute_tool_call(
                 Ok(res) => (res, false, "mcp"),
                 Err(e) => (vec![Content::text(format!("Error: {}", e))], true, "mcp"),
             }
-        } else if !hook_allows_interactive
-            && !ensure_tool_permission(
-                config,
-                exec_ctx,
-                &call.id,
-                &call.function.name,
-                &args,
-                bridge,
-                exec_ctx.turn_id().unwrap_or_default(),
-            )
-            .instrument(info_span!(
-                "agent.tool.permission_wait",
-                tool_name = %call.function.name,
-                tool_call_id = %call.id,
-                session_id = %exec_ctx.session_id,
-            ))
-            .await
-            .map_err(|e| anyhow::anyhow!("Permission check failed: {}", e))?
+        } else if !ensure_tool_permission(
+            config,
+            exec_ctx,
+            &call.id,
+            &call.function.name,
+            &args,
+            bridge,
+            PermissionContext {
+                turn_id: exec_ctx.turn_id().unwrap_or_default(),
+                bypass_interactive_prompt: hook_allows_interactive,
+            },
+        )
+        .instrument(info_span!(
+            "agent.tool.permission_wait",
+            tool_name = %call.function.name,
+            tool_call_id = %call.id,
+            session_id = %exec_ctx.session_id,
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("Permission check failed: {}", e))?
         {
             (
                 vec![Content::text("Error: permission denied")],
@@ -402,7 +404,8 @@ pub(super) async fn execute_tool_call(
         &call.function.name,
         result_blocks,
         is_error,
-    );
+    )
+    .await;
 
     // Extract text summary for event (display purposes)
     let result_text: String = result_blocks
@@ -524,14 +527,32 @@ async fn validate_tool_arguments(
     let Some(schema) = schema else {
         return Ok(());
     };
-    let validator = jsonschema::validator_for(&schema)
-        .map_err(|error| anyhow::anyhow!("invalid tool schema: {}", error))?;
+    let schema_key = serde_json::to_string(&schema)?;
+    let validator = {
+        let cache = exec_ctx.runtime.tool_validator_cache.lock();
+        cache.get(&schema_key).cloned()
+    };
+    let validator = match validator {
+        Some(validator) => validator,
+        None => {
+            let validator = Arc::new(
+                jsonschema::validator_for(&schema)
+                    .map_err(|error| anyhow::anyhow!("invalid tool schema: {}", error))?,
+            );
+            exec_ctx
+                .runtime
+                .tool_validator_cache
+                .lock()
+                .insert(schema_key, validator.clone());
+            validator
+        }
+    };
     validator
         .validate(arguments)
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
-fn truncate_model_tool_output(
+async fn truncate_model_tool_output(
     config: &AgentConfig,
     exec_ctx: &ExecutionContext,
     call_id: &str,
@@ -561,12 +582,25 @@ fn truncate_model_tool_output(
     if !truncation.was_truncated {
         return blocks;
     }
-    let overflow = save_overflow_output(
-        &raw_text,
-        &policy.overflow_storage,
-        &exec_ctx.session_id,
-        call_id,
-        None,
+    let overflow_content = raw_text.clone();
+    let overflow_storage = policy.overflow_storage.clone();
+    let overflow_session_id = exec_ctx.session_id.clone();
+    let overflow_call_id = call_id.to_string();
+    let overflow = tokio::task::spawn_blocking(move || {
+        save_overflow_output(
+            &overflow_content,
+            &overflow_storage,
+            &overflow_session_id,
+            &overflow_call_id,
+            None,
+        )
+    })
+    .await
+    .unwrap_or_else(
+        |error| crate::tools::builtins::helpers::OverflowSaveResult {
+            path: None,
+            error: Some(format!("Failed to join overflow writer: {}", error)),
+        },
     );
     let hint = config
         .tool_registry
@@ -589,12 +623,17 @@ fn truncate_model_tool_output(
     result
 }
 
+pub(super) struct PermissionContext<'a> {
+    turn_id: &'a str,
+    bypass_interactive_prompt: bool,
+}
+
 /// Check if a tool call requires permission and request it if needed.
 ///
 /// Returns `true` if permission is granted (or not required), `false` if denied.
 #[instrument(
     name = "agent.tool.permission",
-    skip(config, exec_ctx, args, bridge),
+    skip(config, exec_ctx, args, bridge, permission),
     fields(
         session_id = %exec_ctx.session_id,
         tool_name = %tool_name,
@@ -611,7 +650,7 @@ pub(super) async fn ensure_tool_permission(
     tool_name: &str,
     args: &serde_json::Value,
     bridge: Option<&ClientBridgeSender>,
-    turn_id: &str,
+    permission: PermissionContext<'_>,
 ) -> Result<bool, agent_client_protocol::Error> {
     use crate::acp::protocol::{
         PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
@@ -643,12 +682,17 @@ pub(super) async fn ensure_tool_permission(
     }
     Span::current().record("cache_hit", false);
 
+    if permission.bypass_interactive_prompt {
+        Span::current().record("granted", true);
+        return Ok(true);
+    }
+
     let hook_decision = config
         .hooks
         .run_permission_request(crate::hooks::PermissionRequestRequest {
             session_id: exec_ctx.session_id.clone(),
             mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
-            turn_id: turn_id.to_string(),
+            turn_id: permission.turn_id.to_string(),
             cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
             model: exec_ctx
                 .llm_config()

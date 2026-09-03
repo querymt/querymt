@@ -264,7 +264,7 @@ pub(super) async fn transition_call_llm(
     exec_ctx: &ExecutionContext,
 ) -> Result<ExecutionState, anyhow::Error> {
     let session_id = &exec_ctx.session_id;
-    let request_messages = request.messages.to_vec();
+    let request_messages = request.messages.as_ref();
     let tools = &request.tools;
     debug!(
         "CallLlm: session={}, messages={}",
@@ -480,7 +480,7 @@ pub(super) async fn transition_call_llm(
                 }
 
                 let mut stream = match provider
-                    .chat_stream_with_tools(&messages_with_cache, Some(tools.as_ref()))
+                    .chat_stream_with_tools(messages_with_cache, Some(tools.as_ref()))
                     .await
                 {
                     Ok(stream) => stream,

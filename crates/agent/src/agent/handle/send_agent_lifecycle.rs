@@ -229,7 +229,9 @@ impl LocalAgentHandle {
     ) -> Result<CloseSessionResponse, Error> {
         let session_id = req.session_id.to_string();
         let result = self.stop_session(&session_id).await;
-        self.run_session_end_hook(&session_id, "close").await?;
+        if let Err(error) = self.run_session_end_hook(&session_id, "close").await {
+            tracing::warn!(session_id, %error, "session_end hook failed during close");
+        }
         self.clear_delegate_model_overrides(&session_id).await;
         result?;
         Ok(CloseSessionResponse::new())
@@ -244,7 +246,9 @@ impl LocalAgentHandle {
         // Closing is best-effort: deleting persisted history is the primary intent.
         // Route through the session binding so delegated runtimes are released too.
         let _ = self.stop_session(&session_id).await;
-        self.run_session_end_hook(&session_id, "delete").await?;
+        if let Err(error) = self.run_session_end_hook(&session_id, "delete").await {
+            tracing::warn!(session_id, %error, "session_end hook failed during delete");
+        }
 
         let exists = self
             .config
