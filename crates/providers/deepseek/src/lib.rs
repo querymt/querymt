@@ -273,6 +273,50 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
     Box::into_raw(Box::new(DeepseekFactory)) as *mut _
 }
 
+#[cfg(test)]
+mod tests {
+    use super::Deepseek;
+    use querymt::chat::{ChatMessage, Content, http::HTTPChatProvider};
+    use serde_json::Value;
+
+    #[test]
+    fn stream_request_keeps_context_inside_tool_response_batch() {
+        let provider: Deepseek = serde_json::from_value(serde_json::json!({
+            "api_key": "test-key",
+            "model": "deepseek-chat"
+        }))
+        .unwrap();
+        let messages = vec![
+            ChatMessage::assistant()
+                .tool_use("call_1", "ls", serde_json::json!({"path": "."}))
+                .build(),
+            ChatMessage::user()
+                .tool_result(
+                    "call_1".to_string(),
+                    Some("ls".to_string()),
+                    false,
+                    vec![Content::text("specs.md")],
+                )
+                .text("<run-objective>Collect benchmark data</run-objective>")
+                .build(),
+        ];
+
+        let request = provider.chat_stream_request(&messages, None).unwrap();
+        let body: Value = serde_json::from_slice(request.body()).unwrap();
+        let api_messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(api_messages.len(), 2);
+        assert_eq!(api_messages[1]["role"], "tool");
+        assert_eq!(api_messages[1]["tool_call_id"], "call_1");
+        assert!(
+            api_messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("<run-objective>")
+        );
+    }
+}
+
 #[cfg(feature = "extism")]
 mod extism_exports {
     use super::{Deepseek, DeepseekFactory};

@@ -409,6 +409,41 @@ mod tests {
     }
 
     #[test]
+    fn stream_request_keeps_context_inside_tool_response_batch() {
+        use querymt::chat::Content;
+
+        let provider = test_provider();
+        let messages = vec![
+            ChatMessage::assistant()
+                .tool_use("call_1", "ls", serde_json::json!({"path": "."}))
+                .build(),
+            ChatMessage::user()
+                .tool_result(
+                    "call_1".to_string(),
+                    Some("ls".to_string()),
+                    false,
+                    vec![Content::text("specs.md")],
+                )
+                .text("<run-objective>Collect benchmark data</run-objective>")
+                .build(),
+        ];
+
+        let request = provider.chat_stream_request(&messages, None).unwrap();
+        let body: Value = serde_json::from_slice(request.body()).unwrap();
+        let api_messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(api_messages.len(), 2);
+        assert_eq!(api_messages[1]["role"], "tool");
+        assert_eq!(api_messages[1]["tool_call_id"], "call_1");
+        assert!(
+            api_messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("<run-objective>")
+        );
+    }
+
+    #[test]
     fn chat_request_injects_reasoning_content_for_assistant_tool_calls() {
         let provider = test_provider();
         let mut parser = provider
