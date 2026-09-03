@@ -20,7 +20,8 @@ pub use driver::{CompositeDriver, MiddlewareDriver};
 pub use error::{MiddlewareError, Result};
 pub use state::{
     AgentStats, ContextFragment, ContextPriority, ConversationContext, ExecutionState, LlmResponse,
-    ToolCall, ToolFunction, ToolResult, WaitCondition, WaitReason, calculate_context_tokens,
+    PreparedModelRequest, ToolCall, ToolFunction, ToolResult, WaitCondition, WaitReason,
+    calculate_context_tokens,
 };
 
 // Re-export model info types for convenience

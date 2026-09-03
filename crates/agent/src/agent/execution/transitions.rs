@@ -13,8 +13,8 @@ use crate::agent::session_actor::ensure_pre_turn_snapshot_ready;
 use crate::agent::utils::u32_from_usize;
 use crate::events::{AgentEventKind, ExecutionMetrics, StopType};
 use crate::middleware::{
-    ExecutionState, LlmResponse, ToolCall as MiddlewareToolCall, ToolFunction, ToolResult,
-    calculate_context_tokens,
+    ExecutionState, LlmResponse, PreparedModelRequest, ToolCall as MiddlewareToolCall,
+    ToolFunction, ToolResult, calculate_context_tokens,
 };
 use crate::model::{AgentMessage, MessagePart};
 use anyhow::Context as _;
@@ -115,9 +115,65 @@ pub(super) async fn transition_before_llm_call(
         );
     }
 
+    let mut messages = context.request_messages();
+    let trigger = if messages.last().is_some_and(|message| {
+        message
+            .content
+            .iter()
+            .any(querymt::chat::Content::is_tool_result)
+    }) {
+        "after_tool_batch"
+    } else {
+        "user_prompt"
+    };
+    let context_window = crate::model_info::get_model_info(&context.provider, &context.model)
+        .and_then(|info| info.limits.context)
+        .unwrap_or(u32::MAX as u64)
+        .min(u32::MAX as u64) as u32;
+    let hook_result = config
+        .hooks
+        .run_context(crate::hooks::ContextHookRequest {
+            session_id: exec_ctx.session_id.clone(),
+            mcp_tool_state: Some(exec_ctx.runtime.mcp_tool_state.clone()),
+            turn_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
+            cwd: exec_ctx.cwd().map(|path| path.to_path_buf()),
+            model: context.model.to_string(),
+            permission_mode: exec_ctx.permission_mode().to_string(),
+            trigger: trigger.to_string(),
+            context_window,
+            messages,
+        })
+        .await?;
+    for notice in hook_result.notices {
+        config.emit_event(
+            &exec_ctx.session_id,
+            AgentEventKind::HookNotice {
+                event_name: notice.event_name,
+                message: notice.message,
+                is_error: notice.is_error,
+            },
+        );
+    }
+    messages = hook_result.messages.unwrap_or_default();
+    if hook_result.estimated_tokens > context_window as usize {
+        return Ok(ExecutionState::Stopped {
+            message: format!(
+                "Prepared request is approximately {} tokens, exceeding the {} token context window",
+                hook_result.estimated_tokens, context_window
+            )
+            .into(),
+            stop_type: StopType::ContextThreshold,
+            context: Some(context.clone()),
+        });
+    }
+    let messages = apply_cache_breakpoints(&messages);
     Ok(ExecutionState::CallLlm {
         context: context.clone(),
-        tools: Arc::from(tools.into_boxed_slice()),
+        request: Arc::new(PreparedModelRequest {
+            messages: Arc::from(messages.into_boxed_slice()),
+            tools: Arc::from(tools.into_boxed_slice()),
+            estimated_tokens: hook_result.estimated_tokens,
+        }),
     })
 }
 
@@ -192,32 +248,24 @@ fn validate_stream_terminal(
 /// tracks usage/costs, and emits LlmRequestStart/End events.
 #[instrument(
     name = "agent.transition.call_llm",
-    skip(config, context, tools, exec_ctx),
+    skip(config, context, request, exec_ctx),
     fields(
         session_id = %exec_ctx.session_id,
         provider = %context.provider,
         model = %context.model,
         message_count = context.messages.len(),
-        tool_count = tools.len()
+        tool_count = request.tools.len()
     )
 )]
 pub(super) async fn transition_call_llm(
     config: &AgentConfig,
     context: &Arc<crate::middleware::ConversationContext>,
-    tools: &Arc<[querymt::chat::Tool]>,
+    request: &Arc<PreparedModelRequest>,
     exec_ctx: &ExecutionContext,
 ) -> Result<ExecutionState, anyhow::Error> {
     let session_id = &exec_ctx.session_id;
-    let (stable_messages, latest_message) = context
-        .messages
-        .split_last()
-        .map(|(latest, stable)| (stable, Some(latest.clone())))
-        .unwrap_or((&[], None));
-    let mut request_messages = apply_cache_breakpoints(stable_messages);
-    request_messages.extend(context.fragment_messages());
-    if let Some(latest_message) = latest_message {
-        request_messages.push(latest_message);
-    }
+    let request_messages = request.messages.as_ref();
+    let tools = &request.tools;
     debug!(
         "CallLlm: session={}, messages={}",
         session_id,
@@ -432,7 +480,7 @@ pub(super) async fn transition_call_llm(
                 }
 
                 let mut stream = match provider
-                    .chat_stream_with_tools(&messages_with_cache, Some(tools.as_ref()))
+                    .chat_stream_with_tools(messages_with_cache, Some(tools.as_ref()))
                     .await
                 {
                     Ok(stream) => stream,

@@ -1,7 +1,7 @@
 use crate::events::StopType;
 use crate::middleware::{
-    AgentStats, ConversationContext, ExecutionState, LlmResponse, ToolResult, WaitCondition,
-    WaitReason,
+    AgentStats, ConversationContext, ExecutionState, LlmResponse, PreparedModelRequest, ToolResult,
+    WaitCondition, WaitReason,
 };
 use crate::test_utils::{mock_tool_call, test_context};
 use querymt::chat::{ChatMessage, ChatRole, Content, FinishReason};
@@ -26,7 +26,11 @@ fn test_execution_state_name_all_variants() {
         (
             ExecutionState::CallLlm {
                 context: context.clone(),
-                tools: Arc::from([]),
+                request: Arc::new(PreparedModelRequest {
+                    messages: Arc::from([]),
+                    tools: Arc::from([]),
+                    estimated_tokens: 0,
+                }),
             },
             "CallLlm",
         ),
@@ -90,7 +94,11 @@ fn test_execution_state_context_accessors() {
         },
         ExecutionState::CallLlm {
             context: context.clone(),
-            tools: Arc::from([]),
+            request: Arc::new(PreparedModelRequest {
+                messages: Arc::from([]),
+                tools: Arc::from([]),
+                estimated_tokens: 0,
+            }),
         },
         ExecutionState::AfterLlm {
             response: response.clone(),

@@ -411,14 +411,14 @@ pub(crate) async fn execute_cycle_state_machine(
 
             ExecutionState::CallLlm {
                 ref context,
-                ref tools,
+                ref request,
             } => {
                 llm_request_count = llm_request_count.saturating_add(1);
-                task_completion_tool_available = has_effective_task_completion_tool(tools);
+                task_completion_tool_available = has_effective_task_completion_tool(&request.tools);
                 let span = tracing::Span::current();
                 span.record("llm_request_count", llm_request_count as u64);
                 span.record("completion_guard_available", task_completion_tool_available);
-                transitions::transition_call_llm(config, context, tools, exec_ctx).await?
+                transitions::transition_call_llm(config, context, request, exec_ctx).await?
             }
 
             ExecutionState::AfterLlm { .. } => {

@@ -770,7 +770,11 @@ mod tests {
 
         let state = ExecutionState::CallLlm {
             context: context.clone(),
-            tools: Arc::from([]),
+            request: Arc::new(crate::middleware::PreparedModelRequest {
+                messages: Arc::from([]),
+                tools: Arc::from([]),
+                estimated_tokens: 0,
+            }),
         };
 
         let result = fixture.run_step(state).await.unwrap();

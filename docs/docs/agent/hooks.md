@@ -1,6 +1,6 @@
 # QueryMT Agent - Hooks
 
-Hooks let you run configured local commands at specific points in the agent lifecycle. They are useful for policy checks, audit logging, approval automation, tool input rewriting, compaction control, delegation control, and stop-time validation.
+Hooks let you run configured local commands at specific points in the agent lifecycle. They are useful for policy checks, audit logging, approval automation, ordered tool input and result transformation, non-destructive request projection, compaction control, delegation control, and stop-time validation.
 
 ## Overview
 
@@ -44,7 +44,9 @@ matcher = "^shell$"
 type = "command"
 command = "sh ./hooks/check-shell.sh"
 timeout_sec = 5
+id = "shell-policy"
 status_message = "Checking shell command"
+additional_context_limit = 2500
 
 [[agent.hooks.pre_compaction]]
 
@@ -71,9 +73,25 @@ timeout_sec = 5
 
 Because hooks live in `[agent.hooks]`, they work well with QueryMT profiles. For example, a review profile can enable stricter `stop` hooks while a coding profile can enable shell-policy hooks. See `crates/agent/examples/confs/hook_guarded_coder.toml` and the companion scripts in `crates/agent/examples/hooks/` for a complete runnable example.
 
+Handlers may also invoke an already-connected MCP tool directly:
+
+```toml
+[[agent.hooks.context]]
+
+[[agent.hooks.context.hooks]]
+type = "mcp_tool"
+id = "memory-retriever"
+server = "memory"
+tool = "retrieve_context"
+timeout_sec = 10
+input = { query = "$event.model", messages = "$event.messages" }
+```
+
+MCP hook handlers are bound to both `server` and `tool`, bypass the model-visible tool loop, and therefore cannot recursively trigger tool hooks. Template strings must be exact `$event.<field>` paths into the event payload; arbitrary interpolation is not supported. MCP handlers currently require an execution-scoped event (`pre_tool_use`, `permission_request`, `post_tool_use`, or `context`) where connected tool state is available. The MCP tool's text content is parsed with the same output contract as a command hook.
+
 ## Hook Command Protocol
 
-Each hook command:
+Each command hook:
 
 - runs as a local process
 - receives one JSON object on stdin
@@ -108,18 +126,31 @@ QueryMT currently supports these hook events:
 
 | Event | Matcher | Effect |
 |---|---|---|
-| `session_start` | none | Observe session creation |
-| `user_prompt_submit` | none | Block a prompt |
-| `pre_tool_use` | tool name regex | Block or rewrite tool input |
-| `permission_request` | tool name regex | Allow or deny permission prompts |
-| `post_tool_use` | tool name regex | Mark a tool result as blocked/error |
-| `pre_compaction` | none | Block compaction and replace the final stop reason shown to the user |
+| `session_start` | none | Gate the next run and contribute context to the next user turn |
+| `user_prompt_submit` | none | Block a prompt or persist provenance-labeled context with it |
+| `pre_tool_use` | tool name regex | Block, approve/defer permission, or chain tool-input rewrites |
+| `permission_request` | tool name regex | Allow or deny permission prompts; deny wins |
+| `post_tool_use` | tool name regex | Chain model-visible content/error patches without changing execution facts |
+| `context` | none | Replace the current request projection or add request-only context |
+| `pre_compaction` | none | Block compaction or provide a complete custom summary |
 | `post_compaction` | none | Append context to the stored compaction summary |
 | `pre_delegation` | target agent regex | Block or rewrite a delegation request before it is recorded |
 | `delegation_start` | target agent regex | Observe delegation start and append planning context for the child session |
 | `post_delegation` | target agent regex | Append context to the delegate summary injected back into the planner |
 | `delegation_failure` | target agent regex | Append context to the failure message injected back into the planner |
 | `stop` | none | Request one extra LLM step |
+| `session_end` | none | Observe explicit session close or deletion |
+
+Handlers run in configuration order. Transform-capable events rebuild each handler's input from the last accepted value. A pre-operation block is sticky. Invalid JSON and invalid replacements emit a durable `hook_notice` and retain the last valid value.
+
+Command exit behavior is:
+
+- exit `0`: parse stdout; empty stdout is a no-op
+- exit `2`: block with trimmed stderr as the reason; stdout does not control the operation
+- other non-zero exits, signals, and timeouts: hook infrastructure errors
+- `system_message`: emitted as a non-error durable notice and never inserted into model context
+
+`additional_context` defaults to an approximate 2500-token limit, configurable per handler with `additional_context_limit`. Prompt and tool contributions are persisted as typed, provenance-labeled message parts. Tool contributions are placed after every `tool_result` block in the combined result message. `context` contributions exist only in the prepared request and never mutate stored history.
 
 ## Examples
 
@@ -156,12 +187,47 @@ Expected hook output:
 {
   "hook_specific_output": {
     "hook_event_name": "pre_tool_use",
+    "permission_decision": "allow",
     "updated_input": {
       "command": "cargo test -p querymt-agent --lib"
     }
   }
 }
 ```
+
+Multiple matching `pre_tool_use` handlers see this rewritten object in order. A rewrite is accepted only with `permission_decision: "allow"`; `ask` follows normal interactive permission handling.
+
+### post_tool_use patch
+
+```json
+{
+  "hook_specific_output": {
+    "hook_event_name": "post_tool_use",
+    "updated_output": {
+      "content": [{ "type": "text", "text": "Redacted result" }],
+      "is_error": false
+    },
+    "additional_context": "Sensitive values were removed."
+  },
+  "system_message": "Tool output was sanitized."
+}
+```
+
+The `tool_response` input remains available as flattened text. The new `tool_result` input contains structured `content`, model-facing `is_error`, immutable `execution_is_error`, and `tool_source`. Post hooks run before final output truncation.
+
+### context projection
+
+```json
+{
+  "hook_specific_output": {
+    "hook_event_name": "context",
+    "messages": [],
+    "additional_context": "Request-only retrieved memory"
+  }
+}
+```
+
+A `context` replacement affects one logical request only. QueryMT rejects malformed projections, unmatched tool calls/results, or changes to existing tool-call identities, then recomputes cache hints after transformation. Provider retries reuse the prepared projection and do not rerun the hook.
 
 ### permission_request allow
 
@@ -193,6 +259,21 @@ Expected hook output:
   }
 }
 ```
+
+### custom compaction
+
+```json
+{
+  "hook_specific_output": {
+    "hook_event_name": "pre_compaction",
+    "compaction": { "summary": "Externally generated summary" }
+  }
+}
+```
+
+A non-blank custom summary skips the compaction model call. Each later handler receives the current candidate in `candidate_summary`; the last valid candidate wins. `pre_compaction.messages` contains the effective typed history used for compaction. QueryMT still owns token counts, message IDs, persistence, boundaries, and effective-history reload.
+
+Command hooks are the portable lifecycle mechanism. MCP-backed handlers are intended for automatic retrieval, sanitation, and policy calls against connected services; ordinary MCP tools remain separately registered and model-visible. Compiled middleware remains the right choice for in-process state-machine behavior.
 
 ### pre_compaction block
 
@@ -290,6 +371,8 @@ Relevant files include:
 - `crates/agent/src/hooks/schema/generated/pre-tool-use.command.output.schema.json`
 - `crates/agent/src/hooks/schema/generated/permission-request.command.input.schema.json`
 - `crates/agent/src/hooks/schema/generated/permission-request.command.output.schema.json`
+- `crates/agent/src/hooks/schema/generated/context.command.input.schema.json`
+- `crates/agent/src/hooks/schema/generated/context.command.output.schema.json`
 - `crates/agent/src/hooks/schema/generated/pre-compaction.command.input.schema.json`
 - `crates/agent/src/hooks/schema/generated/pre-compaction.command.output.schema.json`
 - `crates/agent/src/hooks/schema/generated/post-compaction.command.input.schema.json`
@@ -302,6 +385,8 @@ Relevant files include:
 - `crates/agent/src/hooks/schema/generated/post-delegation.command.output.schema.json`
 - `crates/agent/src/hooks/schema/generated/delegation-failure.command.input.schema.json`
 - `crates/agent/src/hooks/schema/generated/delegation-failure.command.output.schema.json`
+- `crates/agent/src/hooks/schema/generated/session-end.command.input.schema.json`
+- `crates/agent/src/hooks/schema/generated/session-end.command.output.schema.json`
 - `crates/agent/src/hooks/schema/generated/stop.command.input.schema.json`
 - `crates/agent/src/hooks/schema/generated/stop.command.output.schema.json`
 

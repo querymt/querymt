@@ -1,10 +1,11 @@
 use crate::hooks::schema::{
-    BlockDecisionWire, DelegationFailureCommandOutputWire, DelegationStartCommandOutputWire,
-    PermissionRequestBehaviorWire, PermissionRequestCommandOutputWire,
-    PostCompactionCommandOutputWire, PostDelegationCommandOutputWire, PostToolUseCommandOutputWire,
-    PreCompactionCommandOutputWire, PreDelegationCommandOutputWire, PreToolUseCommandOutputWire,
-    PreToolUseDecisionWire, PreToolUsePermissionDecisionWire, SessionStartCommandOutputWire,
-    StopCommandOutputWire, UpdatedDelegationWire, UserPromptSubmitCommandOutputWire,
+    BlockDecisionWire, ContextCommandOutputWire, DelegationFailureCommandOutputWire,
+    DelegationStartCommandOutputWire, PermissionRequestBehaviorWire,
+    PermissionRequestCommandOutputWire, PostCompactionCommandOutputWire,
+    PostDelegationCommandOutputWire, PostToolUseCommandOutputWire, PreCompactionCommandOutputWire,
+    PreDelegationCommandOutputWire, PreToolUseCommandOutputWire, PreToolUseDecisionWire,
+    PreToolUsePermissionDecisionWire, SessionStartCommandOutputWire, StopCommandOutputWire,
+    UpdatedDelegationWire, UserPromptSubmitCommandOutputWire,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -18,6 +19,7 @@ pub enum ParsedDecision {
 pub enum ParsedPermissionDecision {
     Allow,
     Deny { message: String },
+    Ask,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -27,6 +29,12 @@ pub struct ParsedUpdatedDelegation {
     pub context: Option<String>,
     pub constraints: Option<String>,
     pub expected_output: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedContext {
+    pub messages: Option<Vec<Value>>,
+    pub additional_context: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,11 +59,18 @@ pub struct ParsedPermissionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ParsedToolOutputPatch {
+    pub content: Option<Vec<Value>>,
+    pub is_error: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ParsedPostToolUse {
     pub decision: Option<ParsedDecision>,
     pub reason: Option<String>,
     pub continue_processing: bool,
     pub stop_reason: Option<String>,
+    pub updated_output: Option<ParsedToolOutputPatch>,
     pub additional_context: Option<String>,
 }
 
@@ -79,6 +94,7 @@ pub struct ParsedStop {
 pub struct ParsedPreCompaction {
     pub decision: Option<ParsedDecision>,
     pub reason: Option<String>,
+    pub summary: Option<String>,
     pub additional_context: Option<String>,
 }
 
@@ -105,6 +121,19 @@ pub struct ParsedDelegationLifecycle {
 pub fn looks_like_json(stdout: &str) -> bool {
     let trimmed = stdout.trim_start();
     trimmed.starts_with('{') || trimmed.starts_with('[')
+}
+
+pub fn parse_context(stdout: &str) -> anyhow::Result<Option<ParsedContext>> {
+    let Some(output) = parse_json::<ContextCommandOutputWire>(stdout)? else {
+        return Ok(None);
+    };
+    let hook_specific = output.hook_specific_output;
+    Ok(Some(ParsedContext {
+        messages: hook_specific
+            .as_ref()
+            .and_then(|hook| hook.messages.clone()),
+        additional_context: hook_specific.and_then(|hook| hook.additional_context),
+    }))
 }
 
 pub fn parse_user_prompt_submit(stdout: &str) -> anyhow::Result<Option<ParsedUserPromptSubmit>> {
@@ -137,12 +166,7 @@ pub fn parse_pre_tool_use(stdout: &str) -> anyhow::Result<Option<ParsedPreToolUs
                     .and_then(|hook| hook.permission_decision_reason.clone())
                     .unwrap_or_else(|| "blocked by hook".to_string()),
             },
-            PreToolUsePermissionDecisionWire::Ask => ParsedPermissionDecision::Deny {
-                message: hook_specific
-                    .as_ref()
-                    .and_then(|hook| hook.permission_decision_reason.clone())
-                    .unwrap_or_else(|| "hook requested confirmation".to_string()),
-            },
+            PreToolUsePermissionDecisionWire::Ask => ParsedPermissionDecision::Ask,
         });
 
     let decision = match output.decision {
@@ -187,6 +211,7 @@ pub fn parse_post_tool_use(stdout: &str) -> anyhow::Result<Option<ParsedPostTool
     let Some(output) = parse_json::<PostToolUseCommandOutputWire>(stdout)? else {
         return Ok(None);
     };
+    let hook_specific = output.hook_specific_output;
     Ok(Some(ParsedPostToolUse {
         decision: output
             .decision
@@ -194,9 +219,14 @@ pub fn parse_post_tool_use(stdout: &str) -> anyhow::Result<Option<ParsedPostTool
         reason: output.reason,
         continue_processing: output.universal.r#continue,
         stop_reason: output.universal.stop_reason,
-        additional_context: output
-            .hook_specific_output
-            .and_then(|hook| hook.additional_context),
+        updated_output: hook_specific
+            .as_ref()
+            .and_then(|hook| hook.updated_output.as_ref())
+            .map(|patch| ParsedToolOutputPatch {
+                content: patch.content.clone(),
+                is_error: patch.is_error,
+            }),
+        additional_context: hook_specific.and_then(|hook| hook.additional_context),
     }))
 }
 
@@ -234,14 +264,17 @@ pub fn parse_pre_compaction(stdout: &str) -> anyhow::Result<Option<ParsedPreComp
     let Some(output) = parse_json::<PreCompactionCommandOutputWire>(stdout)? else {
         return Ok(None);
     };
+    let hook_specific = output.hook_specific_output;
     Ok(Some(ParsedPreCompaction {
         decision: output
             .decision
             .map(|BlockDecisionWire::Block| ParsedDecision::Block),
         reason: output.reason,
-        additional_context: output
-            .hook_specific_output
-            .and_then(|hook| hook.additional_context),
+        summary: hook_specific
+            .as_ref()
+            .and_then(|hook| hook.compaction.as_ref())
+            .map(|compaction| compaction.summary.clone()),
+        additional_context: hook_specific.and_then(|hook| hook.additional_context),
     }))
 }
 

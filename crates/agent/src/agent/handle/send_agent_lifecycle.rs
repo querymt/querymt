@@ -190,12 +190,48 @@ impl LocalAgentHandle {
             .config_options(config_options))
     }
 
+    async fn run_session_end_hook(&self, session_id: &str, reason: &str) -> Result<(), Error> {
+        let permission_mode = {
+            let mode = *self
+                .default_mode
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            crate::hooks::permission_mode_label(mode).to_string()
+        };
+        let result = self
+            .config
+            .hooks
+            .run_session_end(crate::hooks::SessionEndRequest {
+                session_id: session_id.to_string(),
+                cwd: None,
+                model: String::new(),
+                permission_mode,
+                reason: reason.to_string(),
+            })
+            .await
+            .map_err(|error| Error::internal_error().data(error.to_string()))?;
+        for notice in result.notices {
+            self.config.emit_event(
+                session_id,
+                crate::events::AgentEventKind::HookNotice {
+                    event_name: notice.event_name,
+                    message: notice.message,
+                    is_error: notice.is_error,
+                },
+            );
+        }
+        Ok(())
+    }
+
     pub(super) async fn handle_close_session(
         &self,
         req: CloseSessionRequest,
     ) -> Result<CloseSessionResponse, Error> {
         let session_id = req.session_id.to_string();
         let result = self.stop_session(&session_id).await;
+        if let Err(error) = self.run_session_end_hook(&session_id, "close").await {
+            tracing::warn!(session_id, %error, "session_end hook failed during close");
+        }
         self.clear_delegate_model_overrides(&session_id).await;
         result?;
         Ok(CloseSessionResponse::new())
@@ -210,6 +246,9 @@ impl LocalAgentHandle {
         // Closing is best-effort: deleting persisted history is the primary intent.
         // Route through the session binding so delegated runtimes are released too.
         let _ = self.stop_session(&session_id).await;
+        if let Err(error) = self.run_session_end_hook(&session_id, "delete").await {
+            tracing::warn!(session_id, %error, "session_end hook failed during delete");
+        }
 
         let exists = self
             .config

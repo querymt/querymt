@@ -8,6 +8,18 @@
       ],
       "type": "string"
     },
+    "CompactionOutputWire": {
+      "additionalProperties": false,
+      "properties": {
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "summary"
+      ],
+      "type": "object"
+    },
     "PreCompactionHookSpecificOutputWire": {
       "additionalProperties": false,
       "properties": {
@@ -17,6 +29,17 @@
             "string",
             "null"
           ]
+        },
+        "compaction": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CompactionOutputWire"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "hook_event_name": {
           "const": "pre_compaction",

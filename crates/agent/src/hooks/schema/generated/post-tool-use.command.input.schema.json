@@ -7,6 +7,31 @@
         "string",
         "null"
       ]
+    },
+    "StructuredToolResultWire": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "items": true,
+          "type": "array"
+        },
+        "execution_is_error": {
+          "type": "boolean"
+        },
+        "is_error": {
+          "type": "boolean"
+        },
+        "tool_source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "is_error",
+        "execution_is_error",
+        "tool_source"
+      ],
+      "type": "object"
     }
   },
   "properties": {
@@ -36,6 +61,9 @@
       "type": "string"
     },
     "tool_response": true,
+    "tool_result": {
+      "$ref": "#/definitions/StructuredToolResultWire"
+    },
     "tool_use_id": {
       "type": "string"
     },
@@ -57,6 +85,7 @@
     "tool_name",
     "tool_input",
     "tool_response",
+    "tool_result",
     "tool_use_id"
   ],
   "title": "post-tool-use.command.input",

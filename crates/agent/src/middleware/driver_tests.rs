@@ -1,4 +1,5 @@
 use crate::events::StopType;
+use crate::middleware::PreparedModelRequest;
 use crate::middleware::{
     AgentStats, CompositeDriver, ConversationContext, ExecutionState, LimitsConfig,
     LimitsMiddleware, MaxStepsMiddleware, MiddlewareDriver, PriceLimitMiddleware,
@@ -190,7 +191,11 @@ async fn test_max_steps_ignores_other_states() {
 
     let state = ExecutionState::CallLlm {
         context: context.clone(),
-        tools: Arc::from([]),
+        request: Arc::new(PreparedModelRequest {
+            messages: Arc::from([]),
+            tools: Arc::from([]),
+            estimated_tokens: 0,
+        }),
     };
     let result = middleware.on_step_start(state, None).await.unwrap();
     assert!(matches!(result, ExecutionState::CallLlm { .. }));

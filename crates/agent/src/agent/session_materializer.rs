@@ -647,13 +647,6 @@ impl SessionMaterializer {
                     },
                 );
             }
-            if !hook_result.additional_contexts.is_empty() {
-                log::debug!(
-                    "Session {}: ignoring {} session-start hook additional_context item(s) for MVP",
-                    prepared.session_id,
-                    hook_result.additional_contexts.len()
-                );
-            }
             if let Some(stop_reason) = hook_result.stop_reason {
                 log::warn!(
                     "Session {}: session-start hook requested stop: {}",
