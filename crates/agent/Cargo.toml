@@ -137,7 +137,7 @@ tree-sitter-nix = "0.3"
 tree-sitter-lua = "0.5"
 
 # Rust AST parsing for rich structural fingerprinting during function indexing
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
