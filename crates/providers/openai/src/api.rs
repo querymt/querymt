@@ -932,44 +932,39 @@ fn convert_chat_message_to_openai<'a>(
     // Check if this message contains any ToolUse blocks — those map to tool_calls.
     let has_tool_use = chat_msg.content.iter().any(|b| b.is_tool_use());
 
-    // Emit tool result blocks as separate messages
+    // Emit tool result blocks as separate messages. Any supplemental text on the
+    // same ChatMessage is request context associated with the result batch. Keep
+    // it inside the final tool response: some OpenAI-compatible APIs reject a
+    // user message interleaved between an assistant tool call and its responses.
     if has_tool_results {
-        for block in &chat_msg.content {
+        let supplemental_text = chat_msg
+            .content
+            .iter()
+            .filter(|block| !block.is_tool_result())
+            .filter_map(Content::as_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let last_tool_result_index = chat_msg.content.iter().rposition(Content::is_tool_result);
+
+        for (index, block) in chat_msg.content.iter().enumerate() {
             if let Content::ToolResult { id, content, .. } = block {
-                // Extract text from the tool result content blocks
-                let text: String = content
+                let mut text = content
                     .iter()
-                    .filter_map(|c| c.as_text().map(str::to_string))
+                    .filter_map(Content::as_text)
                     .collect::<Vec<_>>()
                     .join("\n");
+                if Some(index) == last_tool_result_index && !supplemental_text.is_empty() {
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(&supplemental_text);
+                }
                 out.push(OpenAIChatMessage {
                     role: Cow::Borrowed("tool"),
                     tool_call_id: Some(Cow::Borrowed(id.as_str())),
                     tool_calls: None,
                     content: Some(Right(Cow::Owned(text))),
                     reasoning_content: None,
-                });
-            }
-        }
-        // If there are also non-tool-result blocks (e.g. text), emit those too
-        let non_tool_content: Vec<&Content> = chat_msg
-            .content
-            .iter()
-            .filter(|b| !b.is_tool_result())
-            .collect();
-        if !non_tool_content.is_empty() {
-            let text: String = non_tool_content
-                .iter()
-                .filter_map(|b| b.as_text().map(str::to_string))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !text.is_empty() {
-                out.push(OpenAIChatMessage {
-                    role,
-                    tool_call_id: None,
-                    tool_calls: None,
-                    content: Some(Right(Cow::Owned(text))),
-                    reasoning_content: extract_reasoning_content(chat_msg, include_reasoning),
                 });
             }
         }
@@ -1610,6 +1605,44 @@ mod tests {
             }
             other => panic!("expected AuthError, got {other}"),
         }
+    }
+
+    #[test]
+    fn tool_result_context_stays_in_the_tool_response_batch() {
+        use querymt::chat::{ChatMessage, Content};
+
+        let messages = [
+            ChatMessage::assistant()
+                .text("I'll inspect the workspace.")
+                .tool_use("call_1", "ls", serde_json::json!({"path": "."}))
+                .build(),
+            ChatMessage::user()
+                .tool_result(
+                    "call_1".to_string(),
+                    Some("ls".to_string()),
+                    false,
+                    vec![Content::text("specs.md")],
+                )
+                .text("<run-objective>Collect benchmark data</run-objective>")
+                .build(),
+        ];
+
+        let mut converted = Vec::new();
+        for message in &messages {
+            super::convert_chat_message_to_openai(message, &mut converted, true);
+        }
+        let converted = serde_json::to_value(converted).unwrap();
+        let messages = converted.as_array().unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
+        assert_eq!(
+            messages[1]["content"],
+            "specs.md\n\n<run-objective>Collect benchmark data</run-objective>"
+        );
     }
 
     #[test]
