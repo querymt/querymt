@@ -75,7 +75,7 @@ pub fn cursor_from_events(events: &[AgentEvent]) -> StreamCursor {
     cursor
 }
 
-pub fn user_prompt_records(messages: &[crate::model::AgentMessage]) -> Vec<UserPromptRecord> {
+fn user_prompt_records(messages: &[crate::model::AgentMessage]) -> Vec<UserPromptRecord> {
     messages
         .iter()
         .enumerate()

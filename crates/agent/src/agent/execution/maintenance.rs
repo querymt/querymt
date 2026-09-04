@@ -89,6 +89,9 @@ pub(super) async fn run_ai_compaction(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to get agent history: {}", e))?;
 
+    let prompt_limit = exec_ctx
+        .execution_config()
+        .and_then(|cfg| cfg.max_prompt_bytes);
     let token_estimate: usize = messages
         .iter()
         .map(|m| {
@@ -97,7 +100,7 @@ pub(super) async fn run_ai_compaction(
                 .map(|p| match p {
                     MessagePart::Text { content } => content.len() / 4,
                     MessagePart::Prompt { blocks } | MessagePart::Steering { blocks, .. } => {
-                        crate::agent::utils::render_prompt_for_llm(blocks, None).len() / 4
+                        crate::agent::utils::render_prompt_for_llm(blocks, prompt_limit).len() / 4
                     }
                     MessagePart::ToolResult { content, .. } => {
                         content
@@ -296,9 +299,6 @@ pub(super) async fn run_ai_compaction(
         .map_err(|e| anyhow::anyhow!("Failed to get new history: {}", e))?;
 
     // Convert AgentMessages to ChatMessages for the ConversationContext
-    let prompt_limit = exec_ctx
-        .execution_config()
-        .and_then(|cfg| cfg.max_prompt_bytes);
     let chat_messages: Vec<querymt::chat::ChatMessage> = filtered_messages
         .iter()
         .map(|message| message.to_chat_message_with_max_prompt_bytes(prompt_limit))

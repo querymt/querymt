@@ -917,6 +917,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_process_invalid_attachment_does_not_call_provider() {
+        let service = SessionCompaction::new();
+        let message = AgentMessage {
+            id: "invalid-image".into(),
+            session_id: "s1".into(),
+            role: ChatRole::User,
+            parts: vec![MessagePart::Prompt {
+                blocks: vec![crate::acp::protocol::ContentBlock::Image(
+                    crate::acp::protocol::ImageContent::new("%%%", "image/png"),
+                )],
+            }],
+            created_at: 0,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        let provider = Arc::new(MockCompactionProvider::with_summary("must not be called"));
+
+        let result = service
+            .process(
+                &[message],
+                provider.clone(),
+                "model",
+                &RetryConfig::default(),
+                None,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(provider.call_count(), 0);
+    }
+
+    #[tokio::test]
     async fn test_process_success_simple() {
         let fixture = CompactionFixture::new();
         let messages = MessageFixture::simple_conversation("s1");

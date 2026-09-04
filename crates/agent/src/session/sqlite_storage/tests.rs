@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use querymt::LLMParams;
+use querymt::chat::ChatRole;
 use rusqlite::Connection;
 
 use crate::acp::protocol::{ContentBlock, ImageContent, TextContent};
@@ -13,7 +14,6 @@ use crate::session::projection::{
     EventJournal, NewDurableEvent, RecentModelEntry, SessionScope, ViewStore,
 };
 use crate::session::store::SessionStore;
-use querymt::chat::ChatRole;
 
 use super::SqliteStorage;
 use super::migrations::{MIGRATIONS, apply_migrations};

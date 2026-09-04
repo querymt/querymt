@@ -7,6 +7,7 @@ use querymt::{
     chat::{ChatMessage, ChatRole, Content},
 };
 use serde::{Deserialize, Serialize};
+use std::io::{Cursor, Read};
 
 pub const MAX_IMAGES_PER_PROMPT: usize = 8;
 pub const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
@@ -53,7 +54,45 @@ pub fn prompt_contains_images(blocks: &[ContentBlock]) -> bool {
 }
 
 pub fn validate_prompt_blocks(blocks: &[ContentBlock]) -> Result<(), PromptContentError> {
-    convert_prompt_blocks(blocks, None).map(|_| ())
+    if blocks.is_empty() {
+        return Err(PromptContentError::EmptyPrompt);
+    }
+
+    let mut image_count = 0usize;
+    let mut total_attachment_bytes = 0usize;
+    for (index, block) in blocks.iter().enumerate() {
+        match block {
+            ContentBlock::Text(_) | ContentBlock::ResourceLink(_) | ContentBlock::Audio(_) => {}
+            ContentBlock::Image(image) => {
+                let bytes = validate_encoded_attachment(index, &image.data, false)?;
+                validate_attachment_size(index, bytes, &mut total_attachment_bytes)?;
+                validate_image(index, &image.mime_type, &mut image_count)?;
+            }
+            ContentBlock::Resource(resource) => match &resource.resource {
+                EmbeddedResourceResource::TextResourceContents(text) => {
+                    validate_attachment_size(index, text.text.len(), &mut total_attachment_bytes)?;
+                }
+                EmbeddedResourceResource::BlobResourceContents(blob) => {
+                    let mime_type = blob
+                        .mime_type
+                        .as_deref()
+                        .unwrap_or("application/octet-stream");
+                    let bytes = validate_encoded_attachment(
+                        index,
+                        &blob.blob,
+                        mime_type.starts_with("text/"),
+                    )?;
+                    validate_attachment_size(index, bytes, &mut total_attachment_bytes)?;
+                    if mime_type.starts_with("image/") {
+                        validate_image(index, mime_type, &mut image_count)?;
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 pub fn convert_prompt_blocks(
@@ -141,7 +180,54 @@ pub fn convert_prompt_blocks(
     Ok(converted)
 }
 
-fn decode_attachment(index: usize, encoded: &str) -> Result<Vec<u8>, PromptContentError> {
+fn validate_encoded_attachment(
+    index: usize,
+    encoded: &str,
+    require_utf8: bool,
+) -> Result<usize, PromptContentError> {
+    validate_encoded_attachment_bound(index, encoded)?;
+    let mut decoder = base64::read::DecoderReader::new(
+        Cursor::new(encoded.as_bytes()),
+        &base64::engine::general_purpose::STANDARD,
+    );
+    let mut buffer = [0u8; 8192];
+    let mut utf8_tail = Vec::new();
+    let mut decoded_bytes = 0usize;
+    loop {
+        let read =
+            decoder
+                .read(&mut buffer)
+                .map_err(|error| PromptContentError::InvalidBase64 {
+                    index,
+                    reason: error.to_string(),
+                })?;
+        if read == 0 {
+            break;
+        }
+        decoded_bytes = decoded_bytes.saturating_add(read);
+        if require_utf8 {
+            utf8_tail.extend_from_slice(&buffer[..read]);
+            match std::str::from_utf8(&utf8_tail) {
+                Ok(_) => utf8_tail.clear(),
+                Err(error) if error.error_len().is_some() => {
+                    return Err(PromptContentError::InvalidTextResource { index });
+                }
+                Err(error) => {
+                    utf8_tail.drain(..error.valid_up_to());
+                }
+            }
+        }
+    }
+    if require_utf8 && !utf8_tail.is_empty() {
+        return Err(PromptContentError::InvalidTextResource { index });
+    }
+    Ok(decoded_bytes)
+}
+
+fn validate_encoded_attachment_bound(
+    index: usize,
+    encoded: &str,
+) -> Result<(), PromptContentError> {
     // Standard base64 has no ignored whitespace, so this bounds allocation before decoding.
     let max_encoded_bytes = MAX_ATTACHMENT_BYTES.div_ceil(3).saturating_mul(4);
     if encoded.len() > max_encoded_bytes {
@@ -150,7 +236,11 @@ fn decode_attachment(index: usize, encoded: &str) -> Result<Vec<u8>, PromptConte
             max_bytes: MAX_ATTACHMENT_BYTES,
         });
     }
+    Ok(())
+}
 
+fn decode_attachment(index: usize, encoded: &str) -> Result<Vec<u8>, PromptContentError> {
+    validate_encoded_attachment_bound(index, encoded)?;
     base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map_err(|error| PromptContentError::InvalidBase64 {
@@ -640,6 +730,13 @@ mod tests {
         ))]);
         assert!(matches!(
             invalid_base64.to_chat_message(),
+            Err(PromptContentError::InvalidBase64 { index: 0, .. })
+        ));
+        assert!(matches!(
+            super::validate_prompt_blocks(&[ContentBlock::Image(ImageContent::new(
+                "%%%",
+                "image/png",
+            ))]),
             Err(PromptContentError::InvalidBase64 { index: 0, .. })
         ));
 

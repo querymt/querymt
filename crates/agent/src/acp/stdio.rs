@@ -818,14 +818,14 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
 mod stdio_tests {
     use super::{
         AcpLiveEventTranslator, CancelNotification, ClientBridgeMessage, PromptRequest,
-        agent_ext_request, create_elicitation_request, run_bridge_task,
-        spawn_event_bridge_forwarder,
+        agent_ext_request, create_elicitation_request, replay_agent_events_with_user_prompts,
+        run_bridge_task, spawn_event_bridge_forwarder,
     };
     use crate::acp::client_bridge::ClientBridgeSender;
     use crate::acp::protocol::{
-        AgentRequest, CreateElicitationRequest, ElicitationAcceptAction,
-        ElicitationAction as AcpElicitationAction, ElicitationContentValue, PromptResponse,
-        SessionId, SessionNotification, StopReason,
+        AgentRequest, ContentBlock, CreateElicitationRequest, ElicitationAcceptAction,
+        ElicitationAction as AcpElicitationAction, ElicitationContentValue, ImageContent,
+        PromptResponse, SessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
     };
     use crate::elicitation::ElicitationAction;
     use agent_client_protocol::{Agent, ByteStreams, Client, JsonRpcMessage};
@@ -835,6 +835,58 @@ mod stdio_tests {
     use tokio::sync::{Mutex, Notify, mpsc};
     use tokio::time::{Duration, timeout};
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+    #[test]
+    fn session_load_replay_preserves_structured_prompt_order_and_message_id() {
+        let event = crate::events::AgentEvent {
+            seq: 1,
+            timestamp: 1,
+            session_id: "s-1".to_string(),
+            origin: crate::events::EventOrigin::Local,
+            source_node: None,
+            kind: crate::events::AgentEventKind::PromptReceived {
+                content: "flattened summary".to_string(),
+                message_id: Some("stored-message-id".to_string()),
+            },
+        };
+        let prompt_blocks = std::collections::HashMap::from([(
+            "stored-message-id".to_string(),
+            vec![
+                ContentBlock::Text(TextContent::new("before")),
+                ContentBlock::Image(ImageContent::new("AQID", "image/png")),
+                ContentBlock::Text(TextContent::new("after")),
+            ],
+        )]);
+
+        let notifications =
+            replay_agent_events_with_user_prompts("s-1", vec![event], &prompt_blocks);
+
+        assert_eq!(notifications.len(), 3);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::UserMessageChunk(chunk)
+                if matches!(&chunk.content, ContentBlock::Text(text) if text.text == "before")
+        ));
+        assert!(matches!(
+            &notifications[1].update,
+            SessionUpdate::UserMessageChunk(chunk)
+                if matches!(&chunk.content, ContentBlock::Image(image) if image.data == "AQID")
+        ));
+        assert!(matches!(
+            &notifications[2].update,
+            SessionUpdate::UserMessageChunk(chunk)
+                if matches!(&chunk.content, ContentBlock::Text(text) if text.text == "after")
+        ));
+        for notification in notifications {
+            let SessionUpdate::UserMessageChunk(chunk) = notification.update else {
+                panic!("expected structured user message chunk");
+            };
+            assert_eq!(
+                chunk.message_id.as_ref().map(|id| id.0.as_ref()),
+                Some("stored-message-id")
+            );
+        }
+    }
 
     #[tokio::test]
     async fn delegation_update_uses_typed_ext_notification_bridge() {

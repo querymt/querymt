@@ -1461,6 +1461,14 @@ impl Message<SubmitSessionInput> for SessionActor {
 
         match input.delivery {
             InputDelivery::Steer => {
+                let llm_config = self
+                    .config
+                    .provider
+                    .history_store()
+                    .get_session_llm_config(&self.session_id)
+                    .await
+                    .map_err(|e| AgentError::Internal(e.to_string()))?;
+                validate_model_image_support(&input.prompt, llm_config.as_ref())?;
                 let run = self
                     .active_run
                     .as_ref()
@@ -2087,13 +2095,6 @@ async fn execute_prompt_detached(
         );
         return Err(AgentError::Internal(reason));
     }
-    config.emit_event(
-        &session_id,
-        AgentEventKind::PromptReceived {
-            content: display_content.clone(),
-            message_id: Some(message_id.clone()),
-        },
-    );
 
     let mut parts = vec![MessagePart::Prompt {
         blocks: req.prompt.clone(),

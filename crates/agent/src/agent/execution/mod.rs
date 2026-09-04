@@ -93,7 +93,7 @@ fn refresh_objective_fragment(
     ))
 }
 
-async fn apply_pending_steering(
+pub(crate) async fn apply_pending_steering(
     config: &AgentConfig,
     exec_ctx: &mut ExecutionContext,
     context: &Arc<crate::middleware::ConversationContext>,
@@ -129,12 +129,11 @@ async fn apply_pending_steering(
             source_provider: None,
             source_model: None,
         };
-        exec_ctx.add_message(message.clone()).await?;
-        messages.push(
-            message
-                .to_chat_message()
-                .map_err(|error| anyhow::anyhow!("Invalid steering content: {error}"))?,
-        );
+        let chat_message = message
+            .to_chat_message()
+            .map_err(|error| anyhow::anyhow!("Invalid steering content: {error}"))?;
+        exec_ctx.add_message(message).await?;
+        messages.push(chat_message);
         if !display.trim().is_empty() {
             let summary = exec_ctx
                 .state
