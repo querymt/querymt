@@ -11400,7 +11400,7 @@ dependencies = [
  "similarity-rs",
  "stop-words 0.10.0",
  "strsim 0.11.1",
- "syn 2.0.119",
+ "syn 3.0.3",
  "tempfile",
  "thiserror 2.0.20",
  "time",
