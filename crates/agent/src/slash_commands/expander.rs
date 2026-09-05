@@ -39,8 +39,10 @@ pub fn try_parse_invocation(
         return None;
     }
 
-    // Must exist in registry
-    registry.get(name)?;
+    // Must exist as a built-in or discovered command.
+    if !registry.contains(name) {
+        return None;
+    }
 
     let arguments = after_slash[name_end..].trim().to_string();
     let original_text = trimmed.to_string();

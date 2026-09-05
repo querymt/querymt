@@ -11,6 +11,31 @@ Delegation allows agents to:
 - **Run in parallel** multiple delegations
 - **Route to remote agents** via mesh networking
 
+## Delegate from the prompt
+
+Use the built-in `/delegate` command to send a task directly to a configured profile or agent:
+
+```text
+/delegate [--wait|--async] <profile:id|agent:id> <task>
+```
+
+Examples:
+
+```text
+/delegate --wait profile:reviewer Review the current branch
+/delegate --async profile:multi-agent Investigate the failing integration tests
+/delegate --wait agent:gpu-coder Implement and benchmark the fix
+```
+
+`profile:<id>` loads a QueryMT profile. A multi-agent profile starts at its planner. `agent:<id>` targets an entry in the current agent registry, including configured remote agents. `--wait` waits for the result and lets the parent agent process it; `--async` completes the command turn immediately and injects the result in a later turn. The default is `--wait`.
+
+Remote execution supports both existing modes:
+
+- A remote `agent:<id>` runs the child session, model, and tools on the remote node.
+- A peer-routed delegate in a `profile:<id>` keeps the session and tools local while routing model calls to its configured peer.
+
+Both forms use the delegation orchestrator, including concurrency limits, hooks, persistence, cancellation, summaries, and result events.
+
 ## Architecture
 
 ```mermaid

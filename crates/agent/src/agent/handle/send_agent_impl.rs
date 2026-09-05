@@ -21,6 +21,14 @@ impl SendAgent for LocalAgentHandle {
     async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, Error> {
         let session_id = req.session_id.to_string();
         let session_ref = self.session_ref_for_agent_session(&session_id).await?;
+        if let Some(command) = crate::slash_commands::parse_builtin_invocation(&req) {
+            let command = command.map_err(|message| {
+                Error::invalid_params().data(serde_json::json!({ "message": message }))
+            })?;
+            return self
+                .execute_delegate_slash_command(req, session_ref, command)
+                .await;
+        }
         session_ref.prompt(req).await
     }
 
