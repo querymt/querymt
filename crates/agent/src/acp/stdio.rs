@@ -152,6 +152,19 @@ pub async fn load_session_with_replay(
     prepare_session_load(agent, req).instrument(span).await
 }
 
+async fn advertise_available_commands(
+    agent: &Arc<crate::agent::LocalAgentHandle>,
+    bridge_sender: &ClientBridgeSender,
+    session_id: &str,
+) {
+    let Some(notification) = agent.available_slash_commands(session_id).await else {
+        return;
+    };
+    if let Err(e) = bridge_sender.notify(notification).await {
+        log::debug!("Failed to advertise slash commands for session {session_id}: {e}");
+    }
+}
+
 async fn load_session_and_enqueue_replay(
     agent: &Arc<crate::agent::LocalAgentHandle>,
     bridge_sender: &ClientBridgeSender,
@@ -618,8 +631,15 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         .on_receive_request(
             {
                 let agent = agent.clone();
+                let bridge_sender = bridge_sender.clone();
                 async move |req: NewSessionRequest, responder, _cx| {
-                    responder.respond_with_result(agent.new_session(req).await)
+                    let result = agent.new_session(req).await;
+                    let session_id = result.as_ref().ok().map(|r| r.session_id.to_string());
+                    let send_result = responder.respond_with_result(result);
+                    if let Some(session_id) = session_id {
+                        advertise_available_commands(&agent, &bridge_sender, &session_id).await;
+                    }
+                    send_result
                 }
             },
             acp::on_receive_request!(),
@@ -651,9 +671,14 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
                 let agent = agent.clone();
                 let bridge_sender = bridge_sender.clone();
                 async move |req: LoadSessionRequest, responder, _cx| {
-                    responder.respond_with_result(
-                        load_session_and_enqueue_replay(&agent, &bridge_sender, req).await,
-                    )
+                    let session_id = req.session_id.to_string();
+                    let result = load_session_and_enqueue_replay(&agent, &bridge_sender, req).await;
+                    let ok = result.is_ok();
+                    let send_result = responder.respond_with_result(result);
+                    if ok {
+                        advertise_available_commands(&agent, &bridge_sender, &session_id).await;
+                    }
+                    send_result
                 }
             },
             acp::on_receive_request!(),
@@ -679,8 +704,16 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         .on_receive_request(
             {
                 let agent = agent.clone();
+                let bridge_sender = bridge_sender.clone();
                 async move |req: ResumeSessionRequest, responder, _cx| {
-                    responder.respond_with_result(agent.resume_session(req).await)
+                    let session_id = req.session_id.to_string();
+                    let result = agent.resume_session(req).await;
+                    let ok = result.is_ok();
+                    let send_result = responder.respond_with_result(result);
+                    if ok {
+                        advertise_available_commands(&agent, &bridge_sender, &session_id).await;
+                    }
+                    send_result
                 }
             },
             acp::on_receive_request!(),

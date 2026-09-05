@@ -17,7 +17,8 @@ use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::{SnapshotPolicy, ToolPolicy};
 use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{
-    ExecutionPolicy, HooksConfig, McpServerConfig, MiddlewareEntry, SingleAgentConfig, SkillsConfig,
+    ExecutionPolicy, HooksConfig, McpServerConfig, MiddlewareEntry, SingleAgentConfig,
+    SkillsConfig, SlashCommandsConfig,
 };
 use crate::event_fanout::EventFanout;
 use crate::middleware::{MIDDLEWARE_REGISTRY, MiddlewareDriver};
@@ -110,6 +111,7 @@ pub struct AgentBuilder {
     middleware_entries: Vec<MiddlewareEntry>,
     execution: Option<ExecutionPolicy>,
     skills_config: Option<SkillsConfig>,
+    slash_commands_config: Option<SlashCommandsConfig>,
     hooks_config: Option<HooksConfig>,
     /// MCP servers from TOML `[[mcp]]` config, attached to every new session.
     mcp_servers: Vec<McpServerConfig>,
@@ -149,6 +151,7 @@ impl AgentBuilder {
             middleware_entries: Vec::new(),
             execution: None,
             skills_config: None,
+            slash_commands_config: None,
             hooks_config: None,
             mcp_servers: Vec::new(),
             session_mcp_attachment_source: None,
@@ -269,6 +272,12 @@ impl AgentBuilder {
     /// Configure hooks.
     pub fn hooks(mut self, config: HooksConfig) -> Self {
         self.hooks_config = Some(config);
+        self
+    }
+
+    /// Configure slash-command discovery.
+    pub fn slash_commands(mut self, config: SlashCommandsConfig) -> Self {
+        self.slash_commands_config = Some(config);
         self
     }
 
@@ -482,6 +491,34 @@ impl AgentBuilder {
         if let Some(hooks_config) = self.hooks_config.take() {
             let hooks = crate::hooks::Hooks::new(hooks_config)?;
             builder = builder.with_hooks(hooks);
+        }
+
+        if let Some(slash_config) = self.slash_commands_config
+            && slash_config.enabled
+        {
+            let sources = crate::slash_commands::search_paths(
+                cwd.as_deref(),
+                slash_config.include_global,
+                slash_config.include_project,
+                &slash_config.paths,
+            );
+            let (registry, diagnostics) = crate::slash_commands::SlashCommandRegistry::from_sources(
+                &sources,
+                &slash_config.scripts,
+            );
+            for diagnostic in &diagnostics {
+                log::warn!(
+                    "Skipping invalid slash command {}: {}",
+                    diagnostic.path.display(),
+                    diagnostic.message
+                );
+            }
+            if registry.is_empty() {
+                log::info!("No slash commands discovered");
+            } else {
+                log::info!("Discovered slash commands: {}", registry.names().join(", "));
+            }
+            builder = builder.with_slash_command_registry(registry);
         }
 
         // Build initial config for middleware factories (temporary handle)
@@ -1005,6 +1042,7 @@ impl Agent {
         // Thread through config fields that were previously silently dropped
         builder.execution = Some(config.agent.execution);
         builder.skills_config = Some(config.agent.skills);
+        builder.slash_commands_config = Some(config.agent.slash_commands);
         builder.hooks_config = Some(config.agent.hooks);
 
         // Wire MCP servers from TOML `[[mcp]]` config.

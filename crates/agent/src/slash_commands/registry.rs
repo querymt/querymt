@@ -102,26 +102,13 @@ impl SlashCommandRegistry {
     pub fn reload(
         &mut self,
         project_root: Option<&Path>,
+        include_global: bool,
+        include_project: bool,
         extra_paths: &[PathBuf],
         scripts_config: &SlashCommandScriptsConfig,
     ) -> Vec<SlashCommandDiagnostic> {
-        let mut sources = Vec::new();
-
-        if let Some(root) = project_root {
-            sources.extend(discovery::default_search_paths(root));
-        } else {
-            // Global-only when no project root
-            if let Some(home) = dirs::home_dir() {
-                sources.push(SlashCommandSource::Global(home.join(".qmt/commands")));
-            }
-            if let Ok(cfg_dir) = querymt_utils::providers::config_dir() {
-                sources.push(SlashCommandSource::Global(cfg_dir.join("commands")));
-            }
-        }
-
-        for p in extra_paths {
-            sources.push(SlashCommandSource::Configured(p.clone()));
-        }
+        let sources =
+            discovery::search_paths(project_root, include_global, include_project, extra_paths);
 
         let (commands, diagnostics) = discovery::discover_all(&sources);
 
@@ -252,7 +239,7 @@ mod tests {
         .unwrap();
 
         let scripts_config = SlashCommandScriptsConfig::default();
-        let diags = reg.reload(Some(dir.path()), &[], &scripts_config);
+        let diags = reg.reload(Some(dir.path()), true, true, &[], &scripts_config);
         assert!(diags.is_empty());
 
         // Old command is gone
@@ -261,5 +248,27 @@ mod tests {
         // But .qmt/commands doesn't exist in the temp dir, so let's check reload
         // actually cleared old and didn't add anything (no .qmt/commands dir)
         assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn test_reload_honors_include_flags() {
+        let mut reg = SlashCommandRegistry::new();
+        let dir = TempDir::new().unwrap();
+        let commands_dir = dir.path().join(".qmt/commands");
+        fs::create_dir_all(&commands_dir).unwrap();
+        fs::write(
+            commands_dir.join("project.md"),
+            "---\ndescription: Project command\n---\nBody\n",
+        )
+        .unwrap();
+
+        let scripts_config = SlashCommandScriptsConfig::default();
+        let diags = reg.reload(Some(dir.path()), false, false, &[], &scripts_config);
+        assert!(diags.is_empty());
+        assert!(reg.is_empty());
+
+        let diags = reg.reload(Some(dir.path()), false, true, &[], &scripts_config);
+        assert!(diags.is_empty());
+        assert!(reg.get("project").is_some());
     }
 }

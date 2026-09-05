@@ -1,28 +1,76 @@
 use crate::slash_commands::parser::parse_command_file;
 use crate::slash_commands::types::{SlashCommand, SlashCommandDiagnostic, SlashCommandSource};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Build discovery sources from include flags and extra configured paths.
+///
+/// Global: `~/.qmt/commands` and `<config-dir>/commands`
+/// Project: `<PROJECT_ROOT>/.qmt/commands`
+pub fn search_paths(
+    project_root: Option<&Path>,
+    include_global: bool,
+    include_project: bool,
+    extra_paths: &[PathBuf],
+) -> Vec<SlashCommandSource> {
+    let mut paths = Vec::new();
+
+    if include_global {
+        if let Some(home) = dirs::home_dir() {
+            push_unique_source(
+                &mut paths,
+                SlashCommandSource::Global(home.join(".qmt/commands")),
+            );
+        }
+        if let Ok(cfg_dir) = querymt_utils::providers::config_dir() {
+            push_unique_source(
+                &mut paths,
+                SlashCommandSource::Global(cfg_dir.join("commands")),
+            );
+        }
+    }
+
+    if include_project && let Some(root) = project_root {
+        push_unique_source(
+            &mut paths,
+            SlashCommandSource::Project(root.join(".qmt/commands")),
+        );
+    }
+
+    for path in extra_paths {
+        push_unique_source(&mut paths, SlashCommandSource::Configured(path.clone()));
+    }
+
+    paths
+}
+
+fn source_dir(source: &SlashCommandSource) -> &Path {
+    match source {
+        SlashCommandSource::Global(path)
+        | SlashCommandSource::Project(path)
+        | SlashCommandSource::Configured(path) => path,
+    }
+}
+
+fn push_unique_source(paths: &mut Vec<SlashCommandSource>, source: SlashCommandSource) {
+    let path = source_dir(&source);
+    if let Some(existing) = paths
+        .iter_mut()
+        .find(|existing| source_dir(existing) == path)
+    {
+        if source.priority() > existing.priority() {
+            *existing = source;
+        }
+        return;
+    }
+    paths.push(source);
+}
 
 /// Build default discovery sources for slash commands.
 ///
 /// Global: `~/.qmt/commands`
 /// Project: `<PROJECT_ROOT>/.qmt/commands`
 pub fn default_search_paths(project_root: &Path) -> Vec<SlashCommandSource> {
-    let mut paths = Vec::new();
-
-    // Global paths
-    if let Some(home) = dirs::home_dir() {
-        paths.push(SlashCommandSource::Global(home.join(".qmt/commands")));
-    }
-    if let Ok(cfg_dir) = querymt_utils::providers::config_dir() {
-        paths.push(SlashCommandSource::Global(cfg_dir.join("commands")));
-    }
-
-    // Project path
-    paths.push(SlashCommandSource::Project(
-        project_root.join(".qmt/commands"),
-    ));
-
-    paths
+    search_paths(Some(project_root), true, true, &[])
 }
 
 /// Discover commands from a single source directory.
@@ -301,5 +349,52 @@ description: {}
         assert!(paths.iter().any(
             |p| matches!(p, SlashCommandSource::Project(pth) if pth.ends_with(".qmt/commands"))
         ));
+    }
+
+    #[test]
+    fn test_search_paths_honors_include_flags_and_extra_paths() {
+        let extra = PathBuf::from("/custom/commands");
+        let none = search_paths(Some(Path::new("/my/project")), false, false, &[]);
+        assert!(none.is_empty());
+
+        let configured = search_paths(None, false, true, std::slice::from_ref(&extra));
+        assert_eq!(configured.len(), 1);
+        assert!(matches!(
+            &configured[0],
+            SlashCommandSource::Configured(path) if path == &extra
+        ));
+
+        let project_only = search_paths(Some(Path::new("/my/project")), false, true, &[]);
+        assert_eq!(project_only.len(), 1);
+        assert!(matches!(
+            &project_only[0],
+            SlashCommandSource::Project(path) if path.ends_with(".qmt/commands")
+        ));
+    }
+
+    #[test]
+    fn test_search_paths_dedupes_equivalent_directories() {
+        let extra = PathBuf::from("/my/project/.qmt/commands");
+        let paths = search_paths(
+            Some(Path::new("/my/project")),
+            false,
+            true,
+            std::slice::from_ref(&extra),
+        );
+        assert_eq!(paths.len(), 1);
+        assert!(matches!(
+            &paths[0],
+            SlashCommandSource::Configured(path) if path == &extra
+        ));
+
+        let global = search_paths(None, true, false, &[]);
+        let mut seen = std::collections::HashSet::new();
+        for source in &global {
+            assert!(
+                seen.insert(source_dir(source).to_path_buf()),
+                "duplicate discovery path {:?}",
+                source_dir(source)
+            );
+        }
     }
 }

@@ -148,6 +148,17 @@ pub trait SendAgent: Send + Sync + Any {
     /// Receives extension notifications that don't require a response.
     async fn ext_notification(&self, notif: ExtNotification) -> Result<(), Error>;
 
+    /// Slash-command catalog for a session bound on this connection.
+    ///
+    /// Transports advertise this after `session/new`, `session/load`, and
+    /// `session/resume`. Default is no catalog.
+    async fn available_slash_commands(
+        &self,
+        _session_id: &str,
+    ) -> Option<crate::acp::protocol::SessionNotification> {
+        None
+    }
+
     /// Expose dynamic type for downcasting.
     fn as_any(&self) -> &dyn Any;
 }

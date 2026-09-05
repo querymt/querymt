@@ -4,6 +4,7 @@ use super::{
     Agent, AgentInfra, AgentProfiles, AgentSessions, ListSessionsOptions, SessionListMode,
 };
 use crate::acp::protocol::ListSessionsRequest as AcpListSessionsRequest;
+use crate::config::SlashCommandsConfig;
 use crate::events::{AgentEventKind, EventOrigin, ExecutionMetrics};
 use crate::model::AgentMessage;
 use crate::profiles::{LocalProfileCatalog, ProfileCatalog};
@@ -39,6 +40,23 @@ async fn test_agent_with_storage(
             session_mcp_attachment_source: None,
             event_fanout: None,
         })
+        .build()
+        .await
+}
+
+async fn agent_with_slash_config(config: SlashCommandsConfig) -> Result<Agent> {
+    let (registry, _temp_dir) = empty_plugin_registry()?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    Agent::single()
+        .provider("openai", "gpt-4o-mini")
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .slash_commands(config)
         .build()
         .await
 }
@@ -106,6 +124,64 @@ async fn with_profiles_reuses_root_agent_for_active_profile() -> Result<()> {
         .await?;
 
     assert!(Arc::ptr_eq(&root_handle, &runtime.agent().handle()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn programmatic_builder_does_not_discover_slash_commands_by_default() -> Result<()> {
+    let agent = test_agent().await?;
+    assert!(agent.handle().config.slash_command_registry.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn slash_commands_config_disabled_does_not_scan_filesystem() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let commands = dir.path().join("commands");
+    std::fs::create_dir_all(&commands)?;
+    std::fs::write(
+        commands.join("docs.md"),
+        "---\ndescription: Read the docs\n---\nBody\n",
+    )?;
+
+    let agent = agent_with_slash_config(SlashCommandsConfig {
+        enabled: false,
+        include_global: false,
+        include_project: false,
+        paths: vec![commands],
+        scripts: Default::default(),
+    })
+    .await?;
+    assert!(agent.handle().config.slash_command_registry.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn slash_commands_config_enabled_discovers_configured_paths() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let commands = dir.path().join("commands");
+    std::fs::create_dir_all(&commands)?;
+    std::fs::write(
+        commands.join("docs.md"),
+        "---\ndescription: Read the docs\n---\nBody\n",
+    )?;
+
+    let agent = agent_with_slash_config(SlashCommandsConfig {
+        enabled: true,
+        include_global: false,
+        include_project: false,
+        paths: vec![commands],
+        scripts: Default::default(),
+    })
+    .await?;
+    assert!(
+        agent
+            .handle()
+            .config
+            .slash_command_registry
+            .get("docs")
+            .is_some()
+    );
     Ok(())
 }
 

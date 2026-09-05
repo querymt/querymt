@@ -855,3 +855,118 @@ async fn test_set_profile_config_option_accepts_same_bound_profile() {
             .any(|option| option.id.0.as_ref() == "reasoning_effort")
     );
 }
+
+fn advertised_command_names(
+    notification: &crate::acp::protocol::SessionNotification,
+) -> Vec<String> {
+    serde_json::to_value(notification).expect("serialize catalog")["update"]["availableCommands"]
+        .as_array()
+        .expect("availableCommands")
+        .iter()
+        .map(|command| command["name"].as_str().expect("command name").to_string())
+        .collect()
+}
+
+fn test_slash_command(name: &str, description: &str) -> crate::slash_commands::SlashCommand {
+    crate::slash_commands::SlashCommand {
+        name: name.to_string(),
+        source: crate::slash_commands::SlashCommandSource::Global(std::path::PathBuf::from("/tmp")),
+        path: std::path::PathBuf::from(format!("/tmp/{name}.md")),
+        description: description.to_string(),
+        argument_hint: None,
+        tags: Vec::new(),
+        template: description.to_string(),
+        script: None,
+        requires_script: false,
+    }
+}
+
+#[tokio::test]
+async fn test_slash_command_catalog_uses_profile_registry_and_skips_failed_lookup() {
+    let mut root_registry = crate::slash_commands::SlashCommandRegistry::new();
+    root_registry.register(test_slash_command("root", "Root command"));
+    let fixture = crate::test_utils::TestAgent::with_slash_command_registry(root_registry).await;
+
+    let profile_dir = tempfile::TempDir::new().expect("profile dir");
+    let commands = profile_dir.path().join("commands");
+    std::fs::create_dir_all(&commands).expect("commands dir");
+    std::fs::write(
+        commands.join("docs.md"),
+        "---\ndescription: Read the docs\n---\nBody\n",
+    )
+    .expect("docs command");
+    std::fs::write(
+        profile_dir.path().join("alpha.toml"),
+        format!(
+            r#"
+[agent]
+provider = "test"
+model = "test-model"
+system = "alpha"
+
+[agent.slash_commands]
+enabled = true
+include_global = false
+include_project = false
+paths = ["{}"]
+"#,
+            commands.display()
+        ),
+    )
+    .expect("alpha profile");
+
+    let catalog: Arc<dyn ProfileCatalog> = Arc::new(
+        crate::profiles::LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(profile_dir.path())
+            .build(),
+    );
+    let (plugin_registry, _temp_dir) = empty_plugin_registry().expect("plugin registry");
+    let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+        catalog,
+        "alpha",
+        AgentInfra {
+            plugin_registry: Arc::new(plugin_registry),
+            storage: None,
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        },
+    ));
+    fixture.handle.set_profiles(profiles.clone());
+
+    let unbound = fixture
+        .handle
+        .slash_command_catalog("unbound")
+        .await
+        .expect("unbound session uses this handle's registry");
+    assert_eq!(
+        advertised_command_names(&unbound),
+        vec!["/root".to_string()]
+    );
+
+    profiles
+        .bind_session_to_profile("bound", "alpha")
+        .await
+        .expect("bind alpha");
+    let bound = fixture
+        .handle
+        .slash_command_catalog("bound")
+        .await
+        .expect("bound session uses the profile registry");
+    assert_eq!(advertised_command_names(&bound), vec!["/docs".to_string()]);
+
+    profiles
+        .set_session_binding(
+            "ghost",
+            test_profile_metadata("ghost", "ghost", None).session_binding(),
+        )
+        .await;
+    assert!(
+        fixture
+            .handle
+            .slash_command_catalog("ghost")
+            .await
+            .is_none(),
+        "failed profile lookup must not fall back to this handle's registry"
+    );
+}

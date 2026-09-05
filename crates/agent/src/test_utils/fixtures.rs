@@ -79,6 +79,31 @@ impl TestAgent {
         }
     }
 
+    pub async fn with_slash_command_registry(
+        registry: crate::slash_commands::SlashCommandRegistry,
+    ) -> Self {
+        let (plugin_registry, tempdir) = empty_plugin_registry().expect("empty plugin registry");
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("create in-memory sqlite"),
+        );
+        let builder = AgentConfigBuilder::new(
+            Arc::new(plugin_registry),
+            storage.clone(),
+            LLMParams::new().provider("mock").model("mock"),
+        )
+        .with_slash_command_registry(registry);
+        let config = Arc::new(builder.build());
+        let handle = Arc::new(AgentHandle::from_config(config.clone()));
+        Self {
+            storage,
+            config,
+            handle,
+            _tempdir: tempdir,
+        }
+    }
+
     /// Like `new()` but with event journal wired (previously had event observer).
     ///
     /// Observer was a no-op; now this is identical to `new()` with event journal.
