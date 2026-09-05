@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Global: `~/.qmt/commands` and `<config-dir>/commands`
 /// Project: `<PROJECT_ROOT>/.qmt/commands`
-pub fn search_paths(
+pub(crate) fn search_paths(
     project_root: Option<&Path>,
     include_global: bool,
     include_project: bool,

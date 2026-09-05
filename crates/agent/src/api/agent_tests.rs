@@ -185,6 +185,108 @@ async fn slash_commands_config_enabled_discovers_configured_paths() -> Result<()
     Ok(())
 }
 
+async fn agent_from_single_config(toml: &str) -> Result<Agent> {
+    let config: crate::config::SingleAgentConfig = toml::from_str(toml)?;
+    let (registry, _temp_dir) = empty_plugin_registry()?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    Agent::from_config(
+        config,
+        AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn from_single_config_propagates_slash_command_paths_and_include_flags() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let extra = dir.path().join("extra-commands");
+    std::fs::create_dir_all(&extra)?;
+    std::fs::write(
+        extra.join("docs.md"),
+        "---\ndescription: Read the docs\n---\nBody\n",
+    )?;
+    let project_commands = dir.path().join(".qmt/commands");
+    std::fs::create_dir_all(&project_commands)?;
+    std::fs::write(
+        project_commands.join("project.md"),
+        "---\ndescription: Project command\n---\nBody\n",
+    )?;
+
+    let extra_only = format!(
+        r#"
+[agent]
+provider = "openai"
+model = "gpt-4o-mini"
+cwd = "{cwd}"
+
+[agent.slash_commands]
+enabled = true
+include_global = false
+include_project = false
+paths = ["{extra}"]
+"#,
+        cwd = dir.path().display(),
+        extra = extra.display(),
+    );
+    let extra_only_agent = agent_from_single_config(&extra_only).await?;
+    assert!(
+        extra_only_agent
+            .handle()
+            .config
+            .slash_command_registry
+            .get("docs")
+            .is_some()
+    );
+    assert!(
+        extra_only_agent
+            .handle()
+            .config
+            .slash_command_registry
+            .get("project")
+            .is_none(),
+        "include_project=false must not scan <cwd>/.qmt/commands"
+    );
+
+    let project_only = format!(
+        r#"
+[agent]
+provider = "openai"
+model = "gpt-4o-mini"
+cwd = "{cwd}"
+
+[agent.slash_commands]
+enabled = true
+include_global = false
+include_project = true
+"#,
+        cwd = dir.path().display(),
+    );
+    let project_only_agent = agent_from_single_config(&project_only).await?;
+    assert!(
+        project_only_agent
+            .handle()
+            .config
+            .slash_command_registry
+            .get("project")
+            .is_some()
+    );
+    assert!(
+        project_only_agent
+            .handle()
+            .config
+            .slash_command_registry
+            .get("docs")
+            .is_none()
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn shutdown_with_profiles_also_stops_independent_root() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
