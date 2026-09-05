@@ -914,16 +914,63 @@ fn extract_reasoning_content<'a>(msg: &'a ChatMessage, include: bool) -> Option<
     msg.thinking().map(Cow::Borrowed)
 }
 
-fn content_text_with_fallbacks<'a>(content: impl IntoIterator<Item = &'a Content>) -> String {
+fn encode_image_data_url(mime_type: &str, data: &[u8]) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+    format!("data:{mime_type};base64,{encoded}")
+}
+
+fn text_message_content<'a>(text: impl Into<Cow<'a, str>>) -> MessageContent<'a> {
+    MessageContent {
+        message_type: Some(Cow::Borrowed("text")),
+        text: Some(text.into()),
+        image_url: None,
+        tool_call_id: None,
+        tool_output: None,
+    }
+}
+
+fn image_url_message_content<'a>(url: impl Into<Cow<'a, str>>) -> MessageContent<'a> {
+    MessageContent {
+        message_type: Some(Cow::Borrowed("image_url")),
+        text: None,
+        image_url: Some(ImageUrlContent { url: url.into() }),
+        tool_call_id: None,
+        tool_output: None,
+    }
+}
+
+fn image_content_block<'a>(mime_type: &str, data: &[u8]) -> MessageContent<'a> {
+    image_url_message_content(encode_image_data_url(mime_type, data))
+}
+
+fn collect_image_message_contents<'a>(content: &'a [Content]) -> Vec<MessageContent<'a>> {
+    content
+        .iter()
+        .filter_map(|block| match block {
+            Content::Image { mime_type, data } => Some(image_content_block(mime_type, data)),
+            Content::ImageUrl { url } => Some(image_url_message_content(url.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn content_text_with_fallbacks<'a>(
+    content: impl IntoIterator<Item = &'a Content>,
+    include_image_markers: bool,
+) -> String {
     content
         .into_iter()
         .filter_map(|block| match block {
             Content::Text { text } => Some(text.clone()),
-            Content::Image { mime_type, data } => Some(format!(
+            Content::Image { mime_type, data } if include_image_markers => Some(format!(
                 "[Image attachment: {mime_type}, {} bytes]",
                 data.len()
             )),
-            Content::ImageUrl { .. } => Some("[Image URL attachment]".to_string()),
+            Content::Image { .. } => None,
+            Content::ImageUrl { .. } if include_image_markers => {
+                Some("[Image URL attachment]".to_string())
+            }
+            Content::ImageUrl { .. } => None,
             Content::Pdf { data } => Some(format!("[PDF attachment: {} bytes]", data.len())),
             Content::Audio { mime_type, data } => Some(format!(
                 "[Audio attachment: {mime_type}, {} bytes]",
@@ -934,6 +981,19 @@ fn content_text_with_fallbacks<'a>(content: impl IntoIterator<Item = &'a Content
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn tool_result_text(content: &[Content]) -> String {
+    let text = content_text_with_fallbacks(content, false);
+    if text.is_empty()
+        && content
+            .iter()
+            .any(|block| matches!(block, Content::Image { .. } | Content::ImageUrl { .. }))
+    {
+        "[Image attached below]".to_string()
+    } else {
+        text
+    }
 }
 
 /// Convert a ChatMessage with Vec<Content> blocks into one or more OpenAI API messages.
@@ -965,12 +1025,14 @@ fn convert_chat_message_to_openai<'a>(
                 .content
                 .iter()
                 .filter(|block| !block.is_tool_result()),
+            true,
         );
         let last_tool_result_index = chat_msg.content.iter().rposition(Content::is_tool_result);
+        let mut vision_blocks = Vec::new();
 
         for (index, block) in chat_msg.content.iter().enumerate() {
             if let Content::ToolResult { id, content, .. } = block {
-                let mut text = content_text_with_fallbacks(content);
+                let mut text = tool_result_text(content);
                 if Some(index) == last_tool_result_index && !supplemental_text.is_empty() {
                     if !text.is_empty() {
                         text.push_str("\n\n");
@@ -984,7 +1046,25 @@ fn convert_chat_message_to_openai<'a>(
                     content: Some(Right(Cow::Owned(text))),
                     reasoning_content: None,
                 });
+
+                let images = collect_image_message_contents(content);
+                if !images.is_empty() {
+                    vision_blocks.push(text_message_content(format!(
+                        "[Tool result image for {id}]"
+                    )));
+                    vision_blocks.extend(images);
+                }
             }
+        }
+
+        if !vision_blocks.is_empty() {
+            out.push(OpenAIChatMessage {
+                role: Cow::Borrowed("user"),
+                tool_call_id: None,
+                tool_calls: None,
+                content: Some(Left(vision_blocks)),
+                reasoning_content: None,
+            });
         }
         return;
     }
@@ -992,7 +1072,7 @@ fn convert_chat_message_to_openai<'a>(
     // Emit tool use blocks as tool_calls on an assistant message
     if has_tool_use {
         // Preserve non-tool blocks as text or bounded attachment markers.
-        let text = content_text_with_fallbacks(&chat_msg.content);
+        let text = content_text_with_fallbacks(&chat_msg.content, true);
         let content_val = if text.is_empty() {
             None
         } else {
@@ -1056,61 +1136,20 @@ fn convert_chat_message_to_openai<'a>(
             .content
             .iter()
             .filter_map(|block| match block {
-                Content::Text { text } => Some(MessageContent {
-                    message_type: Some(Cow::Borrowed("text")),
-                    text: Some(Cow::Borrowed(text.as_str())),
-                    image_url: None,
-                    tool_call_id: None,
-                    tool_output: None,
-                }),
-                Content::ImageUrl { url } => Some(MessageContent {
-                    message_type: Some(Cow::Borrowed("image_url")),
-                    text: None,
-                    image_url: Some(ImageUrlContent {
-                        url: Cow::Borrowed(url.as_str()),
-                    }),
-                    tool_call_id: None,
-                    tool_output: None,
-                }),
-                Content::Image { mime_type, data } => {
-                    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
-                    Some(MessageContent {
-                        message_type: Some(Cow::Borrowed("image_url")),
-                        text: None,
-                        image_url: Some(ImageUrlContent {
-                            url: Cow::Owned(format!("data:{mime_type};base64,{encoded}")),
-                        }),
-                        tool_call_id: None,
-                        tool_output: None,
-                    })
+                Content::Text { text } => Some(text_message_content(text.as_str())),
+                Content::ImageUrl { url } => Some(image_url_message_content(url.as_str())),
+                Content::Image { mime_type, data } => Some(image_content_block(mime_type, data)),
+                Content::Pdf { data } => Some(text_message_content(format!(
+                    "[PDF attachment: {} bytes]",
+                    data.len()
+                ))),
+                Content::Audio { mime_type, data } => Some(text_message_content(format!(
+                    "[Audio attachment: {mime_type}, {} bytes]",
+                    data.len()
+                ))),
+                Content::ResourceLink { uri, .. } => {
+                    Some(text_message_content(format!("[Attached resource: {uri}]")))
                 }
-                Content::Pdf { data } => Some(MessageContent {
-                    message_type: Some(Cow::Borrowed("text")),
-                    text: Some(Cow::Owned(format!(
-                        "[PDF attachment: {} bytes]",
-                        data.len()
-                    ))),
-                    image_url: None,
-                    tool_call_id: None,
-                    tool_output: None,
-                }),
-                Content::Audio { mime_type, data } => Some(MessageContent {
-                    message_type: Some(Cow::Borrowed("text")),
-                    text: Some(Cow::Owned(format!(
-                        "[Audio attachment: {mime_type}, {} bytes]",
-                        data.len()
-                    ))),
-                    image_url: None,
-                    tool_call_id: None,
-                    tool_output: None,
-                }),
-                Content::ResourceLink { uri, .. } => Some(MessageContent {
-                    message_type: Some(Cow::Borrowed("text")),
-                    text: Some(Cow::Owned(format!("[Attached resource: {uri}]"))),
-                    image_url: None,
-                    tool_call_id: None,
-                    tool_output: None,
-                }),
                 Content::Thinking { .. } | Content::ToolUse { .. } | Content::ToolResult { .. } => {
                     None
                 }
@@ -1710,8 +1749,85 @@ mod tests {
         convert_chat_message_to_openai(&message, &mut converted, true);
         let value = serde_json::to_value(&converted[0]).unwrap();
 
+        assert_eq!(converted.len(), 1);
         assert_eq!(value["role"], "tool");
         assert_eq!(value["content"], "[PDF attachment: 4 bytes]");
+    }
+
+    #[test]
+    fn tool_result_image_is_forwarded_as_follow_up_user_message() {
+        use querymt::chat::{ChatMessage, ChatRole, Content};
+
+        let message = ChatMessage {
+            role: ChatRole::User,
+            content: vec![Content::tool_result(
+                "call-1",
+                vec![Content::image("image/png", vec![1, 2, 3])],
+            )],
+            cache: None,
+        };
+        let mut converted = Vec::new();
+        convert_chat_message_to_openai(&message, &mut converted, true);
+        let value = serde_json::to_value(&converted).unwrap();
+        let messages = value.as_array().unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[0]["tool_call_id"], "call-1");
+        assert_eq!(messages[0]["content"], "[Image attached below]");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(
+            messages[1]["content"][0]["text"],
+            "[Tool result image for call-1]"
+        );
+        assert_eq!(
+            messages[1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AQID"
+        );
+    }
+
+    #[test]
+    fn mixed_tool_result_keeps_text_in_tool_role_and_images_after_batch() {
+        use querymt::chat::{ChatMessage, ChatRole, Content};
+
+        let message = ChatMessage {
+            role: ChatRole::User,
+            content: vec![
+                Content::tool_result(
+                    "call-1",
+                    vec![
+                        Content::text("file exists"),
+                        Content::image("image/png", vec![1, 2, 3]),
+                    ],
+                ),
+                Content::tool_result("call-2", vec![Content::text("ok")]),
+                Content::text("<run-objective>Inspect screenshot</run-objective>"),
+            ],
+            cache: None,
+        };
+        let mut converted = Vec::new();
+        convert_chat_message_to_openai(&message, &mut converted, true);
+        let value = serde_json::to_value(&converted).unwrap();
+        let messages = value.as_array().unwrap();
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[0]["tool_call_id"], "call-1");
+        assert_eq!(messages[0]["content"], "file exists");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(
+            messages[1]["content"],
+            "ok\n\n<run-objective>Inspect screenshot</run-objective>"
+        );
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(
+            messages[2]["content"][0]["text"],
+            "[Tool result image for call-1]"
+        );
+        assert_eq!(
+            messages[2]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AQID"
+        );
     }
 
     #[test]
