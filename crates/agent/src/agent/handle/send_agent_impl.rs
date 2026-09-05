@@ -92,6 +92,13 @@ impl SendAgent for LocalAgentHandle {
         self.handle_ext_notification(notif).await
     }
 
+    async fn available_slash_commands(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::acp::protocol::SessionNotification> {
+        self.slash_command_catalog(session_id).await
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

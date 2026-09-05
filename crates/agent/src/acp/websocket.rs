@@ -1,7 +1,9 @@
 //! Standalone WebSocket ACP server.
 //!
 //! This module provides a pure ACP server over WebSocket without any dashboard UI.
-//! It uses the same client bridge pattern as the stdio transport for consistency.
+//! Session catalog updates are advertised on the JSON-RPC dispatch path after
+//! `session/new`, `session/load`, and `session/resume`. Live events still fan out
+//! per connection; WebSocket does not attach an agent-level client bridge.
 //!
 //! ## Usage
 //!

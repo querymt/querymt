@@ -76,6 +76,38 @@ impl LocalAgentHandle {
         self.profiles.load_full().as_ref().clone()
     }
 
+    /// Catalog belonging to the runtime that owns `session_id`.
+    ///
+    /// Profile sessions use that profile's registry, not this handle's.
+    pub(crate) async fn slash_command_catalog(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::acp::protocol::SessionNotification> {
+        let registry = if let Some(profiles) = self.profiles() {
+            if let Some(binding) = profiles.session_binding(session_id).await {
+                profiles
+                    .runtime_for_profile(&binding.profile_id)
+                    .await
+                    .ok()?
+                    .agent()
+                    .handle()
+                    .config
+                    .slash_command_registry
+                    .clone()
+            } else {
+                self.config.slash_command_registry.clone()
+            }
+        } else {
+            self.config.slash_command_registry.clone()
+        };
+        if registry.is_empty() {
+            return None;
+        }
+        Some(crate::slash_commands::acp::build_commands_notification(
+            session_id, &registry,
+        ))
+    }
+
     pub(super) async fn session_config_options(
         &self,
         session_id: Option<&str>,

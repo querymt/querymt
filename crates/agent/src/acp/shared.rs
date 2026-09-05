@@ -149,6 +149,18 @@ pub(crate) async fn dispatch_rpc_message<S: SendAgent>(
     )
     .await;
 
+    // Reply first so the client can bind the session before catalog updates arrive.
+    if let Some(response) = output.response {
+        match serde_json::to_string(&response) {
+            Ok(json) => {
+                if tx.send(json).await.is_err() {
+                    return;
+                }
+            }
+            Err(err) => log::warn!("Failed to serialize JSON-RPC response: {}", err),
+        }
+    }
+
     for notification in output.notifications {
         let json = match serde_json::to_string(&notification) {
             Ok(json) => json,
@@ -159,15 +171,6 @@ pub(crate) async fn dispatch_rpc_message<S: SendAgent>(
         };
         if tx.send(json).await.is_err() {
             return;
-        }
-    }
-
-    if let Some(response) = output.response {
-        match serde_json::to_string(&response) {
-            Ok(json) => {
-                let _ = tx.send(json).await;
-            }
-            Err(err) => log::warn!("Failed to serialize JSON-RPC response: {}", err),
         }
     }
 }
@@ -843,6 +846,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
 ) -> RpcDispatchOutput {
     let rpc_method = req.method.clone();
     let rpc_params = req.params.clone();
+    let mut notifications = Vec::new();
     let result: Result<serde_json::Value, Error> =
         run_with_acp_span(&rpc_method, &rpc_params, async {
             let method = req.method.clone();
@@ -878,7 +882,13 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                 Ok(r) => {
                                     let session_id = r.session_id.to_string();
                                     let mut owners = session_owners.lock().await;
-                                    owners.insert(session_id, conn_id.to_string());
+                                    owners.insert(session_id.clone(), conn_id.to_string());
+                                    drop(owners);
+                                    if let Some(notification) =
+                                        available_commands_session_update(agent, &session_id).await
+                                    {
+                                        notifications.push(notification);
+                                    }
                                     Ok(serde_json::to_value(r).unwrap())
                                 }
                                 Err(e) => Err(e),
@@ -951,6 +961,11 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                             .on_session_loaded(local_agent, &session_id, &mut value)
                                             .await?;
                                     }
+                                    if let Some(notification) =
+                                        available_commands_session_update(agent, &session_id).await
+                                    {
+                                        notifications.push(notification);
+                                    }
                                     Ok(value)
                                 }
 
@@ -962,11 +977,27 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                     }
                 }
                 m if m == AGENT_METHOD_NAMES.session_resume => {
-                    match serde_json::from_value(req.params) {
-                        Ok(params) => agent
-                            .resume_session(params)
-                            .await
-                            .map(|r| serde_json::to_value(r).unwrap()),
+                    match serde_json::from_value::<crate::acp::protocol::ResumeSessionRequest>(
+                        req.params,
+                    ) {
+                        Ok(params) => {
+                            let session_id = params.session_id.to_string();
+                            let response = agent.resume_session(params).await;
+                            match response {
+                                Ok(r) => {
+                                    let mut owners = session_owners.lock().await;
+                                    owners.insert(session_id.clone(), conn_id.to_string());
+                                    drop(owners);
+                                    if let Some(notification) =
+                                        available_commands_session_update(agent, &session_id).await
+                                    {
+                                        notifications.push(notification);
+                                    }
+                                    Ok(serde_json::to_value(r).unwrap())
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
                         Err(e) => Err(Error::invalid_params()
                             .data(serde_json::json!({"error": e.to_string()}))),
                     }
@@ -1199,9 +1230,22 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
     };
 
     RpcDispatchOutput {
-        notifications: Vec::new(),
+        notifications,
         response,
     }
+}
+
+async fn available_commands_session_update<S: SendAgent>(
+    agent: &S,
+    session_id: &str,
+) -> Option<serde_json::Value> {
+    let notification = agent.available_slash_commands(session_id).await?;
+    let params = serde_json::to_value(&notification).ok()?;
+    Some(serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": params,
+    }))
 }
 
 /// Create a method-specific ACP span, set remote parent if present, and
@@ -2317,6 +2361,160 @@ mod tests {
             response.result,
             Some(serde_json::json!({"sessionId": "s-plain"}))
         );
+        assert!(output.notifications.is_empty());
+    }
+
+    fn docs_slash_command() -> crate::slash_commands::SlashCommand {
+        crate::slash_commands::SlashCommand {
+            name: "docs".to_string(),
+            source: crate::slash_commands::SlashCommandSource::Global(std::path::PathBuf::from(
+                "/tmp",
+            )),
+            path: std::path::PathBuf::from("/tmp/docs.md"),
+            description: "Read the docs".to_string(),
+            argument_hint: None,
+            tags: Vec::new(),
+            template: "Read the docs".to_string(),
+            script: None,
+            requires_script: false,
+        }
+    }
+
+    fn assert_docs_catalog(notification: &serde_json::Value, session_id: &str) {
+        assert_eq!(notification["jsonrpc"], "2.0");
+        assert_eq!(notification["method"], "session/update");
+        assert_eq!(notification["params"]["sessionId"], session_id);
+        assert_eq!(
+            notification["params"]["update"]["sessionUpdate"],
+            "available_commands_update"
+        );
+        assert_eq!(
+            notification["params"]["update"]["availableCommands"][0]["name"],
+            "/docs"
+        );
+    }
+
+    async fn dispatch_session_rpc(
+        agent: &crate::agent::LocalAgentHandle,
+        method: &str,
+        params: serde_json::Value,
+    ) -> RpcDispatchOutput {
+        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        handle_rpc_message_with_context(
+            agent,
+            &session_owners,
+            &pending_permissions,
+            &pending_elicitations,
+            "conn-1",
+            RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                method: method.to_string(),
+                params,
+                id: Some(serde_json::json!(1)),
+            },
+            RpcDispatchContext {
+                session_hooks: None,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn session_new_load_and_resume_advertise_slash_commands() {
+        let mut registry = crate::slash_commands::SlashCommandRegistry::new();
+        registry.register(docs_slash_command());
+        let fixture = crate::test_utils::TestAgent::with_slash_command_registry(registry).await;
+
+        let created = dispatch_session_rpc(
+            fixture.handle.as_ref(),
+            AGENT_METHOD_NAMES.session_new,
+            serde_json::json!({"cwd": "/tmp", "mcpServers": []}),
+        )
+        .await;
+        let response = created.response.expect("session/new should respond");
+        assert!(response.error.is_none());
+        let session_id = response.result.as_ref().unwrap()["sessionId"]
+            .as_str()
+            .expect("sessionId")
+            .to_string();
+        assert_eq!(created.notifications.len(), 1);
+        assert_docs_catalog(&created.notifications[0], &session_id);
+
+        let loaded = dispatch_session_rpc(
+            fixture.handle.as_ref(),
+            AGENT_METHOD_NAMES.session_load,
+            serde_json::json!({"sessionId": session_id, "cwd": "/tmp", "mcpServers": []}),
+        )
+        .await;
+        assert!(
+            loaded
+                .response
+                .expect("session/load should respond")
+                .error
+                .is_none()
+        );
+        assert_eq!(loaded.notifications.len(), 1);
+        assert_docs_catalog(&loaded.notifications[0], &session_id);
+
+        let resumed = dispatch_session_rpc(
+            fixture.handle.as_ref(),
+            AGENT_METHOD_NAMES.session_resume,
+            serde_json::json!({"sessionId": session_id, "cwd": "/tmp"}),
+        )
+        .await;
+        assert!(
+            resumed
+                .response
+                .expect("session/resume should respond")
+                .error
+                .is_none()
+        );
+        assert_eq!(resumed.notifications.len(), 1);
+        assert_docs_catalog(&resumed.notifications[0], &session_id);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rpc_message_sends_slash_catalog_after_response() {
+        let mut registry = crate::slash_commands::SlashCommandRegistry::new();
+        registry.register(docs_slash_command());
+        let fixture = crate::test_utils::TestAgent::with_slash_command_registry(registry).await;
+        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::channel(8);
+
+        dispatch_rpc_message(
+            fixture.handle.clone(),
+            session_owners,
+            pending_permissions,
+            pending_elicitations,
+            "conn-1".to_string(),
+            RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                method: AGENT_METHOD_NAMES.session_new.to_string(),
+                params: serde_json::json!({"cwd": "/tmp", "mcpServers": []}),
+                id: Some(serde_json::json!(1)),
+            },
+            tx,
+        )
+        .await;
+
+        let response: serde_json::Value =
+            serde_json::from_str(&rx.recv().await.expect("session/new response"))
+                .expect("response json");
+        assert_eq!(response["id"], 1);
+        let session_id = response["result"]["sessionId"]
+            .as_str()
+            .expect("sessionId")
+            .to_string();
+
+        let notification: serde_json::Value =
+            serde_json::from_str(&rx.recv().await.expect("catalog notification"))
+                .expect("notification json");
+        assert_docs_catalog(&notification, &session_id);
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
