@@ -2,7 +2,7 @@ use crate::acp::protocol::ContentBlock;
 use crate::agent::LocalAgentHandle;
 use crate::events::AgentEvent;
 use crate::model::MessagePart;
-use crate::session::error::SessionResult;
+use crate::session::error::{SessionError, SessionResult};
 use crate::session::projection::{AuditView, ViewStore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -144,12 +144,26 @@ pub async fn load_session_snapshot(
     let cursor = cursor_from_events(&audit.events);
     let delegation_updates =
         crate::control::delegation_notifications::delegation_updates_from_events(&audit.events);
-    let messages = agent
+    // Remote attached sessions live on their peer and have no local history
+    // rows, so `get_history` reports `SessionNotFound`. Treat that as an empty
+    // history (no user prompt records) instead of failing the whole snapshot.
+    let messages = match agent
         .config
         .provider
         .history_store()
         .get_history(session_id)
-        .await?;
+        .await
+    {
+        Ok(messages) => messages,
+        Err(SessionError::SessionNotFound(_)) if is_remote_attached => {
+            tracing::debug!(
+                session_id,
+                "remote session missing local history rows; using empty history for snapshot"
+            );
+            Vec::new()
+        }
+        Err(e) => return Err(e),
+    };
     let user_prompts = Some(user_prompt_records(&messages));
     Ok(SessionLoadSnapshot {
         audit,
