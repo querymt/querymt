@@ -7,8 +7,8 @@ use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 pub const MAX_STEERING_MESSAGES: usize = 32;
-pub const MAX_STEERING_BYTES: usize = 256 * 1024;
-pub const MAX_STEERING_INPUT_BYTES: usize = 64 * 1024;
+pub const MAX_STEERING_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_STEERING_INPUT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

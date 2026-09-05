@@ -546,7 +546,7 @@ async fn forward_event_to_ui(
             agent_id,
             profile_id,
             session_id: event.session_id().to_owned(),
-            event: event.clone(),
+            event: Box::new(event.clone()),
         },
     )
     .await

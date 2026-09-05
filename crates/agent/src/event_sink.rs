@@ -503,4 +503,67 @@ mod tests {
 
         assert!(env.is_ephemeral());
     }
+
+    #[tokio::test]
+    async fn structured_prompt_blocks_precede_awaited_summary_and_stay_out_of_journal() {
+        let sink = make_sink().await;
+        let mut rx = sink.fanout().subscribe();
+        let blocks = [
+            crate::acp::protocol::ContentBlock::Text(crate::acp::protocol::TextContent::new(
+                "before",
+            )),
+            crate::acp::protocol::ContentBlock::Image(crate::acp::protocol::ImageContent::new(
+                "AQID",
+                "image/png",
+            )),
+        ];
+
+        for block in blocks {
+            sink.emit_ephemeral(
+                "s1",
+                AgentEventKind::UserPromptBlock {
+                    message_id: "m1".into(),
+                    client_prompt_id: Some("client-1".into()),
+                    block,
+                },
+            );
+        }
+        sink.emit_durable(
+            "s1",
+            AgentEventKind::PromptReceived {
+                content: "before\n\n[Image: image/png]".into(),
+                message_id: Some("m1".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        let third = rx.recv().await.unwrap();
+        assert!(matches!(
+            first.kind(),
+            AgentEventKind::UserPromptBlock { .. }
+        ));
+        assert!(matches!(
+            second.kind(),
+            AgentEventKind::UserPromptBlock { .. }
+        ));
+        assert!(matches!(
+            third.kind(),
+            AgentEventKind::PromptReceived { .. }
+        ));
+
+        let journal = sink
+            .journal()
+            .load_session_stream("s1", None, None)
+            .await
+            .unwrap();
+        assert_eq!(journal.len(), 1);
+        assert!(matches!(
+            journal[0].kind,
+            AgentEventKind::PromptReceived { .. }
+        ));
+        assert!(!serde_json::to_string(&journal).unwrap().contains("AQID"));
+    }
 }

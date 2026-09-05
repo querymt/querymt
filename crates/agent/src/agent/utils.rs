@@ -4,17 +4,18 @@ use crate::acp::protocol::{ContentBlock, EmbeddedResourceResource, ToolCallLocat
 use log::warn;
 
 const ATTACHMENTS_DISPLAY_FALLBACK: &str = "(attachments included)";
+const IMAGE_DISPLAY_FALLBACK: &str = "(image attached)";
 
-/// Format only user text from prompt blocks (first Text block only).
-/// This excludes attachment content which is in subsequent blocks.
+/// Collect user-authored text without incorporating attachment payloads.
 pub fn format_prompt_user_text_only(blocks: &[ContentBlock]) -> String {
     blocks
-        .first()
-        .and_then(|block| match block {
-            ContentBlock::Text(text) => Some(text.text.clone()),
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
             _ => None,
         })
-        .unwrap_or_default()
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Render prompt blocks for user-facing displays/events.
@@ -26,7 +27,9 @@ pub fn render_prompt_for_display(blocks: &[ContentBlock]) -> String {
         return user_text;
     }
 
-    if blocks.get(1).is_some() {
+    if crate::model::prompt_contains_images(blocks) {
+        IMAGE_DISPLAY_FALLBACK.to_string()
+    } else if !blocks.is_empty() {
         ATTACHMENTS_DISPLAY_FALLBACK.to_string()
     } else {
         String::new()
@@ -58,9 +61,9 @@ pub fn render_prompt_for_llm(blocks: &[ContentBlock], max_prompt_bytes: Option<u
                 }
                 EmbeddedResourceResource::BlobResourceContents(blob) => {
                     content.push_str(&format!(
-                        "[Embedded Resource: {}] (blob, {} bytes)",
+                        "[Embedded Resource: {}] ({})",
                         blob.uri,
-                        blob.blob.len()
+                        blob.mime_type.as_deref().unwrap_or("binary")
                     ));
                 }
                 _ => {
@@ -68,18 +71,10 @@ pub fn render_prompt_for_llm(blocks: &[ContentBlock], max_prompt_bytes: Option<u
                 }
             },
             ContentBlock::Image(image) => {
-                content.push_str(&format!(
-                    "[Image] mime={}, bytes={}",
-                    image.mime_type,
-                    image.data.len()
-                ));
+                content.push_str(&format!("[Image: {}]", image.mime_type));
             }
             ContentBlock::Audio(audio) => {
-                content.push_str(&format!(
-                    "[Audio] mime={}, bytes={}",
-                    audio.mime_type,
-                    audio.data.len()
-                ));
+                content.push_str(&format!("[Audio: {}]", audio.mime_type));
             }
             _ => {
                 content.push_str("[Unsupported content block]");
@@ -189,8 +184,8 @@ mod tests {
             ContentBlock::Text(TextContent::new("[file: x]".to_string())),
         ];
 
-        assert_eq!(render_prompt_for_display(&blocks), "hello");
-        assert_eq!(format_prompt_user_text_only(&blocks), "hello");
+        assert_eq!(render_prompt_for_display(&blocks), "hello\n\n[file: x]");
+        assert_eq!(format_prompt_user_text_only(&blocks), "hello\n\n[file: x]");
     }
 
     #[test]
@@ -200,6 +195,6 @@ mod tests {
             ContentBlock::Text(TextContent::new("[file: x]".to_string())),
         ];
 
-        assert_eq!(render_prompt_for_display(&blocks), "(attachments included)");
+        assert_eq!(render_prompt_for_display(&blocks), "[file: x]");
     }
 }

@@ -31,7 +31,7 @@ impl LocalAgentHandle {
 
         let mut capabilities = AgentCapabilities::new()
             .load_session(true)
-            .prompt_capabilities(PromptCapabilities::new().embedded_context(true))
+            .prompt_capabilities(PromptCapabilities::new().image(true).embedded_context(true))
             .mcp_capabilities(McpCapabilities::new().http(true).sse(true))
             .session_capabilities(
                 SessionCapabilities::new()

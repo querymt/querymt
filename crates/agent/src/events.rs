@@ -1,4 +1,4 @@
-use crate::acp::protocol::StopReason;
+use crate::acp::protocol::{ContentBlock, StopReason};
 use querymt::Usage;
 use querymt::chat::FinishReason;
 use serde::{Deserialize, Serialize};
@@ -138,8 +138,17 @@ pub enum AgentEventKind {
     SessionCreated,
     PromptReceived {
         content: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
+    },
+    /// Transient structured prompt block for live ACP delivery. Durable prompt
+    /// content remains in MessagePart::Prompt rather than the event journal.
+    UserPromptBlock {
+        message_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_prompt_id: Option<String>,
+        #[typeshare(serialized_as = "any")]
+        block: ContentBlock,
     },
     UserMessageStored {
         content: String,
@@ -779,6 +788,7 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         // ── Ephemeral: high-frequency streaming deltas ──────────────
         // Rationale: per-token chunks; the full content is captured by
         // AssistantMessageStored which IS durable.
+        AgentEventKind::UserPromptBlock { .. } => Durability::Ephemeral,
         AgentEventKind::AssistantContentDelta { .. } => Durability::Ephemeral,
         AgentEventKind::AssistantThinkingDelta { .. } => Durability::Ephemeral,
         AgentEventKind::RemoteStreamDisconnected { .. } => Durability::Ephemeral,
@@ -902,6 +912,25 @@ mod tests {
         // adjacently tagged: payload is under "data"
         assert_eq!(json["data"]["content"], "test prompt");
         assert_eq!(json["data"]["message_id"], "msg-1");
+    }
+
+    #[test]
+    fn user_prompt_block_client_id_is_optional_for_compatibility() {
+        let value = serde_json::json!({
+            "type": "user_prompt_block",
+            "data": {
+                "message_id": "msg-1",
+                "block": {"type": "text", "text": "hello"}
+            }
+        });
+        let kind: AgentEventKind = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            kind,
+            AgentEventKind::UserPromptBlock {
+                client_prompt_id: None,
+                ..
+            }
+        ));
     }
 
     #[test]

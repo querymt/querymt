@@ -93,7 +93,7 @@ fn refresh_objective_fragment(
     ))
 }
 
-async fn apply_pending_steering(
+pub(crate) async fn apply_pending_steering(
     config: &AgentConfig,
     exec_ctx: &mut ExecutionContext,
     context: &Arc<crate::middleware::ConversationContext>,
@@ -129,8 +129,11 @@ async fn apply_pending_steering(
             source_provider: None,
             source_model: None,
         };
-        exec_ctx.add_message(message.clone()).await?;
-        messages.push(message.to_chat_message());
+        let chat_message = message
+            .to_chat_message()
+            .map_err(|error| anyhow::anyhow!("Invalid steering content: {error}"))?;
+        exec_ctx.add_message(message).await?;
+        messages.push(chat_message);
         if !display.trim().is_empty() {
             let summary = exec_ctx
                 .state
@@ -239,13 +242,17 @@ pub(crate) async fn execute_cycle_state_machine(
 
     let messages: Arc<[querymt::chat::ChatMessage]> = async {
         let started = std::time::Instant::now();
-        let messages: Arc<[querymt::chat::ChatMessage]> =
-            Arc::from(exec_ctx.session_handle.history().await.into_boxed_slice());
+        let history = exec_ctx
+            .session_handle
+            .history()
+            .await
+            .map_err(|error| anyhow::anyhow!("Failed to load session history: {error}"));
+        let messages: Arc<[querymt::chat::ChatMessage]> = Arc::from(history?.into_boxed_slice());
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let span = tracing::Span::current();
         span.record("history_ms", elapsed_ms);
         span.record("message_count", messages.len() as u64);
-        messages
+        Ok::<_, anyhow::Error>(messages)
     }
     .instrument(info_span!(
         "agent.execution.history_load",
@@ -253,7 +260,7 @@ pub(crate) async fn execute_cycle_state_machine(
         history_ms = tracing::field::Empty,
         message_count = tracing::field::Empty
     ))
-    .await;
+    .await?;
 
     debug!(
         "Session {}: history loaded, {} messages",
@@ -528,7 +535,16 @@ pub(crate) async fn execute_cycle_state_machine(
 
             ExecutionState::Complete { context } => {
                 exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Closing);
-                let history = Arc::from(exec_ctx.session_handle.history().await.into_boxed_slice());
+                let history = Arc::from(
+                    exec_ctx
+                        .session_handle
+                        .history()
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!("Failed to load session history: {error}")
+                        })?
+                        .into_boxed_slice(),
+                );
                 let fallback_context = Arc::new(
                     crate::middleware::ConversationContext::new(
                         context.session_id.clone(),

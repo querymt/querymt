@@ -1106,7 +1106,11 @@ pub(super) async fn store_all_tool_results(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to store tool results: {}", e))?;
 
-    messages.push(result_msg.to_chat_message());
+    messages.push(
+        result_msg
+            .to_chat_message()
+            .map_err(|error| anyhow::anyhow!("Invalid stored tool result content: {error}"))?,
+    );
 
     let new_context = Arc::new(
         crate::middleware::ConversationContext::new(

@@ -63,6 +63,8 @@ async fn test_initialize_advertises_session_capabilities() {
     let resp = f.handle.initialize(req).await.expect("initialize");
 
     assert!(resp.agent_capabilities.load_session);
+    assert!(resp.agent_capabilities.prompt_capabilities.image);
+    assert!(resp.agent_capabilities.prompt_capabilities.embedded_context);
     assert!(resp.agent_capabilities.session_capabilities.list.is_some());
     assert!(resp.agent_capabilities.session_capabilities.fork.is_some());
     assert!(

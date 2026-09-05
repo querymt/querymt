@@ -103,7 +103,7 @@ impl SessionCompaction {
         let original_token_count = self.estimate_messages_tokens(messages, max_prompt_bytes);
 
         // Build the compaction request
-        let chat_messages = self.build_compaction_messages(messages, max_prompt_bytes);
+        let chat_messages = self.build_compaction_messages(messages, max_prompt_bytes)?;
 
         // Call LLM with retry logic
         let summary = self
@@ -124,11 +124,11 @@ impl SessionCompaction {
         &self,
         messages: &[AgentMessage],
         max_prompt_bytes: Option<usize>,
-    ) -> Vec<querymt::chat::ChatMessage> {
+    ) -> Result<Vec<querymt::chat::ChatMessage>> {
         let mut chat_messages: Vec<querymt::chat::ChatMessage> = messages
             .iter()
-            .map(|m| m.to_chat_message_with_max_prompt_bytes(max_prompt_bytes))
-            .collect();
+            .map(|message| message.to_chat_message_with_max_prompt_bytes(max_prompt_bytes))
+            .collect::<std::result::Result<_, _>>()?;
 
         // Add the compaction prompt as a user message
         chat_messages.push(querymt::chat::ChatMessage {
@@ -137,7 +137,7 @@ impl SessionCompaction {
             cache: None,
         });
 
-        chat_messages
+        Ok(chat_messages)
     }
 
     /// Call LLM with exponential backoff retry.
@@ -838,7 +838,10 @@ mod tests {
         let fixture = CompactionFixture::new();
         let messages = MessageFixture::simple_conversation("s1");
 
-        let chat_messages = fixture.service.build_compaction_messages(&messages, None);
+        let chat_messages = fixture
+            .service
+            .build_compaction_messages(&messages, None)
+            .unwrap();
 
         // Should have all original messages + compaction prompt
         assert_eq!(
@@ -863,13 +866,87 @@ mod tests {
         let fixture = CompactionFixture::new();
         let messages = MessageFixture::simple_conversation("s1");
 
-        let chat_messages = fixture.service.build_compaction_messages(&messages, None);
+        let chat_messages = fixture
+            .service
+            .build_compaction_messages(&messages, None)
+            .unwrap();
 
         // Check that roles are preserved (excluding the appended prompt)
         assert_eq!(chat_messages[0].role, ChatRole::User);
         assert_eq!(chat_messages[1].role, ChatRole::Assistant);
         assert_eq!(chat_messages[2].role, ChatRole::User);
         assert_eq!(chat_messages[3].role, ChatRole::Assistant);
+    }
+
+    #[test]
+    fn test_build_compaction_messages_preserves_pdf_content() {
+        use base64::Engine as _;
+
+        let fixture = CompactionFixture::new();
+        let message = AgentMessage {
+            id: "pdf-message".into(),
+            session_id: "s1".into(),
+            role: ChatRole::User,
+            parts: vec![MessagePart::Prompt {
+                blocks: vec![crate::acp::protocol::ContentBlock::Resource(
+                    crate::acp::protocol::EmbeddedResource::new(
+                        crate::acp::protocol::EmbeddedResourceResource::BlobResourceContents(
+                            crate::acp::protocol::BlobResourceContents::new(
+                                base64::engine::general_purpose::STANDARD.encode(b"%PDF"),
+                                "attachment:///document.pdf",
+                            )
+                            .mime_type("application/pdf".to_string()),
+                        ),
+                    ),
+                )],
+            }],
+            created_at: 0,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+
+        let chat_messages = fixture
+            .service
+            .build_compaction_messages(&[message], None)
+            .unwrap();
+        assert!(matches!(
+            &chat_messages[0].content[0],
+            querymt::chat::Content::Pdf { data } if data == b"%PDF"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_process_invalid_attachment_does_not_call_provider() {
+        let service = SessionCompaction::new();
+        let message = AgentMessage {
+            id: "invalid-image".into(),
+            session_id: "s1".into(),
+            role: ChatRole::User,
+            parts: vec![MessagePart::Prompt {
+                blocks: vec![crate::acp::protocol::ContentBlock::Image(
+                    crate::acp::protocol::ImageContent::new("%%%", "image/png"),
+                )],
+            }],
+            created_at: 0,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        let provider = Arc::new(MockCompactionProvider::with_summary("must not be called"));
+
+        let result = service
+            .process(
+                &[message],
+                provider.clone(),
+                "model",
+                &RetryConfig::default(),
+                None,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(provider.call_count(), 0);
     }
 
     #[tokio::test]
@@ -1063,7 +1140,10 @@ mod tests {
         let fixture = CompactionFixture::new();
         let messages = MessageFixture::simple_conversation("s1");
 
-        let chat_messages = fixture.service.build_compaction_messages(&messages, None);
+        let chat_messages = fixture
+            .service
+            .build_compaction_messages(&messages, None)
+            .unwrap();
 
         // Verify first message is the user message from conversation
         if let MessagePart::Text { content } = &messages[0].parts[0] {
@@ -1074,7 +1154,7 @@ mod tests {
     #[test]
     fn test_compaction_message_to_chat_has_no_trailing_whitespace() {
         let (_, sum) = SessionCompaction::create_compaction_messages("s1", "Test summary", 5000);
-        let chat = sum.to_chat_message();
+        let chat = sum.to_chat_message().unwrap();
 
         let text = chat.text();
         assert!(

@@ -318,11 +318,57 @@ pub fn replay_agent_events_to_session_notifications<I>(
 where
     I: IntoIterator<Item = AgentEvent>,
 {
+    replay_agent_events_with_user_prompts(session_id, events, &HashMap::new())
+}
+
+fn user_prompt_chunk(
+    message_id: &str,
+    client_prompt_id: Option<&str>,
+    block: ContentBlock,
+) -> ContentChunk {
+    let chunk = ContentChunk::new(block).message_id(MessageId::from(message_id.to_string()));
+    match client_prompt_id {
+        Some(client_prompt_id) => chunk.meta(serde_json::Map::from_iter([(
+            "querymt".to_string(),
+            serde_json::json!({"client_prompt_id": client_prompt_id}),
+        )])),
+        None => chunk,
+    }
+}
+
+pub fn replay_agent_events_with_user_prompts<I>(
+    session_id: &str,
+    events: I,
+    user_prompts: &HashMap<String, Vec<ContentBlock>>,
+) -> Vec<crate::acp::protocol::SessionNotification>
+where
+    I: IntoIterator<Item = AgentEvent>,
+{
     events
         .into_iter()
-        .filter_map(|event| {
-            let envelope = EventEnvelope::from(event);
-            translate_replay_event_to_update(&envelope).map(|update| {
+        .flat_map(|event| {
+            let structured_updates = match &event.kind {
+                AgentEventKind::PromptReceived {
+                    message_id: Some(message_id),
+                    ..
+                } => user_prompts.get(message_id).map(|blocks| {
+                    blocks
+                        .iter()
+                        .cloned()
+                        .map(|block| {
+                            SessionUpdate::UserMessageChunk(user_prompt_chunk(
+                                message_id, None, block,
+                            ))
+                        })
+                        .collect::<Vec<_>>()
+                }),
+                _ => None,
+            };
+            let updates = structured_updates.unwrap_or_else(|| {
+                let envelope = EventEnvelope::from(event);
+                translate_replay_event_to_updates(&envelope)
+            });
+            updates.into_iter().map(|update| {
                 crate::acp::protocol::SessionNotification::new(
                     crate::acp::protocol::SessionId::from(session_id.to_string()),
                     update,
@@ -340,6 +386,7 @@ enum AcpTranslateMode {
 
 pub struct AcpLiveEventTranslator {
     streamed_assistant_messages: HashSet<(String, String)>,
+    structured_user_messages: HashSet<(String, String)>,
     delegation_updates: crate::control::delegation_notifications::DelegationUpdateProjector,
 }
 
@@ -353,6 +400,7 @@ impl AcpLiveEventTranslator {
     pub fn new() -> Self {
         Self {
             streamed_assistant_messages: HashSet::new(),
+            structured_user_messages: HashSet::new(),
             delegation_updates:
                 crate::control::delegation_notifications::DelegationUpdateProjector::for_live_stream(
                 ),
@@ -408,6 +456,30 @@ impl AcpLiveEventTranslator {
 
     pub fn translate_update(&mut self, event: &EventEnvelope) -> Option<SessionUpdate> {
         match event.kind() {
+            AgentEventKind::UserPromptBlock {
+                message_id,
+                client_prompt_id,
+                block,
+            } => {
+                self.structured_user_messages
+                    .insert((event.session_id().to_owned(), message_id.clone()));
+                Some(SessionUpdate::UserMessageChunk(user_prompt_chunk(
+                    message_id,
+                    client_prompt_id.as_deref(),
+                    block.clone(),
+                )))
+            }
+            AgentEventKind::PromptReceived {
+                message_id: Some(message_id),
+                ..
+            } => {
+                let key = (event.session_id().to_owned(), message_id.clone());
+                if self.structured_user_messages.remove(&key) {
+                    None
+                } else {
+                    translate_event_to_update_for_mode(event, AcpTranslateMode::Live)
+                }
+            }
             AgentEventKind::AssistantContentDelta {
                 content,
                 message_id,
@@ -491,6 +563,12 @@ pub fn translate_replay_event_to_update(event: &EventEnvelope) -> Option<Session
     translate_event_to_update_for_mode(event, AcpTranslateMode::Replay)
 }
 
+pub fn translate_replay_event_to_updates(event: &EventEnvelope) -> Vec<SessionUpdate> {
+    translate_replay_event_to_update(event)
+        .into_iter()
+        .collect()
+}
+
 fn translate_event_to_update_for_mode(
     event: &EventEnvelope,
     mode: AcpTranslateMode,
@@ -503,6 +581,21 @@ fn translate_event_to_update_for_mode(
             ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
                 .message_id(message_id.clone().map(MessageId::from)),
         )),
+        AgentEventKind::UserPromptBlock {
+            message_id,
+            client_prompt_id,
+            block,
+        } => {
+            if mode == AcpTranslateMode::Replay {
+                None
+            } else {
+                Some(SessionUpdate::UserMessageChunk(user_prompt_chunk(
+                    message_id,
+                    client_prompt_id.as_deref(),
+                    block.clone(),
+                )))
+            }
+        }
         AgentEventKind::AssistantMessageStored {
             content,
             message_id,
@@ -1313,6 +1406,78 @@ mod tests {
             chunk.message_id.as_ref().map(|id| id.0.as_ref()),
             Some("u-1")
         );
+        assert!(chunk.meta.is_none());
+    }
+
+    #[test]
+    fn live_prompt_blocks_preserve_order_and_share_message_id() {
+        let blocks = vec![
+            ContentBlock::Text(TextContent::new("before")),
+            ContentBlock::Image(crate::acp::protocol::ImageContent::new("AQID", "image/png")),
+            ContentBlock::Text(TextContent::new("after")),
+        ];
+        let mut translator = AcpLiveEventTranslator::new();
+        let updates = blocks
+            .into_iter()
+            .enumerate()
+            .map(|(index, block)| {
+                translator
+                    .translate_update(&EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+                        session_id: "s-1".to_string(),
+                        timestamp: index as i64,
+                        origin: EventOrigin::Local,
+                        source_node: None,
+                        kind: AgentEventKind::UserPromptBlock {
+                            message_id: "u-1".to_string(),
+                            client_prompt_id: Some("client-1".to_string()),
+                            block,
+                        },
+                    }))
+                    .expect("prompt block should translate")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(updates.len(), 3);
+        for update in &updates {
+            let SessionUpdate::UserMessageChunk(chunk) = update else {
+                panic!("expected user message chunk");
+            };
+            assert_eq!(
+                chunk.message_id.as_ref().map(|id| id.0.as_ref()),
+                Some("u-1")
+            );
+            assert_eq!(
+                chunk
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("querymt"))
+                    .and_then(|querymt| querymt.get("client_prompt_id"))
+                    .and_then(serde_json::Value::as_str),
+                Some("client-1")
+            );
+            let wire = serde_json::to_value(update).expect("serialize user message chunk");
+            assert_eq!(wire["sessionUpdate"], "user_message_chunk");
+            assert_eq!(wire["_meta"]["querymt"]["client_prompt_id"], "client-1");
+        }
+        assert!(matches!(
+            &updates[1],
+            SessionUpdate::UserMessageChunk(chunk)
+                if matches!(chunk.content, ContentBlock::Image(_))
+        ));
+
+        let summary = EventEnvelope::Durable(DurableEvent {
+            event_id: "evt-prompt".into(),
+            stream_seq: 4,
+            timestamp: 4,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::PromptReceived {
+                content: "before\n\nafter".to_string(),
+                message_id: Some("u-1".to_string()),
+            },
+        });
+        assert!(translator.translate_update(&summary).is_none());
     }
 
     #[test]
@@ -1631,6 +1796,46 @@ mod tests {
             notifications[1].update,
             SessionUpdate::AgentMessageChunk(_)
         ));
+    }
+
+    #[test]
+    fn replay_uses_persisted_structured_prompt_blocks_when_available() {
+        let event = AgentEvent {
+            seq: 1,
+            timestamp: 1,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::PromptReceived {
+                content: "compact summary".to_string(),
+                message_id: Some("u-1".to_string()),
+            },
+        };
+        let prompt_blocks = HashMap::from([(
+            "u-1".to_string(),
+            vec![
+                ContentBlock::Image(crate::acp::protocol::ImageContent::new("AQID", "image/png")),
+                ContentBlock::Text(TextContent::new("describe this")),
+            ],
+        )]);
+        let notifications =
+            replay_agent_events_with_user_prompts("s-1", vec![event], &prompt_blocks);
+
+        assert_eq!(notifications.len(), 2);
+        assert!(matches!(
+            notifications[0].update,
+            SessionUpdate::UserMessageChunk(ref chunk)
+                if matches!(chunk.content, ContentBlock::Image(_))
+        ));
+        for notification in notifications {
+            let SessionUpdate::UserMessageChunk(chunk) = notification.update else {
+                panic!("expected user message chunk");
+            };
+            assert_eq!(
+                chunk.message_id.as_ref().map(|id| id.0.as_ref()),
+                Some("u-1")
+            );
+        }
     }
 
     #[test]

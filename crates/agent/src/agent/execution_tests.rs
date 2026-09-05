@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use tempfile::TempDir;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, oneshot};
 
-use crate::acp::protocol::StopReason;
+use crate::acp::protocol::{ContentBlock, ImageContent, StopReason};
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::ToolPolicy;
 use crate::agent::execution::CycleOutcome;
@@ -38,6 +39,7 @@ struct TestHarness {
     exec_ctx: ExecutionContext,
     provider: Arc<Mutex<MockLlmProvider>>,
     stored_messages: Arc<StdMutex<Vec<crate::model::AgentMessage>>>,
+    history_writes: Arc<AtomicUsize>,
     _temp_dir: TempDir,
 }
 
@@ -109,11 +111,14 @@ impl TestHarness {
             .expect_get_session_provider_node_id()
             .returning(|_| Ok(None))
             .times(0..);
+        let history_writes = Arc::new(AtomicUsize::new(0));
         let stored_messages_for_mock = stored_messages.clone();
+        let history_writes_for_mock = history_writes.clone();
         store
             .expect_add_message()
             .returning(move |_, message| {
                 stored_messages_for_mock.lock().unwrap().push(message);
+                history_writes_for_mock.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
             .times(0..);
@@ -213,6 +218,7 @@ impl TestHarness {
             exec_ctx,
             provider,
             stored_messages,
+            history_writes,
             _temp_dir: temp_dir,
         }
     }
@@ -436,6 +442,42 @@ async fn completion_guard_does_not_continue_for_non_active_task() {
         )
         .await;
     }
+}
+
+#[tokio::test]
+async fn invalid_steering_conversion_does_not_persist_history() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let inbox = Arc::new(crate::agent::turn_control::SteeringInbox::new(
+        "run-1".to_string(),
+    ));
+    inbox
+        .push(
+            "input-1".to_string(),
+            None,
+            vec![ContentBlock::Image(ImageContent::new("%%%", "image/png"))],
+        )
+        .await
+        .expect("direct inbox insertion bypasses admission validation");
+    harness.exec_ctx = harness.exec_ctx.with_steering(inbox);
+    let context = Arc::new(crate::middleware::ConversationContext::new(
+        Arc::from(harness.session_id.as_str()),
+        Arc::from([]),
+        Arc::new(crate::middleware::AgentStats::default()),
+        Arc::from("mock"),
+        Arc::from("mock-model"),
+    ));
+
+    let result = crate::agent::execution::apply_pending_steering(
+        &harness.config,
+        &mut harness.exec_ctx,
+        &context,
+        "test",
+        false,
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(harness.history_writes.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

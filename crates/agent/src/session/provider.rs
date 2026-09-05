@@ -779,26 +779,23 @@ impl SessionHandle {
             .await
     }
 
-    /// Get the session history converted to standard ChatMessages for the LLM
-    pub async fn history(&self) -> Vec<ChatMessage> {
-        match self.get_effective_agent_history().await {
-            Ok(agent_msgs) => agent_msgs
-                .iter()
-                .map(|m| {
-                    m.to_chat_message_with_target(
+    /// Get the session history converted to standard ChatMessages for the LLM.
+    pub async fn history(&self) -> SessionResult<Vec<ChatMessage>> {
+        let agent_msgs = self.get_effective_agent_history().await?;
+        agent_msgs
+            .iter()
+            .map(|message| {
+                message
+                    .to_chat_message_with_target(
                         self.llm_config.as_ref().map(|cfg| cfg.provider.as_str()),
                         self.llm_config.as_ref().map(|cfg| cfg.model.as_str()),
                         self.execution_config
                             .as_ref()
                             .and_then(|cfg| cfg.max_prompt_bytes),
                     )
-                })
-                .collect(),
-            Err(err) => {
-                log::warn!("Failed to load session history: {}", err);
-                Vec::new()
-            }
-        }
+                    .map_err(|error| SessionError::InvalidOperation(error.to_string()))
+            })
+            .collect()
     }
 
     /// Persist an AgentMessage to the store
@@ -837,7 +834,7 @@ impl SessionHandle {
         }
 
         // 2. Fetch full history for context
-        let llm_messages = self.history().await;
+        let llm_messages = self.history().await?;
 
         // 3. Call LLM
         let response = self.submit_request(&llm_messages).await?;
@@ -1163,11 +1160,12 @@ pub mod tests {
     use std::collections::HashMap;
     use std::pin::Pin;
 
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+
     use crate::agent::core::AgentMode;
     use crate::agent::session_control::{SessionControlState, SessionModelBinding};
     use crate::test_utils::{MockSessionStore, empty_plugin_registry, mock_session};
-    use tokio::sync::mpsc;
-    use tokio_stream::wrappers::ReceiverStream;
 
     #[tokio::test]
     async fn handle_construction_uses_atomic_control_snapshot_during_model_transition() {
@@ -1350,6 +1348,48 @@ pub mod tests {
         ) -> querymt::plugin::Fut<'a, Result<Vec<String>, LLMError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
+    }
+
+    #[tokio::test]
+    async fn chat_skips_provider_when_history_conversion_fails() {
+        use crate::acp::protocol::{ContentBlock, ImageContent};
+        use crate::model::MessagePart;
+        use crate::test_utils::{MockSessionStore, mock_llm_config, mock_session};
+
+        let invalid_message = AgentMessage {
+            id: "invalid".to_string(),
+            session_id: "session".to_string(),
+            role: ChatRole::User,
+            parts: vec![MessagePart::Prompt {
+                blocks: vec![ContentBlock::Image(ImageContent::new("%%%", "image/png"))],
+            }],
+            created_at: 0,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        let mut store = MockSessionStore::new();
+        store
+            .expect_get_effective_history()
+            .return_once(move |_| Ok(vec![invalid_message]));
+        let (registry, _temp_dir) = empty_plugin_registry().expect("plugin registry");
+        let provider = Arc::new(SessionProvider::new(
+            Arc::new(registry),
+            Arc::new(store),
+            LLMParams::new().provider("mock").model("model"),
+        ));
+        let handle = SessionHandle {
+            provider,
+            session: mock_session("session"),
+            llm_config: Some(mock_llm_config()),
+            provider_node_id: None,
+            execution_config: None,
+            cached_llm_provider: tokio::sync::OnceCell::new(),
+        };
+
+        let error = handle.chat(&[]).await.unwrap_err();
+
+        assert!(matches!(error, SessionError::InvalidOperation(_)));
     }
 
     #[tokio::test]

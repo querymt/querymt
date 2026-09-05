@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 
 use querymt::LLMParams;
+use querymt::chat::ChatRole;
 use rusqlite::Connection;
 
+use crate::acp::protocol::{ContentBlock, ImageContent, TextContent};
 use crate::agent::core::AgentMode;
 use crate::agent::session_control::{SessionControlState, SessionModelBinding};
 use crate::events::{AgentEventKind, EventOrigin};
+use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::ForkOrigin;
 use crate::session::projection::{
     EventJournal, NewDurableEvent, RecentModelEntry, SessionScope, ViewStore,
@@ -14,6 +17,46 @@ use crate::session::store::SessionStore;
 
 use super::SqliteStorage;
 use super::migrations::{MIGRATIONS, apply_migrations};
+
+#[tokio::test]
+async fn prompt_blocks_round_trip_through_persistence_and_fork() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let session = storage
+        .create_session(Some("source".to_string()), None, None, None)
+        .await
+        .unwrap();
+    let message = AgentMessage {
+        id: "message-1".to_string(),
+        session_id: session.public_id.clone(),
+        role: ChatRole::User,
+        parts: vec![MessagePart::Prompt {
+            blocks: vec![
+                ContentBlock::Text(TextContent::new("before")),
+                ContentBlock::Image(ImageContent::new("AQID", "image/png")),
+                ContentBlock::Text(TextContent::new("after")),
+            ],
+        }],
+        created_at: 1,
+        parent_message_id: None,
+        source_provider: None,
+        source_model: None,
+    };
+    storage
+        .add_message(&session.public_id, message.clone())
+        .await
+        .unwrap();
+
+    let history = storage.get_history(&session.public_id).await.unwrap();
+    assert_eq!(history[0].parts, message.parts);
+
+    let fork_id = storage
+        .fork_session(&session.public_id, "message-1", ForkOrigin::User)
+        .await
+        .unwrap();
+    let fork_history = storage.get_history(&fork_id).await.unwrap();
+    assert_eq!(fork_history.len(), 1);
+    assert_eq!(fork_history[0].parts, message.parts);
+}
 
 #[test]
 fn migration_0001_is_recorded() {
