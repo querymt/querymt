@@ -1,5 +1,6 @@
 import { createContext, useContext, useMemo, ReactNode, MutableRefObject } from 'react';
 import { useUiClient } from '../hooks/useUiClient';
+import type { RemoteSessionConnectionState } from '../types';
 import type {
   EventItem,
   RoutingMode,
@@ -165,6 +166,7 @@ export interface UiClientSessionContextValue {
   lastLoadErrorSessionId: string | null;
   schedules: ScheduleInfo[];
   loadedSessionNodeIds: Record<string, string | null>;
+  sessionConnectionStates: Record<string, RemoteSessionConnectionState | undefined>;
   knowledgeEntries: KnowledgeEntryInfo[];
   knowledgeConsolidations: ConsolidationInfo[];
   knowledgeStats: {
@@ -348,6 +350,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     lastLoadErrorSessionId: uiClient.lastLoadErrorSessionId,
     schedules: uiClient.schedules,
     loadedSessionNodeIds: uiClient.loadedSessionNodeIds,
+    sessionConnectionStates: uiClient.sessionConnectionStates,
     knowledgeEntries: uiClient.knowledgeEntries,
     knowledgeConsolidations: uiClient.knowledgeConsolidations,
     knowledgeStats: uiClient.knowledgeStats,
@@ -389,6 +392,7 @@ export function UiClientProvider({ children }: UiClientProviderProps) {
     uiClient.lastLoadErrorSessionId,
     uiClient.schedules,
     uiClient.loadedSessionNodeIds,
+    uiClient.sessionConnectionStates,
     uiClient.knowledgeEntries,
     uiClient.knowledgeConsolidations,
     uiClient.knowledgeStats,

@@ -20,6 +20,9 @@ use crate::model::AgentMessage;
 use crate::session::store::LLMConfig;
 use kameo::actor::ActorRef;
 use querymt::chat::ReasoningEffort;
+use querymt_remote::{
+    classify_infallible_remote_send_error, classify_remote_send_error_with_timeout_message,
+};
 use std::time::Duration;
 
 /// Location-transparent reference to a `SessionActor`.
@@ -102,8 +105,11 @@ impl SessionActorRef {
 // For the Local variant we forward directly. For Remote, we forward through
 // the kameo remote transport.
 //
-// Error handling: local `SendError` and remote `RemoteSendError` are both
-// mapped to `AgentError::RemoteActor` for a uniform API.
+// Error handling: remote `RemoteSendError` transport variants are classified into
+// `AgentError::RemoteTransport` (see `querymt_remote::classify_remote_send_error`)
+// so the operation layer can make safe retry decisions from the failure kind and
+// delivery certainty; remote handler errors pass through unchanged. Local
+// `SendError` failures are in-process and keep mapping to `AgentError::RemoteActor`.
 
 impl SessionActorRef {
     const REMOTE_CONTROL_MAILBOX_TIMEOUT: Duration = Duration::from_secs(10);
@@ -115,6 +121,7 @@ impl SessionActorRef {
     const REMOTE_HISTORY_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
     const REMOTE_IO_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
+    #[cfg(test)]
     pub(super) fn map_local_prompt_send_error(
         error: kameo::error::SendError<messages::Prompt, AgentError>,
     ) -> AcpError {
@@ -128,38 +135,30 @@ impl SessionActorRef {
         }
     }
 
-    fn map_infallible_remote_send_error(
+    pub(super) fn map_infallible_remote_send_error(
         error: kameo::error::RemoteSendError<kameo::error::Infallible>,
     ) -> AgentError {
-        match error {
-            kameo::error::RemoteSendError::HandlerError(err) => match err {},
-            other => AgentError::RemoteActor(other.to_string()),
-        }
+        AgentError::from_transport_failure(classify_infallible_remote_send_error(error))
     }
 
-    fn map_agent_timeout_remote_send_error(
+    pub(super) fn map_agent_timeout_remote_send_error(
         error: kameo::error::RemoteSendError<AgentError>,
         timeout_message: impl Into<String>,
     ) -> AgentError {
-        match error {
-            kameo::error::RemoteSendError::HandlerError(err) => err,
-            kameo::error::RemoteSendError::ReplyTimeout => AgentError::SessionTimeout {
-                details: timeout_message.into(),
-            },
-            other => AgentError::RemoteActor(other.to_string()),
+        match classify_remote_send_error_with_timeout_message(error, timeout_message) {
+            Ok(failure) => AgentError::from_transport_failure(failure),
+            // Handler errors are delivered remote-side and pass through unchanged.
+            Err(handler_error) => handler_error,
         }
     }
 
-    fn map_infallible_timeout_remote_send_error(
+    pub(super) fn map_infallible_timeout_remote_send_error(
         error: kameo::error::RemoteSendError<kameo::error::Infallible>,
         timeout_message: impl Into<String>,
     ) -> AgentError {
-        match error {
-            kameo::error::RemoteSendError::HandlerError(err) => match err {},
-            kameo::error::RemoteSendError::ReplyTimeout => AgentError::SessionTimeout {
-                details: timeout_message.into(),
-            },
-            other => AgentError::RemoteActor(other.to_string()),
+        match classify_remote_send_error_with_timeout_message(error, timeout_message) {
+            Ok(failure) => AgentError::from_transport_failure(failure),
+            Err(never) => match never {},
         }
     }
 
@@ -173,12 +172,17 @@ impl SessionActorRef {
             timed_out = tracing::field::Empty,
         )
     )]
-    pub async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, AcpError> {
+    pub async fn prompt_agent(&self, req: PromptRequest) -> Result<PromptResponse, AgentError> {
         match self {
-            Self::Local(actor_ref) => actor_ref
-                .ask(messages::Prompt { req })
-                .await
-                .map_err(Self::map_local_prompt_send_error),
+            Self::Local(actor_ref) => {
+                actor_ref
+                    .ask(messages::Prompt { req })
+                    .await
+                    .map_err(|error| match error {
+                        kameo::error::SendError::HandlerError(error) => error,
+                        other => AgentError::RemoteActor(other.to_string()),
+                    })
+            }
 
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
@@ -192,19 +196,25 @@ impl SessionActorRef {
                         "timed_out",
                         matches!(e, kameo::error::RemoteSendError::ReplyTimeout),
                     );
-                    AcpError::from(match e {
-                        kameo::error::RemoteSendError::HandlerError(err) => err,
-                        kameo::error::RemoteSendError::ReplyTimeout => AgentError::SessionTimeout {
-                            details: format!(
-                                "Remote prompt timed out (mailbox={}s, reply={}s)",
-                                Self::REMOTE_PROMPT_MAILBOX_TIMEOUT.as_secs(),
-                                Self::REMOTE_PROMPT_REPLY_TIMEOUT.as_secs()
-                            ),
-                        },
-                        other => AgentError::RemoteActor(other.to_string()),
-                    })
+                    // Reply loss stays ambiguous (`delivery=unknown`); legacy Prompt
+                    // must never be auto-replayed after such a failure.
+                    match classify_remote_send_error_with_timeout_message(
+                        e,
+                        format!(
+                            "Remote prompt timed out (mailbox={}s, reply={}s)",
+                            Self::REMOTE_PROMPT_MAILBOX_TIMEOUT.as_secs(),
+                            Self::REMOTE_PROMPT_REPLY_TIMEOUT.as_secs()
+                        ),
+                    ) {
+                        Ok(failure) => AgentError::from_transport_failure(failure),
+                        Err(handler_error) => handler_error,
+                    }
                 }),
         }
+    }
+
+    pub async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, AcpError> {
+        self.prompt_agent(req).await.map_err(AcpError::from)
     }
 
     pub async fn submit_input(
@@ -276,7 +286,7 @@ impl SessionActorRef {
             Self::Remote { actor_ref, .. } => actor_ref
                 .tell(&messages::Cancel)
                 .send()
-                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+                .map_err(Self::map_infallible_remote_send_error),
         }
     }
 
@@ -453,12 +463,14 @@ impl SessionActorRef {
                 .reply_timeout(Self::REMOTE_UNDO_REPLY_TIMEOUT)
                 .send()
                 .await
-                .map_err(|e| match e {
-                    kameo::error::RemoteSendError::HandlerError(err) => err,
-                    kameo::error::RemoteSendError::ReplyTimeout => {
-                        UndoError::ActorSend("Undo timed out on remote session".to_string())
+                .map_err(|e| {
+                    match classify_remote_send_error_with_timeout_message(
+                        e,
+                        "Undo timed out on remote session",
+                    ) {
+                        Ok(failure) => UndoError::from_transport_failure(failure),
+                        Err(handler_error) => handler_error,
                     }
-                    other => UndoError::ActorSend(other.to_string()),
                 }),
         }
     }
@@ -482,12 +494,14 @@ impl SessionActorRef {
                 .reply_timeout(Self::REMOTE_UNDO_REPLY_TIMEOUT)
                 .send()
                 .await
-                .map_err(|e| match e {
-                    kameo::error::RemoteSendError::HandlerError(err) => err,
-                    kameo::error::RemoteSendError::ReplyTimeout => {
-                        UndoError::ActorSend("Redo timed out on remote session".to_string())
+                .map_err(|e| {
+                    match classify_remote_send_error_with_timeout_message(
+                        e,
+                        "Redo timed out on remote session",
+                    ) {
+                        Ok(failure) => UndoError::from_transport_failure(failure),
+                        Err(handler_error) => handler_error,
                     }
-                    other => UndoError::ActorSend(other.to_string()),
                 }),
         }
     }
@@ -595,6 +609,48 @@ impl SessionActorRef {
                         e,
                         "GetEventStream timed out on remote session",
                     ))
+                }),
+        }
+    }
+
+    /// Get one bounded page of the durable event stream after a source-side
+    /// cursor (plan §16).
+    ///
+    /// Transport failures are typed (`AgentError::RemoteTransport`) so backfill
+    /// can distinguish unsupported mixed-version hosts (e.g. unknown message)
+    /// from transient errors without string matching.
+    #[tracing::instrument(
+        name = "remote.session_ref.get_event_stream_since",
+        skip(self),
+        fields(is_remote = self.is_remote(), peer_label = %self.node_label())
+    )]
+    pub async fn get_event_stream_since(
+        &self,
+        after_source_seq: Option<i64>,
+        limit: usize,
+    ) -> Result<messages::EventStreamPage, AgentError> {
+        let message = messages::GetEventStreamSince {
+            after_source_seq,
+            limit,
+        };
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(message)
+                .await
+                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+
+            #[cfg(feature = "remote")]
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&message)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_HISTORY_REPLY_TIMEOUT)
+                .send()
+                .await
+                .map_err(|e| {
+                    Self::map_agent_timeout_remote_send_error(
+                        e,
+                        "GetEventStreamSince timed out on remote session",
+                    )
                 }),
         }
     }
@@ -814,21 +870,45 @@ impl SessionActorRef {
         relay_actor_id: u64,
         relay_dht_name: String,
     ) -> Result<(), AcpError> {
+        self.subscribe_events_message(messages::SubscribeEvents {
+            relay_actor_id,
+            #[cfg(feature = "remote")]
+            relay_ref: None,
+            relay_dht_name: Some(relay_dht_name),
+            after_source_seq: None,
+        })
+        .await
+    }
+
+    #[cfg(feature = "remote")]
+    pub async fn subscribe_events_direct(
+        &self,
+        relay_actor_id: u64,
+        relay_ref: kameo::actor::RemoteActorRef<crate::agent::remote::EventRelayActor>,
+        relay_dht_name: String,
+    ) -> Result<(), AcpError> {
+        self.subscribe_events_message(messages::SubscribeEvents {
+            relay_actor_id,
+            relay_ref: Some(relay_ref),
+            relay_dht_name: Some(relay_dht_name),
+            after_source_seq: None,
+        })
+        .await
+    }
+
+    async fn subscribe_events_message(
+        &self,
+        message: messages::SubscribeEvents,
+    ) -> Result<(), AcpError> {
         match self {
             Self::Local(actor_ref) => actor_ref
-                .ask(messages::SubscribeEvents {
-                    relay_actor_id,
-                    relay_dht_name,
-                })
+                .ask(message)
                 .await
                 .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
 
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::SubscribeEvents {
-                    relay_actor_id,
-                    relay_dht_name,
-                })
+                .ask(&message)
                 .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
                 .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
                 .send()
@@ -928,12 +1008,14 @@ impl SessionActorRef {
                 .reply_timeout(Self::REMOTE_IO_REPLY_TIMEOUT)
                 .send()
                 .await
-                .map_err(|e| match e {
-                    kameo::error::RemoteSendError::HandlerError(err) => err,
-                    kameo::error::RemoteSendError::ReplyTimeout => FileProxyError::ActorSend(
-                        "GetFileIndex timed out on remote session".to_string(),
-                    ),
-                    other => FileProxyError::ActorSend(other.to_string()),
+                .map_err(|e| {
+                    match classify_remote_send_error_with_timeout_message(
+                        e,
+                        "GetFileIndex timed out on remote session",
+                    ) {
+                        Ok(failure) => FileProxyError::from_transport_failure(failure),
+                        Err(handler_error) => handler_error,
+                    }
                 }),
         }
     }
@@ -980,12 +1062,14 @@ impl SessionActorRef {
                 .reply_timeout(Self::REMOTE_IO_REPLY_TIMEOUT)
                 .send()
                 .await
-                .map_err(|e| match e {
-                    kameo::error::RemoteSendError::HandlerError(err) => err,
-                    kameo::error::RemoteSendError::ReplyTimeout => FileProxyError::ActorSend(
-                        "ReadRemoteFile timed out on remote session".to_string(),
-                    ),
-                    other => FileProxyError::ActorSend(other.to_string()),
+                .map_err(|e| {
+                    match classify_remote_send_error_with_timeout_message(
+                        e,
+                        "ReadRemoteFile timed out on remote session",
+                    ) {
+                        Ok(failure) => FileProxyError::from_transport_failure(failure),
+                        Err(handler_error) => handler_error,
+                    }
                 }),
         }
     }

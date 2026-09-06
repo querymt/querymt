@@ -312,8 +312,28 @@ pub async fn send_message(
 
 /// Send an error message to the client.
 pub async fn send_error(tx: &mpsc::Sender<String>, message: String) -> Result<(), String> {
-    log::debug!("send_error: sending error message: {}", message);
-    send_message(tx, UiServerMessage::Error { message }).await
+    send_session_error(tx, message, None, None).await
+}
+
+/// Send a session-scoped error carrying a stable machine-readable `code` and
+/// the `session_id` it applies to (plan §13). Either field may be omitted for
+/// connection-level errors that are not tied to a session.
+pub async fn send_session_error(
+    tx: &mpsc::Sender<String>,
+    message: String,
+    code: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<(), String> {
+    log::debug!("send_session_error: code={code:?} session_id={session_id:?} message: {message}");
+    send_message(
+        tx,
+        UiServerMessage::Error {
+            message,
+            code: code.map(str::to_string),
+            session_id: session_id.map(str::to_string),
+        },
+    )
+    .await
 }
 
 /// Send a binary frame to the client via the binary channel.

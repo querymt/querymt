@@ -26,7 +26,7 @@ pub struct SessionRuntimeBinding {
 
 /// A bookmark for a remote session — enough metadata to re-discover and
 /// re-attach it after a server restart.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteSessionBookmark {
     pub session_id: String,
     /// PeerId string of the remote node that owns the session.
@@ -39,6 +39,36 @@ pub struct RemoteSessionBookmark {
     pub created_at: i64,
     /// Session title/name (if known).
     pub title: Option<String>,
+}
+
+/// Incremental metadata from a confirmed reattach or resume. Fields left as
+/// `None` mean "no new confirmed value" and must never erase existing
+/// bookmark metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteSessionBookmarkUpdate {
+    pub node_id: Option<String>,
+    pub peer_label: Option<String>,
+    pub cwd: Option<String>,
+    pub title: Option<String>,
+}
+
+impl RemoteSessionBookmark {
+    /// Merge a confirmed reattach/resume result into this bookmark.
+    ///
+    /// Identity fields are never rewritten: `session_id` is fixed and the
+    /// original `created_at` is preserved. Fresh `node_id`/`peer_label` come
+    /// only from confirmed node info, and fresh `cwd`/`title` win only when
+    /// the update actually carries them.
+    pub fn merge_confirmed(self, update: RemoteSessionBookmarkUpdate) -> Self {
+        RemoteSessionBookmark {
+            session_id: self.session_id,
+            node_id: update.node_id.unwrap_or(self.node_id),
+            peer_label: update.peer_label.unwrap_or(self.peer_label),
+            cwd: update.cwd.or(self.cwd),
+            created_at: self.created_at,
+            title: update.title.or(self.title),
+        }
+    }
 }
 
 /// Represents the metadata for a session.
@@ -606,6 +636,16 @@ pub trait SessionStore: Send + Sync {
         bookmark: &RemoteSessionBookmark,
     ) -> SessionResult<()>;
 
+    /// Point lookup for a single remote session bookmark by session ID.
+    ///
+    /// This is the authoritative durable identity check for remote sessions:
+    /// a bookmark here means the ID belongs to a remote session regardless of
+    /// whether an attachment is currently installed in the registry.
+    async fn get_remote_session_bookmark(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<RemoteSessionBookmark>>;
+
     /// List all persisted remote session bookmarks.
     async fn list_remote_session_bookmarks(&self) -> SessionResult<Vec<RemoteSessionBookmark>>;
 
@@ -664,16 +704,41 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_llm_config_values_empty_params() {
-        let params = LLMParams::new().provider("openai").model("gpt-4");
+    fn merge_confirmed_preserves_identity_and_backfills() {
+        let original = RemoteSessionBookmark {
+            session_id: "s1".to_string(),
+            node_id: "node-a".to_string(),
+            peer_label: "peer-a".to_string(),
+            cwd: Some("/work".to_string()),
+            created_at: 111,
+            title: Some("Original".to_string()),
+        };
+        // An update supplying no new values must not erase anything.
+        let merged = original.clone().merge_confirmed(Default::default());
+        assert_eq!(merged, original);
+    }
 
-        let (provider, model, params_json) = extract_llm_config_values(&params).unwrap();
-
-        assert_eq!(provider, "openai");
-        assert_eq!(model, "gpt-4");
-        assert!(
-            params_json.is_none(),
-            "params should be None when only meta fields are present"
-        );
+    #[test]
+    fn merge_confirmed_applies_fresh_values_but_keeps_created_at() {
+        let original = RemoteSessionBookmark {
+            session_id: "s1".to_string(),
+            node_id: "node-a".to_string(),
+            peer_label: "peer-a".to_string(),
+            cwd: Some("/work".to_string()),
+            created_at: 111,
+            title: None,
+        };
+        let merged = original.merge_confirmed(RemoteSessionBookmarkUpdate {
+            node_id: Some("node-b".to_string()),
+            peer_label: None,
+            cwd: Some("/other".to_string()),
+            title: Some("Fresh title".to_string()),
+        });
+        assert_eq!(merged.session_id, "s1");
+        assert_eq!(merged.created_at, 111, "created_at is identity metadata");
+        assert_eq!(merged.node_id, "node-b");
+        assert_eq!(merged.peer_label, "peer-a");
+        assert_eq!(merged.cwd.as_deref(), Some("/other"));
+        assert_eq!(merged.title.as_deref(), Some("Fresh title"));
     }
 }

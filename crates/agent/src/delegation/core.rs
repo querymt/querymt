@@ -2057,6 +2057,8 @@ mod tests {
                 session_id: session.public_id.clone(),
                 origin: crate::events::EventOrigin::Local,
                 source_node: None,
+                source_node_id: None,
+                source_seq: None,
                 kind: AgentEventKind::DelegationRequested {
                     delegation: delegation.clone(),
                     tool_call_id: None,

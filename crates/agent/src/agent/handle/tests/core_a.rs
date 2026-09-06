@@ -133,7 +133,8 @@ async fn test_acp_set_model_routes_local_provider_back_to_caller() {
             None,
             None,
         )
-        .await;
+        .await
+        .expect("attach remote session");
 
     SendAgent::set_session_model(
         &fixture.handle,
@@ -198,14 +199,29 @@ async fn test_cancel_known_remote_session_routes_cancel_to_session_ref() {
         .expect("remote actor should be available");
 
     f.handle
+        .config
+        .provider
+        .history_store()
+        .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
+            session_id: session_id.clone(),
+            node_id: "remote-node".to_string(),
+            peer_label: "remote-peer".to_string(),
+            cwd: None,
+            created_at: 1,
+            title: None,
+        })
+        .await
+        .expect("save remote bookmark");
+    f.handle
         .attach_remote_session(
             session_id.clone(),
             remote_ref,
             "remote-peer".to_string(),
             None,
-            None,
+            Some("remote-node".to_string()),
         )
-        .await;
+        .await
+        .expect("attach remote session");
 
     let mut rx = f.handle.subscribe_events();
     let notif = CancelNotification::new(SessionId::from(session_id.clone()));
@@ -213,10 +229,23 @@ async fn test_cancel_known_remote_session_routes_cancel_to_session_ref() {
         .await
         .expect("cancel should succeed");
 
-    let event = tokio::time::timeout(tokio::time::Duration::from_millis(500), rx.recv())
-        .await
-        .expect("should receive event in time")
-        .expect("event channel should remain open");
+    // Attach spawns the Phase-10 backfill, which publishes an ephemeral
+    // RemoteSessionSyncCompleted signal (a legacy sync boundary here: the
+    // journal holds no source cursor yet). Skip sync-status signals; the
+    // cancel-routed Cancelled event must still arrive.
+    let event = loop {
+        let envelope = tokio::time::timeout(tokio::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("should receive event in time")
+            .expect("event channel should remain open");
+        if matches!(
+            envelope.kind(),
+            crate::events::AgentEventKind::RemoteSessionSyncCompleted { .. }
+        ) {
+            continue;
+        }
+        break envelope;
+    };
 
     assert_eq!(event.session_id(), session_id);
     assert!(matches!(

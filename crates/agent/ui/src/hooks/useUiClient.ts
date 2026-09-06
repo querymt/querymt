@@ -14,6 +14,7 @@ import {
   FileIndexEntry,
   ModelEntry,
   RecentModelEntry,
+  RemoteSessionConnectionState,
   LlmConfigDetails,
   SessionLimits,
   AuthProviderEntry,
@@ -240,6 +241,10 @@ export function useUiClient() {
   const [isUpdatingPlugins, setIsUpdatingPlugins] = useState(false);
   const [schedulesByKey, setSchedulesByKey] = useState<Record<string, ScheduleInfo[]>>({});
   const [loadedSessionNodeIds, setLoadedSessionNodeIds] = useState<Record<string, string | null>>({});
+  // Explicit per-session transport connectivity (plan §12): 'connected' after a
+  // successful open/attach, 'disconnected' on offline opens or remote disconnects.
+  // Local sessions stay undefined.
+  const [sessionConnectionStates, setSessionConnectionStates] = useState<Record<string, RemoteSessionConnectionState | undefined>>({});
   const scheduleKeyForSession = useCallback(
     (targetSessionId?: string | null, explicitNodeId?: string) => {
       const resolvedNodeId = explicitNodeId ?? (targetSessionId ? loadedSessionNodeIds[targetSessionId] ?? undefined : undefined);
@@ -632,6 +637,15 @@ export function useUiClient() {
         const eventKind = eventEnvelope?.kind?.type;
         const kindData = eventEnvelope?.kind?.data ?? {};
 
+        // Ephemeral remote disconnects flip the session to Disconnected
+        // without touching durable history (plan §12).
+        if (eventKind === 'remote_session_disconnected') {
+          setSessionConnectionStates(prev => ({
+            ...prev,
+            [d.session_id]: RemoteSessionConnectionState.Disconnected,
+          }));
+        }
+
         if (eventKind === 'run_started') {
           setRuntimeBySession((prev) => {
             const next = new Map(prev);
@@ -997,8 +1011,17 @@ export function useUiClient() {
       case 'error': {
         const d = msg.data;
         console.error('UI server error:', d.message);
+        // Structured session errors carry a stable code + session_id (plan §13).
+        // Load routing decisions use the codes; the legacy message prefix remains
+        // only as a fallback for codeless errors from older backends.
+        const errorCode = typeof d.code === 'string' ? d.code : undefined;
+        const errorSessionId = typeof d.session_id === 'string' ? d.session_id : undefined;
         const isDeleteError = d.message.includes('Failed to delete session');
-        const isLoadError = d.message.includes('Failed to load session');
+        const isLoadError =
+          (errorCode != null &&
+            errorSessionId != null &&
+            (errorCode === 'session_not_found' || errorCode === 'session_location_conflict')) ||
+          (errorCode == null && d.message.includes('Failed to load session'));
         const isSessionChildrenError =
           d.message.includes('Failed to list session children') ||
           d.message.includes('Session children list only supports user forks');
@@ -1013,7 +1036,8 @@ export function useUiClient() {
 
         if (isLoadError) {
           const pendingEntries = Array.from(pendingLoadLabelsRef.current.entries());
-          const [failedSessionId, pendingLabel] = pendingEntries[pendingEntries.length - 1] ?? [null, undefined];
+          const [pendingSessionId, pendingLabel] = pendingEntries[pendingEntries.length - 1] ?? [null, undefined];
+          const failedSessionId = errorSessionId ?? pendingSessionId;
           pendingLoadLabelsRef.current.clear();
           pushSessionActionNotice(
             'error',
@@ -1172,6 +1196,16 @@ export function useUiClient() {
           ...prev,
           [d.session_id]: d.node_id ?? null,
         }));
+        setSessionConnectionStates(prev => ({
+          ...prev,
+          [d.session_id]:
+            d.connection_state ??
+            (d.node_id ? RemoteSessionConnectionState.Connected : undefined),
+        }));
+        // Reconnect path: refresh runtime state without navigation (plan §13).
+        if (d.connection_state === RemoteSessionConnectionState.Connected && d.node_id) {
+          sendMessage({ type: 'get_runtime_state', data: { session_id: d.session_id } });
+        }
         if (d.profile_id) {
           setSessionProfiles(prev => ({ ...prev, [d.session_id]: d.profile_id! }));
         }
@@ -2307,6 +2341,7 @@ export function useUiClient() {
     updatePlugins,
     schedules,
     loadedSessionNodeIds,
+    sessionConnectionStates,
     listSchedules,
     createSchedule,
     pauseSchedule,

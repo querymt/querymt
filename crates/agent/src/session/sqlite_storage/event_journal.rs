@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::events::{AgentEventKind, DurableEvent, EventOrigin};
@@ -42,7 +42,7 @@ impl EventJournal for SqliteStorage {
             )?;
 
             conn.execute(
-                "INSERT INTO event_journal (event_id, stream_seq, session_id, timestamp, origin, source_node, kind, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO event_journal (event_id, stream_seq, session_id, timestamp, origin, source_node, source_node_id, source_seq, kind, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     event_id,
                     stream_seq,
@@ -50,6 +50,8 @@ impl EventJournal for SqliteStorage {
                     timestamp,
                     origin_str,
                     event_clone.source_node,
+                    event_clone.source_node_id,
+                    event_clone.source_seq,
                     kind_tag,
                     payload_json,
                 ],
@@ -149,6 +151,136 @@ impl EventJournal for SqliteStorage {
                 params![session_id, from_seq],
             )?;
             Ok(deleted)
+        })
+        .await
+        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        .map_err(SessionError::from)
+    }
+
+    async fn append_durable_from_source(
+        &self,
+        event: &NewDurableEvent,
+    ) -> SessionResult<Option<DurableEvent>> {
+        let (source_node_id, source_seq) = match (&event.source_node_id, event.source_seq) {
+            (Some(node_id), Some(seq)) => (node_id.clone(), seq),
+            _ => {
+                return Err(SessionError::Other(
+                    "append_durable_from_source requires source_node_id and source_seq; \
+                     use append_durable for events without source identity"
+                        .to_string(),
+                ));
+            }
+        };
+        let event_clone = event.clone();
+        let conn_arc = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Option<DurableEvent>, rusqlite::Error> {
+            let conn = conn_arc.lock().unwrap();
+
+            let kind_tag = serde_json::to_value(&event_clone.kind)
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
+                .unwrap_or_else(|| "unknown".to_string());
+            let payload_json = serde_json::to_string(&event_clone.kind)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+            let origin_str = match &event_clone.origin {
+                EventOrigin::Local => "local",
+                EventOrigin::Remote => "remote",
+                EventOrigin::Unknown(s) => s.as_str(),
+            };
+
+            // Duplicate replay is a no-op (plan §15/§16): no insert and no
+            // stream_seq allocation. The connection mutex is held for the
+            // whole check+insert so relay/backfill writers serialize in-process;
+            // the partial unique index is the durable backstop.
+            let existing: Option<i64> = conn
+                .query_row(
+                    "SELECT stream_seq FROM event_journal \
+                     WHERE session_id = ?1 AND source_node_id = ?2 AND source_seq = ?3",
+                    params![event_clone.session_id, source_node_id, source_seq],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing.is_some() {
+                return Ok(None);
+            }
+
+            let event_id = Uuid::now_v7().to_string();
+            let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
+
+            // Atomically allocate the next stream_seq and insert the event.
+            let stream_seq: i64 = conn.query_row(
+                "UPDATE event_journal_seq SET next_seq = next_seq + 1 WHERE id = 1 RETURNING next_seq - 1",
+                [],
+                |row| row.get(0),
+            )?;
+
+            conn.execute(
+                "INSERT INTO event_journal (event_id, stream_seq, session_id, timestamp, origin, source_node, source_node_id, source_seq, kind, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    event_id,
+                    stream_seq,
+                    event_clone.session_id,
+                    timestamp,
+                    origin_str,
+                    event_clone.source_node,
+                    Some(source_node_id),
+                    Some(source_seq),
+                    kind_tag,
+                    payload_json,
+                ],
+            )?;
+
+            Ok(Some(DurableEvent {
+                event_id,
+                stream_seq,
+                session_id: event_clone.session_id,
+                timestamp,
+                origin: event_clone.origin,
+                source_node: event_clone.source_node,
+                kind: event_clone.kind,
+            }))
+        })
+        .await
+        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        .map_err(SessionError::from)
+    }
+
+    async fn latest_source_seq(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+    ) -> SessionResult<Option<i64>> {
+        let session_id = session_id.to_string();
+        let source_node_id = source_node_id.to_string();
+        let conn_arc = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Option<i64>, rusqlite::Error> {
+            let conn = conn_arc.lock().unwrap();
+            conn.query_row(
+                "SELECT MAX(source_seq) FROM event_journal \
+                 WHERE session_id = ?1 AND source_node_id = ?2",
+                params![session_id, source_node_id],
+                |row| row.get(0),
+            )
+        })
+        .await
+        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        .map_err(SessionError::from)
+    }
+
+    async fn max_stream_seq(&self, session_id: &str) -> SessionResult<i64> {
+        let session_id = session_id.to_string();
+        let conn_arc = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<i64, rusqlite::Error> {
+            let conn = conn_arc.lock().unwrap();
+            conn.query_row(
+                "SELECT COALESCE(MAX(stream_seq), 0) FROM event_journal WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
         })
         .await
         .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?

@@ -941,11 +941,13 @@ let response = agent
     .await?;
 ```
 
-**Session recovery features:**
-- **Automatic reconnection**: Handles transient network failures
-- **State preservation**: Session state persisted across restarts
-- **History recovery**: Full conversation history maintained
-- **Graceful degradation**: Continues working even if some peers unavailable
+**Recovery semantics:**
+- **Durable identity**: a remote bookmark is the authoritative local record for a remote session (session ID, node, metadata). A bookmarked session is never replaced by a locally created session, and its cached history stays readable while the host is offline.
+- **One recovery algorithm**: opening, explicit reconnect, operation recovery, extension attach, and startup reattach all share a single connection coordinator with per-reason time budgets (open 5s, reconnect/attach 15s, operation recovery 10s by default) and per-session single-flight, so concurrent load/prompt/runtime queries share one recovery attempt.
+- **Connected is verified**: an attachment is reported connected only after the control path (bounded health check) and the event-delivery path (direct relay capability acknowledged after forwarder installation; a generation-specific DHT relay name remains as a compatibility fallback) both succeed. A failed candidate never replaces a working attachment, and delayed failures from an old attachment generation cannot detach a newer one.
+- **Missed events are backfilled exactly once**: on reconnect, durable events emitted while disconnected are fetched with a source-side cursor (session + node + source sequence), deduplicated through a partial unique index, and a sync-completed status is published. Sessions without a source cursor (pre-upgrade history) become a new synchronization boundary — source sequences are never guessed.
+- **Acknowledged submissions**: interactive turns submit with a `client_input_id`; the session actor caches accepted receipts so a retry with the same ID can never duplicate a turn (same-actor retry safety, not cross-restart exactly-once).
+- **Explicit connection state**: session summaries and `session_loaded` carry `connecting | connected | disconnected`. Connection changes are ephemeral signals; conversation events remain durable.
 
 ### Remote Session Lifecycle
 
@@ -967,6 +969,19 @@ stateDiagram-v2
         Streaming --> Processing: Stream complete
     }
 ```
+
+### Offline History, Ambiguous Delivery, and Compatibility
+
+**Offline-first opening.** Opening a bookmarked remote session loads the cached audit history from the local event journal first and reports `disconnected` when the host is unreachable (bounded open-time recovery, ~5s by default). The frontend keeps the URL, cached transcript, and pending draft, shows a reconnect banner, and offers an explicit Reconnect action. Unknown IDs return a structured `session_not_found` error; a session that is both a local row and a remote bookmark returns a structured `session_location_conflict`.
+
+**Typed failures and ambiguous delivery.** Remote transport failures are classified by kind and delivery certainty (`not_delivered` / `unknown`) — never by error-message text:
+
+- Proven pre-delivery failures may reconnect and retry once (idempotent reads; keyed submissions reuse the same `client_input_id`).
+- Ambiguous failures on non-idempotent operations (legacy `Prompt`, unkeyed submissions, undo/redo, mode/model changes) are never replayed; connectivity is restored and a structured `submission_outcome_unknown` result is returned instead.
+- Remote handler/provider errors are delivered results, not transport failures, and are never retried.
+- Protocol mismatch and serialization failures are never retried.
+
+**Mixed-version compatibility.** New protocol fields (direct relay capability, source cursor, connection state, structured error codes) are additive with serde defaults, so older peers ignore them. New clients fall back to the generation-specific DHT relay name when talking to hosts that predate capability handoff, and hosts that predate cursor backfill are reported as potentially stale history rather than connection failure. Legacy `LoadSession`/`AttachRemoteSession` remain supported wrappers over the unified open operation, and legacy `prompt` RPCs are fulfilled with acknowledged submissions.
 
 ### Session Persistence
 

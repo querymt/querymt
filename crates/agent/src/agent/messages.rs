@@ -330,6 +330,38 @@ pub struct GetHistory;
 #[derive(Serialize, Deserialize)]
 pub struct GetEventStream;
 
+/// Retrieve one bounded page of the durable event stream after a source-side
+/// cursor.
+///
+/// Reply: `Result<EventStreamPage, Error>`
+///
+/// Used by remote peers for cursor-based backfill after reconnect (plan §16):
+/// events carry the host journal sequence in `AgentEvent.seq`, which is the
+/// source-side cursor the requesting peer deduplicates against via
+/// `(session_id, source_node_id, source_seq)`. Mixed-version hosts that do
+/// not register this message produce a typed transport failure; the requester
+/// marks history potentially stale instead of failing the connection.
+#[derive(Serialize, Deserialize)]
+pub struct GetEventStreamSince {
+    /// Return only events with a source sequence strictly greater than this
+    /// cursor. `None` starts from the beginning of the session's stream.
+    pub after_source_seq: Option<i64>,
+    /// Maximum number of events to return in this page.
+    pub limit: usize,
+}
+
+/// One page of a cursor-based event-stream backfill (plan §16).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventStreamPage {
+    /// Events ordered by source sequence. `AgentEvent.seq` is the host
+    /// journal sequence and doubles as the backfill cursor.
+    pub events: Vec<crate::events::AgentEvent>,
+    /// The host's current stream tip. Once a page reaches this value the
+    /// backfill is complete. Overlap between pages and the live relay is
+    /// allowed and deduplicated requester-side via source identity.
+    pub latest_source_seq: i64,
+}
+
 /// Subscribe a remote `EventRelayActor` to this session's events.
 ///
 /// Reply: `Result<(), Error>`
@@ -339,13 +371,20 @@ pub struct GetEventStream;
 #[derive(Serialize, Deserialize)]
 pub struct SubscribeEvents {
     pub relay_actor_id: u64,
-    /// Peer-scoped DHT name for the relay actor.
+    /// Direct relay capability used by peers that support capability handoff.
+    #[cfg(feature = "remote")]
+    #[serde(default)]
+    pub relay_ref:
+        Option<kameo::actor::RemoteActorRef<crate::agent::remote::event_relay::EventRelayActor>>,
+    /// Peer-scoped DHT name retained as a mixed-version fallback.
     ///
-    /// Format: `event_relay::{session_id}::{peer_id}`.  Provided by the
-    /// attaching peer so the `SessionActor` looks up the correct per-peer
-    /// relay instead of a shared name that would collide when multiple
-    /// peers attach to the same session (Bug 3 fix).
-    pub relay_dht_name: String,
+    /// `Some` serializes identically to the legacy required string field, so
+    /// older hosts can ignore `relay_ref` and continue resolving this name.
+    #[serde(default)]
+    pub relay_dht_name: Option<String>,
+    /// Reserved for cursor-based event backfill (Phase 10).
+    #[serde(default)]
+    pub after_source_seq: Option<i64>,
 }
 
 /// Unsubscribe a previously registered event relay.
@@ -587,12 +626,31 @@ mod tests {
     fn subscribe_events_message_serializes() {
         let msg = SubscribeEvents {
             relay_actor_id: 42,
-            relay_dht_name: "event_relay::sess-1::peer-A".to_string(),
+            #[cfg(feature = "remote")]
+            relay_ref: None,
+            relay_dht_name: Some("event_relay::sess-1::peer-A".to_string()),
+            after_source_seq: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let rt: SubscribeEvents = serde_json::from_str(&json).unwrap();
         assert_eq!(rt.relay_actor_id, 42);
-        assert_eq!(rt.relay_dht_name, "event_relay::sess-1::peer-A");
+        assert_eq!(
+            rt.relay_dht_name.as_deref(),
+            Some("event_relay::sess-1::peer-A")
+        );
+        assert_eq!(rt.after_source_seq, None);
+    }
+
+    #[test]
+    fn subscribe_events_deserializes_legacy_payload() {
+        let rt: SubscribeEvents =
+            serde_json::from_str(r#"{"relay_actor_id":42,"relay_dht_name":"event_relay::legacy"}"#)
+                .unwrap();
+        assert_eq!(rt.relay_actor_id, 42);
+        #[cfg(feature = "remote")]
+        assert!(rt.relay_ref.is_none());
+        assert_eq!(rt.relay_dht_name.as_deref(), Some("event_relay::legacy"));
+        assert_eq!(rt.after_source_seq, None);
     }
 
     #[test]

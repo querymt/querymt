@@ -44,6 +44,7 @@ pub mod runtime_handle;
 pub mod runtime_helpers;
 pub mod scope;
 pub mod stream_router_protocol;
+pub mod transport_failure;
 
 pub use identity::*;
 pub use invite::*;
@@ -117,4 +118,9 @@ pub use scope::{
 pub use stream_router_protocol::{
     GetRouterStatus, RequestPhase, RoutedRequestStatus, RoutedStreamRelayMessage,
     terminal_request_phase,
+};
+pub use transport_failure::{
+    DeliveryCertainty, RemoteTransportFailure, RemoteTransportFailureKind,
+    classify_infallible_remote_send_error, classify_remote_send_error,
+    classify_remote_send_error_with_timeout_message,
 };

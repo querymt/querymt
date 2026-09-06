@@ -951,15 +951,10 @@ mod remote_session_lifecycle_integration_tests {
         f.cleanup().await;
     }
 
-    // ── G.8 — Bug #5 (documented) ────────────────────────────────────────────
+    // ── G.8 — Direct relay capability handoff ────────────────────────────────
 
-    /// Documents the DHT propagation race in `attach_remote_session`.
-    ///
-    /// `SubscribeEvents` is sent before the `EventRelayActor` registration
-    /// propagates in the DHT, silently dropping event forwarding.
-    ///
-    /// When the race is fixed, this test should assert that events from Beta's
-    /// session appear on Alpha's local event bus.
+    /// Events arrive without waiting for relay DHT propagation because the
+    /// attaching node hands the relay capability directly to the session.
     #[tokio::test]
     async fn test_alpha_events_arrive_on_local_bus() {
         let test_id = Uuid::now_v7().to_string();
@@ -987,8 +982,7 @@ mod remote_session_lifecycle_integration_tests {
         .await
         .expect("create");
 
-        // Alpha sets up a relay actor and registers it in the DHT under the
-        // name that SubscribeEvents will look for on Beta's session.
+        // Alpha creates a relay but deliberately does not publish it in DHT.
         let alpha_storage = Arc::new(
             crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
                 .await
@@ -1011,14 +1005,9 @@ mod remote_session_lifecycle_integration_tests {
             &resp.session_id,
             mesh.peer_id(),
         );
-        mesh.register_actor(relay_ref.clone(), relay_dht_name.clone())
-            .await;
-        let _ = relay_ref;
+        let relay_remote_ref = relay_ref.into_remote_ref().await;
 
-        // Allow DHT propagation before subscribing (mitigates Bug #5 for this test).
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Look up and subscribe.
+        // Look up the remote session and subscribe using direct capability handoff.
         let dht_name = crate::agent::remote::scope::scoped_session(
             &crate::agent::remote::scope::MeshScopeId::lan_default(),
             &resp.session_id,
@@ -1036,22 +1025,21 @@ mod remote_session_lifecycle_integration_tests {
         };
 
         session_ref
-            .subscribe_events(1, relay_dht_name)
+            .subscribe_events_direct(1, relay_remote_ref, relay_dht_name)
             .await
-            .expect("subscribe");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            .expect("subscribe with direct relay capability");
+        let mut alpha_events = alpha_fanout.subscribe();
 
         // Trigger an event on Beta's session by changing mode.
         session_ref
             .set_mode(AgentMode::Plan)
             .await
             .expect("set_mode");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Bug #5: if the DHT race fires, no events may arrive on alpha fanout.
-        // We document expected behaviour without asserting strictly.
-        // When fixed: assert alpha fanout has received at least one event.
-        let _ = alpha_fanout.subscriber_count(); // just ensure no panic
+        let envelope = tokio::time::timeout(STEP_TIMEOUT, alpha_events.recv())
+            .await
+            .expect("relayed event timed out")
+            .expect("alpha event fanout closed");
+        assert_eq!(envelope.session_id(), resp.session_id);
 
         let _ = within_timeout("destroy created session", async {
             querymt_remote::ask_remote_with_timeout(

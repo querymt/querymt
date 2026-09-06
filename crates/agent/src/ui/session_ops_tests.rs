@@ -292,6 +292,21 @@ async fn attach_remote_session_with_node_id(
         .await
         .expect("DHT lookup should succeed")
         .expect("remote actor should be available");
+    let remote_node_id = remote_node_id.unwrap_or("test-remote-node");
+    fixture
+        .agent
+        .storage
+        .session_store()
+        .save_remote_session_bookmark(&RemoteSessionBookmark {
+            session_id: session_id.to_string(),
+            node_id: remote_node_id.to_string(),
+            peer_label: peer_label.to_string(),
+            cwd: None,
+            created_at: 1,
+            title: None,
+        })
+        .await
+        .expect("save test remote bookmark");
     fixture
         .agent
         .handle
@@ -300,9 +315,10 @@ async fn attach_remote_session_with_node_id(
             remote_ref,
             peer_label.to_string(),
             None,
-            remote_node_id.map(str::to_string),
+            Some(remote_node_id.to_string()),
         )
-        .await;
+        .await
+        .expect("attach test remote session");
 }
 
 async fn create_control_test_session(
@@ -1162,13 +1178,17 @@ async fn handle_load_session_succeeds_for_attached_remote_session_with_local_pro
     let loaded = next_message_of_type(&mut rx, "session_loaded").await;
     assert_eq!(loaded["data"]["session_id"], session_id);
     assert_eq!(loaded["data"]["node_id"], remote_node_id);
+    assert_eq!(
+        loaded["data"]["connection_state"], "connected",
+        "attached remote open reports the connected state (plan §12)"
+    );
 
     Ok(())
 }
 
 #[cfg(feature = "remote")]
 #[tokio::test]
-async fn handle_set_session_model_prefers_attached_remote_over_profile_local_actor() -> Result<()> {
+async fn handle_set_session_model_rejects_local_remote_location_conflict() -> Result<()> {
     let mut f = crate::test_utils::TestServerState::new().await;
     let dir = TempDir::new()?;
     write_profile(dir.path(), "alpha.toml");
@@ -1196,28 +1216,12 @@ async fn handle_set_session_model_prefers_attached_remote_over_profile_local_act
     let profile_runtime = profiles.runtime_for_profile("alpha").await?;
     insert_test_actor(&profile_runtime.agent().handle(), &session_id).await;
 
-    handle_set_session_model(&f.state, &session_id, "mock/new-model", None)
+    let error = handle_set_session_model(&f.state, &session_id, "mock/new-model", None)
         .await
-        .expect("set_session_model should succeed for attached remote session");
-
-    let local_llm_cfg = f
-        .agent
-        .storage
-        .session_store()
-        .get_session_llm_config(&session_id)
-        .await?;
-    let local_llm_cfg = local_llm_cfg.expect("session llm config should be set");
-    assert_eq!(
-        local_llm_cfg.model, "new-model",
-        "remote actor should update shared session config instead of profile-local actor"
-    );
-    assert_eq!(
-        local_llm_cfg.provider_node_id,
-        f.agent
-            .handle
-            .mesh()
-            .map(|mesh| crate::agent::remote::NodeId::from_peer_id(*mesh.peer_id()).to_string()),
-        "remote actor should route local provider calls back to the local mesh peer"
+        .expect_err("local row plus remote bookmark must be rejected as a location conflict");
+    assert!(
+        error.contains("session_location_conflict"),
+        "unexpected conflict error: {error}"
     );
 
     Ok(())
@@ -1266,6 +1270,279 @@ async fn list_sessions_returns_detached_remote_bookmarks_without_attaching() -> 
             .is_none(),
         "listing a bookmark must not attach or mutate the registry"
     );
+
+    Ok(())
+}
+
+/// Guardrail (Phase 8): an offline bookmarked remote session opens with its
+/// cached (possibly empty) snapshot instead of failing the load — and the
+/// bookmarked remote ID is still never turned into a local session. The
+/// durable bookmark is the identity record and its node is reported.
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn offline_bookmarked_remote_opens_disconnected_without_local_session() -> Result<()> {
+    let f = crate::test_utils::TestServerState::new().await;
+    let session_id = format!("remote-guard-{}", Uuid::now_v7());
+
+    // Durable remote identity only — no local session row, no registry actor,
+    // no mesh. This is the classic offline/stale-actor scenario.
+    f.agent
+        .storage
+        .session_store()
+        .save_remote_session_bookmark(&RemoteSessionBookmark {
+            session_id: session_id.clone(),
+            node_id: "node-unreachable".to_string(),
+            peer_label: "remote-peer".to_string(),
+            cwd: Some("/remote/workspace".to_string()),
+            created_at: 123,
+            title: Some("Bookmarked remote".to_string()),
+        })
+        .await?;
+
+    let (tx, mut rx) = f.add_connection("conn-remote-guard").await;
+    handle_load_session(&f.state, "conn-remote-guard", &session_id, &tx).await;
+
+    // Offline-first: the open succeeds with a disconnected snapshot — no
+    // fatal load error, no local hydration. With no cached journal events
+    // this is the empty disconnected view (plan §11.4).
+    let loaded = next_message_of_type(&mut rx, "session_loaded").await;
+    assert_eq!(loaded["data"]["session_id"], session_id);
+    assert_eq!(
+        loaded["data"]["node_id"], "node-unreachable",
+        "disconnected open reports the durable bookmark node"
+    );
+    assert_eq!(
+        loaded["data"]["connection_state"], "disconnected",
+        "offline open reports the disconnected connection state (plan §12)"
+    );
+    let events = loaded["data"]["audit"]["events"]
+        .as_array()
+        .expect("audit events array");
+    assert!(
+        events.is_empty(),
+        "no cached journal events must yield an empty disconnected view: {events:?}"
+    );
+
+    // Bookmark metadata seeds the workspace context (plan §11.4).
+    let cwds = f.state.session_cwds.lock().await;
+    assert_eq!(
+        cwds.get(&session_id).map(|p| p.as_path()),
+        Some(std::path::Path::new("/remote/workspace")),
+        "disconnected open uses the bookmark cwd"
+    );
+    drop(cwds);
+
+    // A local session row must never have been created for this remote ID.
+    let local_row = f
+        .agent
+        .storage
+        .session_store()
+        .get_session(&session_id)
+        .await?;
+    assert!(
+        local_row.is_none(),
+        "bookmarked remote ID must not gain a local session row"
+    );
+
+    // The durable bookmark survived the failed recovery attempt unchanged.
+    let bookmark = f
+        .agent
+        .storage
+        .session_store()
+        .get_remote_session_bookmark(&session_id)
+        .await?
+        .expect("bookmark must survive offline open");
+    assert_eq!(bookmark.created_at, 123);
+    assert_eq!(bookmark.title.as_deref(), Some("Bookmarked remote"));
+
+    Ok(())
+}
+
+/// Phase 8: cached journal history is served for an offline bookmarked remote
+/// session without any live actor (plan invariant 9).
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn offline_bookmarked_session_opens_cached_journal_history() -> Result<()> {
+    use crate::events::{AgentEventKind, EventOrigin};
+    use crate::session::projection::NewDurableEvent;
+
+    let f = crate::test_utils::TestServerState::new().await;
+    let session_id = format!("remote-cache-{}", Uuid::now_v7());
+    f.agent
+        .storage
+        .session_store()
+        .save_remote_session_bookmark(&RemoteSessionBookmark {
+            session_id: session_id.clone(),
+            node_id: "node-unreachable".to_string(),
+            peer_label: "remote-peer".to_string(),
+            cwd: None,
+            created_at: 42,
+            title: None,
+        })
+        .await?;
+
+    // Simulate durable events relayed from the remote before the disconnect.
+    f.agent
+        .storage
+        .event_journal()
+        .append_durable(&NewDurableEvent {
+            session_id: session_id.clone(),
+            origin: EventOrigin::Remote,
+            source_node: Some("node-unreachable".to_string()),
+            source_node_id: None,
+            source_seq: None,
+            kind: AgentEventKind::UserMessageStored {
+                content: "cached turn while offline".to_string(),
+            },
+        })
+        .await?;
+
+    let (tx, mut rx) = f.add_connection("conn-remote-cache").await;
+    handle_load_session(&f.state, "conn-remote-cache", &session_id, &tx).await;
+
+    let loaded = next_message_of_type(&mut rx, "session_loaded").await;
+    assert_eq!(loaded["data"]["session_id"], session_id);
+    assert_eq!(loaded["data"]["node_id"], "node-unreachable");
+    let audit = loaded["data"]["audit"].to_string();
+    assert!(
+        audit.contains("cached turn while offline"),
+        "cached journal history must be served offline: {audit}"
+    );
+
+    Ok(())
+}
+
+/// Phase 8: an unknown ID stays distinct from an unavailable remote node —
+/// it is a structured `session_not_found`, never a remote recovery error.
+#[tokio::test]
+async fn load_unknown_session_returns_session_not_found_marker() -> Result<()> {
+    let f = crate::test_utils::TestServerState::new().await;
+    let (tx, mut rx) = f.add_connection("conn-unknown").await;
+    handle_load_session(&f.state, "conn-unknown", "missing-session-id", &tx).await;
+
+    let error = next_message_of_type(&mut rx, "error").await;
+    let message = error["data"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        message.contains("session_not_found"),
+        "unknown ID must surface session_not_found, got: {message:?}"
+    );
+    assert_eq!(
+        error["data"]["code"], "session_not_found",
+        "structured error carries the stable code (plan §13)"
+    );
+    assert_eq!(error["data"]["session_id"], "missing-session-id");
+
+    Ok(())
+}
+
+/// Phase 8: a local row plus a remote bookmark for the same ID is a typed
+/// `session_location_conflict`, never a silent pick of one location.
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn load_conflicting_local_row_and_bookmark_returns_structured_conflict() -> Result<()> {
+    let f = crate::test_utils::TestServerState::new().await;
+    let session_id = f
+        .agent
+        .storage
+        .session_store()
+        .create_session(Some("conflicted".to_string()), None, None, None)
+        .await?
+        .public_id;
+    f.agent
+        .storage
+        .session_store()
+        .save_remote_session_bookmark(&RemoteSessionBookmark {
+            session_id: session_id.clone(),
+            node_id: "node-a".to_string(),
+            peer_label: "remote-peer".to_string(),
+            cwd: None,
+            created_at: 7,
+            title: None,
+        })
+        .await?;
+
+    let (tx, mut rx) = f.add_connection("conn-conflict").await;
+    handle_load_session(&f.state, "conn-conflict", &session_id, &tx).await;
+
+    let error = next_message_of_type(&mut rx, "error").await;
+    let message = error["data"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        message.contains("session_location_conflict"),
+        "local row + bookmark must surface session_location_conflict, got: {message:?}"
+    );
+    assert_eq!(
+        error["data"]["code"], "session_location_conflict",
+        "structured error carries the stable code (plan §13)"
+    );
+    assert_eq!(error["data"]["session_id"], session_id);
+
+    Ok(())
+}
+
+/// Guardrail (Phase 0/8): a bookmarked remote session must still list as a
+/// detached remote summary (attached=false) — an offline open serves the
+/// cached snapshot, does not attach, and does not corrupt durable identity.
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn bookmarked_remote_still_visible_as_detached_after_offline_open() -> Result<()> {
+    let f = crate::test_utils::TestServerState::new().await;
+    let session_id = format!("remote-persist-guard-{}", Uuid::now_v7());
+    f.agent
+        .storage
+        .session_store()
+        .save_remote_session_bookmark(&RemoteSessionBookmark {
+            session_id: session_id.clone(),
+            node_id: "node-unreachable".to_string(),
+            peer_label: "remote-peer".to_string(),
+            cwd: None,
+            created_at: 123,
+            title: Some("Bookmarked remote".to_string()),
+        })
+        .await?;
+
+    // Offline-first open succeeds without connectivity (Phase 8).
+    let (tx, mut rx) = f.add_connection("conn-remote-persist-guard").await;
+    handle_load_session(&f.state, "conn-remote-persist-guard", &session_id, &tx).await;
+    let loaded = next_message_of_type(&mut rx, "session_loaded").await;
+    assert_eq!(loaded["data"]["session_id"], session_id);
+
+    handle_list_sessions(
+        &f.state,
+        &tx,
+        ListSessionsRequest {
+            include_remote: true,
+            ..ListSessionsRequest::root_browse()
+        },
+    )
+    .await;
+
+    let listed = next_message_of_type(&mut rx, "session_list").await;
+    let summary = find_session(&listed, &session_id);
+    assert_eq!(
+        summary["attached"], false,
+        "bookmark stays detached while offline"
+    );
+    assert_eq!(
+        summary["connection_state"], "disconnected",
+        "explicit connection state replaces attached-flag inference (plan §12)"
+    );
+    assert_eq!(summary["runtime_state"], "stopped");
+
+    // The durable bookmark was never removed by the offline open attempt.
+    let bookmark = f
+        .agent
+        .storage
+        .session_store()
+        .get_remote_session_bookmark(&session_id)
+        .await?
+        .expect("bookmark must survive an offline open");
+    assert_eq!(bookmark.session_id, session_id);
 
     Ok(())
 }

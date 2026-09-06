@@ -53,6 +53,20 @@ pub struct ListSessionsOptions {
     pub remote: RemoteSessionMode,
 }
 
+/// Explicit transport connectivity for a remote session (plan §12).
+///
+/// Local sessions carry no transport connectivity and omit the field. The
+/// legacy `attached` flag remains and is derived from this state
+/// (`attached = connection_state == connected`) for compatibility.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteSessionConnectionState {
+    Connecting,
+    Connected,
+    Disconnected,
+}
+
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
@@ -71,6 +85,8 @@ pub struct SessionSummary {
     pub node: Option<String>,
     pub node_id: Option<String>,
     pub attached: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_state: Option<RemoteSessionConnectionState>,
     pub runtime_state: Option<String>,
 }
 
@@ -472,15 +488,24 @@ impl AgentSessions {
     pub async fn delete(&self, session_id: impl AsRef<str>) -> Result<()> {
         let session_id = session_id.as_ref().to_string();
         self.session_store().delete_session(&session_id).await?;
+        self.session_store()
+            .remove_remote_session_bookmark(&session_id)
+            .await?;
         self.agent.clear_delegate_model_overrides(&session_id).await;
-        let mut registry = self.agent.registry.lock().await;
         #[cfg(feature = "remote")]
         {
-            registry.detach_remote_session(&session_id).await;
+            if self
+                .agent
+                .detach_remote_session_attachment(&session_id, true)
+                .await
+                .is_none()
+            {
+                self.agent.registry.lock().await.remove(&session_id);
+            }
         }
         #[cfg(not(feature = "remote"))]
         {
-            registry.remove(&session_id);
+            self.agent.registry.lock().await.remove(&session_id);
         }
         Ok(())
     }
@@ -560,6 +585,7 @@ impl AgentSessions {
                         node: Some(peer_label.clone()),
                         node_id: remote_node_id,
                         attached: Some(true),
+                        connection_state: Some(RemoteSessionConnectionState::Connected),
                         runtime_state: None,
                     };
                     push_group_session(groups, format!("remote::{}", peer_label), summary);
@@ -576,6 +602,9 @@ impl AgentSessions {
                     if registry_ids.contains(&bookmark.session_id) {
                         continue;
                     }
+                    // Connecting while an open/recovery attempt is in flight
+                    // for this session (single-flight gate entry present).
+                    let connecting = self.agent.remote_connect_in_flight(&bookmark.session_id);
                     let summary = SessionSummary {
                         session_id: bookmark.session_id,
                         name: bookmark.title.clone(),
@@ -591,6 +620,11 @@ impl AgentSessions {
                         node: Some(bookmark.peer_label.clone()),
                         node_id: Some(bookmark.node_id),
                         attached: Some(false),
+                        connection_state: Some(if connecting {
+                            RemoteSessionConnectionState::Connecting
+                        } else {
+                            RemoteSessionConnectionState::Disconnected
+                        }),
                         runtime_state: Some("stopped".to_string()),
                     };
                     push_group_session(groups, format!("remote::{}", bookmark.peer_label), summary);
@@ -679,6 +713,7 @@ impl AgentSessions {
                         node: Some(peer_label.clone()),
                         node_id: Some(node_id_str.clone()),
                         attached: Some(false),
+                        connection_state: Some(RemoteSessionConnectionState::Disconnected),
                         runtime_state: session_info.runtime_state,
                     };
                     push_group_session(groups, format!("remote::{}", peer_label), summary);
@@ -758,6 +793,7 @@ impl From<SessionListItem> for SessionSummary {
             node: None,
             node_id: None,
             attached: None,
+            connection_state: None,
             runtime_state: None,
         }
     }

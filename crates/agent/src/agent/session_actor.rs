@@ -14,7 +14,7 @@ use crate::agent::session_control::{
     SessionControlState, SessionControlTransition, SessionModelBinding,
 };
 use crate::agent::turn_control::{
-    ActiveRun, InputDelivery, RunPhase, SubmitInputResult, TurnControlError,
+    ActiveRun, InputDelivery, RunPhase, SubmitInputResult, TurnControlError, now_ms,
 };
 use crate::agent::undo::{RedoResult, UndoError, UndoResult};
 use crate::agent::utils::{format_prompt_user_text_only, render_prompt_for_display};
@@ -179,6 +179,7 @@ pub struct SessionActor {
     pub(crate) prompt_running: bool,
     pub(crate) active_run: Option<ActiveRun>,
     queued_prompts: VecDeque<QueuedPrompt>,
+    submit_receipts: VecDeque<SubmitInputReceipt>,
 
     // ── Mesh (remote sessions only) ──────────────────────────────
     /// Present when this actor was spawned on a mesh node via
@@ -198,6 +199,23 @@ pub(crate) struct TurnState {
 }
 
 const MAX_QUEUED_PROMPTS: usize = 32;
+
+/// Bounded same-actor retry safety for keyed `SubmitInput`.
+///
+/// Stores the accepted `SubmitInputResult` keyed by `client_input_id` so a
+/// retried submission (same ID, lost reply) returns the original receipt
+/// instead of enqueuing a duplicate turn. Same-actor only: a new actor after
+/// restart/materialization has an empty cache, and callers must not assume
+/// cross-restart exactly-once execution.
+const MAX_SUBMIT_RECEIPTS: usize = 128;
+const MAX_SUBMIT_RECEIPT_AGE_MS: u64 = 30 * 60 * 1000;
+
+#[derive(Debug, Clone)]
+struct SubmitInputReceipt {
+    client_input_id: String,
+    result: SubmitInputResult,
+    accepted_at_ms: u64,
+}
 
 fn queued_prompt_capacity_error(session_id: &str) -> AgentError {
     AgentError::TurnControl {
@@ -248,6 +266,7 @@ impl SessionActor {
             prompt_running: false,
             active_run: None,
             queued_prompts: VecDeque::new(),
+            submit_receipts: VecDeque::new(),
             #[cfg(feature = "remote")]
             mesh: None,
             relay_forwarder_handles: HashMap::new(),
@@ -276,6 +295,45 @@ impl SessionActor {
     pub fn with_mesh(mut self, mesh: Option<crate::agent::remote::MeshHandle>) -> Self {
         self.mesh = mesh;
         self
+    }
+
+    /// Return the original receipt for a repeated `client_input_id`, if it is
+    /// still within the bounded cache window.
+    fn cached_submit_receipt(&mut self, client_input_id: &str) -> Option<SubmitInputResult> {
+        self.prune_submit_receipts(now_ms());
+        self.submit_receipts
+            .iter()
+            .find(|receipt| receipt.client_input_id == client_input_id)
+            .map(|receipt| receipt.result.clone())
+    }
+
+    /// Store an accepted submission receipt before it is returned to the
+    /// caller so a retried submission with the same ID is deduplicated
+    /// instead of enqueueing a duplicate turn.
+    fn record_submit_receipt(
+        &mut self,
+        client_input_id: Option<String>,
+        result: &SubmitInputResult,
+    ) {
+        let Some(client_input_id) = client_input_id else {
+            return;
+        };
+        let now = now_ms();
+        self.prune_submit_receipts(now);
+        self.submit_receipts.push_back(SubmitInputReceipt {
+            client_input_id,
+            result: result.clone(),
+            accepted_at_ms: now,
+        });
+        while self.submit_receipts.len() > MAX_SUBMIT_RECEIPTS {
+            self.submit_receipts.pop_front();
+        }
+    }
+
+    fn prune_submit_receipts(&mut self, now_ms_value: u64) {
+        self.submit_receipts.retain(|receipt| {
+            now_ms_value.saturating_sub(receipt.accepted_at_ms) <= MAX_SUBMIT_RECEIPT_AGE_MS
+        });
     }
 
     fn launch_prompt(
@@ -1262,14 +1320,45 @@ impl Message<crate::agent::messages::GetEventStream> for SessionActor {
     }
 }
 
+/// Serve one bounded page of the durable event stream after a source-side
+/// cursor (plan §16).
+///
+/// Events carry the host journal sequence in `AgentEvent.seq`;
+/// `latest_source_seq` is the host stream tip so the requesting peer can page
+/// until current. Overlap between backfill pages and the live relay is
+/// deduplicated requester-side via source identity.
+impl Message<crate::agent::messages::GetEventStreamSince> for SessionActor {
+    type Reply = Result<crate::agent::messages::EventStreamPage, AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: crate::agent::messages::GetEventStreamSince,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let journal = self.config.event_sink.journal();
+        let events = journal
+            .load_session_stream(&self.session_id, msg.after_source_seq, Some(msg.limit))
+            .await
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
+        let latest_source_seq = journal
+            .max_stream_seq(&self.session_id)
+            .await
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
+        Ok(crate::agent::messages::EventStreamPage {
+            events: events
+                .into_iter()
+                .map(crate::events::AgentEvent::from)
+                .collect(),
+            latest_source_seq,
+        })
+    }
+}
+
 /// Subscribe a remote event relay to this session's events.
 ///
-/// When the kameo swarm is bootstrapped, this handler:
-/// 1. Resolves `relay_actor_id` → `RemoteActorRef<EventRelayActor>` via swarm
-/// 2. Starts an `EventForwarder` background task subscribed to the EventFanout
-///
-/// Without a swarm (swarm not bootstrapped), it logs and returns Ok so the
-/// message round-trips correctly for local tests.
+/// New peers hand off a direct relay capability. The DHT name remains a
+/// compatibility fallback for legacy senders. Success acknowledges that the
+/// forwarder has been installed, never merely that the request was received.
 impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
     type Reply = Result<(), AgentError>;
 
@@ -1283,93 +1372,89 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
             use crate::agent::remote::event_forwarder::EventForwarder;
             use crate::agent::remote::event_relay::EventRelayActor;
 
-            if let Some(ref mesh) = self.mesh {
-                let relay_name = msg.relay_dht_name.clone();
-                match mesh
-                    .lookup_actor::<EventRelayActor>(relay_name.clone())
-                    .await
-                {
-                    Ok(Some(relay_ref)) => {
-                        // Abort previous forwarder for this relay_actor_id if any
-                        if let Some(prev_handle) =
-                            self.relay_forwarder_handles.remove(&msg.relay_actor_id)
-                        {
-                            prev_handle.abort();
-                            log::debug!(
-                                "Session {}: SubscribeEvents relay_actor_id={} — aborted previous forwarder",
-                                self.session_id,
-                                msg.relay_actor_id
-                            );
-                        }
-
-                        let fanout = self.config.event_sink.fanout().clone();
-                        let handle = EventForwarder::start(
-                            fanout,
-                            relay_ref,
-                            format!("session:{}", self.session_id),
-                            self.session_id.clone(),
-                        );
-                        self.relay_forwarder_handles
-                            .insert(msg.relay_actor_id, handle);
-
-                        // Catch-up for subscribe-after-ready race:
-                        // if the workspace index finished before this relay subscribed,
-                        // re-emit WorkspaceIndexReady now that forwarding is installed.
-                        if let Some(workspace) = self.runtime.workspace_handle.get()
-                            && let Some(index) = workspace.file_index()
-                            && let Err(e) = self
-                                .config
-                                .emit_event_persisted(
-                                    &self.session_id,
-                                    crate::events::AgentEventKind::WorkspaceIndexReady {
-                                        workspace_root: index.root.display().to_string(),
-                                    },
-                                )
-                                .await
-                        {
-                            warn!(
-                                "Session {}: failed to emit WorkspaceIndexReady catch-up after SubscribeEvents: {}",
-                                self.session_id, e
-                            );
-                        }
-
-                        log::debug!(
-                            "Session {}: SubscribeEvents — EventForwarder started for relay '{}' (relay_actor_id={})",
-                            self.session_id,
-                            relay_name,
-                            msg.relay_actor_id,
-                        );
-                    }
-                    Ok(None) => {
-                        warn!(
-                            "Session {}: SubscribeEvents — no relay actor found under '{}' in DHT yet",
-                            self.session_id, relay_name
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Session {}: SubscribeEvents relay lookup failed: {} (continuing without relay)",
-                            self.session_id, e
-                        );
-                    }
-                }
+            let relay_source = if msg.relay_ref.is_some() {
+                "direct"
             } else {
-                info!(
-                    "Session {}: SubscribeEvents relay_actor_id={} — no mesh, event relay skipped",
-                    self.session_id, msg.relay_actor_id
+                "dht"
+            };
+            let relay_ref = if let Some(relay_ref) = msg.relay_ref {
+                relay_ref
+            } else {
+                let relay_name = msg.relay_dht_name.as_deref().ok_or_else(|| {
+                    AgentError::RemoteActor(
+                        "SubscribeEvents requires relay_ref or relay_dht_name".to_string(),
+                    )
+                })?;
+                let mesh = self.mesh.as_ref().ok_or(AgentError::MeshNotBootstrapped)?;
+                mesh.lookup_actor::<EventRelayActor>(relay_name.to_string())
+                    .await
+                    .map_err(|error| AgentError::SwarmLookupFailed {
+                        key: relay_name.to_string(),
+                        reason: error.to_string(),
+                    })?
+                    .ok_or_else(|| {
+                        AgentError::RemoteActor(format!(
+                            "event relay '{relay_name}' is not available"
+                        ))
+                    })?
+            };
+
+            if let Some(prev_handle) = self.relay_forwarder_handles.remove(&msg.relay_actor_id) {
+                prev_handle.abort();
+                log::debug!(
+                    "Session {}: SubscribeEvents relay_actor_id={} - aborted previous forwarder",
+                    self.session_id,
+                    msg.relay_actor_id
                 );
             }
+
+            let fanout = self.config.event_sink.fanout().clone();
+            let handle = EventForwarder::start(
+                fanout,
+                relay_ref,
+                format!("session:{}", self.session_id),
+                self.session_id.clone(),
+            );
+            self.relay_forwarder_handles
+                .insert(msg.relay_actor_id, handle);
+
+            // Re-emit readiness if indexing completed before the live path existed.
+            if let Some(workspace) = self.runtime.workspace_handle.get()
+                && let Some(index) = workspace.file_index()
+                && let Err(e) = self
+                    .config
+                    .emit_event_persisted(
+                        &self.session_id,
+                        crate::events::AgentEventKind::WorkspaceIndexReady {
+                            workspace_root: index.root.display().to_string(),
+                        },
+                    )
+                    .await
+            {
+                warn!(
+                    "Session {}: failed to emit WorkspaceIndexReady catch-up after SubscribeEvents: {}",
+                    self.session_id, e
+                );
+            }
+
+            log::debug!(
+                "Session {}: SubscribeEvents installed EventForwarder via {} (relay_actor_id={})",
+                self.session_id,
+                relay_source,
+                msg.relay_actor_id,
+            );
+            Ok(())
         }
 
         #[cfg(not(feature = "remote"))]
         {
+            let _ = msg;
             info!(
-                "Session {}: SubscribeEvents relay_actor_id={} (remote feature not enabled)",
-                self.session_id, msg.relay_actor_id
+                "Session {}: SubscribeEvents ignored (remote feature not enabled)",
+                self.session_id
             );
+            Ok(())
         }
-
-        Ok(())
     }
 }
 
@@ -1588,6 +1673,19 @@ impl Message<SubmitSessionInput> for SessionActor {
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
+        // Bounded same-actor receipt dedup: a retried keyed submission whose
+        // original reply was lost returns the original receipt instead of
+        // enqueuing a duplicate turn.
+        if let Some(client_input_id) = input.client_input_id.as_deref()
+            && let Some(receipt) = self.cached_submit_receipt(client_input_id)
+        {
+            info!(
+                "Session {}: SubmitInput client_input_id={} replayed cached receipt",
+                self.session_id, client_input_id
+            );
+            return Ok(receipt);
+        }
+
         match input.delivery {
             InputDelivery::Steer => {
                 let llm_config = self
@@ -1618,7 +1716,11 @@ impl Message<SubmitSessionInput> for SessionActor {
                 }
                 let position = run
                     .steering
-                    .push(input_id.clone(), input.client_input_id, input.prompt)
+                    .push(
+                        input_id.clone(),
+                        input.client_input_id.clone(),
+                        input.prompt,
+                    )
                     .await
                     .map_err(AgentError::from)?;
                 let position = crate::agent::utils::u32_from_usize(
@@ -1634,11 +1736,13 @@ impl Message<SubmitSessionInput> for SessionActor {
                         position,
                     },
                 );
-                Ok(SubmitInputResult::Steered {
+                let result = SubmitInputResult::Steered {
                     run_id: run.run_id.clone(),
                     input_id,
                     position,
-                })
+                };
+                self.record_submit_receipt(input.client_input_id, &result);
+                Ok(result)
             }
             InputDelivery::Queue => {
                 let req =
@@ -1669,7 +1773,9 @@ impl Message<SubmitSessionInput> for SessionActor {
                         .as_ref()
                         .map(|run| run.run_id.clone())
                         .unwrap_or_default();
-                    Ok(SubmitInputResult::Started { run_id, input_id })
+                    let result = SubmitInputResult::Started { run_id, input_id };
+                    self.record_submit_receipt(input.client_input_id, &result);
+                    Ok(result)
                 } else {
                     let position = self.queued_prompts.len() + 1;
                     self.queued_prompts.push_back(QueuedPrompt {
@@ -1689,7 +1795,9 @@ impl Message<SubmitSessionInput> for SessionActor {
                             position,
                         },
                     );
-                    Ok(SubmitInputResult::Queued { input_id, position })
+                    let result = SubmitInputResult::Queued { input_id, position };
+                    self.record_submit_receipt(input.client_input_id, &result);
+                    Ok(result)
                 }
             }
         }
@@ -2762,6 +2870,198 @@ mod tests {
         }
     }
 
+    // ── Cursor-based event stream paging (plan §16) ──────────────────────────
+
+    #[tokio::test]
+    async fn get_event_stream_since_returns_page_and_tip() {
+        let fixture = ActorFixture::new().await;
+        for _ in 0..3 {
+            fixture
+                .config
+                .emit_event_persisted(
+                    "test-session",
+                    crate::events::AgentEventKind::SessionCreated,
+                )
+                .await
+                .unwrap();
+        }
+
+        let session_ref = crate::agent::remote::SessionActorRef::from(fixture.actor_ref.clone());
+
+        // Full page from the beginning includes the host stream tip.
+        let page = session_ref.get_event_stream_since(None, 10).await.unwrap();
+        assert_eq!(page.events.len(), 3);
+        assert_eq!(page.latest_source_seq, 3);
+        assert_eq!(page.events[0].seq, 1);
+        assert_eq!(page.events[2].seq, 3);
+
+        // Paging after a cursor returns only the strictly-later tail.
+        let tail = session_ref
+            .get_event_stream_since(Some(1), 10)
+            .await
+            .unwrap();
+        assert_eq!(tail.events.len(), 2);
+        assert_eq!(tail.events[0].seq, 2);
+        assert_eq!(tail.latest_source_seq, 3);
+
+        // At the tip the page is empty but the tip is still reported, which
+        // is the loop-termination signal for backfill (§16.5).
+        let at_tip = session_ref
+            .get_event_stream_since(Some(3), 10)
+            .await
+            .unwrap();
+        assert!(at_tip.events.is_empty());
+        assert_eq!(at_tip.latest_source_seq, 3);
+    }
+
+    /// End-to-end backfill loop (plan §16) against a spawned session actor:
+    /// legacy boundary skips the fetch, a persisted cursor recovers missed
+    /// events exactly once, and re-running after reaching the tip is a no-op.
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn backfill_recovers_missed_events_and_dedups_overlap() {
+        let fixture = ActorFixture::new().await;
+
+        // Host-side events emitted while the client relay was "disconnected".
+        for _ in 0..3 {
+            fixture
+                .config
+                .emit_event_persisted(
+                    "test-session",
+                    crate::events::AgentEventKind::SessionCreated,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Empty local journal (post-upgrade client, no source cursors yet).
+        let local_storage =
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap();
+        let local_journal = local_storage.event_journal();
+        let fanout = Arc::new(crate::event_fanout::EventFanout::new());
+        let mut rx = fanout.subscribe();
+        let sink = Arc::new(crate::event_sink::EventSink::new(
+            local_journal.clone(),
+            fanout,
+        ));
+        let session_ref = crate::agent::remote::SessionActorRef::from(fixture.actor_ref.clone());
+
+        // Run 1: no source cursor → legacy synchronization boundary; nothing
+        // is fetched or guessed (§16) and a boundary completion is published.
+        crate::agent::remote::event_backfill::backfill_remote_events(
+            sink.clone(),
+            session_ref.clone(),
+            "test-session".to_string(),
+            "node-a".to_string(),
+            "peer-a".to_string(),
+            1,
+        )
+        .await;
+        assert_eq!(
+            local_journal.max_stream_seq("test-session").await.unwrap(),
+            0,
+            "legacy boundary must not backfill without a cursor"
+        );
+
+        // Seed the cursor exactly as the live relay would: one event persisted
+        // with source identity (host seq 1) before the disconnect gap.
+        sink.emit_durable_from_source(
+            "test-session",
+            crate::events::AgentEventKind::SessionCreated,
+            Some("peer-a".to_string()),
+            "node-a".to_string(),
+            1,
+        )
+        .await
+        .unwrap()
+        .expect("seed insert persists");
+
+        // Run 2: pages host seqs after cursor 1 and recovers the gap.
+        crate::agent::remote::event_backfill::backfill_remote_events(
+            sink.clone(),
+            session_ref.clone(),
+            "test-session".to_string(),
+            "node-a".to_string(),
+            "peer-a".to_string(),
+            1,
+        )
+        .await;
+
+        let stream = local_journal
+            .load_session_stream("test-session", None, None)
+            .await
+            .unwrap();
+        assert_eq!(stream.len(), 3, "seeded + backfilled events");
+        assert_eq!(
+            local_journal
+                .latest_source_seq("test-session", "node-a")
+                .await
+                .unwrap(),
+            Some(3)
+        );
+
+        // Run 3: reaching the tip again is a full no-op — duplicate replay
+        // after reconnect is deduplicated (§15/§16, overlap-safe).
+        crate::agent::remote::event_backfill::backfill_remote_events(
+            sink.clone(),
+            session_ref.clone(),
+            "test-session".to_string(),
+            "node-a".to_string(),
+            "peer-a".to_string(),
+            1,
+        )
+        .await;
+        let stream_after = local_journal
+            .load_session_stream("test-session", None, None)
+            .await
+            .unwrap();
+        assert_eq!(stream_after.len(), 3, "overlap must dedup, not duplicate");
+
+        // Sync status published (§16.6): boundary completion, fresh-seed
+        // durable event, completed backfill, and the no-op completion.
+        let first = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("boundary completion published")
+            .unwrap();
+        match first {
+            crate::events::EventEnvelope::Ephemeral(ee) => match ee.kind {
+                crate::events::AgentEventKind::RemoteSessionSyncCompleted {
+                    backfilled,
+                    boundary,
+                    ..
+                } => {
+                    assert_eq!(backfilled, 0);
+                    assert!(boundary, "first run is the legacy sync boundary");
+                }
+                other => panic!("expected RemoteSessionSyncCompleted, got {other:?}"),
+            },
+            other => panic!("expected ephemeral envelope, got {other:?}"),
+        }
+        let _seed_event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("seed durable event published")
+            .unwrap();
+        for expected_backfilled in [2u64, 0u64] {
+            let envelope = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .expect("sync completion published")
+                .unwrap();
+            match envelope {
+                crate::events::EventEnvelope::Ephemeral(ee) => match ee.kind {
+                    crate::events::AgentEventKind::RemoteSessionSyncCompleted {
+                        backfilled,
+                        boundary: false,
+                        ..
+                    } => assert_eq!(backfilled, expected_backfilled),
+                    other => panic!("expected RemoteSessionSyncCompleted, got {other:?}"),
+                },
+                other => panic!("expected ephemeral envelope, got {other:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn invalid_scheduled_task_does_not_write_history_or_intent() {
         let fixture = ActorFixture::new().await;
@@ -3355,14 +3655,25 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_unsubscribe_events_no_panic() {
         let f = ActorFixture::new().await;
-        // Without remote feature, these are no-ops that return Ok(())
-        f.actor_ref
+        let result = f
+            .actor_ref
             .ask(crate::agent::messages::SubscribeEvents {
                 relay_actor_id: 42,
-                relay_dht_name: "event_relay::test::peer-X".to_string(),
+                #[cfg(feature = "remote")]
+                relay_ref: None,
+                relay_dht_name: Some("event_relay::test::peer-X".to_string()),
+                after_source_seq: None,
             })
-            .await
-            .expect("ask SubscribeEvents");
+            .await;
+        #[cfg(feature = "remote")]
+        assert!(matches!(
+            result,
+            Err(kameo::error::SendError::HandlerError(
+                AgentError::MeshNotBootstrapped
+            ))
+        ));
+        #[cfg(not(feature = "remote"))]
+        result.expect("ask SubscribeEvents");
 
         f.actor_ref
             .ask(crate::agent::messages::UnsubscribeEvents {
@@ -3441,6 +3752,47 @@ mod tests {
             AgentMode::Build,
             "f2 should not be affected by f1's mode change"
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_client_input_id_returns_original_receipt() {
+        let f = ActorFixture::new().await;
+        let input = SubmitInput {
+            session_id: f._session_id.clone(),
+            client_input_id: Some("client-dup-1".to_string()),
+            expected_run_id: None,
+            delivery: InputDelivery::Queue,
+            prompt: vec![],
+        };
+
+        let first = f
+            .actor_ref
+            .ask(SubmitSessionInput {
+                input: input.clone(),
+            })
+            .await
+            .expect("first keyed submission should be acknowledged");
+        let second = f
+            .actor_ref
+            .ask(SubmitSessionInput { input })
+            .await
+            .expect("duplicate keyed submission should return the cached receipt");
+
+        let first_receipt = match first {
+            SubmitInputResult::Started { run_id, input_id } => (run_id, input_id),
+            other => panic!("expected Started receipt, got {other:?}"),
+        };
+        assert_eq!(first_receipt.1, "client-dup-1");
+        match second {
+            SubmitInputResult::Started { run_id, input_id } => {
+                assert_eq!(input_id, "client-dup-1");
+                assert_eq!(
+                    run_id, first_receipt.0,
+                    "a repeated client_input_id must not start a second run"
+                );
+            }
+            other => panic!("expected cached Started receipt, got {other:?}"),
+        }
     }
 
     // ── Token state machine tests ─────────────────────────────────────────────

@@ -150,7 +150,7 @@ pub struct AuthProviderEntry {
     pub preferred_method: Option<AuthMethod>,
 }
 
-pub use crate::api::{SessionGroup, SessionSummary};
+pub use crate::api::{RemoteSessionConnectionState, SessionGroup, SessionSummary};
 
 /// Information about a remote node discovered in the kameo mesh.
 #[typeshare(serialized_as = "RemoteNodeInfo")]
@@ -797,6 +797,12 @@ pub enum UiServerMessage {
     },
     Error {
         message: String,
+        /// Stable machine-readable error code (plan §13); omitted for
+        /// connection-level errors that are not session-scoped.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     SessionList {
         groups: Vec<SessionGroup>,
@@ -819,6 +825,8 @@ pub enum UiServerMessage {
         profile_id: Option<String>,
         #[serde(default)]
         node_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection_state: Option<RemoteSessionConnectionState>,
         audit: AuditView,
         undo_stack: Vec<UndoStackFrame>,
         #[typeshare(serialized_as = "StreamCursor")]
@@ -1103,8 +1111,8 @@ impl UiServerMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioModelInfo, OAuthFlowKind, PluginUpdateResult, RoutingMode, UiClientMessage,
-        UiProfileInfo, UiServerMessage,
+        AudioModelInfo, OAuthFlowKind, PluginUpdateResult, RemoteSessionConnectionState,
+        RoutingMode, UiClientMessage, UiProfileInfo, UiServerMessage,
     };
     use crate::agent::messages::{SessionRuntimePhase, SessionRuntimeStatus};
     use crate::session::load_snapshot::StreamCursor;
@@ -1257,12 +1265,69 @@ mod tests {
             agent_id: "primary".to_string(),
             profile_id: Some("coder".to_string()),
             node_id: None,
+            connection_state: None,
             audit: empty_audit("session-1"),
             undo_stack: Vec::new(),
             cursor: StreamCursor::default(),
         })
         .expect("session_loaded should serialize");
         assert_eq!(loaded["data"]["profile_id"], "coder");
+        assert!(
+            loaded["data"].get("connection_state").is_none(),
+            "local loads omit connection_state"
+        );
+    }
+
+    #[test]
+    fn session_loaded_serializes_connection_state() {
+        let disconnected = serde_json::to_value(UiServerMessage::SessionLoaded {
+            session_id: "session-1".to_string(),
+            agent_id: "primary".to_string(),
+            profile_id: None,
+            node_id: Some("node-a".to_string()),
+            connection_state: Some(RemoteSessionConnectionState::Disconnected),
+            audit: empty_audit("session-1"),
+            undo_stack: Vec::new(),
+            cursor: StreamCursor::default(),
+        })
+        .expect("session_loaded should serialize");
+        assert_eq!(disconnected["data"]["connection_state"], "disconnected");
+
+        let connected = serde_json::to_value(UiServerMessage::SessionLoaded {
+            session_id: "session-1".to_string(),
+            agent_id: "primary".to_string(),
+            profile_id: None,
+            node_id: Some("node-a".to_string()),
+            connection_state: Some(RemoteSessionConnectionState::Connected),
+            audit: empty_audit("session-1"),
+            undo_stack: Vec::new(),
+            cursor: StreamCursor::default(),
+        })
+        .expect("session_loaded should serialize");
+        assert_eq!(connected["data"]["connection_state"], "connected");
+    }
+
+    #[test]
+    fn error_serializes_structured_code_and_session_id() {
+        let structured = serde_json::to_value(UiServerMessage::Error {
+            message: "session_not_found: no local session or remote bookmark".to_string(),
+            code: Some("session_not_found".to_string()),
+            session_id: Some("session-1".to_string()),
+        })
+        .expect("error should serialize");
+        assert_eq!(structured["data"]["code"], "session_not_found");
+        assert_eq!(structured["data"]["session_id"], "session-1");
+
+        // Connection-level errors without a session keep the optional fields
+        // out of the payload (mixed-version compatible: serde defaults).
+        let plain = serde_json::to_value(UiServerMessage::Error {
+            message: "boom".to_string(),
+            code: None,
+            session_id: None,
+        })
+        .expect("error should serialize");
+        assert!(plain["data"].get("code").is_none());
+        assert!(plain["data"].get("session_id").is_none());
     }
 
     #[test]

@@ -19,13 +19,34 @@ impl LocalAgentHandle {
             let registry = registry.clone();
             tokio::spawn(async move {
                 while let Some(disconnect) = remote_disconnect_rx.recv().await {
-                    let mut registry = registry.lock().await;
-                    let _ = registry
-                        .detach_remote_session_if_relay_matches(
+                    let attachment = {
+                        let mut registry = registry.lock().await;
+                        registry.invalidate_remote_attachment_if_current(
                             &disconnect.session_id,
                             disconnect.relay_actor_id,
                         )
+                    };
+                    let matched = attachment.is_some();
+                    let remote_actor_id = attachment
+                        .as_ref()
+                        .map(|value| value.remote_actor_id)
+                        .unwrap_or(0);
+                    log::info!(
+                        "remote disconnect: session_id={} node_id={} attachment_id={} relay_actor_id={} remote_actor_id={} reason={} matched_current={}",
+                        disconnect.session_id,
+                        disconnect.remote_node_id.as_deref().unwrap_or(""),
+                        disconnect.relay_actor_id,
+                        disconnect.relay_actor_id,
+                        remote_actor_id,
+                        disconnect.reason,
+                        matched,
+                    );
+                    if let Some(attachment) = attachment {
+                        crate::agent::session_registry::cleanup_installed_remote_attachment(
+                            attachment, false,
+                        )
                         .await;
+                    }
                 }
             });
         }
@@ -55,6 +76,8 @@ impl LocalAgentHandle {
             published_mesh_scopes: StdMutex::new(std::collections::HashSet::new()),
             #[cfg(feature = "remote")]
             remote_node_cache: Arc::new(RemoteNodeMetadataCache::new()),
+            #[cfg(feature = "remote")]
+            remote_connect_gates: Default::default(),
             model_inventory,
             oauth_service,
             profiles: ArcSwap::from_pointee(None),

@@ -229,7 +229,7 @@ mod event_relay_mesh_tests {
     /// We verify indirectly: after subscribe, events published to the session's
     /// EventFanout should arrive at the relay.
     #[tokio::test]
-    async fn test_subscribe_events_with_live_mesh_installs_forwarder() {
+    async fn test_subscribe_events_direct_installs_forwarder_without_dht() {
         let test_id = Uuid::now_v7().to_string();
         let mesh = get_test_mesh().await;
 
@@ -246,7 +246,6 @@ mod event_relay_mesh_tests {
         let session_ref_local = SessionActor::spawn(actor);
         let session_ref = SessionActorRef::Local(session_ref_local);
 
-        // Register a relay under the name the SubscribeEvents handler looks for.
         let relay_dht_name =
             crate::agent::remote::dht_name::event_relay(&session_id, mesh.peer_id());
         let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
@@ -261,34 +260,16 @@ mod event_relay_mesh_tests {
             None,
         );
         let relay_ref = EventRelayActor::spawn(relay);
-        mesh.register_actor(relay_ref.clone(), relay_dht_name.clone())
-            .await;
-        let _ = relay_ref;
+        let relay_remote_ref = relay_ref.into_remote_ref().await;
 
-        // Wait for DHT propagation. On CI (ubuntu-latest) under load, Kademlia
-        // propagation can take longer than on a developer laptop; 200ms is
-        // conservative enough to avoid a lookup-returns-None flake.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // The fallback name is deliberately not registered. A successful reply
+        // proves the direct capability installed the forwarder without DHT propagation.
+        session_ref
+            .subscribe_events_direct(1, relay_remote_ref, relay_dht_name)
+            .await
+            .expect("direct subscription should install the forwarder");
 
-        // SubscribeEvents with any relay_actor_id — the handler looks up
-        // the relay via the peer-scoped DHT name.
-        let result = session_ref
-            .subscribe_events(1, relay_dht_name.clone())
-            .await;
-        assert!(result.is_ok(), "subscribe_events should succeed");
-
-        // Verify the forwarder is working by publishing an event to the session's
-        // fanout and checking it arrives at the relay.  We use a retry-publish
-        // loop instead of a fixed sleep so that:
-        //   • The test passes quickly on a fast laptop (first attempt usually
-        //     succeeds after the first 200 ms poll).
-        //   • The test also passes on a slow/loaded CI runner where Kademlia
-        //     propagation, the async DHT lookup inside subscribe_events, and
-        //     the forwarder task start-up all take longer than any single
-        //     hard-coded delay we could reasonably choose.
-        //
-        // Total budget: 5 s.  Each iteration waits 200 ms for the forwarder to
-        // be ready, publishes a fresh event, then gives recv() 500 ms.
+        // Verify the acknowledged forwarder is already able to relay events.
         let mut rx = relay_sink.fanout().subscribe();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut attempt: u32 = 0;
@@ -330,7 +311,7 @@ mod event_relay_mesh_tests {
     // ── F.5 ──────────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_subscribe_events_without_relay_in_dht_logs_warn() {
+    async fn test_subscribe_events_without_relay_in_dht_returns_error() {
         let test_id = Uuid::now_v7().to_string();
         let mesh = get_test_mesh().await;
 
@@ -351,11 +332,10 @@ mod event_relay_mesh_tests {
         let relay_dht_name =
             crate::agent::remote::dht_name::event_relay(&session_id, mesh.peer_id());
 
-        // Should return Ok (no panic), just logs a warning.
         let result = session_ref.subscribe_events(99, relay_dht_name).await;
         assert!(
-            result.is_ok(),
-            "subscribe_events should return Ok even with no relay in DHT"
+            result.is_err(),
+            "subscription must not acknowledge before a forwarder is installed"
         );
     }
 
@@ -676,6 +656,92 @@ mod event_relay_mesh_tests {
         // without error.
     }
 
+    #[tokio::test]
+    async fn transactional_replacement_keeps_old_until_commit_and_rejects_stale_commit() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+        let fixture = AgentConfigFixture::new().await;
+        let session_id = format!("s-replace-{test_id}");
+        let actor = SessionActor::new(
+            fixture.config.clone(),
+            session_id.clone(),
+            SessionRuntime::new(
+                None,
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        )
+        .with_mesh(Some(mesh.clone()));
+        let local_ref = SessionActor::spawn(actor);
+        let session_dht = crate::agent::remote::scope::scoped_session(
+            &crate::agent::remote::scope::MeshScopeId::lan_default(),
+            &session_id,
+        );
+        mesh.register_actor(local_ref, session_dht.clone()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let remote_ref = mesh
+            .lookup_actor::<SessionActor>(&session_dht)
+            .await
+            .expect("DHT lookup")
+            .expect("remote session");
+
+        let mut registry = crate::agent::session_registry::SessionRegistry::new(fixture.config);
+        let first = crate::agent::session_registry::prepare_remote_attachment(
+            registry.remote_attachment_prepare_context(),
+            session_id.clone(),
+            remote_ref.clone(),
+            "peer".to_string(),
+            Some(mesh.clone()),
+            None,
+            None,
+        )
+        .await
+        .expect("prepare first");
+        let first_id = first.attachment_id();
+        assert!(registry.install_remote_attachment(first, None).is_ok());
+
+        let second = crate::agent::session_registry::prepare_remote_attachment(
+            registry.remote_attachment_prepare_context(),
+            session_id.clone(),
+            remote_ref.clone(),
+            "peer".to_string(),
+            Some(mesh.clone()),
+            None,
+            None,
+        )
+        .await
+        .expect("prepare second");
+        let second_id = second.attachment_id();
+        assert_eq!(registry.remote_attachment_id(&session_id), Some(first_id));
+        let replacement = registry.install_remote_attachment(second, Some(first_id));
+        assert!(replacement.is_ok(), "matching replacement commit");
+        let old = replacement.ok().flatten().expect("old attachment returned");
+        assert_eq!(old.attachment_id, first_id);
+        assert_eq!(registry.remote_attachment_id(&session_id), Some(second_id));
+
+        let stale = crate::agent::session_registry::prepare_remote_attachment(
+            registry.remote_attachment_prepare_context(),
+            session_id.clone(),
+            remote_ref,
+            "peer".to_string(),
+            Some(mesh.clone()),
+            None,
+            None,
+        )
+        .await
+        .expect("prepare stale candidate");
+        let stale_commit = registry.install_remote_attachment(stale, Some(first_id));
+        assert!(stale_commit.is_err(), "stale commit must be rejected");
+        let (stale, conflict) = stale_commit.err().unwrap();
+        assert_eq!(conflict.current_attachment_id, Some(second_id));
+        assert_eq!(registry.remote_attachment_id(&session_id), Some(second_id));
+
+        crate::agent::session_registry::abort_prepared_remote_attachment(stale).await;
+        crate::agent::session_registry::cleanup_installed_remote_attachment(old, true).await;
+        let current = registry.take_remote_attachment(&session_id).unwrap();
+        crate::agent::session_registry::cleanup_installed_remote_attachment(current, true).await;
+    }
+
     // ── F.7 — Detach lifecycle (unsubscribe on remove) ───────────────────────
 
     /// When a remote session is detached via `SessionRegistry::detach_remote_session`,
@@ -723,16 +789,22 @@ mod event_relay_mesh_tests {
 
         // --- local side: attach via registry ---
         let mut registry = crate::agent::session_registry::SessionRegistry::new(f.config.clone());
-        let _ref = registry
-            .attach_remote_session(
-                session_id.clone(),
-                remote_session,
-                "test-peer".to_string(),
-                Some(mesh.clone()),
-                None,
-                None,
-            )
-            .await;
+        let context = registry.remote_attachment_prepare_context();
+        let prepared = crate::agent::session_registry::prepare_remote_attachment(
+            context,
+            session_id.clone(),
+            remote_session,
+            "test-peer".to_string(),
+            Some(mesh.clone()),
+            None,
+            None,
+        )
+        .await
+        .expect("prepare remote attachment");
+        assert!(
+            registry.install_remote_attachment(prepared, None).is_ok(),
+            "install remote attachment"
+        );
 
         // Verify events flow before detach: publish → relay → local fanout
         let mut rx = f.config.event_sink.fanout().subscribe();
@@ -784,7 +856,10 @@ mod event_relay_mesh_tests {
         assert!(flowing, "events should flow through relay before detach");
 
         // --- detach ---
-        registry.detach_remote_session(&session_id).await;
+        let attachment = registry
+            .take_remote_attachment(&session_id)
+            .expect("installed attachment");
+        crate::agent::session_registry::cleanup_installed_remote_attachment(attachment, true).await;
 
         // After detach the session should be removed from the registry
         assert!(

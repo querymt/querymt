@@ -79,6 +79,8 @@ fn durable(session_id: &str, kind: AgentEventKind) -> NewDurableEvent {
         session_id: session_id.to_string(),
         origin: EventOrigin::Local,
         source_node: None,
+        source_node_id: None,
+        source_seq: None,
         kind,
     }
 }

@@ -7,11 +7,11 @@ impl LocalAgentHandle {
     ) -> agent_client_protocol::Error {
         use crate::error::AgentError;
 
-        match error {
-            kameo::error::RemoteSendError::HandlerError(err) => {
-                agent_client_protocol::Error::from(err)
+        match querymt_remote::classify_remote_send_error(error) {
+            Ok(failure) => {
+                agent_client_protocol::Error::from(AgentError::from_transport_failure(failure))
             }
-            other => agent_client_protocol::Error::from(AgentError::RemoteActor(other.to_string())),
+            Err(handler_error) => agent_client_protocol::Error::from(handler_error),
         }
     }
 
@@ -279,19 +279,141 @@ impl LocalAgentHandle {
         peer_label: String,
         preferred_scope: Option<crate::agent::remote::scope::MeshScopeId>,
         remote_node_id: Option<String>,
-    ) -> crate::agent::remote::SessionActorRef {
+    ) -> Result<crate::agent::remote::SessionActorRef, crate::error::AgentError> {
         let mesh = self.mesh();
-        let mut registry = self.registry.lock().await;
-        registry
-            .attach_remote_session(
-                session_id,
-                remote_ref,
-                peer_label,
-                mesh,
-                preferred_scope,
-                remote_node_id,
+        let bookmark_peer_label = peer_label.clone();
+        let bookmark_node_id = remote_node_id.clone();
+        let backfill_node_id = bookmark_node_id.clone();
+        let backfill_peer_label = bookmark_peer_label.clone();
+        let (context, expected_attachment_id) = {
+            let registry = self.registry.lock().await;
+            (
+                registry.remote_attachment_prepare_context(),
+                registry.remote_attachment_id(&session_id),
             )
-            .await
+        };
+        let backfill_sink = context.event_sink.clone();
+        let prepared = crate::agent::session_registry::prepare_remote_attachment(
+            context,
+            session_id.clone(),
+            remote_ref,
+            peer_label,
+            mesh,
+            preferred_scope,
+            remote_node_id,
+        )
+        .await?;
+        let session_ref = prepared.session_ref().clone();
+        let attachment_id = prepared.attachment_id();
+        let health_timeout = Self::remote_connect_health_timeout();
+        match tokio::time::timeout(health_timeout, session_ref.get_mode()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                crate::agent::session_registry::abort_prepared_remote_attachment(prepared).await;
+                return Err(error);
+            }
+            Err(_) => {
+                crate::agent::session_registry::abort_prepared_remote_attachment(prepared).await;
+                return Err(crate::error::AgentError::RemoteActor(format!(
+                    "remote attachment health check timed out after {}ms",
+                    health_timeout.as_millis()
+                )));
+            }
+        }
+
+        if let Some(node_id) = bookmark_node_id {
+            use crate::session::store::{RemoteSessionBookmark, RemoteSessionBookmarkUpdate};
+            let store = self.config.provider.history_store();
+            let existing = match store.get_remote_session_bookmark(&session_id).await {
+                Ok(existing) => existing,
+                Err(error) => {
+                    crate::agent::session_registry::abort_prepared_remote_attachment(prepared)
+                        .await;
+                    return Err(crate::error::AgentError::RemoteActor(error.to_string()));
+                }
+            };
+            let bookmark = existing
+                .map(|value| {
+                    value.merge_confirmed(RemoteSessionBookmarkUpdate {
+                        node_id: Some(node_id.clone()),
+                        peer_label: Some(bookmark_peer_label.clone()),
+                        cwd: None,
+                        title: None,
+                    })
+                })
+                .unwrap_or_else(|| RemoteSessionBookmark {
+                    session_id: session_id.clone(),
+                    node_id,
+                    peer_label: bookmark_peer_label,
+                    cwd: None,
+                    created_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_secs() as i64)
+                        .unwrap_or(0),
+                    title: None,
+                });
+            if let Err(error) = store.save_remote_session_bookmark(&bookmark).await {
+                crate::agent::session_registry::abort_prepared_remote_attachment(prepared).await;
+                return Err(crate::error::AgentError::RemoteActor(error.to_string()));
+            }
+        }
+
+        let commit = {
+            let mut registry = self.registry.lock().await;
+            registry.install_remote_attachment(prepared, expected_attachment_id)
+        };
+        let old = match commit {
+            Ok(old) => old,
+            Err((prepared, conflict)) => {
+                crate::agent::session_registry::abort_prepared_remote_attachment(prepared).await;
+                return Err(crate::error::AgentError::RemoteActor(format!(
+                    "remote attachment changed while preparing session {} (expected={:?}, current={:?})",
+                    session_id, conflict.expected_attachment_id, conflict.current_attachment_id
+                )));
+            }
+        };
+        if let Some(old) = old {
+            crate::agent::session_registry::cleanup_installed_remote_attachment(old, true).await;
+        }
+
+        // Cursor-based backfill (plan §16): live subscription was established
+        // during prepare; historical pages after the persisted source cursor
+        // are recovered with overlap-safe deduplication. Only possible when a
+        // stable node id is available (legacy attachments without one keep
+        // the pre-Phase-10 behavior).
+        if let Some(node_id) = backfill_node_id {
+            tokio::spawn(
+                crate::agent::remote::event_backfill::backfill_remote_events(
+                    backfill_sink,
+                    session_ref.clone(),
+                    session_id.clone(),
+                    node_id,
+                    backfill_peer_label,
+                    attachment_id,
+                ),
+            );
+        }
+
+        Ok(session_ref)
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) async fn detach_remote_session_attachment(
+        &self,
+        session_id: &str,
+        notify_remote: bool,
+    ) -> Option<crate::agent::remote::SessionActorRef> {
+        let attachment = {
+            let mut registry = self.registry.lock().await;
+            registry.take_remote_attachment(session_id)
+        }?;
+        let session_ref = attachment.session_ref.clone();
+        crate::agent::session_registry::cleanup_installed_remote_attachment(
+            attachment,
+            notify_remote,
+        )
+        .await;
+        Some(session_ref)
     }
 
     #[cfg(feature = "remote")]

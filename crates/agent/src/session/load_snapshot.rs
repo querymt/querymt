@@ -104,41 +104,43 @@ pub async fn load_session_snapshot(
         registry.get(session_id).is_some_and(|r| r.is_remote())
     };
 
-    // Load the same snapshot the web UI uses. Remote attached sessions may not
-    // have a full local projection row yet, so fall back to journal events.
+    // Load the same snapshot the web UI uses. Remote sessions may not have a
+    // full local projection row yet — whether attached or merely bookmarked
+    // while offline (plan §11) — so fall back to the local event journal,
+    // which keeps cached remote history readable without a live actor
+    // (plan invariant 9).
     let audit = match view_store.get_audit_view(session_id, false).await {
         Ok(audit) => audit,
         Err(e) if is_remote_attached => {
-            let events: Vec<AgentEvent> = agent
-                .config
-                .event_sink
-                .journal()
-                .load_session_stream(session_id, None, None)
-                .await?
-                .into_iter()
-                .map(AgentEvent::from)
-                .collect();
-
             tracing::debug!(
                 session_id,
                 error = %e,
-                event_count = events.len(),
                 "remote session missing local audit projection; loaded journal-backed snapshot"
             );
-
-            AuditView {
-                session_id: session_id.to_string(),
-                events,
-                tasks: Vec::new(),
-                intent_snapshots: Vec::new(),
-                decisions: Vec::new(),
-                progress_entries: Vec::new(),
-                artifacts: Vec::new(),
-                delegations: Vec::new(),
-                generated_at: OffsetDateTime::now_utc(),
-            }
+            journal_backed_audit_view(agent, session_id).await?
         }
-        Err(e) => return Err(e),
+        Err(e) => {
+            // Offline-first remote identity (plan §11): a bookmarked remote
+            // session opens its cached journal history without a live actor.
+            // An empty journal yields an empty disconnected view (plan §11.4).
+            let bookmarked = agent
+                .config
+                .provider
+                .history_store()
+                .get_remote_session_bookmark(session_id)
+                .await
+                .map(|bookmark| bookmark.is_some())
+                .unwrap_or(false);
+            if !bookmarked {
+                return Err(e);
+            }
+            tracing::debug!(
+                session_id,
+                error = %e,
+                "bookmarked remote session missing local audit projection; loaded journal-backed snapshot"
+            );
+            journal_backed_audit_view(agent, session_id).await?
+        }
     };
 
     let cursor = cursor_from_events(&audit.events);
@@ -170,6 +172,36 @@ pub async fn load_session_snapshot(
         cursor,
         delegation_updates,
         user_prompts,
+    })
+}
+
+/// Build an audit view from the durable local event journal. This is how
+/// cached remote history stays readable while the host is offline; an empty
+/// journal produces an empty disconnected view rather than an error.
+async fn journal_backed_audit_view(
+    agent: &LocalAgentHandle,
+    session_id: &str,
+) -> SessionResult<AuditView> {
+    let events: Vec<AgentEvent> = agent
+        .config
+        .event_sink
+        .journal()
+        .load_session_stream(session_id, None, None)
+        .await?
+        .into_iter()
+        .map(AgentEvent::from)
+        .collect();
+
+    Ok(AuditView {
+        session_id: session_id.to_string(),
+        events,
+        tasks: Vec::new(),
+        intent_snapshots: Vec::new(),
+        decisions: Vec::new(),
+        progress_entries: Vec::new(),
+        artifacts: Vec::new(),
+        delegations: Vec::new(),
+        generated_at: OffsetDateTime::now_utc(),
     })
 }
 

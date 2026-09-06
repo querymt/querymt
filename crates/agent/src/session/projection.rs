@@ -111,7 +111,17 @@ pub enum RedactionPolicy {
 pub struct NewDurableEvent {
     pub session_id: String,
     pub origin: EventOrigin,
+    /// Display-only source label (hostname/peer label); never used as a
+    /// deduplication key (plan §15: stable node ID only).
     pub source_node: Option<String>,
+    /// Stable remote node identity (bookmark `node_id`). `None` for locally
+    /// produced events. Together with `source_seq` this forms the remote
+    /// event uniqueness key `(session_id, source_node_id, source_seq)`.
+    pub source_node_id: Option<String>,
+    /// Source-side journal sequence (the host's `stream_seq` for the event).
+    /// `None` for locally produced events and for relayed events that carry
+    /// no usable source cursor.
+    pub source_seq: Option<i64>,
     pub kind: AgentEventKind,
 }
 
@@ -150,6 +160,38 @@ pub trait EventJournal: Send + Sync {
         session_id: &str,
         from_seq: i64,
     ) -> SessionResult<usize>;
+
+    /// Idempotent append for durable events that carry remote source identity
+    /// (plan §15/§16).
+    ///
+    /// Returns `Ok(None)` when an event with the same
+    /// `(session_id, source_node_id, source_seq)` is already persisted — the
+    /// duplicate replay is a full no-op (no insert, no new `stream_seq`
+    /// allocation). Callers must not republish `None` results to live
+    /// subscribers.
+    ///
+    /// Requires `source_node_id` and `source_seq` on the event; events without
+    /// source identity must go through `append_durable` instead.
+    async fn append_durable_from_source(
+        &self,
+        event: &NewDurableEvent,
+    ) -> SessionResult<Option<DurableEvent>>;
+
+    /// Latest persisted source-side sequence for a session/node pair — the
+    /// dedup/backfill cursor (plan §16.1). `None` when no row with source
+    /// identity exists yet (legacy journals, local-only sessions): the caller
+    /// must treat the first post-upgrade attachment as a new synchronization
+    /// boundary instead of guessing sequences.
+    async fn latest_source_seq(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+    ) -> SessionResult<Option<i64>>;
+
+    /// Stream tip for a session: the highest `stream_seq` currently persisted
+    /// (0 when empty). Serves as the completion marker for cursor-based
+    /// backfill paging (plan §16.5).
+    async fn max_stream_seq(&self, session_id: &str) -> SessionResult<i64>;
 }
 
 /// View generation (read-only projections)

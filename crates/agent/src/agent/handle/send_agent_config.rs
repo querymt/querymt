@@ -7,6 +7,13 @@ impl LocalAgentHandle {
         req: SetSessionModelRequest,
     ) -> Result<SetSessionModelResponse, Error> {
         let session_id = req.session_id.to_string();
+        #[cfg(feature = "remote")]
+        let session_ref = self
+            .session_ref_for_operation(&session_id, session_operation::SessionOperation::SetModel)
+            .await
+            .map_err(session_operation::SessionOperationError::into_acp_error)?
+            .session_ref;
+        #[cfg(not(feature = "remote"))]
         let session_ref = self.session_ref_for_agent_session(&session_id).await?;
         #[cfg(feature = "remote")]
         let provider_node_id = if session_ref.is_remote() {
@@ -17,11 +24,21 @@ impl LocalAgentHandle {
         };
         #[cfg(not(feature = "remote"))]
         let provider_node_id = None;
+        let selection = crate::agent::session_control::SessionModelSelection {
+            model_id: req.model_id.to_string(),
+            provider_node_id,
+        };
+        #[cfg(feature = "remote")]
+        self.execute_session_operation(
+            &session_id,
+            session_operation::SessionOperation::SetModel,
+            |session_ref| Box::pin(session_ref.set_session_model(selection.clone())),
+        )
+        .await
+        .map_err(session_operation::SessionOperationError::into_acp_error)?;
+        #[cfg(not(feature = "remote"))]
         session_ref
-            .set_session_model(crate::agent::session_control::SessionModelSelection {
-                model_id: req.model_id.to_string(),
-                provider_node_id,
-            })
+            .set_session_model(selection)
             .await
             .map_err(Error::from)?;
         Ok(SetSessionModelResponse::new())
@@ -38,9 +55,20 @@ impl LocalAgentHandle {
             .map_err(|e| Error::invalid_params().data(serde_json::json!({ "error": e })))?;
         let session_id = req.session_id.to_string();
 
-        let session_ref = self.session_ref_for_agent_session(&session_id).await?;
-
-        session_ref.set_mode(mode).await.map_err(Error::from)?;
+        #[cfg(feature = "remote")]
+        self.execute_session_operation(
+            &session_id,
+            session_operation::SessionOperation::SetMode,
+            |session_ref| Box::pin(session_ref.set_mode(mode)),
+        )
+        .await
+        .map_err(session_operation::SessionOperationError::into_acp_error)?;
+        #[cfg(not(feature = "remote"))]
+        self.session_ref_for_agent_session(&session_id)
+            .await?
+            .set_mode(mode)
+            .await
+            .map_err(Error::from)?;
         Ok(crate::acp::protocol::SetSessionModeResponse::new())
     }
 

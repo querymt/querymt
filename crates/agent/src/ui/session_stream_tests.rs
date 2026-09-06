@@ -640,6 +640,8 @@ async fn send_message_returns_error_when_shutdown_closes_channel() {
         &tx,
         crate::ui::messages::UiServerMessage::Error {
             message: "closed".to_string(),
+            code: None,
+            session_id: None,
         },
     )
     .await

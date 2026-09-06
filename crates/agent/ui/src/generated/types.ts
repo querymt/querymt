@@ -1106,7 +1106,14 @@ export interface SessionSummary {
 	node?: string;
 	node_id?: string;
 	attached?: boolean;
+	connection_state?: RemoteSessionConnectionState;
 	runtime_state?: string;
+}
+
+export enum RemoteSessionConnectionState {
+	Connecting = "connecting",
+	Connected = "connected",
+	Disconnected = "disconnected",
 }
 
 export interface SessionGroup {
@@ -1727,6 +1734,8 @@ export type UiServerMessage =
 }}
 	| { type: "error", data: {
 	message: string;
+	code?: string;
+	session_id?: string;
 }}
 	| { type: "session_list", data: {
 	groups: SessionGroup[];
@@ -1744,6 +1753,7 @@ export type UiServerMessage =
 	agent_id: string;
 	profile_id?: string;
 	node_id?: string;
+	connection_state?: RemoteSessionConnectionState;
 	audit: AuditView;
 	undo_stack: UndoStackFrame[];
 	cursor: StreamCursor;

@@ -14,6 +14,7 @@ import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { ChevronDown } from 'lucide-react';
 import { useUiClientActions, useUiClientEvents, useUiClientSession, useUiClientConfig } from '../context/UiClientContext';
+import { RemoteSessionConnectionState } from '../types';
 import { useUiStore } from '../store/uiStore';
 import { useVoiceOutput } from '../hooks/useVoiceOutput';
 import { useVoiceStore } from '../store/voiceStore';
@@ -53,7 +54,7 @@ export function ChatView() {
   // Split context subscriptions — ChatView subscribes to Events + Session + Actions
   // (no Config context), so auth/model-list/plugin changes won't trigger re-renders.
   const {
-    sendPrompt,
+    attachRemoteSession,
     submitInput,
     requestRuntimeState,
     cancelSession,
@@ -101,6 +102,7 @@ export function ChatView() {
     undoState,
     schedules,
     loadedSessionNodeIds,
+    sessionConnectionStates,
   } = useUiClientSession();
 
   // UI state from Zustand store
@@ -156,6 +158,19 @@ export function ChatView() {
   );
   const currentSessionNodeId = currentSession?.node_id ?? (sessionId ? loadedSessionNodeIds[sessionId] ?? undefined : undefined);
   const currentSessionIsRemote = Boolean(currentSession?.node || currentSession?.attached !== undefined || currentSession?.runtime_state);
+  // Explicit connection state (plan §12): summaries win (they refresh on list
+  // updates); the loaded state covers the active view between refreshes.
+  const currentSessionConnectionState =
+    currentSession?.connection_state ??
+    (sessionId ? sessionConnectionStates[sessionId] : undefined);
+  const showRemoteConnectionBanner =
+    currentSessionIsRemote &&
+    currentSessionConnectionState !== undefined &&
+    currentSessionConnectionState !== RemoteSessionConnectionState.Connected;
+  const handleReconnectRemoteSession = () => {
+    if (!sessionId || !currentSessionNodeId) return;
+    attachRemoteSession(currentSessionNodeId, sessionId);
+  };
   const remoteNodeIdPending = currentSessionIsRemote && sessionId && currentSession?.node_id === undefined && !(sessionId in loadedSessionNodeIds);
 
   // Fetch schedules when session changes, but wait for remote node resolution first.
@@ -302,8 +317,17 @@ export function ChatView() {
           console.warn(`Input was not submitted: ${result.reason}`);
         }
       } else {
-        await sendPrompt(blocks);
-        setPrompt('');
+        // Idle turn: acknowledged Queue submission (Phase 7). The legacy
+        // Prompt RPC is reserved for ACP/compatibility callers; Queue gives
+        // the UI a submission receipt instead of an ambiguous silent send.
+        const result = submitInput('queue', blocks, sessionId);
+        if (result.accepted) {
+          setPrompt('');
+        } else {
+          followArmedRef.current = false;
+          requestRuntimeState(sessionId);
+          console.warn(`Input was not submitted: ${result.reason}`);
+        }
       }
     } catch (err) {
       followArmedRef.current = false;
@@ -1036,6 +1060,39 @@ export function ChatView() {
         <div className="mx-4 mb-2 px-4 py-2 rounded-lg border border-status-warning/40 bg-surface-elevated text-xs text-status-warning flex items-center gap-2 animate-fade-in">
           <span className="w-1.5 h-1.5 rounded-full bg-status-warning animate-pulse flex-shrink-0" />
           Connection lost. Reconnecting...
+        </div>
+      )}
+
+      {/* Remote session connection state (plan §12/§13): disconnection is a
+          recoverable session state — URL, transcript, and draft are preserved. */}
+      {showRemoteConnectionBanner && (
+        <div
+          data-testid="remote-connection-banner"
+          className="mx-4 mb-2 px-4 py-2 rounded-lg border border-status-warning/40 bg-surface-elevated text-xs text-status-warning flex items-center gap-2 animate-fade-in"
+        >
+          <span
+            className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+              currentSessionConnectionState === RemoteSessionConnectionState.Connecting
+                ? 'bg-status-warning animate-pulse'
+                : 'bg-status-warning'
+            }`}
+          />
+          <span className="flex-1">
+            {currentSessionConnectionState === RemoteSessionConnectionState.Connecting
+              ? 'Connecting to remote session…'
+              : 'Remote session disconnected — history shown from local cache.'}
+          </span>
+          {currentSessionConnectionState === RemoteSessionConnectionState.Disconnected &&
+            currentSessionNodeId && (
+              <button
+                type="button"
+                data-testid="remote-reconnect-button"
+                onClick={handleReconnectRemoteSession}
+                className="px-2 py-0.5 rounded border border-status-warning/60 text-status-warning hover:bg-status-warning/10"
+              >
+                Reconnect
+              </button>
+            )}
         </div>
       )}
 
