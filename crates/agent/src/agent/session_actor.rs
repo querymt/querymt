@@ -64,7 +64,7 @@ enum ControlTransitionIntent {
     ModelConfig {
         model_id: String,
         provider_node_id: Option<String>,
-        params: querymt::LLMParams,
+        params: Box<querymt::LLMParams>,
     },
     ReasoningEffort(Option<ReasoningEffort>),
 }
@@ -743,7 +743,7 @@ impl SessionActor {
                 provider_node_id,
                 params,
             } => {
-                let mut params = params.clone();
+                let mut params = params.as_ref().clone();
                 if rebased {
                     params.reasoning_effort = previous.reasoning_effort;
                 }
@@ -802,7 +802,7 @@ impl SessionActor {
         self.rebase_control_once(ControlTransitionIntent::ModelConfig {
             model_id,
             provider_node_id,
-            params,
+            params: Box::new(params),
         })
         .await
     }
