@@ -497,10 +497,10 @@ impl LocalAgentHandle {
                 });
             }
 
-            let reuse = match (options.replace, attachment_id) {
-                (RemoteReplacePolicy::ReuseIfPresent, Some(_)) => true,
-                (RemoteReplacePolicy::ReplaceIfMatches(failed), Some(current))
-                    if current != failed =>
+            let reuse_snapshot = match (options.replace, attachment.as_ref()) {
+                (RemoteReplacePolicy::ReuseIfPresent, Some(snapshot)) => Some(snapshot),
+                (RemoteReplacePolicy::ReplaceIfMatches(failed), Some(snapshot))
+                    if snapshot.attachment_id != failed =>
                 {
                     // Stale failure: a newer generation is already installed
                     // (plan §18: "stale invalidation ignored").
@@ -508,16 +508,17 @@ impl LocalAgentHandle {
                         "remote session {} connect: stale invalidation ignored — current \
                          attachment_id={} is newer than failed attachment_id={}",
                         session_id,
-                        current,
+                        snapshot.attachment_id,
                         failed,
                     );
-                    true
+                    Some(snapshot)
                 }
-                _ => false,
+                // No complete attachment snapshot: fall through to the
+                // replacement path instead of unwrapping.
+                _ => None,
             };
 
-            if reuse {
-                let snapshot = attachment.expect("reuse implies a complete attachment");
+            if let Some(snapshot) = reuse_snapshot {
                 let id = snapshot.attachment_id;
                 log::info!(
                     "remote session {} connect: existing attachment reused \

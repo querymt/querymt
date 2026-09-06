@@ -14,62 +14,24 @@ impl EventJournal for SqliteStorage {
         let event_clone = event.clone();
         let conn_arc = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<DurableEvent, rusqlite::Error> {
+        tokio::task::spawn_blocking(move || -> SessionResult<DurableEvent> {
             let conn = conn_arc.lock().unwrap();
 
-            let kind_tag = serde_json::to_value(&event_clone.kind)
-                .ok()
-                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
-                .unwrap_or_else(|| "unknown".to_string());
-
-            let payload_json = serde_json::to_string(&event_clone.kind)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-            let origin_str = match &event_clone.origin {
-                EventOrigin::Local => "local",
-                EventOrigin::Remote => "remote",
-                EventOrigin::Unknown(s) => s.as_str(),
-            };
-
-            let event_id = Uuid::now_v7().to_string();
-            let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
-
-            // Atomically allocate the next stream_seq and insert the event.
-            let stream_seq: i64 = conn.query_row(
-                "UPDATE event_journal_seq SET next_seq = next_seq + 1 WHERE id = 1 RETURNING next_seq - 1",
-                [],
-                |row| row.get(0),
-            )?;
-
-            conn.execute(
-                "INSERT INTO event_journal (event_id, stream_seq, session_id, timestamp, origin, source_node, source_node_id, source_seq, kind, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![
-                    event_id,
-                    stream_seq,
-                    event_clone.session_id,
-                    timestamp,
-                    origin_str,
-                    event_clone.source_node,
-                    event_clone.source_node_id,
-                    event_clone.source_seq,
-                    kind_tag,
-                    payload_json,
-                ],
-            )?;
-
-            Ok(DurableEvent {
-                event_id,
-                stream_seq,
-                session_id: event_clone.session_id,
-                timestamp,
-                origin: event_clone.origin,
-                source_node: event_clone.source_node,
-                kind: event_clone.kind,
+            insert_journal_event(
+                &conn,
+                &event_clone,
+                event_clone.source_node_id.as_deref(),
+                event_clone.source_seq,
+            )?
+            .ok_or_else(|| {
+                SessionError::DatabaseError(
+                    "duplicate source-identity event rejected by the journal unique index"
+                        .to_string(),
+                )
             })
         })
         .await
         .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
     }
 
     async fn load_session_stream(
@@ -174,27 +136,17 @@ impl EventJournal for SqliteStorage {
         let event_clone = event.clone();
         let conn_arc = self.conn.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<Option<DurableEvent>, rusqlite::Error> {
-            let conn = conn_arc.lock().unwrap();
-
-            let kind_tag = serde_json::to_value(&event_clone.kind)
-                .ok()
-                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
-                .unwrap_or_else(|| "unknown".to_string());
-            let payload_json = serde_json::to_string(&event_clone.kind)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-
-            let origin_str = match &event_clone.origin {
-                EventOrigin::Local => "local",
-                EventOrigin::Remote => "remote",
-                EventOrigin::Unknown(s) => s.as_str(),
-            };
-
+        tokio::task::spawn_blocking(move || -> SessionResult<Option<DurableEvent>> {
             // Duplicate replay is a no-op (plan §15/§16): no insert and no
-            // stream_seq allocation. The connection mutex is held for the
-            // whole check+insert so relay/backfill writers serialize in-process;
-            // the partial unique index is the durable backstop.
-            let existing: Option<i64> = conn
+            // stream_seq allocation. The source-existence check, sequence
+            // allocation, and insert all run inside one Immediate transaction
+            // so concurrent writers serialize at the database level (not just
+            // in-process via the connection mutex); the partial unique index
+            // (idx_event_journal_source_identity) remains the durable backstop.
+            let mut conn = conn_arc.lock().unwrap();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+            let existing: Option<i64> = tx
                 .query_row(
                     "SELECT stream_seq FROM event_journal \
                      WHERE session_id = ?1 AND source_node_id = ?2 AND source_seq = ?3",
@@ -206,45 +158,19 @@ impl EventJournal for SqliteStorage {
                 return Ok(None);
             }
 
-            let event_id = Uuid::now_v7().to_string();
-            let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
-
-            // Atomically allocate the next stream_seq and insert the event.
-            let stream_seq: i64 = conn.query_row(
-                "UPDATE event_journal_seq SET next_seq = next_seq + 1 WHERE id = 1 RETURNING next_seq - 1",
-                [],
-                |row| row.get(0),
-            )?;
-
-            conn.execute(
-                "INSERT INTO event_journal (event_id, stream_seq, session_id, timestamp, origin, source_node, source_node_id, source_seq, kind, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![
-                    event_id,
-                    stream_seq,
-                    event_clone.session_id,
-                    timestamp,
-                    origin_str,
-                    event_clone.source_node,
-                    Some(source_node_id),
-                    Some(source_seq),
-                    kind_tag,
-                    payload_json,
-                ],
-            )?;
-
-            Ok(Some(DurableEvent {
-                event_id,
-                stream_seq,
-                session_id: event_clone.session_id,
-                timestamp,
-                origin: event_clone.origin,
-                source_node: event_clone.source_node,
-                kind: event_clone.kind,
-            }))
+            let inserted =
+                insert_journal_event(&tx, &event_clone, Some(&source_node_id), Some(source_seq))?;
+            if inserted.is_none() {
+                // Lost the race against a concurrent duplicate writer: dropping
+                // the transaction rolls back (releasing the allocated sequence)
+                // and the replay reports no-op.
+                return Ok(None);
+            }
+            tx.commit()?;
+            Ok(inserted)
         })
         .await
         .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
     }
 
     async fn latest_source_seq(
@@ -286,6 +212,78 @@ impl EventJournal for SqliteStorage {
         .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
         .map_err(SessionError::from)
     }
+}
+
+/// Shared event-journal insertion: derives the storage columns from the event,
+/// allocates the next stream sequence, and inserts the row. Returns `None`
+/// when the partial source-identity unique index
+/// (`idx_event_journal_source_identity`) suppressed the insert as a duplicate
+/// replay of `(session_id, source_node_id, source_seq)`; unrelated constraint
+/// failures still propagate.
+fn insert_journal_event(
+    conn: &rusqlite::Connection,
+    event: &NewDurableEvent,
+    source_node_id: Option<&str>,
+    source_seq: Option<i64>,
+) -> Result<Option<DurableEvent>, rusqlite::Error> {
+    let kind_tag = serde_json::to_value(&event.kind)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let payload_json = serde_json::to_string(&event.kind)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+    let origin_str = match &event.origin {
+        EventOrigin::Local => "local",
+        EventOrigin::Remote => "remote",
+        EventOrigin::Unknown(s) => s.as_str(),
+    };
+
+    let event_id = Uuid::now_v7().to_string();
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    // Atomically allocate the next stream_seq and insert the event. The
+    // conflict target matches idx_event_journal_source_identity so duplicate
+    // replays are skipped here instead of surfacing as constraint errors.
+    let stream_seq: i64 = conn.query_row(
+        "UPDATE event_journal_seq SET next_seq = next_seq + 1 WHERE id = 1 RETURNING next_seq - 1",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let inserted = conn.execute(
+        "INSERT INTO event_journal \
+         (event_id, stream_seq, session_id, timestamp, origin, source_node, source_node_id, source_seq, kind, payload_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (session_id, source_node_id, source_seq) \
+         WHERE source_node_id IS NOT NULL AND source_seq IS NOT NULL DO NOTHING",
+        params![
+            event_id,
+            stream_seq,
+            event.session_id,
+            timestamp,
+            origin_str,
+            event.source_node,
+            source_node_id,
+            source_seq,
+            kind_tag,
+            payload_json,
+        ],
+    )?;
+    if inserted == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(DurableEvent {
+        event_id,
+        stream_seq,
+        session_id: event.session_id.clone(),
+        timestamp,
+        origin: event.origin.clone(),
+        source_node: event.source_node.clone(),
+        kind: event.kind.clone(),
+    }))
 }
 
 fn parse_journal_row(row: &rusqlite::Row) -> Result<DurableEvent, rusqlite::Error> {

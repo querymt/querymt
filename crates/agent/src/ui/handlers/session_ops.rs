@@ -818,13 +818,20 @@ pub async fn handle_delete_session(
         let _ = send_error(tx, format!("Failed to delete session: {}", err)).await;
         return;
     }
+    // Bookmark cleanup is best-effort: report the failure but continue so
+    // actor detachment, registry/connection-mapping cleanup, and the
+    // session-list refresh still run.
     if let Err(err) = state
         .session_store
         .remove_remote_session_bookmark(session_id)
         .await
     {
+        log::error!(
+            "failed to remove remote session bookmark for {}: {}",
+            session_id,
+            err
+        );
         let _ = send_error(tx, format!("Failed to delete remote bookmark: {}", err)).await;
-        return;
     }
 
     if let Some(agent) = bound_agent.as_ref() {

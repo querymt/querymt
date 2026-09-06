@@ -307,14 +307,47 @@ pub(crate) async fn attach_remote_session_via_lookup(
     session_id: &str,
     tx: &mpsc::Sender<String>,
 ) -> Result<(), String> {
+    // A persisted remote identity means this attach is a repair reconnect
+    // (plan §12), not a first-time attach: reinstall the attachment instead
+    // of early-returning a possibly-broken one.
+    let reconnect = match state
+        .agent
+        .config
+        .provider
+        .history_store()
+        .get_remote_session_bookmark(session_id)
+        .await
+    {
+        Ok(bookmark) => bookmark.is_some(),
+        Err(error) => {
+            log::warn!(
+                "attach_remote_session: bookmark lookup failed for {}: {}; \
+                 falling back to first-time attach",
+                session_id,
+                error
+            );
+            false
+        }
+    };
+    let (reason, replace) = if reconnect {
+        (
+            crate::agent::handle::remote_connect::RemoteConnectReason::ExplicitReconnect,
+            crate::agent::handle::remote_connect::RemoteReplacePolicy::ReplaceCurrent,
+        )
+    } else {
+        (
+            crate::agent::handle::remote_connect::RemoteConnectReason::ExtensionAttach,
+            crate::agent::handle::remote_connect::RemoteReplacePolicy::ReuseIfPresent,
+        )
+    };
     let attached_session_ref = state
         .agent
         .connect_remote_session(
             session_id,
             crate::agent::handle::remote_connect::RemoteConnectOptions {
                 node_hint: Some(node_id),
-                reason: crate::agent::handle::remote_connect::RemoteConnectReason::ExtensionAttach,
-                replace: crate::agent::handle::remote_connect::RemoteReplacePolicy::ReuseIfPresent,
+                reason,
+                replace,
                 handoff: None,
             },
         )

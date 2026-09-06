@@ -45,9 +45,10 @@ impl LocalAgentHandle {
     /// Delegates to the connection coordinator (plan §2) so every caller shares
     /// one recovery algorithm: single-flight per session, scoped DHT lookup,
     /// node-manager resume fallback, handoff resolution, bounded health check,
-    /// merged bookmark persistence. An already-installed healthy attachment is
-    /// reused instead of re-attaching (previously this re-spawned the relay and
-    /// overwrote the registry entry on every call).
+    /// merged bookmark persistence. First-time attaches reuse an
+    /// already-installed healthy attachment instead of re-attaching; re-attaches
+    /// of an already-bookmarked remote session are repair reconnects and always
+    /// reinstall through lookup/resume/attach/health validation.
     #[cfg(feature = "remote")]
     pub(crate) async fn attach_remote_session_for_ext(
         &self,
@@ -55,13 +56,45 @@ impl LocalAgentHandle {
         session_id: &str,
         handoff: Option<crate::agent::remote::node_manager::SessionHandoff>,
     ) -> Result<serde_json::Value, Error> {
+        // A persisted remote identity means this attach is a repair reconnect
+        // (plan §12), not a first-time attach: reinstall the attachment instead
+        // of early-returning a possibly-broken one.
+        let reconnect = match self
+            .config
+            .provider
+            .history_store()
+            .get_remote_session_bookmark(session_id)
+            .await
+        {
+            Ok(bookmark) => bookmark.is_some(),
+            Err(error) => {
+                log::warn!(
+                    "attach_remote_session: bookmark lookup failed for {}: {}; \
+                     falling back to first-time attach",
+                    session_id,
+                    error
+                );
+                false
+            }
+        };
+        let (reason, replace) = if reconnect {
+            (
+                RemoteConnectReason::ExplicitReconnect,
+                RemoteReplacePolicy::ReplaceCurrent,
+            )
+        } else {
+            (
+                RemoteConnectReason::ExtensionAttach,
+                RemoteReplacePolicy::ReuseIfPresent,
+            )
+        };
         let _connected = self
             .connect_remote_session(
                 session_id,
                 RemoteConnectOptions {
                     node_hint: Some(node_id),
-                    reason: RemoteConnectReason::ExtensionAttach,
-                    replace: RemoteReplacePolicy::ReuseIfPresent,
+                    reason,
+                    replace,
                     handoff,
                 },
             )

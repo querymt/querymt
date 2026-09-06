@@ -236,6 +236,8 @@ pub async fn ensure_session(
         // local-session creation. A missing/dead attachment here means
         // disconnected, not destroyed — keep the binding intact and surface a
         // typed remote-unavailable signal so callers can drive reconnect.
+        // Fail closed like guard_bookmarked_remote_unattached: a bookmark
+        // lookup failure is not proof that the session is local.
         let has_remote_bookmark = state
             .agent
             .config
@@ -243,8 +245,10 @@ pub async fn ensure_session(
             .history_store()
             .get_remote_session_bookmark(session_id)
             .await
-            .map(|bookmark| bookmark.is_some())
-            .unwrap_or(false);
+            .map_err(|e| {
+                format!("remote identity lookup failed for session '{session_id}': {e}")
+            })?
+            .is_some();
         if has_remote_bookmark {
             return Err(format!(
                 "remote_session_unavailable: session '{}' is bookmarked on a remote node but not currently connected; reconnect to open it",

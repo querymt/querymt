@@ -638,12 +638,15 @@ export function useUiClient() {
         const kindData = eventEnvelope?.kind?.data ?? {};
 
         // Ephemeral remote disconnects flip the session to Disconnected
-        // without touching durable history (plan §12).
+        // without touching durable history (plan §12). Return immediately so
+        // translateAgentEvent and the normal eventsBySession append path never
+        // process this ephemeral signal.
         if (eventKind === 'remote_session_disconnected') {
           setSessionConnectionStates(prev => ({
             ...prev,
             [d.session_id]: RemoteSessionConnectionState.Disconnected,
           }));
+          return;
         }
 
         if (eventKind === 'run_started') {
@@ -1196,14 +1199,15 @@ export function useUiClient() {
           ...prev,
           [d.session_id]: d.node_id ?? null,
         }));
+        const resolvedConnectionState =
+          d.connection_state ??
+          (d.node_id ? RemoteSessionConnectionState.Connected : undefined);
         setSessionConnectionStates(prev => ({
           ...prev,
-          [d.session_id]:
-            d.connection_state ??
-            (d.node_id ? RemoteSessionConnectionState.Connected : undefined),
+          [d.session_id]: resolvedConnectionState,
         }));
         // Reconnect path: refresh runtime state without navigation (plan §13).
-        if (d.connection_state === RemoteSessionConnectionState.Connected && d.node_id) {
+        if (resolvedConnectionState === RemoteSessionConnectionState.Connected && d.node_id) {
           sendMessage({ type: 'get_runtime_state', data: { session_id: d.session_id } });
         }
         if (d.profile_id) {

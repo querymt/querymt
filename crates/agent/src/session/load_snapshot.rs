@@ -123,14 +123,26 @@ pub async fn load_session_snapshot(
             // Offline-first remote identity (plan §11): a bookmarked remote
             // session opens its cached journal history without a live actor.
             // An empty journal yields an empty disconnected view (plan §11.4).
-            let bookmarked = agent
+            let bookmarked = match agent
                 .config
                 .provider
                 .history_store()
                 .get_remote_session_bookmark(session_id)
                 .await
-                .map(|bookmark| bookmark.is_some())
-                .unwrap_or(false);
+            {
+                Ok(bookmark) => bookmark.is_some(),
+                Err(bookmark_error) => {
+                    // Keep the offline fallback behavior, but make lookup
+                    // failures distinguishable from "no bookmark".
+                    tracing::warn!(
+                        session_id,
+                        error = %bookmark_error,
+                        "remote bookmark lookup failed while resolving offline audit \
+                         fallback; treating as not bookmarked"
+                    );
+                    false
+                }
+            };
             if !bookmarked {
                 return Err(e);
             }

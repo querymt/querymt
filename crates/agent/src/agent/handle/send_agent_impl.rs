@@ -50,6 +50,15 @@ impl SendAgent for LocalAgentHandle {
             {
                 Ok(()) => Ok(()),
                 Err(session_operation::SessionOperationError::NotFound { .. }) => Ok(()),
+                // Cancel is best-effort: a transient connection failure means
+                // the run is currently unreachable, not that the cancel was
+                // rejected. Structural errors (e.g. SessionNotFoundOnHost)
+                // still surface through into_acp_error.
+                Err(session_operation::SessionOperationError::Connect(connect_error))
+                    if connect_error.is_retriable() =>
+                {
+                    Ok(())
+                }
                 Err(error) => Err(error.into_acp_error()),
             }
         }

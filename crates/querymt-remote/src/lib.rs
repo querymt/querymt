@@ -44,7 +44,7 @@ pub mod runtime_handle;
 pub mod runtime_helpers;
 pub mod scope;
 pub mod stream_router_protocol;
-pub mod transport_failure;
+mod transport_failure;
 
 pub use identity::*;
 pub use invite::*;

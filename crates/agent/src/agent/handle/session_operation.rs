@@ -330,14 +330,40 @@ impl LocalAgentHandle {
                     SessionOperationError::Connect(error)
                 })?;
 
-            let retry_against_materialized_actor = !matches!(
-                (operation, failure.delivery, recovered.outcome),
+            // Replay safety: only replay into the recovered attachment when it
+            // still points at the same remote actor (same peer, actor sequence,
+            // and node scope) the failed attempt was sent to. A different
+            // identity means the request may have been served by a
+            // re-attached/recreated actor with unknowable state — refuse replay
+            // for every recovery outcome (Reused, Resumed, Reattached).
+            let same_remote_actor = match (&resolved.session_ref, &recovered.session_ref) {
                 (
-                    SessionOperation::SubmitInput { has_key: true },
-                    querymt_remote::DeliveryCertainty::Unknown,
-                    remote_connect::RemoteConnectOutcome::Resumed,
-                )
-            );
+                    SessionActorRef::Remote {
+                        actor_ref: failed_ref,
+                        remote_node_id: failed_node,
+                        ..
+                    },
+                    SessionActorRef::Remote {
+                        actor_ref: recovered_ref,
+                        remote_node_id: recovered_node,
+                        ..
+                    },
+                ) => {
+                    failed_ref.id().peer_id() == recovered_ref.id().peer_id()
+                        && failed_ref.id().sequence_id() == recovered_ref.id().sequence_id()
+                        && failed_node == recovered_node
+                }
+                _ => false,
+            };
+            let retry_against_materialized_actor = same_remote_actor
+                && !matches!(
+                    (operation, failure.delivery, recovered.outcome),
+                    (
+                        SessionOperation::SubmitInput { has_key: true },
+                        querymt_remote::DeliveryCertainty::Unknown,
+                        remote_connect::RemoteConnectOutcome::Resumed,
+                    )
+                );
             if !operation.can_retry(&failure) || !retry_against_materialized_actor {
                 tracing::Span::current().record("retry_decision", "outcome_unknown_no_replay");
                 log::warn!(

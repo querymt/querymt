@@ -230,6 +230,7 @@ pub async fn handle_ui_message(
                         build_ui_prompt_blocks(&state, &session_id, &prompt)
                             .await
                             .map_err(crate::error::AgentError::Internal)?;
+                    #[cfg(feature = "remote")]
                     let has_key = client_input_id.is_some();
                     let message = crate::agent::messages::SubmitInput {
                         session_id: session_id.clone(),

@@ -1336,8 +1336,14 @@ impl Message<crate::agent::messages::GetEventStreamSince> for SessionActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let journal = self.config.event_sink.journal();
+        // Sanitize remote pagination inputs (plan §16): the journal query casts
+        // the limit into a signed i64 (`LIMIT ?`), so bound it to the positive
+        // i64 range to keep a hostile usize from wrapping negative, and floor
+        // negative cursors at zero. Error mapping and response flow unchanged.
+        let limit = msg.limit.min(i64::MAX as usize);
+        let after_source_seq = msg.after_source_seq.map(|seq| seq.max(0));
         let events = journal
-            .load_session_stream(&self.session_id, msg.after_source_seq, Some(msg.limit))
+            .load_session_stream(&self.session_id, after_source_seq, Some(limit))
             .await
             .map_err(|e| AgentError::Internal(e.to_string()))?;
         let latest_source_seq = journal

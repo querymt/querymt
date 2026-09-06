@@ -158,11 +158,13 @@ export function ChatView() {
   );
   const currentSessionNodeId = currentSession?.node_id ?? (sessionId ? loadedSessionNodeIds[sessionId] ?? undefined : undefined);
   const currentSessionIsRemote = Boolean(currentSession?.node || currentSession?.attached !== undefined || currentSession?.runtime_state);
-  // Explicit connection state (plan §12): summaries win (they refresh on list
-  // updates); the loaded state covers the active view between refreshes.
+  // Explicit connection state (plan §12): the loaded/ephemeral state wins —
+  // session_loaded and remote_session_disconnected write it as soon as the
+  // newest state is known, before the session list refreshes. The list
+  // summary is the fallback when no loaded state exists yet.
   const currentSessionConnectionState =
-    currentSession?.connection_state ??
-    (sessionId ? sessionConnectionStates[sessionId] : undefined);
+    (sessionId ? sessionConnectionStates[sessionId] : undefined) ??
+    currentSession?.connection_state;
   const showRemoteConnectionBanner =
     currentSessionIsRemote &&
     currentSessionConnectionState !== undefined &&

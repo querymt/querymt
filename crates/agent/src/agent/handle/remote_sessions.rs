@@ -15,6 +15,23 @@ impl LocalAgentHandle {
         }
     }
 
+    /// Typed failure for the attachment health-check timeout: ReplyTimeout with
+    /// Unknown delivery, so recovery decisions can consult `transport_failure()`
+    /// instead of parsing error strings.
+    #[cfg(feature = "remote")]
+    pub(crate) fn remote_health_check_timeout_error(
+        health_timeout: std::time::Duration,
+    ) -> crate::error::AgentError {
+        crate::error::AgentError::RemoteTransport(querymt_remote::RemoteTransportFailure::new(
+            querymt_remote::RemoteTransportFailureKind::ReplyTimeout,
+            querymt_remote::DeliveryCertainty::Unknown,
+            format!(
+                "remote attachment health check timed out after {}ms",
+                health_timeout.as_millis()
+            ),
+        ))
+    }
+
     /// Find a `RemoteNodeManager` by its stable node id (PeerId string).
     ///
     /// ## Fast path
@@ -537,5 +554,46 @@ impl LocalAgentHandle {
         )
         .await
         .map_err(Self::map_remote_node_manager_error)
+    }
+}
+
+#[cfg(all(test, feature = "remote"))]
+mod tests {
+    use super::*;
+
+    /// Regression test: the remote attachment health-check timeout must
+    /// surface as a typed `RemoteTransport` failure (ReplyTimeout kind, Unknown
+    /// delivery) so `transport_failure()` stays usable for recovery decisions,
+    /// instead of the untyped `AgentError::RemoteActor` string previously
+    /// returned by `attach_remote_session`.
+    ///
+    /// `attach_remote_session` applies this mapping when its
+    /// `tokio::time::timeout(remote_connect_health_timeout(), get_mode())`
+    /// guard expires. Driving a real get_mode() past the deadline end-to-end
+    /// requires a live mesh peer (this crate has no offline remote-transport
+    /// test harness), so the typed construction that timeout path produces is
+    /// asserted directly here.
+    #[test]
+    fn health_check_timeout_maps_to_typed_reply_timeout_failure() {
+        let error = LocalAgentHandle::remote_health_check_timeout_error(
+            std::time::Duration::from_millis(50),
+        );
+        let failure = error
+            .transport_failure()
+            .expect("health-check timeout must carry a typed transport failure");
+        assert!(matches!(
+            failure.kind,
+            querymt_remote::RemoteTransportFailureKind::ReplyTimeout
+        ));
+        assert_eq!(failure.delivery, querymt_remote::DeliveryCertainty::Unknown);
+        assert!(
+            failure.is_retryable_kind(),
+            "reply timeouts must stay retryable for recovery decisions"
+        );
+        assert!(
+            error.to_string().contains("health check timed out"),
+            "message should name the timeout, got: {}",
+            error
+        );
     }
 }
