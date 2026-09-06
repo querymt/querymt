@@ -58,6 +58,17 @@ fn parse_transport_model_id(model_id: &str, fallback_provider: &str) -> (String,
     }
 }
 
+enum ControlTransitionIntent {
+    Mode(AgentMode),
+    Model(crate::agent::session_control::SessionModelSelection),
+    ModelConfig {
+        model_id: String,
+        provider_node_id: Option<String>,
+        params: querymt::LLMParams,
+    },
+    ReasoningEffort(Option<ReasoningEffort>),
+}
+
 const ATTACHMENTS_PLACEHOLDER: &str = "(attachments included)";
 
 fn emit_hook_notices(config: &AgentConfig, session_id: &str, notices: Vec<HookNotice>) {
@@ -583,17 +594,17 @@ impl Message<SetLlmConfig> for SessionActor {
 }
 
 impl SessionActor {
-    async fn ensure_control_state(&mut self) -> Result<SessionControlState, AgentError> {
-        if let Some(state) = &self.control_state {
-            return Ok(state.clone());
-        }
+    fn apply_control_state(&mut self, state: SessionControlState) -> SessionControlState {
+        self.mode = state.active_mode;
+        self.reasoning_effort = state.reasoning_effort;
+        self.control_state = Some(state.clone());
+        state
+    }
 
+    async fn load_control_state_from_store(&mut self) -> Result<SessionControlState, AgentError> {
         let store = self.config.provider.history_store();
         if let Some(state) = store.get_session_control(&self.session_id).await? {
-            self.mode = state.active_mode;
-            self.reasoning_effort = state.reasoning_effort;
-            self.control_state = Some(state.clone());
-            return Ok(state);
+            return Ok(self.apply_control_state(state));
         }
 
         let config = match store.get_session_llm_config(&self.session_id).await? {
@@ -623,11 +634,33 @@ impl SessionActor {
             effective_model: binding,
             mode_models,
         };
-        let state = store
+        match store
             .commit_session_control(&self.session_id, 0, &state)
-            .await?;
-        self.control_state = Some(state.clone());
-        Ok(state)
+            .await
+        {
+            Ok(state) => Ok(self.apply_control_state(state)),
+            Err(error) => {
+                let agent_error = AgentError::from(error);
+                if agent_error.is_session_control_revision_conflict()
+                    && let Some(existing) = store.get_session_control(&self.session_id).await?
+                {
+                    return Ok(self.apply_control_state(existing));
+                }
+                Err(agent_error)
+            }
+        }
+    }
+
+    async fn ensure_control_state(&mut self) -> Result<SessionControlState, AgentError> {
+        if let Some(state) = &self.control_state {
+            return Ok(state.clone());
+        }
+        self.load_control_state_from_store().await
+    }
+
+    async fn reload_control_state(&mut self) -> Result<SessionControlState, AgentError> {
+        self.control_state = None;
+        self.load_control_state_from_store().await
     }
 
     async fn commit_control_transition(
@@ -636,16 +669,18 @@ impl SessionActor {
         mut proposed: SessionControlState,
     ) -> Result<SessionControlTransition, AgentError> {
         proposed.revision = previous.revision.saturating_add(1);
-        let current = self
+        let current = match self
             .config
             .provider
             .history_store()
             .commit_session_control(&self.session_id, previous.revision, &proposed)
-            .await?;
+            .await
+        {
+            Ok(current) => current,
+            Err(error) => return Err(AgentError::from(error)),
+        };
 
-        self.mode = current.active_mode;
-        self.reasoning_effort = current.reasoning_effort;
-        self.control_state = Some(current.clone());
+        self.apply_control_state(current.clone());
 
         if previous.active_mode != current.active_mode {
             self.config.emit_event(
@@ -675,11 +710,70 @@ impl SessionActor {
         Ok(SessionControlTransition { previous, current })
     }
 
+    async fn rebase_control_once(
+        &mut self,
+        intent: ControlTransitionIntent,
+    ) -> Result<SessionControlTransition, AgentError> {
+        let previous = self.ensure_control_state().await?;
+        match self.apply_control_intent(previous, &intent, false).await {
+            Ok(transition) => Ok(transition),
+            Err(error) if error.is_session_control_revision_conflict() => {
+                let previous = self.reload_control_state().await?;
+                self.apply_control_intent(previous, &intent, true).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn apply_control_intent(
+        &mut self,
+        previous: SessionControlState,
+        intent: &ControlTransitionIntent,
+        rebased: bool,
+    ) -> Result<SessionControlTransition, AgentError> {
+        match intent {
+            ControlTransitionIntent::Mode(mode) => {
+                self.commit_mode_transition(previous, *mode).await
+            }
+            ControlTransitionIntent::Model(selection) => {
+                self.apply_model_selection(previous, selection).await
+            }
+            ControlTransitionIntent::ModelConfig {
+                model_id,
+                provider_node_id,
+                params,
+            } => {
+                let mut params = params.clone();
+                if rebased {
+                    params.reasoning_effort = previous.reasoning_effort;
+                }
+                self.apply_model_binding(
+                    previous,
+                    model_id.clone(),
+                    provider_node_id.clone(),
+                    params,
+                )
+                .await
+            }
+            ControlTransitionIntent::ReasoningEffort(effort) => {
+                self.commit_reasoning_effort(previous, *effort).await
+            }
+        }
+    }
+
     async fn transition_mode(
         &mut self,
         mode: AgentMode,
     ) -> Result<SessionControlTransition, AgentError> {
-        let previous = self.ensure_control_state().await?;
+        self.rebase_control_once(ControlTransitionIntent::Mode(mode))
+            .await
+    }
+
+    async fn commit_mode_transition(
+        &mut self,
+        previous: SessionControlState,
+        mode: AgentMode,
+    ) -> Result<SessionControlTransition, AgentError> {
         let mut proposed = previous.clone();
         let binding = proposed
             .binding_for(mode)
@@ -695,15 +789,7 @@ impl SessionActor {
         &mut self,
         selection: crate::agent::session_control::SessionModelSelection,
     ) -> Result<SessionControlTransition, AgentError> {
-        let previous = self.ensure_control_state().await?;
-        let (provider, model) =
-            parse_transport_model_id(&selection.model_id, &previous.effective_model.provider);
-        let mut params = querymt::LLMParams::new().provider(&provider).model(&model);
-        for prompt_part in self.get_session_system_prompt().await {
-            params = params.system(prompt_part);
-        }
-        params.reasoning_effort = previous.reasoning_effort;
-        self.transition_model_with_config(selection.model_id, selection.provider_node_id, params)
+        self.rebase_control_once(ControlTransitionIntent::Model(selection))
             .await
     }
 
@@ -713,7 +799,42 @@ impl SessionActor {
         provider_node_id: Option<String>,
         params: querymt::LLMParams,
     ) -> Result<SessionControlTransition, AgentError> {
-        let previous = self.ensure_control_state().await?;
+        self.rebase_control_once(ControlTransitionIntent::ModelConfig {
+            model_id,
+            provider_node_id,
+            params,
+        })
+        .await
+    }
+
+    async fn apply_model_selection(
+        &mut self,
+        previous: SessionControlState,
+        selection: &crate::agent::session_control::SessionModelSelection,
+    ) -> Result<SessionControlTransition, AgentError> {
+        let (provider, model) =
+            parse_transport_model_id(&selection.model_id, &previous.effective_model.provider);
+        let mut params = querymt::LLMParams::new().provider(&provider).model(&model);
+        for prompt_part in self.get_session_system_prompt().await {
+            params = params.system(prompt_part);
+        }
+        params.reasoning_effort = previous.reasoning_effort;
+        self.apply_model_binding(
+            previous,
+            selection.model_id.clone(),
+            selection.provider_node_id.clone(),
+            params,
+        )
+        .await
+    }
+
+    async fn apply_model_binding(
+        &mut self,
+        previous: SessionControlState,
+        model_id: String,
+        provider_node_id: Option<String>,
+        params: querymt::LLMParams,
+    ) -> Result<SessionControlTransition, AgentError> {
         let provider_name = params
             .provider
             .as_ref()
@@ -751,7 +872,15 @@ impl SessionActor {
         &mut self,
         effort: Option<ReasoningEffort>,
     ) -> Result<SessionControlTransition, AgentError> {
-        let previous = self.ensure_control_state().await?;
+        self.rebase_control_once(ControlTransitionIntent::ReasoningEffort(effort))
+            .await
+    }
+
+    async fn commit_reasoning_effort(
+        &mut self,
+        previous: SessionControlState,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<SessionControlTransition, AgentError> {
         let store = self.config.provider.history_store();
         let mut proposed = previous.clone();
         proposed.reasoning_effort = effort;

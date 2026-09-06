@@ -97,6 +97,9 @@ pub enum AgentError {
     #[error("invalid prompt content: {message}")]
     InvalidPromptContent { message: String },
 
+    #[error("session control revision conflict: expected {expected}, found {found}")]
+    SessionControlRevisionConflict { expected: u64, found: u64 },
+
     // --- Serialization ---
     #[error("serialization error: {0}")]
     Serialization(String),
@@ -145,6 +148,14 @@ impl From<AgentError> for AcpError {
             return AcpError::new(-32602, message.clone()).data(serde_json::json!({
                 "category": "prompt_content",
                 "message": message,
+            }));
+        }
+        if let AgentError::SessionControlRevisionConflict { expected, found } = &e {
+            return AcpError::new(-32603, e.to_string()).data(serde_json::json!({
+                "category": "session_control",
+                "kind": "revision_conflict",
+                "expected": expected,
+                "found": found,
             }));
         }
 
@@ -210,11 +221,20 @@ impl From<serde_json::Error> for AgentError {
     }
 }
 
+impl AgentError {
+    pub(crate) fn is_session_control_revision_conflict(&self) -> bool {
+        matches!(self, Self::SessionControlRevisionConflict { .. })
+    }
+}
+
 impl From<crate::session::error::SessionError> for AgentError {
     fn from(e: crate::session::error::SessionError) -> Self {
         use crate::session::error::SessionError;
         match e {
             SessionError::SessionNotFound(id) => AgentError::SessionNotFound { session_id: id },
+            SessionError::SessionControlRevisionConflict { expected, found } => {
+                AgentError::SessionControlRevisionConflict { expected, found }
+            }
             other => AgentError::Internal(other.to_string()),
         }
     }
@@ -240,6 +260,18 @@ mod tests {
         }
         .into();
         assert_eq!(error.code, ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn session_control_revision_conflict_maps_to_internal_error() {
+        let error: AcpError = AgentError::SessionControlRevisionConflict {
+            expected: 30,
+            found: 31,
+        }
+        .into();
+        assert_eq!(error.code, ErrorCode::InternalError);
+        assert!(error.message.contains("expected 30"));
+        assert!(error.message.contains("found 31"));
     }
 
     #[test]
@@ -517,6 +549,32 @@ mod tests {
         let session_err = crate::session::error::SessionError::TaskNotFound("t-1".to_string());
         let agent_err: AgentError = session_err.into();
         assert!(matches!(agent_err, AgentError::Internal(_)));
+    }
+
+    #[test]
+    fn from_session_error_revision_conflict_is_typed() {
+        let session_err = crate::session::error::SessionError::SessionControlRevisionConflict {
+            expected: 1,
+            found: 31,
+        };
+        let agent_err: AgentError = session_err.into();
+        assert!(matches!(
+            agent_err,
+            AgentError::SessionControlRevisionConflict {
+                expected: 1,
+                found: 31
+            }
+        ));
+    }
+
+    #[test]
+    fn invalid_operation_conflict_text_is_not_a_typed_conflict() {
+        let session_err = crate::session::error::SessionError::InvalidOperation(
+            "session control revision conflict".to_string(),
+        );
+        let agent_err: AgentError = session_err.into();
+        assert!(matches!(agent_err, AgentError::Internal(_)));
+        assert!(!agent_err.is_session_control_revision_conflict());
     }
 
     #[test]

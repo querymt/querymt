@@ -118,10 +118,14 @@ impl SessionActorRef {
     pub(super) fn map_local_prompt_send_error(
         error: kameo::error::SendError<messages::Prompt, AgentError>,
     ) -> AcpError {
-        AcpError::from(match error {
+        AcpError::from(Self::map_local_agent_send_error(error))
+    }
+
+    fn map_local_agent_send_error<M>(error: kameo::error::SendError<M, AgentError>) -> AgentError {
+        match error {
             kameo::error::SendError::HandlerError(err) => err,
             other => AgentError::RemoteActor(other.to_string()),
-        })
+        }
     }
 
     fn map_infallible_remote_send_error(
@@ -282,7 +286,7 @@ impl SessionActorRef {
             Self::Local(actor_ref) => actor_ref
                 .ask(messages::SetMode { mode })
                 .await
-                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+                .map_err(Self::map_local_agent_send_error),
 
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
@@ -334,7 +338,7 @@ impl SessionActorRef {
             Self::Local(actor_ref) => actor_ref
                 .ask(messages::SetReasoningEffort { effort })
                 .await
-                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+                .map_err(Self::map_local_agent_send_error),
 
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
@@ -358,7 +362,7 @@ impl SessionActorRef {
             Self::Local(actor_ref) => actor_ref
                 .ask(messages::GetSessionControl)
                 .await
-                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+                .map_err(Self::map_local_agent_send_error),
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
                 .ask(&messages::GetSessionControl)
@@ -389,7 +393,7 @@ impl SessionActorRef {
             Self::Local(actor_ref) => actor_ref
                 .ask(msg)
                 .await
-                .map_err(|error| AgentError::RemoteActor(error.to_string())),
+                .map_err(Self::map_local_agent_send_error),
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
                 .ask(&msg)
@@ -516,7 +520,7 @@ impl SessionActorRef {
             Self::Local(actor_ref) => actor_ref
                 .ask(msg)
                 .await
-                .map_err(|e| AgentError::RemoteActor(e.to_string())),
+                .map_err(Self::map_local_agent_send_error),
 
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref

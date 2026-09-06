@@ -20,6 +20,7 @@ use crate::test_utils::{
 };
 use kameo::actor::Spawn;
 use querymt::LLMParams;
+use querymt::chat::ReasoningEffort;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -225,6 +226,256 @@ async fn test_local_ref_mode_model_bindings_are_session_scoped() {
         .await
         .expect("second control state");
     assert_eq!(second_state.effective_model.model, "mock");
+}
+
+#[tokio::test]
+async fn stale_actor_rebases_mode_after_revision_conflict() {
+    let (config, _td) = test_agent_config().await;
+    let (fresh, session_id) = spawn_test_session_with_id(config.clone(), "stale-mode").await;
+    let initial = fresh
+        .get_session_control()
+        .await
+        .expect("initialize control state");
+    assert_eq!(initial.revision, 1);
+
+    let stale = SessionActorRef::Local(SessionActor::spawn(
+        SessionActor::new(
+            config.clone(),
+            session_id.clone(),
+            SessionRuntime::new(
+                None,
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        )
+        .with_control_state(initial),
+    ));
+
+    let advanced = fresh
+        .set_mode(AgentMode::Plan)
+        .await
+        .expect("fresh actor advances revision");
+    assert_eq!(advanced.current.revision, 2);
+    assert_eq!(advanced.current.active_mode, AgentMode::Plan);
+
+    let rebased = stale
+        .set_mode(AgentMode::Build)
+        .await
+        .expect("stale actor rebases onto latest revision");
+    assert_eq!(rebased.current.active_mode, AgentMode::Build);
+    assert!(rebased.current.revision > 2);
+
+    let persisted = config
+        .provider
+        .history_store()
+        .get_session_control(&session_id)
+        .await
+        .expect("load persisted control")
+        .expect("control state exists");
+    assert_eq!(persisted.active_mode, AgentMode::Build);
+    assert_eq!(persisted.revision, rebased.current.revision);
+}
+
+#[tokio::test]
+async fn stale_actor_rebases_model_after_revision_conflict() {
+    let (config, _td) = test_agent_config().await;
+    let (fresh, session_id) = spawn_test_session_with_id(config.clone(), "stale-model").await;
+    let initial = fresh
+        .get_session_control()
+        .await
+        .expect("initialize control state");
+
+    let stale = SessionActorRef::Local(SessionActor::spawn(
+        SessionActor::new(
+            config,
+            session_id,
+            SessionRuntime::new(
+                None,
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        )
+        .with_control_state(initial),
+    ));
+
+    fresh
+        .set_mode(AgentMode::Plan)
+        .await
+        .expect("fresh actor switches to plan");
+
+    let rebased = stale
+        .set_session_model(crate::agent::session_control::SessionModelSelection {
+            model_id: "mock/rebased-model".to_string(),
+            provider_node_id: None,
+        })
+        .await
+        .expect("stale actor rebases model onto current mode");
+    assert_eq!(rebased.current.active_mode, AgentMode::Plan);
+    assert_eq!(rebased.current.effective_model.model, "rebased-model");
+    assert_eq!(
+        rebased
+            .current
+            .binding_for(AgentMode::Plan)
+            .map(|binding| binding.model.as_str()),
+        Some("rebased-model")
+    );
+}
+
+#[tokio::test]
+async fn stale_actor_rebases_reasoning_effort_after_revision_conflict() {
+    let (config, _td) = test_agent_config().await;
+    let (fresh, session_id) = spawn_test_session_with_id(config.clone(), "stale-effort").await;
+    let initial = fresh
+        .get_session_control()
+        .await
+        .expect("initialize control state");
+
+    let stale = SessionActorRef::Local(SessionActor::spawn(
+        SessionActor::new(
+            config.clone(),
+            session_id.clone(),
+            SessionRuntime::new(
+                None,
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        )
+        .with_control_state(initial),
+    ));
+
+    fresh
+        .set_mode(AgentMode::Review)
+        .await
+        .expect("fresh actor switches to review");
+
+    let rebased = stale
+        .set_reasoning_effort(Some(ReasoningEffort::High))
+        .await
+        .expect("stale actor rebases effort onto current mode");
+    assert_eq!(rebased.current.active_mode, AgentMode::Review);
+    assert_eq!(
+        rebased.current.reasoning_effort,
+        Some(ReasoningEffort::High)
+    );
+
+    let persisted = config
+        .provider
+        .history_store()
+        .get_session_control(&session_id)
+        .await
+        .expect("load persisted control")
+        .expect("control state exists");
+    assert_eq!(persisted.active_mode, AgentMode::Review);
+    assert_eq!(persisted.reasoning_effort, Some(ReasoningEffort::High));
+}
+
+#[tokio::test]
+async fn stale_actor_rebases_llm_config_after_revision_conflict() {
+    let (config, _td) = test_agent_config().await;
+    let (fresh, session_id) = spawn_test_session_with_id(config.clone(), "stale-config").await;
+    let initial = fresh
+        .get_session_control()
+        .await
+        .expect("initialize control state");
+
+    let stale = SessionActorRef::Local(SessionActor::spawn(
+        SessionActor::new(
+            config.clone(),
+            session_id.clone(),
+            SessionRuntime::new(
+                None,
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        )
+        .with_control_state(initial),
+    ));
+
+    fresh
+        .set_reasoning_effort(Some(ReasoningEffort::Low))
+        .await
+        .expect("fresh actor sets effort");
+    fresh
+        .set_mode(AgentMode::Plan)
+        .await
+        .expect("fresh actor switches to plan");
+
+    stale
+        .set_llm_config(
+            LLMParams::new().provider("mock").model("rebased-config"),
+            None,
+        )
+        .await
+        .expect("stale actor rebases llm config onto current mode");
+
+    let persisted = config
+        .provider
+        .history_store()
+        .get_session_control(&session_id)
+        .await
+        .expect("load persisted control")
+        .expect("control state exists");
+    assert_eq!(persisted.active_mode, AgentMode::Plan);
+    assert_eq!(persisted.effective_model.model, "rebased-config");
+    assert_eq!(persisted.reasoning_effort, Some(ReasoningEffort::Low));
+    let llm = config
+        .provider
+        .history_store()
+        .get_llm_config(persisted.effective_model.llm_config_id)
+        .await
+        .expect("load llm config")
+        .expect("llm config exists");
+    let params: LLMParams = llm
+        .params
+        .as_ref()
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default();
+    assert_eq!(params.reasoning_effort, Some(ReasoningEffort::Low));
+}
+
+#[tokio::test]
+async fn set_llm_config_keeps_params_effort_when_uncontended() {
+    let (config, _td) = test_agent_config().await;
+    let (session, session_id) =
+        spawn_test_session_with_id(config.clone(), "uncontended-config").await;
+    session
+        .set_reasoning_effort(Some(ReasoningEffort::Low))
+        .await
+        .expect("set session effort");
+
+    session
+        .set_llm_config(
+            LLMParams::new()
+                .provider("mock")
+                .model("explicit-effort")
+                .reasoning_effort(ReasoningEffort::High),
+            None,
+        )
+        .await
+        .expect("uncontended llm config keeps params effort");
+
+    let persisted = config
+        .provider
+        .history_store()
+        .get_session_control(&session_id)
+        .await
+        .expect("load persisted control")
+        .expect("control state exists");
+    assert_eq!(persisted.reasoning_effort, Some(ReasoningEffort::Low));
+    assert_eq!(persisted.effective_model.model, "explicit-effort");
+    let llm = config
+        .provider
+        .history_store()
+        .get_llm_config(persisted.effective_model.llm_config_id)
+        .await
+        .expect("load llm config")
+        .expect("llm config exists");
+    let params: LLMParams = llm
+        .params
+        .as_ref()
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default();
+    assert_eq!(params.reasoning_effort, Some(ReasoningEffort::High));
 }
 
 #[tokio::test]

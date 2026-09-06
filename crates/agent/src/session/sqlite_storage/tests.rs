@@ -260,7 +260,13 @@ async fn session_control_commit_is_revisioned_and_session_scoped() {
         .commit_session_control(&first.public_id, 0, &state)
         .await
         .expect_err("stale revision must fail");
-    assert!(stale.to_string().contains("revision conflict"));
+    assert!(matches!(
+        stale,
+        crate::session::error::SessionError::SessionControlRevisionConflict {
+            expected: 0,
+            found: 1
+        }
+    ));
 }
 
 #[tokio::test]
