@@ -107,6 +107,15 @@ impl SqliteStorage {
         F: FnOnce(&mut Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
+        self.run_blocking_session(move |conn| f(conn).map_err(SessionError::from))
+            .await
+    }
+
+    pub(super) async fn run_blocking_session<F, R>(&self, f: F) -> SessionResult<R>
+    where
+        F: FnOnce(&mut Connection) -> SessionResult<R> + Send + 'static,
+        R: Send + 'static,
+    {
         let conn_arc = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = conn_arc.lock().unwrap();
@@ -114,7 +123,6 @@ impl SqliteStorage {
         })
         .await
         .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
-        .map_err(SessionError::from)
     }
 
     /// Helper: Resolve session public_id → internal i64

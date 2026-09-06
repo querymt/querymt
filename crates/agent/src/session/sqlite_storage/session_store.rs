@@ -767,26 +767,29 @@ impl SessionStore for SqliteStorage {
     ) -> SessionResult<SessionControlState> {
         let session_id = session_id.to_string();
         let state = state.clone();
-        let committed = self
-            .run_blocking(move |conn| {
-                let tx = conn.transaction()?;
-                let session_internal_id: i64 = tx.query_row(
-                    "SELECT id FROM sessions WHERE public_id = ?1",
-                    params![session_id],
-                    |row| row.get(0),
-                )?;
+        self.run_blocking_session(move |conn| {
+                let tx = conn.transaction().map_err(SessionError::from)?;
+                let session_internal_id: i64 = tx
+                    .query_row(
+                        "SELECT id FROM sessions WHERE public_id = ?1",
+                        params![session_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(SessionError::from)?;
                 let current_revision = tx
                     .query_row(
                         "SELECT revision FROM session_control_states WHERE session_id = ?1",
                         params![session_internal_id],
                         |row| row.get::<_, i64>(0).map(|revision| revision as u64),
                     )
-                    .optional()?
+                    .optional()
+                    .map_err(SessionError::from)?
                     .unwrap_or(0);
                 if current_revision != expected_revision {
-                    return Err(rusqlite::Error::InvalidParameterName(format!(
-                        "session_control_revision_conflict:{current_revision}"
-                    )));
+                    return Err(SessionError::SessionControlRevisionConflict {
+                        expected: expected_revision,
+                        found: current_revision,
+                    });
                 }
 
                 let now = OffsetDateTime::now_utc()
@@ -802,35 +805,31 @@ impl SessionStore for SqliteStorage {
                         reasoning_effort = excluded.reasoning_effort, revision = excluded.revision,
                         updated_at = excluded.updated_at",
                     params![session_internal_id, state.active_mode.as_str(), reasoning_effort, state.revision as i64, now],
-                )?;
+                )
+                .map_err(SessionError::from)?;
                 tx.execute(
                     "DELETE FROM session_mode_model_bindings WHERE session_id = ?1",
                     params![session_internal_id],
-                )?;
+                )
+                .map_err(SessionError::from)?;
                 for (mode, binding) in &state.mode_models {
                     tx.execute(
                         "INSERT INTO session_mode_model_bindings
                          (session_id, mode, model_id, provider, model, llm_config_id, provider_node_id)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                         params![session_internal_id, mode, binding.model_id, binding.provider, binding.model, binding.llm_config_id, binding.provider_node_id],
-                    )?;
+                    )
+                    .map_err(SessionError::from)?;
                 }
                 tx.execute(
                     "UPDATE sessions SET llm_config_id = ?1, provider_node_id = ?2, updated_at = ?3 WHERE id = ?4",
                     params![state.effective_model.llm_config_id, state.effective_model.provider_node_id, now, session_internal_id],
-                )?;
-                tx.commit()?;
+                )
+                .map_err(SessionError::from)?;
+                tx.commit().map_err(SessionError::from)?;
                 Ok(state)
             })
-            .await;
-        committed.map_err(|error| match error {
-            SessionError::DatabaseError(message)
-                if message.contains("session_control_revision_conflict") =>
-            {
-                SessionError::InvalidOperation("session control revision conflict".to_string())
-            }
-            other => other,
-        })
+            .await
     }
 
     async fn set_profile_binding(&self, session_id: &str, profile_id: &str) -> SessionResult<()> {

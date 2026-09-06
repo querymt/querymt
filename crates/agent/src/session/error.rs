@@ -62,6 +62,10 @@ pub enum SessionError {
     #[error("Invalid operation: {0}")]
     InvalidOperation(String),
 
+    /// Session control CAS failed because another writer advanced the revision.
+    #[error("session control revision conflict: expected {expected}, found {found}")]
+    SessionControlRevisionConflict { expected: u64, found: u64 },
+
     /// Provider error (from LLM operations)
     #[error("Provider error: {0}")]
     ProviderError(#[from] LLMError),
@@ -101,6 +105,11 @@ impl From<SessionError> for LLMError {
             SessionError::InvalidForkPoint(msg)
             | SessionError::InvalidMessageIndex(msg)
             | SessionError::InvalidOperation(msg) => LLMError::InvalidRequest(msg),
+            SessionError::SessionControlRevisionConflict { expected, found } => {
+                LLMError::InvalidRequest(format!(
+                    "session control revision conflict: expected {expected}, found {found}"
+                ))
+            }
             SessionError::ForkPointTypeMismatch { expected, actual } => {
                 LLMError::InvalidRequest(format!(
                     "Fork point type mismatch: expected {}, got {}",
