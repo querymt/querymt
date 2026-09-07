@@ -1038,14 +1038,20 @@ export function useUiClient() {
         }
 
         if (isLoadError) {
+          // Prefer the label tracked for the session the backend named in the
+          // error; only fall back to the most recent pending load when the
+          // error carries no structured session ID.
           const pendingEntries = Array.from(pendingLoadLabelsRef.current.entries());
-          const [pendingSessionId, pendingLabel] = pendingEntries[pendingEntries.length - 1] ?? [null, undefined];
-          const failedSessionId = errorSessionId ?? pendingSessionId;
+          const fallbackEntry = pendingEntries[pendingEntries.length - 1];
+          const failedSessionId = errorSessionId ?? fallbackEntry?.[0] ?? null;
+          const failedLabel = failedSessionId != null
+            ? pendingLoadLabelsRef.current.get(failedSessionId)
+            : fallbackEntry?.[1];
           pendingLoadLabelsRef.current.clear();
           pushSessionActionNotice(
             'error',
-            pendingLabel
-              ? `Failed to open session: ${pendingLabel}`
+            failedLabel
+              ? `Failed to open session: ${failedLabel}`
               : d.message
           );
           if (failedSessionId) {
