@@ -1047,7 +1047,15 @@ export function useUiClient() {
           const failedLabel = failedSessionId != null
             ? pendingLoadLabelsRef.current.get(failedSessionId)
             : fallbackEntry?.[1];
-          pendingLoadLabelsRef.current.clear();
+          if (failedSessionId != null) {
+            // Structured errors name the failing session: remove only its
+            // entry so other pending loads keep their labels for their own
+            // correlated errors (mirrors the per-session cleanup on
+            // session_loaded). Codeless errors keep the wholesale fallback.
+            pendingLoadLabelsRef.current.delete(failedSessionId);
+          } else {
+            pendingLoadLabelsRef.current.clear();
+          }
           pushSessionActionNotice(
             'error',
             failedLabel
