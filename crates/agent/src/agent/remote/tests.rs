@@ -907,7 +907,7 @@ mod event_forwarder_stub {
 #[cfg(feature = "remote")]
 mod node_manager_tests {
     use super::*;
-    use crate::agent::messages::GetMode;
+    use crate::agent::messages::{GetEventStream, GetMode};
     use crate::agent::remote::node_manager::{
         AdmissionRequest, AdmissionResponse, CreateRemoteSchedule, CreateRemoteSession,
         DeleteRemoteSchedule, ForkRemoteSession, GetNodeInfo, ListRemoteSchedules,
@@ -1558,22 +1558,22 @@ mod node_manager_tests {
     }
 
     /// Regression test: after stopping and resuming a session, the
-    /// materialized actor's event stream should include previously persisted
-    /// events.  This validates that `ResumeRemoteSession` →
-    /// `materialize_remote_session` → `GetEventStream` reads from the
-    /// durable journal, not just from ephemeral actor state.
-    #[tokio::test]
+    /// rematerialized actor's remote `GetEventStream` should include
+    /// previously persisted events. Multi-thread runtime is required so
+    /// mesh I/O on `MESH_RUNTIME` cannot deadlock against a current-thread
+    /// test runtime waiting on the session actor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_resume_session_exposes_persisted_event_stream() {
         let (nm_ref, config, _td) = spawn_test_node_manager_with_mesh().await;
-
         let control_timeout = Duration::from_secs(5);
+
         let resp = nm_ref
             .ask(CreateRemoteSession { cwd: None })
             .mailbox_timeout(control_timeout)
             .reply_timeout(control_timeout)
             .send()
             .await
-            .unwrap_or_else(|err| panic!("create timed out after {:?}: {err}", control_timeout));
+            .unwrap_or_else(|err| panic!("create timed out after {control_timeout:?}: {err}"));
 
         // Persist a durable event through the agent's event sink.
         config
@@ -1593,39 +1593,41 @@ mod node_manager_tests {
             .reply_timeout(control_timeout)
             .send()
             .await
-            .unwrap_or_else(|err| panic!("stop timed out after {:?}: {err}", control_timeout));
+            .unwrap_or_else(|err| panic!("stop timed out after {control_timeout:?}: {err}"));
 
-        // Resume — materializes a new actor from SQLite.
-        let resumed = nm_ref
-            .ask(ResumeRemoteSession {
-                session_id: resp.session_id.clone(),
-            })
-            .mailbox_timeout(control_timeout)
-            .reply_timeout(control_timeout)
-            .send()
-            .await
-            .unwrap_or_else(|err| panic!("resume timed out after {:?}: {err}", control_timeout));
+        // Resume rematerializes from SQLite and exports a remote ref. kameo
+        // reply_timeout does not cancel the DelegatedReply task, so bound
+        // the wait with an outer timeout.
+        let resumed = tokio::time::timeout(
+            control_timeout,
+            nm_ref
+                .ask(ResumeRemoteSession {
+                    session_id: resp.session_id.clone(),
+                })
+                .mailbox_timeout(control_timeout)
+                .reply_timeout(control_timeout)
+                .send(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("resume outer timeout after {control_timeout:?}"))
+        .unwrap_or_else(|err| panic!("resume timed out after {control_timeout:?}: {err}"));
 
-        // Resolve the handoff to get a live actor reference.
         let session_ref = match resumed.handoff {
             SessionHandoff::DirectRemote { session_ref } => session_ref,
             other => panic!("expected DirectRemote handoff, got {other:?}"),
         };
 
-        // Ask the resumed actor for its full event stream with bounded remote
-        // mailbox/reply timeouts so suite-level mesh issues fail fast.
-        let timeout = Duration::from_secs(5);
-        let events: Vec<crate::events::AgentEvent> = querymt_remote::ask_remote_with_timeout(
-            &session_ref,
-            &crate::agent::messages::GetEventStream,
-            timeout,
+        let events: Vec<crate::events::AgentEvent> = tokio::time::timeout(
+            control_timeout,
+            querymt_remote::ask_remote_with_timeout(&session_ref, &GetEventStream, control_timeout),
         )
         .await
+        .unwrap_or_else(|_| panic!("GetEventStream outer timeout after {control_timeout:?}"))
         .unwrap_or_else(|err| match err {
             RemoteSendError::ReplyTimeout => {
-                panic!("GetEventStream remote reply timed out after {:?}", timeout)
+                panic!("GetEventStream remote reply timed out after {control_timeout:?}")
             }
-            other => panic!("GetEventStream RPC failed after {:?}: {other}", timeout),
+            other => panic!("GetEventStream RPC failed after {control_timeout:?}: {other}"),
         });
 
         assert!(
