@@ -522,7 +522,20 @@ async fn test_local_ref_subscribe_unsubscribe_events() {
     let (config, _td) = test_agent_config().await;
     let session_ref = spawn_test_session(config, "test-events-1").await;
 
-    // Subscribe with a dummy relay_actor_id
+    // Subscribe with a dummy relay_actor_id. Subscribing by DHT relay name
+    // requires a bootstrapped mesh to resolve the relay actor, so a bare
+    // mesh-less local session must fail typed — mirroring
+    // session_actor::test_subscribe_unsubscribe_events_no_panic. Success-path
+    // coverage lives in the mesh tests.
+    #[cfg(feature = "remote")]
+    {
+        let err = session_ref
+            .subscribe_events(42, "event_relay::test-events-1::local".to_string())
+            .await
+            .expect_err("subscribe_events without a mesh must fail");
+        assert!(err.message.contains("mesh not bootstrapped"));
+    }
+    #[cfg(not(feature = "remote"))]
     session_ref
         .subscribe_events(42, "event_relay::test-events-1::local".to_string())
         .await

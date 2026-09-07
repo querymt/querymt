@@ -487,10 +487,13 @@ impl AgentSessions {
 
     pub async fn delete(&self, session_id: impl AsRef<str>) -> Result<()> {
         let session_id = session_id.as_ref().to_string();
-        self.session_store().delete_session(&session_id).await?;
+        // Remove the durable remote bookmark first: if that fails, return
+        // early with the session row intact instead of deleting the row and
+        // leaving a dangling bookmark behind.
         self.session_store()
             .remove_remote_session_bookmark(&session_id)
             .await?;
+        self.session_store().delete_session(&session_id).await?;
         self.agent.clear_delegate_model_overrides(&session_id).await;
         #[cfg(feature = "remote")]
         {

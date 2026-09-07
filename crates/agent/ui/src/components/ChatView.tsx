@@ -165,8 +165,11 @@ export function ChatView() {
   const currentSessionConnectionState =
     (sessionId ? sessionConnectionStates[sessionId] : undefined) ??
     currentSession?.connection_state;
+  // A defined connection state is only written for remote sessions
+  // (remote_session_disconnected, or session_loaded with node info), so it
+  // identifies a remote session on its own — including sessions absent from
+  // the possibly stale session-list summary.
   const showRemoteConnectionBanner =
-    currentSessionIsRemote &&
     currentSessionConnectionState !== undefined &&
     currentSessionConnectionState !== RemoteSessionConnectionState.Connected;
   const handleReconnectRemoteSession = () => {

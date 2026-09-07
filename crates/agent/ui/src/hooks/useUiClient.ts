@@ -1039,10 +1039,13 @@ export function useUiClient() {
 
         if (isLoadError) {
           // Prefer the label tracked for the session the backend named in the
-          // error; only fall back to the most recent pending load when the
-          // error carries no structured session ID.
+          // error. Codeless (legacy) errors may only borrow the pending-entry
+          // identity when exactly one load is pending: with several pending
+          // loads the most-recent fallback would attribute the failure to an
+          // arbitrary session, clear its label, and wrongly navigate away from
+          // a session that loaded fine.
           const pendingEntries = Array.from(pendingLoadLabelsRef.current.entries());
-          const fallbackEntry = pendingEntries[pendingEntries.length - 1];
+          const fallbackEntry = pendingEntries.length === 1 ? pendingEntries[0] : undefined;
           const failedSessionId = errorSessionId ?? fallbackEntry?.[0] ?? null;
           const failedLabel = failedSessionId != null
             ? pendingLoadLabelsRef.current.get(failedSessionId)

@@ -194,7 +194,21 @@ pub(crate) async fn backfill_remote_events(
             match last_seq {
                 // Reached the host tip (§16.5).
                 Some(seq) if seq >= tip => break,
-                Some(seq) => after = seq,
+                // Defend against non-monotonic pages: the cursor must advance,
+                // otherwise the same page would be requested forever.
+                Some(seq) if seq > after => after = seq,
+                Some(seq) => {
+                    tracing::warn!(
+                        target: "remote::event_backfill",
+                        session_id = %session_id,
+                        node_id = %source_node_id,
+                        attachment_id,
+                        after,
+                        page_last_seq = seq,
+                        "backfill stopped: host page did not advance the cursor"
+                    );
+                    break;
+                }
                 // Empty page: stream exhausted.
                 None => break,
             }
