@@ -23,10 +23,19 @@ use super::*;
 
 use crate::error::AgentError;
 use crate::session::store::{RemoteSessionBookmark, RemoteSessionBookmarkUpdate};
-use querymt_remote::RemoteTransportFailure;
+use querymt_remote::{DeliveryCertainty, RemoteTransportFailure, RemoteTransportFailureKind};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::Instrument;
+
+/// Shared slot used to hand a prepared-but-uncommitted attachment candidate
+/// back to the connect coordinator when the connect budget cancels the
+/// in-flight recovery future. Parking the candidate keeps it reachable after
+/// the future is dropped, so the coordinator can run the full async teardown
+/// (remote forwarder unsubscribe + relay unlink) that plain `Drop` cannot.
+type PreparedCandidateSlot = std::sync::Arc<
+    std::sync::Mutex<Option<crate::agent::session_registry::PreparedRemoteAttachment>>,
+>;
 
 // ── Reason / outcome / result types ─────────────────────────────────────
 
@@ -160,6 +169,9 @@ pub(crate) enum RemoteSessionConnectError {
     BookmarkMissing { session_id: String },
     /// The bookmark store itself failed; refused rather than guessing.
     BookmarkLookupFailed { session_id: String, message: String },
+    /// The bookmark could not be persisted before the attachment was
+    /// committed; refused rather than connecting without durable identity.
+    BookmarkSaveFailed { session_id: String, message: String },
     /// Local durable/actor state conflicts with a remote attachment.
     LocationConflict { session_id: String, message: String },
     /// Mesh runtime is not bootstrapped locally, so no remote work is possible.
@@ -178,7 +190,11 @@ pub(crate) enum RemoteSessionConnectError {
     /// The recovery budget elapsed before a connected attachment existed.
     TimedOut { budget_ms: u64 },
     /// A candidate attachment failed the bounded control health check.
-    HealthCheckFailed { session_id: String, message: String },
+    HealthCheckFailed {
+        session_id: String,
+        transport: Option<RemoteTransportFailure>,
+        message: String,
+    },
     /// The host is reachable but explicitly reports the session does not exist
     /// there (resume-side `RemoteSessionNotFound`). Kept distinct so callers
     /// get a not-found (-32002) response, not a transient-looking failure.
@@ -195,6 +211,7 @@ impl RemoteSessionConnectError {
         match self {
             Self::BookmarkMissing { .. } => "session_bookmark_missing",
             Self::BookmarkLookupFailed { .. } => "session_bookmark_lookup_failed",
+            Self::BookmarkSaveFailed { .. } => "session_bookmark_save_failed",
             Self::LocationConflict { .. } => "session_location_conflict",
             Self::MeshUnavailable { .. } => "remote_node_unavailable",
             Self::NodeUnavailable { .. } => "remote_node_unavailable",
@@ -209,9 +226,9 @@ impl RemoteSessionConnectError {
     /// `None` when the failure is local/structural rather than transport.
     pub(crate) fn transport_failure(&self) -> Option<&RemoteTransportFailure> {
         match self {
-            Self::NodeUnavailable { transport, .. } | Self::RecoveryFailed { transport, .. } => {
-                transport.as_ref()
-            }
+            Self::NodeUnavailable { transport, .. }
+            | Self::RecoveryFailed { transport, .. }
+            | Self::HealthCheckFailed { transport, .. } => transport.as_ref(),
             _ => None,
         }
     }
@@ -222,6 +239,7 @@ impl RemoteSessionConnectError {
         match self {
             Self::BookmarkMissing { .. }
             | Self::BookmarkLookupFailed { .. }
+            | Self::BookmarkSaveFailed { .. }
             | Self::LocationConflict { .. }
             | Self::SessionNotFoundOnHost { .. } => false,
             Self::MeshUnavailable { .. }
@@ -248,6 +266,7 @@ impl RemoteSessionConnectError {
         match self {
             Self::BookmarkMissing { session_id }
             | Self::BookmarkLookupFailed { session_id, .. }
+            | Self::BookmarkSaveFailed { session_id, .. }
             | Self::LocationConflict { session_id, .. }
             | Self::HealthCheckFailed { session_id, .. } => {
                 data["session_id"] = serde_json::Value::String(session_id.clone());
@@ -289,6 +308,13 @@ impl std::fmt::Display for RemoteSessionConnectError {
                 f,
                 "failed to read bookmark for remote session '{session_id}': {message}"
             ),
+            Self::BookmarkSaveFailed {
+                session_id,
+                message,
+            } => write!(
+                f,
+                "failed to persist bookmark for remote session '{session_id}': {message}"
+            ),
             Self::LocationConflict {
                 session_id,
                 message,
@@ -323,6 +349,7 @@ impl std::fmt::Display for RemoteSessionConnectError {
             Self::HealthCheckFailed {
                 session_id,
                 message,
+                ..
             } => write!(
                 f,
                 "remote session '{session_id}' attachment failed health verification: {message}"
@@ -594,17 +621,37 @@ impl LocalAgentHandle {
 
         // ── Bounded recovery.
         let budget = options.reason.connect_budget();
+        let prepared_slot: PreparedCandidateSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
         let recovery = tokio::time::timeout(
             budget,
-            self.recover_remote_attachment(session_id, options, mesh, node_id, bookmark),
+            self.recover_remote_attachment(
+                session_id,
+                options,
+                mesh,
+                node_id,
+                bookmark,
+                &prepared_slot,
+            ),
         )
         .await;
 
         match recovery {
             Ok(connected) => connected,
             Err(_) => {
-                // Dropping an in-flight prepared attachment synchronously kills
-                // and deregisters its candidate relay; the old generation stays installed.
+                // The budget cancelled the recovery future. Any candidate it
+                // had already prepared is parked in the slot: abort it
+                // explicitly so cancellation still unsubscribes the remote
+                // forwarder and unlinks the relay (plain Drop only kills the
+                // relay and deregisters its DHT names). The old generation
+                // stays installed.
+                let parked = prepared_slot
+                    .lock()
+                    .expect("prepared candidate slot poisoned")
+                    .take();
+                if let Some(prepared) = parked {
+                    crate::agent::session_registry::abort_prepared_remote_attachment(prepared)
+                        .await;
+                }
                 Err(RemoteSessionConnectError::TimedOut {
                     budget_ms: budget.as_millis() as u64,
                 })
@@ -622,6 +669,7 @@ impl LocalAgentHandle {
         mesh: crate::agent::remote::MeshHandle,
         node_id: String,
         bookmark: Option<RemoteSessionBookmark>,
+        prepared_slot: &PreparedCandidateSlot,
     ) -> Result<ConnectedRemoteSession, RemoteSessionConnectError> {
         let peer_label = bookmark
             .as_ref()
@@ -669,6 +717,7 @@ impl LocalAgentHandle {
                     None,
                     &merged,
                     RemoteConnectOutcome::Resumed,
+                    prepared_slot,
                 )
                 .await;
         }
@@ -694,6 +743,7 @@ impl LocalAgentHandle {
                     Some(matched_scope),
                     &merged,
                     RemoteConnectOutcome::Reattached,
+                    prepared_slot,
                 )
                 .await
             {
@@ -796,6 +846,7 @@ impl LocalAgentHandle {
             None,
             &merged,
             RemoteConnectOutcome::Resumed,
+            prepared_slot,
         )
         .await
     }
@@ -811,6 +862,7 @@ impl LocalAgentHandle {
         preferred_scope: Option<crate::agent::remote::scope::MeshScopeId>,
         bookmark: &RemoteSessionBookmark,
         outcome: RemoteConnectOutcome,
+        prepared_slot: &PreparedCandidateSlot,
     ) -> Result<ConnectedRemoteSession, RemoteSessionConnectError> {
         let (context, expected_attachment_id) = {
             let registry = self.registry.lock().await;
@@ -839,13 +891,32 @@ impl LocalAgentHandle {
         .await
         .map_err(|error| RemoteSessionConnectError::HealthCheckFailed {
             session_id: session_id.to_string(),
+            transport: None,
             message: error.to_string(),
         })?;
         let session_ref = prepared.session_ref().clone();
         let attachment_id = prepared.attachment_id();
 
+        // Park the candidate while the health check is awaited: if the connect
+        // budget cancels this future mid-check, the coordinator finds the
+        // candidate in the slot and runs the full async teardown (remote
+        // unsubscribe + unlink) instead of the Drop-only partial cleanup.
+        {
+            let mut parked = prepared_slot
+                .lock()
+                .expect("prepared candidate slot poisoned");
+            debug_assert!(parked.is_none(), "prepared candidate slot must be empty");
+            *parked = Some(prepared);
+        }
+
         let health_timeout = Self::remote_connect_health_timeout();
-        match tokio::time::timeout(health_timeout, session_ref.get_mode()).await {
+        let health = tokio::time::timeout(health_timeout, session_ref.get_mode()).await;
+        let prepared = prepared_slot
+            .lock()
+            .expect("prepared candidate slot poisoned")
+            .take()
+            .expect("prepared candidate parked before health check");
+        match health {
             Ok(Ok(_mode)) => {}
             Ok(Err(error)) => {
                 log::warn!(
@@ -857,6 +928,7 @@ impl LocalAgentHandle {
                 crate::agent::session_registry::abort_prepared_remote_attachment(prepared).await;
                 return Err(RemoteSessionConnectError::HealthCheckFailed {
                     session_id: session_id.to_string(),
+                    transport: error.transport_failure().cloned(),
                     message: error.to_string(),
                 });
             }
@@ -868,12 +940,18 @@ impl LocalAgentHandle {
                     health_timeout.as_millis(),
                 );
                 crate::agent::session_registry::abort_prepared_remote_attachment(prepared).await;
+                let message = format!(
+                    "control health check timed out after {}ms",
+                    health_timeout.as_millis()
+                );
                 return Err(RemoteSessionConnectError::HealthCheckFailed {
                     session_id: session_id.to_string(),
-                    message: format!(
-                        "control health check timed out after {}ms",
-                        health_timeout.as_millis()
-                    ),
+                    transport: Some(RemoteTransportFailure::new(
+                        RemoteTransportFailureKind::ReplyTimeout,
+                        DeliveryCertainty::Unknown,
+                        message.clone(),
+                    )),
+                    message,
                 });
             }
         }
@@ -991,15 +1069,16 @@ impl LocalAgentHandle {
                 title,
             },
         };
-        // A persistence failure is local-storage, not transport: the control
-        // path is healthy, so keep the attachment but log loudly.
-        if let Err(e) = store.save_remote_session_bookmark(&merged).await {
-            log::warn!(
-                "remote session {} connect: bookmark persistence failed (attachment kept): {}",
-                session_id,
-                e
-            );
-        }
+        // First-time identity (and any confirmed node move) must be durable
+        // before the attachment is committed (plan §6): propagate a typed
+        // error instead of connecting without durable identity.
+        store
+            .save_remote_session_bookmark(&merged)
+            .await
+            .map_err(|e| RemoteSessionConnectError::BookmarkSaveFailed {
+                session_id: session_id.to_string(),
+                message: e.to_string(),
+            })?;
         Ok(merged)
     }
 

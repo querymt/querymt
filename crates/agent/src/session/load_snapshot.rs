@@ -227,6 +227,10 @@ async fn journal_backed_audit_view(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use querymt::{LLMParams, chat::ChatRole};
+
     use super::{SessionLoadSnapshot, load_session_snapshot, user_prompt_records};
     use crate::acp::protocol::{ContentBlock, ImageContent, TextContent};
     use crate::agent::agent_config_builder::AgentConfigBuilder;
@@ -241,8 +245,6 @@ mod tests {
     use crate::session::provider::SessionProvider;
     use crate::session::store::{RemoteSessionBookmark, SessionStore};
     use crate::test_utils::{MockSessionStore, empty_plugin_registry};
-    use querymt::{LLMParams, chat::ChatRole};
-    use std::sync::Arc;
 
     #[test]
     fn user_prompt_projection_preserves_message_identity_order_and_blocks() {
