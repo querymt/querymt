@@ -234,7 +234,7 @@ mod tests {
     use crate::session::backend::StorageBackend;
     use crate::session::error::{SessionError, SessionResult};
     use crate::session::projection::{
-        AuditView, RedactedView, RedactionPolicy, RecentModelsView, SessionGroup,
+        AuditView, RecentModelsView, RedactedView, RedactionPolicy, SessionGroup,
         SessionListFilter, SessionListItem, SessionListMetaStats, SessionListView, SessionScope,
         SummaryView, ViewStore,
     };
@@ -509,10 +509,9 @@ mod tests {
         // missing (view store errors), so the snapshot is journal-backed, and
         // `get_history` reports `SessionNotFound`. The snapshot must still
         // succeed with an empty user-prompt list.
-        let snapshot =
-            load_session_snapshot(&agent, Arc::new(FailingAuditViewStore), &session_id)
-                .await
-                .unwrap();
+        let snapshot = load_session_snapshot(&agent, Arc::new(FailingAuditViewStore), &session_id)
+            .await
+            .unwrap();
         assert!(snapshot.audit.events.is_empty());
         assert_eq!(snapshot.user_prompts, Some(Vec::new()));
     }

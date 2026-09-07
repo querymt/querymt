@@ -1055,10 +1055,7 @@ impl InstalledRemoteAttachment {
 }
 
 #[cfg(feature = "remote")]
-async fn cleanup_attachment_parts(
-    parts: RemoteAttachmentCleanupParts<'_>,
-    notify_remote: bool,
-) {
+async fn cleanup_attachment_parts(parts: RemoteAttachmentCleanupParts<'_>, notify_remote: bool) {
     let RemoteAttachmentCleanupParts {
         session_id,
         session_ref,

@@ -1342,7 +1342,9 @@ impl Message<crate::agent::messages::GetEventStreamSince> for SessionActor {
         // `LIMIT ?` cast nor materialize the whole stream in one reply, and
         // floor negative cursors at zero. Error mapping and response flow
         // unchanged.
-        let limit = msg.limit.min(crate::agent::messages::MAX_EVENT_STREAM_PAGE_SIZE);
+        let limit = msg
+            .limit
+            .min(crate::agent::messages::MAX_EVENT_STREAM_PAGE_SIZE);
         let after_source_seq = msg.after_source_seq.map(|seq| seq.max(0));
         let events = journal
             .load_session_stream(&self.session_id, after_source_seq, Some(limit))

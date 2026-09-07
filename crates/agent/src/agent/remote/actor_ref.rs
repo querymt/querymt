@@ -174,12 +174,10 @@ impl SessionActorRef {
     )]
     pub async fn prompt_agent(&self, req: PromptRequest) -> Result<PromptResponse, AgentError> {
         match self {
-            Self::Local(actor_ref) => {
-                actor_ref
-                    .ask(messages::Prompt { req })
-                    .await
-                    .map_err(Self::map_local_agent_send_error)
-            }
+            Self::Local(actor_ref) => actor_ref
+                .ask(messages::Prompt { req })
+                .await
+                .map_err(Self::map_local_agent_send_error),
 
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
