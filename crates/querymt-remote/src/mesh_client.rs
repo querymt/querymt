@@ -212,13 +212,21 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         host: &Self::HostRef,
         request: &crate::ProviderChatRequest,
     ) -> Result<crate::ProviderChatResponse, LLMError> {
+        let encoded_bytes = crate::provider_transport::remote_ask_request_size(
+            host,
+            request,
+            Some(Self::PROVIDER_CONTROL_TIMEOUT),
+            Some(Self::PROVIDER_CHAT_REPLY_TIMEOUT),
+        )?;
+        crate::provider_transport::ensure_mesh_request_fits(encoded_bytes)?;
+
         host.ask(request)
             .mailbox_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
             .reply_timeout(Self::PROVIDER_CHAT_REPLY_TIMEOUT)
             .send()
             .await
             .map_err(|e| match crate::remote_send_error_base(e) {
-                Ok(err) => err,
+                Ok(err) => crate::provider_transport::remap_legacy_oversize_eof(err, encoded_bytes),
                 Err(handler) => crate::decode_payload_handler_error(
                     &serde_json::to_string(&handler.to_payload())
                         .unwrap_or_else(|_| handler.to_string()),
@@ -231,10 +239,16 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         host: &Self::HostRef,
         request: GenericProviderStreamRequest<Self::RemoteRouterRef>,
     ) -> Result<(), LLMError> {
-        host.tell(&request)
-            .send_ack()
-            .await
-            .map_err(remote_send_error_to_llm_error_no_handler)
+        let encoded_bytes =
+            crate::provider_transport::remote_tell_request_size(host, &request, None)?;
+        crate::provider_transport::ensure_mesh_request_fits(encoded_bytes)?;
+
+        host.tell(&request).send_ack().await.map_err(|error| {
+            crate::provider_transport::remap_legacy_oversize_eof(
+                remote_send_error_to_llm_error_no_handler(error),
+                encoded_bytes,
+            )
+        })
     }
 
     async fn cancel_stream(

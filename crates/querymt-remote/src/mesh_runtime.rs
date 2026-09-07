@@ -21,6 +21,13 @@ use crate::{
     MeshStateStore, MeshTransportMode, SignedInviteGrant, default_mesh_state_path,
 };
 
+fn messaging_config(request_timeout: std::time::Duration) -> remote::messaging::Config {
+    remote::messaging::Config::default()
+        .with_request_timeout(request_timeout)
+        .with_request_size_maximum(crate::provider_transport::MESH_MESSAGE_SIZE_MAXIMUM)
+        .with_response_size_maximum(crate::provider_transport::MESH_MESSAGE_SIZE_MAXIMUM)
+}
+
 pub async fn bootstrap_mesh_runtime(
     config: &MeshRuntimeConfig,
 ) -> Result<MeshRuntimeHandle, MeshError> {
@@ -132,12 +139,8 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
             .map_err(|e: std::convert::Infallible| -> MeshError { match e {} })?
             .with_behaviour(|key| {
                 let local_peer_id = key.public().to_peer_id();
-                let kameo_behaviour = remote::Behaviour::new(
-                    local_peer_id,
-                    remote::messaging::Config::default()
-                        .with_request_timeout(config.request_timeout)
-                        .with_response_size_maximum(50 * 1024 * 1024),
-                );
+                let kameo_behaviour =
+                    remote::Behaviour::new(local_peer_id, messaging_config(config.request_timeout));
                 let mdns_behaviour = if enable_mdns {
                     let mdns_config = libp2p::mdns::Config {
                         ttl: std::time::Duration::from_secs(30),
@@ -173,12 +176,8 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
             .with_quic()
             .with_behaviour(|key| {
                 let local_peer_id = key.public().to_peer_id();
-                let kameo_behaviour = remote::Behaviour::new(
-                    local_peer_id,
-                    remote::messaging::Config::default()
-                        .with_request_timeout(config.request_timeout)
-                        .with_response_size_maximum(50 * 1024 * 1024),
-                );
+                let kameo_behaviour =
+                    remote::Behaviour::new(local_peer_id, messaging_config(config.request_timeout));
                 let mdns_behaviour = if enable_mdns {
                     let mdns_config = libp2p::mdns::Config {
                         ttl: std::time::Duration::from_secs(30),
@@ -213,12 +212,7 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
 
         let local_peer_id = iroh_transport.peer_id;
         let behaviour = UnifiedMeshBehaviour {
-            kameo: remote::Behaviour::new(
-                local_peer_id,
-                remote::messaging::Config::default()
-                    .with_request_timeout(config.request_timeout)
-                    .with_response_size_maximum(50 * 1024 * 1024),
-            ),
+            kameo: remote::Behaviour::new(local_peer_id, messaging_config(config.request_timeout)),
             mdns: None.into(),
         };
 
@@ -511,4 +505,35 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
     );
     handle.set_config_scopes(config.active_scopes());
     Ok(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::io::Cursor;
+    use libp2p::request_response::Codec as _;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct LargeRequest(Vec<u8>);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct EmptyResponse;
+
+    #[tokio::test]
+    async fn shared_messaging_config_applies_the_request_limit() {
+        let protocol = libp2p::StreamProtocol::new("/querymt/mesh-config-test/1");
+        let request = LargeRequest(vec![0_u8; 2 * 1024 * 1024]);
+        let encoded = cbor4ii::serde::to_vec(Vec::new(), &request).unwrap();
+        assert!(encoded.len() as u64 > 1024 * 1024);
+        assert!(encoded.len() as u64 <= crate::provider_transport::MESH_MESSAGE_SIZE_MAXIMUM);
+
+        let mut codec: libp2p::request_response::cbor::codec::Codec<LargeRequest, EmptyResponse> =
+            messaging_config(std::time::Duration::from_secs(1)).into();
+        let decoded = codec
+            .read_request(&protocol, &mut Cursor::new(encoded))
+            .await
+            .expect("the common mesh config must raise the request limit");
+        assert_eq!(decoded.0.len(), 2 * 1024 * 1024);
+    }
 }
