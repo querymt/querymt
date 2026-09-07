@@ -3772,7 +3772,12 @@ mod tests {
             client_input_id: Some("client-dup-1".to_string()),
             expected_run_id: None,
             delivery: InputDelivery::Queue,
-            prompt: vec![],
+            // Must be a valid prompt: submissions are validated before the
+            // receipt cache is consulted, so an empty prompt would be rejected
+            // with InvalidPromptContent and never yield a replayable receipt.
+            prompt: vec![crate::acp::protocol::ContentBlock::Text(
+                crate::acp::protocol::TextContent::new("keyed submission"),
+            )],
         };
 
         let first = f
