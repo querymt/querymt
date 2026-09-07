@@ -517,7 +517,13 @@ async fn open_local_session(
         match load_session_snapshot(&state.agent, state.view_store.clone(), session_id).await {
             Ok(snapshot) => snapshot,
             Err(e) => {
-                let _ = send_error(tx, format!("Failed to load session: {}", e)).await;
+                let _ = send_session_error(
+                    tx,
+                    format!("Failed to load session: {}", e),
+                    None,
+                    Some(session_id),
+                )
+                .await;
                 return;
             }
         };
@@ -556,7 +562,18 @@ async fn open_local_session(
     }
 
     finish_session_open(
-        state, conn_id, session_id, agent_id, profile_id, cwd_path, snapshot, None, None, tx,
+        state,
+        SessionOpenPayload {
+            session_id: session_id.to_string(),
+            agent_id,
+            profile_id,
+            cwd_path,
+            snapshot,
+            connection_state: None,
+            bookmark_node_id: None,
+        },
+        conn_id,
+        tx,
     )
     .await;
 }
@@ -598,7 +615,13 @@ async fn open_remote_bookmarked_session(
         match load_session_snapshot(&state.agent, state.view_store.clone(), session_id).await {
             Ok(snapshot) => snapshot,
             Err(e) => {
-                let _ = send_error(tx, format!("Failed to load session: {}", e)).await;
+                let _ = send_session_error(
+                    tx,
+                    format!("Failed to load session: {}", e),
+                    None,
+                    Some(session_id),
+                )
+                .await;
                 return;
             }
         };
@@ -653,12 +676,11 @@ async fn open_remote_bookmarked_session(
     // 3. On success, reload the snapshot so events relayed while the
     //    attachment was established are included. Exact cursor-based backfill
     //    of missed events is Phase 10.
-    if recovered {
-        if let Ok(fresh) =
+    if recovered
+        && let Ok(fresh) =
             load_session_snapshot(&state.agent, state.view_store.clone(), session_id).await
-        {
-            snapshot = fresh;
-        }
+    {
+        snapshot = fresh;
     }
 
     // Profile metadata follows the same rules as the local open: a persisted
@@ -684,33 +706,50 @@ async fn open_remote_bookmarked_session(
 
     finish_session_open(
         state,
+        SessionOpenPayload {
+            session_id: session_id.to_string(),
+            agent_id,
+            profile_id,
+            cwd_path,
+            snapshot,
+            connection_state,
+            bookmark_node_id: bookmark.map(|b| b.node_id),
+        },
         conn_id,
-        session_id,
-        agent_id,
-        profile_id,
-        cwd_path,
-        snapshot,
-        connection_state,
-        bookmark.map(|b| b.node_id),
         tx,
     )
     .await;
 }
 
-/// Shared tail of the unified open flow: register the connection mapping,
-/// deliver the hydrated snapshot, seed the replay cursor, and refresh state.
-async fn finish_session_open(
-    state: &ServerState,
-    conn_id: &str,
-    session_id: &str,
+/// Everything the shared open tail needs about the session being opened,
+/// bundled so `finish_session_open` stays within clippy's argument budget.
+struct SessionOpenPayload {
+    session_id: String,
     agent_id: String,
     profile_id: Option<String>,
     cwd_path: Option<PathBuf>,
     snapshot: SessionLoadSnapshot,
     connection_state: Option<RemoteSessionConnectionState>,
     bookmark_node_id: Option<String>,
+}
+
+/// Shared tail of the unified open flow: register the connection mapping,
+/// deliver the hydrated snapshot, seed the replay cursor, and refresh state.
+async fn finish_session_open(
+    state: &ServerState,
+    payload: SessionOpenPayload,
+    conn_id: &str,
     tx: &mpsc::Sender<String>,
 ) {
+    let SessionOpenPayload {
+        session_id,
+        agent_id,
+        profile_id,
+        cwd_path,
+        snapshot,
+        connection_state,
+        bookmark_node_id,
+    } = payload;
     #[cfg(not(feature = "remote"))]
     let _ = bookmark_node_id;
 
@@ -731,7 +770,7 @@ async fn finish_session_open(
     }
 
     // Send loaded audit view and persisted undo stack for UI hydration
-    let undo_stack = load_undo_stack(state, session_id).await;
+    let undo_stack = load_undo_stack(state, &session_id).await;
     let cursor = snapshot.cursor.clone();
 
     // Node identity: the live attachment wins; a disconnected open falls back

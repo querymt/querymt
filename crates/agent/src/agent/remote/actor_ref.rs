@@ -178,10 +178,7 @@ impl SessionActorRef {
                 actor_ref
                     .ask(messages::Prompt { req })
                     .await
-                    .map_err(|error| match error {
-                        kameo::error::SendError::HandlerError(error) => error,
-                        other => AgentError::RemoteActor(other.to_string()),
-                    })
+                    .map_err(Self::map_local_agent_send_error)
             }
 
             #[cfg(feature = "remote")]

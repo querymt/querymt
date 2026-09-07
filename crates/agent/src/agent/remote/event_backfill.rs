@@ -37,8 +37,10 @@ use crate::session::projection::NewDurableEvent;
 use super::actor_ref::SessionActorRef;
 
 /// Page size for backfill requests. Bounded so a large gap cannot produce a
-/// single huge message; the loop pages until the host tip is reached.
-const BACKFILL_PAGE_SIZE: usize = 200;
+/// single huge message; the loop pages until the host tip is reached. Pinned
+/// to the host-side `MAX_EVENT_STREAM_PAGE_SIZE` cap so every page is served
+/// in full.
+const BACKFILL_PAGE_SIZE: usize = crate::agent::messages::MAX_EVENT_STREAM_PAGE_SIZE;
 
 /// Backfill durable events for a freshly (re)attached remote session.
 ///

@@ -32,10 +32,9 @@ impl LocalAgentHandle {
                         .map(|value| value.remote_actor_id)
                         .unwrap_or(0);
                     log::info!(
-                        "remote disconnect: session_id={} node_id={} attachment_id={} relay_actor_id={} remote_actor_id={} reason={} matched_current={}",
+                        "remote disconnect: session_id={} node_id={} attachment_id={} remote_actor_id={} reason={} matched_current={}",
                         disconnect.session_id,
                         disconnect.remote_node_id.as_deref().unwrap_or(""),
-                        disconnect.relay_actor_id,
                         disconnect.relay_actor_id,
                         remote_actor_id,
                         disconnect.reason,

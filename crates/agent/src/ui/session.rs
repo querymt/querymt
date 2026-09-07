@@ -245,9 +245,7 @@ pub async fn ensure_session(
             .history_store()
             .get_remote_session_bookmark(session_id)
             .await
-            .map_err(|e| {
-                format!("remote identity lookup failed for session '{session_id}': {e}")
-            })?
+            .map_err(|e| format!("remote identity lookup failed for session '{session_id}': {e}"))?
             .is_some();
         if has_remote_bookmark {
             return Err(format!(

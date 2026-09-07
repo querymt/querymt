@@ -48,8 +48,8 @@
 //! be reused for session commands; use [`classify_remote_send_error`] plus the
 //! operation layer's safety metadata instead.
 
-use std::fmt;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Whether the transport contract proves the remote side never enqueued or
 /// invoked the message. Conservative: only failures with a local proof of

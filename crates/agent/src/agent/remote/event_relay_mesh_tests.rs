@@ -732,7 +732,7 @@ mod event_relay_mesh_tests {
         .expect("prepare stale candidate");
         let stale_commit = registry.install_remote_attachment(stale, Some(first_id));
         assert!(stale_commit.is_err(), "stale commit must be rejected");
-        let (stale, conflict) = stale_commit.err().unwrap();
+        let (stale, conflict) = *stale_commit.err().unwrap();
         assert_eq!(conflict.current_attachment_id, Some(second_id));
         assert_eq!(registry.remote_attachment_id(&session_id), Some(second_id));
 

@@ -331,10 +331,7 @@ impl LocalAgentHandle {
             }
             Err(_) => {
                 crate::agent::session_registry::abort_prepared_remote_attachment(prepared).await;
-                return Err(crate::error::AgentError::RemoteActor(format!(
-                    "remote attachment health check timed out after {}ms",
-                    health_timeout.as_millis()
-                )));
+                return Err(Self::remote_health_check_timeout_error(health_timeout));
             }
         }
 
@@ -381,7 +378,8 @@ impl LocalAgentHandle {
         };
         let old = match commit {
             Ok(old) => old,
-            Err((prepared, conflict)) => {
+            Err(boxed) => {
+                let (prepared, conflict) = *boxed;
                 crate::agent::session_registry::abort_prepared_remote_attachment(prepared).await;
                 return Err(crate::error::AgentError::RemoteActor(format!(
                     "remote attachment changed while preparing session {} (expected={:?}, current={:?})",

@@ -330,6 +330,12 @@ pub struct GetHistory;
 #[derive(Serialize, Deserialize)]
 pub struct GetEventStream;
 
+/// Hard cap on a single `GetEventStreamSince` page (plan §16). Bounds one
+/// reply so an oversized or hostile `limit` can neither wrap the journal's
+/// signed `LIMIT ?` cast nor materialize the whole stream at once; backfill
+/// pages at exactly this size.
+pub(crate) const MAX_EVENT_STREAM_PAGE_SIZE: usize = 200;
+
 /// Retrieve one bounded page of the durable event stream after a source-side
 /// cursor.
 ///

@@ -893,7 +893,8 @@ impl LocalAgentHandle {
         .await;
         let old = match commit {
             Ok(old) => old,
-            Err((prepared, conflict)) => {
+            Err(boxed) => {
+                let (prepared, conflict) = *boxed;
                 crate::agent::session_registry::abort_prepared_remote_attachment(prepared).await;
                 return Err(RemoteSessionConnectError::RecoveryFailed {
                     transport: None,

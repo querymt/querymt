@@ -1336,11 +1336,13 @@ impl Message<crate::agent::messages::GetEventStreamSince> for SessionActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let journal = self.config.event_sink.journal();
-        // Sanitize remote pagination inputs (plan §16): the journal query casts
-        // the limit into a signed i64 (`LIMIT ?`), so bound it to the positive
-        // i64 range to keep a hostile usize from wrapping negative, and floor
-        // negative cursors at zero. Error mapping and response flow unchanged.
-        let limit = msg.limit.min(i64::MAX as usize);
+        // Sanitize remote pagination inputs (plan §16): cap the page at
+        // MAX_EVENT_STREAM_PAGE_SIZE — the fixed backfill page bound — so a
+        // hostile usize can neither wrap negative in the journal's signed i64
+        // `LIMIT ?` cast nor materialize the whole stream in one reply, and
+        // floor negative cursors at zero. Error mapping and response flow
+        // unchanged.
+        let limit = msg.limit.min(crate::agent::messages::MAX_EVENT_STREAM_PAGE_SIZE);
         let after_source_seq = msg.after_source_seq.map(|seq| seq.max(0));
         let events = journal
             .load_session_stream(&self.session_id, after_source_seq, Some(limit))

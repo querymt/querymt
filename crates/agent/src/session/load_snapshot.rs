@@ -109,6 +109,11 @@ pub async fn load_session_snapshot(
     // while offline (plan §11) — so fall back to the local event journal,
     // which keeps cached remote history readable without a live actor
     // (plan invariant 9).
+    // Whether the audit view below was rebuilt from the local journal instead
+    // of a durable projection row. Journal-backed sessions have no local
+    // history rows either, so the history lookup must tolerate
+    // `SessionNotFound`.
+    let mut journal_backed = false;
     let audit = match view_store.get_audit_view(session_id, false).await {
         Ok(audit) => audit,
         Err(e) if is_remote_attached => {
@@ -117,6 +122,7 @@ pub async fn load_session_snapshot(
                 error = %e,
                 "remote session missing local audit projection; loaded journal-backed snapshot"
             );
+            journal_backed = true;
             journal_backed_audit_view(agent, session_id).await?
         }
         Err(e) => {
@@ -151,6 +157,7 @@ pub async fn load_session_snapshot(
                 error = %e,
                 "bookmarked remote session missing local audit projection; loaded journal-backed snapshot"
             );
+            journal_backed = true;
             journal_backed_audit_view(agent, session_id).await?
         }
     };
@@ -158,9 +165,10 @@ pub async fn load_session_snapshot(
     let cursor = cursor_from_events(&audit.events);
     let delegation_updates =
         crate::control::delegation_notifications::delegation_updates_from_events(&audit.events);
-    // Remote attached sessions live on their peer and have no local history
-    // rows, so `get_history` reports `SessionNotFound`. Treat that as an empty
-    // history (no user prompt records) instead of failing the whole snapshot.
+    // Journal-backed sessions (remote attached, or merely bookmarked while
+    // offline) live on their peer and have no local history rows, so
+    // `get_history` reports `SessionNotFound`. Treat that as an empty history
+    // (no user prompt records) instead of failing the whole snapshot.
     let messages = match agent
         .config
         .provider
@@ -169,10 +177,10 @@ pub async fn load_session_snapshot(
         .await
     {
         Ok(messages) => messages,
-        Err(SessionError::SessionNotFound(_)) if is_remote_attached => {
+        Err(SessionError::SessionNotFound(_)) if journal_backed => {
             tracing::debug!(
                 session_id,
-                "remote session missing local history rows; using empty history for snapshot"
+                "journal-backed session missing local history rows; using empty history for snapshot"
             );
             Vec::new()
         }
@@ -224,9 +232,14 @@ mod tests {
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::model::{AgentMessage, MessagePart};
     use crate::session::backend::StorageBackend;
-    use crate::session::error::SessionError;
+    use crate::session::error::{SessionError, SessionResult};
+    use crate::session::projection::{
+        AuditView, RedactedView, RedactionPolicy, RecentModelsView, SessionGroup,
+        SessionListFilter, SessionListItem, SessionListMetaStats, SessionListView, SessionScope,
+        SummaryView, ViewStore,
+    };
     use crate::session::provider::SessionProvider;
-    use crate::session::store::SessionStore;
+    use crate::session::store::{RemoteSessionBookmark, SessionStore};
     use crate::test_utils::{MockSessionStore, empty_plugin_registry};
     use querymt::{LLMParams, chat::ChatRole};
     use std::sync::Arc;
@@ -335,5 +348,172 @@ mod tests {
         });
         let snapshot: SessionLoadSnapshot = serde_json::from_value(value).unwrap();
         assert!(snapshot.user_prompts.is_none());
+    }
+
+    /// View store whose audit lookup always fails, forcing the journal-backed
+    /// fallback path. `load_session_snapshot` only consults `get_audit_view`;
+    /// the remaining methods are unreachable stubs.
+    struct FailingAuditViewStore;
+
+    #[async_trait::async_trait]
+    impl ViewStore for FailingAuditViewStore {
+        async fn get_audit_view(
+            &self,
+            _session_id: &str,
+            _include_children: bool,
+        ) -> SessionResult<AuditView> {
+            Err(SessionError::DatabaseError("no audit projection".into()))
+        }
+
+        async fn get_redacted_view(
+            &self,
+            _session_id: &str,
+            _policy: RedactionPolicy,
+        ) -> SessionResult<RedactedView> {
+            unimplemented!()
+        }
+
+        async fn get_summary_view(&self, _session_id: &str) -> SessionResult<SummaryView> {
+            unimplemented!()
+        }
+
+        async fn get_session_list_view(
+            &self,
+            _filter: Option<SessionListFilter>,
+        ) -> SessionResult<SessionListView> {
+            unimplemented!()
+        }
+
+        async fn browse_session_groups(
+            &self,
+            _cursor: Option<String>,
+            _group_limit: usize,
+            _session_limit_per_group: usize,
+            _session_scope: SessionScope,
+        ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
+            unimplemented!()
+        }
+
+        async fn list_group_sessions(
+            &self,
+            _cwd: Option<String>,
+            _cursor: Option<String>,
+            _limit: usize,
+            _session_scope: SessionScope,
+        ) -> SessionResult<(SessionGroup, usize)> {
+            unimplemented!()
+        }
+
+        async fn list_session_items(
+            &self,
+            _cwd: Option<String>,
+            _cursor: Option<String>,
+            _limit: usize,
+            _session_scope: SessionScope,
+        ) -> SessionResult<(Vec<SessionListItem>, Option<String>, usize)> {
+            unimplemented!()
+        }
+
+        async fn get_session_list_meta_stats(
+            &self,
+            _session_ids: &[String],
+        ) -> SessionResult<std::collections::HashMap<String, SessionListMetaStats>> {
+            unimplemented!()
+        }
+
+        async fn search_sessions(
+            &self,
+            _query: String,
+            _cursor: Option<String>,
+            _limit: usize,
+            _session_scope: SessionScope,
+        ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
+            unimplemented!()
+        }
+
+        async fn list_session_children(
+            &self,
+            _parent_session_id: String,
+            _cursor: Option<String>,
+            _limit: usize,
+        ) -> SessionResult<(SessionGroup, usize)> {
+            unimplemented!()
+        }
+
+        async fn get_atif(
+            &self,
+            _session_id: &str,
+            _options: &crate::export::AtifExportOptions,
+        ) -> SessionResult<crate::export::ATIF> {
+            unimplemented!()
+        }
+
+        async fn get_recent_models_view(
+            &self,
+            _limit_per_workspace: usize,
+        ) -> SessionResult<RecentModelsView> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn bookmarked_unattached_session_tolerates_missing_history() {
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap(),
+        );
+        let session_id = "remote-bookmarked-1".to_string();
+        let mut store = MockSessionStore::new();
+        store
+            .expect_get_history()
+            .withf({
+                let session_id = session_id.clone();
+                move |actual| actual == session_id
+            })
+            .returning(|_| Err(SessionError::SessionNotFound("no local history".into())))
+            .times(1);
+        store
+            .expect_get_remote_session_bookmark()
+            .withf({
+                let session_id = session_id.clone();
+                move |actual| actual == session_id
+            })
+            .returning({
+                let session_id = session_id.clone();
+                move |_| {
+                    Ok(Some(RemoteSessionBookmark {
+                        session_id: session_id.clone(),
+                        node_id: "node-abc".to_string(),
+                        peer_label: "peer-abc".to_string(),
+                        cwd: None,
+                        created_at: 0,
+                        title: None,
+                    }))
+                }
+            })
+            .times(1);
+        let (plugin_registry, _temp_dir) = empty_plugin_registry().unwrap();
+        let provider = Arc::new(SessionProvider::new(
+            Arc::new(plugin_registry),
+            Arc::new(store),
+            LLMParams::new().provider("mock").model("mock-model"),
+        ));
+        let config = Arc::new(
+            AgentConfigBuilder::from_provider(storage.clone(), provider, storage.event_journal())
+                .build(),
+        );
+        let agent = crate::agent::LocalAgentHandle::from_config(config);
+
+        // Bookmarked but unattached remote session: the audit projection is
+        // missing (view store errors), so the snapshot is journal-backed, and
+        // `get_history` reports `SessionNotFound`. The snapshot must still
+        // succeed with an empty user-prompt list.
+        let snapshot =
+            load_session_snapshot(&agent, Arc::new(FailingAuditViewStore), &session_id)
+                .await
+                .unwrap();
+        assert!(snapshot.audit.events.is_empty());
+        assert_eq!(snapshot.user_prompts, Some(Vec::new()));
     }
 }

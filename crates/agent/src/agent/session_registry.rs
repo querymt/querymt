@@ -574,7 +574,7 @@ impl SessionRegistry {
         expected_attachment_id: Option<u64>,
     ) -> Result<
         Option<InstalledRemoteAttachment>,
-        (PreparedRemoteAttachment, RemoteAttachmentInstallConflict),
+        Box<(PreparedRemoteAttachment, RemoteAttachmentInstallConflict)>,
     > {
         let current_attachment_id = self.remote_attachment_id(&prepared.session_id);
         if current_attachment_id != expected_attachment_id
@@ -583,13 +583,13 @@ impl SessionRegistry {
                 .get(&prepared.session_id)
                 .is_some_and(|session_ref| !session_ref.is_remote())
         {
-            return Err((
+            return Err(Box::new((
                 prepared,
                 RemoteAttachmentInstallConflict {
                     expected_attachment_id,
                     current_attachment_id,
                 },
-            ));
+            )));
         }
 
         let session_id = prepared.session_id.clone();
@@ -987,18 +987,7 @@ pub(crate) async fn prepare_remote_attachment(
 /// Tear down a candidate which never became registry-owned.
 #[cfg(feature = "remote")]
 pub(crate) async fn abort_prepared_remote_attachment(mut candidate: PreparedRemoteAttachment) {
-    cleanup_attachment_parts(
-        &candidate.session_id,
-        &candidate.session_ref,
-        candidate.relay_actor_id,
-        &candidate.relay_dht_name,
-        &candidate.registered_relay_names,
-        &candidate.relay_ref,
-        candidate.linked,
-        candidate.mesh.as_ref(),
-        true,
-    )
-    .await;
+    cleanup_attachment_parts(candidate.cleanup_parts(), true).await;
     candidate.armed = false;
 }
 
@@ -1010,18 +999,7 @@ pub(crate) async fn cleanup_installed_remote_attachment(
     notify_remote: bool,
 ) {
     let matched_scope = attachment.matched_scope.clone();
-    cleanup_attachment_parts(
-        &attachment.session_id,
-        &attachment.session_ref,
-        attachment.attachment_id,
-        &attachment.relay_dht_name,
-        &attachment.registered_relay_names,
-        &attachment.relay_ref,
-        attachment.linked,
-        attachment.mesh.as_ref(),
-        notify_remote,
-    )
-    .await;
+    cleanup_attachment_parts(attachment.cleanup_parts(), notify_remote).await;
     log::debug!(
         "remote attachment resources released for {} (scope={:?})",
         attachment.session_id,
@@ -1029,18 +1007,68 @@ pub(crate) async fn cleanup_installed_remote_attachment(
     );
 }
 
+/// Cleanup-relevant view of an attachment, shared by prepared (never
+/// installed) and installed attachments so the cleanup routine takes a single
+/// borrowed argument instead of eight positional ones.
+#[cfg(feature = "remote")]
+struct RemoteAttachmentCleanupParts<'a> {
+    session_id: &'a str,
+    session_ref: &'a SessionActorRef,
+    attachment_id: u64,
+    relay_dht_name: &'a str,
+    registered_relay_names: &'a [String],
+    relay_ref: &'a ActorRef<crate::agent::remote::EventRelayActor>,
+    linked: bool,
+    mesh: Option<&'a crate::agent::remote::MeshHandle>,
+}
+
+#[cfg(feature = "remote")]
+impl PreparedRemoteAttachment {
+    fn cleanup_parts(&self) -> RemoteAttachmentCleanupParts<'_> {
+        RemoteAttachmentCleanupParts {
+            session_id: &self.session_id,
+            session_ref: &self.session_ref,
+            attachment_id: self.relay_actor_id,
+            relay_dht_name: &self.relay_dht_name,
+            registered_relay_names: &self.registered_relay_names,
+            relay_ref: &self.relay_ref,
+            linked: self.linked,
+            mesh: self.mesh.as_ref(),
+        }
+    }
+}
+
+#[cfg(feature = "remote")]
+impl InstalledRemoteAttachment {
+    fn cleanup_parts(&self) -> RemoteAttachmentCleanupParts<'_> {
+        RemoteAttachmentCleanupParts {
+            session_id: &self.session_id,
+            session_ref: &self.session_ref,
+            attachment_id: self.attachment_id,
+            relay_dht_name: &self.relay_dht_name,
+            registered_relay_names: &self.registered_relay_names,
+            relay_ref: &self.relay_ref,
+            linked: self.linked,
+            mesh: self.mesh.as_ref(),
+        }
+    }
+}
+
 #[cfg(feature = "remote")]
 async fn cleanup_attachment_parts(
-    session_id: &str,
-    session_ref: &SessionActorRef,
-    attachment_id: u64,
-    relay_dht_name: &str,
-    registered_relay_names: &[String],
-    relay_ref: &ActorRef<crate::agent::remote::EventRelayActor>,
-    linked: bool,
-    mesh: Option<&crate::agent::remote::MeshHandle>,
+    parts: RemoteAttachmentCleanupParts<'_>,
     notify_remote: bool,
 ) {
+    let RemoteAttachmentCleanupParts {
+        session_id,
+        session_ref,
+        attachment_id,
+        relay_dht_name,
+        registered_relay_names,
+        relay_ref,
+        linked,
+        mesh,
+    } = parts;
     if notify_remote {
         if let Err(error) = session_ref
             .unsubscribe_events(attachment_id, relay_dht_name.to_string())
