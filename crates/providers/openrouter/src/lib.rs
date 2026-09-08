@@ -276,7 +276,10 @@ mod extism_exports {
 mod tests {
     use super::{OpenRouter, OpenRouterFactory};
     use querymt::chat::{StreamChunk, http::HTTPChatProvider};
-    use querymt::{error::LLMError, plugin::HTTPLLMProviderFactory};
+    use querymt::{
+        error::{LLMError, ProviderErrorKind},
+        plugin::HTTPLLMProviderFactory,
+    };
     use serde_json::Value;
 
     fn test_provider() -> OpenRouter {
@@ -312,6 +315,30 @@ mod tests {
             .expect("stream request should build");
         let body: Value = serde_json::from_slice(req.body()).expect("body should be valid json");
         assert_eq!(body.get("stream"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn upstream_idle_timeout_is_retryable() {
+        for code in [serde_json::json!(504), serde_json::json!("504")] {
+            let provider = test_provider();
+            let mut parser = provider
+                .chat_stream_parser()
+                .expect("parser should initialize");
+            let chunk = format!(
+                "data: {{\"error\":{{\"message\":\"Upstream idle timeout exceeded\",\"code\":{code}}}}}\n\n"
+            );
+
+            let error = parser
+                .parse_chunk(chunk.as_bytes())
+                .expect_err("504 error envelope should return an error");
+            assert!(matches!(
+                error,
+                LLMError::ProviderResponseError(ref failure)
+                    if failure.kind() == ProviderErrorKind::UnknownTransient
+                        && failure.code() == Some("504")
+            ));
+            assert!(error.is_retryable());
+        }
     }
 
     #[test]

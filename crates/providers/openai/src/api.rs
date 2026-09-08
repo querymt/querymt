@@ -1388,15 +1388,22 @@ fn map_openai_error_envelope(
         .and_then(openai_error_kind)
         .or_else(|| type_norm.as_deref().and_then(openai_error_kind));
 
-    // Unclassified server-side codes are transient; anything else unknown
-    // defers to the caller's status-based guess.
-    let server_side = matches!(
-        code_norm.as_deref(),
-        Some("server_error" | "internal_server_error")
-    ) || matches!(
-        type_norm.as_deref(),
-        Some("server_error" | "internal_server_error")
-    );
+    // Some OpenAI-compatible providers put an HTTP status in the in-stream
+    // error code. Preserve semantic classifications above, then use server
+    // status codes as transient evidence when the SSE response has no status.
+    let numeric_server_code = code_norm
+        .as_deref()
+        .and_then(|code| code.parse::<u16>().ok())
+        .is_some_and(|code| code == 408 || code == 429 || (500..=599).contains(&code));
+    let server_side = numeric_server_code
+        || matches!(
+            code_norm.as_deref(),
+            Some("server_error" | "internal_server_error")
+        )
+        || matches!(
+            type_norm.as_deref(),
+            Some("server_error" | "internal_server_error")
+        );
     let kind = mapped.unwrap_or(if unknown_transient || server_side {
         ProviderErrorKind::UnknownTransient
     } else {
@@ -2245,6 +2252,44 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
     fn parse_sse_unknown_error_without_server_evidence_is_permanent() {
         let mut tool_states = HashMap::new();
         let chunk = br#"data: {"error":{"message":"vendor failure","code":"vendor_specific"}}
+
+"#;
+
+        let error = parse_openai_sse_chunk(chunk, &mut tool_states).unwrap_err();
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::UnknownPermanent
+        ));
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn parse_sse_numeric_gateway_timeout_is_retryable() {
+        for code in [serde_json::json!(504), serde_json::json!("504")] {
+            let mut tool_states = HashMap::new();
+            let chunk = format!(
+                "data: {{\"error\":{{\"message\":\"Upstream idle timeout exceeded\",\"code\":{code}}}}}\n\n"
+            );
+
+            let error = parse_openai_sse_chunk(chunk.as_bytes(), &mut tool_states)
+                .expect_err("504 error envelope should return an error");
+            match &error {
+                LLMError::ProviderResponseError(failure) => {
+                    assert_eq!(failure.message(), "Upstream idle timeout exceeded");
+                    assert_eq!(failure.code(), Some("504"));
+                    assert_eq!(failure.kind(), ProviderErrorKind::UnknownTransient);
+                }
+                other => panic!("expected ProviderResponseError, got {other}"),
+            }
+            assert!(error.is_retryable());
+        }
+    }
+
+    #[test]
+    fn parse_sse_numeric_client_error_remains_permanent() {
+        let mut tool_states = HashMap::new();
+        let chunk = br#"data: {"error":{"message":"vendor failure","code":499}}
 
 "#;
 

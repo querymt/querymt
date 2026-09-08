@@ -188,8 +188,10 @@ pub struct SessionActor {
     #[cfg(feature = "remote")]
     pub(crate) mesh: Option<crate::agent::remote::MeshHandle>,
 
-    // Tracks EventForwarder task handles by relay actor so unsubscribe can abort.
-    pub(crate) relay_forwarder_handles: HashMap<u64, tokio::task::JoinHandle<()>>,
+    // Tracks owned EventForwarder tasks by relay actor so replacement, unsubscribe,
+    // and SessionActor teardown cancel the corresponding background task.
+    pub(crate) relay_forwarder_handles:
+        HashMap<u64, crate::agent::remote::event_forwarder::EventForwarderHandle>,
 }
 
 #[derive(Clone)]
@@ -1408,6 +1410,12 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
                         ))
                     })?
             };
+
+            // Completed forwarders no longer own a live subscription. Prune them
+            // before installing a generation so repeated reconnects cannot leave
+            // finished task handles in the session actor.
+            self.relay_forwarder_handles
+                .retain(|_, handle| !handle.is_finished());
 
             if let Some(prev_handle) = self.relay_forwarder_handles.remove(&msg.relay_actor_id) {
                 prev_handle.abort();
