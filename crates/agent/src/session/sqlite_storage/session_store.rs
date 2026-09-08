@@ -1916,10 +1916,21 @@ impl SessionStore for SqliteStorage {
     ) -> SessionResult<()> {
         let b = bookmark.clone();
         self.run_blocking(move |conn| {
+            // Metadata-preserving UPSERT (per plan: never reset existing fields
+            // to null, never overwrite the original creation time):
+            // - `created_at` keeps the value from the FIRST insert.
+            // - `cwd`/`title` are replaced only when the update supplies a
+            //   fresh value (COALESCE(excluded, existing)).
+            // - `node_id`/`peer_label` always reflect the latest confirmed node.
             conn.execute(
-                "INSERT OR REPLACE INTO remote_session_bookmarks
+                "INSERT INTO remote_session_bookmarks
                      (session_id, node_id, peer_label, cwd, created_at, title)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     node_id = excluded.node_id,
+                     peer_label = excluded.peer_label,
+                     cwd = COALESCE(excluded.cwd, remote_session_bookmarks.cwd),
+                     title = COALESCE(excluded.title, remote_session_bookmarks.title)",
                 params![
                     b.session_id,
                     b.node_id,
@@ -1954,6 +1965,33 @@ impl SessionStore for SqliteStorage {
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
+        })
+        .await
+    }
+
+    async fn get_remote_session_bookmark(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<RemoteSessionBookmark>> {
+        let sid = session_id.to_string();
+        self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT session_id, node_id, peer_label, cwd, created_at, title
+                 FROM remote_session_bookmarks
+                 WHERE session_id = ?1",
+                params![sid],
+                |row| {
+                    Ok(RemoteSessionBookmark {
+                        session_id: row.get(0)?,
+                        node_id: row.get(1)?,
+                        peer_label: row.get(2)?,
+                        cwd: row.get(3)?,
+                        created_at: row.get(4)?,
+                        title: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
         })
         .await
     }

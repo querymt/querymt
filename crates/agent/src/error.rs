@@ -6,6 +6,7 @@
 
 use agent_client_protocol::Error as AcpError;
 use querymt::error::{LLMErrorPayload, ProviderErrorKind};
+use querymt_remote::RemoteTransportFailure;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -81,6 +82,15 @@ pub enum AgentError {
     // --- Remote / Mesh ---
     #[error("remote actor error: {0}")]
     RemoteActor(String),
+
+    /// A remote transport failure with typed classification.
+    ///
+    /// Unlike [`AgentError::RemoteActor`], this variant stays machine-readable
+    /// so the operation layer can make safe retry decisions (failure kind,
+    /// delivery certainty) without parsing strings. Handler and provider
+    /// errors are never represented as this variant.
+    #[error("{0}")]
+    RemoteTransport(RemoteTransportFailure),
 
     #[error("swarm lookup failed for '{key}': {reason}")]
     SwarmLookupFailed { key: String, reason: String },
@@ -158,6 +168,14 @@ impl From<AgentError> for AcpError {
                 "found": found,
             }));
         }
+        if let AgentError::RemoteTransport(failure) = &e {
+            return AcpError::new(-32603, e.to_string()).data(serde_json::json!({
+                "category": "remote_transport",
+                "kind": failure.kind,
+                "delivery": failure.delivery,
+                "message": failure.message,
+            }));
+        }
 
         let code: i32 = match &e {
             AgentError::MethodNotImplemented { .. } => -32601,
@@ -189,6 +207,22 @@ fn provider_error_metadata(error: &LLMErrorPayload) -> (Option<ProviderErrorKind
             Some(message.clone()),
         ),
         _ => (None, None),
+    }
+}
+
+impl AgentError {
+    /// Wrap a classified remote transport failure.
+    pub fn from_transport_failure(failure: RemoteTransportFailure) -> Self {
+        Self::RemoteTransport(failure)
+    }
+
+    /// Returns the typed transport failure when this error is one, so callers
+    /// can decide about recovery/retry without parsing strings.
+    pub fn transport_failure(&self) -> Option<&RemoteTransportFailure> {
+        match self {
+            Self::RemoteTransport(failure) => Some(failure),
+            _ => None,
+        }
     }
 }
 
@@ -250,6 +284,7 @@ impl From<crate::middleware::error::MiddlewareError> for AgentError {
 mod tests {
     use super::*;
     use agent_client_protocol::ErrorCode;
+    use querymt_remote::{DeliveryCertainty, RemoteTransportFailureKind};
 
     // ── From<AgentError> for AcpError ──────────────────────────────────────
 
@@ -483,6 +518,62 @@ mod tests {
         let acp: AcpError = AgentError::RemoteActor("actor dead".to_string()).into();
         assert_eq!(acp.code, ErrorCode::InternalError);
         assert!(acp.message.contains("actor dead"));
+    }
+
+    #[test]
+    fn remote_transport_maps_to_structured_acp_error() {
+        let acp: AcpError = AgentError::from_transport_failure(RemoteTransportFailure::new(
+            RemoteTransportFailureKind::ConnectionClosed,
+            DeliveryCertainty::Unknown,
+            "connection closed",
+        ))
+        .into();
+        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert!(acp.message.contains("connection closed"));
+        assert!(acp.message.contains("kind=connection_closed"));
+        assert_eq!(
+            acp.data,
+            Some(serde_json::json!({
+                "category": "remote_transport",
+                "kind": "connection_closed",
+                "delivery": "unknown",
+                "message": "connection closed",
+            }))
+        );
+    }
+
+    #[test]
+    fn remote_transport_failure_accessor_roundtrips() {
+        let failure = RemoteTransportFailure::new(
+            RemoteTransportFailureKind::ReplyTimeout,
+            DeliveryCertainty::Unknown,
+            "SubmitInput timed out on remote session",
+        );
+        let error = AgentError::from_transport_failure(failure.clone());
+        assert_eq!(error.transport_failure(), Some(&failure));
+        assert!(
+            AgentError::RemoteActor("x".to_string())
+                .transport_failure()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn remote_transport_serde_roundtrip() {
+        let error = AgentError::from_transport_failure(RemoteTransportFailure::new(
+            RemoteTransportFailureKind::ProtocolMismatch,
+            DeliveryCertainty::NotDelivered,
+            "bad actor type",
+        ));
+        let json = serde_json::to_string(&error).unwrap();
+        let parsed: AgentError = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.transport_failure().map(|f| (f.kind, f.delivery)),
+            Some((
+                RemoteTransportFailureKind::ProtocolMismatch,
+                DeliveryCertainty::NotDelivered
+            ))
+        );
     }
 
     #[test]

@@ -230,6 +230,7 @@ mock! {
             call_ids: &[String],
         ) -> SessionResult<usize>;
         async fn save_remote_session_bookmark(&self, bookmark: &RemoteSessionBookmark) -> SessionResult<()>;
+        async fn get_remote_session_bookmark(&self, session_id: &str) -> SessionResult<Option<RemoteSessionBookmark>>;
         async fn list_remote_session_bookmarks(&self) -> SessionResult<Vec<RemoteSessionBookmark>>;
         async fn remove_remote_session_bookmark(&self, session_id: &str) -> SessionResult<()>;
     }

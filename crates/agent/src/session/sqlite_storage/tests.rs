@@ -13,7 +13,7 @@ use crate::session::domain::ForkOrigin;
 use crate::session::projection::{
     EventJournal, NewDurableEvent, RecentModelEntry, SessionScope, ViewStore,
 };
-use crate::session::store::SessionStore;
+use crate::session::store::{RemoteSessionBookmark, SessionStore};
 
 use super::SqliteStorage;
 use super::migrations::{MIGRATIONS, apply_migrations};
@@ -853,8 +853,247 @@ fn new_durable(session_id: &str, kind: AgentEventKind) -> NewDurableEvent {
         session_id: session_id.to_string(),
         origin: EventOrigin::Local,
         source_node: None,
+        source_node_id: None,
+        source_seq: None,
         kind,
     }
+}
+
+// ── Remote source identity (plan §15/§16) ─────────────────────────────────
+
+#[tokio::test]
+async fn remote_sync_checkpoint_survives_restart_and_live_events_cannot_advance_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sync.db");
+    {
+        let storage = SqliteStorage::connect(path.clone()).await.unwrap();
+        storage
+            .advance_remote_sync_cursor("s1", "node-a", 10, false)
+            .await
+            .unwrap();
+        let mut live = new_durable("s1", AgentEventKind::Cancelled);
+        live.origin = EventOrigin::Remote;
+        live.source_node_id = Some("node-a".into());
+        live.source_seq = Some(21);
+        storage.append_durable_from_source(&live).await.unwrap();
+        assert_eq!(
+            storage.latest_source_seq("s1", "node-a").await.unwrap(),
+            Some(21)
+        );
+    }
+    let storage = SqliteStorage::connect(path).await.unwrap();
+    assert_eq!(
+        storage.remote_sync_cursor("s1", "node-a").await.unwrap(),
+        Some(10)
+    );
+    assert_eq!(
+        storage.remote_sync_cursor("s1", "node-b").await.unwrap(),
+        None
+    );
+    storage
+        .advance_remote_sync_cursor("s1", "node-a", 5, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.remote_sync_cursor("s1", "node-a").await.unwrap(),
+        Some(10)
+    );
+}
+
+#[tokio::test]
+async fn remote_snapshot_orders_host_events_and_preserves_legacy_storage() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    storage
+        .append_durable(&new_durable("s1", AgentEventKind::SessionCreated))
+        .await
+        .unwrap();
+    for (seq, kind) in [
+        (3, AgentEventKind::Cancelled),
+        (1, AgentEventKind::SessionCreated),
+    ] {
+        let mut event = new_durable("s1", kind);
+        event.origin = EventOrigin::Remote;
+        event.source_node_id = Some("node-a".into());
+        event.source_seq = Some(seq);
+        storage.append_durable_from_source(&event).await.unwrap();
+    }
+    assert_eq!(
+        storage
+            .load_remote_session_stream("s1", "node-a")
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    storage
+        .advance_remote_sync_cursor("s1", "node-a", 3, true)
+        .await
+        .unwrap();
+    let snapshot = storage
+        .load_remote_session_stream("s1", "node-a")
+        .await
+        .unwrap();
+    assert_eq!(snapshot.len(), 2);
+    assert!(matches!(snapshot[0].kind, AgentEventKind::SessionCreated));
+    assert!(matches!(snapshot[1].kind, AgentEventKind::Cancelled));
+    assert!(
+        snapshot[0].stream_seq > snapshot[1].stream_seq,
+        "retain local sequence identity, not source sequence"
+    );
+    assert_eq!(
+        storage
+            .load_session_stream("s1", None, None)
+            .await
+            .unwrap()
+            .len(),
+        3,
+        "legacy rows are not deleted"
+    );
+}
+
+#[tokio::test]
+async fn journal_remote_source_insert_is_idempotent() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+
+    let mut event = new_durable("s1", AgentEventKind::SessionCreated);
+    event.origin = EventOrigin::Remote;
+    event.source_node = Some("peer-a".to_string());
+    event.source_node_id = Some("node-a".to_string());
+    event.source_seq = Some(7);
+
+    let first = journal
+        .append_durable_from_source(&event)
+        .await
+        .unwrap()
+        .expect("first insert persists and returns the event");
+    assert_eq!(first.stream_seq, 1);
+    assert!(matches!(first.origin, EventOrigin::Remote));
+
+    // Duplicate replay (same session/node/source_seq) is a no-op: no second
+    // row and no stream_seq allocation (plan §15 "duplicate replay becomes a
+    // no-op").
+    let duplicate = journal.append_durable_from_source(&event).await.unwrap();
+    assert!(
+        duplicate.is_none(),
+        "duplicate source identity must be ignored"
+    );
+    assert_eq!(journal.max_stream_seq("s1").await.unwrap(), 1);
+
+    let stream = journal.load_session_stream("s1", None, None).await.unwrap();
+    assert_eq!(stream.len(), 1);
+    assert_eq!(stream[0].source_node.as_deref(), Some("peer-a"));
+
+    // A different source sequence is a different event.
+    let mut next = event.clone();
+    next.kind = AgentEventKind::Cancelled;
+    next.source_seq = Some(8);
+    assert!(
+        journal
+            .append_durable_from_source(&next)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(journal.max_stream_seq("s1").await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn journal_source_cursor_is_per_session_and_node() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+
+    for (session, node, seq) in [
+        ("s1", "node-a", 5),
+        ("s1", "node-b", 3),
+        ("s2", "node-a", 9),
+    ] {
+        let mut event = new_durable(session, AgentEventKind::SessionCreated);
+        event.source_node_id = Some(node.to_string());
+        event.source_seq = Some(seq);
+        journal
+            .append_durable_from_source(&event)
+            .await
+            .unwrap()
+            .expect("identity insert persists");
+    }
+
+    // Cursors are scoped to (session_id, source_node_id).
+    assert_eq!(
+        journal.latest_source_seq("s1", "node-a").await.unwrap(),
+        Some(5)
+    );
+    assert_eq!(
+        journal.latest_source_seq("s1", "node-b").await.unwrap(),
+        Some(3)
+    );
+    assert_eq!(
+        journal.latest_source_seq("s2", "node-a").await.unwrap(),
+        Some(9)
+    );
+    assert_eq!(
+        journal.latest_source_seq("s2", "node-b").await.unwrap(),
+        None
+    );
+    assert_eq!(
+        journal.latest_source_seq("s3", "node-a").await.unwrap(),
+        None
+    );
+
+    // The maximum source_seq wins over insertion order.
+    let mut event = new_durable("s1", AgentEventKind::Cancelled);
+    event.source_node_id = Some("node-a".to_string());
+    event.source_seq = Some(11);
+    journal
+        .append_durable_from_source(&event)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        journal.latest_source_seq("s1", "node-a").await.unwrap(),
+        Some(11)
+    );
+
+    // Stream tips reflect global stream_seq allocation (s1 owns rows 1, 2
+    // and 4; s2 owns row 3).
+    assert_eq!(journal.max_stream_seq("s1").await.unwrap(), 4);
+    assert_eq!(journal.max_stream_seq("s2").await.unwrap(), 3);
+    assert_eq!(journal.max_stream_seq("s4").await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn journal_legacy_rows_without_source_cursor_remain_readable() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+
+    // Legacy/pre-migration shape: no source identity at all.
+    journal
+        .append_durable(&new_durable("s1", AgentEventKind::SessionCreated))
+        .await
+        .unwrap();
+
+    // The identity-bearing API refuses identity-less events rather than
+    // silently persisting undeduplicatable rows.
+    assert!(
+        journal
+            .append_durable_from_source(&new_durable("s1", AgentEventKind::Cancelled))
+            .await
+            .is_err(),
+        "append_durable_from_source requires source identity"
+    );
+
+    // No cursor can be derived from legacy rows: callers must treat the next
+    // attachment as a new synchronization boundary (plan §16), never guess.
+    assert_eq!(
+        journal.latest_source_seq("s1", "node-a").await.unwrap(),
+        None
+    );
+
+    // Legacy rows remain fully readable in the session stream.
+    let stream = journal.load_session_stream("s1", None, None).await.unwrap();
+    assert_eq!(stream.len(), 1);
+    assert!(matches!(stream[0].origin, EventOrigin::Local));
+    assert_eq!(stream[0].source_node, None);
 }
 
 #[tokio::test]
@@ -888,6 +1127,8 @@ async fn journal_append_durable_returns_correct_fields() {
             session_id: "sess-x".to_string(),
             origin: EventOrigin::Remote,
             source_node: Some("node-a".to_string()),
+            source_node_id: None,
+            source_seq: None,
             kind: AgentEventKind::Cancelled,
         })
         .await
@@ -1353,6 +1594,8 @@ async fn recent_models_view_reads_from_event_journal() {
             session_id: session_id.clone(),
             origin: EventOrigin::Local,
             source_node: None,
+            source_node_id: None,
+            source_seq: None,
             kind: AgentEventKind::ProviderChanged {
                 provider: "anthropic".to_string(),
                 model: "claude-3-opus".to_string(),
@@ -1419,6 +1662,8 @@ async fn recent_models_view_respects_limit_per_workspace() {
                 session_id: session_id.clone(),
                 origin: EventOrigin::Local,
                 source_node: None,
+                source_node_id: None,
+                source_seq: None,
                 kind: AgentEventKind::ProviderChanged {
                     provider: provider.to_string(),
                     model: model.to_string(),
@@ -1454,6 +1699,8 @@ async fn journal_preserves_remote_origin_and_source_node() {
             session_id: "s1".to_string(),
             origin: EventOrigin::Remote,
             source_node: Some("peer-42".to_string()),
+            source_node_id: None,
+            source_seq: None,
             kind: AgentEventKind::SessionCreated,
         })
         .await
@@ -1463,4 +1710,35 @@ async fn journal_preserves_remote_origin_and_source_node() {
     assert_eq!(events.len(), 1);
     assert!(matches!(events[0].origin, EventOrigin::Remote));
     assert_eq!(events[0].source_node.as_deref(), Some("peer-42"));
+}
+
+#[tokio::test]
+async fn remote_bookmark_point_lookup_round_trip() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let bookmark = RemoteSessionBookmark {
+        session_id: "s-rem".to_string(),
+        node_id: "node-1".to_string(),
+        peer_label: "remote-host".to_string(),
+        cwd: Some("/remote/dir".to_string()),
+        created_at: 42,
+        title: Some("My remote session".to_string()),
+    };
+    storage
+        .save_remote_session_bookmark(&bookmark)
+        .await
+        .unwrap();
+
+    let got = storage
+        .get_remote_session_bookmark("s-rem")
+        .await
+        .unwrap()
+        .expect("bookmark must round-trip through the store");
+    assert_eq!(got, bookmark);
+}
+
+#[tokio::test]
+async fn remote_bookmark_point_lookup_missing_returns_none() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let got = storage.get_remote_session_bookmark("absent").await.unwrap();
+    assert_eq!(got, None);
 }

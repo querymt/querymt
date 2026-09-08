@@ -40,7 +40,6 @@ export interface SessionManager {
 export function useSessionManager(): SessionManager {
   const {
     loadSession,
-    attachRemoteSession,
     newSession,
     sessionCreatingRef,
   } = useUiClientActions();
@@ -107,22 +106,14 @@ export function useSessionManager(): SessionManager {
       ? currentSession.title || currentSession.name || currentSession.session_id
       : undefined;
 
-    // Remote sessions that have not yet been attached need attach_remote_session
-    // (which does a DHT lookup and wires up the actor), not load_session (which
-    // only queries the local database and would always fail with "Query returned
-    // no rows" for sessions that live on a remote peer).
-    // If this is a remote session and it's not currently attached, attach first.
-    // Treat missing `attached` as unattached for backward compatibility.
-    if (currentSession?.node_id && currentSession.attached !== true) {
-      console.log('[useSessionManager] Attaching remote session:', urlSessionId, 'on node', currentSession.node_id);
-      attachRemoteSession(currentSession.node_id, urlSessionId, sessionLabel);
-      return;
-    }
-
-    console.log('[useSessionManager] URL changed, loading session:', urlSessionId);
+    // Unified backend open (plan §11/§13): the backend resolves durable
+    // location and reconnects bookmarked remote sessions itself. The frontend
+    // never chooses between load and attach based on cached `attached` state,
+    // so offline bookmarked sessions keep their URL and cached transcript.
+    console.log('[useSessionManager] URL changed, opening session:', urlSessionId);
     loadSession(urlSessionId, sessionLabel);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [urlSessionId, serverSessionId, connected, loadSession, attachRemoteSession, sessionCreatingRef]);
+  }, [urlSessionId, serverSessionId, connected, loadSession, sessionCreatingRef]);
   // ^ sessionGroups is deliberately omitted — use sessionGroupsRef instead.
   
   // --- View state save/restore on URL change ---

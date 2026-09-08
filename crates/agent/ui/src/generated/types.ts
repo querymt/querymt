@@ -127,6 +127,22 @@ export type AgentEventKind =
 	message: string;
 	node_id?: string;
 }}
+	/**
+	 * Ephemeral signal emitted when cursor-based event backfill for a remote
+	 * session finishes after (re)connect (plan §10/§16). Connection and sync
+	 * progress are transient state, never durable history.
+	 */
+	| { type: "remote_session_sync_completed", data: {
+	/** Number of durable events newly persisted by the backfill. */
+	backfilled: number;
+	/**
+	 * True when no source cursor existed (legacy boundary): no exact
+	 * backfill was possible and history may be missing events emitted
+	 * before the first post-upgrade attachment.
+	 */
+	boundary: boolean;
+	node_id?: string;
+}}
 	/** Ephemeral signal emitted when a remote provider host reports liveness while waiting. */
 	| { type: "remote_provider_heartbeat", data: {
 	phase: string;
@@ -1091,6 +1107,19 @@ export interface SchedulesChangedNotification {
 	schedule?: ScheduleInfo;
 }
 
+/**
+ * Explicit transport connectivity for a remote session (plan §12).
+ * 
+ * Local sessions carry no transport connectivity and omit the field. The
+ * legacy `attached` flag remains and is derived from this state
+ * (`attached = connection_state == connected`) for compatibility.
+ */
+export enum RemoteSessionConnectionState {
+	Connecting = "connecting",
+	Connected = "connected",
+	Disconnected = "disconnected",
+}
+
 export interface SessionSummary {
 	session_id: string;
 	name?: string;
@@ -1106,6 +1135,7 @@ export interface SessionSummary {
 	node?: string;
 	node_id?: string;
 	attached?: boolean;
+	connection_state?: RemoteSessionConnectionState;
 	runtime_state?: string;
 }
 
@@ -1727,6 +1757,12 @@ export type UiServerMessage =
 }}
 	| { type: "error", data: {
 	message: string;
+	/**
+	 * Stable machine-readable error code (plan §13); omitted for
+	 * connection-level errors that are not session-scoped.
+	 */
+	code?: string;
+	session_id?: string;
 }}
 	| { type: "session_list", data: {
 	groups: SessionGroup[];
@@ -1744,6 +1780,7 @@ export type UiServerMessage =
 	agent_id: string;
 	profile_id?: string;
 	node_id?: string;
+	connection_state?: RemoteSessionConnectionState;
 	audit: AuditView;
 	undo_stack: UndoStackFrame[];
 	cursor: StreamCursor;

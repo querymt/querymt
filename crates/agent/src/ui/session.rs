@@ -6,9 +6,7 @@
 use super::error::format_prefixed_error_chain;
 use super::messages::{RoutingMode, UiAgentInfo, UiProfileInfo, UiPromptBlock, UiServerMessage};
 use super::{ServerState, cursor_from_events};
-use crate::acp::protocol::{
-    ContentBlock, LoadSessionRequest, NewSessionRequest, PromptRequest, SessionId,
-};
+use crate::acp::protocol::{ContentBlock, LoadSessionRequest, NewSessionRequest, SessionId};
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::core::AgentMode;
 use crate::agent::handle::AgentHandle as AgentHandleTrait;
@@ -19,6 +17,7 @@ use querymt::chat::ReasoningEffort;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 pub const PRIMARY_AGENT_ID: &str = "primary";
 
@@ -50,6 +49,12 @@ pub async fn ensure_sessions_for_mode_with_profile(
 }
 
 /// Send a prompt to agents based on the current routing mode.
+///
+/// The interactive UI path uses acknowledged `SubmitInput` (Queue) instead of
+/// the legacy `Prompt` RPC: the caller receives a submission receipt, and a
+/// later safe retry reuses the same `client_input_id`, which the session
+/// actor's bounded receipt cache deduplicates instead of enqueueing a
+/// duplicate turn.
 pub async fn prompt_for_mode(
     state: &ServerState,
     conn_id: &str,
@@ -62,14 +67,14 @@ pub async fn prompt_for_mode(
         RoutingMode::Single => {
             let agent_id = current_active_agent(state, conn_id).await?;
             let session_id = ensure_session(state, conn_id, &agent_id, cwd, tx, None, None).await?;
-            prompt_session(state, &session_id, prompt, cwd).await?;
+            submit_input_queue(state, &session_id, prompt).await?;
         }
         RoutingMode::Broadcast => {
             let agent_ids = list_agent_ids(state).await;
             for agent_id in agent_ids {
                 let session_id =
                     ensure_session(state, conn_id, &agent_id, cwd, tx, None, None).await?;
-                prompt_session(state, &session_id, prompt, cwd).await?;
+                submit_input_queue(state, &session_id, prompt).await?;
             }
         }
     }
@@ -81,41 +86,101 @@ pub async fn build_ui_prompt_blocks(
     session_id: &str,
     prompt: &[UiPromptBlock],
 ) -> Result<(SessionActorRef, Vec<ContentBlock>), String> {
+    #[cfg(feature = "remote")]
+    let session_ref = state
+        .agent
+        .session_ref_for_operation(
+            session_id,
+            crate::agent::handle::session_operation::SessionOperation::SubmitInput {
+                has_key: false,
+            },
+        )
+        .await
+        .map_err(|error| error.into_agent_error().to_string())?
+        .session_ref;
+    #[cfg(not(feature = "remote"))]
     let session_ref = session_ref_for_session(state, session_id)
         .await
         .ok_or_else(|| format!("session not found: {session_id}"))?;
     let session_cwd = session_cwd_for(state, session_id).await;
+    #[cfg(feature = "remote")]
+    if session_ref.is_remote() {
+        let user_text = prompt
+            .iter()
+            .find_map(|block| match block {
+                UiPromptBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let blocks = super::mentions::build_remote_prompt_blocks(
+            &state.agent,
+            session_id,
+            session_cwd.as_ref(),
+            user_text,
+            prompt,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        return Ok((session_ref, blocks));
+    }
     let blocks = super::mentions::build_prompt_blocks(
         &state.workspace_manager,
         session_cwd.as_ref(),
         prompt,
-        Some(&session_ref),
     )
     .await;
     Ok((session_ref, blocks))
 }
 
-async fn prompt_session(
+/// Submit input to a specific session as an acknowledged queued submission.
+///
+/// Legacy `Prompt` is reserved for ACP/compatibility callers; the interactive
+/// UI path uses `SubmitInput { delivery: Queue }` so a submission is either
+/// acknowledged (`Started`/`Queued`) or reported failed, and is never
+/// silently ambiguous. The generated `client_input_id` makes a later safe
+/// retry (same key) idempotent at the session actor's bounded receipt cache.
+async fn submit_input_queue(
     state: &ServerState,
     session_id: &str,
     prompt: &[UiPromptBlock],
-    cwd: Option<&PathBuf>,
 ) -> Result<(), String> {
-    let session_ref = session_ref_for_session(state, session_id)
-        .await
-        .ok_or_else(|| {
-            format_prompt_error(session_id, "unresolved session", "session not found")
-        })?;
-    let session_cwd = session_cwd_for(state, session_id).await.or(cwd.cloned());
-    let prompt_blocks = super::mentions::build_prompt_blocks(
-        &state.workspace_manager,
-        session_cwd.as_ref(),
-        prompt,
-        Some(&session_ref),
-    )
-    .await;
+    let (session_ref, prompt_blocks) = build_ui_prompt_blocks(state, session_id, prompt).await?;
     let prompt_target = prompt_target_for_session_ref(&session_ref);
-    send_prompt(session_ref, session_id, prompt_blocks, &prompt_target).await
+    let message = crate::agent::messages::SubmitInput {
+        session_id: session_id.to_string(),
+        client_input_id: Some(Uuid::new_v4().to_string()),
+        expected_run_id: None,
+        delivery: crate::agent::messages::InputDelivery::Queue,
+        prompt: prompt_blocks,
+    };
+    #[cfg(feature = "remote")]
+    state
+        .agent
+        .execute_session_operation(
+            session_id,
+            crate::agent::handle::session_operation::SessionOperation::SubmitInput {
+                has_key: true,
+            },
+            |session_ref| Box::pin(session_ref.submit_input(message.clone())),
+        )
+        .await
+        .map_err(|error| {
+            format_prompt_error(
+                session_id,
+                &prompt_target,
+                &error.into_agent_error().to_string(),
+            )
+        })?;
+    #[cfg(not(feature = "remote"))]
+    session_ref
+        .submit_input(message)
+        .await
+        .map_err(|err| format_prompt_error(session_id, &prompt_target, &err.to_string()))?;
+    log::info!(
+        "Session {}: UI input acknowledged as queued submission",
+        session_id
+    );
+    Ok(())
 }
 
 fn prompt_target_for_session_ref(session_ref: &SessionActorRef) -> String {
@@ -124,21 +189,6 @@ fn prompt_target_for_session_ref(session_ref: &SessionActorRef) -> String {
     } else {
         "local session".to_string()
     }
-}
-
-/// Send a prompt to a specific session actor.
-async fn send_prompt(
-    session_ref: SessionActorRef,
-    session_id: &str,
-    prompt: Vec<ContentBlock>,
-    prompt_target: &str,
-) -> Result<(), String> {
-    let request = PromptRequest::new(session_id.to_string(), prompt);
-    session_ref
-        .prompt(request)
-        .await
-        .map_err(|err| format_prompt_error(session_id, prompt_target, &err.message))?;
-    Ok(())
 }
 
 fn format_prompt_error(session_id: &str, prompt_target: &str, message: &str) -> String {
@@ -165,15 +215,34 @@ pub async fn ensure_session(
             .and_then(|conn| conn.sessions.get(agent_id).cloned())
     };
     if let Some(session_id) = &existing {
-        let root_session_ref = {
-            let registry = state.agent.registry.lock().await;
-            registry.get(session_id).cloned()
-        };
-        if root_session_ref
-            .as_ref()
-            .is_some_and(SessionActorRef::is_remote)
+        use crate::session::location::{SessionLocation, resolve_session_location};
+        match resolve_session_location(
+            state.agent.config.provider.history_store().as_ref(),
+            session_id,
+        )
+        .await
+        .map_err(|e| e.to_string())?
         {
-            return Ok(session_id.clone());
+            SessionLocation::Conflict { .. } => return Err("session_location_conflict".into()),
+            SessionLocation::Remote { .. } => {
+                #[cfg(feature = "remote")]
+                {
+                    state
+                        .agent
+                        .session_ref_for_operation(
+                            session_id,
+                            crate::agent::handle::session_operation::SessionOperation::RuntimeState,
+                        )
+                        .await
+                        .map_err(|e| {
+                            format!("remote_session_unavailable: {}", e.into_agent_error())
+                        })?;
+                    return Ok(session_id.clone());
+                }
+                #[cfg(not(feature = "remote"))]
+                return Err("remote_session_unavailable: remote support disabled".into());
+            }
+            _ => {}
         }
 
         // Verify the session still exists in the registry.
@@ -447,6 +516,20 @@ pub async fn local_agent_for_session(
     session_id: Option<&str>,
     requested_profile_id: Option<&str>,
 ) -> Result<Arc<AgentHandle>, String> {
+    if let Some(session_id) = session_id {
+        use crate::session::location::{SessionLocation, resolve_session_location};
+        match resolve_session_location(
+            state.agent.config.provider.history_store().as_ref(),
+            session_id,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        {
+            SessionLocation::Remote { .. } => return Ok(state.agent.clone()),
+            SessionLocation::Conflict { .. } => return Err("session_location_conflict".to_string()),
+            _ => {}
+        }
+    }
     let profile_id =
         resolve_profile_id_for_session(state, session_id, requested_profile_id).await?;
     local_agent_for_profile(state, profile_id.as_deref()).await
@@ -504,29 +587,74 @@ pub async fn default_reasoning_effort_for_session(
         .and_then(|agent| **agent.default_reasoning_effort.load())
 }
 
-pub async fn mode_for_session(state: &ServerState, session_id: Option<&str>) -> AgentMode {
-    if let Some(session_id) = session_id
-        && let Some(session_ref) = session_ref_for_session(state, session_id).await
-        && let Ok(mode) = session_ref.get_mode().await
-    {
-        return mode;
+pub async fn mode_for_session(
+    state: &ServerState,
+    session_id: Option<&str>,
+) -> Result<AgentMode, String> {
+    #[cfg(feature = "remote")]
+    if let Some(id) = session_id {
+        let agent = local_agent_for_session(state, Some(id), None).await?;
+        if agent
+            .config
+            .provider
+            .history_store()
+            .get_remote_session_bookmark(id)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return agent
+                .execute_session_operation(
+                    id,
+                    crate::agent::handle::session_operation::SessionOperation::GetMode,
+                    |sr| Box::pin(sr.get_mode()),
+                )
+                .await
+                .map_err(|e| e.into_agent_error().to_string());
+        }
     }
-
-    default_mode_for_session(state, session_id).await
+    if let Some(id) = session_id
+        && let Some(sr) = session_ref_for_session(state, id).await
+        && let Ok(mode) = sr.get_mode().await
+    {
+        return Ok(mode);
+    }
+    Ok(default_mode_for_session(state, session_id).await)
 }
 
 pub async fn reasoning_effort_for_session(
     state: &ServerState,
     session_id: Option<&str>,
-) -> Option<ReasoningEffort> {
-    if let Some(session_id) = session_id
-        && let Some(session_ref) = session_ref_for_session(state, session_id).await
-        && let Ok(effort) = session_ref.get_reasoning_effort().await
-    {
-        return effort;
+) -> Result<Option<ReasoningEffort>, String> {
+    #[cfg(feature = "remote")]
+    if let Some(id) = session_id {
+        let agent = local_agent_for_session(state, Some(id), None).await?;
+        if agent
+            .config
+            .provider
+            .history_store()
+            .get_remote_session_bookmark(id)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return agent
+                .execute_session_operation(
+                    id,
+                    crate::agent::handle::session_operation::SessionOperation::GetReasoningEffort,
+                    |sr| Box::pin(sr.get_reasoning_effort()),
+                )
+                .await
+                .map_err(|e| e.into_agent_error().to_string());
+        }
     }
-
-    default_reasoning_effort_for_session(state, session_id).await
+    if let Some(id) = session_id
+        && let Some(sr) = session_ref_for_session(state, id).await
+        && let Ok(effort) = sr.get_reasoning_effort().await
+    {
+        return Ok(effort);
+    }
+    Ok(default_reasoning_effort_for_session(state, session_id).await)
 }
 
 pub async fn list_profiles(state: &ServerState) -> Result<Vec<UiProfileInfo>, String> {
@@ -638,6 +766,10 @@ mod tests {
     use crate::agent::core::AgentMode;
     use crate::api::{AgentInfra, ProfileRuntimeHandle};
     use crate::profiles::{LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager};
+    #[cfg(feature = "remote")]
+    use crate::session::backend::StorageBackend;
+    #[cfg(feature = "remote")]
+    use crate::session::store::RemoteSessionBookmark;
     use crate::test_utils::{TestServerState, empty_plugin_registry};
     use crate::ui::messages::UiPromptBlock;
     #[cfg(feature = "remote")]
@@ -798,15 +930,46 @@ system = "inline"
 
         fixture
             .agent
+            .storage
+            .session_store()
+            .save_remote_session_bookmark(&RemoteSessionBookmark {
+                session_id: session_id.to_string(),
+                node_id: "remote-peer".into(),
+                peer_label: "remote-peer".into(),
+                cwd: None,
+                created_at: 1,
+                title: None,
+            })
+            .await
+            .unwrap();
+        // These UI unit tests deliberately model legacy/corrupt registrations,
+        // including synthetic node IDs. Coordinator validation is tested separately.
+        let context = fixture
+            .agent
             .handle
-            .attach_remote_session(
-                session_id.to_string(),
-                remote_ref,
-                "remote-peer".to_string(),
-                None,
-                None,
-            )
-            .await;
+            .registry
+            .lock()
+            .await
+            .remote_attachment_prepare_context();
+        let candidate = crate::agent::session_registry::prepare_remote_attachment(
+            context,
+            session_id.to_string(),
+            remote_ref,
+            "remote-peer".to_string(),
+            None,
+            None,
+            Some("remote-peer".to_string()),
+        )
+        .await
+        .expect("prepare test relay");
+        fixture
+            .agent
+            .handle
+            .registry
+            .lock()
+            .await
+            .install_remote_attachment(candidate, None)
+            .unwrap_or_else(|_| panic!("install test relay"));
     }
 
     #[cfg(feature = "remote")]
@@ -868,10 +1031,14 @@ system = "inline"
         assert!(profiles.session_binding(&resolved).await.is_none());
     }
 
+    /// Phase 7: idle UI turns use acknowledged Queue `SubmitInput` instead of
+    /// the legacy `Prompt` RPC. A remote submission must be acknowledged
+    /// against the remote actor and must never hydrate the local profile
+    /// runtime for a session that is not a local row.
     #[cfg(feature = "remote")]
     #[tokio::test]
     async fn prompt_for_mode_uses_root_remote_actor_when_connection_session_is_remote() {
-        let (fixture, _profiles, _dir) = profile_fixture().await;
+        let (fixture, profiles, _dir) = profile_fixture().await;
         let conn_id = "conn-remote-prompt";
         let (tx, _rx) = fixture.add_connection(conn_id).await;
         let session_id = format!("remote-prompt-{}", Uuid::now_v7());
@@ -884,7 +1051,7 @@ system = "inline"
                 .insert(PRIMARY_AGENT_ID.to_string(), session_id.clone());
         }
 
-        let err = prompt_for_mode(
+        prompt_for_mode(
             &fixture.state,
             conn_id,
             &[UiPromptBlock::Text {
@@ -894,15 +1061,103 @@ system = "inline"
             &tx,
         )
         .await
-        .expect_err("test remote actor has no provider, but prompt should target remote actor");
+        .expect("queue submission to the attached remote actor should be acknowledged");
 
         assert!(
-            err.contains("remote node 'remote-peer'"),
-            "expected remote prompt target, got: {err}"
+            profiles.session_binding(&session_id).await.is_none(),
+            "remote submission must not be routed through local profile runtime"
         );
         assert!(
-            !err.contains("local session"),
-            "remote prompt must not be routed through local profile runtime: {err}"
+            fixture
+                .agent
+                .storage
+                .session_store()
+                .get_session(&session_id)
+                .await
+                .expect("local session lookup should succeed")
+                .is_none(),
+            "submitting input to a remote session must not create a local session row"
+        );
+    }
+
+    /// Guardrail (Phase 1): a connection bound to a bookmarked-but-unattached
+    /// remote session must never create a local replacement session. The
+    /// bookmark is the authoritative identity record for the session; absence
+    /// of a live attachment means "disconnected", not "destroyed".
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn ensure_session_never_creates_local_substitute_for_bookmarked_remote_binding() {
+        let (fixture, _profiles, _dir) = profile_fixture().await;
+        let conn_id = "conn-remote-bookmark-no-create";
+        let (tx, _rx) = fixture.add_connection(conn_id).await;
+        let session_id = format!("remote-bookmark-no-create-{}", Uuid::now_v7());
+
+        fixture
+            .agent
+            .storage
+            .session_store()
+            .save_remote_session_bookmark(&RemoteSessionBookmark {
+                session_id: session_id.clone(),
+                node_id: "offline-node".to_string(),
+                peer_label: "remote-peer".to_string(),
+                cwd: None,
+                created_at: 123,
+                title: None,
+            })
+            .await
+            .expect("bookmark should persist");
+
+        // Bind the connection to the remote session ID without attaching an
+        // actor (simulates a dropped/disconnected remote).
+        {
+            let mut connections = fixture.state.connections.lock().await;
+            connections
+                .get_mut(conn_id)
+                .expect("connection exists")
+                .sessions
+                .insert(PRIMARY_AGENT_ID.to_string(), session_id.clone());
+        }
+
+        let result = ensure_session(
+            &fixture.state,
+            conn_id,
+            PRIMARY_AGENT_ID,
+            None,
+            &tx,
+            None,
+            None,
+        )
+        .await;
+
+        let err = result.expect_err(
+            "ensure_session must refuse creating a local substitute for a bookmarked remote ID",
+        );
+        assert!(
+            err.contains("remote_session_unavailable"),
+            "expected a typed remote-unavailable error, got: {err}"
+        );
+
+        // The connection binding survives: it will be needed by a later
+        // explicit reconnect. It must NOT have been cleared as "stale".
+        let survived = {
+            let connections = fixture.state.connections.lock().await;
+            connections
+                .get(conn_id)
+                .and_then(|c| c.sessions.get(PRIMARY_AGENT_ID).cloned())
+        };
+        assert_eq!(survived.as_deref(), Some(session_id.as_str()));
+
+        // And no local session row was minted for this remote ID.
+        let local_row = fixture
+            .agent
+            .storage
+            .session_store()
+            .get_session(&session_id)
+            .await
+            .expect("session row lookup should succeed");
+        assert!(
+            local_row.is_none(),
+            "no local session row may be created for a bookmarked remote ID"
         );
     }
 }

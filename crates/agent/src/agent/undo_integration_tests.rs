@@ -514,6 +514,8 @@ async fn append_prompt_event(
             session_id: session_id.to_string(),
             origin: EventOrigin::Local,
             source_node: None,
+            source_node_id: None,
+            source_seq: None,
             kind: AgentEventKind::PromptReceived {
                 content: "test prompt".to_string(),
                 message_id: Some(message_id.to_string()),
@@ -531,6 +533,8 @@ async fn append_generic_event(journal: &dyn EventJournal, session_id: &str) -> i
             session_id: session_id.to_string(),
             origin: EventOrigin::Local,
             source_node: None,
+            source_node_id: None,
+            source_seq: None,
             kind: AgentEventKind::Cancelled,
         })
         .await

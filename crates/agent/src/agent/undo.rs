@@ -46,9 +46,21 @@ pub enum UndoError {
     #[error("Actor send error: {0}")]
     ActorSend(String),
 
+    /// A classified remote transport failure (failure kind + delivery
+    /// certainty), preserved for safe retry decisions by the operation layer.
+    #[error("{0}")]
+    Transport(querymt_remote::RemoteTransportFailure),
+
     /// Catch-all for unexpected errors.
     #[error("{0}")]
     Other(String),
+}
+
+impl UndoError {
+    /// Wrap a classified remote transport failure.
+    pub fn from_transport_failure(f: querymt_remote::RemoteTransportFailure) -> Self {
+        UndoError::Transport(f)
+    }
 }
 
 impl From<crate::snapshot::SnapshotError> for UndoError {

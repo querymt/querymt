@@ -14,6 +14,7 @@ import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { ChevronDown } from 'lucide-react';
 import { useUiClientActions, useUiClientEvents, useUiClientSession, useUiClientConfig } from '../context/UiClientContext';
+import { RemoteSessionConnectionState } from '../types';
 import { useUiStore } from '../store/uiStore';
 import { useVoiceOutput } from '../hooks/useVoiceOutput';
 import { useVoiceStore } from '../store/voiceStore';
@@ -53,8 +54,9 @@ export function ChatView() {
   // Split context subscriptions — ChatView subscribes to Events + Session + Actions
   // (no Config context), so auth/model-list/plugin changes won't trigger re-renders.
   const {
-    sendPrompt,
+    attachRemoteSession,
     submitInput,
+    subscribeSession,
     requestRuntimeState,
     cancelSession,
     deleteSession,
@@ -101,6 +103,7 @@ export function ChatView() {
     undoState,
     schedules,
     loadedSessionNodeIds,
+    sessionConnectionStates,
   } = useUiClientSession();
 
   // UI state from Zustand store
@@ -156,6 +159,24 @@ export function ChatView() {
   );
   const currentSessionNodeId = currentSession?.node_id ?? (sessionId ? loadedSessionNodeIds[sessionId] ?? undefined : undefined);
   const currentSessionIsRemote = Boolean(currentSession?.node || currentSession?.attached !== undefined || currentSession?.runtime_state);
+  // Explicit connection state (plan §12): the loaded/ephemeral state wins —
+  // session_loaded and remote_session_disconnected write it as soon as the
+  // newest state is known, before the session list refreshes. The list
+  // summary is the fallback when no loaded state exists yet.
+  const currentSessionConnectionState =
+    (sessionId ? sessionConnectionStates[sessionId] : undefined) ??
+    currentSession?.connection_state;
+  // A defined connection state is only written for remote sessions
+  // (remote_session_disconnected, or session_loaded with node info), so it
+  // identifies a remote session on its own — including sessions absent from
+  // the possibly stale session-list summary.
+  const showRemoteConnectionBanner =
+    currentSessionConnectionState !== undefined &&
+    currentSessionConnectionState !== RemoteSessionConnectionState.Connected;
+  const handleReconnectRemoteSession = () => {
+    if (!sessionId || !currentSessionNodeId) return;
+    attachRemoteSession(currentSessionNodeId, sessionId);
+  };
   const remoteNodeIdPending = currentSessionIsRemote && sessionId && currentSession?.node_id === undefined && !(sessionId in loadedSessionNodeIds);
 
   // Fetch schedules when session changes, but wait for remote node resolution first.
@@ -191,6 +212,8 @@ export function ChatView() {
   const previousThinkingAgentIdRef = useRef<string | null>(null);
   const mentionInputRef = useRef<HTMLTextAreaElement>(null);
   const promptRef = useRef(prompt);
+  const activeSessionRef = useRef(sessionId);
+  activeSessionRef.current = sessionId;
   const activeIndexStatus = sessionId ? workspaceIndexStatus[sessionId]?.status : undefined;
 
   promptRef.current = prompt;
@@ -284,26 +307,22 @@ export function ChatView() {
 
   const handleSendPrompt = async (delivery?: 'steer' | 'queue') => {
     if (!prompt.trim() || loading || !sessionId) return;
-
-    fileMention.clear();
+    const submittedDraft = prompt;
+    const submittedSession = sessionId;
     followArmedRef.current = followNewMessages;
-
     setLoading(true);
     try {
-      const blocks = buildPromptBlocksFromInput(prompt);
-      const activeDelivery = delivery ?? (runtimeState?.steerable ? 'steer' : undefined);
-      if (activeDelivery) {
-        const result = submitInput(activeDelivery, blocks, sessionId);
-        if (result.accepted) {
+      const result = submitInput(delivery ?? (runtimeState?.steerable ? 'steer' : 'queue'),
+        buildPromptBlocksFromInput(submittedDraft), submittedSession);
+      if (result.accepted && await result.acknowledgement) {
+        // Do not erase edits or another session's draft while awaiting the receipt.
+        if (useUiStore.getState().prompt === submittedDraft && activeSessionRef.current === submittedSession) {
           setPrompt('');
-        } else {
-          followArmedRef.current = false;
-          requestRuntimeState(sessionId);
-          console.warn(`Input was not submitted: ${result.reason}`);
+          fileMention.clear();
         }
       } else {
-        await sendPrompt(blocks);
-        setPrompt('');
+        followArmedRef.current = false;
+        requestRuntimeState(submittedSession);
       }
     } catch (err) {
       followArmedRef.current = false;
@@ -1039,6 +1058,39 @@ export function ChatView() {
         </div>
       )}
 
+      {/* Remote session connection state (plan §12/§13): disconnection is a
+          recoverable session state — URL, transcript, and draft are preserved. */}
+      {showRemoteConnectionBanner && (
+        <div
+          data-testid="remote-connection-banner"
+          className="mx-4 mb-2 px-4 py-2 rounded-lg border border-status-warning/40 bg-surface-elevated text-xs text-status-warning flex items-center gap-2 animate-fade-in"
+        >
+          <span
+            className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+              currentSessionConnectionState === RemoteSessionConnectionState.Connecting
+                ? 'bg-status-warning animate-pulse'
+                : 'bg-status-warning'
+            }`}
+          />
+          <span className="flex-1">
+            {currentSessionConnectionState === RemoteSessionConnectionState.Connecting
+              ? 'Connecting to remote session…'
+              : 'Remote session disconnected — history shown from local cache.'}
+          </span>
+          {currentSessionConnectionState === RemoteSessionConnectionState.Disconnected &&
+            currentSessionNodeId && (
+              <button
+                type="button"
+                data-testid="remote-reconnect-button"
+                onClick={handleReconnectRemoteSession}
+                className="px-2 py-0.5 rounded border border-status-warning/60 text-status-warning hover:bg-status-warning/10"
+              >
+                Reconnect
+              </button>
+            )}
+        </div>
+      )}
+
       {/* Input Area */}
       <ChatInputBar
         mentionInputRef={mentionInputRef}
@@ -1053,6 +1105,12 @@ export function ChatView() {
         sessionThinkingAgentId={sessionThinkingAgentId}
         runtimeState={runtimeState}
         pendingInputs={pendingInputs}
+        onReconcile={() => {
+          if (sessionId) {
+            subscribeSession(sessionId);
+            requestRuntimeState(sessionId);
+          }
+        }}
         rateLimitState={rateLimitState}
         activeIndexStatus={activeIndexStatus}
         allFiles={fileMention.allFiles}

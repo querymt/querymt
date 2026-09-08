@@ -25,6 +25,8 @@ use tokio::sync::mpsc;
 pub(crate) struct RemoteSessionDisconnect {
     pub session_id: String,
     pub relay_actor_id: u64,
+    pub remote_node_id: Option<String>,
+    pub reason: String,
 }
 
 #[derive(Clone)]
@@ -82,6 +84,8 @@ impl Actor for EventRelayActor {
             let _ = disconnect_tx.send(RemoteSessionDisconnect {
                 session_id: self.session_id.clone(),
                 relay_actor_id,
+                remote_node_id: self.remote_node_id.clone(),
+                reason: reason.to_string(),
             });
         }
         Ok(ControlFlow::Continue(()))
@@ -161,16 +165,50 @@ impl Message<RelayedEvent> for EventRelayActor {
         // ephemeral events are published to fanout only.
         match classify_durability(&event.kind) {
             Durability::Durable => {
-                if let Err(e) = self
-                    .event_sink
-                    .emit_durable_with_origin(
-                        &event.session_id,
-                        event.kind,
-                        EventOrigin::Remote,
-                        source_node,
-                    )
-                    .await
-                {
+                // Source identity (plan §15/§16): the host journal sequence
+                // rides in `AgentEvent.seq` and the bookmark node id is the
+                // stable dedup key (`source_node`/hostname is display
+                // metadata only). With identity, persistence is idempotent
+                // per `(session_id, source_node_id, source_seq)`, so overlap
+                // between the live relay and reconnect backfill is a no-op.
+                let source_node_id = self.remote_node_id.clone();
+                let source_seq = (event.seq > 0).then_some(event.seq);
+                let result = match (source_node_id, source_seq) {
+                    (Some(node_id), Some(seq)) => self
+                        .event_sink
+                        .emit_durable_from_source(
+                            &event.session_id,
+                            event.kind,
+                            source_node,
+                            node_id,
+                            seq,
+                        )
+                        .await
+                        .map(|inserted| {
+                            if inserted.is_none() {
+                                tracing::trace!(
+                                    target: "remote::event_relay",
+                                    source = %self.source_label,
+                                    source_seq = seq,
+                                    session_id = %event.session_id,
+                                    "duplicate relayed durable event ignored (source identity already persisted)"
+                                );
+                            }
+                        }),
+                    // No stable identity available (pre-bookmark attachment or
+                    // legacy host): fall back to non-idempotent persistence.
+                    _ => self
+                        .event_sink
+                        .emit_durable_with_origin(
+                            &event.session_id,
+                            event.kind,
+                            EventOrigin::Remote,
+                            source_node,
+                        )
+                        .await
+                        .map(|_| ()),
+                };
+                if let Err(e) = result {
                     log::warn!(
                         "EventRelayActor({}): failed to persist relayed durable event: {}",
                         self.source_label,
@@ -262,6 +300,104 @@ mod tests {
         } else {
             panic!("expected durable event envelope");
         }
+    }
+
+    /// Relayed durable events persist remote source identity (plan §15):
+    /// the bookmark node id is the stable dedup key and `AgentEvent.seq` is
+    /// the source-side cursor. A duplicate replay of the same identity is a
+    /// no-op — exactly one journal row.
+    #[tokio::test]
+    async fn relayed_durable_event_persists_source_identity_and_dedups() {
+        let (sink, journal) = make_relay_with_sink("test-remote").await;
+        let relay = EventRelayActor::new(
+            sink.clone(),
+            "test-session".to_string(),
+            "test-remote".to_string(),
+            Some("node-a".to_string()),
+            None,
+        );
+        let relay_ref = <EventRelayActor as kameo::actor::Spawn>::spawn(relay);
+
+        let event = AgentEvent {
+            seq: 7,
+            timestamp: 1234567890,
+            session_id: "test-session".to_string(),
+            origin: EventOrigin::Remote,
+            source_node: Some("remote-a".to_string()),
+            kind: AgentEventKind::SessionCreated,
+        };
+
+        // ask() awaits handler completion, so both deliveries are processed
+        // deterministically before assertions.
+        relay_ref
+            .ask(RelayedEvent {
+                event: event.clone(),
+            })
+            .await
+            .expect("first relay processed");
+        relay_ref
+            .ask(RelayedEvent { event })
+            .await
+            .expect("duplicate relay processed");
+
+        // Source identity persisted: cursor query sees the host sequence.
+        assert_eq!(
+            journal
+                .latest_source_seq("test-session", "node-a")
+                .await
+                .unwrap(),
+            Some(7)
+        );
+        let stream = journal
+            .load_session_stream("test-session", None, None)
+            .await
+            .unwrap();
+        assert_eq!(stream.len(), 1, "duplicate replay must not double-persist");
+        assert_eq!(stream[0].source_node.as_deref(), Some("remote-a"));
+        assert!(matches!(stream[0].origin, EventOrigin::Remote));
+    }
+
+    /// Relayed durable events without a stable node id (legacy attachments)
+    /// keep the pre-Phase-10 behavior: persisted with origin metadata but no
+    /// source cursor.
+    #[tokio::test]
+    async fn relayed_durable_event_without_node_id_has_no_source_cursor() {
+        let (sink, journal) = make_relay_with_sink("test-remote").await;
+        let relay = EventRelayActor::new(
+            sink,
+            "test-session".to_string(),
+            "test-remote".to_string(),
+            None,
+            None,
+        );
+        let relay_ref = <EventRelayActor as kameo::actor::Spawn>::spawn(relay);
+
+        let event = AgentEvent {
+            seq: 5,
+            timestamp: 1234567890,
+            session_id: "test-session".to_string(),
+            origin: EventOrigin::Remote,
+            source_node: Some("remote-a".to_string()),
+            kind: AgentEventKind::SessionCreated,
+        };
+        relay_ref
+            .ask(RelayedEvent { event })
+            .await
+            .expect("relay processed");
+
+        assert_eq!(
+            journal
+                .latest_source_seq("test-session", "node-a")
+                .await
+                .unwrap(),
+            None,
+            "no stable node id → no source cursor"
+        );
+        let stream = journal
+            .load_session_stream("test-session", None, None)
+            .await
+            .unwrap();
+        assert_eq!(stream.len(), 1, "event still persisted");
     }
 
     /// Remote durable events relayed through EventRelayActor must be persisted
@@ -527,5 +663,7 @@ mod tests {
         let disconnect = disconnect_rx.recv().await.expect("disconnect message");
         assert_eq!(disconnect.session_id, "session-disconnect");
         assert_eq!(disconnect.relay_actor_id, actor_ref.id().sequence_id());
+        assert_eq!(disconnect.remote_node_id.as_deref(), Some("node-123"));
+        assert!(disconnect.reason.contains("peer disconnected"));
     }
 }

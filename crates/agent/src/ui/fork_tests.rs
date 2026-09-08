@@ -97,6 +97,8 @@ async fn fork_session_from_selected_message_succeeds() -> Result<()> {
             session_id: source_session_id.clone(),
             origin: EventOrigin::Local,
             source_node: None,
+            source_node_id: None,
+            source_seq: None,
             kind: AgentEventKind::PromptReceived {
                 content: "Fork from here".to_string(),
                 message_id: Some(user_message_id.clone()),
@@ -108,6 +110,8 @@ async fn fork_session_from_selected_message_succeeds() -> Result<()> {
             session_id: source_session_id.clone(),
             origin: EventOrigin::Local,
             source_node: None,
+            source_node_id: None,
+            source_seq: None,
             kind: AgentEventKind::ToolCallStart {
                 tool_call_id: "tc-1".to_string(),
                 tool_name: "read_tool".to_string(),
@@ -120,6 +124,8 @@ async fn fork_session_from_selected_message_succeeds() -> Result<()> {
             session_id: source_session_id.clone(),
             origin: EventOrigin::Local,
             source_node: None,
+            source_node_id: None,
+            source_seq: None,
             kind: AgentEventKind::AssistantMessageStored {
                 content: "Assistant kept in fork".to_string(),
                 thinking: None,

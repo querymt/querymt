@@ -10,120 +10,20 @@ impl LocalAgentHandle {
         self.model_inventory.invalidate_all().await;
     }
 
-    /// Attempt to re-attach a remote session from a persisted bookmark.
-    ///
-    /// Performs a DHT lookup for the session, and if found, attaches it to the
-    /// local registry (spawning an EventRelayActor and sending SubscribeEvents).
-    ///
-    /// Returns `Ok(session_ref)` on success, or an error if the mesh is not
-    /// active, the session is not found in the DHT, or the attach fails.
+    /// Attempt to re-attach a remote session through the shared coordinator.
     #[cfg(feature = "remote")]
     pub async fn reattach_from_bookmark(
         &self,
         bookmark: &crate::session::store::RemoteSessionBookmark,
     ) -> Result<crate::agent::remote::SessionActorRef, crate::error::AgentError> {
-        let mesh = self
-            .mesh()
-            .ok_or(crate::error::AgentError::MeshNotBootstrapped)?;
-
-        let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
-        let mut remote_ref = None;
-        let mut matched_scope = None;
-        for scope in runtime.active_scopes() {
-            let dht_name =
-                crate::agent::remote::scope::scoped_session(&scope, &bookmark.session_id);
-            let lookup = runtime
-                .lookup_actor::<crate::agent::session_actor::SessionActor>(dht_name.clone())
-                .await
-                .map_err(|e| crate::error::AgentError::SwarmLookupFailed {
-                    key: dht_name.clone(),
-                    reason: e.to_string(),
-                })?;
-            if let Some(found) = lookup {
-                remote_ref = Some(found);
-                matched_scope = Some(scope);
-                break;
-            }
-        }
-        let remote_ref =
-            remote_ref.ok_or_else(|| crate::error::AgentError::RemoteSessionNotFound {
-                details: format!(
-                    "bookmarked session {} not found in DHT",
-                    bookmark.session_id
-                ),
-            })?;
-
-        let mut registry = self.registry.lock().await;
-        let session_ref = registry
-            .attach_remote_session(
-                bookmark.session_id.clone(),
-                remote_ref,
-                bookmark.peer_label.clone(),
-                Some(mesh),
-                matched_scope,
-                Some(bookmark.node_id.clone()),
-            )
-            .await;
-
-        Ok(session_ref)
-    }
-
-    /// Like [`reattach_from_bookmark`] but uses a single DHT lookup with **no
-    /// retries**.
-    ///
-    /// Intended for bulk bookmark reattach during session listing where we
-    /// prefer a fast failure over spending ~1.75 s per stale bookmark.
-    #[cfg(feature = "remote")]
-    pub async fn reattach_from_bookmark_quick(
-        &self,
-        bookmark: &crate::session::store::RemoteSessionBookmark,
-    ) -> Result<crate::agent::remote::SessionActorRef, crate::error::AgentError> {
-        let mesh = self
-            .mesh()
-            .ok_or(crate::error::AgentError::MeshNotBootstrapped)?;
-
-        let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
-        let mut remote_ref = None;
-        let mut matched_scope = None;
-        for scope in runtime.active_scopes() {
-            let dht_name =
-                crate::agent::remote::scope::scoped_session(&scope, &bookmark.session_id);
-            let lookup = runtime
-                .lookup_actor_no_retry::<crate::agent::session_actor::SessionActor>(
-                    dht_name.clone(),
-                )
-                .await
-                .map_err(|e| crate::error::AgentError::SwarmLookupFailed {
-                    key: dht_name.clone(),
-                    reason: e.to_string(),
-                })?;
-            if let Some(found) = lookup {
-                remote_ref = Some(found);
-                matched_scope = Some(scope);
-                break;
-            }
-        }
-        let remote_ref =
-            remote_ref.ok_or_else(|| crate::error::AgentError::RemoteSessionNotFound {
-                details: format!(
-                    "bookmarked session {} not found in DHT",
-                    bookmark.session_id
-                ),
-            })?;
-
-        let mut registry = self.registry.lock().await;
-        let session_ref = registry
-            .attach_remote_session(
-                bookmark.session_id.clone(),
-                remote_ref,
-                bookmark.peer_label.clone(),
-                Some(mesh),
-                matched_scope,
-                Some(bookmark.node_id.clone()),
-            )
-            .await;
-
-        Ok(session_ref)
+        self.ensure_remote_session_connected(
+            &bookmark.session_id,
+            Some(&bookmark.node_id),
+            super::remote_connect::RemoteConnectReason::StartupReattach,
+        )
+        .await
+        .map(|connected| connected.session_ref)
+        .map_err(|error| crate::error::AgentError::RemoteActor(error.to_string()))
     }
 
     /// Resolve a `SessionHandoff` into a concrete remote actor reference.

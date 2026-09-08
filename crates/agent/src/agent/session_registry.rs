@@ -148,15 +148,70 @@ pub struct SessionMaterialization {
 struct RemoteRelayRegistration {
     relay_actor_id: u64,
     relay_dht_name: String,
+    registered_relay_names: Vec<String>,
     relay_ref: ActorRef<crate::agent::remote::EventRelayActor>,
     linked: bool,
+    mesh: Option<crate::agent::remote::MeshHandle>,
+    matched_scope: Option<MeshScopeId>,
+}
+
+/// Read-only metadata for the currently installed remote attachment.
+#[cfg(feature = "remote")]
+#[derive(Clone)]
+pub(crate) struct RemoteAttachmentSnapshot {
+    pub(crate) session_ref: SessionActorRef,
+    pub(crate) attachment_id: u64,
+    pub(crate) remote_actor_id: u64,
+    pub(crate) node_id: Option<String>,
+    pub(crate) peer_label: String,
+    pub(crate) matched_scope: Option<MeshScopeId>,
+}
+
+/// Fully prepared control + relay attachment which has not yet been published
+/// in the registry. Preparation performs all remote work before commit.
+#[cfg(feature = "remote")]
+pub(crate) struct PreparedRemoteAttachment {
+    armed: bool,
+    session_id: String,
+    session_ref: SessionActorRef,
+    relay_actor_id: u64,
+    relay_dht_name: String,
+    registered_relay_names: Vec<String>,
+    relay_ref: ActorRef<crate::agent::remote::EventRelayActor>,
+    linked: bool,
+    mesh: Option<crate::agent::remote::MeshHandle>,
+    matched_scope: Option<MeshScopeId>,
+}
+
+/// Complete installed attachment returned when registry ownership is removed.
+/// Cleanup is deliberately asynchronous and must happen after releasing the
+/// registry lock.
+#[cfg(feature = "remote")]
+pub(crate) struct InstalledRemoteAttachment {
+    pub(crate) session_id: String,
+    pub(crate) session_ref: SessionActorRef,
+    pub(crate) attachment_id: u64,
+    pub(crate) remote_actor_id: u64,
+    relay_dht_name: String,
+    registered_relay_names: Vec<String>,
+    relay_ref: ActorRef<crate::agent::remote::EventRelayActor>,
+    linked: bool,
+    mesh: Option<crate::agent::remote::MeshHandle>,
+    matched_scope: Option<MeshScopeId>,
 }
 
 #[cfg(feature = "remote")]
-#[derive(Clone, Copy)]
-struct RemoteDetachOptions {
-    preserve_bookmark: bool,
-    notify_remote: bool,
+#[derive(Debug)]
+pub(crate) struct RemoteAttachmentInstallConflict {
+    pub(crate) expected_attachment_id: Option<u64>,
+    pub(crate) current_attachment_id: Option<u64>,
+}
+
+#[cfg(feature = "remote")]
+#[derive(Clone)]
+pub(crate) struct RemoteAttachmentPrepareContext {
+    pub(crate) event_sink: Arc<crate::event_sink::EventSink>,
+    pub(crate) disconnect_tx: Option<mpsc::UnboundedSender<RemoteSessionDisconnect>>,
 }
 
 pub struct SessionRegistry {
@@ -210,6 +265,14 @@ impl SessionRegistry {
         tx: mpsc::UnboundedSender<RemoteSessionDisconnect>,
     ) {
         self.remote_disconnect_tx = Some(tx);
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn remote_attachment_prepare_context(&self) -> RemoteAttachmentPrepareContext {
+        RemoteAttachmentPrepareContext {
+            event_sink: self.config.event_sink.clone(),
+            disconnect_tx: self.remote_disconnect_tx.clone(),
+        }
     }
 
     /// Set the mesh handle so that `remove()` and `detach_remote_session()`
@@ -466,321 +529,139 @@ impl SessionRegistry {
             .collect()
     }
 
-    /// Attach a remote session to this registry.
-    ///
-    /// Wraps the remote actor ref in a `SessionActorRef::Remote`, spawns a local
-    /// `EventRelayActor`, registers it in the swarm (via `into_remote_ref`), and
-    /// sends `SubscribeEvents` to the remote `SessionActor` so events stream back.
-    ///
-    /// # Event relay
-    ///
-    /// The `EventRelayActor` is spawned locally and its `ActorId` is sent to the
-    /// remote session via `SubscribeEvents`. The remote handler constructs a
-    /// `RemoteActorRef<EventRelayActor>` from that id (requires swarm to be
-    /// bootstrapped — Phase 6). Until then the relay is spawned but the
-    /// `SubscribeEvents` call returns Ok without installing the forwarder.
-    ///
-    /// # Returns
-    ///
-    /// The `SessionActorRef::Remote` for the attached session.
+    /// Attachment generation (relay actor id) of the currently installed
+    /// remote attachment, if any. Used by the connection coordinator for
+    /// generation-aware invalidation (plan §2/§3).
     #[cfg(feature = "remote")]
-    pub async fn attach_remote_session(
-        &mut self,
-        session_id: String,
-        remote_ref: kameo::actor::RemoteActorRef<SessionActor>,
-        peer_label: String,
-        mesh: Option<crate::agent::remote::MeshHandle>,
-        preferred_scope: Option<MeshScopeId>,
-        remote_node_id: Option<String>,
-    ) -> SessionActorRef {
-        log::debug!(
-            "attach_remote_session: called for session_id={} peer='{}' \
-             (registry currently has {} session(s))",
-            session_id,
-            peer_label,
-            self.sessions.len(),
-        );
-        use crate::agent::remote::{EventRelayActor, SessionActorRef};
-        use kameo::actor::Spawn;
-
-        // 1. Wrap in SessionActorRef::Remote
-        let session_ref = SessionActorRef::Remote {
-            actor_ref: remote_ref.clone(),
-            peer_label: peer_label.clone(),
-            remote_node_id: remote_node_id.clone(),
-        };
-
-        // 2. Spawn a local EventRelayActor for this session.
-        //    It persists durable remote events to the journal, publishes to fanout,
-        //    and serves as the local endpoint for remote actor linking.
-        let relay_actor = EventRelayActor::new(
-            self.config.event_sink.clone(),
-            session_id.clone(),
-            peer_label.clone(),
-            remote_node_id.clone(),
-            self.remote_disconnect_tx.clone(),
-        );
-        let relay_ref = EventRelayActor::spawn(relay_actor);
-        let relay_id = relay_ref.id().sequence_id();
-
-        // 3. Register the relay in REMOTE_REGISTRY + DHT so the remote
-        //    SessionActor can look it up by name and install an EventForwarder.
-        //    Use peer-scoped name so multiple peers can attach to the same
-        //    session without overwriting each other's relay (Bug 3 fix).
-        let mesh_active = mesh.is_some();
-        let relay_dht_name = if let Some(ref mesh) = mesh {
-            let runtime = MeshRuntimeHandle::from(mesh.clone());
-            let active_scopes = runtime.active_scopes();
-            for scope in &active_scopes {
-                let name = scoped_event_relay(scope, &session_id, mesh.peer_id());
-                runtime.register_actor(relay_ref.clone(), name).await;
-            }
-
-            let selected_scope = select_relay_scope(&active_scopes, preferred_scope);
-            scoped_event_relay(&selected_scope, &session_id, mesh.peer_id())
-        } else {
-            log::debug!(
-                "attach_remote_session: no mesh, DHT registration skipped for relay (session {})",
-                session_id
-            );
-            // Fallback name when there is no mesh (shouldn't happen in practice
-            // but keeps the type system happy).
-            format!("event_relay::{}::local", session_id)
-        };
-
-        // 4. Link the local relay to the remote session actor so we can observe
-        //    peer disconnects and other remote actor lifecycle failures.
-        let linked = match relay_ref.link_remote(&remote_ref).await {
-            Ok(()) => {
-                log::debug!(
-                    "attach_remote_session: linked relay actor {} to remote session {}",
-                    relay_id,
-                    session_id
-                );
-                true
-            }
-            Err(e) => {
-                log::warn!(
-                    "attach_remote_session: failed to link relay actor {} to remote session {}: {}",
-                    relay_id,
-                    session_id,
-                    e
-                );
-                false
-            }
-        };
-
-        // 5. Send SubscribeEvents to the remote session.
-        //    The remote SubscribeEvents handler uses mesh.lookup_actor to find
-        //    the relay and install an EventForwarder on its EventBus.
-        if let Err(e) = session_ref
-            .subscribe_events(relay_id, relay_dht_name.clone())
-            .await
-        {
-            log::warn!(
-                "attach_remote_session: SubscribeEvents failed for {} (event relay may not be active): {}",
-                session_id,
-                e
-            );
-        }
-
-        // 6. Insert into registry and track relay metadata for later cleanup.
-        self.sessions
-            .insert(session_id.clone(), session_ref.clone());
-        self.relay_actor_ids.insert(
-            session_id.clone(),
-            RemoteRelayRegistration {
-                relay_actor_id: relay_id,
-                relay_dht_name: relay_dht_name.clone(),
-                relay_ref: relay_ref.clone(),
-                linked,
-            },
-        );
-
-        // Persist a bookmark so this remote session survives server restart.
-        if let Some(node_id) = remote_node_id {
-            let title = self
-                .config
-                .provider
-                .history_store()
-                .get_session(&session_id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|session| session.name);
-            let bookmark = crate::session::store::RemoteSessionBookmark {
-                session_id: session_id.clone(),
-                node_id,
-                peer_label: peer_label.clone(),
-                cwd: None,
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0),
-                title,
-            };
-            let store = self.config.provider.history_store();
-            tokio::spawn(async move {
-                if let Err(e) = store.save_remote_session_bookmark(&bookmark).await {
-                    log::warn!("Failed to persist remote session bookmark: {}", e);
-                }
-            });
-        }
-
-        log::info!(
-            "Attached remote session {} from {} (relay_actor_id={}, event relay {})",
-            session_id,
-            peer_label,
-            relay_id,
-            if mesh_active {
-                "active"
-            } else {
-                "pending mesh bootstrap"
-            }
-        );
-
-        session_ref
+    pub fn remote_attachment_id(&self, session_id: &str) -> Option<u64> {
+        self.relay_actor_ids
+            .get(session_id)
+            .map(|registration| registration.relay_actor_id)
     }
 
+    /// Snapshot the complete routing identity of the current attachment.
     #[cfg(feature = "remote")]
-    async fn detach_remote_session_inner(
-        &mut self,
-        session_id: &str,
-        options: RemoteDetachOptions,
-    ) -> Option<SessionActorRef> {
-        // Unlink and unsubscribe before removing so the remote forwarder is aborted
-        // and normal local detach does not look like an unexpected disconnect.
-        if options.notify_remote
-            && let (Some(session_ref), Some(relay_reg)) = (
-                self.sessions.get(session_id),
-                self.relay_actor_ids.get(session_id).cloned(),
-            )
-            && session_ref.is_remote()
-        {
-            if let SessionActorRef::Remote { actor_ref, .. } = session_ref
-                && relay_reg.linked
-            {
-                if let Err(e) = relay_reg.relay_ref.unlink_remote(actor_ref).await {
-                    log::warn!(
-                        "detach_remote_session: unlink_remote failed for {} (relay_actor_id={}): {}",
-                        session_id,
-                        relay_reg.relay_actor_id,
-                        e
-                    );
-                } else {
-                    log::debug!(
-                        "detach_remote_session: unlinked relay actor {} from remote session {}",
-                        relay_reg.relay_actor_id,
-                        session_id
-                    );
-                }
-            }
-
-            if let Err(e) = session_ref
-                .unsubscribe_events(relay_reg.relay_actor_id, relay_reg.relay_dht_name.clone())
-                .await
-            {
-                log::warn!(
-                    "detach_remote_session: UnsubscribeEvents failed for {} (relay_actor_id={}, relay_dht_name={}): {}",
-                    session_id,
-                    relay_reg.relay_actor_id,
-                    relay_reg.relay_dht_name,
-                    e
-                );
-            } else {
-                log::info!(
-                    "detach_remote_session: sent UnsubscribeEvents for {} (relay_actor_id={}, relay_dht_name={})",
-                    session_id,
-                    relay_reg.relay_actor_id,
-                    relay_reg.relay_dht_name,
-                );
-            }
-        }
-
-        // Deregister the session and relay actors from the re-registration map
-        // so dead closures don't accumulate (Phase 4 of Bug 1 fix).
-        if let Some(ref mesh) = self.mesh {
-            let runtime = MeshRuntimeHandle::from(mesh.clone());
-            for scope in runtime.active_scopes() {
-                let session_dht_name = scoped_session(&scope, session_id);
-                runtime.deregister_actor(&session_dht_name);
-
-                let relay_name = scoped_event_relay(&scope, session_id, mesh.peer_id());
-                runtime.deregister_actor(&relay_name);
-            }
-        }
-
-        if !options.preserve_bookmark {
-            let store = self.config.provider.history_store();
-            let sid = session_id.to_string();
-            tokio::spawn(async move {
-                if let Err(e) = store.remove_remote_session_bookmark(&sid).await {
-                    log::warn!("Failed to remove remote session bookmark {}: {}", sid, e);
-                }
-            });
-        }
-
-        self.relay_actor_ids.remove(session_id);
-        self.local_actor_refs.remove(session_id);
-        self.sessions.remove(session_id)
-    }
-
-    /// Detach a remote session: send `UnsubscribeEvents` to stop the remote
-    /// `EventForwarder`, then remove the session from the registry.
-    ///
-    /// This is the counterpart to [`attach_remote_session`](Self::attach_remote_session).
-    /// Call this instead of bare `remove()` for remote sessions so the
-    /// forwarder task on the remote node is properly cleaned up.
-    ///
-    /// For local sessions (or if the session is not in the registry) this
-    /// falls back to a plain `remove()`.
-    #[cfg(feature = "remote")]
-    pub async fn detach_remote_session(&mut self, session_id: &str) -> Option<SessionActorRef> {
-        self.detach_remote_session_inner(
-            session_id,
-            RemoteDetachOptions {
-                preserve_bookmark: false,
-                notify_remote: true,
-            },
-        )
-        .await
-    }
-
-    /// Remove a remote session runtime from local tracking but keep its bookmark
-    /// so the stopped session remains visible and resumable.
-    #[cfg(feature = "remote")]
-    pub async fn detach_remote_session_preserve_bookmark(
-        &mut self,
-        session_id: &str,
-    ) -> Option<SessionActorRef> {
-        self.detach_remote_session_inner(
-            session_id,
-            RemoteDetachOptions {
-                preserve_bookmark: true,
-                notify_remote: true,
-            },
-        )
-        .await
-    }
-
-    #[cfg(feature = "remote")]
-    pub(crate) async fn detach_remote_session_if_relay_matches(
-        &mut self,
-        session_id: &str,
-        relay_actor_id: u64,
-    ) -> Option<SessionActorRef> {
+    pub(crate) fn remote_attachment(&self, session_id: &str) -> Option<RemoteAttachmentSnapshot> {
+        let session_ref = self.sessions.get(session_id)?.clone();
         let registration = self.relay_actor_ids.get(session_id)?;
-        if registration.relay_actor_id != relay_actor_id {
+        let SessionActorRef::Remote {
+            actor_ref,
+            peer_label,
+            remote_node_id,
+        } = &session_ref
+        else {
+            return None;
+        };
+        let remote_actor_id = actor_ref.id().sequence_id();
+        let node_id = remote_node_id.clone();
+        let peer_label = peer_label.clone();
+        Some(RemoteAttachmentSnapshot {
+            session_ref,
+            attachment_id: registration.relay_actor_id,
+            remote_actor_id,
+            node_id,
+            peer_label,
+            matched_scope: registration.matched_scope.clone(),
+        })
+    }
+
+    /// Atomically install a prepared attachment if the generation observed by
+    /// the preparer is still current. `None` means no attachment was observed.
+    #[cfg(feature = "remote")]
+    pub(crate) fn install_remote_attachment(
+        &mut self,
+        mut prepared: PreparedRemoteAttachment,
+        expected_attachment_id: Option<u64>,
+    ) -> Result<
+        Option<InstalledRemoteAttachment>,
+        Box<(PreparedRemoteAttachment, RemoteAttachmentInstallConflict)>,
+    > {
+        let current_attachment_id = self.remote_attachment_id(&prepared.session_id);
+        if current_attachment_id != expected_attachment_id
+            || self
+                .sessions
+                .get(&prepared.session_id)
+                .is_some_and(|session_ref| !session_ref.is_remote())
+        {
+            return Err(Box::new((
+                prepared,
+                RemoteAttachmentInstallConflict {
+                    expected_attachment_id,
+                    current_attachment_id,
+                },
+            )));
+        }
+
+        let session_id = prepared.session_id.clone();
+        let old = self.take_remote_attachment_if_current(&session_id, expected_attachment_id);
+        self.sessions
+            .insert(session_id.clone(), prepared.session_ref.clone());
+        self.local_actor_refs.remove(&session_id);
+        self.relay_actor_ids.insert(
+            session_id,
+            RemoteRelayRegistration {
+                relay_actor_id: prepared.relay_actor_id,
+                relay_dht_name: prepared.relay_dht_name.clone(),
+                registered_relay_names: prepared.registered_relay_names.clone(),
+                relay_ref: prepared.relay_ref.clone(),
+                linked: prepared.linked,
+                mesh: prepared.mesh.clone(),
+                matched_scope: prepared.matched_scope.clone(),
+            },
+        );
+        prepared.armed = false;
+        Ok(old)
+    }
+
+    /// Remove an attachment only if it still matches the supplied generation.
+    #[cfg(feature = "remote")]
+    pub(crate) fn invalidate_remote_attachment_if_current(
+        &mut self,
+        session_id: &str,
+        attachment_id: u64,
+    ) -> Option<InstalledRemoteAttachment> {
+        self.take_remote_attachment_if_current(session_id, Some(attachment_id))
+    }
+
+    /// Remove the current remote attachment from registry ownership.
+    #[cfg(feature = "remote")]
+    pub(crate) fn take_remote_attachment(
+        &mut self,
+        session_id: &str,
+    ) -> Option<InstalledRemoteAttachment> {
+        let attachment_id = self.remote_attachment_id(session_id)?;
+        self.take_remote_attachment_if_current(session_id, Some(attachment_id))
+    }
+
+    #[cfg(feature = "remote")]
+    fn take_remote_attachment_if_current(
+        &mut self,
+        session_id: &str,
+        expected_attachment_id: Option<u64>,
+    ) -> Option<InstalledRemoteAttachment> {
+        if self.remote_attachment_id(session_id) != expected_attachment_id {
             return None;
         }
-        self.detach_remote_session_inner(
-            session_id,
-            RemoteDetachOptions {
-                preserve_bookmark: true,
-                notify_remote: false,
-            },
-        )
-        .await
+        let session_ref = self.sessions.get(session_id)?.clone();
+        let registration = self.relay_actor_ids.remove(session_id)?;
+        self.sessions.remove(session_id);
+        self.local_actor_refs.remove(session_id);
+        let remote_actor_id = match &session_ref {
+            SessionActorRef::Remote { actor_ref, .. } => actor_ref.id().sequence_id(),
+            SessionActorRef::Local(_) => 0,
+        };
+        Some(InstalledRemoteAttachment {
+            session_id: session_id.to_string(),
+            session_ref,
+            attachment_id: registration.relay_actor_id,
+            remote_actor_id,
+            relay_dht_name: registration.relay_dht_name,
+            registered_relay_names: registration.registered_relay_names,
+            relay_ref: registration.relay_ref,
+            linked: registration.linked,
+            mesh: registration.mesh,
+            matched_scope: registration.matched_scope,
+        })
     }
 
     /// Fork an existing session at the latest message.
@@ -970,6 +851,275 @@ impl SessionRegistry {
     }
 }
 
+#[cfg(feature = "remote")]
+impl PreparedRemoteAttachment {
+    pub(crate) fn session_ref(&self) -> &SessionActorRef {
+        &self.session_ref
+    }
+
+    pub(crate) fn attachment_id(&self) -> u64 {
+        self.relay_actor_id
+    }
+}
+
+#[cfg(feature = "remote")]
+impl Drop for PreparedRemoteAttachment {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(mesh) = &self.mesh {
+            let runtime = MeshRuntimeHandle::from(mesh.clone());
+            for name in &self.registered_relay_names {
+                runtime.deregister_actor(name);
+            }
+        }
+        self.relay_ref.kill();
+    }
+}
+
+/// Prepare a complete remote attachment without holding the registry lock.
+/// The caller must either install the returned value or abort it.
+#[cfg(feature = "remote")]
+pub(crate) async fn prepare_remote_attachment(
+    context: RemoteAttachmentPrepareContext,
+    session_id: String,
+    remote_ref: kameo::actor::RemoteActorRef<SessionActor>,
+    peer_label: String,
+    mesh: Option<crate::agent::remote::MeshHandle>,
+    preferred_scope: Option<MeshScopeId>,
+    remote_node_id: Option<String>,
+) -> Result<PreparedRemoteAttachment, AgentError> {
+    use crate::agent::remote::EventRelayActor;
+
+    let session_ref = SessionActorRef::Remote {
+        actor_ref: remote_ref.clone(),
+        peer_label: peer_label.clone(),
+        remote_node_id: remote_node_id.clone(),
+    };
+    let relay_ref = EventRelayActor::spawn(EventRelayActor::new(
+        context.event_sink,
+        session_id.clone(),
+        peer_label,
+        remote_node_id,
+        context.disconnect_tx,
+    ));
+    let relay_actor_id = relay_ref.id().sequence_id();
+    let mut candidate = PreparedRemoteAttachment {
+        armed: true,
+        session_id,
+        session_ref,
+        relay_actor_id,
+        relay_dht_name: String::new(),
+        registered_relay_names: Vec::new(),
+        relay_ref,
+        linked: false,
+        mesh,
+        matched_scope: None,
+    };
+
+    if let Some(mesh) = candidate.mesh.clone() {
+        let runtime = MeshRuntimeHandle::from(mesh.clone());
+        let active_scopes = runtime.active_scopes();
+        let selected_scope = select_relay_scope(&active_scopes, preferred_scope);
+        candidate.relay_dht_name = format!(
+            "{}::{}",
+            scoped_event_relay(&selected_scope, &candidate.session_id, mesh.peer_id()),
+            candidate.relay_actor_id
+        );
+        candidate.matched_scope = Some(selected_scope);
+        candidate
+            .registered_relay_names
+            .reserve(active_scopes.len());
+        for scope in &active_scopes {
+            // A generation-specific name lets an old attachment be cleaned up
+            // after commit without deregistering the replacement relay.
+            let name = format!(
+                "{}::{}",
+                scoped_event_relay(scope, &candidate.session_id, mesh.peer_id()),
+                candidate.relay_actor_id
+            );
+            candidate.registered_relay_names.push(name.clone());
+            runtime
+                .register_actor(candidate.relay_ref.clone(), name)
+                .await;
+        }
+    } else {
+        candidate.relay_dht_name = format!(
+            "event_relay::{}::local::{}",
+            candidate.session_id, candidate.relay_actor_id
+        );
+    }
+
+    if let Err(error) = candidate.relay_ref.link_remote(&remote_ref).await {
+        abort_prepared_remote_attachment(candidate).await;
+        return Err(AgentError::RemoteActor(format!(
+            "failed to link event relay to remote session: {error}"
+        )));
+    }
+    candidate.linked = true;
+
+    let relay_remote_ref = candidate.relay_ref.into_remote_ref().await;
+    if let Err(error) = candidate
+        .session_ref
+        .subscribe_events_direct(
+            candidate.relay_actor_id,
+            relay_remote_ref,
+            candidate.relay_dht_name.clone(),
+        )
+        .await
+    {
+        log::warn!(
+            "remote attachment event subscription failed for {} (attachment_id={}): {}",
+            candidate.session_id,
+            candidate.relay_actor_id,
+            error
+        );
+        abort_prepared_remote_attachment(candidate).await;
+        return Err(AgentError::RemoteActor(format!(
+            "failed to subscribe remote session events: {error}"
+        )));
+    }
+
+    Ok(candidate)
+}
+
+/// Tear down a candidate which never became registry-owned.
+#[cfg(feature = "remote")]
+pub(crate) async fn abort_prepared_remote_attachment(mut candidate: PreparedRemoteAttachment) {
+    cleanup_attachment_parts(candidate.cleanup_parts(), true).await;
+    candidate.armed = false;
+}
+
+/// Clean up a removed/replaced attachment without touching registry state or
+/// durable bookmark identity.
+#[cfg(feature = "remote")]
+pub(crate) async fn cleanup_installed_remote_attachment(
+    attachment: InstalledRemoteAttachment,
+    notify_remote: bool,
+) {
+    let matched_scope = attachment.matched_scope.clone();
+    cleanup_attachment_parts(attachment.cleanup_parts(), notify_remote).await;
+    log::debug!(
+        "remote attachment resources released for {} (scope={:?})",
+        attachment.session_id,
+        matched_scope
+    );
+}
+
+/// Cleanup-relevant view of an attachment, shared by prepared (never
+/// installed) and installed attachments so the cleanup routine takes a single
+/// borrowed argument instead of eight positional ones.
+#[cfg(feature = "remote")]
+struct RemoteAttachmentCleanupParts<'a> {
+    session_id: &'a str,
+    session_ref: &'a SessionActorRef,
+    attachment_id: u64,
+    relay_dht_name: &'a str,
+    registered_relay_names: &'a [String],
+    relay_ref: &'a ActorRef<crate::agent::remote::EventRelayActor>,
+    linked: bool,
+    mesh: Option<&'a crate::agent::remote::MeshHandle>,
+}
+
+#[cfg(feature = "remote")]
+impl PreparedRemoteAttachment {
+    fn cleanup_parts(&self) -> RemoteAttachmentCleanupParts<'_> {
+        RemoteAttachmentCleanupParts {
+            session_id: &self.session_id,
+            session_ref: &self.session_ref,
+            attachment_id: self.relay_actor_id,
+            relay_dht_name: &self.relay_dht_name,
+            registered_relay_names: &self.registered_relay_names,
+            relay_ref: &self.relay_ref,
+            linked: self.linked,
+            mesh: self.mesh.as_ref(),
+        }
+    }
+}
+
+#[cfg(feature = "remote")]
+impl InstalledRemoteAttachment {
+    fn cleanup_parts(&self) -> RemoteAttachmentCleanupParts<'_> {
+        RemoteAttachmentCleanupParts {
+            session_id: &self.session_id,
+            session_ref: &self.session_ref,
+            attachment_id: self.attachment_id,
+            relay_dht_name: &self.relay_dht_name,
+            registered_relay_names: &self.registered_relay_names,
+            relay_ref: &self.relay_ref,
+            linked: self.linked,
+            mesh: self.mesh.as_ref(),
+        }
+    }
+}
+
+#[cfg(feature = "remote")]
+async fn cleanup_attachment_parts(parts: RemoteAttachmentCleanupParts<'_>, notify_remote: bool) {
+    let RemoteAttachmentCleanupParts {
+        session_id,
+        session_ref,
+        attachment_id,
+        relay_dht_name,
+        registered_relay_names,
+        relay_ref,
+        linked,
+        mesh,
+    } = parts;
+    if notify_remote {
+        if let Err(error) = session_ref
+            .unsubscribe_events(attachment_id, relay_dht_name.to_string())
+            .await
+        {
+            log::warn!(
+                "remote attachment cleanup: unsubscribe failed for {} (attachment_id={}): {}",
+                session_id,
+                attachment_id,
+                error
+            );
+        }
+        if linked
+            && let SessionActorRef::Remote { actor_ref, .. } = session_ref
+            && let Err(error) = relay_ref.unlink_remote(actor_ref).await
+        {
+            log::warn!(
+                "remote attachment cleanup: unlink failed for {} (attachment_id={}): {}",
+                session_id,
+                attachment_id,
+                error
+            );
+        }
+    }
+
+    if let Some(mesh) = mesh {
+        let runtime = MeshRuntimeHandle::from(mesh.clone());
+        for name in registered_relay_names {
+            runtime.deregister_actor(name);
+        }
+    }
+    relay_ref.kill();
+    let (remote_actor_id, node_id, peer_label) = match session_ref {
+        SessionActorRef::Remote {
+            actor_ref,
+            remote_node_id,
+            peer_label,
+        } => (
+            actor_ref.id().sequence_id(),
+            remote_node_id.as_deref().unwrap_or(""),
+            peer_label.as_str(),
+        ),
+        SessionActorRef::Local(_) => (0, "", ""),
+    };
+    log::info!(
+        "remote attachment cleanup complete for {} (attachment_id={}, remote_actor_id={}, node_id={}, peer_label={})",
+        session_id,
+        attachment_id,
+        remote_actor_id,
+        node_id,
+        peer_label,
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 //  Tests
 // ══════════════════════════════════════════════════════════════════════════
@@ -990,7 +1140,7 @@ mod tests {
     use querymt::LLMParams;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::sync::{Mutex, mpsc};
+    use tokio::sync::Mutex;
 
     // ── Fixture ──────────────────────────────────────────────────────────────
 
@@ -1399,80 +1549,73 @@ mod tests {
     }
 
     #[cfg(feature = "remote")]
-    #[tokio::test]
-    async fn detach_remote_session_if_relay_matches_ignores_stale_relay_id() {
-        let mut f = RegistryFixture::new().await;
-        let actor_ref = f.spawn_actor();
-        f.registry.sessions.insert(
-            "remote-session".to_string(),
-            SessionActorRef::Local(actor_ref),
-        );
-        f.registry.relay_actor_ids.insert(
-            "remote-session".to_string(),
-            RemoteRelayRegistration {
-                relay_actor_id: 42,
-                relay_dht_name: "relay::remote-session".to_string(),
-                relay_ref: crate::agent::remote::EventRelayActor::spawn(
-                    crate::agent::remote::EventRelayActor::new(
-                        f.registry.config.event_sink.clone(),
-                        "remote-session".to_string(),
-                        "peer".to_string(),
-                        None,
-                        None,
-                    ),
-                ),
-                linked: false,
-            },
-        );
-
-        let detached = f
+    fn install_test_registration(fixture: &mut RegistryFixture, session_id: &str) -> u64 {
+        let actor_ref = fixture.spawn_actor();
+        fixture
             .registry
-            .detach_remote_session_if_relay_matches("remote-session", 99)
-            .await;
-
-        assert!(detached.is_none());
-        assert!(f.registry.sessions.contains_key("remote-session"));
-        assert!(f.registry.relay_actor_ids.contains_key("remote-session"));
-    }
-
-    #[cfg(feature = "remote")]
-    #[tokio::test]
-    async fn detach_remote_session_if_relay_matches_detaches_current_registration() {
-        let mut f = RegistryFixture::new().await;
-        let actor_ref = f.spawn_actor();
-        let session_id = "remote-session".to_string();
-        f.registry
             .sessions
-            .insert(session_id.clone(), SessionActorRef::Local(actor_ref));
+            .insert(session_id.to_string(), SessionActorRef::Local(actor_ref));
         let relay_ref = crate::agent::remote::EventRelayActor::spawn(
             crate::agent::remote::EventRelayActor::new(
-                f.registry.config.event_sink.clone(),
-                session_id.clone(),
+                fixture.registry.config.event_sink.clone(),
+                session_id.to_string(),
                 "peer".to_string(),
                 None,
                 None,
             ),
         );
         let relay_actor_id = relay_ref.id().sequence_id();
-        f.registry.relay_actor_ids.insert(
-            session_id.clone(),
+        fixture.registry.relay_actor_ids.insert(
+            session_id.to_string(),
             RemoteRelayRegistration {
                 relay_actor_id,
-                relay_dht_name: "relay::remote-session".to_string(),
+                relay_dht_name: format!("relay::{session_id}::{relay_actor_id}"),
+                registered_relay_names: Vec::new(),
                 relay_ref,
                 linked: false,
+                mesh: None,
+                matched_scope: None,
             },
         );
-        let (disconnect_tx, _disconnect_rx) = mpsc::unbounded_channel();
-        f.registry.set_remote_disconnect_tx(disconnect_tx);
+        relay_actor_id
+    }
 
-        let detached = f
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn invalidate_remote_attachment_ignores_stale_generation() {
+        let mut fixture = RegistryFixture::new().await;
+        let current = install_test_registration(&mut fixture, "remote-session");
+
+        let invalidated = fixture
             .registry
-            .detach_remote_session_if_relay_matches(&session_id, relay_actor_id)
-            .await;
+            .invalidate_remote_attachment_if_current("remote-session", current + 1);
 
-        assert!(detached.is_some());
-        assert!(!f.registry.sessions.contains_key(&session_id));
-        assert!(!f.registry.relay_actor_ids.contains_key(&session_id));
+        assert!(invalidated.is_none());
+        assert_eq!(
+            fixture.registry.remote_attachment_id("remote-session"),
+            Some(current)
+        );
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn invalidate_remote_attachment_removes_matching_generation_atomically() {
+        let mut fixture = RegistryFixture::new().await;
+        let current = install_test_registration(&mut fixture, "remote-session");
+
+        let invalidated = fixture
+            .registry
+            .invalidate_remote_attachment_if_current("remote-session", current)
+            .expect("matching generation should be removed");
+
+        assert_eq!(invalidated.attachment_id, current);
+        assert!(fixture.registry.get("remote-session").is_none());
+        assert!(
+            fixture
+                .registry
+                .remote_attachment_id("remote-session")
+                .is_none()
+        );
+        cleanup_installed_remote_attachment(invalidated, false).await;
     }
 }

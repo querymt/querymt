@@ -702,6 +702,8 @@ async fn acp_session_list_includes_relationship_and_operational_meta() -> Result
             session_id: child.public_id.clone(),
             origin: EventOrigin::Local,
             source_node: None,
+            source_node_id: None,
+            source_seq: None,
             kind: AgentEventKind::LlmRequestEnd {
                 usage: None,
                 tool_calls: 0,

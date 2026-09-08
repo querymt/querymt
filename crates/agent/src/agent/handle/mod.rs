@@ -17,6 +17,8 @@ mod ext_remote;
 mod ext_schedules;
 mod ext_session_ops;
 mod model_registry;
+#[cfg(feature = "remote")]
+pub(crate) mod remote_connect;
 mod remote_mesh;
 mod remote_nodes;
 mod remote_sessions;
@@ -26,6 +28,8 @@ mod send_agent_impl;
 mod send_agent_lifecycle;
 mod session_config;
 mod session_control;
+#[cfg(feature = "remote")]
+pub(crate) mod session_operation;
 mod utils;
 
 #[cfg(test)]
@@ -212,6 +216,12 @@ pub struct LocalAgentHandle {
 
     #[cfg(feature = "remote")]
     remote_node_cache: Arc<RemoteNodeMetadataCache>,
+
+    /// Per-session single-flight gates for the remote connection coordinator
+    /// (`remote_connect`). Kept independent of the registry mutex so recovery
+    /// never holds registry state across network work (plan §2).
+    #[cfg(feature = "remote")]
+    pub(crate) remote_connect_gates: remote_connect::RemoteConnectGateMap,
 
     /// Non-blocking model inventory with snapshot-based reads and background refresh.
     /// This is the canonical public API for model listing and cache management.

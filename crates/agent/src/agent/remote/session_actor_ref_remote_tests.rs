@@ -50,7 +50,10 @@ mod session_actor_ref_remote_tests {
             HashMap::new(),
             crate::agent::core::McpToolState::empty(),
         );
-        let actor = SessionActor::new(f.config.clone(), session_id.clone(), runtime);
+        // A host-side session actor carries the mesh: SubscribeEvents resolves
+        // the event relay through it (mirrors production hosts).
+        let actor = SessionActor::new(f.config.clone(), session_id.clone(), runtime)
+            .with_mesh(Some(mesh.clone()));
         let local_ref = SessionActor::spawn(actor);
 
         let dht_name = crate::agent::remote::scope::scoped_session(
@@ -179,16 +182,58 @@ mod session_actor_ref_remote_tests {
 
     #[tokio::test]
     async fn test_remote_ref_subscribe_unsubscribe_roundtrip() {
+        use crate::agent::remote::dht_name;
+        use crate::agent::remote::event_relay::EventRelayActor;
+        use crate::event_fanout::EventFanout;
+        use crate::event_sink::EventSink;
+        use crate::session::backend::StorageBackend as _;
+        use crate::session::sqlite_storage::SqliteStorage;
+        use std::sync::Arc;
+
         let (session_ref, _local) = remote_session_ref("e8").await;
+        let mesh = get_test_mesh().await;
+
+        // Phase-5 contract: a relay name that is not published in the DHT must
+        // fail the subscription instead of silently reporting a connected
+        // event path (plan §5).
+        let missing_name = dht_name::event_relay("remote-e-e8-missing", mesh.peer_id());
+        let missing = session_ref.subscribe_events(98, missing_name).await;
+        assert!(
+            missing.is_err(),
+            "unregistered relay must fail subscription"
+        );
+
+        // Happy path through the retained DHT fallback: publish a real relay
+        // under the name and roundtrip subscribe/unsubscribe.
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("in-memory store"),
+        );
+        let event_sink = Arc::new(EventSink::new(
+            storage.event_journal(),
+            Arc::new(EventFanout::new()),
+        ));
+        let relay = EventRelayActor::new(
+            event_sink,
+            "remote-e-e8".to_string(),
+            "event_relay::test::peer-e8".to_string(),
+            None,
+            None,
+        );
+        let relay_ref = EventRelayActor::spawn(relay);
+        let relay_dht_name = dht_name::event_relay("remote-e-e8", mesh.peer_id());
+        mesh.register_actor(relay_ref.clone(), relay_dht_name.clone())
+            .await;
+        // Give DHT a moment to propagate (same-process, should be instant).
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         let result = session_ref
-            .subscribe_events(99, "event_relay::test::peer-e8".to_string())
+            .subscribe_events(99, relay_dht_name.clone())
             .await;
         assert!(result.is_ok(), "subscribe_events should return Ok");
 
-        let result = session_ref
-            .unsubscribe_events(99, "event_relay::test::peer-e8".to_string())
-            .await;
+        let result = session_ref.unsubscribe_events(99, relay_dht_name).await;
         assert!(result.is_ok(), "unsubscribe_events should return Ok");
     }
 

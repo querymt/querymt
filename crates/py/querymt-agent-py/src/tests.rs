@@ -31,6 +31,7 @@ mod tests {
                         node: None,
                         node_id: None,
                         attached: None,
+                        connection_state: None,
                         runtime_state: None,
                     }],
                     latest_activity: Some("2026-01-02T00:00:00Z".to_string()),

@@ -2,7 +2,7 @@
 
 use crate::agent::remote::RemoteSessionSnapshot;
 use crate::ui::handlers::refresh_attached_remote_summary;
-use crate::ui::messages::SessionSummary;
+use crate::ui::messages::{RemoteSessionConnectionState, SessionSummary};
 use std::collections::HashMap;
 
 #[test]
@@ -25,6 +25,7 @@ fn refresh_attached_remote_summary_updates_title_for_attached_session() {
             node: Some("peer-a".to_string()),
             node_id: None,
             attached: Some(true),
+            connection_state: Some(RemoteSessionConnectionState::Connected),
             runtime_state: Some("active".to_string()),
         }],
     );
@@ -71,6 +72,7 @@ fn refresh_attached_remote_summary_does_not_clear_existing_title_on_none() {
             node: Some("peer-a".to_string()),
             node_id: None,
             attached: Some(true),
+            connection_state: Some(RemoteSessionConnectionState::Connected),
             runtime_state: Some("active".to_string()),
         }],
     );

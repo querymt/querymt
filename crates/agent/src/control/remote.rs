@@ -253,10 +253,9 @@ pub async fn dismiss_remote_session(
 ) -> Result<RemoteSessionDismissInfo, Error> {
     #[cfg(feature = "remote")]
     {
-        {
-            let mut registry = agent.registry.lock().await;
-            registry.detach_remote_session(&request.session_id).await;
-        }
+        agent
+            .detach_remote_session_attachment(&request.session_id, true)
+            .await;
 
         agent
             .config

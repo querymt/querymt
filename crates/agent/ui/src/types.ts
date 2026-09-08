@@ -31,6 +31,7 @@ export {
   OAuthFlowKindTs,
   UiInputDelivery,
   SessionRuntimePhase,
+  RemoteSessionConnectionState,
 } from './generated/types';
 
 export type {

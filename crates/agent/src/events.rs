@@ -264,6 +264,20 @@ pub enum AgentEventKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         node_id: Option<String>,
     },
+    /// Ephemeral signal emitted when cursor-based event backfill for a remote
+    /// session finishes after (re)connect (plan §10/§16). Connection and sync
+    /// progress are transient state, never durable history.
+    RemoteSessionSyncCompleted {
+        /// Number of durable events newly persisted by the backfill.
+        #[typeshare(serialized_as = "number")]
+        backfilled: u64,
+        /// True when no source cursor existed (legacy boundary): no exact
+        /// backfill was possible and history may be missing events emitted
+        /// before the first post-upgrade attachment.
+        boundary: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        node_id: Option<String>,
+    },
     /// Ephemeral signal emitted when a remote provider host reports liveness while waiting.
     RemoteProviderHeartbeat {
         phase: String,
@@ -794,6 +808,9 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         AgentEventKind::RemoteStreamDisconnected { .. } => Durability::Ephemeral,
         AgentEventKind::RemoteStreamReconnected { .. } => Durability::Ephemeral,
         AgentEventKind::RemoteSessionDisconnected { .. } => Durability::Ephemeral,
+        // Rationale: sync progress is transient connection state (plan §12/§16);
+        // the backfilled events themselves are durable through the journal.
+        AgentEventKind::RemoteSessionSyncCompleted { .. } => Durability::Ephemeral,
         AgentEventKind::RemoteProviderHeartbeat { .. } => Durability::Ephemeral,
         AgentEventKind::StreamRecovering { .. } => Durability::Ephemeral,
 

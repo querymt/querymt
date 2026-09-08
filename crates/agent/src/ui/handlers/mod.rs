@@ -16,6 +16,7 @@ mod plugins;
 mod remote;
 mod schedules;
 mod session_ops;
+pub(crate) use session_ops::send_cached_session_events;
 
 // ── Re-exports consumed by sibling modules ────────────────────────────────────
 
@@ -226,26 +227,36 @@ pub async fn handle_ui_message(
             tokio::spawn(async move {
                 let failure_input_id = client_input_id.clone().unwrap_or_default();
                 let result: Result<_, crate::error::AgentError> = async {
-                    let (session_ref, prompt) =
+                    let (_session_ref, prompt) =
                         build_ui_prompt_blocks(&state, &session_id, &prompt)
                             .await
                             .map_err(crate::error::AgentError::Internal)?;
-                    session_ref
-                        .submit_input(crate::agent::messages::SubmitInput {
-                            session_id: session_id.clone(),
-                            client_input_id,
-                            expected_run_id,
-                            delivery: match delivery {
-                                UiInputDelivery::Steer => {
-                                    crate::agent::messages::InputDelivery::Steer
-                                }
-                                UiInputDelivery::Queue => {
-                                    crate::agent::messages::InputDelivery::Queue
-                                }
+                    #[cfg(feature = "remote")]
+                    let has_key = client_input_id.is_some();
+                    let message = crate::agent::messages::SubmitInput {
+                        session_id: session_id.clone(),
+                        client_input_id,
+                        expected_run_id,
+                        delivery: match delivery {
+                            UiInputDelivery::Steer => crate::agent::messages::InputDelivery::Steer,
+                            UiInputDelivery::Queue => crate::agent::messages::InputDelivery::Queue,
+                        },
+                        prompt,
+                    };
+                    #[cfg(feature = "remote")]
+                    return state
+                        .agent
+                        .execute_session_operation(
+                            &session_id,
+                            crate::agent::handle::session_operation::SessionOperation::SubmitInput {
+                                has_key,
                             },
-                            prompt,
-                        })
+                            |session_ref| Box::pin(session_ref.submit_input(message.clone())),
+                        )
                         .await
+                        .map_err(|error| error.into_agent_error());
+                    #[cfg(not(feature = "remote"))]
+                    _session_ref.submit_input(message).await
                 }
                 .await;
                 match result {
@@ -289,6 +300,17 @@ pub async fn handle_ui_message(
             let state = state.clone();
             let tx = tx.clone();
             tokio::spawn(async move {
+                #[cfg(feature = "remote")]
+                let result = state
+                    .agent
+                    .execute_session_operation(
+                        &session_id,
+                        crate::agent::handle::session_operation::SessionOperation::RuntimeState,
+                        |session_ref| Box::pin(session_ref.get_runtime_status()),
+                    )
+                    .await
+                    .map_err(|error| error.into_agent_error().to_string());
+                #[cfg(not(feature = "remote"))]
                 let result =
                     match crate::ui::session::session_ref_for_session(&state, &session_id).await {
                         Some(session_ref) => session_ref

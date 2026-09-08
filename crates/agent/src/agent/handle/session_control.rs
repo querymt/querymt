@@ -251,13 +251,18 @@ impl LocalAgentHandle {
                     )
                     .await
                     .map_err(|e| {
-                        Error::from(crate::error::AgentError::RemoteActor(e.to_string()))
+                        Error::from(match querymt_remote::classify_remote_send_error(e) {
+                            Ok(failure) => {
+                                crate::error::AgentError::from_transport_failure(failure)
+                            }
+                            Err(handler_error) => {
+                                crate::error::AgentError::RemoteActor(handler_error.to_string())
+                            }
+                        })
                     })?;
                 }
 
-                let mut registry = self.registry.lock().await;
-                registry
-                    .detach_remote_session_preserve_bookmark(session_id)
+                self.detach_remote_session_attachment(session_id, true)
                     .await;
             }
         } else {

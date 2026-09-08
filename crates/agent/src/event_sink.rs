@@ -56,6 +56,8 @@ impl EventSink {
             session_id: session_id.to_string(),
             origin: origin.clone(),
             source_node: source_node.clone(),
+            source_node_id: None,
+            source_seq: None,
             kind: kind.clone(),
         };
 
@@ -66,6 +68,42 @@ impl EventSink {
             .publish(EventEnvelope::Durable(persisted.clone()));
 
         Ok(persisted)
+    }
+
+    /// Emit a durable event that carries remote source identity (plan §15/§16).
+    ///
+    /// Persists through the idempotent source-identity path: when an event with
+    /// the same `(session_id, source_node_id, source_seq)` is already journaled,
+    /// this is a full no-op — `Ok(None)` is returned and the fanout is NOT
+    /// republished, so duplicate replay after reconnect never doubles local
+    /// delivery.
+    pub async fn emit_durable_from_source(
+        &self,
+        session_id: &str,
+        kind: AgentEventKind,
+        source_node: Option<String>,
+        source_node_id: String,
+        source_seq: i64,
+    ) -> SessionResult<Option<DurableEvent>> {
+        let new_event = NewDurableEvent {
+            session_id: session_id.to_string(),
+            origin: EventOrigin::Remote,
+            source_node,
+            source_node_id: Some(source_node_id),
+            source_seq: Some(source_seq),
+            kind,
+        };
+
+        match self.journal.append_durable_from_source(&new_event).await? {
+            // Duplicate replay: no insert, no fanout republish.
+            None => Ok(None),
+            Some(persisted) => {
+                // Publish to fanout for live subscribers
+                self.fanout
+                    .publish(EventEnvelope::Durable(persisted.clone()));
+                Ok(Some(persisted))
+            }
+        }
     }
 
     /// Emit an ephemeral event. Published to fanout only — never persisted.
@@ -229,6 +267,64 @@ mod tests {
             events.is_empty(),
             "ephemeral events must never appear in journal"
         );
+    }
+
+    // ── Source-identity dedup (plan §15/§16) ───────────────────────────
+
+    #[tokio::test]
+    async fn emit_durable_from_source_dedups_and_skips_fanout() {
+        let sink = make_sink().await;
+        let mut rx = sink.fanout().subscribe();
+
+        let first = sink
+            .emit_durable_from_source(
+                "s1",
+                AgentEventKind::SessionCreated,
+                Some("peer-a".to_string()),
+                "node-a".to_string(),
+                7,
+            )
+            .await
+            .unwrap();
+        assert!(
+            first.is_some(),
+            "fresh source identity persists and returns the event"
+        );
+
+        // Same (session, node, source_seq): no insert, no fanout republish —
+        // duplicate replay after reconnect must never double local delivery.
+        let duplicate = sink
+            .emit_durable_from_source(
+                "s1",
+                AgentEventKind::SessionCreated,
+                Some("peer-a".to_string()),
+                "node-a".to_string(),
+                7,
+            )
+            .await
+            .unwrap();
+        assert!(duplicate.is_none(), "duplicate replay is a no-op");
+
+        let received = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("fresh insert publishes to fanout")
+            .unwrap();
+        assert_eq!(received.session_id(), "s1");
+        let late = tokio::time::timeout(std::time::Duration::from_millis(80), rx.recv()).await;
+        assert!(late.is_err(), "duplicate must not be republished to fanout");
+
+        // A different source sequence is a distinct event.
+        let third = sink
+            .emit_durable_from_source(
+                "s1",
+                AgentEventKind::Cancelled,
+                Some("peer-a".to_string()),
+                "node-a".to_string(),
+                8,
+            )
+            .await
+            .unwrap();
+        assert!(third.is_some());
     }
 
     // ── emit (auto-classify) ───────────────────────────────────────────
@@ -411,6 +507,45 @@ mod tests {
                 _session_id: &str,
                 _from_seq: i64,
             ) -> SessionResult<usize> {
+                Ok(0)
+            }
+
+            async fn append_durable_from_source(
+                &self,
+                event: &NewDurableEvent,
+            ) -> SessionResult<Option<DurableEvent>> {
+                Ok(Some(self.append_durable(event).await?))
+            }
+
+            async fn latest_source_seq(
+                &self,
+                _session_id: &str,
+                _source_node_id: &str,
+            ) -> SessionResult<Option<i64>> {
+                Ok(None)
+            }
+
+            async fn remote_sync_cursor(&self, _: &str, _: &str) -> SessionResult<Option<i64>> {
+                Ok(None)
+            }
+            async fn advance_remote_sync_cursor(
+                &self,
+                _: &str,
+                _: &str,
+                _: i64,
+                _: bool,
+            ) -> SessionResult<()> {
+                Ok(())
+            }
+            async fn load_remote_session_stream(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> SessionResult<Vec<DurableEvent>> {
+                Ok(vec![])
+            }
+
+            async fn max_stream_seq(&self, _session_id: &str) -> SessionResult<i64> {
                 Ok(0)
             }
         }

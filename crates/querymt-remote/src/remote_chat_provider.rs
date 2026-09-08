@@ -69,7 +69,10 @@ where
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
     ) -> Result<Box<dyn querymt::chat::ChatResponse>, LLMError> {
-        let chat_response = self
+        let provider_name = self.core.config().provider_name.clone();
+        let model_name = self.core.config().model.clone();
+        let target_locator = self.core.config().target_locator.clone();
+        let result = self
             .core
             .chat_with_tools(messages, tools, |error| {
                 matches!(
@@ -81,7 +84,23 @@ where
                     }
                 )
             })
-            .await?;
+            .await;
+        let chat_response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(
+                    target: "querymt_remote::provider::chat",
+                    provider = %provider_name,
+                    model = %model_name,
+                    target_locator = %target_locator,
+                    error = %error,
+                    error_payload = %serde_json::to_string(&error.to_payload())
+                        .unwrap_or_else(|_| "unavailable".to_string()),
+                    "remote provider chat request failed"
+                );
+                return Err(error);
+            }
+        };
 
         Ok(Box::new(chat_response))
     }
@@ -173,7 +192,8 @@ where
             request_id = %request_id,
             "sending remote provider stream request"
         );
-        self.core
+        if let Err(error) = self
+            .core
             .send_stream_request_with_retry(&host_ref, stream_request, |error| {
                 matches!(
                     error,
@@ -184,7 +204,22 @@ where
                     }
                 )
             })
-            .await?;
+            .await
+        {
+            tracing::warn!(
+                target: "querymt_remote::provider::stream",
+                session_id = %session_id,
+                request_id = %request_id,
+                provider = %provider_name,
+                model = %model_name,
+                target_locator = %target_locator,
+                error = %error,
+                error_payload = %serde_json::to_string(&error.to_payload())
+                    .unwrap_or_else(|_| "unavailable".to_string()),
+                "remote provider stream request setup failed"
+            );
+            return Err(error);
+        }
         tracing::info!(
             target: "querymt_remote::provider::stream",
             session_id = %session_id,

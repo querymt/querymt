@@ -68,6 +68,14 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0014_session_control",
         apply: migration_0014_session_control,
     },
+    Migration {
+        version: "0015_event_source_identity",
+        apply: migration_0015_event_source_identity,
+    },
+    Migration {
+        version: "0016_remote_sync_progress",
+        apply: migration_0016_remote_sync_progress,
+    },
 ];
 
 pub(super) fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -98,6 +106,18 @@ pub(super) fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Er
     }
 
     Ok(())
+}
+
+fn migration_0016_remote_sync_progress(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS remote_session_sync (
+            session_id TEXT NOT NULL,
+            source_node_id TEXT NOT NULL,
+            source_seq INTEGER NOT NULL DEFAULT 0,
+            complete INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (session_id, source_node_id)
+        );",
+    )
 }
 
 fn load_applied_migrations(conn: &Connection) -> Result<HashSet<String>, rusqlite::Error> {
@@ -499,6 +519,47 @@ fn migration_0014_session_control(conn: &mut Connection) -> Result<(), rusqlite:
             );
         "#,
     )
+}
+
+/// Remote event source identity (plan §15).
+///
+/// Adds the source-side cursor to the event journal so relayed durable events
+/// can be deduplicated and backfilled exactly once after reconnect:
+/// - `source_node_id`: stable remote node identity (bookmark `node_id`);
+///   `source_node` remains display metadata only.
+/// - `source_seq`: the host journal's stream sequence for the event.
+///
+/// Uniqueness is enforced with a partial index so local rows (no source
+/// identity) are unaffected and pre-migration rows remain valid. Additive
+/// migration: existing journals/bookmarks are preserved.
+///
+/// Concurrent connect paths (e.g. several runtimes opening one database
+/// file) can execute this migration simultaneously: the check-and-alter runs
+/// inside an immediate transaction so a racing second runner observes the
+/// committed columns and skips the ALTER instead of failing with
+/// "duplicate column name".
+fn migration_0015_event_source_identity(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let has_column = |name: &str| -> Result<bool, rusqlite::Error> {
+        tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('event_journal') WHERE name = ?1)",
+            params![name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|exists| exists != 0)
+    };
+    if !has_column("source_node_id")? {
+        tx.execute_batch("ALTER TABLE event_journal ADD COLUMN source_node_id TEXT;")?;
+    }
+    if !has_column("source_seq")? {
+        tx.execute_batch("ALTER TABLE event_journal ADD COLUMN source_seq INTEGER;")?;
+    }
+    tx.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_event_journal_source_identity \
+         ON event_journal(session_id, source_node_id, source_seq) \
+         WHERE source_node_id IS NOT NULL AND source_seq IS NOT NULL;",
+    )?;
+    tx.commit()
 }
 
 fn migration_0012_task_and_intent_revisions(conn: &mut Connection) -> Result<(), rusqlite::Error> {

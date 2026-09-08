@@ -2,6 +2,7 @@ pub mod error;
 pub use error::{SessionError, SessionResult};
 
 pub mod domain;
+pub mod location;
 pub mod provider;
 pub mod provider_config;
 pub use provider::{SessionHandle, SessionProvider};

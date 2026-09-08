@@ -24,6 +24,26 @@ pub enum FileProxyError {
     ReadError(String),
     #[error("Actor send error: {0}")]
     ActorSend(String),
+    /// A classified remote transport failure (failure kind + delivery
+    /// certainty), preserved for safe retry decisions by the operation layer.
+    #[error("{0}")]
+    Transport(querymt_remote::RemoteTransportFailure),
+}
+
+impl From<FileProxyError> for crate::error::AgentError {
+    fn from(error: FileProxyError) -> Self {
+        match error {
+            FileProxyError::Transport(failure) => Self::from_transport_failure(failure),
+            other => Self::Internal(other.to_string()),
+        }
+    }
+}
+
+impl FileProxyError {
+    /// Wrap a classified remote transport failure.
+    pub fn from_transport_failure(f: querymt_remote::RemoteTransportFailure) -> Self {
+        FileProxyError::Transport(f)
+    }
 }
 
 /// Successful response from `GetFileIndex`.

@@ -15,6 +15,8 @@ pub mod actor_ref;
 #[cfg(feature = "remote")]
 pub(crate) mod admission;
 pub mod dht_name;
+#[cfg(feature = "remote")]
+pub mod event_backfill;
 pub mod event_forwarder;
 #[cfg(feature = "remote")]
 pub mod event_relay;

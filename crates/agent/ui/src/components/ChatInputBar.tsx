@@ -17,6 +17,7 @@ import type { FileIndexEntry } from '../generated/types';
 import { useVoiceInput } from '../hooks/useVoiceInput';
 import { useVoiceStore } from '../store/voiceStore';
 import { useUiClientConfig } from '../context/UiClientContext';
+import { buildPromptBlocksFromInput } from '../logic/chatViewLogic';
 
 interface ChatInputBarProps {
   mentionInputRef: RefObject<HTMLTextAreaElement | null>;
@@ -31,6 +32,7 @@ interface ChatInputBarProps {
   sessionThinkingAgentId: string | null;
   runtimeState?: SessionRuntimeStatus;
   pendingInputs: PendingSessionInput[];
+  onReconcile?: () => void;
   rateLimitState: RateLimitState | undefined;
   activeIndexStatus: string | undefined;
   // File mention
@@ -52,6 +54,7 @@ export function ChatInputBar({
   sessionThinkingAgentId,
   runtimeState,
   pendingInputs,
+  onReconcile,
   rateLimitState,
   activeIndexStatus,
   allFiles,
@@ -77,10 +80,13 @@ export function ChatInputBar({
   const delivery = deliveryOverride === 'steer' && !canSteer
     ? defaultDelivery
     : deliveryOverride ?? defaultDelivery;
+  const fingerprint = JSON.stringify(buildPromptBlocksFromInput(prompt));
+  const duplicatePending = pendingInputs.some(item => ['sending', 'unknown'].includes(item.state)
+    && (item.prompt ? JSON.stringify(item.prompt) === fingerprint : item.text === prompt));
   const submitCurrentInput = useCallback(() => {
-    handleSendPrompt(delivery);
-  }, [delivery, handleSendPrompt]);
-  const canSend = !loading && connected && !!sessionId && !!prompt.trim() && !rateLimitState?.isRateLimited;
+    if (!duplicatePending) handleSendPrompt(delivery);
+  }, [delivery, handleSendPrompt, duplicatePending]);
+  const canSend = !duplicatePending && !loading && connected && !!sessionId && !!prompt.trim() && !rateLimitState?.isRateLimited;
 
   const { audioCapabilities } = useUiClientConfig();
   const { sttProvider, sttModel } = useVoiceStore();
@@ -178,7 +184,9 @@ export function ChatInputBar({
         <div className="mb-2 flex flex-wrap gap-1.5" aria-label="Pending inputs">
           {pendingInputs.filter((item) => !['applied', 'started'].includes(item.state)).map((item) => (
             <span key={item.inputId} className="max-w-full truncate rounded-md border border-surface-border bg-surface-canvas/40 px-2 py-1 text-[11px] text-text-secondary" title={item.text}>
-              {item.delivery === 'steer' ? 'Steering' : `Queued${item.position ? ` #${item.position}` : ''}`}: {item.text || '(attachment)'}
+              {item.state === 'unknown' ? 'Delivery status unknown' : item.state === 'failed' ? 'Not submitted' : item.state === 'discarded' ? 'Discarded' : item.state === 'sending' ? 'Awaiting acknowledgement' : item.delivery === 'steer' ? 'Steering' : `Queued${item.position ? ` #${item.position}` : ''}`}: {item.text || '(attachment)'}
+              {item.error && <span className="ml-2">{item.error}</span>}
+              {item.state === 'unknown' && onReconcile && <button type="button" className="ml-2 underline" onClick={onReconcile}>Refresh / Reconcile</button>}
             </span>
           ))}
         </div>

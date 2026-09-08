@@ -161,7 +161,12 @@ impl RemoteAgentHandle {
             std::time::Duration::from_secs(10),
         )
         .await
-        .map_err(|e| Error::from(AgentError::RemoteActor(e.to_string())))?;
+        .map_err(|e| {
+            Error::from(match querymt_remote::classify_remote_send_error(e) {
+                Ok(failure) => AgentError::from_transport_failure(failure),
+                Err(handler_error) => AgentError::RemoteActor(handler_error.to_string()),
+            })
+        })?;
         span.record("create_session_ms", t1.elapsed().as_millis() as u64);
 
         let session_id = resp.session_id.clone();
@@ -379,7 +384,12 @@ impl AgentHandle for RemoteAgentHandle {
             std::time::Duration::from_secs(10),
         )
         .await
-        .map_err(|e| Error::from(AgentError::RemoteActor(e.to_string())))?;
+        .map_err(|e| {
+            Error::from(match querymt_remote::classify_remote_send_error(e) {
+                Ok(failure) => AgentError::from_transport_failure(failure),
+                Err(handler_error) => AgentError::RemoteActor(handler_error.to_string()),
+            })
+        })?;
 
         let session_ref = self
             .attach_handoff_session(&session_id, response.handoff)

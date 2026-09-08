@@ -7,12 +7,29 @@ impl LocalAgentHandle {
     ) -> agent_client_protocol::Error {
         use crate::error::AgentError;
 
-        match error {
-            kameo::error::RemoteSendError::HandlerError(err) => {
-                agent_client_protocol::Error::from(err)
+        match querymt_remote::classify_remote_send_error(error) {
+            Ok(failure) => {
+                agent_client_protocol::Error::from(AgentError::from_transport_failure(failure))
             }
-            other => agent_client_protocol::Error::from(AgentError::RemoteActor(other.to_string())),
+            Err(handler_error) => agent_client_protocol::Error::from(handler_error),
         }
+    }
+
+    /// Typed failure for the attachment health-check timeout: ReplyTimeout with
+    /// Unknown delivery, so recovery decisions can consult `transport_failure()`
+    /// instead of parsing error strings.
+    #[cfg(feature = "remote")]
+    pub(crate) fn remote_health_check_timeout_error(
+        health_timeout: std::time::Duration,
+    ) -> crate::error::AgentError {
+        crate::error::AgentError::RemoteTransport(querymt_remote::RemoteTransportFailure::new(
+            querymt_remote::RemoteTransportFailureKind::ReplyTimeout,
+            querymt_remote::DeliveryCertainty::Unknown,
+            format!(
+                "remote attachment health check timed out after {}ms",
+                health_timeout.as_millis()
+            ),
+        ))
     }
 
     /// Find a `RemoteNodeManager` by its stable node id (PeerId string).
@@ -242,6 +259,57 @@ impl LocalAgentHandle {
         .map_err(Self::map_remote_node_manager_error)
     }
 
+    #[cfg(feature = "remote")]
+    pub(crate) async fn fork_remote_session_operation(
+        self: &Arc<Self>,
+        source_session_id: &str,
+        message_id: &str,
+    ) -> Result<crate::agent::remote::ForkRemoteSessionResponse, agent_client_protocol::Error> {
+        self.execute_session_operation(
+            source_session_id,
+            super::session_operation::SessionOperation::Fork,
+            |session_ref| {
+                let agent = self.clone();
+                let source_session_id = source_session_id.to_owned();
+                let message_id = message_id.to_owned();
+                let node_id = session_ref.remote_node_id().map(str::to_owned);
+                Box::pin(async move {
+                    let node_id = node_id.ok_or_else(|| {
+                        crate::error::AgentError::Internal("remote fork requires owner node".into())
+                    })?;
+                    let manager = agent.find_node_manager(&node_id).await.map_err(|e| {
+                        crate::error::AgentError::from_transport_failure(
+                            querymt_remote::RemoteTransportFailure::new(
+                                querymt_remote::RemoteTransportFailureKind::ActorUnavailable,
+                                querymt_remote::DeliveryCertainty::NotDelivered,
+                                e.to_string(),
+                            ),
+                        )
+                    })?;
+                    querymt_remote::ask_remote_with_timeout(
+                        &manager,
+                        &crate::agent::remote::ForkRemoteSession {
+                            source_session_id,
+                            message_id,
+                        },
+                        Self::remote_request_timeout(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        match querymt_remote::classify_remote_send_error(e) {
+                            Ok(failure) => {
+                                crate::error::AgentError::from_transport_failure(failure)
+                            }
+                            Err(handler) => handler,
+                        }
+                    })
+                })
+            },
+        )
+        .await
+        .map_err(|e| e.into_acp_error())
+    }
+
     /// Fork a session on a remote node and return the forked child's live session ref.
     #[cfg(feature = "remote")]
     pub async fn fork_remote_session(
@@ -279,19 +347,49 @@ impl LocalAgentHandle {
         peer_label: String,
         preferred_scope: Option<crate::agent::remote::scope::MeshScopeId>,
         remote_node_id: Option<String>,
-    ) -> crate::agent::remote::SessionActorRef {
-        let mesh = self.mesh();
-        let mut registry = self.registry.lock().await;
-        registry
-            .attach_remote_session(
-                session_id,
-                remote_ref,
-                peer_label,
-                mesh,
+    ) -> Result<crate::agent::remote::SessionActorRef, crate::error::AgentError> {
+        let node_id = remote_node_id
+            .or_else(|| remote_ref.id().peer_id().map(|peer| peer.to_string()))
+            .ok_or_else(|| {
+                crate::error::AgentError::Internal("remote actor has no peer identity".into())
+            })?;
+        self.connect_remote_session(
+            &session_id,
+            super::remote_connect::RemoteConnectOptions {
+                node_hint: Some(&node_id),
+                peer_label: Some(&peer_label),
                 preferred_scope,
-                remote_node_id,
-            )
-            .await
+                reason: super::remote_connect::RemoteConnectReason::ExtensionAttach,
+                replace: super::remote_connect::RemoteReplacePolicy::ReplaceCurrent,
+                handoff: Some(
+                    crate::agent::remote::node_manager::SessionHandoff::DirectRemote {
+                        session_ref: remote_ref,
+                    },
+                ),
+            },
+        )
+        .await
+        .map(|connected| connected.session_ref)
+        .map_err(|error| crate::error::AgentError::RemoteActor(error.to_string()))
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) async fn detach_remote_session_attachment(
+        &self,
+        session_id: &str,
+        notify_remote: bool,
+    ) -> Option<crate::agent::remote::SessionActorRef> {
+        let attachment = {
+            let mut registry = self.registry.lock().await;
+            registry.take_remote_attachment(session_id)
+        }?;
+        let session_ref = attachment.session_ref.clone();
+        crate::agent::session_registry::cleanup_installed_remote_attachment(
+            attachment,
+            notify_remote,
+        )
+        .await;
+        Some(session_ref)
     }
 
     #[cfg(feature = "remote")]
@@ -415,5 +513,46 @@ impl LocalAgentHandle {
         )
         .await
         .map_err(Self::map_remote_node_manager_error)
+    }
+}
+
+#[cfg(all(test, feature = "remote"))]
+mod tests {
+    use super::*;
+
+    /// Regression test: the remote attachment health-check timeout must
+    /// surface as a typed `RemoteTransport` failure (ReplyTimeout kind, Unknown
+    /// delivery) so `transport_failure()` stays usable for recovery decisions,
+    /// instead of the untyped `AgentError::RemoteActor` string previously
+    /// returned by `attach_remote_session`.
+    ///
+    /// `attach_remote_session` applies this mapping when its
+    /// `tokio::time::timeout(remote_connect_health_timeout(), get_mode())`
+    /// guard expires. Driving a real get_mode() past the deadline end-to-end
+    /// requires a live mesh peer (this crate has no offline remote-transport
+    /// test harness), so the typed construction that timeout path produces is
+    /// asserted directly here.
+    #[test]
+    fn health_check_timeout_maps_to_typed_reply_timeout_failure() {
+        let error = LocalAgentHandle::remote_health_check_timeout_error(
+            std::time::Duration::from_millis(50),
+        );
+        let failure = error
+            .transport_failure()
+            .expect("health-check timeout must carry a typed transport failure");
+        assert!(matches!(
+            failure.kind,
+            querymt_remote::RemoteTransportFailureKind::ReplyTimeout
+        ));
+        assert_eq!(failure.delivery, querymt_remote::DeliveryCertainty::Unknown);
+        assert!(
+            failure.is_retryable_kind(),
+            "reply timeouts must stay retryable for recovery decisions"
+        );
+        assert!(
+            error.to_string().contains("health check timed out"),
+            "message should name the timeout, got: {}",
+            error
+        );
     }
 }

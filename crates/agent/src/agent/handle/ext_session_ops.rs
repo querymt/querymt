@@ -55,17 +55,30 @@ impl LocalAgentHandle {
         delivery: crate::agent::messages::InputDelivery,
     ) -> Result<ExtResponse, Error> {
         let parsed: SubmitInputRequest = parse_session_op_request(req)?;
-        let session_ref = self
-            .session_ref_for_agent_session(&parsed.session_id)
-            .await?;
-        let result = session_ref
-            .submit_input(crate::agent::messages::SubmitInput {
-                session_id: parsed.session_id,
-                client_input_id: parsed.client_input_id,
-                expected_run_id: parsed.expected_run_id,
-                delivery,
-                prompt: parsed.prompt,
+        let session_id = parsed.session_id.clone();
+        #[cfg(feature = "remote")]
+        let operation = session_operation::SessionOperation::SubmitInput {
+            has_key: parsed.client_input_id.is_some(),
+        };
+        let message = crate::agent::messages::SubmitInput {
+            session_id: parsed.session_id,
+            client_input_id: parsed.client_input_id,
+            expected_run_id: parsed.expected_run_id,
+            delivery,
+            prompt: parsed.prompt,
+        };
+        #[cfg(feature = "remote")]
+        let result = self
+            .execute_session_operation(&session_id, operation, |session_ref| {
+                Box::pin(session_ref.submit_input(message.clone()))
             })
+            .await
+            .map_err(session_operation::SessionOperationError::into_acp_error)?;
+        #[cfg(not(feature = "remote"))]
+        let result = self
+            .session_ref_for_agent_session(&session_id)
+            .await?
+            .submit_input(message)
             .await
             .map_err(Error::from)?;
         ext_json_response(&result)
@@ -76,10 +89,19 @@ impl LocalAgentHandle {
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
         let parsed: SessionIdRequest = parse_session_op_request(req)?;
-        let session_ref = self
+        #[cfg(feature = "remote")]
+        let state = self
+            .execute_session_operation(
+                &parsed.session_id,
+                session_operation::SessionOperation::RuntimeState,
+                |session_ref| Box::pin(session_ref.get_runtime_status()),
+            )
+            .await
+            .map_err(session_operation::SessionOperationError::into_acp_error)?;
+        #[cfg(not(feature = "remote"))]
+        let state = self
             .session_ref_for_agent_session(&parsed.session_id)
-            .await?;
-        let state = session_ref
+            .await?
             .get_runtime_status()
             .await
             .map_err(Error::from)?;

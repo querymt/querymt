@@ -20,16 +20,55 @@ impl SendAgent for LocalAgentHandle {
 
     async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, Error> {
         let session_id = req.session_id.to_string();
-        let session_ref = self.session_ref_for_agent_session(&session_id).await?;
-        session_ref.prompt(req).await
+        #[cfg(feature = "remote")]
+        return self
+            .execute_session_operation(
+                &session_id,
+                session_operation::SessionOperation::LegacyPrompt,
+                |session_ref| Box::pin(session_ref.prompt_agent(req.clone())),
+            )
+            .await
+            .map_err(session_operation::SessionOperationError::into_acp_error);
+        #[cfg(not(feature = "remote"))]
+        self.session_ref_for_agent_session(&session_id)
+            .await?
+            .prompt(req)
+            .await
     }
 
     async fn cancel(&self, notif: CancelNotification) -> Result<(), Error> {
         let session_id = notif.session_id.to_string();
-        let Ok(session_ref) = self.session_ref_for_agent_session(&session_id).await else {
-            return Ok(());
-        };
-        session_ref.cancel().await.map_err(Error::from)
+        #[cfg(feature = "remote")]
+        {
+            match self
+                .execute_session_operation(
+                    &session_id,
+                    session_operation::SessionOperation::Cancel,
+                    |session_ref| Box::pin(session_ref.cancel()),
+                )
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(session_operation::SessionOperationError::NotFound { .. }) => Ok(()),
+                // Cancel is best-effort: a transient connection failure means
+                // the run is currently unreachable, not that the cancel was
+                // rejected. Structural errors (e.g. SessionNotFoundOnHost)
+                // still surface through into_acp_error.
+                Err(session_operation::SessionOperationError::Connect(connect_error))
+                    if connect_error.is_retriable() =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(error.into_acp_error()),
+            }
+        }
+        #[cfg(not(feature = "remote"))]
+        {
+            let Ok(session_ref) = self.session_ref_for_agent_session(&session_id).await else {
+                return Ok(());
+            };
+            session_ref.cancel().await.map_err(Error::from)
+        }
     }
 
     async fn load_session(&self, req: LoadSessionRequest) -> Result<LoadSessionResponse, Error> {
