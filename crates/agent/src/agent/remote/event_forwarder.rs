@@ -12,18 +12,49 @@ use std::sync::Arc;
 
 #[cfg(feature = "remote")]
 use kameo::actor::RemoteActorRef;
+#[cfg(feature = "remote")]
+use kameo::error::{Infallible, RemoteSendError};
 
 #[cfg(feature = "remote")]
 use super::event_relay::{EventRelayActor, RelayedEvent};
 
+/// An owned event-forwarder task. Dropping the handle cancels the task.
+pub struct EventForwarderHandle {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl EventForwarderHandle {
+    pub fn abort(&self) {
+        self.task.abort();
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+}
+
+impl Drop for EventForwarderHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Event forwarder that subscribes to an EventFanout and sends events to a
 /// remote EventRelayActor.
-///
-/// Spawns a background task that reads from the fanout receiver and forwards
-/// each event to the relay actor. The task is cancelled when the returned
-/// `tokio::task::JoinHandle` is aborted or the fanout sender is dropped.
 #[cfg(feature = "remote")]
 pub struct EventForwarder;
+
+#[cfg(feature = "remote")]
+fn destination_is_gone(error: &RemoteSendError<Infallible>) -> bool {
+    matches!(
+        error,
+        RemoteSendError::ActorNotRunning
+            | RemoteSendError::ActorStopped
+            | RemoteSendError::UnknownActor { .. }
+            | RemoteSendError::UnknownMessage { .. }
+            | RemoteSendError::BadActorType
+    )
+}
 
 #[cfg(feature = "remote")]
 impl EventForwarder {
@@ -34,15 +65,16 @@ impl EventForwarder {
     /// skipped.  This prevents N-times duplication when multiple remote
     /// sessions share the same `EventFanout`.
     ///
-    /// Returns a `JoinHandle` that can be used to abort the forwarder task.
+    /// Returns an owned handle which cancels the forwarder when dropped.
     pub fn start(
         fanout: Arc<crate::event_fanout::EventFanout>,
         relay_ref: RemoteActorRef<EventRelayActor>,
         source_label: String,
         filter_session_id: String,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> EventForwarderHandle {
         let mut rx = fanout.subscribe();
-        tokio::spawn(async move {
+        let relay_actor_id = relay_ref.id();
+        let task = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(envelope) => {
@@ -63,18 +95,27 @@ impl EventForwarder {
                             "forwarding event to relay actor"
                         );
 
-                        if let Err(e) = relay_ref
+                        if let Err(error) = relay_ref
                             .tell(&RelayedEvent {
                                 event: event.clone(),
                             })
-                            .send()
+                            .mailbox_timeout(std::time::Duration::from_secs(3))
+                            .send_ack()
+                            .await
                         {
+                            let terminal = destination_is_gone(&error);
                             tracing::warn!(
                                 target: "remote::event_forwarder",
                                 source = %source_label,
-                                error = %e,
+                                session_id = %filter_session_id,
+                                relay_actor_id = %relay_actor_id,
+                                terminal,
+                                error = %error,
                                 "failed to forward event to relay actor"
                             );
+                            if terminal {
+                                break;
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -95,7 +136,8 @@ impl EventForwarder {
                     }
                 }
             }
-        })
+        });
+        EventForwarderHandle { task }
     }
 }
 
@@ -112,7 +154,7 @@ impl EventForwarder {
         _relay_ref: (),
         _source_label: String,
         _filter_session_id: String,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> EventForwarderHandle {
         panic!("EventForwarder requires the 'remote' feature to be enabled")
     }
 }

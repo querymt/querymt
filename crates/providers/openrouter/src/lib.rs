@@ -1,8 +1,8 @@
 use http::{Method, Request, Response, header::CONTENT_TYPE};
 use qmt_openai::api::{
-    OpenAIProviderConfig, OpenAIToolUseState, classify_openai_http_error, openai_chat_request,
-    openai_embed_request, openai_parse_chat, openai_parse_embed, parse_openai_sse_chunk,
-    url_schema,
+    OpenAIErrorClassification, OpenAIProviderConfig, OpenAIToolUseState,
+    classify_openai_http_error_with, openai_chat_request, openai_embed_request,
+    openai_parse_chat_with, openai_parse_embed, parse_openai_sse_chunk_with, url_schema,
 };
 use querymt::{
     HTTPLLMProvider,
@@ -12,7 +12,7 @@ use querymt::{
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
-    error::LLMError,
+    error::{LLMError, ProviderErrorKind},
     plugin::HTTPLLMProviderFactory,
 };
 use schemars::{JsonSchema, schema_for};
@@ -114,9 +114,123 @@ impl OpenAIProviderConfig for OpenRouter {
     }
 }
 
+fn normalize_openrouter_error_type(error_type: &str) -> String {
+    error_type
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_")
+}
+
+fn openrouter_error_kind(error_type: &str) -> Option<ProviderErrorKind> {
+    match error_type {
+        "provider_overloaded" => Some(ProviderErrorKind::ServerOverloaded),
+        "rate_limit_exceeded" => Some(ProviderErrorKind::RateLimited),
+        "context_length_exceeded" => Some(ProviderErrorKind::ContextWindowExceeded),
+        "authentication" => Some(ProviderErrorKind::Authentication),
+        "payment_required" => Some(ProviderErrorKind::QuotaExceeded),
+        "invalid_request"
+        | "invalid_prompt"
+        | "not_found"
+        | "precondition_failed"
+        | "payload_too_large"
+        | "unprocessable"
+        | "content_policy_violation"
+        | "refusal"
+        | "invalid_image"
+        | "image_too_large"
+        | "image_too_small"
+        | "unsupported_image_format"
+        | "image_not_found" => Some(ProviderErrorKind::InvalidRequest),
+        "permission_denied" | "token_limit_exceeded" | "string_too_long" => {
+            Some(ProviderErrorKind::UnknownPermanent)
+        }
+        "provider_unavailable" | "image_download_failed" | "server" | "timeout" | "unmapped" => {
+            Some(ProviderErrorKind::UnknownTransient)
+        }
+        // These describe successful length-limited completions when OpenRouter
+        // applies its documented transformation, not retryable provider errors.
+        "max_tokens_exceeded" => Some(ProviderErrorKind::UnknownPermanent),
+        _ => None,
+    }
+}
+
+fn classify_openrouter_error(error: &Value) -> Option<OpenAIErrorClassification> {
+    let typed_error = error
+        .get("metadata")
+        .and_then(|metadata| metadata.get("error_type"))
+        .or_else(|| error.get("error_type"))
+        .and_then(Value::as_str)
+        .map(normalize_openrouter_error_type);
+
+    if let Some(error_type) = typed_error.as_deref()
+        && let Some(kind) = openrouter_error_kind(error_type)
+    {
+        return Some(OpenAIErrorClassification {
+            kind,
+            error_type: typed_error,
+        });
+    }
+
+    let status = error.get("code").and_then(|code| {
+        code.as_u64()
+            .and_then(|code| u16::try_from(code).ok())
+            .or_else(|| code.as_str().and_then(|code| code.parse::<u16>().ok()))
+    })?;
+    let kind = match status {
+        400 | 403 | 404 | 422 => ProviderErrorKind::InvalidRequest,
+        401 => ProviderErrorKind::Authentication,
+        402 => ProviderErrorKind::QuotaExceeded,
+        408 | 500..=599 => ProviderErrorKind::UnknownTransient,
+        429 => ProviderErrorKind::RateLimited,
+        _ => return None,
+    };
+    Some(OpenAIErrorClassification {
+        kind,
+        error_type: typed_error,
+    })
+}
+
+fn normalize_openrouter_chat_error_response(response: Response<Vec<u8>>) -> Response<Vec<u8>> {
+    if !response.status().is_success() {
+        return response;
+    }
+
+    let Ok(mut envelope) = serde_json::from_slice::<Value>(response.body()) else {
+        return response;
+    };
+    if envelope.get("error").is_some() {
+        return response;
+    }
+    let choice_error = envelope
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| {
+            choice.get("error").or_else(|| {
+                choice
+                    .get("message")
+                    .and_then(|message| message.get("error"))
+            })
+        })
+        .cloned();
+    let Some(choice_error) = choice_error else {
+        return response;
+    };
+    let Some(object) = envelope.as_object_mut() else {
+        return response;
+    };
+    object.insert("error".to_owned(), choice_error);
+
+    let (parts, _) = response.into_parts();
+    Response::from_parts(
+        parts,
+        serde_json::to_vec(&envelope).expect("JSON value must serialize"),
+    )
+}
+
 impl HTTPChatProvider for OpenRouter {
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        classify_openai_http_error(response)
+        classify_openai_http_error_with(response, Some(classify_openrouter_error))
     }
 
     fn chat_request(
@@ -138,7 +252,11 @@ impl HTTPChatProvider for OpenRouter {
     }
 
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
-        openai_parse_chat(self, response)
+        openai_parse_chat_with(
+            self,
+            normalize_openrouter_chat_error_response(response),
+            Some(classify_openrouter_error),
+        )
     }
 
     fn supports_streaming(&self) -> bool {
@@ -157,7 +275,11 @@ struct OpenRouterStreamParser {
 
 impl ChatStreamParser for OpenRouterStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        parse_openai_sse_chunk(chunk, &mut self.tool_states)
+        parse_openai_sse_chunk_with(
+            chunk,
+            &mut self.tool_states,
+            Some(classify_openrouter_error),
+        )
     }
 }
 
@@ -275,8 +397,12 @@ mod extism_exports {
 #[cfg(test)]
 mod tests {
     use super::{OpenRouter, OpenRouterFactory};
+    use http::Response;
     use querymt::chat::{StreamChunk, http::HTTPChatProvider};
-    use querymt::{error::LLMError, plugin::HTTPLLMProviderFactory};
+    use querymt::{
+        error::{LLMError, ProviderErrorKind},
+        plugin::HTTPLLMProviderFactory,
+    };
     use serde_json::Value;
 
     fn test_provider() -> OpenRouter {
@@ -312,6 +438,134 @@ mod tests {
             .expect("stream request should build");
         let body: Value = serde_json::from_slice(req.body()).expect("body should be valid json");
         assert_eq!(body.get("stream"), Some(&Value::Bool(true)));
+    }
+
+    fn parse_stream_error(error: Value) -> LLMError {
+        let provider = test_provider();
+        let mut parser = provider
+            .chat_stream_parser()
+            .expect("parser should initialize");
+        let chunk = format!("data: {}\n\n", serde_json::json!({ "error": error }));
+        parser
+            .parse_chunk(chunk.as_bytes())
+            .expect_err("error envelope should return an error")
+    }
+
+    #[test]
+    fn upstream_idle_timeout_is_retryable() {
+        for code in [serde_json::json!(504), serde_json::json!("504")] {
+            let error = parse_stream_error(serde_json::json!({
+                "message": "Upstream idle timeout exceeded",
+                "code": code
+            }));
+            assert!(matches!(
+                error,
+                LLMError::ProviderResponseError(ref failure)
+                    if failure.kind() == ProviderErrorKind::UnknownTransient
+                        && failure.code() == Some("504")
+            ));
+            assert!(error.is_retryable());
+        }
+    }
+
+    #[test]
+    fn typed_error_takes_precedence_over_numeric_status() {
+        let error = parse_stream_error(serde_json::json!({
+            "message": "Request was rejected",
+            "code": 504,
+            "metadata": { "error_type": "invalid_request" }
+        }));
+
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::InvalidRequest
+                    && failure.error_type() == Some("invalid_request")
+                    && failure.code() == Some("504")
+        ));
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn typed_generic_errors_are_retryable() {
+        for error_type in ["timeout", "server", "unmapped"] {
+            let error = parse_stream_error(serde_json::json!({
+                "message": "provider failed",
+                "code": 500,
+                "metadata": { "error_type": error_type }
+            }));
+            assert!(matches!(
+                error,
+                LLMError::ProviderResponseError(ref failure)
+                    if failure.kind() == ProviderErrorKind::UnknownTransient
+                        && failure.error_type() == Some(error_type)
+            ));
+            assert!(error.is_retryable(), "error_type={error_type}");
+        }
+    }
+
+    #[test]
+    fn typed_rate_limit_preserves_retry_hint() {
+        let error = parse_stream_error(serde_json::json!({
+            "message": "slow down",
+            "code": 429,
+            "retry_after": "3s",
+            "metadata": { "error_type": "rate_limit_exceeded" }
+        }));
+
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::RateLimited
+                    && failure.retry_after_secs() == Some(3)
+        ));
+    }
+
+    #[test]
+    fn successful_http_error_body_uses_openrouter_classifier() {
+        let provider = test_provider();
+        let response = Response::builder()
+            .status(200)
+            .body(
+                br#"{"id":"gen-1","error":{"code":504,"message":"timed out","metadata":{"error_type":"timeout"}}}"#
+                    .to_vec(),
+            )
+            .unwrap();
+
+        let error = provider
+            .parse_chat(response)
+            .err()
+            .expect("HTTP 200 error body should fail");
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::UnknownTransient
+                    && failure.error_type() == Some("timeout")
+                    && failure.request_id() == Some("gen-1")
+        ));
+    }
+
+    #[test]
+    fn choice_level_http_error_uses_openrouter_classifier() {
+        let provider = test_provider();
+        let response = Response::builder()
+            .status(200)
+            .body(
+                br#"{"id":"gen-2","choices":[{"message":{"role":"assistant","content":"partial"},"finish_reason":"error","error":{"code":504,"message":"timed out","metadata":{"error_type":"timeout"}}}]}"#
+                    .to_vec(),
+            )
+            .unwrap();
+
+        let error = provider
+            .parse_chat(response)
+            .err()
+            .expect("choice-level error should fail");
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::UnknownTransient
+                    && failure.error_type() == Some("timeout")
+        ));
     }
 
     #[test]

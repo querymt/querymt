@@ -886,24 +886,51 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
 }
 
 pub fn openai_parse_chat<C: OpenAIProviderConfig>(
-    _cfg: &C,
+    cfg: &C,
     response: Response<Vec<u8>>,
 ) -> Result<Box<dyn ChatResponse>, LLMError> {
+    openai_parse_chat_with(cfg, response, None)
+}
+
+pub fn openai_parse_chat_with<C: OpenAIProviderConfig>(
+    _cfg: &C,
+    response: Response<Vec<u8>>,
+    provider_classifier: Option<OpenAIErrorClassifier>,
+) -> Result<Box<dyn ChatResponse>, LLMError> {
     if !response.status().is_success() {
-        return Err(classify_openai_http_error(&response));
+        return Err(classify_openai_http_error_with(
+            &response,
+            provider_classifier,
+        ));
     }
 
-    let json_resp: Result<OpenAIChatResponse, serde_json::Error> =
-        serde_json::from_slice(response.body());
-
-    let resp_text: String = "".to_string();
-    match json_resp {
-        Ok(response) => Ok(Box::new(response)),
-        Err(e) => Err(LLMError::ResponseFormatError {
-            message: format!("Failed to decode API response: {}", e),
-            raw_response: resp_text,
-        }),
+    let envelope: Value =
+        serde_json::from_slice(response.body()).map_err(|error| LLMError::ResponseFormatError {
+            message: format!("Failed to decode API response: {error}"),
+            raw_response: String::from_utf8_lossy(response.body()).into_owned(),
+        })?;
+    if let Some(error) = envelope.get("error") {
+        let explicit_request_id = envelope
+            .get("request_id")
+            .or_else(|| envelope.get("requestId"))
+            .or_else(|| envelope.get("id"))
+            .and_then(Value::as_str);
+        return Err(map_openai_error_envelope(
+            error,
+            &envelope,
+            explicit_request_id,
+            false,
+            provider_classifier,
+        )
+        .into());
     }
+
+    serde_json::from_value::<OpenAIChatResponse>(envelope)
+        .map(|response| Box::new(response) as Box<dyn ChatResponse>)
+        .map_err(|error| LLMError::ResponseFormatError {
+            message: format!("Failed to decode API response: {error}"),
+            raw_response: String::from_utf8_lossy(response.body()).into_owned(),
+        })
 }
 
 /// Extract the thinking/reasoning content from a ChatMessage, if any.
@@ -1341,13 +1368,25 @@ fn openai_error_kind(code: &str) -> Option<ProviderErrorKind> {
     }
 }
 
+/// Provider-specific classification layered over the shared OpenAI-compatible
+/// envelope parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenAIErrorClassification {
+    pub kind: ProviderErrorKind,
+    pub error_type: Option<String>,
+}
+
+pub type OpenAIErrorClassifier = fn(&Value) -> Option<OpenAIErrorClassification>;
+
 /// Map an OpenAI-compatible SSE/HTTP `{ "error": ... }` envelope into unified
-/// [`ProviderFailure`] kinds. Vendor `code`/`type` dialect stays here.
+/// [`ProviderFailure`] kinds. Provider-specific classifiers take precedence over
+/// the generic `code`/`type` dialect table.
 fn map_openai_error_envelope(
     error: &Value,
     envelope: &Value,
     explicit_request_id: Option<&str>,
     unknown_transient: bool,
+    provider_classifier: Option<OpenAIErrorClassifier>,
 ) -> ProviderFailure {
     let message = error
         .as_str()
@@ -1367,11 +1406,17 @@ fn map_openai_error_envelope(
             .map(str::to_owned)
             .or_else(|| value.as_i64().map(|number| number.to_string()))
     });
-    let error_type = error
-        .get("type")
-        .or_else(|| error.get("error_type"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let provider_classification = provider_classifier.and_then(|classify| classify(error));
+    let error_type = provider_classification
+        .as_ref()
+        .and_then(|classification| classification.error_type.clone())
+        .or_else(|| {
+            error
+                .get("type")
+                .or_else(|| error.get("error_type"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
     let request_id = explicit_request_id.map(str::to_owned).or_else(|| {
         error
             .get("request_id")
@@ -1383,13 +1428,11 @@ fn map_openai_error_envelope(
         extract_retry_after_from_json(error).or_else(|| extract_retry_after_from_json(envelope));
     let code_norm = code.as_deref().map(normalize_error_token);
     let type_norm = error_type.as_deref().map(normalize_error_token);
-    let mapped = code_norm
-        .as_deref()
-        .and_then(openai_error_kind)
+    let mapped = provider_classification
+        .map(|classification| classification.kind)
+        .or_else(|| code_norm.as_deref().and_then(openai_error_kind))
         .or_else(|| type_norm.as_deref().and_then(openai_error_kind));
 
-    // Unclassified server-side codes are transient; anything else unknown
-    // defers to the caller's status-based guess.
     let server_side = matches!(
         code_norm.as_deref(),
         Some("server_error" | "internal_server_error")
@@ -1419,6 +1462,13 @@ fn map_openai_error_envelope(
 
 /// Classify an OpenAI-compatible HTTP error body.
 pub fn classify_openai_http_error(response: &Response<Vec<u8>>) -> LLMError {
+    classify_openai_http_error_with(response, None)
+}
+
+pub fn classify_openai_http_error_with(
+    response: &Response<Vec<u8>>,
+    provider_classifier: Option<OpenAIErrorClassifier>,
+) -> LLMError {
     let status = response.status().as_u16();
     let retry_after_secs = parse_retry_after(response.headers());
     let request_id = response
@@ -1435,6 +1485,7 @@ pub fn classify_openai_http_error(response: &Response<Vec<u8>>) -> LLMError {
             envelope,
             request_id,
             matches!(status, 429 | 500..=599),
+            provider_classifier,
         );
         let retry_after_secs = retry_after_secs.or(mapped.retry_after_secs());
         return mapped.with_retry_after_secs(retry_after_secs).into();
@@ -1447,6 +1498,14 @@ pub fn classify_openai_http_error(response: &Response<Vec<u8>>) -> LLMError {
 pub fn parse_openai_sse_chunk(
     chunk: &[u8],
     tool_states: &mut HashMap<usize, OpenAIToolUseState>,
+) -> Result<Vec<StreamChunk>, LLMError> {
+    parse_openai_sse_chunk_with(chunk, tool_states, None)
+}
+
+pub fn parse_openai_sse_chunk_with(
+    chunk: &[u8],
+    tool_states: &mut HashMap<usize, OpenAIToolUseState>,
+    provider_classifier: Option<OpenAIErrorClassifier>,
 ) -> Result<Vec<StreamChunk>, LLMError> {
     // Skip empty chunks
     if chunk.is_empty() {
@@ -1512,9 +1571,14 @@ pub fn parse_openai_sse_chunk(
                 .get("request_id")
                 .or_else(|| envelope.get("requestId"))
                 .and_then(Value::as_str);
-            return Err(
-                map_openai_error_envelope(error, &envelope, explicit_request_id, false).into(),
-            );
+            return Err(map_openai_error_envelope(
+                error,
+                &envelope,
+                explicit_request_id,
+                false,
+                provider_classifier,
+            )
+            .into());
         }
         let mut stream_chunk: OpenAIStreamChunk =
             serde_json::from_value(envelope).map_err(|e| LLMError::ResponseFormatError {
@@ -2245,6 +2309,42 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
     fn parse_sse_unknown_error_without_server_evidence_is_permanent() {
         let mut tool_states = HashMap::new();
         let chunk = br#"data: {"error":{"message":"vendor failure","code":"vendor_specific"}}
+
+"#;
+
+        let error = parse_openai_sse_chunk(chunk, &mut tool_states).unwrap_err();
+        assert!(matches!(
+            error,
+            LLMError::ProviderResponseError(ref failure)
+                if failure.kind() == ProviderErrorKind::UnknownPermanent
+        ));
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn parse_sse_numeric_vendor_code_is_not_assumed_to_be_http_status() {
+        for code in [serde_json::json!(504), serde_json::json!("504")] {
+            let mut tool_states = HashMap::new();
+            let chunk = format!(
+                "data: {{\"error\":{{\"message\":\"vendor failure\",\"code\":{code}}}}}\n\n"
+            );
+
+            let error = parse_openai_sse_chunk(chunk.as_bytes(), &mut tool_states)
+                .expect_err("error envelope should return an error");
+            assert!(matches!(
+                error,
+                LLMError::ProviderResponseError(ref failure)
+                    if failure.code() == Some("504")
+                        && failure.kind() == ProviderErrorKind::UnknownPermanent
+            ));
+            assert!(!error.is_retryable());
+        }
+    }
+
+    #[test]
+    fn parse_sse_numeric_client_error_remains_permanent() {
+        let mut tool_states = HashMap::new();
+        let chunk = br#"data: {"error":{"message":"vendor failure","code":499}}
 
 "#;
 

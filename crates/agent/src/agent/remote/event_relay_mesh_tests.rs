@@ -120,6 +120,47 @@ mod event_relay_mesh_tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_event_forwarder_stops_after_relay_actor_dies() {
+        let test_id = Uuid::now_v7().to_string();
+        let mesh = get_test_mesh().await;
+        let (relay_ref, _event_sink, dht_name) =
+            setup_relay("f1-dead", &test_id, "s-f1-dead").await;
+
+        let remote_relay = mesh
+            .lookup_actor::<EventRelayActor>(&dht_name)
+            .await
+            .expect("DHT lookup")
+            .expect("relay not in DHT");
+        let source_fanout = Arc::new(EventFanout::new());
+        let handle = EventForwarder::start(
+            source_fanout.clone(),
+            remote_relay,
+            "test-source-f1-dead".to_string(),
+            "s-f1-dead".to_string(),
+        );
+
+        relay_ref.kill();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        source_fanout.publish(EventEnvelope::Durable(crate::events::DurableEvent {
+            event_id: "e-f1-dead".into(),
+            stream_seq: 1,
+            session_id: "s-f1-dead".into(),
+            timestamp: 1000,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::SessionCreated,
+        }));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !handle.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("forwarder should stop after ActorNotRunning");
+    }
+
     // ── F.2 ──────────────────────────────────────────────────────────────────
 
     #[tokio::test]
