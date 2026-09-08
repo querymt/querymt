@@ -30,7 +30,7 @@ serde_json.workspace = true
 url.workspace = true
 schemars.workspace = true
 futures.workspace = true
-mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs.git", tag = "v0.9.2" }
+mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs.git", tag = "v0.9.3" }
 async-trait.workspace = true
 tokio = { version = "1", features = ["full"] }
 image = "0.25"
