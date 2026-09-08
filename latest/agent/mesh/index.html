@@ -2375,6 +2375,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#offline-history-ambiguous-delivery-and-compatibility" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Offline History, Ambiguous Delivery, and Compatibility
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#session-persistence" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -4390,11 +4401,13 @@
 <a id="__codelineno-43-3" name="__codelineno-43-3"></a><span class="w">    </span><span class="p">.</span><span class="n">resume_remote_session</span><span class="p">(</span><span class="o">&amp;</span><span class="n">node_manager_ref</span><span class="p">,</span><span class="w"> </span><span class="n">session_id</span><span class="p">)</span>
 <a id="__codelineno-43-4" name="__codelineno-43-4"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
-<p><strong>Session recovery features:</strong>
-- <strong>Automatic reconnection</strong>: Handles transient network failures
-- <strong>State preservation</strong>: Session state persisted across restarts
-- <strong>History recovery</strong>: Full conversation history maintained
-- <strong>Graceful degradation</strong>: Continues working even if some peers unavailable</p>
+<p><strong>Recovery semantics:</strong>
+- <strong>Durable identity</strong>: a remote bookmark is the authoritative local record for a remote session (session ID, node, metadata). A bookmarked session is never replaced by a locally created session, and its cached history stays readable while the host is offline.
+- <strong>One recovery algorithm</strong>: opening, explicit reconnect, operation recovery, extension attach, and startup reattach all share a single connection coordinator with per-reason time budgets (open 5s, reconnect/attach 15s, operation recovery 10s by default) and per-session single-flight, so concurrent load/prompt/runtime queries share one recovery attempt.
+- <strong>Connected is verified</strong>: an attachment is reported connected only after the control path (bounded health check) and the event-delivery path (direct relay capability acknowledged after forwarder installation; a generation-specific DHT relay name remains as a compatibility fallback) both succeed. A failed candidate never replaces a working attachment, and delayed failures from an old attachment generation cannot detach a newer one.
+- <strong>Missed events are backfilled exactly once</strong>: reconnect captures a durable synchronization checkpoint before subscribing. Live delivery cannot advance this checkpoint; each successfully persisted historical page advances it, so an interrupted backfill resumes safely after either process restarts. New events publish to subscribers, and completion refreshes the host-ordered transcript in place. Cursorless sessions fetch authoritative host pages from the beginning. Legacy rows remain stored, but the completed source-identified snapshot supersedes them in the remote transcript without guessing their source sequences.
+- <strong>Acknowledged submissions</strong>: interactive turns submit with a <code>client_input_id</code>; the session actor caches accepted receipts for bounded same-actor retry safety, not cross-restart exactly-once. The draft is cleared only after a receipt or matching durable acceptance event. Failed inputs remain visible; lost acknowledgements are labelled "Delivery status unknown" and offer Refresh / Reconcile rather than automatic resend.
+- <strong>Explicit connection state</strong>: session summaries and <code>session_loaded</code> carry <code>connecting | connected | disconnected</code>. Connection changes are ephemeral signals; conversation events remain durable.</p>
 <h3 id="remote-session-lifecycle">Remote Session Lifecycle</h3>
 <pre class="mermaid"><code>stateDiagram-v2
     [*] --&gt; Created: create_remote_session()
@@ -4412,6 +4425,16 @@
         Processing --&gt; Streaming: LLM response
         Streaming --&gt; Processing: Stream complete
     }</code></pre>
+<h3 id="offline-history-ambiguous-delivery-and-compatibility">Offline History, Ambiguous Delivery, and Compatibility</h3>
+<p><strong>Offline-first opening.</strong> Opening a bookmarked remote session loads the cached audit history from the local event journal first and reports <code>disconnected</code> when the host is unreachable (bounded open-time recovery, ~5s by default). The frontend keeps the URL, cached transcript, and pending draft, shows a reconnect banner, and offers an explicit Reconnect action. Unknown IDs return a structured <code>session_not_found</code> error; a session that is both a local row and a remote bookmark returns a structured <code>session_location_conflict</code>.</p>
+<p><strong>Typed failures and ambiguous delivery.</strong> Remote transport failures are classified by kind and delivery certainty (<code>not_delivered</code> / <code>unknown</code>) — never by error-message text:</p>
+<ul>
+<li>Idempotent reads and proven pre-delivery failures may reconnect and retry once, including against a replacement actor. Ambiguous keyed submissions may retry only against the same actor, with the same <code>client_input_id</code>; materializing a different actor never authorizes an ambiguous resend.</li>
+<li>Ambiguous failures on non-idempotent operations (legacy <code>Prompt</code>, unkeyed submissions, undo/redo, mode/model changes) are never replayed; connectivity is restored and a structured <code>submission_outcome_unknown</code> result is returned instead.</li>
+<li>Remote handler/provider errors are delivered results, not transport failures, and are never retried.</li>
+<li>Protocol mismatch and serialization failures are never retried.</li>
+</ul>
+<p><strong>Mixed-version compatibility.</strong> New protocol fields (direct relay capability, source cursor, connection state, structured error codes) are additive with serde defaults, so older peers ignore them. New clients fall back to the generation-specific DHT relay name when talking to hosts that predate capability handoff, and hosts that predate cursor backfill are reported as potentially stale history rather than connection failure. Legacy <code>LoadSession</code>/<code>AttachRemoteSession</code> remain supported wrappers over the unified open operation, and legacy <code>prompt</code> RPCs are fulfilled with acknowledged submissions.</p>
 <h3 id="session-persistence">Session Persistence</h3>
 <p>Remote sessions are persisted on the host node:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-44-1">1</a></span>
