@@ -72,6 +72,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0015_event_source_identity",
         apply: migration_0015_event_source_identity,
     },
+    Migration {
+        version: "0016_remote_sync_progress",
+        apply: migration_0016_remote_sync_progress,
+    },
 ];
 
 pub(super) fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -102,6 +106,18 @@ pub(super) fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Er
     }
 
     Ok(())
+}
+
+fn migration_0016_remote_sync_progress(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS remote_session_sync (
+            session_id TEXT NOT NULL,
+            source_node_id TEXT NOT NULL,
+            source_seq INTEGER NOT NULL DEFAULT 0,
+            complete INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (session_id, source_node_id)
+        );",
+    )
 }
 
 fn load_applied_migrations(conn: &Connection) -> Result<HashSet<String>, rusqlite::Error> {

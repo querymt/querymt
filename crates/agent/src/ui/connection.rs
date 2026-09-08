@@ -263,8 +263,57 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
         .as_ref()
         .map(|path| path.to_string_lossy().to_string());
 
-    let agent_mode = mode_for_session(state, active_session_id.as_deref()).await;
-    let reasoning_effort = reasoning_effort_for_session(state, active_session_id.as_deref()).await;
+    let agent_mode = async {
+        #[cfg(feature = "remote")]
+        if let Some(id) = active_session_id.as_deref() {
+            let attached = state
+                .agent
+                .registry
+                .lock()
+                .await
+                .remote_attachment(id)
+                .is_some();
+            if !attached
+                && state
+                    .agent
+                    .config
+                    .provider
+                    .history_store()
+                    .get_remote_session_bookmark(id)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .is_some()
+            {
+                // State hydration must not restart recovery after an offline open.
+                return Err("Remote session is disconnected; mode is unavailable".to_string());
+            }
+        }
+        mode_for_session(state, active_session_id.as_deref()).await
+    }
+    .await;
+    let reasoning_effort = if agent_mode.is_ok() {
+        reasoning_effort_for_session(state, active_session_id.as_deref()).await
+    } else {
+        Ok(None)
+    };
+    if let Err(error) = &agent_mode {
+        let _ = send_session_error(
+            tx,
+            error.clone(),
+            Some("remote_session_disconnected"),
+            active_session_id.as_deref(),
+        )
+        .await;
+    }
+    if let Err(error) = &reasoning_effort {
+        let _ = send_session_error(
+            tx,
+            error.clone(),
+            Some("remote_session_disconnected"),
+            active_session_id.as_deref(),
+        )
+        .await;
+    }
 
     let _ = send_message(
         tx,
@@ -277,8 +326,10 @@ pub async fn send_state(state: &ServerState, conn_id: &str, tx: &mpsc::Sender<St
             profiles,
             active_profile_id,
             sessions_by_agent,
-            agent_mode: agent_mode.as_str().to_string(),
-            reasoning_effort: reasoning_effort.map(|e| e.to_string()),
+            agent_mode: agent_mode
+                .map(|mode| mode.as_str().to_string())
+                .unwrap_or_default(),
+            reasoning_effort: reasoning_effort.ok().flatten().map(|e| e.to_string()),
         },
     )
     .await;
@@ -477,6 +528,17 @@ async fn forward_event_to_ui(
         return Ok(());
     }
 
+    if matches!(
+        event.kind(),
+        crate::events::AgentEventKind::RemoteSessionSyncCompleted { .. }
+    ) {
+        // Publish the authoritative host-ordered snapshot without navigation.
+        // This also covers synchronization finishing after SessionLoaded.
+        super::handlers::send_cached_session_events(state, conn_id, event.session_id(), None, tx)
+            .await;
+        return Ok(());
+    }
+
     // React to WorkspaceIndexReady from a remote session: push status +
     // fetch and push the file index so the UI gets it without polling.
     if let crate::events::AgentEventKind::WorkspaceIndexReady { .. } = event.kind() {
@@ -493,14 +555,32 @@ async fn forward_event_to_ui(
         .await;
 
         let profile_id = profile_id_for_session(state, &session_id).await;
-        if let Some(actor_ref) =
+        if let Some(_actor_ref) =
             session_ref_for_profile(state, profile_id.as_deref(), &session_id).await
         {
             let cwd = {
                 let cwds = state.session_cwds.lock().await;
                 cwds.get(&session_id).cloned()
             };
-            match actor_ref.get_file_index().await {
+            #[cfg(feature = "remote")]
+            let result = state
+                .agent
+                .execute_session_operation(
+                    &session_id,
+                    crate::agent::handle::session_operation::SessionOperation::FileIndex,
+                    |sr| {
+                        Box::pin(async move {
+                            sr.get_file_index()
+                                .await
+                                .map_err(crate::error::AgentError::from)
+                        })
+                    },
+                )
+                .await
+                .map_err(|e| e.into_agent_error());
+            #[cfg(not(feature = "remote"))]
+            let result = _actor_ref.get_file_index().await;
+            match result {
                 Ok(resp) => {
                     use super::mentions::filter_index_for_cwd_entries;
                     let root = std::path::PathBuf::from(&resp.workspace_root);

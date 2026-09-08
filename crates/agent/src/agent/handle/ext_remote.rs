@@ -93,6 +93,8 @@ impl LocalAgentHandle {
                 session_id,
                 RemoteConnectOptions {
                     node_hint: Some(node_id),
+                    peer_label: None,
+                    preferred_scope: None,
                     reason,
                     replace,
                     handoff,

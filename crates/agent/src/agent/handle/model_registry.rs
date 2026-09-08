@@ -26,53 +26,6 @@ impl LocalAgentHandle {
         .map_err(|error| crate::error::AgentError::RemoteActor(error.to_string()))
     }
 
-    /// Like [`reattach_from_bookmark`] but uses scoped no-retry DHT lookups.
-    #[cfg(feature = "remote")]
-    pub async fn reattach_from_bookmark_quick(
-        &self,
-        bookmark: &crate::session::store::RemoteSessionBookmark,
-    ) -> Result<crate::agent::remote::SessionActorRef, crate::error::AgentError> {
-        let mesh = self
-            .mesh()
-            .ok_or(crate::error::AgentError::MeshNotBootstrapped)?;
-        let runtime = crate::agent::remote::MeshRuntimeHandle::from(mesh.clone());
-        let mut remote_ref = None;
-        let mut matched_scope = None;
-        for scope in runtime.active_scopes() {
-            let dht_name =
-                crate::agent::remote::scope::scoped_session(&scope, &bookmark.session_id);
-            let lookup = runtime
-                .lookup_actor_no_retry::<crate::agent::session_actor::SessionActor>(
-                    dht_name.clone(),
-                )
-                .await
-                .map_err(|error| crate::error::AgentError::SwarmLookupFailed {
-                    key: dht_name,
-                    reason: error.to_string(),
-                })?;
-            if let Some(found) = lookup {
-                remote_ref = Some(found);
-                matched_scope = Some(scope);
-                break;
-            }
-        }
-        let remote_ref =
-            remote_ref.ok_or_else(|| crate::error::AgentError::RemoteSessionNotFound {
-                details: format!(
-                    "bookmarked session {} not found in DHT",
-                    bookmark.session_id
-                ),
-            })?;
-        self.attach_remote_session(
-            bookmark.session_id.clone(),
-            remote_ref,
-            bookmark.peer_label.clone(),
-            matched_scope,
-            Some(bookmark.node_id.clone()),
-        )
-        .await
-    }
-
     /// Resolve a `SessionHandoff` into a concrete remote actor reference.
     ///
     /// - `DirectRemote` → return the embedded ref directly.

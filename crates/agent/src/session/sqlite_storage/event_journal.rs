@@ -196,6 +196,73 @@ impl EventJournal for SqliteStorage {
         .map_err(SessionError::from)
     }
 
+    async fn remote_sync_cursor(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+    ) -> SessionResult<Option<i64>> {
+        let session_id = session_id.to_owned();
+        let source_node_id = source_node_id.to_owned();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            conn.lock().unwrap().query_row(
+                "SELECT source_seq FROM remote_session_sync WHERE session_id = ?1 AND source_node_id = ?2",
+                params![session_id, source_node_id],
+                |row| row.get(0),
+            ).optional().map_err(SessionError::from)
+        }).await.map_err(|e| SessionError::Other(e.to_string()))?
+    }
+
+    async fn advance_remote_sync_cursor(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+        source_seq: i64,
+        complete: bool,
+    ) -> SessionResult<()> {
+        let session_id = session_id.to_owned();
+        let source_node_id = source_node_id.to_owned();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            conn.lock().unwrap().execute(
+                "INSERT INTO remote_session_sync (session_id, source_node_id, source_seq, complete)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (session_id, source_node_id) DO UPDATE SET
+                 source_seq = MAX(source_seq, excluded.source_seq),
+                 complete = MAX(complete, excluded.complete)",
+                params![session_id, source_node_id, source_seq, complete],
+            ).map(|_| ()).map_err(SessionError::from)
+        })
+        .await
+        .map_err(|e| SessionError::Other(e.to_string()))?
+    }
+
+    async fn load_remote_session_stream(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+    ) -> SessionResult<Vec<DurableEvent>> {
+        let session_id = session_id.to_owned();
+        let source_node_id = source_node_id.to_owned();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            // Legacy rows remain intact. Once an authoritative snapshot is
+            // complete, prefer it over cursorless copies of the same history.
+            let mut stmt = conn.prepare(
+                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json
+                 FROM event_journal WHERE session_id = ?1 AND (
+                     source_node_id = ?2 OR (source_node_id IS NULL AND NOT EXISTS (
+                         SELECT 1 FROM remote_session_sync
+                         WHERE session_id = ?1 AND source_node_id = ?2 AND complete = 1
+                     ))
+                 ) ORDER BY CASE WHEN source_seq IS NULL THEN 0 ELSE 1 END, source_seq, stream_seq",
+            )?;
+            stmt.query_map(params![session_id, source_node_id], parse_journal_row)?
+                .collect::<Result<Vec<_>, _>>().map_err(SessionError::from)
+        }).await.map_err(|e| SessionError::Other(e.to_string()))?
+    }
+
     async fn max_stream_seq(&self, session_id: &str) -> SessionResult<i64> {
         let session_id = session_id.to_string();
         let conn_arc = self.conn.clone();

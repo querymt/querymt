@@ -307,18 +307,34 @@ async fn attach_remote_session_with_node_id(
         })
         .await
         .expect("save test remote bookmark");
+    // These UI unit tests deliberately model legacy/corrupt registrations,
+    // including synthetic node IDs. Coordinator validation is tested separately.
+    let context = fixture
+        .agent
+        .handle
+        .registry
+        .lock()
+        .await
+        .remote_attachment_prepare_context();
+    let candidate = crate::agent::session_registry::prepare_remote_attachment(
+        context,
+        session_id.to_string(),
+        remote_ref,
+        peer_label.to_string(),
+        None,
+        None,
+        Some(remote_node_id.to_string()),
+    )
+    .await
+    .expect("prepare test relay");
     fixture
         .agent
         .handle
-        .attach_remote_session(
-            session_id.to_string(),
-            remote_ref,
-            peer_label.to_string(),
-            None,
-            Some(remote_node_id.to_string()),
-        )
+        .registry
+        .lock()
         .await
-        .expect("attach test remote session");
+        .install_remote_attachment(candidate, None)
+        .unwrap_or_else(|_| panic!("install test relay"));
 }
 
 async fn create_control_test_session(
@@ -1414,6 +1430,47 @@ async fn offline_bookmarked_session_opens_cached_journal_history() -> Result<()>
 
 /// Phase 8: an unknown ID stays distinct from an unavailable remote node —
 /// it is a structured `session_not_found`, never a remote recovery error.
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn incomplete_remote_attachment_opens_disconnected() -> Result<()> {
+    let f = crate::test_utils::TestServerState::new().await;
+    let session_id = format!("incomplete-remote-{}", Uuid::now_v7());
+    attach_remote_session(&f, &session_id, "remote-peer").await;
+    let attachment = {
+        let mut registry = f.agent.handle.registry.lock().await;
+        let session_ref = registry.get(&session_id).cloned().unwrap();
+        let attachment = registry.take_remote_attachment(&session_id).unwrap();
+        // Keep the actor route but remove its relay/attachment generation.
+        registry.insert(session_id.clone(), session_ref);
+        attachment
+    };
+    crate::agent::session_registry::cleanup_installed_remote_attachment(attachment, false).await;
+    let (tx, mut rx) = f.add_connection("incomplete-remote").await;
+    handle_load_session(&f.state, "incomplete-remote", &session_id, &tx).await;
+    let loaded = next_message_of_type(&mut rx, "session_loaded").await;
+    assert_eq!(loaded["data"]["connection_state"], "disconnected");
+    let state = next_message_of_type(&mut rx, "state").await;
+    assert_eq!(state["data"]["agent_mode"], "");
+    assert!(
+        f.agent
+            .handle
+            .registry
+            .lock()
+            .await
+            .remote_attachment(&session_id)
+            .is_none()
+    );
+    assert!(
+        f.agent
+            .storage
+            .session_store()
+            .get_session(&session_id)
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn load_unknown_session_returns_session_not_found_marker() -> Result<()> {
     let f = crate::test_utils::TestServerState::new().await;

@@ -28,6 +28,23 @@ fn messaging_config(request_timeout: std::time::Duration) -> remote::messaging::
         .with_response_size_maximum(crate::provider_transport::MESH_MESSAGE_SIZE_MAXIMUM)
 }
 
+async fn next_mesh_event<B: NetworkBehaviour>(
+    swarm: &mut libp2p::Swarm<B>,
+) -> SwarmEvent<B::ToSwarm> {
+    // Kameo 0.22 polls one command at a time but does not self-wake after
+    // Unregister/LookupLocal. Queued commands can then sleep indefinitely on
+    // idle meshes. Re-poll locally until upstream drains its command queue;
+    // this watchdog sends no network traffic and never replays requests.
+    let mut poll_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    poll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = poll_tick.tick() => {},
+            event = swarm.select_next_some() => return event,
+        }
+    }
+}
+
 pub async fn bootstrap_mesh_runtime(
     config: &MeshRuntimeConfig,
 ) -> Result<MeshRuntimeHandle, MeshError> {
@@ -432,7 +449,7 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
                         }
                     }
                 }
-                event = swarm.select_next_some() => {
+                event = next_mesh_event(&mut swarm) => {
                     match event {
                         SwarmEvent::Behaviour(UnifiedMeshBehaviourEvent::Kameo(remote::Event::Messaging(event))) => {
                             log_kameo_messaging_event(&event);
@@ -519,6 +536,40 @@ mod tests {
 
     #[derive(Debug, Serialize, Deserialize)]
     struct EmptyResponse;
+
+    #[tokio::test]
+    async fn idle_mesh_drains_queued_unregister_commands() {
+        let peer_id = PeerId::random();
+        let behaviour =
+            remote::Behaviour::new(peer_id, messaging_config(std::time::Duration::from_secs(1)));
+        behaviour.init_global();
+        let transport = libp2p::core::transport::dummy::DummyTransport::<(
+            PeerId,
+            libp2p::core::muxing::StreamMuxerBox,
+        )>::new();
+        let mut swarm = libp2p::Swarm::new(
+            libp2p::Transport::boxed(transport),
+            behaviour,
+            peer_id,
+            libp2p::swarm::Config::with_tokio_executor(),
+        );
+        let driver = tokio::spawn(async move {
+            loop {
+                next_mesh_event(&mut swarm).await;
+            }
+        });
+        // No network or discovery event should be needed to drain local commands.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            futures_util::future::join_all(
+                (0..8).map(|index| remote::unregister(format!("absent-{index}"))),
+            ),
+        )
+        .await;
+        driver.abort();
+        let replies = result.expect("queued unregister commands must not stall an idle mesh");
+        assert!(replies.into_iter().all(|reply| reply.is_ok()));
+    }
 
     #[tokio::test]
     async fn shared_messaging_config_applies_the_request_limit() {

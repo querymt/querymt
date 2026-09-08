@@ -525,6 +525,26 @@ mod tests {
                 Ok(None)
             }
 
+            async fn remote_sync_cursor(&self, _: &str, _: &str) -> SessionResult<Option<i64>> {
+                Ok(None)
+            }
+            async fn advance_remote_sync_cursor(
+                &self,
+                _: &str,
+                _: &str,
+                _: i64,
+                _: bool,
+            ) -> SessionResult<()> {
+                Ok(())
+            }
+            async fn load_remote_session_stream(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> SessionResult<Vec<DurableEvent>> {
+                Ok(vec![])
+            }
+
             async fn max_stream_seq(&self, _session_id: &str) -> SessionResult<i64> {
                 Ok(0)
             }

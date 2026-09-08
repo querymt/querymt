@@ -14,30 +14,19 @@ pub(crate) enum SessionOperationSafety {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionOperation {
     LegacyPrompt,
-    SubmitInput {
-        has_key: bool,
-    },
+    SubmitInput { has_key: bool },
     RuntimeState,
     Cancel,
-    // Classified for plan §9 completeness but not yet routed: production
-    // get-mode queries still use the session ref directly (tests construct it).
-    #[allow(dead_code)]
     GetMode,
+    GetReasoningEffort,
     SetMode,
     SetReasoningEffort,
     SetModel,
     Undo,
     Redo,
-    // Deferred with their owning packages (fork finalization, remote file
-    // helpers, event refresh); classified and named for stability but not yet
-    // routed through `session_ref_for_operation`.
-    #[allow(dead_code)]
     Fork,
-    #[allow(dead_code)]
     FileIndex,
-    #[allow(dead_code)]
     ReadFile,
-    #[allow(dead_code)]
     EventRefresh,
 }
 
@@ -49,6 +38,7 @@ impl SessionOperation {
             Self::RuntimeState => "runtime_state",
             Self::Cancel => "cancel",
             Self::GetMode => "get_mode",
+            Self::GetReasoningEffort => "get_reasoning_effort",
             Self::SetMode => "set_mode",
             Self::SetReasoningEffort => "set_reasoning_effort",
             Self::SetModel => "set_model",
@@ -65,6 +55,7 @@ impl SessionOperation {
         match self {
             Self::RuntimeState
             | Self::GetMode
+            | Self::GetReasoningEffort
             | Self::FileIndex
             | Self::ReadFile
             | Self::EventRefresh => SessionOperationSafety::Idempotent,
@@ -79,6 +70,13 @@ impl SessionOperation {
             | Self::Redo
             | Self::Fork => SessionOperationSafety::NonIdempotent,
         }
+    }
+
+    fn can_retry_after_recovery(self, failure: &RemoteTransportFailure, same_actor: bool) -> bool {
+        self.can_retry(failure)
+            && (failure.proven_not_delivered()
+                || self.safety() == SessionOperationSafety::Idempotent
+                || same_actor)
     }
 
     fn can_retry(self, failure: &RemoteTransportFailure) -> bool {
@@ -118,6 +116,31 @@ pub(crate) enum SessionOperationError {
 }
 
 impl SessionOperationError {
+    fn after_retry(
+        session_id: &str,
+        operation: SessionOperation,
+        first_failure: &RemoteTransportFailure,
+        error: AgentError,
+    ) -> Self {
+        match error.transport_failure() {
+            Some(retry_failure)
+                if !retry_failure.proven_not_delivered()
+                    || !first_failure.proven_not_delivered() =>
+            {
+                Self::OutcomeUnknown {
+                    session_id: session_id.to_owned(),
+                    operation,
+                    failure: if first_failure.proven_not_delivered() {
+                        retry_failure.clone()
+                    } else {
+                        first_failure.clone()
+                    },
+                }
+            }
+            _ => Self::Failed(error),
+        }
+    }
+
     pub(crate) fn into_agent_error(self) -> AgentError {
         match self {
             Self::Failed(error) => error,
@@ -143,7 +166,10 @@ impl SessionOperationError {
                 session_id,
                 message,
             } => AgentError::Internal(format!("failed to resolve session {session_id}: {message}")),
-            Self::Connect(error) => AgentError::Internal(error.to_string()),
+            Self::Connect(error) => AgentError::TurnControl {
+                kind: error.code().to_string(),
+                message: error.to_string(),
+            },
         }
     }
 
@@ -190,6 +216,39 @@ impl SessionOperationError {
 }
 
 impl LocalAgentHandle {
+    pub(crate) async fn refresh_remote_session_events(
+        &self,
+        session_id: &str,
+    ) -> Result<(), SessionOperationError> {
+        self.execute_session_operation(session_id, SessionOperation::EventRefresh, |session_ref| {
+            let sink = self.config.event_sink.clone();
+            let session_ref = session_ref.clone();
+            let session_id = session_id.to_owned();
+            Box::pin(async move {
+                let Some(node_id) = session_ref.remote_node_id().map(str::to_owned) else {
+                    return Ok(());
+                };
+                let cursor = sink
+                    .journal()
+                    .remote_sync_cursor(&session_id, &node_id)
+                    .await
+                    .map_err(|e| AgentError::Internal(e.to_string()))?;
+                let peer_label = session_ref.node_label().to_owned();
+                crate::agent::remote::event_backfill::backfill_remote_events(
+                    sink,
+                    session_ref,
+                    session_id,
+                    node_id,
+                    peer_label,
+                    0,
+                    cursor,
+                )
+                .await
+            })
+        })
+        .await
+    }
+
     pub(crate) async fn session_ref_for_operation(
         &self,
         session_id: &str,
@@ -203,24 +262,18 @@ impl LocalAgentHandle {
         );
         async move {
             let store = self.config.provider.history_store();
-            let (bookmark, local) = tokio::join!(
-                store.get_remote_session_bookmark(session_id),
-                store.get_session(session_id)
-            );
-            let bookmark = bookmark.map_err(|error| SessionOperationError::Storage {
-                session_id: session_id.to_string(),
-                message: error.to_string(),
-            })?;
-            let local = local.map_err(|error| SessionOperationError::Storage {
-                session_id: session_id.to_string(),
-                message: error.to_string(),
-            })?;
-
-            match (local.is_some(), bookmark) {
-                (true, Some(_)) => Err(SessionOperationError::LocationConflict {
+            use crate::session::location::{SessionLocation, resolve_session_location};
+            let location = resolve_session_location(store.as_ref(), session_id)
+                .await
+                .map_err(|error| SessionOperationError::Storage {
+                    session_id: session_id.to_string(),
+                    message: error.to_string(),
+                })?;
+            match location {
+                SessionLocation::Conflict { .. } => Err(SessionOperationError::LocationConflict {
                     session_id: session_id.to_string(),
                 }),
-                (true, None) => self
+                SessionLocation::Local => self
                     .session_ref_for_agent_session(session_id)
                     .await
                     .map(|session_ref| ResolvedSession {
@@ -231,7 +284,7 @@ impl LocalAgentHandle {
                         session_id: session_id.to_string(),
                         message: error.to_string(),
                     }),
-                (false, Some(bookmark)) => {
+                SessionLocation::Remote { bookmark } => {
                     let installed = {
                         let registry = self.registry.lock().await;
                         registry.remote_attachment(session_id)
@@ -255,7 +308,7 @@ impl LocalAgentHandle {
                     })
                     .map_err(SessionOperationError::Connect)
                 }
-                (false, None) => Err(SessionOperationError::NotFound {
+                SessionLocation::NotFound => Err(SessionOperationError::NotFound {
                     session_id: session_id.to_string(),
                 }),
             }
@@ -319,6 +372,8 @@ impl LocalAgentHandle {
                     session_id,
                     remote_connect::RemoteConnectOptions {
                         node_hint: resolved.session_ref.remote_node_id(),
+                        peer_label: None,
+                        preferred_scope: None,
                         reason: remote_connect::RemoteConnectReason::OperationRecovery,
                         replace: remote_connect::RemoteReplacePolicy::ReplaceIfMatches(attachment_id),
                         handoff: None,
@@ -327,15 +382,12 @@ impl LocalAgentHandle {
                 .await
                 .map_err(|error| {
                     tracing::Span::current().record("retry_decision", "recovery_failed");
-                    SessionOperationError::Connect(error)
+                    if !failure.proven_not_delivered() {
+                        SessionOperationError::OutcomeUnknown { session_id: session_id.to_owned(), operation, failure: failure.clone() }
+                    } else { SessionOperationError::Connect(error) }
                 })?;
 
-            // Replay safety: only replay into the recovered attachment when it
-            // still points at the same remote actor (same peer, actor sequence,
-            // and node scope) the failed attempt was sent to. A different
-            // identity means the request may have been served by a
-            // re-attached/recreated actor with unknowable state — refuse replay
-            // for every recovery outcome (Reused, Resumed, Reattached).
+            // Only ambiguous keyed submissions depend on an actor-local receipt.
             let same_remote_actor = match (&resolved.session_ref, &recovered.session_ref) {
                 (
                     SessionActorRef::Remote {
@@ -355,16 +407,7 @@ impl LocalAgentHandle {
                 }
                 _ => false,
             };
-            let retry_against_materialized_actor = same_remote_actor
-                && !matches!(
-                    (operation, failure.delivery, recovered.outcome),
-                    (
-                        SessionOperation::SubmitInput { has_key: true },
-                        querymt_remote::DeliveryCertainty::Unknown,
-                        remote_connect::RemoteConnectOutcome::Resumed,
-                    )
-                );
-            if !operation.can_retry(&failure) || !retry_against_materialized_actor {
+            if !operation.can_retry_after_recovery(&failure, same_remote_actor) {
                 tracing::Span::current().record("retry_decision", "outcome_unknown_no_replay");
                 log::warn!(
                     "remote session operation not replayed (session_id={}, operation={}, attachment_id={}, failure_kind={}, delivery={})",
@@ -392,7 +435,7 @@ impl LocalAgentHandle {
             );
             invoke(&recovered.session_ref)
                 .await
-                .map_err(SessionOperationError::Failed)
+                .map_err(|error| SessionOperationError::after_retry(session_id, operation, &failure, error))
         }
         .instrument(retry_span)
         .await
@@ -457,6 +500,184 @@ mod tests {
             cwd: None,
             created_at: 1,
             title: None,
+        }
+    }
+
+    #[test]
+    fn retry_after_actor_replacement_requires_receipt_only_for_ambiguous_keyed_input() {
+        let unknown = failure(
+            RemoteTransportFailureKind::ReplyTimeout,
+            DeliveryCertainty::Unknown,
+        );
+        let not_delivered = failure(
+            RemoteTransportFailureKind::ActorUnavailable,
+            DeliveryCertainty::NotDelivered,
+        );
+        assert!(SessionOperation::RuntimeState.can_retry_after_recovery(&unknown, false));
+        assert!(SessionOperation::LegacyPrompt.can_retry_after_recovery(&not_delivered, false));
+        assert!(SessionOperation::Fork.can_retry_after_recovery(&not_delivered, false));
+        assert!(
+            SessionOperation::SubmitInput { has_key: true }
+                .can_retry_after_recovery(&not_delivered, false)
+        );
+        assert!(
+            !SessionOperation::SubmitInput { has_key: true }
+                .can_retry_after_recovery(&unknown, false)
+        );
+        assert!(
+            SessionOperation::SubmitInput { has_key: true }
+                .can_retry_after_recovery(&unknown, true)
+        );
+        assert!(!SessionOperation::LegacyPrompt.can_retry_after_recovery(&unknown, true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_recovery_retries_idempotent_operation_after_actor_replacement() {
+        assert_actor_replacement_retry(
+            SessionOperation::RuntimeState,
+            DeliveryCertainty::Unknown,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_recovery_retries_not_delivered_operation_after_actor_replacement() {
+        assert_actor_replacement_retry(
+            SessionOperation::LegacyPrompt,
+            DeliveryCertainty::NotDelivered,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_recovery_does_not_replay_ambiguous_input_after_actor_replacement() {
+        assert_actor_replacement_retry(
+            SessionOperation::SubmitInput { has_key: true },
+            DeliveryCertainty::Unknown,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_recovery_repeated_actor_replacements_do_not_stall_idle_mesh() {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            for _ in 0..3 {
+                assert_actor_replacement_retry(
+                    SessionOperation::RuntimeState,
+                    DeliveryCertainty::Unknown,
+                    true,
+                )
+                .await;
+                assert_actor_replacement_retry(
+                    SessionOperation::LegacyPrompt,
+                    DeliveryCertainty::NotDelivered,
+                    true,
+                )
+                .await;
+                assert_actor_replacement_retry(
+                    SessionOperation::SubmitInput { has_key: true },
+                    DeliveryCertainty::Unknown,
+                    false,
+                )
+                .await;
+            }
+        })
+        .await
+        .expect("repeated replacements must not require network activity to wake the mesh");
+    }
+
+    async fn assert_actor_replacement_retry(
+        operation: SessionOperation,
+        certainty: DeliveryCertainty,
+        should_retry: bool,
+    ) {
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh()
+            .await
+            .clone();
+        let (handle, _storage, _tmp) = handle_with_real_storage().await;
+        let handle = Arc::new(handle);
+        let (host, _host_storage, _host_tmp) = handle_with_real_storage().await;
+        handle.set_mesh(mesh.clone());
+        let id = format!("operation-replacement-{}", uuid::Uuid::now_v7());
+        let make_actor = || {
+            SessionActor::spawn(
+                SessionActor::new(
+                    host.config.clone(),
+                    id.clone(),
+                    SessionRuntime::new(
+                        None,
+                        Default::default(),
+                        crate::agent::core::McpToolState::empty(),
+                    ),
+                )
+                .with_mesh(Some(mesh.clone())),
+            )
+        };
+        let original = make_actor();
+        let replacement = make_actor();
+        let replacement_remote = replacement.clone().into_remote_ref().await;
+        handle
+            .attach_remote_session(
+                id.clone(),
+                original.into_remote_ref().await,
+                "test-peer".into(),
+                None,
+                Some(mesh.peer_id().to_string()),
+            )
+            .await
+            .unwrap();
+        let mut attempts = 0;
+        let result = handle
+            .execute_session_operation(&id, operation, |sr| {
+                attempts += 1;
+                let attempt = attempts;
+                let sr = sr.clone();
+                let mesh = mesh.clone();
+                let handle = handle.clone();
+                let replacement = replacement.clone();
+                let id = id.clone();
+                Box::pin(async move {
+                    if attempt == 1 {
+                        // A concurrent recovery installs a new actor before
+                        // the old in-flight operation reports its failure.
+                        handle
+                            .attach_remote_session(
+                                id,
+                                replacement.into_remote_ref().await,
+                                "test-peer".into(),
+                                None,
+                                Some(mesh.peer_id().to_string()),
+                            )
+                            .await
+                            .map_err(|e| AgentError::Internal(e.to_string()))?;
+                        return Err(AgentError::from_transport_failure(failure(
+                            RemoteTransportFailureKind::ConnectionClosed,
+                            certainty,
+                        )));
+                    }
+                    sr.get_mode().await
+                })
+            })
+            .await;
+        if should_retry {
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(attempts, 2);
+        } else {
+            assert!(matches!(
+                result,
+                Err(SessionOperationError::OutcomeUnknown { .. })
+            ));
+            assert_eq!(attempts, 1);
+        }
+        let installed = handle.registry.lock().await.get(&id).cloned().unwrap();
+        match installed {
+            SessionActorRef::Remote { actor_ref, .. } => {
+                assert_eq!(actor_ref.id(), replacement_remote.id())
+            }
+            _ => panic!("recovery created a local replacement"),
         }
     }
 
@@ -595,6 +816,45 @@ mod tests {
             error,
             SessionOperationError::LocationConflict { .. }
         ));
+    }
+
+    #[test]
+    fn final_retry_preserves_ambiguity_from_either_attempt() {
+        for (first, retry, unknown) in [
+            (
+                DeliveryCertainty::Unknown,
+                DeliveryCertainty::NotDelivered,
+                true,
+            ),
+            (
+                DeliveryCertainty::NotDelivered,
+                DeliveryCertainty::Unknown,
+                true,
+            ),
+            (DeliveryCertainty::Unknown, DeliveryCertainty::Unknown, true),
+            (
+                DeliveryCertainty::NotDelivered,
+                DeliveryCertainty::NotDelivered,
+                false,
+            ),
+        ] {
+            let result = SessionOperationError::after_retry(
+                "session",
+                SessionOperation::SubmitInput { has_key: true },
+                &failure(RemoteTransportFailureKind::ConnectionClosed, first),
+                AgentError::from_transport_failure(failure(
+                    RemoteTransportFailureKind::ConnectionClosed,
+                    retry,
+                )),
+            );
+            assert_eq!(
+                matches!(result, SessionOperationError::OutcomeUnknown { .. }),
+                unknown
+            );
+            if let SessionOperationError::OutcomeUnknown { failure, .. } = result {
+                assert!(!failure.proven_not_delivered());
+            }
+        }
     }
 
     #[test]

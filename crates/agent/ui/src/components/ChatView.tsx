@@ -56,6 +56,7 @@ export function ChatView() {
   const {
     attachRemoteSession,
     submitInput,
+    subscribeSession,
     requestRuntimeState,
     cancelSession,
     deleteSession,
@@ -211,6 +212,8 @@ export function ChatView() {
   const previousThinkingAgentIdRef = useRef<string | null>(null);
   const mentionInputRef = useRef<HTMLTextAreaElement>(null);
   const promptRef = useRef(prompt);
+  const activeSessionRef = useRef(sessionId);
+  activeSessionRef.current = sessionId;
   const activeIndexStatus = sessionId ? workspaceIndexStatus[sessionId]?.status : undefined;
 
   promptRef.current = prompt;
@@ -304,35 +307,22 @@ export function ChatView() {
 
   const handleSendPrompt = async (delivery?: 'steer' | 'queue') => {
     if (!prompt.trim() || loading || !sessionId) return;
-
-    fileMention.clear();
+    const submittedDraft = prompt;
+    const submittedSession = sessionId;
     followArmedRef.current = followNewMessages;
-
     setLoading(true);
     try {
-      const blocks = buildPromptBlocksFromInput(prompt);
-      const activeDelivery = delivery ?? (runtimeState?.steerable ? 'steer' : undefined);
-      if (activeDelivery) {
-        const result = submitInput(activeDelivery, blocks, sessionId);
-        if (result.accepted) {
+      const result = submitInput(delivery ?? (runtimeState?.steerable ? 'steer' : 'queue'),
+        buildPromptBlocksFromInput(submittedDraft), submittedSession);
+      if (result.accepted && await result.acknowledgement) {
+        // Do not erase edits or another session's draft while awaiting the receipt.
+        if (useUiStore.getState().prompt === submittedDraft && activeSessionRef.current === submittedSession) {
           setPrompt('');
-        } else {
-          followArmedRef.current = false;
-          requestRuntimeState(sessionId);
-          console.warn(`Input was not submitted: ${result.reason}`);
+          fileMention.clear();
         }
       } else {
-        // Idle turn: acknowledged Queue submission (Phase 7). The legacy
-        // Prompt RPC is reserved for ACP/compatibility callers; Queue gives
-        // the UI a submission receipt instead of an ambiguous silent send.
-        const result = submitInput('queue', blocks, sessionId);
-        if (result.accepted) {
-          setPrompt('');
-        } else {
-          followArmedRef.current = false;
-          requestRuntimeState(sessionId);
-          console.warn(`Input was not submitted: ${result.reason}`);
-        }
+        followArmedRef.current = false;
+        requestRuntimeState(submittedSession);
       }
     } catch (err) {
       followArmedRef.current = false;
@@ -1115,6 +1105,12 @@ export function ChatView() {
         sessionThinkingAgentId={sessionThinkingAgentId}
         runtimeState={runtimeState}
         pendingInputs={pendingInputs}
+        onReconcile={() => {
+          if (sessionId) {
+            subscribeSession(sessionId);
+            requestRuntimeState(sessionId);
+          }
+        }}
         rateLimitState={rateLimitState}
         activeIndexStatus={activeIndexStatus}
         allFiles={fileMention.allFiles}

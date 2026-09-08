@@ -99,69 +99,18 @@ pub async fn load_session_snapshot(
     view_store: Arc<dyn ViewStore>,
     session_id: &str,
 ) -> SessionResult<SessionLoadSnapshot> {
-    let is_remote_attached = {
-        let registry = agent.registry.lock().await;
-        registry.get(session_id).is_some_and(|r| r.is_remote())
+    let bookmark = agent
+        .config
+        .provider
+        .history_store()
+        .get_remote_session_bookmark(session_id)
+        .await?;
+    let journal_backed = bookmark.is_some();
+    let audit = if let Some(bookmark) = bookmark {
+        journal_backed_audit_view(agent, session_id, &bookmark.node_id).await?
+    } else {
+        view_store.get_audit_view(session_id, false).await?
     };
-
-    // Load the same snapshot the web UI uses. Remote sessions may not have a
-    // full local projection row yet — whether attached or merely bookmarked
-    // while offline (plan §11) — so fall back to the local event journal,
-    // which keeps cached remote history readable without a live actor
-    // (plan invariant 9).
-    // Whether the audit view below was rebuilt from the local journal instead
-    // of a durable projection row. Journal-backed sessions have no local
-    // history rows either, so the history lookup must tolerate
-    // `SessionNotFound`.
-    let mut journal_backed = false;
-    let audit = match view_store.get_audit_view(session_id, false).await {
-        Ok(audit) => audit,
-        Err(e) if is_remote_attached => {
-            tracing::debug!(
-                session_id,
-                error = %e,
-                "remote session missing local audit projection; loaded journal-backed snapshot"
-            );
-            journal_backed = true;
-            journal_backed_audit_view(agent, session_id).await?
-        }
-        Err(e) => {
-            // Offline-first remote identity (plan §11): a bookmarked remote
-            // session opens its cached journal history without a live actor.
-            // An empty journal yields an empty disconnected view (plan §11.4).
-            let bookmarked = match agent
-                .config
-                .provider
-                .history_store()
-                .get_remote_session_bookmark(session_id)
-                .await
-            {
-                Ok(bookmark) => bookmark.is_some(),
-                Err(bookmark_error) => {
-                    // Keep the offline fallback behavior, but make lookup
-                    // failures distinguishable from "no bookmark".
-                    tracing::warn!(
-                        session_id,
-                        error = %bookmark_error,
-                        "remote bookmark lookup failed while resolving offline audit \
-                         fallback; treating as not bookmarked"
-                    );
-                    false
-                }
-            };
-            if !bookmarked {
-                return Err(e);
-            }
-            tracing::debug!(
-                session_id,
-                error = %e,
-                "bookmarked remote session missing local audit projection; loaded journal-backed snapshot"
-            );
-            journal_backed = true;
-            journal_backed_audit_view(agent, session_id).await?
-        }
-    };
-
     let cursor = cursor_from_events(&audit.events);
     let delegation_updates =
         crate::control::delegation_notifications::delegation_updates_from_events(&audit.events);
@@ -201,12 +150,13 @@ pub async fn load_session_snapshot(
 async fn journal_backed_audit_view(
     agent: &LocalAgentHandle,
     session_id: &str,
+    node_id: &str,
 ) -> SessionResult<AuditView> {
-    let events: Vec<AgentEvent> = agent
+    let events = agent
         .config
         .event_sink
         .journal()
-        .load_session_stream(session_id, None, None)
+        .load_remote_session_stream(session_id, node_id)
         .await?
         .into_iter()
         .map(AgentEvent::from)
@@ -304,6 +254,10 @@ mod tests {
             .await
             .unwrap();
         let mut store = MockSessionStore::new();
+        store
+            .expect_get_remote_session_bookmark()
+            .returning(|_| Ok(None))
+            .times(1);
         store
             .expect_get_history()
             .withf({

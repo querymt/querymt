@@ -103,11 +103,30 @@ pub async fn build_ui_prompt_blocks(
         .await
         .ok_or_else(|| format!("session not found: {session_id}"))?;
     let session_cwd = session_cwd_for(state, session_id).await;
+    #[cfg(feature = "remote")]
+    if session_ref.is_remote() {
+        let user_text = prompt
+            .iter()
+            .find_map(|block| match block {
+                UiPromptBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let blocks = super::mentions::build_remote_prompt_blocks(
+            &state.agent,
+            session_id,
+            session_cwd.as_ref(),
+            user_text,
+            prompt,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        return Ok((session_ref, blocks));
+    }
     let blocks = super::mentions::build_prompt_blocks(
         &state.workspace_manager,
         session_cwd.as_ref(),
         prompt,
-        Some(&session_ref),
     )
     .await;
     Ok((session_ref, blocks))
@@ -125,32 +144,7 @@ async fn submit_input_queue(
     session_id: &str,
     prompt: &[UiPromptBlock],
 ) -> Result<(), String> {
-    #[cfg(feature = "remote")]
-    let session_ref = state
-        .agent
-        .session_ref_for_operation(
-            session_id,
-            crate::agent::handle::session_operation::SessionOperation::SubmitInput {
-                has_key: true,
-            },
-        )
-        .await
-        .map_err(|error| error.into_agent_error().to_string())?
-        .session_ref;
-    #[cfg(not(feature = "remote"))]
-    let session_ref = session_ref_for_session(state, session_id)
-        .await
-        .ok_or_else(|| {
-            format_prompt_error(session_id, "unresolved session", "session not found")
-        })?;
-    let session_cwd = session_cwd_for(state, session_id).await;
-    let prompt_blocks = super::mentions::build_prompt_blocks(
-        &state.workspace_manager,
-        session_cwd.as_ref(),
-        prompt,
-        Some(&session_ref),
-    )
-    .await;
+    let (session_ref, prompt_blocks) = build_ui_prompt_blocks(state, session_id, prompt).await?;
     let prompt_target = prompt_target_for_session_ref(&session_ref);
     let message = crate::agent::messages::SubmitInput {
         session_id: session_id.to_string(),
@@ -221,37 +215,34 @@ pub async fn ensure_session(
             .and_then(|conn| conn.sessions.get(agent_id).cloned())
     };
     if let Some(session_id) = &existing {
-        let root_session_ref = {
-            let registry = state.agent.registry.lock().await;
-            registry.get(session_id).cloned()
-        };
-        if root_session_ref
-            .as_ref()
-            .is_some_and(SessionActorRef::is_remote)
+        use crate::session::location::{SessionLocation, resolve_session_location};
+        match resolve_session_location(
+            state.agent.config.provider.history_store().as_ref(),
+            session_id,
+        )
+        .await
+        .map_err(|e| e.to_string())?
         {
-            return Ok(session_id.clone());
-        }
-
-        // A session ID durably bookmarked as remote must never be passed into
-        // local-session creation. A missing/dead attachment here means
-        // disconnected, not destroyed — keep the binding intact and surface a
-        // typed remote-unavailable signal so callers can drive reconnect.
-        // Fail closed like guard_bookmarked_remote_unattached: a bookmark
-        // lookup failure is not proof that the session is local.
-        let has_remote_bookmark = state
-            .agent
-            .config
-            .provider
-            .history_store()
-            .get_remote_session_bookmark(session_id)
-            .await
-            .map_err(|e| format!("remote identity lookup failed for session '{session_id}': {e}"))?
-            .is_some();
-        if has_remote_bookmark {
-            return Err(format!(
-                "remote_session_unavailable: session '{}' is bookmarked on a remote node but not currently connected; reconnect to open it",
-                session_id
-            ));
+            SessionLocation::Conflict { .. } => return Err("session_location_conflict".into()),
+            SessionLocation::Remote { .. } => {
+                #[cfg(feature = "remote")]
+                {
+                    state
+                        .agent
+                        .session_ref_for_operation(
+                            session_id,
+                            crate::agent::handle::session_operation::SessionOperation::RuntimeState,
+                        )
+                        .await
+                        .map_err(|e| {
+                            format!("remote_session_unavailable: {}", e.into_agent_error())
+                        })?;
+                    return Ok(session_id.clone());
+                }
+                #[cfg(not(feature = "remote"))]
+                return Err("remote_session_unavailable: remote support disabled".into());
+            }
+            _ => {}
         }
 
         // Verify the session still exists in the registry.
@@ -525,6 +516,20 @@ pub async fn local_agent_for_session(
     session_id: Option<&str>,
     requested_profile_id: Option<&str>,
 ) -> Result<Arc<AgentHandle>, String> {
+    if let Some(session_id) = session_id {
+        use crate::session::location::{SessionLocation, resolve_session_location};
+        match resolve_session_location(
+            state.agent.config.provider.history_store().as_ref(),
+            session_id,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        {
+            SessionLocation::Remote { .. } => return Ok(state.agent.clone()),
+            SessionLocation::Conflict { .. } => return Err("session_location_conflict".to_string()),
+            _ => {}
+        }
+    }
     let profile_id =
         resolve_profile_id_for_session(state, session_id, requested_profile_id).await?;
     local_agent_for_profile(state, profile_id.as_deref()).await
@@ -582,29 +587,74 @@ pub async fn default_reasoning_effort_for_session(
         .and_then(|agent| **agent.default_reasoning_effort.load())
 }
 
-pub async fn mode_for_session(state: &ServerState, session_id: Option<&str>) -> AgentMode {
-    if let Some(session_id) = session_id
-        && let Some(session_ref) = session_ref_for_session(state, session_id).await
-        && let Ok(mode) = session_ref.get_mode().await
-    {
-        return mode;
+pub async fn mode_for_session(
+    state: &ServerState,
+    session_id: Option<&str>,
+) -> Result<AgentMode, String> {
+    #[cfg(feature = "remote")]
+    if let Some(id) = session_id {
+        let agent = local_agent_for_session(state, Some(id), None).await?;
+        if agent
+            .config
+            .provider
+            .history_store()
+            .get_remote_session_bookmark(id)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return agent
+                .execute_session_operation(
+                    id,
+                    crate::agent::handle::session_operation::SessionOperation::GetMode,
+                    |sr| Box::pin(sr.get_mode()),
+                )
+                .await
+                .map_err(|e| e.into_agent_error().to_string());
+        }
     }
-
-    default_mode_for_session(state, session_id).await
+    if let Some(id) = session_id
+        && let Some(sr) = session_ref_for_session(state, id).await
+        && let Ok(mode) = sr.get_mode().await
+    {
+        return Ok(mode);
+    }
+    Ok(default_mode_for_session(state, session_id).await)
 }
 
 pub async fn reasoning_effort_for_session(
     state: &ServerState,
     session_id: Option<&str>,
-) -> Option<ReasoningEffort> {
-    if let Some(session_id) = session_id
-        && let Some(session_ref) = session_ref_for_session(state, session_id).await
-        && let Ok(effort) = session_ref.get_reasoning_effort().await
-    {
-        return effort;
+) -> Result<Option<ReasoningEffort>, String> {
+    #[cfg(feature = "remote")]
+    if let Some(id) = session_id {
+        let agent = local_agent_for_session(state, Some(id), None).await?;
+        if agent
+            .config
+            .provider
+            .history_store()
+            .get_remote_session_bookmark(id)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return agent
+                .execute_session_operation(
+                    id,
+                    crate::agent::handle::session_operation::SessionOperation::GetReasoningEffort,
+                    |sr| Box::pin(sr.get_reasoning_effort()),
+                )
+                .await
+                .map_err(|e| e.into_agent_error().to_string());
+        }
     }
-
-    default_reasoning_effort_for_session(state, session_id).await
+    if let Some(id) = session_id
+        && let Some(sr) = session_ref_for_session(state, id).await
+        && let Ok(effort) = sr.get_reasoning_effort().await
+    {
+        return Ok(effort);
+    }
+    Ok(default_reasoning_effort_for_session(state, session_id).await)
 }
 
 pub async fn list_profiles(state: &ServerState) -> Result<Vec<UiProfileInfo>, String> {
@@ -880,16 +930,46 @@ system = "inline"
 
         fixture
             .agent
-            .handle
-            .attach_remote_session(
-                session_id.to_string(),
-                remote_ref,
-                "remote-peer".to_string(),
-                None,
-                Some("remote-peer".to_string()),
-            )
+            .storage
+            .session_store()
+            .save_remote_session_bookmark(&RemoteSessionBookmark {
+                session_id: session_id.to_string(),
+                node_id: "remote-peer".into(),
+                peer_label: "remote-peer".into(),
+                cwd: None,
+                created_at: 1,
+                title: None,
+            })
             .await
-            .expect("attach test remote session");
+            .unwrap();
+        // These UI unit tests deliberately model legacy/corrupt registrations,
+        // including synthetic node IDs. Coordinator validation is tested separately.
+        let context = fixture
+            .agent
+            .handle
+            .registry
+            .lock()
+            .await
+            .remote_attachment_prepare_context();
+        let candidate = crate::agent::session_registry::prepare_remote_attachment(
+            context,
+            session_id.to_string(),
+            remote_ref,
+            "remote-peer".to_string(),
+            None,
+            None,
+            Some("remote-peer".to_string()),
+        )
+        .await
+        .expect("prepare test relay");
+        fixture
+            .agent
+            .handle
+            .registry
+            .lock()
+            .await
+            .install_remote_attachment(candidate, None)
+            .unwrap_or_else(|_| panic!("install test relay"));
     }
 
     #[cfg(feature = "remote")]

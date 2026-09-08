@@ -177,16 +177,39 @@ pub trait EventJournal: Send + Sync {
         event: &NewDurableEvent,
     ) -> SessionResult<Option<DurableEvent>>;
 
-    /// Latest persisted source-side sequence for a session/node pair — the
-    /// dedup/backfill cursor (plan §16.1). `None` when no row with source
-    /// identity exists yet (legacy journals, local-only sessions): the caller
-    /// must treat the first post-upgrade attachment as a new synchronization
-    /// boundary instead of guessing sequences.
+    /// Latest received source-side sequence for a session/node pair.
+    /// This is NOT a synchronization checkpoint: live delivery may skip gaps.
+    /// Returns `None` when no row carries source identity. Use
+    /// `remote_sync_cursor` to resume backfill without skipping missing events.
     async fn latest_source_seq(
         &self,
         session_id: &str,
         source_node_id: &str,
     ) -> SessionResult<Option<i64>>;
+
+    /// Last successfully backfilled source sequence, independent of live delivery.
+    async fn remote_sync_cursor(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+    ) -> SessionResult<Option<i64>>;
+
+    /// Advance only after every event in a historical page has persisted.
+    /// `complete` makes the source-identified snapshot authoritative over legacy rows.
+    async fn advance_remote_sync_cursor(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+        source_seq: i64,
+        complete: bool,
+    ) -> SessionResult<()>;
+
+    /// Cached remote snapshot in host order, without duplicating legacy rows once synced.
+    async fn load_remote_session_stream(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+    ) -> SessionResult<Vec<DurableEvent>>;
 
     /// Stream tip for a session: the highest `stream_seq` currently persisted
     /// (0 when empty). Serves as the completion marker for cursor-based

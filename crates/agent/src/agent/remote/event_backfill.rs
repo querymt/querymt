@@ -1,30 +1,7 @@
-//! Cursor-based event backfill for remote sessions (plan §10/§16).
-//!
-//! After a fresh attachment commit, the local journal may be missing durable
-//! events that the host emitted while the relay was disconnected. Backfill:
-//!
-//! 1. Reads the last persisted source cursor `(session_id, source_node_id)`.
-//! 2. Pages the host stream via `GetEventStreamSince` after that cursor.
-//! 3. Inserts through the same idempotent source-identity path as the live
-//!    relay (`EventJournal::append_durable_from_source`), so overlap between
-//!    the live subscription and historical pages is deduplicated — never
-//!    double-inserted, never republished twice.
-//! 4. Publishes an ephemeral `RemoteSessionSyncCompleted` when done.
-//!
-//! Ordering guarantee: the live subscription is established during attachment
-//! prepare (before commit), and backfill starts after commit — newly generated
-//! events cannot be lost, and overlap is deduplicated. Prefer overlap over gap.
-//!
-//! Mixed-version: a host that predates cursor backfill fails the page query
-//! with a typed transport failure (unknown message). That marks history
-//! potentially stale but never fails the established connection (plan
-//! compatibility rule).
-//!
-//! Legacy boundary (§16): when no source cursor exists for the session/node,
-//! source sequences are never guessed. The first post-upgrade successful
-//! attachment is the new synchronization boundary; the authoritative snapshot
-//! served at open covers that opening, and every subsequent event persists
-//! with a cursor.
+//! Historical synchronization uses a durable checkpoint captured before subscription.
+//! Live events cannot advance it; successful pages advance it only after persistence.
+//! Cursorless sessions fetch authoritative host pages from the beginning, without
+//! assigning guessed source identities to legacy rows. Fresh events publish once.
 
 use std::sync::Arc;
 
@@ -32,7 +9,6 @@ use tracing::Instrument;
 
 use crate::event_sink::EventSink;
 use crate::events::{AgentEventKind, EventOrigin};
-use crate::session::projection::NewDurableEvent;
 
 use super::actor_ref::SessionActorRef;
 
@@ -52,73 +28,21 @@ pub(crate) async fn backfill_remote_events(
     source_node_id: String,
     peer_label: String,
     attachment_id: u64,
-) {
+    cursor: Option<i64>,
+) -> Result<(), crate::error::AgentError> {
     let span = tracing::info_span!(
         "remote.session.sync",
         session_id = %session_id,
         node_id = %source_node_id,
-        peer_label = %peer_label,
         attachment_id,
     );
     async move {
-        let journal = event_sink.journal().clone();
-
-        // §16.1: last persisted source sequence for this session/node.
-        let cursor = match journal
-            .latest_source_seq(&session_id, &source_node_id)
-            .await
-        {
-            Ok(cursor) => cursor,
-            Err(error) => {
-                tracing::warn!(
-                    target: "remote::event_backfill",
-                    session_id = %session_id,
-                    node_id = %source_node_id,
-                    attachment_id,
-                    error = %error,
-                    "backfill failed to read the persisted source cursor"
-                );
-                return;
-            }
-        };
-
-        let Some(mut after) = cursor else {
-            // §16 legacy boundary: rows persisted before source identity
-            // existed carry no cursor. Do not guess source sequences — treat
-            // this first post-upgrade attachment as a new synchronization
-            // boundary; cursor-based persistence is guaranteed for every
-            // event from now on.
-            tracing::info!(
-                target: "remote::event_backfill",
-                session_id = %session_id,
-                node_id = %source_node_id,
-                attachment_id,
-                "backfill skipped: no source cursor for session/node (legacy sync boundary)"
-            );
-            event_sink.emit_ephemeral_with_origin(
-                &session_id,
-                AgentEventKind::RemoteSessionSyncCompleted {
-                    backfilled: 0,
-                    boundary: true,
-                    node_id: Some(source_node_id.clone()),
-                },
-                EventOrigin::Local,
-                None,
-            );
-            return;
-        };
-
-        tracing::info!(
-            target: "remote::event_backfill",
-            session_id = %session_id,
-            node_id = %source_node_id,
-            attachment_id,
-            after,
-            "backfill started"
-        );
-
-        let mut backfilled: u64 = 0;
-        let mut duplicates: u64 = 0;
+        let journal = event_sink.journal();
+        // This checkpoint was captured BEFORE subscription. Never replace it
+        // with MAX(source_seq): a live event may already be beyond a gap.
+        let mut after = cursor.unwrap_or(0);
+        let boundary = cursor.is_none();
+        let mut backfilled = 0;
         loop {
             let page = match session_ref
                 .get_event_stream_since(Some(after), BACKFILL_PAGE_SIZE)
@@ -126,114 +50,60 @@ pub(crate) async fn backfill_remote_events(
             {
                 Ok(page) => page,
                 Err(error) => {
-                    // Unsupported backfill (mixed-version host) and transient
-                    // transport failures both mark history potentially stale;
-                    // neither fails the established connection (plan compat).
-                    match error.transport_failure() {
-                        Some(failure) => tracing::info!(
-                            target: "remote::event_backfill",
-                            session_id = %session_id,
-                            node_id = %source_node_id,
-                            attachment_id,
-                            failure_kind = ?failure.kind,
-                            delivery = ?failure.delivery,
-                            "backfill unavailable; history may be stale"
-                        ),
-                        None => tracing::warn!(
-                            target: "remote::event_backfill",
-                            session_id = %session_id,
-                            node_id = %source_node_id,
-                            attachment_id,
-                            error = %error,
-                            "backfill failed; history may be stale"
-                        ),
-                    }
-                    return;
+                    tracing::warn!(session_id, %error, "backfill unavailable; history may be stale");
+                    return Err(error);
                 }
             };
-
-            let tip = page.latest_source_seq;
-            let last_seq = page.events.last().map(|event| event.seq);
-
+            let last = page.events.last().map(|event| event.seq);
+            if last.is_some_and(|seq| seq <= after)
+                || (last.is_none() && page.latest_source_seq > after)
+            {
+                tracing::warn!(session_id, after, "backfill page did not advance; retaining checkpoint");
+                return Err(crate::error::AgentError::Internal("invalid backfill page".into()));
+            }
+            let mut previous = after;
             for event in page.events {
-                if event.seq <= 0 {
-                    // No usable source cursor on this event; cannot dedup.
-                    continue;
+                if event.seq <= previous || event.session_id != session_id {
+                    tracing::warn!(session_id, "invalid backfill page; retaining checkpoint");
+                    return Err(crate::error::AgentError::Internal("invalid backfill page".into()));
                 }
-                let new_event = NewDurableEvent {
-                    session_id: session_id.clone(),
-                    origin: EventOrigin::Remote,
-                    // Display metadata only (§15); live relay uses the same
-                    // label, so backfilled rows look identical to live rows.
-                    source_node: event
-                        .source_node
-                        .clone()
-                        .or_else(|| Some(peer_label.clone())),
-                    source_node_id: Some(source_node_id.clone()),
-                    source_seq: Some(event.seq),
-                    kind: event.kind.clone(),
-                };
-                match journal.append_durable_from_source(&new_event).await {
+                previous = event.seq;
+                match event_sink.emit_durable_from_source(
+                    &session_id,
+                    event.kind,
+                    Some(peer_label.clone()),
+                    source_node_id.clone(),
+                    event.seq,
+                ).await {
                     Ok(Some(_)) => backfilled += 1,
-                    // Overlap with the live relay deduplicated (§16.4/§16.5).
-                    Ok(None) => duplicates += 1,
+                    Ok(None) => {},
                     Err(error) => {
-                        tracing::warn!(
-                            target: "remote::event_backfill",
-                            session_id = %session_id,
-                            node_id = %source_node_id,
-                            attachment_id,
-                            error = %error,
-                            "backfill failed to persist page; history may be stale"
-                        );
-                        return;
+                        tracing::warn!(session_id, %error, "backfill persistence failed; retaining checkpoint");
+                        return Err(crate::error::AgentError::Internal(error.to_string()));
                     }
                 }
             }
-
-            match last_seq {
-                // Reached the host tip (§16.5).
-                Some(seq) if seq >= tip => break,
-                // Defend against non-monotonic pages: the cursor must advance,
-                // otherwise the same page would be requested forever.
-                Some(seq) if seq > after => after = seq,
-                Some(seq) => {
-                    tracing::warn!(
-                        target: "remote::event_backfill",
-                        session_id = %session_id,
-                        node_id = %source_node_id,
-                        attachment_id,
-                        after,
-                        page_last_seq = seq,
-                        "backfill stopped: host page did not advance the cursor"
-                    );
-                    break;
-                }
-                // Empty page: stream exhausted.
-                None => break,
+            after = last.unwrap_or(after);
+            let complete = after >= page.latest_source_seq;
+            if let Err(error) = journal.advance_remote_sync_cursor(
+                &session_id, &source_node_id, after, complete,
+            ).await {
+                tracing::warn!(session_id, %error, "backfill checkpoint failed");
+                return Err(crate::error::AgentError::Internal(error.to_string()));
             }
+            if complete { break; }
         }
-
-        tracing::info!(
-            target: "remote::event_backfill",
-            session_id = %session_id,
-            node_id = %source_node_id,
-            attachment_id,
-            backfilled,
-            duplicates,
-            "backfill completed"
-        );
+        tracing::info!(session_id, backfilled, after, "backfill completed");
         event_sink.emit_ephemeral_with_origin(
             &session_id,
             AgentEventKind::RemoteSessionSyncCompleted {
                 backfilled,
-                boundary: false,
-                node_id: Some(source_node_id.clone()),
+                boundary,
+                node_id: Some(source_node_id),
             },
             EventOrigin::Local,
             None,
         );
-    }
-    .instrument(span)
-    .await;
+        Ok(())
+    }.instrument(span).await
 }

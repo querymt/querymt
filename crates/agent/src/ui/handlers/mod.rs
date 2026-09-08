@@ -16,6 +16,7 @@ mod plugins;
 mod remote;
 mod schedules;
 mod session_ops;
+pub(crate) use session_ops::send_cached_session_events;
 
 // ── Re-exports consumed by sibling modules ────────────────────────────────────
 

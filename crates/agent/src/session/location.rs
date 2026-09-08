@@ -16,7 +16,6 @@
 //!    regardless of current registry state.").
 
 use crate::session::error::SessionError;
-use crate::session::repository::SessionRepository;
 use crate::session::store::{RemoteSessionBookmark, SessionStore};
 
 /// Where a session ID durably lives.
@@ -50,7 +49,6 @@ pub type SessionLocationResult = Result<SessionLocation, SessionError>;
 /// can only enrich runtime information after this returns the authoritative type.
 pub async fn resolve_session_location(
     session_store: &dyn SessionStore,
-    local_repo: &dyn SessionRepository,
     session_id: &str,
 ) -> SessionLocationResult {
     // 1. Check the remote bookmark (authoritative durable identity for remote).
@@ -61,7 +59,7 @@ pub async fn resolve_session_location(
     // 2. Check whether a local session row exists. `get_session` returns
     //    `Ok(None)` when no row matches, so a hard error here is a genuine
     //    storage failure and must propagate — never guess.
-    let local_exists = local_repo.get_session(session_id).await?.is_some();
+    let local_exists = session_store.get_session(session_id).await?.is_some();
 
     Ok(match (local_exists, bookmark) {
         (true, Some(bookmark)) => SessionLocation::Conflict { bookmark },
@@ -74,7 +72,6 @@ pub async fn resolve_session_location(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::repo_session::SqliteSessionRepository;
     use crate::session::sqlite_storage::SqliteStorage;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -83,7 +80,6 @@ mod tests {
     /// over the same SQLite database (authoritative local row detection).
     struct Fixture {
         store: Arc<dyn SessionStore>,
-        repo: SqliteSessionRepository,
     }
 
     impl Fixture {
@@ -92,8 +88,7 @@ mod tests {
                 .await
                 .expect("connect in-memory sqlite");
             let store = crate::session::backend::StorageBackend::session_store(&storage);
-            let repo = SqliteSessionRepository::new(storage.conn());
-            Self { store, repo }
+            Self { store }
         }
 
         fn bookmark(&self, session_id: &str) -> RemoteSessionBookmark {
@@ -109,7 +104,7 @@ mod tests {
     }
 
     async fn resolve(fx: &Fixture, id: &str) -> SessionLocation {
-        resolve_session_location(fx.store.as_ref(), &fx.repo, id)
+        resolve_session_location(fx.store.as_ref(), id)
             .await
             .expect("resolve_session_location")
     }

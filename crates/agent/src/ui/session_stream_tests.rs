@@ -82,6 +82,81 @@ async fn test_profile_manager_with_infra(
 }
 
 #[tokio::test]
+async fn sync_completion_refreshes_open_remote_transcript_in_host_order() -> Result<()> {
+    let mut f = TestServerState::new().await;
+    f.state.event_sources = vec![f.agent.config.event_sink.fanout().clone()];
+    let id = "remote-sync-ui";
+    f.agent
+        .storage
+        .session_store()
+        .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
+            session_id: id.into(),
+            node_id: "owner".into(),
+            peer_label: "peer".into(),
+            cwd: None,
+            created_at: 1,
+            title: None,
+        })
+        .await?;
+    let (tx, mut rx) = f.add_connection("sync-ui").await;
+    f.state
+        .connections
+        .lock()
+        .await
+        .get_mut("sync-ui")
+        .unwrap()
+        .subscribed_sessions
+        .insert(id.into());
+    spawn_event_forwarders(f.state.clone(), "sync-ui".into(), tx);
+    let sink = &f.agent.config.event_sink;
+    sink.emit_durable_from_source(
+        id,
+        AgentEventKind::Cancelled,
+        Some("peer".into()),
+        "owner".into(),
+        3,
+    )
+    .await?;
+    sink.emit_durable_from_source(
+        id,
+        AgentEventKind::SessionCreated,
+        Some("peer".into()),
+        "owner".into(),
+        1,
+    )
+    .await?;
+    sink.journal()
+        .advance_remote_sync_cursor(id, "owner", 3, true)
+        .await?;
+    sink.emit_ephemeral_with_origin(
+        id,
+        AgentEventKind::RemoteSessionSyncCompleted {
+            backfilled: 1,
+            boundary: true,
+            node_id: Some("owner".into()),
+        },
+        EventOrigin::Local,
+        None,
+    );
+    let replay = timeout(Duration::from_secs(2), async {
+        loop {
+            let msg = parse_message(&rx.recv().await.unwrap());
+            if msg["type"] == "session_events" {
+                break msg;
+            }
+        }
+    })
+    .await?;
+    assert_eq!(replay["data"]["session_id"], id);
+    let events = replay["data"]["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["data"]["kind"]["type"], "session_created");
+    assert_eq!(events[1]["data"]["kind"]["type"], "cancelled");
+    f.state.shutdown_token.cancel();
+    Ok(())
+}
+
+#[tokio::test]
 async fn load_session_includes_cursor_seq_from_audit_tail() -> Result<()> {
     let f = TestServerState::new().await;
     let session_id = f.agent.create_session().await;

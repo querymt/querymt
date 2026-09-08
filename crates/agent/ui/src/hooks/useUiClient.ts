@@ -38,6 +38,8 @@ import {
   SessionRuntimePhase,
   UiInputDelivery,
 } from '../types';
+import { useUiStore } from '../store/uiStore';
+import { buildPromptBlocksFromInput } from '../logic/chatViewLogic';
 import { debugLog, debugTrace } from '../utils/debugLog';
 
 // Callback type for file index updates
@@ -52,15 +54,16 @@ type UndoFrame = {
 };
 
 export type SubmitInputDispatchResult =
-  | { accepted: true; inputId: string }
-  | { accepted: false; reason: 'no_session' | 'not_connected' | 'not_steerable' };
+  | { accepted: true; inputId: string; acknowledgement: Promise<boolean> }
+  | { accepted: false; reason: 'no_session' | 'not_connected' | 'not_steerable' | 'pending_input' };
 
 export type PendingSessionInput = {
   inputId: string;
   sessionId: string;
   delivery: 'steer' | 'queue';
   text: string;
-  state: 'sending' | 'accepted' | 'queued' | 'applied' | 'started' | 'failed' | 'discarded';
+  prompt?: UiPromptBlock[];
+  state: 'sending' | 'accepted' | 'queued' | 'applied' | 'started' | 'failed' | 'unknown' | 'discarded';
   position?: number;
   error?: string;
 };
@@ -268,6 +271,28 @@ export function useUiClient() {
   const [defaultCwd, setDefaultCwd] = useState<string | null>(null);
   const [workspacePathDialogOpen, setWorkspacePathDialogOpen] = useState(false);
   const [workspacePathDialogDefaultValue, setWorkspacePathDialogDefaultValue] = useState('');
+  const inputAcknowledgementsRef = useRef(new Map<string, {
+    sessionId: string;
+    fingerprint: string;
+    resolve: (accepted: boolean) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>());
+  const uncertainInputsRef = useRef(new Map<string, { sessionId: string; fingerprint: string }>());
+  const settleInput = useCallback((inputId: string, accepted: boolean, unknown = false) => {
+    const pending = inputAcknowledgementsRef.current.get(inputId);
+    if (pending) {
+      clearTimeout(pending.timer);
+      inputAcknowledgementsRef.current.delete(inputId);
+      if (unknown) uncertainInputsRef.current.set(inputId, pending);
+      pending.resolve(accepted);
+    }
+    const uncertain = uncertainInputsRef.current.get(inputId);
+    if (accepted && uncertain && sessionIdRef.current === uncertain.sessionId
+        && JSON.stringify(buildPromptBlocksFromInput(useUiStore.getState().prompt)) === uncertain.fingerprint) {
+      useUiStore.getState().setPrompt('');
+    }
+    if (accepted || !unknown) uncertainInputsRef.current.delete(inputId);
+  }, []);
   const socketRef = useRef<WebSocket | null>(null);
   const requestRuntimeState = useCallback((targetSessionId?: string) => {
     const resolvedSessionId = targetSessionId ?? sessionIdRef.current;
@@ -369,6 +394,10 @@ export function useUiClient() {
       socket.onclose = () => {
         if (!mounted) return;
         setConnected(false);
+        for (const [inputId, pending] of inputAcknowledgementsRef.current) {
+          updatePendingInput(pending.sessionId, inputId, { state: 'unknown', error: 'Connection closed before acknowledgement' });
+          settleInput(inputId, false, true);
+        }
         scheduleReconnect();
       };
 
@@ -433,6 +462,7 @@ export function useUiClient() {
 
     return () => {
       mounted = false;
+      for (const [inputId] of inputAcknowledgementsRef.current) settleInput(inputId, false, true);
 
       // Cancel any pending reconnect timer
       if (reconnectTimerRef.current !== null) {
@@ -488,6 +518,22 @@ export function useUiClient() {
     }, 5000);
   }, []);
 
+  const reconcileInputEvent = (event: any) => {
+    const kind = event.kind?.type;
+    const data = event.kind?.data;
+    if (!data?.input_id) return;
+    if (['steering_accepted', 'input_queued', 'steering_applied', 'queued_input_started'].includes(kind)) {
+      settleInput(data.input_id, true);
+      if (kind === 'steering_applied' || kind === 'queued_input_started') {
+        removePendingInput(event.session_id, data.input_id);
+      } else {
+        updatePendingInput(event.session_id, data.input_id, {
+          state: kind === 'input_queued' ? 'queued' : 'accepted', position: data.position, error: undefined,
+        });
+      }
+    }
+  };
+
   const handleServerMessage = (msg: UiServerMessage) => {
     debugLog('[useUiClient] Received message:', () => ({ type: msg.type, msg }));
     switch (msg.type) {
@@ -505,7 +551,7 @@ export function useUiClient() {
           setAgentModeState(d.agent_mode);
         }
         // reasoning_effort may be null/undefined (= "auto")
-        setReasoningEffortState(d.reasoning_effort ?? null);
+        if (d.agent_mode) setReasoningEffortState(d.reasoning_effort ?? null);
         break;
       }
       case 'session_created': {
@@ -536,16 +582,17 @@ export function useUiClient() {
         break;
       }
       case 'input_submission_failed': {
+        // Durable acceptance wins over a delayed failure from the request path.
+        if (!inputAcknowledgementsRef.current.has(msg.data.client_input_id)
+            && !uncertainInputsRef.current.has(msg.data.client_input_id)) break;
         updatePendingInput(msg.data.session_id, msg.data.client_input_id, {
-          state: 'failed',
+          state: msg.data.code === 'submission_outcome_unknown' ? 'unknown' : 'failed',
           error: msg.data.message,
         });
         pushSessionActionNotice('error', msg.data.code === 'run_closing'
           ? 'The run is finishing. Queue this message for the next turn.'
           : msg.data.message);
-        window.setTimeout(() => {
-          removePendingInput(msg.data.session_id, msg.data.client_input_id);
-        }, 5000);
+        settleInput(msg.data.client_input_id, false, msg.data.code === 'submission_outcome_unknown');
         if (msg.data.active_run_id) {
           requestAnimationFrame(() => requestRuntimeState(msg.data.session_id));
         }
@@ -564,6 +611,7 @@ export function useUiClient() {
       case 'input_submitted': {
         const result = msg.data.result;
         const inputId = result.data.input_id;
+        settleInput(inputId, true);
         if (result.status === 'steered') {
           updatePendingInput(msg.data.session_id, inputId, {
             state: 'accepted',
@@ -589,6 +637,7 @@ export function useUiClient() {
         // Events arrive as EventEnvelope[] (adjacently tagged); unwrap before translating.
         const translated = d.events.map((e: any) => {
           const unwrapped = unwrapEnvelope(e);
+          reconcileInputEvent(unwrapped);
           const item = translateAgentEvent(d.agent_id, unwrapped);
           item.sessionId = d.session_id;
           item.seq = unwrapped.seq;
@@ -649,6 +698,7 @@ export function useUiClient() {
           return;
         }
 
+        reconcileInputEvent(eventEnvelope);
         if (eventKind === 'run_started') {
           setRuntimeBySession((prev) => {
             const next = new Map(prev);
@@ -955,8 +1005,7 @@ export function useUiClient() {
               }));
             } else {
               // Non-streaming provider or out-of-order final message: append if newer.
-              const lastSeq = existing.length > 0 ? (existing[existing.length - 1].seq ?? -1) : -1;
-              if (translated.seq == null || translated.seq > lastSeq) {
+              if (translated.seq == null || !existing.some(item => item.seq === translated.seq)) {
                 next.set(d.session_id, [...existing, translated]);
               }
               debugTrace('[useUiClient] final assistant message appended without live accumulator', () => ({
@@ -964,7 +1013,6 @@ export function useUiClient() {
                 message_id: messageId,
                 existing_len: existing.length,
                 translated_seq: translated.seq,
-                last_seq: lastSeq,
               }));
             }
             return next;
@@ -976,8 +1024,7 @@ export function useUiClient() {
             const existing = next.get(d.session_id) ?? [];
             // Dedup: skip if we already have this seq
             if (existing.length > 0 && translated.seq != null) {
-              const lastSeq = existing[existing.length - 1].seq ?? -1;
-              if (translated.seq <= lastSeq) return prev;
+              if (existing.some(item => item.seq === translated.seq)) return prev;
             }
             next.set(d.session_id, [...existing, translated]);
             return next;
@@ -1019,6 +1066,9 @@ export function useUiClient() {
         // only as a fallback for codeless errors from older backends.
         const errorCode = typeof d.code === 'string' ? d.code : undefined;
         const errorSessionId = typeof d.session_id === 'string' ? d.session_id : undefined;
+        if (errorSessionId && errorCode?.startsWith('remote_')) {
+          setSessionConnectionStates(prev => ({ ...prev, [errorSessionId]: RemoteSessionConnectionState.Disconnected }));
+        }
         const isDeleteError = d.message.includes('Failed to delete session');
         const isLoadError =
           (errorCode != null &&
@@ -1243,6 +1293,7 @@ export function useUiClient() {
         
         // Populate eventsBySession from the audit events (for old session history)
         const translated = d.audit.events.map((e: any) => {
+          reconcileInputEvent(e);
           const item = translateAgentEvent(d.agent_id, e);
           item.sessionId = d.session_id;
           item.seq = e.seq;
@@ -1782,7 +1833,19 @@ export function useUiClient() {
       return { accepted: false, reason: 'not_steerable' };
     }
 
+    const fingerprint = JSON.stringify(prompt);
+    if ([...inputAcknowledgementsRef.current.values(), ...uncertainInputsRef.current.values()]
+      .some(item => item.sessionId === resolvedSessionId && item.fingerprint === fingerprint)) {
+      return { accepted: false, reason: 'pending_input' };
+    }
     const inputId = uuidv7();
+    const acknowledgement = new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        updatePendingInput(resolvedSessionId, inputId, { state: 'unknown', error: 'Acknowledgement timed out' });
+        settleInput(inputId, false, true);
+      }, 30_000);
+      inputAcknowledgementsRef.current.set(inputId, { sessionId: resolvedSessionId, fingerprint, resolve, timer });
+    });
     const text = prompt
       .filter((block): block is Extract<UiPromptBlock, { type: 'text' }> => block.type === 'text')
       .map((block) => block.data.text)
@@ -1791,22 +1854,27 @@ export function useUiClient() {
       const next = new Map(prev);
       next.set(resolvedSessionId, [
         ...(next.get(resolvedSessionId) ?? []),
-        { inputId, sessionId: resolvedSessionId, delivery, text, state: 'sending' },
+        { inputId, sessionId: resolvedSessionId, delivery, text, prompt, state: 'sending' },
       ]);
       return next;
     });
 
-    sendMessage({
-      type: 'submit_input',
-      data: {
-        session_id: resolvedSessionId,
-        delivery: delivery === 'steer' ? UiInputDelivery.Steer : UiInputDelivery.Queue,
-        expected_run_id: delivery === 'steer' ? runtime?.active_run_id : undefined,
-        client_input_id: inputId,
-        prompt,
-      },
-    });
-    return { accepted: true, inputId };
+    try {
+      sendMessage({
+        type: 'submit_input',
+        data: {
+          session_id: resolvedSessionId,
+          delivery: delivery === 'steer' ? UiInputDelivery.Steer : UiInputDelivery.Queue,
+          expected_run_id: delivery === 'steer' ? runtime?.active_run_id : undefined,
+          client_input_id: inputId,
+          prompt,
+        },
+      });
+    } catch {
+      updatePendingInput(resolvedSessionId, inputId, { state: 'unknown', error: 'Connection failed before acknowledgement' });
+      settleInput(inputId, false, true);
+    }
+    return { accepted: true, inputId, acknowledgement };
   }, []);
 
   const sendPrompt = useCallback(async (prompt: UiPromptBlock[]) => {
@@ -1837,6 +1905,7 @@ export function useUiClient() {
   const attachRemoteSession = useCallback((nodeId: string, sessionId: string, sessionLabel?: string) => {
     const label = sessionLabel && sessionLabel.trim().length > 0 ? sessionLabel : sessionId;
     pendingLoadLabelsRef.current.set(sessionId, label);
+    setSessionConnectionStates(prev => ({ ...prev, [sessionId]: RemoteSessionConnectionState.Connecting }));
     sendMessage({ type: 'attach_remote_session', data: { node_id: nodeId, session_id: sessionId } });
   }, []);
 

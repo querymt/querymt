@@ -14,10 +14,11 @@ use super::super::messages::UiServerMessage;
 #[cfg(feature = "remote")]
 use super::remote::finalize_remote_session_attach;
 
+#[cfg(not(feature = "remote"))]
+use super::super::session::session_ref_for_session;
 use super::super::session::{
     PRIMARY_AGENT_ID, agent_for_profile_and_id, local_agent_for_session, mode_for_session,
     reasoning_effort_for_session, resolve_profile_id, resolve_profile_id_for_session,
-    session_ref_for_session,
 };
 use crate::acp::protocol::{LoadSessionRequest, SessionId};
 use crate::agent::LocalAgentHandle;
@@ -416,37 +417,18 @@ async fn resolve_open_session_route(
     session_id: &str,
 ) -> Result<OpenSessionRoute, String> {
     let store = state.agent.config.provider.history_store();
-    let (bookmark, local_row) = tokio::join!(
-        store.get_remote_session_bookmark(session_id),
-        store.get_session(session_id),
-    );
-    let bookmark = bookmark
-        .map_err(|e| format!("remote identity lookup failed for session '{session_id}': {e}"))?;
-    let local_row = local_row
-        .map_err(|e| format!("local session lookup failed for session '{session_id}': {e}"))?;
-
-    Ok(match (local_row.is_some(), bookmark) {
-        (true, Some(_)) => OpenSessionRoute::Conflict,
-        (true, None) => OpenSessionRoute::Local,
-        (false, Some(bookmark)) => OpenSessionRoute::Remote(Some(bookmark)),
-        (false, None) => {
-            // Neither durable record. A live remote attachment without a
-            // bookmark is a pre-upgrade attachment: keep it openable through
-            // the attached-remote flow instead of reporting it as not found.
-            let live_remote = state
-                .agent
-                .registry
-                .lock()
-                .await
-                .get(session_id)
-                .is_some_and(|session_ref| session_ref.is_remote());
-            if live_remote {
-                OpenSessionRoute::Remote(None)
-            } else {
-                OpenSessionRoute::NotFound
-            }
-        }
-    })
+    use crate::session::location::{SessionLocation, resolve_session_location};
+    Ok(
+        match resolve_session_location(store.as_ref(), session_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            SessionLocation::Conflict { .. } => OpenSessionRoute::Conflict,
+            SessionLocation::Local => OpenSessionRoute::Local,
+            SessionLocation::Remote { bookmark } => OpenSessionRoute::Remote(Some(bookmark)),
+            SessionLocation::NotFound => OpenSessionRoute::NotFound,
+        },
+    )
 }
 
 pub async fn handle_load_session(
@@ -630,43 +612,37 @@ async fn open_remote_bookmarked_session(
     //    the cached snapshot is served as disconnected either way.
     #[cfg(feature = "remote")]
     let (connected, recovered) = {
-        let attached = state
+        // The coordinator reuses only complete attachments, without a health RTT.
+        match state
             .agent
-            .registry
-            .lock()
+            .ensure_remote_session_connected(
+                session_id,
+                bookmark.as_ref().map(|b| b.node_id.as_str()),
+                RemoteConnectReason::Open,
+            )
             .await
-            .get(session_id)
-            .is_some_and(|session_ref| session_ref.is_remote());
-        if attached {
-            (true, false)
-        } else {
-            match state
-                .agent
-                .ensure_remote_session_connected(
+        {
+            Ok(connected) => {
+                tracing::debug!(
                     session_id,
-                    bookmark.as_ref().map(|b| b.node_id.as_str()),
-                    RemoteConnectReason::Open,
+                    outcome = connected.outcome.as_str(),
+                    attachment_id = connected.attachment_id,
+                    "remote session connected during open"
+                );
+                (
+                    true,
+                    connected.outcome
+                        != crate::agent::handle::remote_connect::RemoteConnectOutcome::Reused,
                 )
-                .await
-            {
-                Ok(connected) => {
-                    tracing::debug!(
-                        session_id,
-                        outcome = connected.outcome.as_str(),
-                        attachment_id = connected.attachment_id,
-                        "remote session recovered during open"
-                    );
-                    (true, true)
-                }
-                Err(e) => {
-                    tracing::info!(
-                        session_id,
-                        node_id = bookmark.as_ref().map(|b| b.node_id.as_str()).unwrap_or(""),
-                        code = e.code(),
-                        "remote open-time recovery failed; serving cached snapshot as disconnected"
-                    );
-                    (false, false)
-                }
+            }
+            Err(e) => {
+                tracing::info!(
+                    session_id,
+                    node_id = bookmark.as_ref().map(|b| b.node_id.as_str()).unwrap_or(""),
+                    code = e.code(),
+                    "remote open-time recovery failed; serving cached snapshot as disconnected"
+                );
+                (false, false)
             }
         }
     };
@@ -674,8 +650,8 @@ async fn open_remote_bookmarked_session(
     let (connected, recovered): (bool, bool) = (false, false);
 
     // 3. On success, reload the snapshot so events relayed while the
-    //    attachment was established are included. Exact cursor-based backfill
-    //    of missed events is Phase 10.
+    //    attachment was established are included. Later synchronization
+    //    completion publishes a host-ordered snapshot to active subscribers.
     if recovered
         && let Ok(fresh) =
             load_session_snapshot(&state.agent, state.view_store.clone(), session_id).await
@@ -818,8 +794,13 @@ async fn finish_session_open(
     // Send updated state
     send_state(state, conn_id, tx).await;
 
-    // Subscribe to file index updates if this session has a cwd
-    if let Some(cwd) = cwd_path {
+    if connection_state.is_some() {
+        send_cached_session_events(state, conn_id, &session_id, None, tx).await;
+    }
+    // Remote paths must never be indexed on the client filesystem.
+    if connection_state.is_none()
+        && let Some(cwd) = cwd_path
+    {
         let root = resolve_workspace_root(&cwd);
         subscribe_to_file_index(state.clone(), conn_id.to_string(), tx.clone(), root).await;
     }
@@ -1057,6 +1038,38 @@ pub async fn handle_subscribe_session(
     agent_id: Option<&str>,
     tx: &mpsc::Sender<String>,
 ) {
+    send_cached_session_events(state, conn_id, session_id, agent_id, tx).await;
+    #[cfg(feature = "remote")]
+    if state
+        .agent
+        .config
+        .provider
+        .history_store()
+        .get_remote_session_bookmark(session_id)
+        .await
+        .is_ok_and(|bookmark| bookmark.is_some())
+    {
+        let agent = state.agent.clone();
+        let session_id = session_id.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = agent.refresh_remote_session_events(&session_id).await {
+                tracing::warn!(
+                    session_id,
+                    ?error,
+                    "remote history refresh failed; cached history retained"
+                );
+            }
+        });
+    }
+}
+
+pub(crate) async fn send_cached_session_events(
+    state: &ServerState,
+    conn_id: &str,
+    session_id: &str,
+    agent_id: Option<&str>,
+    tx: &mpsc::Sender<String>,
+) {
     // 1. Register subscription FIRST (so live events start flowing)
     {
         let mut connections = state.connections.lock().await;
@@ -1072,28 +1085,27 @@ pub async fn handle_subscribe_session(
     }
 
     // 3. Replay stored events (ViewStore has everything persisted)
-    let (events, resolved_agent_id) = match state.view_store.get_audit_view(session_id, false).await
-    {
-        Ok(audit) => {
-            let resolved_agent_id = {
-                let agents = state.session_agents.lock().await;
-                agents
-                    .get(session_id)
-                    .cloned()
-                    .unwrap_or_else(|| PRIMARY_AGENT_ID.to_string())
-            };
-            (audit.events, resolved_agent_id)
-        }
-        Err(_) => {
-            // Session may be brand new with no stored events yet — that's OK
-            (
-                vec![],
-                agent_id
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| PRIMARY_AGENT_ID.to_string()),
-            )
-        }
-    };
+    let events =
+        match load_session_snapshot(&state.agent, state.view_store.clone(), session_id).await {
+            Ok(snapshot) => snapshot.audit.events,
+            Err(error) => {
+                let _ = send_session_error(
+                    tx,
+                    error.to_string(),
+                    Some("session_refresh_failed"),
+                    Some(session_id),
+                )
+                .await;
+                return;
+            }
+        };
+    let resolved_agent_id = state
+        .session_agents
+        .lock()
+        .await
+        .get(session_id)
+        .cloned()
+        .unwrap_or_else(|| PRIMARY_AGENT_ID.to_string());
 
     let cursor = cursor_from_events(&events);
     let events: Vec<EventEnvelope> = events.into_iter().map(Into::into).collect();
@@ -1346,7 +1358,55 @@ pub async fn handle_fork_session(
             return;
         }
     };
-    let source_session_ref = session_ref_for_session(state, &source_session_id).await;
+    let source_session_ref =
+        super::super::session::session_ref_for_session(state, &source_session_id).await;
+    #[cfg(feature = "remote")]
+    let source_session_ref = match crate::session::location::resolve_session_location(
+        state.agent.config.provider.history_store().as_ref(),
+        &source_session_id,
+    )
+    .await
+    {
+        Ok(crate::session::location::SessionLocation::Remote { .. }) => {
+            match state
+                .agent
+                .session_ref_for_operation(
+                    &source_session_id,
+                    crate::agent::handle::session_operation::SessionOperation::Fork,
+                )
+                .await
+            {
+                Ok(resolved) => Some(resolved.session_ref),
+                Err(error) => {
+                    let _ = send_message(
+                        tx,
+                        UiServerMessage::ForkResult {
+                            success: false,
+                            source_session_id: Some(source_session_id),
+                            forked_session_id: None,
+                            message: Some(error.into_agent_error().to_string()),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+        Ok(crate::session::location::SessionLocation::Local) => source_session_ref,
+        other => {
+            let _ = send_message(
+                tx,
+                UiServerMessage::ForkResult {
+                    success: false,
+                    source_session_id: Some(source_session_id),
+                    forked_session_id: None,
+                    message: Some(format!("Cannot resolve fork source: {other:?}")),
+                },
+            )
+            .await;
+            return;
+        }
+    };
 
     #[cfg(feature = "remote")]
     if let Some(crate::agent::remote::SessionActorRef::Remote { .. }) = source_session_ref.as_ref()
@@ -1379,32 +1439,8 @@ pub async fn handle_fork_session(
             return;
         };
 
-        let node_manager_ref = match source_agent.find_node_manager(&node_id).await {
-            Ok(r) => r,
-            Err(err) => {
-                let _ = send_message(
-                    tx,
-                    UiServerMessage::ForkResult {
-                        success: false,
-                        source_session_id: Some(source_session_id),
-                        forked_session_id: None,
-                        message: Some(format!(
-                            "Failed to resolve remote node manager: {}",
-                            err.message
-                        )),
-                    },
-                )
-                .await;
-                return;
-            }
-        };
-
         match source_agent
-            .fork_remote_session(
-                &node_manager_ref,
-                source_session_id.clone(),
-                message_id.to_string(),
-            )
+            .fork_remote_session_operation(&source_session_id, message_id)
             .await
         {
             Ok(resp) => {
@@ -1676,7 +1712,19 @@ pub async fn handle_set_agent_mode(
                     .and_then(|conn| conn.sessions.get(&conn.active_agent_id).cloned())
             };
 
-            let previous_mode = mode_for_session(state, session_id.as_deref()).await;
+            let previous_mode = match mode_for_session(state, session_id.as_deref()).await {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = send_session_error(
+                        tx,
+                        error,
+                        Some("remote_session_disconnected"),
+                        session_id.as_deref(),
+                    )
+                    .await;
+                    return;
+                }
+            };
 
             match local_agent_for_session(state, session_id.as_deref(), None).await {
                 Ok(agent) => {
@@ -1767,7 +1815,19 @@ pub async fn handle_get_agent_mode(state: &ServerState, conn_id: &str, tx: &mpsc
             .and_then(|conn| conn.sessions.get(&conn.active_agent_id).cloned())
     };
 
-    let mode = mode_for_session(state, session_id.as_deref()).await;
+    let mode = match mode_for_session(state, session_id.as_deref()).await {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = send_session_error(
+                tx,
+                error,
+                Some("remote_session_disconnected"),
+                session_id.as_deref(),
+            )
+            .await;
+            return;
+        }
+    };
 
     let _ = send_message(
         tx,
@@ -1887,7 +1947,19 @@ pub async fn handle_get_reasoning_effort(
             .and_then(|conn| conn.sessions.get(&conn.active_agent_id).cloned())
     };
 
-    let effort = reasoning_effort_for_session(state, session_id.as_deref()).await;
+    let effort = match reasoning_effort_for_session(state, session_id.as_deref()).await {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = send_session_error(
+                tx,
+                error,
+                Some("remote_session_disconnected"),
+                session_id.as_deref(),
+            )
+            .await;
+            return;
+        }
+    };
 
     let _ = send_message(
         tx,
@@ -1914,16 +1986,50 @@ pub async fn handle_get_file_index(state: &ServerState, conn_id: &str, tx: &mpsc
         return;
     };
 
-    // For remote sessions, proxy the file index request to the remote SessionActor.
-    if let Some(actor_ref) = session_ref_for_session(state, &session_id).await
-        && actor_ref.is_remote()
+    use crate::session::location::{SessionLocation, resolve_session_location};
+    let remote = match resolve_session_location(
+        state.agent.config.provider.history_store().as_ref(),
+        &session_id,
+    )
+    .await
     {
+        Ok(SessionLocation::Remote { .. }) => true,
+        Ok(SessionLocation::Local) => false,
+        other => {
+            let _ = send_error(tx, format!("Cannot resolve file index session: {other:?}")).await;
+            return;
+        }
+    };
+    if remote {
         let cwd = {
             let cwds = state.session_cwds.lock().await;
             cwds.get(&session_id).cloned()
         };
 
-        match actor_ref.get_file_index().await {
+        #[cfg(feature = "remote")]
+        let result = state
+            .agent
+            .execute_session_operation(
+                &session_id,
+                crate::agent::handle::session_operation::SessionOperation::FileIndex,
+                |sr| {
+                    Box::pin(async move {
+                        sr.get_file_index()
+                            .await
+                            .map_err(crate::error::AgentError::from)
+                    })
+                },
+            )
+            .await
+            .map_err(|e| e.into_agent_error());
+        #[cfg(not(feature = "remote"))]
+        let result: Result<
+            crate::agent::file_proxy::GetFileIndexResponse,
+            crate::error::AgentError,
+        > = Err(crate::error::AgentError::Internal(
+            "remote support disabled".into(),
+        ));
+        match result {
             Ok(resp) => {
                 let root = std::path::PathBuf::from(&resp.workspace_root);
                 let files = match cwd.as_ref().and_then(|c| c.strip_prefix(&root).ok()) {

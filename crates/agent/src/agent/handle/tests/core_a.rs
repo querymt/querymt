@@ -91,7 +91,8 @@ async fn test_acp_set_model_routes_local_provider_back_to_caller() {
     let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
     let fixture = RealStorageHandleFixture::new().await;
     fixture.handle.set_mesh(mesh.clone());
-    let store = fixture.storage.session_store();
+    let host = RealStorageHandleFixture::new().await;
+    let store = host.storage.session_store();
     let session = store
         .create_session(None, None, None, None)
         .await
@@ -106,7 +107,7 @@ async fn test_acp_set_model_routes_local_provider_back_to_caller() {
         .expect("bind config");
 
     let actor = SessionActor::new(
-        fixture.handle.config.clone(),
+        host.handle.config.clone(),
         session.public_id.clone(),
         SessionRuntime::new(
             None,
@@ -204,7 +205,7 @@ async fn test_cancel_known_remote_session_routes_cancel_to_session_ref() {
         .history_store()
         .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
             session_id: session_id.clone(),
-            node_id: "remote-node".to_string(),
+            node_id: mesh.peer_id().to_string(),
             peer_label: "remote-peer".to_string(),
             cwd: None,
             created_at: 1,
@@ -218,7 +219,7 @@ async fn test_cancel_known_remote_session_routes_cancel_to_session_ref() {
             remote_ref,
             "remote-peer".to_string(),
             None,
-            Some("remote-node".to_string()),
+            Some(mesh.peer_id().to_string()),
         )
         .await
         .expect("attach remote session");
