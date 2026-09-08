@@ -23,7 +23,7 @@ use super::*;
 
 use crate::error::AgentError;
 use crate::session::store::{RemoteSessionBookmark, RemoteSessionBookmarkUpdate};
-use querymt_remote::{DeliveryCertainty, RemoteTransportFailure, RemoteTransportFailureKind};
+use querymt_remote::RemoteTransportFailure;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::Instrument;
@@ -366,6 +366,8 @@ impl std::error::Error for RemoteSessionConnectError {}
 /// state (extension attach) or generation knowledge (operation recovery).
 pub(crate) struct RemoteConnectOptions<'a> {
     pub(crate) node_hint: Option<&'a str>,
+    pub(crate) peer_label: Option<&'a str>,
+    pub(crate) preferred_scope: Option<crate::agent::remote::scope::MeshScopeId>,
     pub(crate) reason: RemoteConnectReason,
     pub(crate) replace: RemoteReplacePolicy,
     /// Pre-resolved handoff from a create/resume response. Skips DHT lookup
@@ -382,16 +384,14 @@ pub(crate) struct RemoteConnectOptions<'a> {
 pub(crate) type RemoteConnectGateMap =
     Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 
-/// RAII holder for one acquisition of a per-session recovery gate. The map
-/// entry is removed once the last waiter drops (mirrors
-/// `SessionSingleFlightGuard`): three strong refs remain at that point —
-/// the map entry, this struct's `lock` field, and the `Arc` inside
-/// `_guard`.
+/// RAII holder for one acquisition of a per-session recovery gate.
+/// References and the map entry are retired under the same lock so a woken
+/// follower cannot race a still-dropping holder or a newly arriving waiter.
 pub(crate) struct RemoteConnectGate {
     session_id: String,
-    lock: Arc<tokio::sync::Mutex<()>>,
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
     map: RemoteConnectGateMap,
-    _guard: tokio::sync::OwnedMutexGuard<()>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl RemoteConnectGate {
@@ -406,23 +406,25 @@ impl RemoteConnectGate {
         let owned_guard = lock.clone().lock_owned().await;
         Self {
             session_id: session_id.to_string(),
-            lock,
+            lock: Some(lock),
             map: map.clone(),
-            _guard: owned_guard,
+            guard: Some(owned_guard),
         }
     }
 }
 
 impl Drop for RemoteConnectGate {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.lock) == 3 {
-            let mut map = self.map.lock();
-            if map
-                .get(&self.session_id)
-                .is_some_and(|entry| Arc::ptr_eq(entry, &self.lock))
-            {
-                map.remove(&self.session_id);
-            }
+        let mut map = self.map.lock();
+        // Release all of this holder's references while the map is locked.
+        // A woken follower cannot retire the entry before these refs disappear.
+        drop(self.guard.take());
+        drop(self.lock.take());
+        if map
+            .get(&self.session_id)
+            .is_some_and(|entry| Arc::strong_count(entry) == 1)
+        {
+            map.remove(&self.session_id);
         }
     }
 }
@@ -444,6 +446,8 @@ impl LocalAgentHandle {
             session_id,
             RemoteConnectOptions {
                 node_hint,
+                peer_label: None,
+                preferred_scope: None,
                 reason,
                 replace: reason.default_replace_policy(),
                 handoff: None,
@@ -497,6 +501,39 @@ impl LocalAgentHandle {
         // acquiring the gate and reuse the freshly installed attachment.
         let _gate = RemoteConnectGate::acquire(&self.remote_connect_gates, session_id).await;
 
+        use crate::session::location::{SessionLocation, resolve_session_location};
+        let store = self.config.provider.history_store();
+        let bookmark = match resolve_session_location(store.as_ref(), session_id)
+            .await
+            .map_err(|e| RemoteSessionConnectError::BookmarkLookupFailed {
+                session_id: session_id.to_string(),
+                message: e.to_string(),
+            })? {
+            SessionLocation::Local | SessionLocation::Conflict { .. } => {
+                return Err(RemoteSessionConnectError::LocationConflict {
+                    session_id: session_id.to_string(),
+                    message: "a local session row exists under this remote session id".to_string(),
+                });
+            }
+            SessionLocation::Remote { bookmark } => Some(bookmark),
+            SessionLocation::NotFound => None,
+        };
+        if let (Some(bookmark), Some(hint)) = (&bookmark, options.node_hint)
+            && bookmark.node_id != hint
+        {
+            return Err(RemoteSessionConnectError::LocationConflict {
+                session_id: session_id.to_string(),
+                message: "node hint disagrees with the durable remote owner".to_string(),
+            });
+        }
+        let node_id = bookmark
+            .as_ref()
+            .map(|b| b.node_id.clone())
+            .or_else(|| options.node_hint.map(str::to_string))
+            .ok_or_else(|| RemoteSessionConnectError::BookmarkMissing {
+                session_id: session_id.to_string(),
+            })?;
+
         // Attachment reuse/replacement decision. Replacement preparation keeps
         // this generation installed until the candidate is fully validated.
         let existing = {
@@ -545,7 +582,10 @@ impl LocalAgentHandle {
                 _ => None,
             };
 
-            if let Some(snapshot) = reuse_snapshot {
+            if let Some(snapshot) = reuse_snapshot
+                && bookmark.is_some()
+                && session_ref.remote_node_id() == Some(node_id.as_str())
+            {
                 let id = snapshot.attachment_id;
                 log::info!(
                     "remote session {} connect: existing attachment reused \
@@ -559,7 +599,6 @@ impl LocalAgentHandle {
                     options.reason.as_str(),
                 );
                 debug_assert_eq!(snapshot.session_ref.is_remote(), session_ref.is_remote());
-                let bookmark = self.load_bookmark_for_reuse(session_id, &session_ref).await;
                 return Ok(ConnectedRemoteSession {
                     session_ref,
                     attachment_id: id,
@@ -576,42 +615,6 @@ impl LocalAgentHandle {
                 options.reason.as_str(),
             );
         }
-
-        // ── Durable identity.
-        let store = self.config.provider.history_store();
-        let bookmark = store
-            .get_remote_session_bookmark(session_id)
-            .await
-            .map_err(|e| RemoteSessionConnectError::BookmarkLookupFailed {
-                session_id: session_id.to_string(),
-                message: e.to_string(),
-            })?;
-
-        // A local session row for the same id is a location conflict (plan
-        // invariant 2). Checked only when we are about to recover/install an
-        // attachment; pure reuse above never reaches here.
-        if bookmark.is_none()
-            && matches!(store.get_session(session_id).await, Ok(Some(_)))
-            && options.handoff.is_none()
-        {
-            log::warn!(
-                "remote session {} connect: local session row exists with no remote bookmark",
-                session_id
-            );
-            return Err(RemoteSessionConnectError::LocationConflict {
-                session_id: session_id.to_string(),
-                message: "a local session row exists and no bookmark claims this id as remote"
-                    .to_string(),
-            });
-        }
-
-        let node_id = options
-            .node_hint
-            .map(str::to_string)
-            .or_else(|| bookmark.as_ref().map(|b| b.node_id.clone()))
-            .ok_or_else(|| RemoteSessionConnectError::BookmarkMissing {
-                session_id: session_id.to_string(),
-            })?;
 
         let mesh = self
             .mesh()
@@ -674,10 +677,11 @@ impl LocalAgentHandle {
         let peer_label = bookmark
             .as_ref()
             .map(|b| b.peer_label.clone())
+            .or_else(|| options.peer_label.map(str::to_owned))
             .unwrap_or_else(|| node_id.clone());
         // Only scan the mesh for a display label on first-time attaches that
         // lack a bookmark (the label is cosmetic and the scan is expensive).
-        let peer_label = if bookmark.is_some() {
+        let peer_label = if bookmark.is_some() || options.peer_label.is_some() {
             peer_label
         } else {
             self.list_remote_nodes()
@@ -708,13 +712,13 @@ impl LocalAgentHandle {
                     }
                 })?;
             let merged = self
-                .persist_connect_bookmark(session_id, &node_id, &peer_label, None, None, None)
+                .build_connect_bookmark(session_id, &node_id, &peer_label, None, None, None)
                 .await?;
             return self
                 .attach_and_verify_remote(
                     session_id,
                     remote_ref,
-                    None,
+                    options.preferred_scope,
                     &merged,
                     RemoteConnectOutcome::Resumed,
                     prepared_slot,
@@ -728,13 +732,13 @@ impl LocalAgentHandle {
             session_id,
             node_id = node_id.as_str(),
         );
-        let dht_hit = Self::lookup_remote_session_actor(&mesh, session_id)
+        let dht_hit = Self::lookup_remote_session_actor(&mesh, session_id, &node_id)
             .instrument(lookup_span)
             .await;
 
         if let Some((remote_ref, matched_scope)) = dht_hit {
             let merged = self
-                .persist_connect_bookmark(session_id, &node_id, &peer_label, None, None, None)
+                .build_connect_bookmark(session_id, &node_id, &peer_label, None, None, None)
                 .await?;
             match self
                 .attach_and_verify_remote(
@@ -831,7 +835,7 @@ impl LocalAgentHandle {
             })?;
 
         let merged = self
-            .persist_connect_bookmark(
+            .build_connect_bookmark(
                 session_id,
                 &node_id,
                 &peer_label,
@@ -864,6 +868,12 @@ impl LocalAgentHandle {
         outcome: RemoteConnectOutcome,
         prepared_slot: &PreparedCandidateSlot,
     ) -> Result<ConnectedRemoteSession, RemoteSessionConnectError> {
+        if !Self::remote_actor_matches_node(&remote_ref, &bookmark.node_id) {
+            return Err(RemoteSessionConnectError::LocationConflict {
+                session_id: session_id.to_string(),
+                message: "remote actor peer disagrees with the durable owner".to_string(),
+            });
+        }
         let (context, expected_attachment_id) = {
             let registry = self.registry.lock().await;
             (
@@ -872,6 +882,14 @@ impl LocalAgentHandle {
             )
         };
         let backfill_sink = context.event_sink.clone();
+        let sync_cursor = backfill_sink
+            .journal()
+            .remote_sync_cursor(session_id, &bookmark.node_id)
+            .await
+            .map_err(|error| RemoteSessionConnectError::RecoveryFailed {
+                transport: None,
+                message: error.to_string(),
+            })?;
         let prepare_span = tracing::info_span!(
             "remote.session.attach.prepare",
             session_id,
@@ -911,6 +929,15 @@ impl LocalAgentHandle {
 
         let health_timeout = Self::remote_connect_health_timeout();
         let health = tokio::time::timeout(health_timeout, session_ref.get_mode()).await;
+        let saved = if matches!(health, Ok(Ok(_))) {
+            self.config
+                .provider
+                .history_store()
+                .save_remote_session_bookmark(bookmark)
+                .await
+        } else {
+            Ok(())
+        };
         let prepared = prepared_slot
             .lock()
             .expect("prepared candidate slot poisoned")
@@ -946,14 +973,20 @@ impl LocalAgentHandle {
                 );
                 return Err(RemoteSessionConnectError::HealthCheckFailed {
                     session_id: session_id.to_string(),
-                    transport: Some(RemoteTransportFailure::new(
-                        RemoteTransportFailureKind::ReplyTimeout,
-                        DeliveryCertainty::Unknown,
-                        message.clone(),
-                    )),
+                    transport: Self::remote_health_check_timeout_error(health_timeout)
+                        .transport_failure()
+                        .cloned(),
                     message,
                 });
             }
+        }
+
+        if let Err(error) = saved {
+            crate::agent::session_registry::abort_prepared_remote_attachment(prepared).await;
+            return Err(RemoteSessionConnectError::BookmarkSaveFailed {
+                session_id: session_id.to_string(),
+                message: error.to_string(),
+            });
         }
 
         let commit_span = tracing::info_span!(
@@ -1008,6 +1041,7 @@ impl LocalAgentHandle {
                 bookmark.node_id.clone(),
                 bookmark.peer_label.clone(),
                 attachment_id,
+                sync_cursor,
             ),
         );
 
@@ -1019,12 +1053,13 @@ impl LocalAgentHandle {
         })
     }
 
-    /// Merge confirmed node info into the durable bookmark and persist it.
+    /// Build candidate metadata without mutating durable state. Persistence is
+    /// performed only after attachment health validation.
     /// Awaited: first-time identity must be durable before the attachment is
     /// reported connected (plan §6). Existing `created_at` is preserved by
     /// `merge_confirmed`; a first write uses the resume-reported creation
     /// time when available.
-    async fn persist_connect_bookmark(
+    async fn build_connect_bookmark(
         &self,
         session_id: &str,
         node_id: &str,
@@ -1069,63 +1104,24 @@ impl LocalAgentHandle {
                 title,
             },
         };
-        // First-time identity (and any confirmed node move) must be durable
-        // before the attachment is committed (plan §6): propagate a typed
-        // error instead of connecting without durable identity.
-        store
-            .save_remote_session_bookmark(&merged)
-            .await
-            .map_err(|e| RemoteSessionConnectError::BookmarkSaveFailed {
-                session_id: session_id.to_string(),
-                message: e.to_string(),
-            })?;
         Ok(merged)
     }
 
-    /// Bookmark for the reuse fast path. The durable store is authoritative;
-    /// a lookup failure or absence degrades to metadata synthesized from the
-    /// installed attachment without rewriting durable state.
-    async fn load_bookmark_for_reuse(
-        &self,
-        session_id: &str,
-        session_ref: &SessionActorRef,
-    ) -> Option<RemoteSessionBookmark> {
-        let store = self.config.provider.history_store();
-        match store.get_remote_session_bookmark(session_id).await {
-            Ok(Some(bookmark)) => Some(bookmark),
-            Ok(None) => match session_ref {
-                SessionActorRef::Remote {
-                    peer_label,
-                    remote_node_id,
-                    ..
-                } => remote_node_id
-                    .as_ref()
-                    .map(|node_id| RemoteSessionBookmark {
-                        session_id: session_id.to_string(),
-                        node_id: node_id.clone(),
-                        peer_label: peer_label.clone(),
-                        cwd: None,
-                        created_at: 0,
-                        title: None,
-                    }),
-                SessionActorRef::Local(_) => None,
-            },
-            Err(e) => {
-                log::warn!(
-                    "remote session {} connect: bookmark lookup failed on reuse path \
-                     (continuing with installed attachment): {}",
-                    session_id,
-                    e
-                );
-                None
-            }
-        }
+    fn remote_actor_matches_node(
+        actor: &kameo::actor::RemoteActorRef<crate::agent::session_actor::SessionActor>,
+        node_id: &str,
+    ) -> bool {
+        actor
+            .id()
+            .peer_id()
+            .is_some_and(|peer| peer.to_string() == node_id)
     }
 
     /// Scoped DHT lookup for a session actor across all active scopes.
     async fn lookup_remote_session_actor(
         mesh: &crate::agent::remote::MeshHandle,
         session_id: &str,
+        node_id: &str,
     ) -> Option<(
         kameo::actor::RemoteActorRef<crate::agent::session_actor::SessionActor>,
         crate::agent::remote::scope::MeshScopeId,
@@ -1138,6 +1134,10 @@ impl LocalAgentHandle {
                 .await
             {
                 Ok(Some(found)) => {
+                    if !Self::remote_actor_matches_node(&found, node_id) {
+                        tracing::warn!(session_id, node_id, actor = %found.id(), "ignoring DHT actor from another peer");
+                        continue;
+                    }
                     log::debug!(
                         "remote session {} connect: DHT publication found (scope matched)",
                         session_id
@@ -1513,6 +1513,153 @@ mod tests {
         assert_eq!(gate_map_len(&map), 0);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unverified_candidates_cannot_write_bookmarks_or_replace_attachment() {
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh()
+            .await
+            .clone();
+        let (handle, storage, _tmp) = handle_with_real_storage().await;
+        handle.set_mesh(mesh.clone());
+        let session_id = "candidate-validation";
+        let actor = SessionActor::spawn(
+            SessionActor::new(
+                handle.config.clone(),
+                session_id.into(),
+                SessionRuntime::new(
+                    None,
+                    Default::default(),
+                    crate::agent::core::McpToolState::empty(),
+                ),
+            )
+            .with_mesh(Some(mesh.clone())),
+        );
+        let remote = actor.clone().into_remote_ref().await;
+        let peer = mesh.peer_id().to_string();
+        let bookmark = test_bookmark(session_id, &peer);
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let wrong = test_bookmark(session_id, "another-peer");
+        let error = handle
+            .attach_and_verify_remote(
+                session_id,
+                remote.clone(),
+                None,
+                &wrong,
+                RemoteConnectOutcome::Reattached,
+                &slot,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "session_location_conflict");
+        assert!(
+            storage
+                .session_store()
+                .get_remote_session_bookmark(session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // DHT entries are scope/session keyed: an actor from a different node
+        // must be ignored even if it advertises the requested session name.
+        mesh.register_actor(
+            actor.clone(),
+            crate::agent::remote::scope::scoped_session(
+                &crate::agent::remote::scope::MeshScopeId::lan_default(),
+                session_id,
+            ),
+        )
+        .await;
+        assert!(
+            LocalAgentHandle::lookup_remote_session_actor(&mesh, session_id, "another-peer")
+                .await
+                .is_none()
+        );
+        let attached = handle
+            .attach_and_verify_remote(
+                session_id,
+                remote.clone(),
+                None,
+                &bookmark,
+                RemoteConnectOutcome::Reattached,
+                &slot,
+            )
+            .await
+            .unwrap();
+        let other_actor = SessionActor::spawn(
+            SessionActor::new(
+                handle.config.clone(),
+                session_id.into(),
+                SessionRuntime::new(
+                    None,
+                    Default::default(),
+                    crate::agent::core::McpToolState::empty(),
+                ),
+            )
+            .with_mesh(Some(mesh.clone())),
+        );
+        let dead = other_actor.clone().into_remote_ref().await;
+        other_actor.kill();
+        other_actor.wait_for_shutdown().await;
+        let mut changed = bookmark.clone();
+        changed.title = Some("must not persist".into());
+        assert!(
+            handle
+                .attach_and_verify_remote(
+                    session_id,
+                    dead,
+                    None,
+                    &changed,
+                    RemoteConnectOutcome::Reattached,
+                    &slot
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            storage
+                .session_store()
+                .get_remote_session_bookmark(session_id)
+                .await
+                .unwrap(),
+            Some(bookmark)
+        );
+        assert_eq!(
+            handle
+                .registry
+                .lock()
+                .await
+                .remote_attachment_id(session_id),
+            Some(attached.attachment_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_node_hint_cannot_change_bookmark() {
+        let (handle, storage, _tmp) = handle_with_real_storage().await;
+        let bookmark = test_bookmark("owner-check", "owner");
+        storage
+            .session_store()
+            .save_remote_session_bookmark(&bookmark)
+            .await
+            .unwrap();
+        let error = handle
+            .ensure_remote_session_connected(
+                "owner-check",
+                Some("other"),
+                RemoteConnectReason::Open,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "session_location_conflict");
+        assert_eq!(
+            storage
+                .session_store()
+                .get_remote_session_bookmark("owner-check")
+                .await
+                .unwrap(),
+            Some(bookmark)
+        );
+    }
+
     // ── Coordinator error-path tests (no mesh) ──────────────────────────
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1594,6 +1741,10 @@ mod tests {
             .await
             .expect("create local session");
 
+        store
+            .save_remote_session_bookmark(&test_bookmark(&session.public_id, "node-abc"))
+            .await
+            .expect("save conflicting bookmark");
         let err = handle
             .ensure_remote_session_connected(
                 &session.public_id,

@@ -81,4 +81,27 @@ describe('ChatInputBar steering', () => {
     fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter', shiftKey: false });
     expect(baseProps.handleSendPrompt).toHaveBeenLastCalledWith(undefined);
   });
+  it('blocks duplicates with normalized file mentions from Enter and the button', () => {
+    render(<ChatInputBar {...baseProps} sessionThinkingAgentId={null} prompt="Read @{file:src/main.rs}"
+      pendingInputs={[{ inputId: 'id', sessionId: 'session-1', delivery: 'queue', text: 'Read @src/main.rs', state: 'unknown',
+        prompt: [{ type: 'text', data: { text: 'Read @src/main.rs' } },
+          { type: 'resource_link', data: { name: 'src/main.rs', uri: 'src/main.rs' } }],
+      }]} />);
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+    expect(baseProps.handleSendPrompt).not.toHaveBeenCalled();
+  });
+
+  it('keeps unknown delivery visible with reconcile rather than resend', () => {
+    const reconcile = vi.fn();
+    render(<ChatInputBar {...baseProps} sessionThinkingAgentId={null} onReconcile={reconcile}
+      pendingInputs={[{ inputId: 'id', sessionId: 'session-1', delivery: 'queue', text: baseProps.prompt, state: 'unknown' }]} />);
+    expect(screen.getByText(/Delivery status unknown/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+    expect(baseProps.handleSendPrompt).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh / Reconcile' }));
+    expect(reconcile).toHaveBeenCalledTimes(1);
+  });
+
 });

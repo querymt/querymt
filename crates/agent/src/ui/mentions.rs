@@ -6,6 +6,7 @@
 
 use super::messages::UiPromptBlock;
 use crate::acp::protocol::{ContentBlock, ImageContent, TextContent};
+#[cfg(feature = "remote")]
 use crate::agent::file_proxy::ReadRemoteFileResponse;
 use crate::index::{
     FileIndex, FileIndexEntry, WorkspaceIndexManagerActor, get_or_create_workspace_with_timeout,
@@ -27,7 +28,6 @@ pub async fn build_prompt_blocks(
     workspace_manager: &ActorRef<WorkspaceIndexManagerActor>,
     cwd: Option<&PathBuf>,
     prompt: &[UiPromptBlock],
-    session_ref: Option<&crate::agent::SessionActorRef>,
 ) -> Vec<ContentBlock> {
     let user_text = prompt
         .iter()
@@ -36,13 +36,6 @@ pub async fn build_prompt_blocks(
             _ => None,
         })
         .unwrap_or_default();
-
-    // Remote sessions: proxy all file operations through the mesh.
-    if let Some(sr) = session_ref
-        && sr.is_remote()
-    {
-        return build_remote_prompt_blocks(sr, cwd, user_text, prompt).await;
-    }
 
     let Some(cwd) = cwd else {
         return vec![ContentBlock::Text(TextContent::new(user_text))];
@@ -197,12 +190,14 @@ pub fn filter_index_for_cwd_entries(
 }
 
 /// Build prompt blocks for a remote session by proxying file reads over the mesh.
-async fn build_remote_prompt_blocks(
-    session_ref: &crate::agent::SessionActorRef,
+#[cfg(feature = "remote")]
+pub(super) async fn build_remote_prompt_blocks(
+    agent: &crate::agent::LocalAgentHandle,
+    session_id: &str,
     cwd: Option<&PathBuf>,
     user_text: String,
     prompt: &[UiPromptBlock],
-) -> Vec<ContentBlock> {
+) -> Result<Vec<ContentBlock>, crate::error::AgentError> {
     let mut blocks = vec![ContentBlock::Text(TextContent::new(user_text))];
     let mut seen = HashSet::new();
 
@@ -221,9 +216,21 @@ async fn build_remote_prompt_blocks(
             .map(|c| c.join(raw_path).display().to_string())
             .unwrap_or_else(|| raw_path.to_string());
 
-        match session_ref
-            .read_remote_file(raw_path.to_string(), 0, DEFAULT_READ_LIMIT)
+        match agent
+            .execute_session_operation(
+                session_id,
+                crate::agent::handle::session_operation::SessionOperation::ReadFile,
+                |sr| {
+                    let path = raw_path.to_string();
+                    Box::pin(async move {
+                        sr.read_remote_file(path, 0, DEFAULT_READ_LIMIT)
+                            .await
+                            .map_err(crate::error::AgentError::from)
+                    })
+                },
+            )
             .await
+            .map_err(|e| e.into_agent_error())
         {
             Ok(ReadRemoteFileResponse::Text(output)) => {
                 blocks.push(ContentBlock::Text(TextContent::new(format!(
@@ -244,10 +251,10 @@ async fn build_remote_prompt_blocks(
                 ))));
             }
             Err(e) => {
-                log::warn!("remote file read failed for '{raw_path}': {e}");
+                return Err(e);
             }
         }
     }
 
-    blocks
+    Ok(blocks)
 }

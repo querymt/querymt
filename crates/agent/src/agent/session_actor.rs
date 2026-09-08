@@ -2930,9 +2930,8 @@ mod tests {
     #[cfg(feature = "remote")]
     #[tokio::test]
     async fn backfill_recovers_missed_events_and_dedups_overlap() {
+        use crate::agent::remote::event_backfill::backfill_remote_events;
         let fixture = ActorFixture::new().await;
-
-        // Host-side events emitted while the client relay was "disconnected".
         for _ in 0..3 {
             fixture
                 .config
@@ -2943,133 +2942,124 @@ mod tests {
                 .await
                 .unwrap();
         }
-
-        // Empty local journal (post-upgrade client, no source cursors yet).
-        let local_storage =
-            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
-                .await
-                .unwrap();
-        let local_journal = local_storage.event_journal();
+        let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+            .await
+            .unwrap();
+        let journal = storage.event_journal();
         let fanout = Arc::new(crate::event_fanout::EventFanout::new());
         let mut rx = fanout.subscribe();
-        let sink = Arc::new(crate::event_sink::EventSink::new(
-            local_journal.clone(),
-            fanout,
-        ));
+        let sink = Arc::new(crate::event_sink::EventSink::new(journal.clone(), fanout));
         let session_ref = crate::agent::remote::SessionActorRef::from(fixture.actor_ref.clone());
 
-        // Run 1: no source cursor → legacy synchronization boundary; nothing
-        // is fetched or guessed (§16) and a boundary completion is published.
-        crate::agent::remote::event_backfill::backfill_remote_events(
-            sink.clone(),
-            session_ref.clone(),
-            "test-session".to_string(),
-            "node-a".to_string(),
-            "peer-a".to_string(),
-            1,
+        // Cursorless legacy rows remain stored, but the complete host snapshot
+        // supersedes them in the remote read model without guessed identities.
+        sink.emit_durable_with_origin(
+            "test-session",
+            crate::events::AgentEventKind::SessionCreated,
+            crate::events::EventOrigin::Remote,
+            Some("peer-a".into()),
         )
-        .await;
-        assert_eq!(
-            local_journal.max_stream_seq("test-session").await.unwrap(),
-            0,
-            "legacy boundary must not backfill without a cursor"
-        );
-
-        // Seed the cursor exactly as the live relay would: one event persisted
-        // with source identity (host seq 1) before the disconnect gap.
+        .await
+        .unwrap();
+        rx.recv().await.unwrap();
+        let cursor = journal
+            .remote_sync_cursor("test-session", "node-a")
+            .await
+            .unwrap();
+        assert_eq!(cursor, None);
+        // Deterministically simulate a new live event arriving before backfill.
         sink.emit_durable_from_source(
             "test-session",
             crate::events::AgentEventKind::SessionCreated,
-            Some("peer-a".to_string()),
-            "node-a".to_string(),
-            1,
+            Some("peer-a".into()),
+            "node-a".into(),
+            3,
         )
         .await
-        .unwrap()
-        .expect("seed insert persists");
-
-        // Run 2: pages host seqs after cursor 1 and recovers the gap.
-        crate::agent::remote::event_backfill::backfill_remote_events(
-            sink.clone(),
-            session_ref.clone(),
-            "test-session".to_string(),
-            "node-a".to_string(),
-            "peer-a".to_string(),
-            1,
-        )
-        .await;
-
-        let stream = local_journal
-            .load_session_stream("test-session", None, None)
-            .await
-            .unwrap();
-        assert_eq!(stream.len(), 3, "seeded + backfilled events");
+        .unwrap();
+        rx.recv().await.unwrap();
         assert_eq!(
-            local_journal
+            journal
                 .latest_source_seq("test-session", "node-a")
                 .await
                 .unwrap(),
             Some(3)
         );
+        assert_eq!(
+            journal
+                .remote_sync_cursor("test-session", "node-a")
+                .await
+                .unwrap(),
+            None
+        );
 
-        // Run 3: reaching the tip again is a full no-op — duplicate replay
-        // after reconnect is deduplicated (§15/§16, overlap-safe).
-        crate::agent::remote::event_backfill::backfill_remote_events(
+        backfill_remote_events(
             sink.clone(),
             session_ref.clone(),
-            "test-session".to_string(),
-            "node-a".to_string(),
-            "peer-a".to_string(),
+            "test-session".into(),
+            "node-a".into(),
+            "peer-a".into(),
             1,
+            cursor,
         )
-        .await;
-        let stream_after = local_journal
-            .load_session_stream("test-session", None, None)
-            .await
-            .unwrap();
-        assert_eq!(stream_after.len(), 3, "overlap must dedup, not duplicate");
-
-        // Sync status published (§16.6): boundary completion, fresh-seed
-        // durable event, completed backfill, and the no-op completion.
-        let first = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
-            .await
-            .expect("boundary completion published")
-            .unwrap();
-        match first {
-            crate::events::EventEnvelope::Ephemeral(ee) => match ee.kind {
-                crate::events::AgentEventKind::RemoteSessionSyncCompleted {
-                    backfilled,
-                    boundary,
-                    ..
-                } => {
-                    assert_eq!(backfilled, 0);
-                    assert!(boundary, "first run is the legacy sync boundary");
-                }
-                other => panic!("expected RemoteSessionSyncCompleted, got {other:?}"),
-            },
-            other => panic!("expected ephemeral envelope, got {other:?}"),
-        }
-        let _seed_event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
-            .await
-            .expect("seed durable event published")
-            .unwrap();
-        for expected_backfilled in [2u64, 0u64] {
-            let envelope = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+        .await
+        .unwrap();
+        assert_eq!(
+            journal
+                .load_session_stream("test-session", None, None)
                 .await
-                .expect("sync completion published")
-                .unwrap();
-            match envelope {
-                crate::events::EventEnvelope::Ephemeral(ee) => match ee.kind {
-                    crate::events::AgentEventKind::RemoteSessionSyncCompleted {
-                        backfilled,
-                        boundary: false,
-                        ..
-                    } => assert_eq!(backfilled, expected_backfilled),
-                    other => panic!("expected RemoteSessionSyncCompleted, got {other:?}"),
-                },
-                other => panic!("expected ephemeral envelope, got {other:?}"),
-            }
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            journal
+                .load_remote_session_stream("test-session", "node-a")
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            journal
+                .remote_sync_cursor("test-session", "node-a")
+                .await
+                .unwrap(),
+            Some(3)
+        );
+        // Both missed events publish, followed by sync completion. Live overlap
+        // must not be published a second time.
+        for _ in 0..2 {
+            assert!(rx.recv().await.unwrap().is_durable());
         }
+        assert!(matches!(
+            rx.recv().await.unwrap().kind(),
+            crate::events::AgentEventKind::RemoteSessionSyncCompleted {
+                backfilled: 2,
+                boundary: true,
+                ..
+            }
+        ));
+        backfill_remote_events(
+            sink,
+            session_ref,
+            "test-session".into(),
+            "node-a".into(),
+            "peer-a".into(),
+            2,
+            Some(3),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            rx.recv().await.unwrap().kind(),
+            crate::events::AgentEventKind::RemoteSessionSyncCompleted {
+                backfilled: 0,
+                boundary: false,
+                ..
+            }
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

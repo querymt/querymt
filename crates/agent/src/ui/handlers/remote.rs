@@ -165,6 +165,8 @@ pub(crate) async fn finalize_remote_session_attach(
             session_id,
             crate::agent::handle::remote_connect::RemoteConnectOptions {
                 node_hint: Some(node_id),
+                peer_label: None,
+                preferred_scope: None,
                 reason: crate::agent::handle::remote_connect::RemoteConnectReason::ExtensionAttach,
                 replace: crate::agent::handle::remote_connect::RemoteReplacePolicy::ReuseIfPresent,
                 handoff: Some(handoff),
@@ -194,7 +196,7 @@ async fn finish_attach_ui_state(
     conn_id: &str,
     node_id: &str,
     session_id: &str,
-    attached_session_ref: crate::agent::remote::SessionActorRef,
+    _attached_session_ref: crate::agent::remote::SessionActorRef,
     cwd: Option<PathBuf>,
     tx: &mpsc::Sender<String>,
 ) -> Result<(), String> {
@@ -219,37 +221,12 @@ async fn finish_attach_ui_state(
         cwds.insert(session_id.to_string(), cwd_path);
     }
 
-    let remote_events = match attached_session_ref.get_event_stream().await {
-        Ok(events) => {
-            log::info!(
-                "handle_attach_remote_session: fetched {} events from remote session {}",
-                events.len(),
-                session_id
-            );
-            events
-        }
-        Err(e) => {
-            log::warn!(
-                "handle_attach_remote_session: failed to fetch remote event stream for {}: {}",
-                session_id,
-                e
-            );
-            Vec::new()
-        }
-    };
-
-    let cursor = super::super::cursor_from_events(&remote_events);
-    let audit = crate::session::projection::AuditView {
-        session_id: session_id.to_string(),
-        events: remote_events,
-        tasks: Vec::new(),
-        intent_snapshots: Vec::new(),
-        decisions: Vec::new(),
-        progress_entries: Vec::new(),
-        artifacts: Vec::new(),
-        delegations: Vec::new(),
-        generated_at: time::OffsetDateTime::now_utc(),
-    };
+    let snapshot =
+        crate::session::load_session_snapshot(&state.agent, state.view_store.clone(), session_id)
+            .await
+            .map_err(|error| error.to_string())?;
+    let cursor = snapshot.cursor;
+    let audit = snapshot.audit;
 
     {
         let mut connections = state.connections.lock().await;
@@ -346,6 +323,8 @@ pub(crate) async fn attach_remote_session_via_lookup(
             session_id,
             crate::agent::handle::remote_connect::RemoteConnectOptions {
                 node_hint: Some(node_id),
+                peer_label: None,
+                preferred_scope: None,
                 reason,
                 replace,
                 handoff: None,
@@ -380,7 +359,13 @@ pub async fn handle_attach_remote_session(
         if let Err(err) =
             attach_remote_session_via_lookup(state, conn_id, node_id, session_id, tx).await
         {
-            let _ = send_error(tx, err).await;
+            let _ = super::super::connection::send_session_error(
+                tx,
+                err,
+                Some("remote_recovery_failed"),
+                Some(session_id),
+            )
+            .await;
         }
     }
     #[cfg(not(feature = "remote"))]

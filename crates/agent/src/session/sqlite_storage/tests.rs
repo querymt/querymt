@@ -862,6 +862,96 @@ fn new_durable(session_id: &str, kind: AgentEventKind) -> NewDurableEvent {
 // ── Remote source identity (plan §15/§16) ─────────────────────────────────
 
 #[tokio::test]
+async fn remote_sync_checkpoint_survives_restart_and_live_events_cannot_advance_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sync.db");
+    {
+        let storage = SqliteStorage::connect(path.clone()).await.unwrap();
+        storage
+            .advance_remote_sync_cursor("s1", "node-a", 10, false)
+            .await
+            .unwrap();
+        let mut live = new_durable("s1", AgentEventKind::Cancelled);
+        live.origin = EventOrigin::Remote;
+        live.source_node_id = Some("node-a".into());
+        live.source_seq = Some(21);
+        storage.append_durable_from_source(&live).await.unwrap();
+        assert_eq!(
+            storage.latest_source_seq("s1", "node-a").await.unwrap(),
+            Some(21)
+        );
+    }
+    let storage = SqliteStorage::connect(path).await.unwrap();
+    assert_eq!(
+        storage.remote_sync_cursor("s1", "node-a").await.unwrap(),
+        Some(10)
+    );
+    assert_eq!(
+        storage.remote_sync_cursor("s1", "node-b").await.unwrap(),
+        None
+    );
+    storage
+        .advance_remote_sync_cursor("s1", "node-a", 5, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.remote_sync_cursor("s1", "node-a").await.unwrap(),
+        Some(10)
+    );
+}
+
+#[tokio::test]
+async fn remote_snapshot_orders_host_events_and_preserves_legacy_storage() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    storage
+        .append_durable(&new_durable("s1", AgentEventKind::SessionCreated))
+        .await
+        .unwrap();
+    for (seq, kind) in [
+        (3, AgentEventKind::Cancelled),
+        (1, AgentEventKind::SessionCreated),
+    ] {
+        let mut event = new_durable("s1", kind);
+        event.origin = EventOrigin::Remote;
+        event.source_node_id = Some("node-a".into());
+        event.source_seq = Some(seq);
+        storage.append_durable_from_source(&event).await.unwrap();
+    }
+    assert_eq!(
+        storage
+            .load_remote_session_stream("s1", "node-a")
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    storage
+        .advance_remote_sync_cursor("s1", "node-a", 3, true)
+        .await
+        .unwrap();
+    let snapshot = storage
+        .load_remote_session_stream("s1", "node-a")
+        .await
+        .unwrap();
+    assert_eq!(snapshot.len(), 2);
+    assert!(matches!(snapshot[0].kind, AgentEventKind::SessionCreated));
+    assert!(matches!(snapshot[1].kind, AgentEventKind::Cancelled));
+    assert!(
+        snapshot[0].stream_seq > snapshot[1].stream_seq,
+        "retain local sequence identity, not source sequence"
+    );
+    assert_eq!(
+        storage
+            .load_session_stream("s1", None, None)
+            .await
+            .unwrap()
+            .len(),
+        3,
+        "legacy rows are not deleted"
+    );
+}
+
+#[tokio::test]
 async fn journal_remote_source_insert_is_idempotent() {
     let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
     let journal: &dyn EventJournal = &storage;

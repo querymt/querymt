@@ -1,6 +1,6 @@
 import { act, renderHook } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { SessionRuntimePhase } from '../types';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { SessionRuntimePhase, RemoteSessionConnectionState } from '../types';
 import { useUiClient } from './useUiClient';
 
 class MockWebSocket {
@@ -43,6 +43,7 @@ describe('useUiClient steering', () => {
   afterEach(() => {
     MockWebSocket.instance?.close();
     globalThis.WebSocket = OriginalWebSocket;
+    vi.useRealTimers();
   });
 
   function eventMessage(sessionId: string, kind: { type: string; data: Record<string, unknown> }) {
@@ -240,4 +241,120 @@ describe('useUiClient steering', () => {
       data: { session_id: 'session-1' },
     });
   });
+  it('waits for a correlated backend receipt and blocks duplicate dispatch', async () => {
+    const { result } = renderHook(() => useUiClient());
+    await act(async () => { await Promise.resolve(); });
+    const prompt = [{ type: 'text' as const, data: { text: 'Keep this draft' } }];
+    let dispatch!: ReturnType<typeof result.current.submitInput>;
+    act(() => { dispatch = result.current.submitInput('queue', prompt, 's1'); });
+    if (!dispatch.accepted) throw new Error('dispatch rejected');
+    const acknowledged = vi.fn();
+    dispatch.acknowledgement.then(acknowledged);
+    await act(async () => { await Promise.resolve(); });
+    expect(acknowledged).not.toHaveBeenCalled();
+    expect(result.current.submitInput('queue', prompt, 's1')).toEqual({ accepted: false, reason: 'pending_input' });
+    await act(async () => {
+      MockWebSocket.instance!.simulateMessage({ type: 'input_submitted', data: {
+        session_id: 's1', result: { status: 'started', data: { input_id: dispatch.accepted && dispatch.inputId, run_id: 'run' } },
+      } });
+    });
+    expect(acknowledged).toHaveBeenCalledWith(true);
+  });
+
+  it('retains failed and ambiguous input past five seconds and reconciles cached events', async () => {
+    const { result } = renderHook(() => useUiClient());
+    await act(async () => { await Promise.resolve(); });
+    vi.useFakeTimers();
+    const prompt = [{ type: 'text' as const, data: { text: 'Do not lose me' } }];
+    let dispatch!: ReturnType<typeof result.current.submitInput>;
+    act(() => { dispatch = result.current.submitInput('queue', prompt, 's1'); });
+    if (!dispatch.accepted) throw new Error('dispatch rejected');
+    const id = dispatch.inputId;
+    await act(async () => {
+      MockWebSocket.instance!.simulateMessage({ type: 'input_submission_failed', data: {
+        session_id: 's1', client_input_id: id, code: 'submission_outcome_unknown', message: 'Reply lost',
+      } });
+      vi.advanceTimersByTime(6000);
+    });
+    expect(await dispatch.acknowledgement).toBe(false);
+    expect(result.current.pendingInputsBySession.get('s1')?.[0]).toMatchObject({ state: 'unknown', text: 'Do not lose me', prompt });
+    expect(result.current.submitInput('queue', prompt, 's1')).toEqual({ accepted: false, reason: 'pending_input' });
+    await act(async () => {
+      MockWebSocket.instance!.simulateMessage({ type: 'session_events', data: {
+        session_id: 's1', agent_id: 'primary', events: [eventMessage('s1', {
+          type: 'queued_input_started', data: { input_id: id, run_id: 'run' },
+        }).data.event], cursor: { local_seq: 1, remote_seq_by_source: {} },
+      } });
+    });
+    expect(result.current.pendingInputsBySession.get('s1')).toBeUndefined();
+    let failed!: ReturnType<typeof result.current.submitInput>;
+    act(() => { failed = result.current.submitInput('queue', prompt, 's1'); });
+    if (!failed.accepted) throw new Error('dispatch rejected');
+    await act(async () => {
+      MockWebSocket.instance!.simulateMessage({ type: 'input_submission_failed', data: {
+        session_id: 's1', client_input_id: failed.accepted && failed.inputId, code: 'submission_not_delivered', message: 'Offline',
+      } });
+      vi.advanceTimersByTime(6000);
+    });
+    expect(await failed.acknowledgement).toBe(false);
+    expect(result.current.pendingInputsBySession.get('s1')?.[0]).toMatchObject({ state: 'failed', text: 'Do not lose me' });
+  });
+
+  it('marks a lost acknowledgement unknown on socket close without resending', async () => {
+    const { result } = renderHook(() => useUiClient());
+    await act(async () => { await Promise.resolve(); });
+    let dispatch!: ReturnType<typeof result.current.submitInput>;
+    act(() => { dispatch = result.current.submitInput('queue', [{ type: 'text', data: { text: 'Once' } }], 's1'); });
+    if (!dispatch.accepted) throw new Error('dispatch rejected');
+    act(() => { MockWebSocket.instance!.onclose?.(new CloseEvent('close')); });
+    expect(await dispatch.acknowledgement).toBe(false);
+    expect(result.current.pendingInputsBySession.get('s1')?.[0].state).toBe('unknown');
+    expect(MockWebSocket.instance!.sent.filter(value => JSON.parse(value).type === 'submit_input')).toHaveLength(1);
+  });
+
+  it('does not overwrite durable acceptance with a late request failure', async () => {
+    const { result } = renderHook(() => useUiClient());
+    await act(async () => { await Promise.resolve(); });
+    let dispatch!: ReturnType<typeof result.current.submitInput>;
+    act(() => { dispatch = result.current.submitInput('queue', [{ type: 'text', data: { text: 'Once' } }], 's1'); });
+    if (!dispatch.accepted) throw new Error('dispatch rejected');
+    const inputId = dispatch.inputId;
+    await act(async () => {
+      MockWebSocket.instance!.simulateMessage(eventMessage('s1', {
+        type: 'input_queued', data: { input_id: inputId, position: 1 },
+      }));
+      MockWebSocket.instance!.simulateMessage({ type: 'input_submission_failed', data: {
+        session_id: 's1', client_input_id: inputId, code: 'submission_outcome_unknown', message: 'Late failure',
+      } });
+    });
+    expect(await dispatch.acknowledgement).toBe(true);
+    expect(result.current.pendingInputsBySession.get('s1')?.[0]).toMatchObject({ state: 'queued', position: 1 });
+    expect(result.current.sessionActionNotices).toHaveLength(0);
+  });
+
+  it('settles a synchronous send failure without losing or resending the draft', async () => {
+    const { result } = renderHook(() => useUiClient());
+    await act(async () => { await Promise.resolve(); });
+    vi.spyOn(MockWebSocket.instance!, 'send').mockImplementationOnce(() => { throw new Error('Socket failed'); });
+    const prompt = [{ type: 'text' as const, data: { text: 'Keep me' } }];
+    let dispatch!: ReturnType<typeof result.current.submitInput>;
+    act(() => { dispatch = result.current.submitInput('queue', prompt, 's1'); });
+    if (!dispatch.accepted) throw new Error('dispatch rejected');
+    expect(await dispatch.acknowledgement).toBe(false);
+    expect(result.current.pendingInputsBySession.get('s1')?.[0]).toMatchObject({ state: 'unknown', prompt });
+    expect(result.current.submitInput('queue', prompt, 's1')).toEqual({ accepted: false, reason: 'pending_input' });
+  });
+
+  it('sets Connecting immediately and restores Disconnected on scoped reconnect failure', async () => {
+    const { result } = renderHook(() => useUiClient());
+    await act(async () => { await Promise.resolve(); });
+    act(() => { result.current.attachRemoteSession('peer', 's1'); });
+    expect(result.current.sessionConnectionStates.s1).toBe(RemoteSessionConnectionState.Connecting);
+    act(() => { MockWebSocket.instance!.simulateMessage({ type: 'error', data: {
+      code: 'remote_recovery_failed', session_id: 's1', message: 'Peer unavailable',
+    } }); });
+    expect(result.current.sessionConnectionStates.s1).toBe(RemoteSessionConnectionState.Disconnected);
+    expect(result.current.lastLoadErrorSessionId).toBeNull();
+  });
+
 });
