@@ -309,7 +309,7 @@ pub(crate) async fn execute_cycle_state_machine(
     let mut last_objective_checkpoint_step = 0usize;
 
     state = driver
-        .run_turn_start(state, Some(&exec_ctx.runtime))
+        .run_turn_start_cancellable(state, Some(&exec_ctx.runtime), &exec_ctx.cancellation_token)
         .instrument(info_span!(
             "agent.execution.middleware.turn_start",
             session_id = %exec_ctx.session_id
@@ -397,7 +397,11 @@ pub(crate) async fn execute_cycle_state_machine(
                 let context = refresh_objective_fragment(&context, exec_ctx);
                 let state = ExecutionState::BeforeLlmCall { context };
                 let state = driver
-                    .run_step_start(state, Some(&exec_ctx.runtime))
+                    .run_step_start_cancellable(
+                        state,
+                        Some(&exec_ctx.runtime),
+                        &exec_ctx.cancellation_token,
+                    )
                     .instrument(info_span!(
                         "agent.execution.middleware.step_start",
                         session_id = %exec_ctx.session_id
@@ -430,7 +434,11 @@ pub(crate) async fn execute_cycle_state_machine(
 
             ExecutionState::AfterLlm { .. } => {
                 let state = driver
-                    .run_after_llm(state, Some(&exec_ctx.runtime))
+                    .run_after_llm_cancellable(
+                        state,
+                        Some(&exec_ctx.runtime),
+                        &exec_ctx.cancellation_token,
+                    )
                     .instrument(info_span!(
                         "agent.execution.middleware.after_llm",
                         session_id = %exec_ctx.session_id
@@ -497,7 +505,11 @@ pub(crate) async fn execute_cycle_state_machine(
                     context,
                 };
                 let state = driver
-                    .run_processing_tool_calls(state, Some(&exec_ctx.runtime))
+                    .run_processing_tool_calls_cancellable(
+                        state,
+                        Some(&exec_ctx.runtime),
+                        &exec_ctx.cancellation_token,
+                    )
                     .instrument(info_span!(
                         "agent.execution.middleware.processing_tool_calls",
                         session_id = %exec_ctx.session_id
@@ -569,11 +581,12 @@ pub(crate) async fn execute_cycle_state_machine(
                     continue;
                 }
                 let turn_end_state = driver
-                    .run_turn_end(
+                    .run_turn_end_cancellable(
                         ExecutionState::Complete {
                             context: fallback_context,
                         },
                         Some(&exec_ctx.runtime),
+                        &exec_ctx.cancellation_token,
                     )
                     .instrument(info_span!(
                         "agent.execution.middleware.turn_end",
