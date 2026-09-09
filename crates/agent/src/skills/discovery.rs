@@ -25,7 +25,12 @@ pub fn default_search_paths(project_root: &Path) -> Vec<SkillSource> {
     paths
 }
 
-/// Discover skills from a single source (non-recursive in each immediate subdirectory)
+/// Discover skills from a single source.
+///
+/// Most sources follow the shallow convention
+/// `base_path/skill-name/SKILL.md` (a maximum depth of 2). The project-level
+/// `.agents/skills` directory is walked recursively so nested layouts such as
+/// `base_path/<category>/<skill-name>/SKILL.md` are also discovered.
 pub fn discover_from_source(source: &SkillSource) -> Result<Vec<Skill>> {
     let base_path = match source {
         SkillSource::Global(p) | SkillSource::Project(p) | SkillSource::Configured(p) => p,
@@ -38,12 +43,13 @@ pub fn discover_from_source(source: &SkillSource) -> Result<Vec<Skill>> {
 
     let mut skills = Vec::new();
 
-    // Use ignore crate to respect .gitignore
-    for entry in ignore::WalkBuilder::new(base_path)
-        .max_depth(Some(2)) // Only look 2 levels deep: base_path/skill-name/SKILL.md
-        .hidden(false)
-        .build()
-    {
+    // Use ignore crate to respect .gitignore. Only project `.agents/skills` is
+    // walked without a depth limit; every other source stays shallow.
+    let mut walker = ignore::WalkBuilder::new(base_path);
+    if !is_recursive_project_agents_skills(source) {
+        walker.max_depth(Some(2)); // Only look 2 levels deep: base_path/skill-name/SKILL.md
+    }
+    for entry in walker.hidden(false).build() {
         let entry = entry?;
         if entry.file_name() == SKILL_FILENAME {
             match parse_skill_file(entry.path(), source.clone()) {
@@ -63,6 +69,21 @@ pub fn discover_from_source(source: &SkillSource) -> Result<Vec<Skill>> {
     }
 
     Ok(skills)
+}
+
+/// Whether this source is a project-level `.agents/skills` directory, which
+/// supports fully recursive skill discovery.
+fn is_recursive_project_agents_skills(source: &SkillSource) -> bool {
+    let path = match source {
+        SkillSource::Project(path) => path,
+        _ => return false,
+    };
+    let file_name = path.file_name().and_then(|name| name.to_str());
+    let parent_name = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    file_name == Some("skills") && parent_name == Some(".agents")
 }
 
 /// Discover all skills from multiple sources with deduplication
@@ -131,7 +152,8 @@ mod tests {
 
     fn create_skill(dir: &Path, name: &str, version: &str) {
         let skill_dir = dir.join(name);
-        fs::create_dir(&skill_dir).unwrap();
+        // create_dir_all so nested skills (e.g. `.agents/skills/<cat>/<skill>`) work
+        fs::create_dir_all(&skill_dir).unwrap();
         fs::write(
             skill_dir.join("SKILL.md"),
             format!(
@@ -176,6 +198,74 @@ Content
         let source = SkillSource::Global(dir.path().to_path_buf());
         let skills = discover_from_source(&source).unwrap();
         assert_eq!(skills.len(), 3);
+    }
+
+    #[test]
+    fn test_project_agents_skills_discovered_recursively() {
+        let dir = TempDir::new().unwrap();
+        let skills_root = dir.path().join(".agents").join("skills");
+
+        create_skill(&skills_root, "agents-recursive-shallow", "1.0");
+        // Mirrors `.agents/skills/<category>/<skill-name>/SKILL.md`
+        let nested = skills_root.join("openspec").join("openspec-explore");
+        create_skill(&nested, "agents-recursive-nested", "1.0");
+
+        let source = SkillSource::Project(skills_root);
+        let skills = discover_from_source(&source).unwrap();
+        let mut names: Vec<_> = skills.iter().map(|s| s.metadata.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["agents-recursive-nested", "agents-recursive-shallow"]
+        );
+    }
+
+    #[test]
+    fn test_non_agents_project_source_stays_shallow() {
+        let dir = TempDir::new().unwrap();
+        let skills_root = dir.path().join(".qmt").join("skills");
+
+        create_skill(&skills_root, "shallow-skill", "1.0");
+        // Beyond the default max depth of 2 — should not be discovered
+        let nested = skills_root.join("category");
+        create_skill(&nested, "nested-skill", "1.0");
+
+        let source = SkillSource::Project(skills_root);
+        let skills = discover_from_source(&source).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].metadata.name, "shallow-skill");
+    }
+
+    #[test]
+    fn test_global_agents_source_stays_shallow() {
+        let dir = TempDir::new().unwrap();
+        let skills_root = dir.path().join(".agents").join("skills");
+
+        create_skill(&skills_root, "shallow-skill", "1.0");
+        // Recursion is project-only, even for `.agents/skills`
+        let nested = skills_root.join("category");
+        create_skill(&nested, "nested-skill", "1.0");
+
+        let source = SkillSource::Global(skills_root);
+        let skills = discover_from_source(&source).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].metadata.name, "shallow-skill");
+    }
+
+    #[test]
+    fn test_default_search_paths_include_nested_project_agents_skills() {
+        let project = TempDir::new().unwrap();
+        let skills_root = project.path().join(".agents").join("skills");
+
+        create_skill(&skills_root, "agents-recursive-shallow", "1.0");
+        let nested = skills_root.join("openspec").join("openspec-propose");
+        create_skill(&nested, "agents-recursive-nested", "1.0");
+
+        let sources = default_search_paths(project.path());
+        let skills = discover_all(&sources, true).unwrap();
+        let names: Vec<_> = skills.iter().map(|s| s.metadata.name.as_str()).collect();
+        assert!(names.contains(&"agents-recursive-shallow"));
+        assert!(names.contains(&"agents-recursive-nested"));
     }
 
     #[test]
