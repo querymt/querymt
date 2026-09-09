@@ -748,6 +748,7 @@ async fn finish_session_open(
     // Send loaded audit view and persisted undo stack for UI hydration
     let undo_stack = load_undo_stack(state, &session_id).await;
     let cursor = snapshot.cursor.clone();
+    let user_prompts = snapshot.user_prompts.unwrap_or_default();
 
     // Node identity: the live attachment wins; a disconnected open falls back
     // to the durable bookmark (plan §11.4).
@@ -776,6 +777,7 @@ async fn finish_session_open(
             node_id: None,
             connection_state,
             audit: snapshot.audit,
+            user_prompts,
             undo_stack,
             cursor: cursor.clone(),
         },

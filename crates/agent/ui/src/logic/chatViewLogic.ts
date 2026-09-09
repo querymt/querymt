@@ -13,6 +13,44 @@ const FILE_MENTION_MARKUP_RE = /@\{(file|dir):([^}]+)\}/g;
  * Parse user input text into prompt blocks, extracting file mention markup
  * into resource_link blocks.
  */
+export interface UserPromptDisplay {
+  content: string;
+  attachments: string[];
+}
+
+/** Project structured ACP blocks into the compact user-message presentation. */
+export function projectUserPromptBlocks(blocks: unknown[]): UserPromptDisplay {
+  const text: string[] = [];
+  const attachments: string[] = [];
+
+  for (const block of blocks) {
+    if (!block || typeof block !== 'object') continue;
+    const value = block as { type?: string; text?: string; data?: { text?: string }; uri?: string; resource?: unknown };
+    if (value.type === 'text') {
+      const content = value.text ?? value.data?.text;
+      if (typeof content === 'string') text.push(content);
+      continue;
+    }
+    if (value.type === 'resource' || value.type === 'image') {
+      const uri = findAttachmentUri(value);
+      attachments.push(uri ?? (value.type === 'image' ? 'image attachment' : 'attachment'));
+    }
+  }
+
+  return { content: text.join('\n'), attachments };
+}
+
+function findAttachmentUri(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const object = value as Record<string, unknown>;
+  if (typeof object.uri === 'string') return object.uri;
+  for (const child of Object.values(object)) {
+    const uri = findAttachmentUri(child);
+    if (uri) return uri;
+  }
+  return undefined;
+}
+
 export function buildPromptBlocksFromInput(input: string): UiPromptBlock[] {
   const links = new Map<string, UiPromptBlock>();
   const normalizedText = input.replace(FILE_MENTION_MARKUP_RE, (_match, _kind: string, rawPath: string) => {

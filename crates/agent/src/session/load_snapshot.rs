@@ -81,7 +81,9 @@ fn user_prompt_records(messages: &[crate::model::AgentMessage]) -> Vec<UserPromp
         .enumerate()
         .filter_map(|(message_order, message)| {
             let blocks = message.parts.iter().find_map(|part| match part {
-                MessagePart::Prompt { blocks } => Some(blocks.clone()),
+                MessagePart::Prompt { blocks } | MessagePart::Steering { blocks, .. } => {
+                    Some(blocks.clone())
+                }
                 _ => None,
             })?;
             Some(UserPromptRecord {

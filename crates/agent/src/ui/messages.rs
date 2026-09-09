@@ -6,7 +6,9 @@
 use crate::events::EventEnvelope;
 use crate::index::FileIndexEntry;
 use crate::profiles::ProfileMetadata;
-pub use crate::session::load_snapshot::{SessionLoadSnapshot, StreamCursor, cursor_from_events};
+pub use crate::session::load_snapshot::{
+    SessionLoadSnapshot, StreamCursor, UserPromptRecord, cursor_from_events,
+};
 use crate::session::projection::{AuditView, SessionScope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -828,6 +830,8 @@ pub enum UiServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         connection_state: Option<RemoteSessionConnectionState>,
         audit: AuditView,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        user_prompts: Vec<UserPromptRecord>,
         undo_stack: Vec<UndoStackFrame>,
         #[typeshare(serialized_as = "StreamCursor")]
         cursor: StreamCursor,
@@ -1267,6 +1271,7 @@ mod tests {
             node_id: None,
             connection_state: None,
             audit: empty_audit("session-1"),
+            user_prompts: Vec::new(),
             undo_stack: Vec::new(),
             cursor: StreamCursor::default(),
         })
@@ -1287,6 +1292,7 @@ mod tests {
             node_id: Some("node-a".to_string()),
             connection_state: Some(RemoteSessionConnectionState::Disconnected),
             audit: empty_audit("session-1"),
+            user_prompts: Vec::new(),
             undo_stack: Vec::new(),
             cursor: StreamCursor::default(),
         })
@@ -1300,6 +1306,7 @@ mod tests {
             node_id: Some("node-a".to_string()),
             connection_state: Some(RemoteSessionConnectionState::Connected),
             audit: empty_audit("session-1"),
+            user_prompts: Vec::new(),
             undo_stack: Vec::new(),
             cursor: StreamCursor::default(),
         })

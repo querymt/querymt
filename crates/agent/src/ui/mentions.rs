@@ -1,11 +1,14 @@
 //! Prompt attachment expansion for ACP ResourceLink references.
 //!
 //! The UI sends one text block plus ResourceLink blocks for file mentions.
-//! This module resolves those links and expands text files into synthetic
-//! read-style text chunks in the same user turn.
+//! This module resolves links into structured ACP resources so attachment
+//! payloads remain distinct from user-authored text throughout the pipeline.
 
 use super::messages::UiPromptBlock;
-use crate::acp::protocol::{ContentBlock, ImageContent, TextContent};
+use crate::acp::protocol::{
+    ContentBlock, EmbeddedResource, EmbeddedResourceResource, ImageContent, TextContent,
+    TextResourceContents,
+};
 #[cfg(feature = "remote")]
 use crate::agent::file_proxy::ReadRemoteFileResponse;
 use crate::index::{
@@ -97,12 +100,8 @@ pub async fn build_prompt_blocks(
                     blocks.push(ContentBlock::Image(image));
                 }
                 querymt::chat::Content::Text { text } => {
-                    let label = if is_dir { "dir" } else { "file" };
-                    blocks.push(ContentBlock::Text(TextContent::new(format!(
-                        "[{label}: {}]\n{}",
-                        resolved_path.display(),
-                        text
-                    ))));
+                    let uri = attachment_uri(&resolved_path, is_dir);
+                    blocks.push(text_resource(text, uri));
                 }
                 _ => {}
             }
@@ -110,6 +109,17 @@ pub async fn build_prompt_blocks(
     }
 
     blocks
+}
+
+fn text_resource(text: String, uri: String) -> ContentBlock {
+    ContentBlock::Resource(EmbeddedResource::new(
+        EmbeddedResourceResource::TextResourceContents(TextResourceContents::new(text, uri)),
+    ))
+}
+
+fn attachment_uri(path: &Path, is_dir: bool) -> String {
+    let scheme = if is_dir { "directory" } else { "file" };
+    format!("{scheme}://{}", path.display())
 }
 
 fn resolve_resource_path(cwd: &Path, root: &Path, raw_path: &str) -> Option<PathBuf> {
@@ -233,9 +243,7 @@ pub(super) async fn build_remote_prompt_blocks(
             .map_err(|e| e.into_agent_error())
         {
             Ok(ReadRemoteFileResponse::Text(output)) => {
-                blocks.push(ContentBlock::Text(TextContent::new(format!(
-                    "[file: {display_path}]\n{output}"
-                ))));
+                blocks.push(text_resource(output, format!("file://{display_path}")));
             }
             Ok(ReadRemoteFileResponse::Image {
                 mime_type,
@@ -246,9 +254,10 @@ pub(super) async fn build_remote_prompt_blocks(
                 ));
             }
             Ok(ReadRemoteFileResponse::Binary) => {
-                blocks.push(ContentBlock::Text(TextContent::new(format!(
-                    "[file: {display_path}]\n(binary file; not inlined)"
-                ))));
+                blocks.push(text_resource(
+                    "(binary file; not inlined)".to_string(),
+                    format!("file://{display_path}"),
+                ));
             }
             Err(e) => {
                 return Err(e);

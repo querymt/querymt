@@ -116,6 +116,7 @@ export interface EventItem {
   timestamp: number;
   isMessage?: boolean;  // True for actual user/assistant messages (not internal events)
   messageId?: string;  // Message UUID from the database (for undo/redo)
+  promptBlocks?: unknown[];  // Structured ACP prompt blocks for attachment-aware display.
   toolCall?: {
     tool_call_id?: string;
     description?: string;

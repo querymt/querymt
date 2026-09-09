@@ -19,6 +19,7 @@ import {
   isDelegationAwaitingInput,
   buildEventRowsWithDelegations,
   inferToolName,
+  projectUserPromptBlocks,
 } from './chatViewLogic';
 import {
   resetFixtureCounter,
@@ -35,6 +36,39 @@ import {
   makeSystemEvent,
   makeProviderChangedEvent,
 } from '../test/fixtures';
+
+describe('projectUserPromptBlocks', () => {
+  it('keeps authored mentions visible while separating embedded resources', () => {
+    expect(projectUserPromptBlocks([
+      { type: 'text', text: 'Inspect @sample_text' },
+      { type: 'resource', resource: { uri: 'file:///workspace/sample_text', text: 'secret contents' } },
+    ])).toEqual({
+      content: 'Inspect @sample_text',
+      attachments: ['file:///workspace/sample_text'],
+    });
+  });
+
+  it('handles ACP resource wrappers without exposing their payload', () => {
+    expect(projectUserPromptBlocks([
+      { type: 'text', text: 'Review @notes.md' },
+      {
+        type: 'resource',
+        resource: {
+          resource: { uri: 'file:///workspace/notes.md', text: 'private attachment contents' },
+        },
+      },
+    ])).toEqual({
+      content: 'Review @notes.md',
+      attachments: ['file:///workspace/notes.md'],
+    });
+  });
+
+  it('preserves ordinary text that resembles a legacy attachment marker', () => {
+    expect(projectUserPromptBlocks([
+      { type: 'text', text: '[file: literal text]' },
+    ])).toEqual({ content: '[file: literal text]', attachments: [] });
+  });
+});
 
 describe('inferToolName', () => {
   beforeEach(() => {

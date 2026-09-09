@@ -1782,6 +1782,7 @@ export type UiServerMessage =
 	node_id?: string;
 	connection_state?: RemoteSessionConnectionState;
 	audit: AuditView;
+	user_prompts?: UserPromptRecord[];
 	undo_stack: UndoStackFrame[];
 	cursor: StreamCursor;
 }}

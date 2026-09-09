@@ -10,6 +10,7 @@ import { ModelConfigPopover } from './ModelConfigPopover';
 import { ElicitationCard } from './ElicitationCard';
 import { CompactionCard, CompactingIndicator } from './CompactionCard';
 import { getAgentShortName } from '../utils/agentNames';
+import { projectUserPromptBlocks } from '../logic/chatViewLogic';
 import { colorWithAlpha, getAgentColor } from '../utils/agentColors';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
 import { Undo2, Redo2, Copy, Check, GitBranchPlus, Loader, Volume2 as Volume2Icon } from 'lucide-react';
@@ -153,6 +154,9 @@ export const TurnCard = memo(function TurnCard({
   const agentColor = turn.agentId ? getAgentColor(turn.agentId) : undefined;
   const hasUndoOverlay = isUndone || isUndoPending || isStackedUndone;
   const canShowUndoButton = !!onUndoTurn && canUndo && !turn.isActive && !hasUndoOverlay;
+  const userAttachments = turn.userMessage?.promptBlocks
+    ? projectUserPromptBlocks(turn.userMessage.promptBlocks).attachments
+    : [];
   const canShowForkButton =
     !!onForkTurn &&
     (!!turn.userMessage?.messageId || turn.agentMessages.some((message) => !!message.messageId)) &&
@@ -249,6 +253,15 @@ export const TurnCard = memo(function TurnCard({
           </div>
           <div className="bg-surface-elevated/60 border border-accent-secondary/15 rounded-lg px-4 py-3">
             <MessageContent content={turn.userMessage.content} />
+            {userAttachments.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {userAttachments.map((attachment) => (
+                  <span key={attachment} className="rounded-md border border-accent-secondary/20 bg-accent-secondary/10 px-2 py-0.5 text-xs text-ui-secondary">
+                    {attachment}
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       )}
