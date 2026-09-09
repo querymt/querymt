@@ -166,14 +166,6 @@ pub struct DelegateAssignmentWrite {
     pub changed: bool,
 }
 
-impl std::ops::Deref for DelegateAssignmentWrite {
-    type Target = DelegateAssignments;
-
-    fn deref(&self) -> &Self::Target {
-        &self.assignments
-    }
-}
-
 /// Stored session-scoped execution configuration snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionExecutionConfig {

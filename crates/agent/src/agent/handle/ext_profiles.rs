@@ -300,7 +300,7 @@ impl LocalAgentHandle {
             .agent_registry()
             .get_agent(agent_id)
             .is_none()
-            && !(parsed.model_id.is_none()
+            && !(parsed.model_id.0.is_none()
                 && match &before {
                     Some(state) => state.overrides.contains_key(agent_id),
                     None => profile_handle
@@ -319,7 +319,7 @@ impl LocalAgentHandle {
             })));
         }
 
-        let model = match parsed.model_id {
+        let model = match parsed.model_id.0 {
             Some(model_id) => {
                 let model_id = model_id.trim();
                 if model_id.is_empty() {
@@ -395,7 +395,11 @@ impl LocalAgentHandle {
                         crate::session::error::SessionError::DelegateAssignmentRevisionConflict {
                             expected,
                             found,
-                        } => Error::invalid_params().data(serde_json::json!({
+                        } => Error::new(
+                            crate::control::delegate_models::DELEGATE_ASSIGNMENT_CONFLICT_ACP_CODE,
+                            "Delegate assignments changed; refresh before retrying",
+                        )
+                        .data(serde_json::json!({
                             "code": "delegate_assignment_conflict",
                             "expected_revision": expected,
                             "actual_revision": found,
@@ -418,7 +422,7 @@ impl LocalAgentHandle {
         } else {
             false
         };
-        let revision = persisted.as_ref().map(|write| write.revision);
+        let revision = persisted.as_ref().map(|write| write.assignments.revision);
         if legacy_changed || persisted.as_ref().is_some_and(|write| write.changed) {
             profile_handle.emit_event(
                 session_id,

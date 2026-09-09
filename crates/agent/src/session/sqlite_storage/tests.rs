@@ -244,8 +244,8 @@ async fn delegate_assignments_are_read_only_revisioned_and_session_scoped() {
         .await
         .unwrap();
     assert!(one.changed);
-    assert_eq!(one.revision, 1);
-    assert_eq!(one.overrides["coder"], model);
+    assert_eq!(one.assignments.revision, 1);
+    assert_eq!(one.assignments.overrides["coder"], model);
     let noop = storage
         .set_delegate_assignment(&first.public_id, "coder", Some(model.clone()), Some(1))
         .await
@@ -267,14 +267,14 @@ async fn delegate_assignments_are_read_only_revisioned_and_session_scoped() {
         .set_delegate_assignment(&first.public_id, "reviewer", Some(model.clone()), None)
         .await
         .unwrap();
-    assert_eq!(two.revision, 2);
+    assert_eq!(two.assignments.revision, 2);
     let cleared = storage
         .set_delegate_assignment(&first.public_id, "coder", None, Some(2))
         .await
         .unwrap();
-    assert_eq!(cleared.revision, 3);
-    assert!(!cleared.overrides.contains_key("coder"));
-    assert_eq!(cleared.overrides["reviewer"], model);
+    assert_eq!(cleared.assignments.revision, 3);
+    assert!(!cleared.assignments.overrides.contains_key("coder"));
+    assert_eq!(cleared.assignments.overrides["reviewer"], model);
     assert!(
         storage
             .get_delegate_assignments(&second.public_id)
@@ -383,7 +383,7 @@ async fn delegate_assignments_survive_reopen_and_detect_cross_connection_conflic
         .await
         .unwrap();
     assert!(!noop.changed, "cross-connection no-op must be explicit");
-    assert_eq!(noop.revision, 1);
+    assert_eq!(noop.assignments.revision, 1);
     let (a, b) = tokio::join!(
         first.set_delegate_assignment(&parent.public_id, "a", Some(model.clone()), Some(1)),
         second.set_delegate_assignment(&parent.public_id, "b", Some(model), Some(1)),

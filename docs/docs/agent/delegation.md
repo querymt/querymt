@@ -148,7 +148,8 @@ and `durable`. Omit `node_id` (or use `null`) for a local model. Reset with
 aliases. An empty node string is rejected rather than silently selecting local execution.
 
 Use the revision from readback to avoid lost updates. A stale write fails without
-changing anything, using ACP InvalidParams with error data:
+changing anything. The ACP error code is `-32020`, not `InvalidParams`
+(`-32602`), with this error data:
 
 ```json
 {

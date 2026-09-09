@@ -825,6 +825,10 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         AgentEventKind::RemoteSessionSyncCompleted { .. } => Durability::Ephemeral,
         AgentEventKind::RemoteProviderHeartbeat { .. } => Durability::Ephemeral,
         AgentEventKind::StreamRecovering { .. } => Durability::Ephemeral,
+        // Rationale: the assignment table is authoritative. This is a live
+        // ACP invalidation hint, not a commit record, and must not pollute
+        // the durable journal or break older journal loaders.
+        AgentEventKind::DelegateModelsChanged { .. } => Durability::Ephemeral,
 
         // Everything else is durable by default.
         _ => Durability::Durable,
@@ -1157,6 +1161,18 @@ mod tests {
             node_id: Some("node-1".into()),
         };
         assert_eq!(classify_durability(&kind), Durability::Ephemeral);
+    }
+
+    #[test]
+    fn classify_delegate_models_changed_is_ephemeral() {
+        assert_eq!(
+            classify_durability(&AgentEventKind::DelegateModelsChanged { revision: Some(1) }),
+            Durability::Ephemeral
+        );
+        assert_eq!(
+            classify_durability(&AgentEventKind::DelegateModelsChanged { revision: None }),
+            Durability::Ephemeral
+        );
     }
 
     #[test]

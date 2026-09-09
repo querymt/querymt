@@ -515,7 +515,7 @@ async fn delegate_assignments_restore_after_full_profile_restart_from_temporary_
 }
 
 #[tokio::test]
-async fn delegate_assignment_user_fork_can_own_independent_routing() {
+async fn delegate_assignment_user_fork_inherits_revision_zero_copy() {
     let (f, _dir) = profile_fixture_with_files(&[("quorum.toml", QUORUM_PROFILE_TOML)]).await;
     let parent = persisted_delegate_parent(&f).await;
     let runtime = f
@@ -526,35 +526,69 @@ async fn delegate_assignment_user_fork_can_own_independent_routing() {
         .await
         .unwrap();
     let store = runtime.agent().handle().config.provider.history_store();
-    let fork = store
-        .create_session(
-            None,
-            None,
-            Some(parent.clone()),
-            Some(crate::session::domain::ForkOrigin::User),
+    ext_method_json(
+        &f.handle,
+        "querymt/session/setDelegateModel",
+        serde_json::json!({
+            "session_id": parent,
+            "agent_id": "coder",
+            "model_id": "test/test-model",
+            "expected_revision": 0
+        }),
+    )
+    .await;
+    store
+        .add_message(
+            &parent,
+            crate::model::AgentMessage {
+                id: "fork-point".into(),
+                session_id: parent.clone(),
+                role: querymt::chat::ChatRole::User,
+                parts: vec![crate::model::MessagePart::Prompt {
+                    blocks: vec![crate::acp::protocol::ContentBlock::Text(
+                        crate::acp::protocol::TextContent::new("task"),
+                    )],
+                }],
+                created_at: 1,
+                parent_message_id: None,
+                source_provider: None,
+                source_model: None,
+            },
         )
         .await
         .unwrap();
-    bind_test_profile(&f, &fork.public_id, "quorum").await;
+    let fork_id = store
+        .fork_session(
+            &parent,
+            "fork-point",
+            crate::session::domain::ForkOrigin::User,
+        )
+        .await
+        .unwrap();
+    bind_test_profile(&f, &fork_id, "quorum").await;
     let result = ext_method_json(
         &f.handle,
         "querymt/session/delegateModels",
-        serde_json::json!({"session_id": fork.public_id}),
+        serde_json::json!({"session_id": fork_id}),
     )
     .await;
     assert_eq!(result["editable"], true);
-    ext_method_json(&f.handle, "querymt/session/setDelegateModel", serde_json::json!({
-        "session_id": fork.public_id, "agent_id": "reviewer", "model_id": "test/test-model", "expected_revision": 0
-    })).await;
-    assert!(
-        store
-            .get_delegate_assignments(&parent)
-            .await
-            .unwrap()
-            .unwrap()
-            .overrides
-            .is_empty()
+    assert_eq!(result["revision"], 0);
+    assert_eq!(
+        result["assignments"][0]["model"]["model_id"],
+        "test/test-model"
     );
+    ext_method_json(&f.handle, "querymt/session/setDelegateModel", serde_json::json!({
+        "session_id": fork_id, "agent_id": "reviewer", "model_id": "test/test-model", "expected_revision": 0
+    })).await;
+    let parent_state = store
+        .get_delegate_assignments(&parent)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(parent_state.revision, 1);
+    assert_eq!(parent_state.overrides["coder"].model_id, "test/test-model");
+    assert!(!parent_state.overrides.contains_key("reviewer"));
 }
 
 #[tokio::test]
@@ -709,6 +743,20 @@ async fn delegate_assignment_changes_notify_and_failed_writes_do_not() {
     assert_eq!(notification["params"]["version"], 1);
     assert_eq!(notification["params"]["session_id"], session_id);
     assert_eq!(notification["params"]["revision"], 1);
+    let handle = runtime.agent().handle();
+    let durable = handle
+        .config
+        .event_sink
+        .journal()
+        .load_session_stream(&session_id, None, None)
+        .await
+        .unwrap();
+    assert!(
+        durable
+            .iter()
+            .all(|event| { !matches!(event.kind, AgentEventKind::DelegateModelsChanged { .. }) }),
+        "invalidation hints must not be journaled"
+    );
     let stale = f.handle.ext_method(crate::acp::protocol::ExtRequest::new("querymt/session/setDelegateModel", raw_params(&serde_json::json!({
         "session_id": session_id, "agent_id": "coder", "model_id": null, "expected_revision": 0
     }).to_string()))).await;
@@ -769,6 +817,12 @@ async fn test_querymt_session_set_delegate_model_sets_and_clears_override() {
     let stale = f.handle.ext_method(crate::acp::protocol::ExtRequest::new("querymt/session/setDelegateModel", raw_params(&serde_json::json!({
         "session_id": session_id, "agent_id": "coder", "model_id": null, "expected_revision": 0
     }).to_string()))).await.unwrap_err();
+    assert_eq!(
+        stale.code,
+        agent_client_protocol::ErrorCode::Other(
+            crate::control::delegate_models::DELEGATE_ASSIGNMENT_CONFLICT_ACP_CODE
+        )
+    );
     assert_eq!(stale.data.unwrap()["code"], "delegate_assignment_conflict");
     let cleared = ext_method_json(
         &f.handle,
@@ -808,6 +862,7 @@ async fn test_querymt_session_set_delegate_model_rejects_invalid_targets() {
     for params in [
         serde_json::json!({"session_id": "missing", "agent_id": "coder", "model_id": null}),
         serde_json::json!({"session_id": session_id, "agent_id": "missing", "model_id": null}),
+        serde_json::json!({"session_id": session_id, "agent_id": "coder"}),
         serde_json::json!({"session_id": session_id, "agent_id": "coder", "model_id": "test/missing"}),
         serde_json::json!({"session_id": session_id, "agent_id": "coder", "model_id": " "}),
         serde_json::json!({"session_id": session_id, "agent_id": "coder", "model_id": null, "node_id": "node"}),

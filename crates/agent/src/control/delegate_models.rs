@@ -1,13 +1,36 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use typeshare::typeshare;
 
 use crate::delegation::DelegateModelOverride;
 
 pub const DELEGATE_MODELS_VERSION: u32 = 1;
+/// Distinct from ACP `InvalidParams` (`-32602`) so clients can refresh-and-retry.
+pub const DELEGATE_ASSIGNMENT_CONFLICT_ACP_CODE: i32 = -32020;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// JSON null serializes as `null`. Unlike `Option`, a missing field is invalid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct RequiredNullable<T>(pub Option<T>);
+
+impl<'de, T> Deserialize<'de> for RequiredNullable<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Do not deserialize through `Option`: serde treats a missing field as
+        // `None` whenever the type calls `deserialize_option`. `Value` uses
+        // `deserialize_any`, so absence is `InvalidParams` and JSON null clears.
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::Null => Ok(Self(None)),
+            value => T::deserialize(value)
+                .map(|parsed| Self(Some(parsed)))
+                .map_err(serde::de::Error::custom),
+        }
+    }
+}
 
 impl<T> From<Option<T>> for RequiredNullable<T> {
     fn from(value: Option<T>) -> Self {
@@ -29,9 +52,10 @@ pub struct SetDelegateModelRequest {
     pub session_id: String,
     #[serde(alias = "agentId")]
     pub agent_id: String,
-    #[serde(default, alias = "modelId")]
+    /// Present and null clears the override. Omitted is invalid, not a wipe.
+    #[serde(alias = "modelId")]
     #[typeshare(typescript(type = "string | null"))]
-    pub model_id: Option<String>,
+    pub model_id: RequiredNullable<String>,
     #[serde(default, alias = "nodeId")]
     #[typeshare(typescript(type = "string | null"))]
     pub node_id: Option<String>,
@@ -106,4 +130,43 @@ pub struct DelegateModelsChangedNotification {
     #[typeshare(serialized_as = "number")]
     #[typeshare(typescript(type = "number | null"))]
     pub revision: RequiredNullable<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SetDelegateModelRequest;
+
+    #[test]
+    fn omitted_model_id_is_rejected() {
+        let error = serde_json::from_str::<SetDelegateModelRequest>(
+            r#"{"session_id":"s","agent_id":"coder"}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("model_id"));
+    }
+
+    #[test]
+    fn explicit_null_model_id_clears() {
+        let parsed: SetDelegateModelRequest =
+            serde_json::from_str(r#"{"session_id":"s","agent_id":"coder","model_id":null}"#)
+                .unwrap();
+        assert!(parsed.model_id.0.is_none());
+        assert!(parsed.node_id.is_none());
+    }
+
+    #[test]
+    fn camel_case_null_model_id_clears() {
+        let parsed: SetDelegateModelRequest =
+            serde_json::from_str(r#"{"sessionId":"s","agentId":"coder","modelId":null}"#).unwrap();
+        assert!(parsed.model_id.0.is_none());
+    }
+
+    #[test]
+    fn present_model_id_is_some() {
+        let parsed: SetDelegateModelRequest = serde_json::from_str(
+            r#"{"session_id":"s","agent_id":"coder","model_id":"test/test-model"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.model_id.0.as_deref(), Some("test/test-model"));
+    }
 }
