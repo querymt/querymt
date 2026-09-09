@@ -38,6 +38,11 @@ pub struct DelegationUpdateNotification {
     pub objective: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_session_id: Option<String>,
+    /// Confirmed child model, not the parent's current preference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_provider_node_id: Option<String>,
     #[typeshare(serialized_as = "number")]
     pub requested_at: i64,
     #[typeshare(serialized_as = "Option<number>")]
@@ -66,6 +71,8 @@ enum PendingDelegationTransition {
     Forked {
         session_id: String,
         child_session_id: String,
+        selected_model_id: Option<String>,
+        selected_provider_node_id: Option<String>,
         timestamp: i64,
     },
     Finished {
@@ -148,6 +155,8 @@ impl DelegationUpdateProjector {
                     target_agent_id: delegation.target_agent_id.clone(),
                     objective: delegation.objective.clone(),
                     child_session_id: None,
+                    selected_model_id: None,
+                    selected_provider_node_id: None,
                     requested_at: timestamp,
                     forked_at: None,
                     finished_at: None,
@@ -172,11 +181,15 @@ impl DelegationUpdateProjector {
                 child_session_id,
                 origin: ForkOrigin::Delegation,
                 fork_point_ref,
+                selected_model_id,
+                selected_provider_node_id,
                 ..
             } => {
                 let transition = PendingDelegationTransition::Forked {
                     session_id: parent_session_id.clone(),
                     child_session_id: child_session_id.clone(),
+                    selected_model_id: selected_model_id.clone(),
+                    selected_provider_node_id: selected_provider_node_id.clone(),
                     timestamp,
                 };
                 if !self.apply_transition(fork_point_ref, transition.clone()) {
@@ -249,6 +262,8 @@ impl DelegationUpdateProjector {
             PendingDelegationTransition::Forked {
                 session_id,
                 child_session_id,
+                selected_model_id,
+                selected_provider_node_id,
                 timestamp,
             } => {
                 if timestamp < snapshot.requested_at
@@ -260,6 +275,8 @@ impl DelegationUpdateProjector {
                 }
                 snapshot.session_id = session_id;
                 snapshot.child_session_id = Some(child_session_id);
+                snapshot.selected_model_id = selected_model_id;
+                snapshot.selected_provider_node_id = selected_provider_node_id;
                 snapshot.forked_at = Some(
                     snapshot
                         .forked_at
@@ -429,6 +446,8 @@ mod tests {
                 fork_point_type: ForkPointType::MessageIndex,
                 fork_point_ref: "delegation-1".into(),
                 instructions: None,
+                selected_model_id: Some("provider/model".into()),
+                selected_provider_node_id: Some("node".into()),
             },
         );
         let completed = event(
@@ -448,14 +467,51 @@ mod tests {
         let forked = projector.project_event(&forked).unwrap();
         assert_eq!(forked.state, DelegationUpdateState::Forked);
         assert_eq!(forked.child_session_id.as_deref(), Some("child-1"));
+        assert_eq!(forked.selected_model_id.as_deref(), Some("provider/model"));
+        assert_eq!(forked.selected_provider_node_id.as_deref(), Some("node"));
         assert_eq!(forked.target_agent_id, "coder");
 
         let completed = projector.project_event(&completed).unwrap();
         assert_eq!(completed.state, DelegationUpdateState::Completed);
         assert_eq!(completed.child_session_id.as_deref(), Some("child-1"));
         assert_eq!(completed.result_summary.as_deref(), Some("done"));
+        assert_eq!(
+            completed.selected_model_id.as_deref(),
+            Some("provider/model")
+        );
+        assert_eq!(completed.selected_provider_node_id.as_deref(), Some("node"));
         assert_eq!(completed.finished_at, Some(3));
         assert_eq!(projector.project_event(&requested), Some(completed));
+    }
+
+    #[test]
+    fn historical_fork_without_model_provenance_projects_unknown() {
+        let mut projector = DelegationUpdateProjector::default();
+        projector.project_event(&event(
+            1,
+            AgentEventKind::DelegationRequested {
+                delegation: delegation(),
+                tool_call_id: None,
+            },
+        ));
+        let update = projector
+            .project_event(&event(
+                2,
+                AgentEventKind::SessionForked {
+                    parent_session_id: "parent-1".into(),
+                    child_session_id: "child-1".into(),
+                    target_agent_id: "coder".into(),
+                    origin: ForkOrigin::Delegation,
+                    fork_point_type: ForkPointType::ProgressEntry,
+                    fork_point_ref: "delegation-1".into(),
+                    instructions: None,
+                    selected_model_id: None,
+                    selected_provider_node_id: None,
+                },
+            ))
+            .unwrap();
+        assert!(update.selected_model_id.is_none());
+        assert!(update.selected_provider_node_id.is_none());
     }
 
     #[test]
@@ -522,6 +578,8 @@ mod tests {
                 fork_point_type: ForkPointType::ProgressEntry,
                 fork_point_ref: "delegation-1".into(),
                 instructions: None,
+                selected_model_id: Some("provider/model".into()),
+                selected_provider_node_id: Some("node".into()),
             },
         ));
 
@@ -560,6 +618,8 @@ mod tests {
                 fork_point_type: ForkPointType::ProgressEntry,
                 fork_point_ref: "delegation-1".into(),
                 instructions: None,
+                selected_model_id: Some("provider/model".into()),
+                selected_provider_node_id: Some("node".into()),
             },
         ));
 
@@ -610,6 +670,8 @@ mod tests {
                     fork_point_type: ForkPointType::ProgressEntry,
                     fork_point_ref: "delegation-1".into(),
                     instructions: None,
+                    selected_model_id: Some("provider/model".into()),
+                    selected_provider_node_id: Some("node".into()),
                 },
             ))
             .unwrap();
@@ -618,6 +680,8 @@ mod tests {
         assert_eq!(update.finished_at, completed.finished_at);
         assert_eq!(update.result_summary, completed.result_summary);
         assert_eq!(update.child_session_id.as_deref(), Some("child-1"));
+        assert_eq!(update.selected_model_id.as_deref(), Some("provider/model"));
+        assert_eq!(update.selected_provider_node_id.as_deref(), Some("node"));
     }
 
     #[test]
@@ -673,6 +737,8 @@ mod tests {
                     fork_point_type: ForkPointType::ProgressEntry,
                     fork_point_ref: "delegation-1".into(),
                     instructions: None,
+                    selected_model_id: Some("provider/model".into()),
+                    selected_provider_node_id: Some("node".into()),
                 },
             ),
             event(
@@ -690,6 +756,14 @@ mod tests {
         assert_eq!(updates[0].state, DelegationUpdateState::Completed);
         assert_eq!(updates[0].child_session_id.as_deref(), Some("child-1"));
         assert_eq!(updates[0].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(
+            updates[0].selected_model_id.as_deref(),
+            Some("provider/model")
+        );
+        assert_eq!(
+            updates[0].selected_provider_node_id.as_deref(),
+            Some("node")
+        );
     }
 
     #[test]

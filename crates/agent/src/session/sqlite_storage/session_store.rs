@@ -26,13 +26,69 @@ use crate::session::repository::{
     ProgressRepository, SessionRepository, TaskRepository,
 };
 use crate::session::store::{
-    CustomModel, LLMConfig, RemoteSessionBookmark, Session, SessionExecutionConfig, SessionStore,
-    TaskPatch, extract_llm_config_values,
+    CustomModel, DelegateAssignmentWrite, DelegateAssignments, LLMConfig, RemoteSessionBookmark,
+    Session, SessionExecutionConfig, SessionStore, TaskPatch, extract_llm_config_values,
 };
 use std::collections::HashMap;
 
 use super::SqliteStorage;
 use super::row_parsers::{parse_llm_config_row, parse_llm_params};
+
+fn read_delegate_assignments(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> SessionResult<(i64, DelegateAssignments)> {
+    let row = conn
+        .query_row(
+            "SELECT s.id, d.revision, d.overrides_json FROM sessions s
+         LEFT JOIN session_delegate_assignments d ON d.session_id = s.id WHERE s.public_id = ?1",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let (id, revision, json) =
+        row.ok_or_else(|| SessionError::SessionNotFound(session_id.to_owned()))?;
+    let revision = u64::try_from(revision.unwrap_or(0))
+        .map_err(|_| SessionError::DatabaseError("Negative delegate assignment revision".into()))?;
+    let overrides = match json {
+        Some(json) => serde_json::from_str(&json)?,
+        None => Default::default(),
+    };
+    validate_delegate_assignments(&overrides, SessionError::DatabaseError)?;
+    Ok((
+        id,
+        DelegateAssignments {
+            revision,
+            overrides,
+        },
+    ))
+}
+
+fn validate_delegate_assignments(
+    overrides: &std::collections::BTreeMap<String, crate::delegation::DelegateModelOverride>,
+    error: impl Fn(String) -> SessionError,
+) -> SessionResult<()> {
+    for (agent_id, model) in overrides {
+        if agent_id.is_empty()
+            || agent_id.trim() != agent_id
+            || model.model_id.is_empty()
+            || model.model_id.trim() != model.model_id
+            || model
+                .node_id
+                .as_ref()
+                .is_some_and(|node_id| node_id.is_empty() || node_id.trim() != node_id)
+        {
+            return Err(error("Invalid delegate assignment identity".into()));
+        }
+    }
+    Ok(())
+}
 
 fn insert_intent_snapshot(
     conn: &rusqlite::Connection,
@@ -528,6 +584,15 @@ impl SessionStore for SqliteStorage {
                 )?;
             }
 
+            // User forks inherit routing preferences, but delegated children do not.
+            if fork_origin == ForkOrigin::User {
+                tx.execute(
+                    "INSERT INTO session_delegate_assignments (session_id, revision, overrides_json)
+                     SELECT ?1, 0, overrides_json FROM session_delegate_assignments WHERE session_id = ?2",
+                    params![new_session_internal_id, source_session_internal_id],
+                )?;
+            }
+
             // Forks inherit an independent copy of the source session's control state.
             tx.execute(
                 "INSERT INTO session_control_states
@@ -757,6 +822,70 @@ impl SessionStore for SqliteStorage {
             }))
         })
         .await
+    }
+
+    async fn get_delegate_assignments(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<DelegateAssignments>> {
+        let session_id = session_id.to_owned();
+        self.run_blocking_session(move |conn| {
+            read_delegate_assignments(conn, &session_id).map(|(_, state)| Some(state))
+        })
+        .await
+    }
+
+    async fn set_delegate_assignment(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        model: Option<crate::delegation::DelegateModelOverride>,
+        expected_revision: Option<u64>,
+    ) -> SessionResult<DelegateAssignmentWrite> {
+        let mut candidate = std::collections::BTreeMap::new();
+        if let Some(model) = &model {
+            candidate.insert(agent_id.to_owned(), model.clone());
+        } else if agent_id.is_empty() || agent_id.trim() != agent_id {
+            return Err(SessionError::InvalidOperation(
+                "Delegate IDs must be nonempty and normalized".into(),
+            ));
+        }
+        validate_delegate_assignments(&candidate, SessionError::InvalidOperation)?;
+        let session_id = session_id.to_owned();
+        let agent_id = agent_id.to_owned();
+        self.run_blocking_session(move |conn| {
+            // An immediate transaction protects the read/modify/write across independent connections.
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let (id, mut state) = read_delegate_assignments(&tx, &session_id)?;
+            if let Some(expected) = expected_revision
+                && expected != state.revision
+            {
+                return Err(SessionError::DelegateAssignmentRevisionConflict { expected, found: state.revision });
+            }
+            if state.overrides.get(&agent_id) == model.as_ref() {
+                return Ok(DelegateAssignmentWrite {
+                    assignments: state,
+                    changed: false,
+                });
+            }
+            match model {
+                Some(model) => { state.overrides.insert(agent_id, model); }
+                None => { state.overrides.remove(&agent_id); }
+            }
+            let revision = i64::try_from(state.revision).ok().and_then(|r| r.checked_add(1))
+                .ok_or_else(|| SessionError::InvalidOperation("Delegate assignment revision exhausted".into()))?;
+            state.revision = revision as u64;
+            tx.execute(
+                "INSERT INTO session_delegate_assignments (session_id, revision, overrides_json) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session_id) DO UPDATE SET revision = excluded.revision, overrides_json = excluded.overrides_json",
+                params![id, revision, serde_json::to_string(&state.overrides)?],
+            )?;
+            tx.commit()?;
+            Ok(DelegateAssignmentWrite {
+                assignments: state,
+                changed: true,
+            })
+        }).await
     }
 
     async fn commit_session_control(

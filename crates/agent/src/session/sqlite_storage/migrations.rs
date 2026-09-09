@@ -76,7 +76,21 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0016_remote_sync_progress",
         apply: migration_0016_remote_sync_progress,
     },
+    Migration {
+        version: "0017_delegate_assignments",
+        apply: migration_0017_delegate_assignments,
+    },
 ];
+
+fn migration_0017_delegate_assignments(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_delegate_assignments (
+            session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+            revision INTEGER NOT NULL CHECK (revision >= 0),
+            overrides_json TEXT NOT NULL
+        );",
+    )
+}
 
 pub(super) fn apply_migrations(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(

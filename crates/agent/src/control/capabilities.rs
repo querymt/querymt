@@ -107,6 +107,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
             "querymt/profile/agents".to_string(),
             "querymt/profile/setActive".to_string(),
             "querymt/session/setDelegateModel".to_string(),
+            "querymt/session/delegateModels".to_string(),
         ]);
     }
 
@@ -124,6 +125,19 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
             "querymt/remote/attachSession".to_string(),
             "querymt/remote/dismissSession".to_string(),
         ]);
+    }
+
+    let mut notifications = vec![
+        "querymt/mesh/nodesChanged".to_string(),
+        "querymt/mesh/joined".to_string(),
+        "querymt/mesh/peerExpired".to_string(),
+        "querymt/models/changed".to_string(),
+        "querymt/schedules/changed".to_string(),
+        crate::acp::shared::QMT_NOTIFICATION_DELEGATION_UPDATE.to_string(),
+    ];
+    if agent.profiles().is_some() {
+        notifications
+            .push(crate::acp::shared::QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED.to_string());
     }
 
     CapabilitiesInfo {
@@ -157,13 +171,6 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
             steering: true,
         },
         methods,
-        notifications: vec![
-            "querymt/mesh/nodesChanged".to_string(),
-            "querymt/mesh/joined".to_string(),
-            "querymt/mesh/peerExpired".to_string(),
-            "querymt/models/changed".to_string(),
-            "querymt/schedules/changed".to_string(),
-            "querymt/session/delegationUpdate".to_string(),
-        ],
+        notifications,
     }
 }

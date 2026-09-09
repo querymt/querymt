@@ -66,6 +66,10 @@ pub enum SessionError {
     #[error("session control revision conflict: expected {expected}, found {found}")]
     SessionControlRevisionConflict { expected: u64, found: u64 },
 
+    /// A delegate assignment snapshot was superseded by another writer.
+    #[error("delegate assignment revision conflict: expected {expected}, found {found}")]
+    DelegateAssignmentRevisionConflict { expected: u64, found: u64 },
+
     /// Provider error (from LLM operations)
     #[error("Provider error: {0}")]
     ProviderError(#[from] LLMError),
@@ -108,6 +112,11 @@ impl From<SessionError> for LLMError {
             SessionError::SessionControlRevisionConflict { expected, found } => {
                 LLMError::InvalidRequest(format!(
                     "session control revision conflict: expected {expected}, found {found}"
+                ))
+            }
+            SessionError::DelegateAssignmentRevisionConflict { expected, found } => {
+                LLMError::InvalidRequest(format!(
+                    "delegate assignment revision conflict: expected {expected}, found {found}"
                 ))
             }
             SessionError::ForkPointTypeMismatch { expected, actual } => {

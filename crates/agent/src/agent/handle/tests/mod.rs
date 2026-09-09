@@ -36,6 +36,25 @@ struct RealStorageHandleFixture {
     _temp_dir: tempfile::TempDir,
 }
 
+struct TestStorageBackend {
+    session_store: Arc<dyn SessionStore>,
+    event_storage: Arc<crate::session::sqlite_storage::SqliteStorage>,
+}
+
+impl StorageBackend for TestStorageBackend {
+    fn session_store(&self) -> Arc<dyn SessionStore> {
+        self.session_store.clone()
+    }
+
+    fn event_journal(&self) -> Arc<dyn crate::session::projection::EventJournal> {
+        self.event_storage.clone()
+    }
+
+    fn view_store(&self) -> Option<Arc<dyn crate::session::projection::ViewStore>> {
+        Some(self.event_storage.clone())
+    }
+}
+
 impl HandleFixture {
     async fn new() -> Self {
         Self::with_list_sessions(vec![]).await
@@ -77,6 +96,21 @@ impl HandleFixture {
     }
 
     async fn with_profiles(self, active_profile_id: &str, profile_dir: &Path) -> Self {
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("profile test storage"),
+        );
+        self.with_profile_storage(active_profile_id, profile_dir, storage)
+            .await
+    }
+
+    async fn with_profile_storage(
+        self,
+        active_profile_id: &str,
+        profile_dir: &Path,
+        storage: Arc<dyn crate::session::backend::StorageBackend>,
+    ) -> Self {
         let catalog: Arc<dyn ProfileCatalog> = Arc::new(
             crate::profiles::LocalProfileCatalog::builder()
                 .include_embedded_default(false)
@@ -89,7 +123,8 @@ impl HandleFixture {
             active_profile_id,
             AgentInfra {
                 plugin_registry: Arc::new(plugin_registry),
-                storage: None,
+                // The manager and its runtimes share explicit test storage, never the user DB.
+                storage: Some(storage),
                 session_mcp_attachment_source: None,
                 event_fanout: None,
             },

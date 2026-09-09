@@ -79,12 +79,21 @@ async fn test_querymt_capabilities_lists_control_surface() {
     assert_eq!(result["transport"]["mesh_transport"], "none");
     assert_eq!(result["features"]["mesh_invites"], false);
     assert_eq!(result["features"]["profiles"], false);
+    let methods = result["methods"].as_array().expect("methods array");
+    for unavailable in [
+        "querymt/profiles",
+        "querymt/session/setDelegateModel",
+        "querymt/session/delegateModels",
+    ] {
+        assert!(
+            !methods.iter().any(|method| method == unavailable),
+            "unexpected profile capability method {unavailable}"
+        );
+    }
     assert!(
-        !result["methods"]
-            .as_array()
-            .expect("methods array")
+        !notifications
             .iter()
-            .any(|method| method == "querymt/profiles")
+            .any(|method| method == "querymt/session/delegateModelsChanged")
     );
 }
 
@@ -96,11 +105,25 @@ async fn test_querymt_capabilities_advertises_profile_methods_when_configured() 
     let methods = result["methods"].as_array().expect("methods array");
 
     assert_eq!(result["features"]["profiles"], true);
+    let notifications = result["notifications"]
+        .as_array()
+        .expect("notifications array");
+    assert!(
+        notifications
+            .iter()
+            .any(|method| method == "querymt/session/delegateModelsChanged")
+    );
+    assert!(
+        !methods
+            .iter()
+            .any(|method| method == "querymt/session/delegateModelsChanged")
+    );
     for expected in [
         "querymt/profiles",
         "querymt/profile/agents",
         "querymt/profile/setActive",
         "querymt/session/setDelegateModel",
+        "querymt/session/delegateModels",
     ] {
         assert!(
             methods.iter().any(|method| method == expected),

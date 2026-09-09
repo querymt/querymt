@@ -464,33 +464,57 @@ fn spawn_event_bridge_forwarder(
                             .flatten();
                         (delegation_update, session_update)
                     };
-                    let result = if let Some(update) = delegation_update {
-                        let params = serde_json::value::RawValue::from_string(
-                            serde_json::to_string(&update).unwrap_or_else(|_| "null".to_string()),
-                        )
-                        .map(Arc::from)
-                        .map_err(acp::Error::into_internal_error);
-                        match params {
-                            Ok(params) => {
-                                bridge
-                                    .notify_ext(crate::acp::protocol::ExtNotification::new(
-                                        QMT_NOTIFICATION_DELEGATION_UPDATE,
-                                        params,
-                                    ))
-                                    .await
-                            }
-                            Err(err) => Err(err),
+                    let result =
+                        if let crate::events::AgentEventKind::DelegateModelsChanged { revision } =
+                            event.kind()
+                        {
+                            let notification =
+                                crate::acp::shared::delegate_models_changed_notification(
+                                    event.session_id(),
+                                    *revision,
+                                );
+                            let params = serde_json::value::RawValue::from_string(
+                                notification["params"].to_string(),
+                            )
+                            .map(Arc::from)
+                            .map_err(acp::Error::into_internal_error);
+                            match params {
+                            Ok(params) => bridge
+                                .notify_ext(crate::acp::protocol::ExtNotification::new(
+                                    crate::acp::shared::QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED,
+                                    params,
+                                ))
+                                .await,
+                            Err(error) => Err(error),
                         }
-                    } else if let Some(update) = session_update {
-                        bridge
-                            .notify(SessionNotification::new(
-                                SessionId::from(event.session_id().to_owned()),
-                                update,
-                            ))
-                            .await
-                    } else {
-                        continue;
-                    };
+                        } else if let Some(update) = delegation_update {
+                            let params = serde_json::value::RawValue::from_string(
+                                serde_json::to_string(&update)
+                                    .unwrap_or_else(|_| "null".to_string()),
+                            )
+                            .map(Arc::from)
+                            .map_err(acp::Error::into_internal_error);
+                            match params {
+                                Ok(params) => {
+                                    bridge
+                                        .notify_ext(crate::acp::protocol::ExtNotification::new(
+                                            QMT_NOTIFICATION_DELEGATION_UPDATE,
+                                            params,
+                                        ))
+                                        .await
+                                }
+                                Err(err) => Err(err),
+                            }
+                        } else if let Some(update) = session_update {
+                            bridge
+                                .notify(SessionNotification::new(
+                                    SessionId::from(event.session_id().to_owned()),
+                                    update,
+                                ))
+                                .await
+                        } else {
+                            continue;
+                        };
 
                     if let Err(e) = result {
                         log::info!(
@@ -919,6 +943,56 @@ mod stdio_tests {
                 Some("stored-message-id")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn delegate_assignment_invalidation_uses_typed_stdio_bridge() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let (bridge_tx, mut bridge_rx) = mpsc::channel(4);
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+        let forwarder = spawn_event_bridge_forwarder(
+            fixture.config.event_sink.fanout().clone(),
+            ClientBridgeSender::new(bridge_tx),
+            fixture.handle.clone(),
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            Arc::new(std::sync::Mutex::new(AcpLiveEventTranslator::new())),
+            shutdown_tx,
+        );
+        tokio::task::yield_now().await;
+        fixture
+            .config
+            .event_sink
+            .fanout()
+            .publish(crate::events::EventEnvelope::Durable(
+                crate::events::DurableEvent {
+                    event_id: "assignment-event".into(),
+                    stream_seq: 1,
+                    session_id: "parent".into(),
+                    timestamp: 0,
+                    origin: crate::events::EventOrigin::Local,
+                    source_node: None,
+                    kind: crate::events::AgentEventKind::DelegateModelsChanged {
+                        revision: Some(7),
+                    },
+                },
+            ));
+        let message = timeout(Duration::from_secs(2), bridge_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ClientBridgeMessage::ExtNotification(notification) = message else {
+            panic!("expected extension notification");
+        };
+        assert_eq!(
+            notification.method.as_ref(),
+            crate::acp::shared::QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED
+        );
+        let params: serde_json::Value = serde_json::from_str(notification.params.get()).unwrap();
+        assert_eq!(
+            params,
+            serde_json::json!({ "version": 1, "session_id": "parent", "revision": 7 })
+        );
+        forwarder.abort();
     }
 
     #[tokio::test]

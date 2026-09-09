@@ -3,7 +3,7 @@ use crate::agent::core::ToolPolicy;
 use crate::agent::execution::CycleOutcome;
 use crate::agent::execution_context::ExecutionContext;
 use crate::delegation::{AgentInfo, DefaultAgentRegistry, DelegationOrchestrator};
-use crate::events::StopType;
+use crate::events::{AgentEventKind, StopType};
 use crate::middleware::{
     AgentStats, ConversationContext, DelegationGuardMiddleware, ExecutionState, LlmResponse,
     MiddlewareDriver,
@@ -896,16 +896,19 @@ async fn test_delegate_model_override_applies_before_prompt() {
         .await;
     harness
         .config
-        .delegate_model_overrides
-        .set(
-            harness.exec_ctx.session_id.clone(),
+        .provider
+        .history_store()
+        .set_delegate_assignment(
+            &harness.exec_ctx.session_id,
             "agent",
-            crate::delegation::DelegateModelOverride {
+            Some(crate::delegation::DelegateModelOverride {
                 model_id: "mock/override-model".into(),
                 node_id: None,
-            },
+            }),
+            Some(0),
         )
-        .await;
+        .await
+        .unwrap();
 
     let outcome = harness.run_single_delegation().await;
 
@@ -913,6 +916,28 @@ async fn test_delegate_model_override_applies_before_prompt() {
     let (child_model, child_params) = harness.child_llm_params().await;
     assert_eq!(child_model, "override-model");
     assert_eq!(child_params.reasoning_effort, Some(ReasoningEffort::High));
+    let events = harness
+        .config
+        .event_sink
+        .journal()
+        .load_session_stream(&harness.exec_ctx.session_id, None, None)
+        .await
+        .unwrap();
+    let fork = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            AgentEventKind::SessionForked {
+                selected_model_id,
+                selected_provider_node_id,
+                ..
+            } => Some((
+                selected_model_id.as_deref(),
+                selected_provider_node_id.as_deref(),
+            )),
+            _ => None,
+        })
+        .expect("delegation fork event");
+    assert_eq!(fork, (Some("mock/override-model"), None));
 }
 
 #[tokio::test]

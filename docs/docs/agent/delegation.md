@@ -70,6 +70,145 @@ system = """You are a planner agent. Your role is to:
 5. Review and integrate delegate results"""
 ```
 
+## Session-Scoped Delegate Models (ACP)
+
+A delegate's profile configuration supplies its default model. A parent session can
+explicitly override that model for **future delegations**, without changing the
+profile, another parent session, or a child that is already running. The override
+is read during child setup, before its first prompt; a change racing with setup
+is not guaranteed to affect that already-starting child.
+
+### Read assignments
+
+Check `querymt/capabilities` for `querymt/session/delegateModels` and
+`querymt/session/setDelegateModel`. Call:
+
+```json
+{"method":"querymt/session/delegateModels","params":{"session_id":"parent-session-id"}}
+```
+
+An illustrative result is:
+
+```json
+{
+  "version": 1,
+  "session_id": "parent-session-id",
+  "profile_id": "quorum",
+  "revision": 2,
+  "durable": true,
+  "editable": true,
+  "assignments": [
+    {
+      "agent_id": "coder",
+      "name": "Coder",
+      "description": "Writes code",
+      "model": {"model_id": "provider/model", "node_id": "mesh-node-id"},
+      "source": "override",
+      "configured_default_model_id": "provider/default-model"
+    }
+  ],
+  "orphaned_overrides": []
+}
+```
+
+- `model` is the stored override, or `null` to inherit. It is returned even if the
+  model has disappeared from the current catalog or its node is offline.
+- `source` is `override` or `profile_default`. A failed read is **unknown**, not
+  proof of inheritance. Do not substitute a recent/default catalog entry.
+- `configured_default_model_id` is the local delegate's configured provider/model,
+  also included by `querymt/profile/agents`. It may be `null` for a remote delegate.
+  It is **not** a resolved Mesh route, a runtime availability guarantee, or the model
+  that generated an existing child's messages.
+- `orphaned_overrides` contains `{agent_id, model}` entries for removed profile
+  roles. They remain visible and can be explicitly cleared; reads never delete them.
+- `editable` is false for delegated child sessions. User-created forks can own
+  independent assignments. The session must have a valid persisted profile binding;
+  no prior actor load is required.
+
+Reads do not set models, replay client preferences, or create session actors.
+
+### Change one assignment
+
+```json
+{
+  "method": "querymt/session/setDelegateModel",
+  "params": {
+    "session_id": "parent-session-id",
+    "agent_id": "coder",
+    "model_id": "provider/model",
+    "node_id": "mesh-node-id",
+    "expected_revision": 2
+  }
+}
+```
+
+The response includes `version`, `session_id`, `agent_id`, confirmed `model`, `revision`,
+and `durable`. Omit `node_id` (or use `null`) for a local model. Reset with
+`model_id: null` and no node. Snake-case request fields also accept their camelCase
+aliases. An empty node string is rejected rather than silently selecting local execution.
+
+Use the revision from readback to avoid lost updates. A stale write fails without
+changing anything, using ACP InvalidParams with error data:
+
+```json
+{
+  "code": "delegate_assignment_conflict",
+  "expected_revision": 2,
+  "actual_revision": 3,
+  "message": "Delegate assignments changed; refresh before retrying"
+}
+```
+
+Refresh and let the user review a conflict; do not blindly retry. Writes to an
+unchanged value keep the revision. The revision covers all roles in that parent
+session; a changed role increments it once. Multiple setter calls are not an atomic
+bulk operation: retain per-role confirmations and handle partial failure before
+sending a new session's first prompt.
+
+Older clients may omit `expected_revision`; their writes are unconditional but
+atomically preserve other roles. SQLite persists assignments across close, reload,
+and restart. Deleting a parent cascades to its assignments. A user fork copies
+assignments independently with revision zero; delegated children do not inherit
+that assignment map.
+
+### Notifications and recovery
+
+On changes, stdio and WebSocket event streams send the advertised
+`querymt/session/delegateModelsChanged` invalidation hint:
+
+```json
+{"method":"querymt/session/delegateModelsChanged","params":{"version":1,"session_id":"parent-session-id","revision":3}}
+```
+
+Notifications use existing session event routing/ownership rules. They are not a
+cross-process database watcher or a guaranteed event for every commit: the write
+and event publication are separate. Always read back on reconnect and refresh on
+focus when other processes may write. The returned state, not an event history scan, is authoritative.
+
+Delegation updates and load snapshots also expose `selectedModelId` and
+`selectedProviderNodeId` once a child has been configured. These optional fields
+come from that child's confirmed control state immediately before the fork event
+and first prompt. Older fork events omit them. Use them for historical execution
+provenance; do not rewrite them from today's parent assignment settings.
+
+Custom `SessionStore` implementations that do not implement durable assignments
+retain the legacy in-memory path. They report `durable: false` and `revision: null`,
+and reject an `expected_revision`. Do not promise persistence or compare-and-swap
+for those backends. Legacy in-memory overrides are not automatically migrated;
+clients must explicitly apply any desired saved setup.
+
+### Testing and database isolation
+
+Profile tests must inject temporary or in-memory storage into `AgentInfra`; the
+profile manager and its runtimes must use the same isolated storage. `storage: None`
+means **use the normal user database**, not an in-memory test database.
+
+As defense in depth, run tests with a fresh `QMT_SESSIONS_DB`, `QMT_HOME`, and
+`HOME`, and use a filesystem sandbox that hides the real home and other worktrees.
+Never launch development builds against a live sessions database to test migrations.
+The delegate-assignment migration is `0017_delegate_assignments`, after the event
+source identity and remote sync progress migrations already present on `main`.
+
 ## Delegation Lifecycle
 
 ### 1. Delegation Request

@@ -933,11 +933,38 @@ async fn execute_delegation(
         .await;
     }
 
-    if let Some(model_override) = ctx
+    let model_override = match ctx
         .delegate_model_overrides
-        .get(&parent_session_id, &delegation.target_agent_id)
+        .resolve(
+            ctx.store.as_ref(),
+            &parent_session_id,
+            &delegation.target_agent_id,
+        )
         .await
     {
+        Ok(model) => model,
+        Err(error) => {
+            let _ = session_ref.shutdown().await;
+            fail_delegation(
+                DelegationFailureContext {
+                    event_sink: &ctx.event_sink,
+                    delegator: &ctx.delegator,
+                    store: &ctx.store,
+                    hooks: Some(&ctx.hooks),
+                    config: &ctx.config,
+                    parent_session_id: &parent_session_id,
+                    delegation_id: &delegation.public_id,
+                    target_agent_id: Some(&delegation.target_agent_id),
+                    objective: Some(&delegation.objective),
+                },
+                &format!("Failed to read delegate model assignment: {error}"),
+            )
+            .await;
+            ctx.active_delegations.lock().await.remove(&delegation_id);
+            return;
+        }
+    };
+    if let Some(model_override) = model_override {
         #[cfg(feature = "remote")]
         let provider_node_id = match model_override.node_id.as_deref() {
             Some(node_id) => match crate::agent::remote::NodeId::parse(node_id) {
@@ -1033,6 +1060,33 @@ async fn execute_delegation(
         return;
     }
 
+    let selected_model = match session_ref.get_session_control().await {
+        Ok(control) => (
+            control.effective_model.model_id,
+            control.effective_model.provider_node_id,
+        ),
+        Err(error) => {
+            let _ = session_ref.shutdown().await;
+            fail_delegation(
+                DelegationFailureContext {
+                    event_sink: &ctx.event_sink,
+                    delegator: &ctx.delegator,
+                    store: &ctx.store,
+                    hooks: Some(&ctx.hooks),
+                    config: &ctx.config,
+                    parent_session_id: &parent_session_id,
+                    delegation_id: &delegation.public_id,
+                    target_agent_id: Some(&delegation.target_agent_id),
+                    objective: Some(&delegation.objective),
+                },
+                &format!("Failed to confirm delegate model before prompt: {error}"),
+            )
+            .await;
+            ctx.active_delegations.lock().await.remove(&delegation_id);
+            return;
+        }
+    };
+
     emit_delegation_event(
         &ctx.delegator,
         &ctx.event_sink,
@@ -1045,6 +1099,8 @@ async fn execute_delegation(
             fork_point_type: ForkPointType::ProgressEntry,
             fork_point_ref: delegation.public_id.clone(),
             instructions: delegation.context.clone(),
+            selected_model_id: Some(selected_model.0),
+            selected_provider_node_id: selected_model.1,
         },
     );
 

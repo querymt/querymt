@@ -101,6 +101,7 @@ impl LocalAgentHandle {
                 "name": agent.name,
                 "description": agent.description,
                 "capabilities": agent.capabilities,
+                "configured_default_model_id": Self::configured_delegate_model_id(&runtime.agent().handle(), &agent.id),
             })
         }));
 
@@ -110,21 +111,132 @@ impl LocalAgentHandle {
         }))
     }
 
+    /// Read current assignments without loading a session actor or applying client preferences.
+    pub(super) async fn handle_ext_delegate_models(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
+        use crate::control::delegate_models::{
+            DELEGATE_MODELS_VERSION, DelegateAssignmentInfo, DelegateAssignmentSource,
+            DelegateAssignmentsInfo, DelegateModelsRequest, OrphanedDelegateAssignment,
+        };
+
+        let parsed: DelegateModelsRequest = serde_json::from_str(req.params.get())
+            .map_err(|error| Error::invalid_params().data(error.to_string()))?;
+        let session_id = parsed.session_id.trim();
+        if session_id.is_empty() {
+            return Err(Error::invalid_params().data("session_id must be nonempty"));
+        }
+        let profiles = self.profiles().ok_or_else(Error::invalid_params)?;
+        let binding = profiles.session_binding(session_id).await.ok_or_else(|| {
+            Error::invalid_params().data("session is not bound to an available profile")
+        })?;
+        let runtime = profiles
+            .runtime_for_profile(&binding.profile_id)
+            .await
+            .map_err(|error| {
+                Error::internal_error().data(format_prefixed_error_chain(
+                    "Failed to load bound profile",
+                    &error,
+                ))
+            })?;
+        let handle = runtime.agent().handle();
+        let store = handle.config.provider.history_store();
+        let session = store
+            .get_session(session_id)
+            .await
+            .map_err(Error::into_internal_error)?
+            .ok_or_else(|| Error::invalid_params().data("unknown session"))?;
+        let state = store
+            .get_delegate_assignments(session_id)
+            .await
+            .map_err(Error::into_internal_error)?;
+        let editable = binding.agent_id.is_none()
+            && session.fork_origin != Some(crate::session::domain::ForkOrigin::Delegation);
+        let mut agents = if editable {
+            handle.agent_registry().list_agents()
+        } else {
+            Vec::new()
+        };
+        agents.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut assignments = Vec::with_capacity(agents.len());
+        for agent in agents {
+            let model = match &state {
+                Some(state) => state.overrides.get(&agent.id).cloned(),
+                None => {
+                    handle
+                        .config
+                        .delegate_model_overrides
+                        .get(session_id, &agent.id)
+                        .await
+                }
+            };
+            assignments.push(DelegateAssignmentInfo {
+                agent_id: agent.id.clone(),
+                name: agent.name,
+                description: agent.description,
+                source: if model.is_some() {
+                    DelegateAssignmentSource::Override
+                } else {
+                    DelegateAssignmentSource::ProfileDefault
+                },
+                model: model.into(),
+                configured_default_model_id: Self::configured_delegate_model_id(&handle, &agent.id)
+                    .into(),
+            });
+        }
+        // Keep orphan overrides visible after a profile edit; never silently turn them into inheritance.
+        let orphaned_overrides = match &state {
+            Some(state) => state
+                .overrides
+                .iter()
+                .filter(|(id, _)| handle.agent_registry().get_agent(id).is_none())
+                .map(|(id, model)| OrphanedDelegateAssignment {
+                    agent_id: id.clone(),
+                    model: model.clone(),
+                })
+                .collect(),
+            None => handle
+                .config
+                .delegate_model_overrides
+                .list_parent(session_id)
+                .await
+                .into_iter()
+                .filter(|(id, _)| handle.agent_registry().get_agent(id).is_none())
+                .map(|(agent_id, model)| OrphanedDelegateAssignment { agent_id, model })
+                .collect(),
+        };
+        ext_json_response(&DelegateAssignmentsInfo {
+            version: DELEGATE_MODELS_VERSION,
+            session_id: session_id.to_owned(),
+            profile_id: binding.profile_id,
+            revision: state.as_ref().map(|state| state.revision).into(),
+            durable: state.is_some(),
+            editable,
+            assignments,
+            orphaned_overrides,
+        })
+    }
+
+    // This is profile configuration, not a resolved Mesh route or historical execution identity.
+    fn configured_delegate_model_id(handle: &LocalAgentHandle, agent_id: &str) -> Option<String> {
+        let target = handle.agent_registry().get_handle(agent_id)?;
+        let local = target.as_any().downcast_ref::<LocalAgentHandle>()?;
+        let config = local.config.provider.initial_config();
+        Some(format!(
+            "{}/{}",
+            config.provider.as_deref()?,
+            config.model.as_deref()?
+        ))
+    }
+
     pub(super) async fn handle_ext_set_delegate_model(
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        #[derive(serde::Deserialize)]
-        struct SetDelegateModelRequest {
-            #[serde(alias = "sessionId")]
-            session_id: String,
-            #[serde(alias = "agentId")]
-            agent_id: String,
-            #[serde(default, alias = "modelId")]
-            model_id: Option<String>,
-            #[serde(default, alias = "nodeId")]
-            node_id: Option<String>,
-        }
+        use crate::control::delegate_models::{
+            DELEGATE_MODELS_VERSION, SetDelegateModelRequest, SetDelegateModelResponse,
+        };
 
         let parsed: SetDelegateModelRequest =
             serde_json::from_str(req.params.get()).map_err(|e| {
@@ -162,23 +274,42 @@ impl LocalAgentHandle {
                 }))
             })?;
         let profile_handle = runtime.agent().handle();
-        if profile_handle
-            .registry
-            .lock()
+        let store = profile_handle.config.provider.history_store();
+        let session = store
+            .get_session(session_id)
             .await
-            .get(session_id)
-            .is_none()
+            .map_err(Error::into_internal_error)?
+            .ok_or_else(|| Error::invalid_params().data("unknown session for bound profile"))?;
+        if binding.agent_id.is_some()
+            || session.fork_origin == Some(crate::session::domain::ForkOrigin::Delegation)
         {
-            return Err(Error::invalid_params().data(serde_json::json!({
-                "message": "unknown session for bound profile",
-                "sessionId": session_id,
-                "profileId": binding.profile_id,
-            })));
+            return Err(
+                Error::invalid_params().data("Configure delegate models on their parent session")
+            );
+        }
+        let before = store
+            .get_delegate_assignments(session_id)
+            .await
+            .map_err(Error::into_internal_error)?;
+        if before.is_none() && parsed.expected_revision.is_some() {
+            return Err(Error::invalid_params().data(
+                "This storage backend does not support revision-checked delegate assignments",
+            ));
         }
         if profile_handle
             .agent_registry()
             .get_agent(agent_id)
             .is_none()
+            && !(parsed.model_id.is_none()
+                && match &before {
+                    Some(state) => state.overrides.contains_key(agent_id),
+                    None => profile_handle
+                        .config
+                        .delegate_model_overrides
+                        .get(session_id, agent_id)
+                        .await
+                        .is_some(),
+                })
         {
             return Err(Error::invalid_params().data(serde_json::json!({
                 "message": "unknown delegate agent",
@@ -196,12 +327,12 @@ impl LocalAgentHandle {
                         "message": "model_id must be null or a non-empty string",
                     })));
                 }
-                let node_id = parsed
-                    .node_id
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string);
+                let node_id = parsed.node_id.as_deref().map(str::trim).map(str::to_string);
+                if node_id.as_ref().is_some_and(String::is_empty) {
+                    return Err(
+                        Error::invalid_params().data("node_id must be null or a non-empty string")
+                    );
+                }
                 #[cfg(not(feature = "remote"))]
                 if node_id.is_some() {
                     return Err(Error::invalid_params().data(serde_json::json!({
@@ -222,22 +353,8 @@ impl LocalAgentHandle {
                 let model_exists = models
                     .iter()
                     .any(|entry| entry.id == model_id && entry.node_id == node_id);
-                let current_delegate_model = profile_handle
-                    .agent_registry()
-                    .get_handle(agent_id)
-                    .and_then(|handle| {
-                        handle
-                            .as_any()
-                            .downcast_ref::<LocalAgentHandle>()
-                            .and_then(|handle| {
-                                let config = handle.config.provider.initial_config();
-                                Some(format!(
-                                    "{}/{}",
-                                    config.provider.as_deref()?,
-                                    config.model.as_deref()?
-                                ))
-                            })
-                    });
+                let current_delegate_model =
+                    Self::configured_delegate_model_id(&profile_handle, agent_id);
                 if !model_exists
                     && (node_id.is_some() || current_delegate_model.as_deref() != Some(model_id))
                 {
@@ -263,25 +380,59 @@ impl LocalAgentHandle {
             }
         };
 
-        if let Some(model) = model.clone() {
-            profile_handle
-                .config
-                .delegate_model_overrides
-                .set(session_id, agent_id, model)
-                .await;
+        let persisted = if before.is_some() {
+            Some(
+                store
+                    .set_delegate_assignment(
+                        session_id,
+                        agent_id,
+                        model.clone(),
+                        parsed.expected_revision,
+                    )
+                    .await
+                    .map_err(|error| {
+                        match error {
+                        crate::session::error::SessionError::DelegateAssignmentRevisionConflict {
+                            expected,
+                            found,
+                        } => Error::invalid_params().data(serde_json::json!({
+                            "code": "delegate_assignment_conflict",
+                            "expected_revision": expected,
+                            "actual_revision": found,
+                            "message": "Delegate assignments changed; refresh before retrying",
+                        })),
+                        other => Error::into_internal_error(other),
+                    }
+                    })?,
+            )
         } else {
+            None
+        };
+        // The legacy cache is only used by storage backends without durable support.
+        let legacy_changed = if persisted.is_none() {
             profile_handle
                 .config
                 .delegate_model_overrides
-                .clear(session_id, agent_id)
-                .await;
+                .update(session_id, agent_id, model.clone())
+                .await
+        } else {
+            false
+        };
+        let revision = persisted.as_ref().map(|write| write.revision);
+        if legacy_changed || persisted.as_ref().is_some_and(|write| write.changed) {
+            profile_handle.emit_event(
+                session_id,
+                AgentEventKind::DelegateModelsChanged { revision },
+            );
         }
-
-        ext_json_response(&serde_json::json!({
-            "session_id": session_id,
-            "agent_id": agent_id,
-            "model": model,
-        }))
+        ext_json_response(&SetDelegateModelResponse {
+            version: DELEGATE_MODELS_VERSION,
+            session_id: session_id.to_owned(),
+            agent_id: agent_id.to_owned(),
+            model: model.into(),
+            revision: revision.into(),
+            durable: persisted.is_some(),
+        })
     }
 
     async fn profiles_response(&self) -> Result<serde_json::Value, Error> {

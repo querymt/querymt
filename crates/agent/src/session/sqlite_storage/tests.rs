@@ -205,6 +205,366 @@ fn migration_0014_adds_session_control_tables() {
 }
 
 #[tokio::test]
+async fn delegate_assignments_are_read_only_revisioned_and_session_scoped() {
+    use crate::delegation::DelegateModelOverride;
+    use crate::session::error::SessionError;
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let first = storage
+        .create_session(None, None, None, None)
+        .await
+        .unwrap();
+    let second = storage
+        .create_session(None, None, None, None)
+        .await
+        .unwrap();
+    let original = storage
+        .get_delegate_assignments(&first.public_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.revision, 0);
+    assert!(original.overrides.is_empty());
+    let rows = storage
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_delegate_assignments",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0, "read must not create assignment state");
+    let model = DelegateModelOverride {
+        model_id: "provider/model".into(),
+        node_id: Some("mesh-node".into()),
+    };
+    let one = storage
+        .set_delegate_assignment(&first.public_id, "coder", Some(model.clone()), Some(0))
+        .await
+        .unwrap();
+    assert!(one.changed);
+    assert_eq!(one.revision, 1);
+    assert_eq!(one.overrides["coder"], model);
+    let noop = storage
+        .set_delegate_assignment(&first.public_id, "coder", Some(model.clone()), Some(1))
+        .await
+        .unwrap();
+    assert!(!noop.changed);
+    assert_eq!(noop.assignments, one.assignments);
+    let stale = storage
+        .set_delegate_assignment(&first.public_id, "coder", None, Some(0))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale,
+        SessionError::DelegateAssignmentRevisionConflict {
+            expected: 0,
+            found: 1
+        }
+    ));
+    let two = storage
+        .set_delegate_assignment(&first.public_id, "reviewer", Some(model.clone()), None)
+        .await
+        .unwrap();
+    assert_eq!(two.revision, 2);
+    let cleared = storage
+        .set_delegate_assignment(&first.public_id, "coder", None, Some(2))
+        .await
+        .unwrap();
+    assert_eq!(cleared.revision, 3);
+    assert!(!cleared.overrides.contains_key("coder"));
+    assert_eq!(cleared.overrides["reviewer"], model);
+    assert!(
+        storage
+            .get_delegate_assignments(&second.public_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .overrides
+            .is_empty()
+    );
+    assert!(matches!(
+        storage.get_delegate_assignments("missing").await,
+        Err(SessionError::SessionNotFound(_))
+    ));
+    assert!(
+        storage
+            .set_delegate_assignment("missing", "coder", None, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        storage
+            .set_delegate_assignment(&first.public_id, "", None, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        storage
+            .set_delegate_assignment(&first.public_id, " coder ", Some(model.clone()), None)
+            .await
+            .is_err()
+    );
+    assert!(
+        storage
+            .set_delegate_assignment(
+                &first.public_id,
+                "coder",
+                Some(DelegateModelOverride {
+                    model_id: " provider/model ".into(),
+                    node_id: None
+                }),
+                None
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        storage
+            .set_delegate_assignment(
+                &first.public_id,
+                "coder",
+                Some(DelegateModelOverride {
+                    model_id: "provider/model".into(),
+                    node_id: Some(" ".into())
+                }),
+                None
+            )
+            .await
+            .is_err()
+    );
+    storage.delete_session(&first.public_id).await.unwrap();
+    let count = storage
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_delegate_assignments",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "deleting a parent cascades to assignments");
+}
+
+#[tokio::test]
+async fn delegate_assignments_survive_reopen_and_detect_cross_connection_conflicts() {
+    use crate::delegation::DelegateModelOverride;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sessions.db");
+    let storage = SqliteStorage::connect(path.clone()).await.unwrap();
+    let parent = storage
+        .create_session(None, None, None, None)
+        .await
+        .unwrap();
+    let model = DelegateModelOverride {
+        model_id: "provider/retired-model".into(),
+        node_id: Some("offline-node".into()),
+    };
+    storage
+        .set_delegate_assignment(&parent.public_id, "coder", Some(model.clone()), Some(0))
+        .await
+        .unwrap();
+    drop(storage);
+    let first = SqliteStorage::connect(path.clone()).await.unwrap();
+    let second = SqliteStorage::connect(path).await.unwrap();
+    assert_eq!(
+        first
+            .get_delegate_assignments(&parent.public_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .overrides["coder"],
+        model
+    );
+    let noop = second
+        .set_delegate_assignment(&parent.public_id, "coder", Some(model.clone()), None)
+        .await
+        .unwrap();
+    assert!(!noop.changed, "cross-connection no-op must be explicit");
+    assert_eq!(noop.revision, 1);
+    let (a, b) = tokio::join!(
+        first.set_delegate_assignment(&parent.public_id, "a", Some(model.clone()), Some(1)),
+        second.set_delegate_assignment(&parent.public_id, "b", Some(model), Some(1)),
+    );
+    assert_ne!(
+        a.is_ok(),
+        b.is_ok(),
+        "exactly one writer can consume revision 1"
+    );
+    let error = a.err().or_else(|| b.err()).unwrap();
+    assert!(matches!(
+        error,
+        crate::session::error::SessionError::DelegateAssignmentRevisionConflict {
+            expected: 1,
+            found: 2
+        }
+    ));
+    assert_eq!(
+        first
+            .get_delegate_assignments(&parent.public_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        2
+    );
+}
+
+#[tokio::test]
+async fn delegate_assignments_rollback_failed_writes_and_do_not_hide_corruption() {
+    use crate::delegation::DelegateModelOverride;
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let parent = storage
+        .create_session(None, None, None, None)
+        .await
+        .unwrap();
+    let model = DelegateModelOverride {
+        model_id: "provider/model".into(),
+        node_id: None,
+    };
+    let before = storage
+        .set_delegate_assignment(&parent.public_id, "coder", Some(model.clone()), None)
+        .await
+        .unwrap();
+    storage
+        .run_blocking(|conn| {
+            conn.execute_batch(
+        "CREATE TRIGGER reject_delegate_update BEFORE UPDATE ON session_delegate_assignments
+         BEGIN SELECT RAISE(ABORT, 'rejected update'); END;"
+    )
+        })
+        .await
+        .unwrap();
+    assert!(
+        storage
+            .set_delegate_assignment(&parent.public_id, "reviewer", Some(model), Some(1))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        storage
+            .get_delegate_assignments(&parent.public_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        before.assignments
+    );
+    storage.run_blocking(|conn| conn.execute_batch(
+        "DROP TRIGGER reject_delegate_update; UPDATE session_delegate_assignments SET overrides_json = 'broken';"
+    )).await.unwrap();
+    assert!(
+        storage
+            .get_delegate_assignments(&parent.public_id)
+            .await
+            .is_err(),
+        "corrupt state must not be displayed as inheritance"
+    );
+}
+
+#[tokio::test]
+async fn delegate_assignments_user_forks_inherit_but_delegate_children_do_not() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let parent = storage
+        .create_session(None, None, None, None)
+        .await
+        .unwrap();
+    let model = crate::delegation::DelegateModelOverride {
+        model_id: "provider/model".into(),
+        node_id: None,
+    };
+    storage
+        .set_delegate_assignment(&parent.public_id, "coder", Some(model.clone()), None)
+        .await
+        .unwrap();
+    storage
+        .add_message(
+            &parent.public_id,
+            AgentMessage {
+                id: "fork-point".into(),
+                session_id: parent.public_id.clone(),
+                role: ChatRole::User,
+                parts: vec![MessagePart::Prompt {
+                    blocks: vec![ContentBlock::Text(TextContent::new("task"))],
+                }],
+                created_at: 1,
+                parent_message_id: None,
+                source_provider: None,
+                source_model: None,
+            },
+        )
+        .await
+        .unwrap();
+    let fork = storage
+        .fork_session(&parent.public_id, "fork-point", ForkOrigin::User)
+        .await
+        .unwrap();
+    let child = storage
+        .fork_session(&parent.public_id, "fork-point", ForkOrigin::Delegation)
+        .await
+        .unwrap();
+    assert_eq!(
+        storage
+            .get_delegate_assignments(&fork)
+            .await
+            .unwrap()
+            .unwrap()
+            .overrides["coder"],
+        model
+    );
+    assert!(
+        storage
+            .get_delegate_assignments(&child)
+            .await
+            .unwrap()
+            .unwrap()
+            .overrides
+            .is_empty()
+    );
+    storage
+        .set_delegate_assignment(&fork, "coder", None, Some(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        storage
+            .get_delegate_assignments(&parent.public_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .overrides["coder"],
+        model
+    );
+}
+
+#[test]
+fn delegate_assignment_migration_preserves_existing_records() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    // Model an upgrade from main's prior schema rather than only testing fresh databases.
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|m| m.version != "0017_delegate_assignments")
+    {
+        (migration.apply)(&mut conn).unwrap();
+    }
+    conn.execute("INSERT INTO sessions (public_id, name, created_at, updated_at) VALUES ('existing', 'Keep me', '2026-09-07T00:00:00Z', '2026-09-07T00:00:00Z')", []).unwrap();
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0017_delegate_assignments")
+        .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+    (migration.apply)(&mut conn).unwrap();
+    let name: String = conn
+        .query_row(
+            "SELECT name FROM sessions WHERE public_id = 'existing'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(name, "Keep me");
+}
+
+#[tokio::test]
 async fn session_control_commit_is_revisioned_and_session_scoped() {
     let storage = SqliteStorage::connect(":memory:".into())
         .await
