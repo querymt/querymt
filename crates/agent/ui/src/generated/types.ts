@@ -1266,6 +1266,7 @@ export interface SessionMeta {
 export interface SetDelegateModelRequest {
 	session_id: string;
 	agent_id: string;
+	/** Present and null clears the override. Omitted is invalid, not a wipe. */
 	model_id: string | null;
 	node_id?: string | null;
 	expected_revision?: number | null;
