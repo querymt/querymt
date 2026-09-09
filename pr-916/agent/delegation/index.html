@@ -2370,7 +2370,8 @@ and <code>durable</code>. Omit <code>node_id</code> (or use <code>null</code>) f
 <code>model_id: null</code> and no node. Snake-case request fields also accept their camelCase
 aliases. An empty node string is rejected rather than silently selecting local execution.</p>
 <p>Use the revision from readback to avoid lost updates. A stale write fails without
-changing anything, using ACP InvalidParams with error data:</p>
+changing anything. The ACP error code is <code>-32020</code>, not <code>InvalidParams</code>
+(<code>-32602</code>), with this error data:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-6-1">1</a></span>
 <span class="normal"><a href="#__codelineno-6-2">2</a></span>
 <span class="normal"><a href="#__codelineno-6-3">3</a></span>
