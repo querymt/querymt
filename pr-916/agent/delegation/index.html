@@ -2308,25 +2308,29 @@ is not guaranteed to affect that already-starting child.</p>
 <span class="normal"><a href="#__codelineno-4-16">16</a></span>
 <span class="normal"><a href="#__codelineno-4-17">17</a></span>
 <span class="normal"><a href="#__codelineno-4-18">18</a></span>
-<span class="normal"><a href="#__codelineno-4-19">19</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="p">{</span>
+<span class="normal"><a href="#__codelineno-4-19">19</a></span>
+<span class="normal"><a href="#__codelineno-4-20">20</a></span>
+<span class="normal"><a href="#__codelineno-4-21">21</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="p">{</span>
 <a id="__codelineno-4-2" name="__codelineno-4-2"></a><span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
-<a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="w">  </span><span class="nt">"session_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"parent-session-id"</span><span class="p">,</span>
-<a id="__codelineno-4-4" name="__codelineno-4-4"></a><span class="w">  </span><span class="nt">"profile_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"quorum"</span><span class="p">,</span>
-<a id="__codelineno-4-5" name="__codelineno-4-5"></a><span class="w">  </span><span class="nt">"revision"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
-<a id="__codelineno-4-6" name="__codelineno-4-6"></a><span class="w">  </span><span class="nt">"durable"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
-<a id="__codelineno-4-7" name="__codelineno-4-7"></a><span class="w">  </span><span class="nt">"editable"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
-<a id="__codelineno-4-8" name="__codelineno-4-8"></a><span class="w">  </span><span class="nt">"assignments"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-4-9" name="__codelineno-4-9"></a><span class="w">    </span><span class="p">{</span>
-<a id="__codelineno-4-10" name="__codelineno-4-10"></a><span class="w">      </span><span class="nt">"agent_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"coder"</span><span class="p">,</span>
-<a id="__codelineno-4-11" name="__codelineno-4-11"></a><span class="w">      </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Coder"</span><span class="p">,</span>
-<a id="__codelineno-4-12" name="__codelineno-4-12"></a><span class="w">      </span><span class="nt">"description"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Writes code"</span><span class="p">,</span>
-<a id="__codelineno-4-13" name="__codelineno-4-13"></a><span class="w">      </span><span class="nt">"model"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"model_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"provider/model"</span><span class="p">,</span><span class="w"> </span><span class="nt">"node_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"mesh-node-id"</span><span class="p">},</span>
-<a id="__codelineno-4-14" name="__codelineno-4-14"></a><span class="w">      </span><span class="nt">"source"</span><span class="p">:</span><span class="w"> </span><span class="s2">"override"</span><span class="p">,</span>
-<a id="__codelineno-4-15" name="__codelineno-4-15"></a><span class="w">      </span><span class="nt">"configured_default_model_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"provider/default-model"</span>
-<a id="__codelineno-4-16" name="__codelineno-4-16"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-4-17" name="__codelineno-4-17"></a><span class="w">  </span><span class="p">],</span>
-<a id="__codelineno-4-18" name="__codelineno-4-18"></a><span class="w">  </span><span class="nt">"orphaned_overrides"</span><span class="p">:</span><span class="w"> </span><span class="p">[]</span>
-<a id="__codelineno-4-19" name="__codelineno-4-19"></a><span class="p">}</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="w">  </span><span class="nt">"reasoning_effort_supported"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<a id="__codelineno-4-4" name="__codelineno-4-4"></a><span class="w">  </span><span class="nt">"session_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"parent-session-id"</span><span class="p">,</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5"></a><span class="w">  </span><span class="nt">"profile_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"quorum"</span><span class="p">,</span>
+<a id="__codelineno-4-6" name="__codelineno-4-6"></a><span class="w">  </span><span class="nt">"revision"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+<a id="__codelineno-4-7" name="__codelineno-4-7"></a><span class="w">  </span><span class="nt">"durable"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<a id="__codelineno-4-8" name="__codelineno-4-8"></a><span class="w">  </span><span class="nt">"editable"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<a id="__codelineno-4-9" name="__codelineno-4-9"></a><span class="w">  </span><span class="nt">"assignments"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<a id="__codelineno-4-10" name="__codelineno-4-10"></a><span class="w">    </span><span class="p">{</span>
+<a id="__codelineno-4-11" name="__codelineno-4-11"></a><span class="w">      </span><span class="nt">"agent_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"coder"</span><span class="p">,</span>
+<a id="__codelineno-4-12" name="__codelineno-4-12"></a><span class="w">      </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Coder"</span><span class="p">,</span>
+<a id="__codelineno-4-13" name="__codelineno-4-13"></a><span class="w">      </span><span class="nt">"description"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Writes code"</span><span class="p">,</span>
+<a id="__codelineno-4-14" name="__codelineno-4-14"></a><span class="w">      </span><span class="nt">"model"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"model_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"provider/model"</span><span class="p">,</span><span class="w"> </span><span class="nt">"node_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"mesh-node-id"</span><span class="p">},</span>
+<a id="__codelineno-4-15" name="__codelineno-4-15"></a><span class="w">      </span><span class="nt">"source"</span><span class="p">:</span><span class="w"> </span><span class="s2">"override"</span><span class="p">,</span>
+<a id="__codelineno-4-16" name="__codelineno-4-16"></a><span class="w">      </span><span class="nt">"configured_default_model_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"provider/default-model"</span><span class="p">,</span>
+<a id="__codelineno-4-17" name="__codelineno-4-17"></a><span class="w">      </span><span class="nt">"reasoning_effort"</span><span class="p">:</span><span class="w"> </span><span class="s2">"high"</span>
+<a id="__codelineno-4-18" name="__codelineno-4-18"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-4-19" name="__codelineno-4-19"></a><span class="w">  </span><span class="p">],</span>
+<a id="__codelineno-4-20" name="__codelineno-4-20"></a><span class="w">  </span><span class="nt">"orphaned_overrides"</span><span class="p">:</span><span class="w"> </span><span class="p">[]</span>
+<a id="__codelineno-4-21" name="__codelineno-4-21"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <ul>
 <li><code>model</code> is the stored override, or <code>null</code> to inherit. It is returned even if the
@@ -2337,8 +2341,13 @@ is not guaranteed to affect that already-starting child.</p>
   also included by <code>querymt/profile/agents</code>. It may be <code>null</code> for a remote delegate.
   It is <strong>not</strong> a resolved Mesh route, a runtime availability guarantee, or the model
   that generated an existing child's messages.</li>
-<li><code>orphaned_overrides</code> contains <code>{agent_id, model}</code> entries for removed profile
-  roles. They remain visible and can be explicitly cleared; reads never delete them.</li>
+<li><code>reasoning_effort_supported</code> is true when the additive setter/readback field is
+  available. Clients must hide reasoning controls when an older backend omits it.</li>
+<li><code>reasoning_effort</code> is <code>null</code> to inherit the parent session at delegation time, or
+  <code>auto</code>, <code>low</code>, <code>medium</code>, <code>high</code>, or <code>max</code> for an explicit role override.</li>
+<li><code>orphaned_overrides</code> contains <code>{agent_id, model, reasoning_effort}</code> entries for
+  removed profile roles. Model can be <code>null</code> for reasoning-only overrides. They
+  remain visible and can be explicitly cleared; reads never delete them.</li>
 <li><code>editable</code> is false for delegated child sessions. User-created forks can own
   independent assignments. The session must have a valid persisted profile binding;
   no prior actor load is required.</li>
@@ -2354,21 +2363,26 @@ is not guaranteed to affect that already-starting child.</p>
 <span class="normal"><a href="#__codelineno-5-7"> 7</a></span>
 <span class="normal"><a href="#__codelineno-5-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-5-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-5-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="p">{</span>
+<span class="normal"><a href="#__codelineno-5-10">10</a></span>
+<span class="normal"><a href="#__codelineno-5-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="p">{</span>
 <a id="__codelineno-5-2" name="__codelineno-5-2"></a><span class="w">  </span><span class="nt">"method"</span><span class="p">:</span><span class="w"> </span><span class="s2">"querymt/session/setDelegateModel"</span><span class="p">,</span>
 <a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="w">  </span><span class="nt">"params"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-5-4" name="__codelineno-5-4"></a><span class="w">    </span><span class="nt">"session_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"parent-session-id"</span><span class="p">,</span>
 <a id="__codelineno-5-5" name="__codelineno-5-5"></a><span class="w">    </span><span class="nt">"agent_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"coder"</span><span class="p">,</span>
 <a id="__codelineno-5-6" name="__codelineno-5-6"></a><span class="w">    </span><span class="nt">"model_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"provider/model"</span><span class="p">,</span>
 <a id="__codelineno-5-7" name="__codelineno-5-7"></a><span class="w">    </span><span class="nt">"node_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"mesh-node-id"</span><span class="p">,</span>
-<a id="__codelineno-5-8" name="__codelineno-5-8"></a><span class="w">    </span><span class="nt">"expected_revision"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span>
-<a id="__codelineno-5-9" name="__codelineno-5-9"></a><span class="w">  </span><span class="p">}</span>
-<a id="__codelineno-5-10" name="__codelineno-5-10"></a><span class="p">}</span>
+<a id="__codelineno-5-8" name="__codelineno-5-8"></a><span class="w">    </span><span class="nt">"reasoning_effort"</span><span class="p">:</span><span class="w"> </span><span class="s2">"high"</span><span class="p">,</span>
+<a id="__codelineno-5-9" name="__codelineno-5-9"></a><span class="w">    </span><span class="nt">"expected_revision"</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span>
+<a id="__codelineno-5-10" name="__codelineno-5-10"></a><span class="w">  </span><span class="p">}</span>
+<a id="__codelineno-5-11" name="__codelineno-5-11"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
-<p>The response includes <code>version</code>, <code>session_id</code>, <code>agent_id</code>, confirmed <code>model</code>, <code>revision</code>,
-and <code>durable</code>. Omit <code>node_id</code> (or use <code>null</code>) for a local model. Reset with
-<code>model_id: null</code> and no node. Snake-case request fields also accept their camelCase
-aliases. An empty node string is rejected rather than silently selecting local execution.</p>
+<p>The response includes <code>version</code>, <code>session_id</code>, <code>agent_id</code>, confirmed <code>model</code>,
+<code>reasoning_effort</code>, <code>revision</code>, and <code>durable</code>. Omit <code>node_id</code> (or use <code>null</code>) for a
+local model. Reset the model with <code>model_id: null</code> and no node. The optional
+<code>reasoning_effort</code> field preserves the existing setting when omitted, clears it back
+to parent-session inheritance when null, and accepts <code>auto</code>, <code>low</code>, <code>medium</code>, <code>high</code>,
+or <code>max</code>. Snake-case request fields also accept their camelCase aliases. An empty
+node string is rejected rather than silently selecting local execution.</p>
 <p>Use the revision from readback to avoid lost updates. A stale write fails without
 changing anything. The ACP error code is <code>-32020</code>, not <code>InvalidParams</code>
 (<code>-32602</code>), with this error data:</p>
@@ -2390,10 +2404,11 @@ session; a changed role increments it once. Multiple setter calls are not an ato
 bulk operation: retain per-role confirmations and handle partial failure before
 sending a new session's first prompt.</p>
 <p>Older clients may omit <code>expected_revision</code>; their writes are unconditional but
-atomically preserve other roles. SQLite persists assignments across close, reload,
-and restart. Deleting a parent cascades to its assignments. A user fork copies
-assignments independently with revision zero; delegated children do not inherit
-that assignment map.</p>
+atomically preserve other roles and any omitted reasoning setting. SQLite stores one
+revision row per parent session and one relational override row per configured role;
+there are no JSON assignment blobs. Deleting a parent cascades to its assignments. A
+user fork copies assignments independently with revision zero; delegated children do
+not inherit that assignment map.</p>
 <h3 id="notifications-and-recovery">Notifications and recovery</h3>
 <p>On changes, stdio and WebSocket event streams send the advertised
 <code>querymt/session/delegateModelsChanged</code> invalidation hint:</p>
