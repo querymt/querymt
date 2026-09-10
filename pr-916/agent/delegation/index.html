@@ -2377,8 +2377,9 @@ is not guaranteed to affect that already-starting child.</p>
 <a id="__codelineno-5-11" name="__codelineno-5-11"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <p>The response includes <code>version</code>, <code>session_id</code>, <code>agent_id</code>, confirmed <code>model</code>,
-<code>reasoning_effort</code>, <code>revision</code>, and <code>durable</code>. Omit <code>node_id</code> (or use <code>null</code>) for a
-local model. Reset the model with <code>model_id: null</code> and no node. The optional
+<code>reasoning_effort</code>, <code>revision</code>, and <code>durable</code>. Every write must include <code>model_id</code>;
+omitting it is <code>InvalidParams</code>. Omit <code>node_id</code> (or use <code>null</code>) for a local model.
+Reset the model with an explicit <code>model_id: null</code> and no node. The optional
 <code>reasoning_effort</code> field preserves the existing setting when omitted, clears it back
 to parent-session inheritance when null, and accepts <code>auto</code>, <code>low</code>, <code>medium</code>, <code>high</code>,
 or <code>max</code>. Snake-case request fields also accept their camelCase aliases. An empty
