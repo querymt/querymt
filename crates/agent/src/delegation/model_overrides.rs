@@ -308,11 +308,10 @@ mod tests {
         assert!(changed);
         assert_eq!(route, DelegateRouteOverrides::default());
         assert!(
-            store
+            !store
                 .list_parent_routes("parent-1")
                 .await
-                .get("coder")
-                .is_none()
+                .contains_key("coder")
         );
         let (changed, route) = store.update_route("parent-1", "coder", None, None).await;
         assert!(!changed);

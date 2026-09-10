@@ -151,8 +151,9 @@ Reads do not set models, replay client preferences, or create session actors.
 ```
 
 The response includes `version`, `session_id`, `agent_id`, confirmed `model`,
-`reasoning_effort`, `revision`, and `durable`. Omit `node_id` (or use `null`) for a
-local model. Reset the model with `model_id: null` and no node. The optional
+`reasoning_effort`, `revision`, and `durable`. Every write must include `model_id`;
+omitting it is `InvalidParams`. Omit `node_id` (or use `null`) for a local model.
+Reset the model with an explicit `model_id: null` and no node. The optional
 `reasoning_effort` field preserves the existing setting when omitted, clears it back
 to parent-session inheritance when null, and accepts `auto`, `low`, `medium`, `high`,
 or `max`. Snake-case request fields also accept their camelCase aliases. An empty

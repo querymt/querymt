@@ -39,17 +39,12 @@ impl<T> From<Option<T>> for RequiredNullable<T> {
 }
 
 /// An additive request field where omission preserves state and null clears it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum OptionalNullable<T> {
+    #[default]
     Missing,
     Null,
     Value(T),
-}
-
-impl<T> Default for OptionalNullable<T> {
-    fn default() -> Self {
-        Self::Missing
-    }
 }
 
 impl<'de, T> Deserialize<'de> for OptionalNullable<T>
