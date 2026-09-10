@@ -92,6 +92,7 @@ An illustrative result is:
 ```json
 {
   "version": 1,
+  "reasoning_effort_supported": true,
   "session_id": "parent-session-id",
   "profile_id": "quorum",
   "revision": 2,
@@ -104,7 +105,8 @@ An illustrative result is:
       "description": "Writes code",
       "model": {"model_id": "provider/model", "node_id": "mesh-node-id"},
       "source": "override",
-      "configured_default_model_id": "provider/default-model"
+      "configured_default_model_id": "provider/default-model",
+      "reasoning_effort": "high"
     }
   ],
   "orphaned_overrides": []
@@ -119,8 +121,13 @@ An illustrative result is:
   also included by `querymt/profile/agents`. It may be `null` for a remote delegate.
   It is **not** a resolved Mesh route, a runtime availability guarantee, or the model
   that generated an existing child's messages.
-- `orphaned_overrides` contains `{agent_id, model}` entries for removed profile
-  roles. They remain visible and can be explicitly cleared; reads never delete them.
+- `reasoning_effort_supported` is true when the additive setter/readback field is
+  available. Clients must hide reasoning controls when an older backend omits it.
+- `reasoning_effort` is `null` to inherit the parent session at delegation time, or
+  `auto`, `low`, `medium`, `high`, or `max` for an explicit role override.
+- `orphaned_overrides` contains `{agent_id, model, reasoning_effort}` entries for
+  removed profile roles. Model can be `null` for reasoning-only overrides. They
+  remain visible and can be explicitly cleared; reads never delete them.
 - `editable` is false for delegated child sessions. User-created forks can own
   independent assignments. The session must have a valid persisted profile binding;
   no prior actor load is required.
@@ -137,15 +144,19 @@ Reads do not set models, replay client preferences, or create session actors.
     "agent_id": "coder",
     "model_id": "provider/model",
     "node_id": "mesh-node-id",
+    "reasoning_effort": "high",
     "expected_revision": 2
   }
 }
 ```
 
-The response includes `version`, `session_id`, `agent_id`, confirmed `model`, `revision`,
-and `durable`. Omit `node_id` (or use `null`) for a local model. Reset with
-`model_id: null` and no node. Snake-case request fields also accept their camelCase
-aliases. An empty node string is rejected rather than silently selecting local execution.
+The response includes `version`, `session_id`, `agent_id`, confirmed `model`,
+`reasoning_effort`, `revision`, and `durable`. Omit `node_id` (or use `null`) for a
+local model. Reset the model with `model_id: null` and no node. The optional
+`reasoning_effort` field preserves the existing setting when omitted, clears it back
+to parent-session inheritance when null, and accepts `auto`, `low`, `medium`, `high`,
+or `max`. Snake-case request fields also accept their camelCase aliases. An empty
+node string is rejected rather than silently selecting local execution.
 
 Use the revision from readback to avoid lost updates. A stale write fails without
 changing anything. The ACP error code is `-32020`, not `InvalidParams`
@@ -167,10 +178,11 @@ bulk operation: retain per-role confirmations and handle partial failure before
 sending a new session's first prompt.
 
 Older clients may omit `expected_revision`; their writes are unconditional but
-atomically preserve other roles. SQLite persists assignments across close, reload,
-and restart. Deleting a parent cascades to its assignments. A user fork copies
-assignments independently with revision zero; delegated children do not inherit
-that assignment map.
+atomically preserve other roles and any omitted reasoning setting. SQLite stores one
+revision row per parent session and one relational override row per configured role;
+there are no JSON assignment blobs. Deleting a parent cascades to its assignments. A
+user fork copies assignments independently with revision zero; delegated children do
+not inherit that assignment map.
 
 ### Notifications and recovery
 

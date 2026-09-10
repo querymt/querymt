@@ -159,18 +159,32 @@ impl LocalAgentHandle {
             Vec::new()
         };
         agents.sort_by(|left, right| left.id.cmp(&right.id));
+        let legacy_routes = if state.is_none() {
+            Some(
+                handle
+                    .config
+                    .delegate_model_overrides
+                    .list_parent_routes(session_id)
+                    .await,
+            )
+        } else {
+            None
+        };
         let mut assignments = Vec::with_capacity(agents.len());
         for agent in agents {
-            let model = match &state {
-                Some(state) => state.overrides.get(&agent.id).cloned(),
-                None => {
-                    handle
-                        .config
-                        .delegate_model_overrides
-                        .get(session_id, &agent.id)
-                        .await
-                }
+            let route = match &state {
+                Some(state) => crate::delegation::DelegateRouteOverrides {
+                    model: state.overrides.get(&agent.id).cloned(),
+                    reasoning_effort: state.reasoning_overrides.get(&agent.id).copied(),
+                },
+                None => legacy_routes
+                    .as_ref()
+                    .and_then(|routes| routes.get(&agent.id))
+                    .cloned()
+                    .unwrap_or_default(),
             };
+            let model = route.model;
+            let reasoning_effort = route.reasoning_effort;
             assignments.push(DelegateAssignmentInfo {
                 agent_id: agent.id.clone(),
                 name: agent.name,
@@ -183,31 +197,42 @@ impl LocalAgentHandle {
                 model: model.into(),
                 configured_default_model_id: Self::configured_delegate_model_id(&handle, &agent.id)
                     .into(),
+                reasoning_effort: reasoning_effort.into(),
             });
         }
         // Keep orphan overrides visible after a profile edit; never silently turn them into inheritance.
-        let orphaned_overrides = match &state {
+        let routes = match &state {
             Some(state) => state
                 .overrides
-                .iter()
-                .filter(|(id, _)| handle.agent_registry().get_agent(id).is_none())
-                .map(|(id, model)| OrphanedDelegateAssignment {
-                    agent_id: id.clone(),
-                    model: model.clone(),
+                .keys()
+                .chain(state.reasoning_overrides.keys())
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .map(|agent_id| {
+                    (
+                        agent_id.clone(),
+                        crate::delegation::DelegateRouteOverrides {
+                            model: state.overrides.get(&agent_id).cloned(),
+                            reasoning_effort: state.reasoning_overrides.get(&agent_id).copied(),
+                        },
+                    )
                 })
                 .collect(),
-            None => handle
-                .config
-                .delegate_model_overrides
-                .list_parent(session_id)
-                .await
-                .into_iter()
-                .filter(|(id, _)| handle.agent_registry().get_agent(id).is_none())
-                .map(|(agent_id, model)| OrphanedDelegateAssignment { agent_id, model })
-                .collect(),
+            None => legacy_routes.unwrap_or_default(),
         };
+        let orphaned_overrides = routes
+            .into_iter()
+            .filter(|(agent_id, _)| handle.agent_registry().get_agent(agent_id).is_none())
+            .map(|(agent_id, route)| OrphanedDelegateAssignment {
+                model: route.model.into(),
+                reasoning_effort: route.reasoning_effort.into(),
+                agent_id,
+            })
+            .collect();
         ext_json_response(&DelegateAssignmentsInfo {
             version: DELEGATE_MODELS_VERSION,
+            reasoning_effort_supported: true,
             session_id: session_id.to_owned(),
             profile_id: binding.profile_id,
             revision: state.as_ref().map(|state| state.revision).into(),
@@ -296,20 +321,33 @@ impl LocalAgentHandle {
                 "This storage backend does not support revision-checked delegate assignments",
             ));
         }
+        let orphan_route = match &before {
+            Some(state) => crate::delegation::DelegateRouteOverrides {
+                model: state.overrides.get(agent_id).cloned(),
+                reasoning_effort: state.reasoning_overrides.get(agent_id).copied(),
+            },
+            None => {
+                profile_handle
+                    .config
+                    .delegate_model_overrides
+                    .get_route(session_id, agent_id)
+                    .await
+            }
+        };
+        let stored_orphan = orphan_route.model.is_some() || orphan_route.reasoning_effort.is_some();
+        let clears_orphan = parsed.model_id.0.is_none()
+            && match &parsed.reasoning_effort {
+                crate::control::delegate_models::OptionalNullable::Missing => {
+                    orphan_route.reasoning_effort.is_none()
+                }
+                crate::control::delegate_models::OptionalNullable::Null => true,
+                crate::control::delegate_models::OptionalNullable::Value(_) => false,
+            };
         if profile_handle
             .agent_registry()
             .get_agent(agent_id)
             .is_none()
-            && !(parsed.model_id.0.is_none()
-                && match &before {
-                    Some(state) => state.overrides.contains_key(agent_id),
-                    None => profile_handle
-                        .config
-                        .delegate_model_overrides
-                        .get(session_id, agent_id)
-                        .await
-                        .is_some(),
-                })
+            && !(stored_orphan && clears_orphan)
         {
             return Err(Error::invalid_params().data(serde_json::json!({
                 "message": "unknown delegate agent",
@@ -383,10 +421,11 @@ impl LocalAgentHandle {
         let persisted = if before.is_some() {
             Some(
                 store
-                    .set_delegate_assignment(
+                    .set_delegate_assignment_with_reasoning(
                         session_id,
                         agent_id,
                         model.clone(),
+                        parsed.reasoning_effort.as_update(),
                         parsed.expected_revision,
                     )
                     .await
@@ -413,14 +452,27 @@ impl LocalAgentHandle {
             None
         };
         // The legacy cache is only used by storage backends without durable support.
-        let legacy_changed = if persisted.is_none() {
-            profile_handle
-                .config
-                .delegate_model_overrides
-                .update(session_id, agent_id, model.clone())
-                .await
+        let legacy_write = if persisted.is_none() {
+            Some(
+                profile_handle
+                    .config
+                    .delegate_model_overrides
+                    .update_route(
+                        session_id,
+                        agent_id,
+                        model.clone(),
+                        parsed.reasoning_effort.as_update(),
+                    )
+                    .await,
+            )
         } else {
-            false
+            None
+        };
+        let legacy_changed = legacy_write.as_ref().is_some_and(|(changed, _)| *changed);
+        let reasoning_effort = match (&persisted, &legacy_write) {
+            (Some(write), _) => write.assignments.reasoning_overrides.get(agent_id).copied(),
+            (None, Some((_, route))) => route.reasoning_effort,
+            (None, None) => None,
         };
         let revision = persisted.as_ref().map(|write| write.assignments.revision);
         if legacy_changed || persisted.as_ref().is_some_and(|write| write.changed) {
@@ -431,9 +483,11 @@ impl LocalAgentHandle {
         }
         ext_json_response(&SetDelegateModelResponse {
             version: DELEGATE_MODELS_VERSION,
+            reasoning_effort_supported: true,
             session_id: session_id.to_owned(),
             agent_id: agent_id.to_owned(),
             model: model.into(),
+            reasoning_effort: reasoning_effort.into(),
             revision: revision.into(),
             durable: persisted.is_some(),
         })

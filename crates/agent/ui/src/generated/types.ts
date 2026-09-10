@@ -764,20 +764,18 @@ export interface DelegateAssignmentInfo {
 	model: DelegateModelOverride | null;
 	source: DelegateAssignmentSource;
 	configured_default_model_id: string | null;
-}
-
-export interface DelegateModelOverride {
-	model_id: string;
-	node_id?: string;
+	reasoning_effort: DelegateReasoningEffort | null;
 }
 
 export interface OrphanedDelegateAssignment {
 	agent_id: string;
-	model: DelegateModelOverride;
+	model: DelegateModelOverride | null;
+	reasoning_effort: DelegateReasoningEffort | null;
 }
 
 export interface DelegateAssignmentsInfo {
 	version: number;
+	reasoning_effort_supported: boolean;
 	session_id: string;
 	profile_id: string;
 	revision: number | null;
@@ -785,6 +783,11 @@ export interface DelegateAssignmentsInfo {
 	editable: boolean;
 	assignments: DelegateAssignmentInfo[];
 	orphaned_overrides: OrphanedDelegateAssignment[];
+}
+
+export interface DelegateModelOverride {
+	model_id: string;
+	node_id?: string;
 }
 
 export interface DelegateModelsChangedNotification {
@@ -1269,14 +1272,18 @@ export interface SetDelegateModelRequest {
 	/** Present and null clears the override. Omitted is invalid, not a wipe. */
 	model_id: string | null;
 	node_id?: string | null;
+	/** Omitted preserves the current setting; null restores parent-session inheritance. */
+	reasoning_effort?: DelegateReasoningEffort | null;
 	expected_revision?: number | null;
 }
 
 export interface SetDelegateModelResponse {
 	version: number;
+	reasoning_effort_supported: boolean;
 	session_id: string;
 	agent_id: string;
 	model: DelegateModelOverride | null;
+	reasoning_effort: DelegateReasoningEffort | null;
 	revision: number | null;
 	durable: boolean;
 }
@@ -1326,6 +1333,14 @@ export interface UsageInfo {
 	reasoning_tokens?: number;
 	cache_read?: number;
 	cache_write?: number;
+}
+
+export enum DelegateReasoningEffort {
+	Auto = "auto",
+	Low = "low",
+	Medium = "medium",
+	High = "high",
+	Max = "max",
 }
 
 /**

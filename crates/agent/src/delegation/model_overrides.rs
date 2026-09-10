@@ -11,9 +11,69 @@ pub struct DelegateModelOverride {
     pub node_id: Option<String>,
 }
 
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegateReasoningEffort {
+    Auto,
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl DelegateReasoningEffort {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+
+    pub(crate) fn session_effort(self) -> Option<querymt::chat::ReasoningEffort> {
+        use querymt::chat::ReasoningEffort;
+        match self {
+            Self::Auto => None,
+            Self::Low => Some(ReasoningEffort::Low),
+            Self::Medium => Some(ReasoningEffort::Medium),
+            Self::High => Some(ReasoningEffort::High),
+            Self::Max => Some(ReasoningEffort::Max),
+        }
+    }
+}
+
+impl std::str::FromStr for DelegateReasoningEffort {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "max" => Ok(Self::Max),
+            _ => Err(format!("Invalid delegate reasoning effort: {value}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DelegateRouteOverrides {
+    pub model: Option<DelegateModelOverride>,
+    pub reasoning_effort: Option<DelegateReasoningEffort>,
+}
+
+#[derive(Debug, Default)]
+struct DelegateOverrideCacheState {
+    values: HashMap<(String, String), DelegateRouteOverrides>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DelegateModelOverrideStore {
-    overrides: Arc<RwLock<HashMap<(String, String), DelegateModelOverride>>>,
+    state: Arc<RwLock<DelegateOverrideCacheState>>,
 }
 
 impl DelegateModelOverrideStore {
@@ -23,10 +83,11 @@ impl DelegateModelOverrideStore {
         agent_id: impl Into<String>,
         model: DelegateModelOverride,
     ) {
-        self.overrides
-            .write()
-            .await
-            .insert((parent_session_id.into(), agent_id.into()), model);
+        let parent_session_id = parent_session_id.into();
+        let agent_id = agent_id.into();
+        let _ = self
+            .update_route(&parent_session_id, &agent_id, Some(model), None)
+            .await;
     }
 
     pub async fn get(
@@ -34,52 +95,77 @@ impl DelegateModelOverrideStore {
         parent_session_id: &str,
         agent_id: &str,
     ) -> Option<DelegateModelOverride> {
-        self.overrides
+        self.get_route(parent_session_id, agent_id).await.model
+    }
+
+    /// Clear only the model override, matching a request with omitted reasoning.
+    pub async fn clear(&self, parent_session_id: &str, agent_id: &str) {
+        let _ = self
+            .update_route(parent_session_id, agent_id, None, None)
+            .await;
+    }
+
+    pub async fn get_reasoning(
+        &self,
+        parent_session_id: &str,
+        agent_id: &str,
+    ) -> Option<DelegateReasoningEffort> {
+        self.get_route(parent_session_id, agent_id)
+            .await
+            .reasoning_effort
+    }
+
+    pub(crate) async fn get_route(
+        &self,
+        parent_session_id: &str,
+        agent_id: &str,
+    ) -> DelegateRouteOverrides {
+        self.state
             .read()
             .await
+            .values
             .get(&(parent_session_id.to_string(), agent_id.to_string()))
             .cloned()
+            .unwrap_or_default()
     }
 
-    pub async fn clear(&self, parent_session_id: &str, agent_id: &str) {
-        self.overrides
-            .write()
-            .await
-            .remove(&(parent_session_id.to_string(), agent_id.to_string()));
-    }
-
-    pub(crate) async fn update(
+    pub(crate) async fn update_route(
         &self,
         parent_session_id: &str,
         agent_id: &str,
         model: Option<DelegateModelOverride>,
-    ) -> bool {
+        reasoning_effort: Option<Option<DelegateReasoningEffort>>,
+    ) -> (bool, DelegateRouteOverrides) {
         let key = (parent_session_id.to_string(), agent_id.to_string());
-        let mut overrides = self.overrides.write().await;
-        if overrides.get(&key) == model.as_ref() {
-            return false;
+        let mut state = self.state.write().await;
+        let current = state.values.get(&key).cloned().unwrap_or_default();
+        let mut next = current.clone();
+        next.model = model;
+        if let Some(reasoning_effort) = reasoning_effort {
+            next.reasoning_effort = reasoning_effort;
         }
-        match model {
-            Some(model) => {
-                overrides.insert(key, model);
-            }
-            None => {
-                overrides.remove(&key);
-            }
+        if next == current {
+            return (false, current);
         }
-        true
+        if next.model.is_none() && next.reasoning_effort.is_none() {
+            state.values.remove(&key);
+        } else {
+            state.values.insert(key, next.clone());
+        }
+        (true, next)
     }
 
-    pub(crate) async fn list_parent(
+    pub(crate) async fn list_parent_routes(
         &self,
         parent_session_id: &str,
-    ) -> BTreeMap<String, DelegateModelOverride> {
-        self.overrides
+    ) -> BTreeMap<String, DelegateRouteOverrides> {
+        self.state
             .read()
             .await
+            .values
             .iter()
             .filter(|((session_id, _), _)| session_id == parent_session_id)
-            .map(|((_, agent_id), model)| (agent_id.clone(), model.clone()))
+            .map(|((_, agent_id), value)| (agent_id.clone(), value.clone()))
             .collect()
     }
 
@@ -89,17 +175,20 @@ impl DelegateModelOverrideStore {
         store: &dyn crate::session::store::SessionStore,
         parent_session_id: &str,
         agent_id: &str,
-    ) -> crate::session::error::SessionResult<Option<DelegateModelOverride>> {
+    ) -> crate::session::error::SessionResult<DelegateRouteOverrides> {
         match store.get_delegate_assignments(parent_session_id).await? {
-            Some(state) => Ok(state.overrides.get(agent_id).cloned()),
-            None => Ok(self.get(parent_session_id, agent_id).await),
+            Some(state) => Ok(DelegateRouteOverrides {
+                model: state.overrides.get(agent_id).cloned(),
+                reasoning_effort: state.reasoning_overrides.get(agent_id).copied(),
+            }),
+            None => Ok(self.get_route(parent_session_id, agent_id).await),
         }
     }
 
     pub async fn clear_parent(&self, parent_session_id: &str) {
-        self.overrides
-            .write()
-            .await
+        let mut state = self.state.write().await;
+        state
+            .values
             .retain(|(session_id, _), _| session_id != parent_session_id);
     }
 }
@@ -133,6 +222,7 @@ mod tests {
                 .resolve(&storage, &parent.public_id, "coder")
                 .await
                 .unwrap()
+                .model
                 .is_none()
         );
         storage
@@ -143,7 +233,8 @@ mod tests {
             cache
                 .resolve(&storage, &parent.public_id, "coder")
                 .await
-                .unwrap(),
+                .unwrap()
+                .model,
             Some(new)
         );
         storage
@@ -155,6 +246,7 @@ mod tests {
                 .resolve(&storage, &parent.public_id, "coder")
                 .await
                 .unwrap()
+                .model
                 .is_none()
         );
         assert!(cache.resolve(&storage, "missing", "coder").await.is_err());
@@ -164,7 +256,8 @@ mod tests {
             cache
                 .resolve(&unsupported, &parent.public_id, "coder")
                 .await
-                .unwrap(),
+                .unwrap()
+                .model,
             Some(old)
         );
     }
@@ -191,16 +284,39 @@ mod tests {
             Some(second.clone())
         );
 
-        assert_eq!(
-            store.list_parent("parent-1").await,
-            BTreeMap::from([
-                ("coder".into(), first.clone()),
-                ("reviewer".into(), second.clone()),
-            ])
+        let routes = store.list_parent_routes("parent-1").await;
+        assert_eq!(routes["coder"].model, Some(first.clone()));
+        assert_eq!(routes["reviewer"].model, Some(second.clone()));
+        let (changed, route) = store
+            .update_route(
+                "parent-1",
+                "coder",
+                Some(first.clone()),
+                Some(Some(DelegateReasoningEffort::High)),
+            )
+            .await;
+        assert!(changed);
+        assert_eq!(route.model, Some(first.clone()));
+        assert_eq!(route.reasoning_effort, Some(DelegateReasoningEffort::High));
+        let (changed, route) = store.update_route("parent-1", "coder", None, None).await;
+        assert!(changed);
+        assert!(route.model.is_none());
+        assert_eq!(route.reasoning_effort, Some(DelegateReasoningEffort::High));
+        let (changed, route) = store
+            .update_route("parent-1", "coder", None, Some(None))
+            .await;
+        assert!(changed);
+        assert_eq!(route, DelegateRouteOverrides::default());
+        assert!(
+            store
+                .list_parent_routes("parent-1")
+                .await
+                .get("coder")
+                .is_none()
         );
-        assert!(!store.update("parent-1", "coder", Some(first)).await);
-        assert!(store.update("parent-1", "coder", None).await);
-        assert!(!store.update("parent-1", "coder", None).await);
+        let (changed, route) = store.update_route("parent-1", "coder", None, None).await;
+        assert!(!changed);
+        assert_eq!(route, DelegateRouteOverrides::default());
         assert_eq!(store.get("parent-1", "coder").await, None);
         assert_eq!(store.get("parent-2", "coder").await, Some(second));
 

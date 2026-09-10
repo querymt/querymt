@@ -326,6 +326,7 @@ async fn delegate_assignments_custom_storage_uses_legacy_memory_without_false_no
     )
     .await;
     assert_eq!(before["version"], 1);
+    assert_eq!(before["reasoning_effort_supported"], true);
     assert_eq!(before["durable"], false);
     assert!(before["revision"].is_null());
 
@@ -340,8 +341,10 @@ async fn delegate_assignments_custom_storage_uses_legacy_memory_without_false_no
     )
     .await;
     assert_eq!(set["version"], 1);
+    assert_eq!(set["reasoning_effort_supported"], true);
     assert_eq!(set["durable"], false);
     assert!(set["revision"].is_null());
+    assert!(set["reasoning_effort"].is_null());
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             if matches!(
@@ -362,6 +365,31 @@ async fn delegate_assignments_custom_storage_uses_legacy_memory_without_false_no
     )
     .await;
     assert_eq!(current["assignments"][0]["source"], "override");
+    assert!(current["assignments"][0]["reasoning_effort"].is_null());
+    let reasoning = ext_method_json(
+        &f.handle,
+        "querymt/session/setDelegateModel",
+        serde_json::json!({
+            "session_id": "legacy-parent",
+            "agent_id": "coder",
+            "model_id": "test/test-model",
+            "reasoning_effort": "high"
+        }),
+    )
+    .await;
+    assert_eq!(reasoning["reasoning_effort"], "high");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().kind(),
+                AgentEventKind::DelegateModelsChanged { revision: None }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
     let noop = ext_method_json(
         &f.handle,
         "querymt/session/setDelegateModel",
@@ -372,6 +400,7 @@ async fn delegate_assignments_custom_storage_uses_legacy_memory_without_false_no
         }),
     )
     .await;
+    assert_eq!(noop["reasoning_effort"], "high");
     assert!(noop["revision"].is_null());
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(100), events.recv())
@@ -458,10 +487,19 @@ async fn delegate_assignments_restore_after_full_profile_restart_from_temporary_
         .await;
     let parent = persisted_delegate_parent(&first).await;
     let sibling = persisted_delegate_parent(&first).await;
-    ext_method_json(&first.handle, "querymt/session/setDelegateModel", serde_json::json!({
-        "session_id": parent, "agent_id": "coder", "model_id": "test/test-model", "expected_revision": 0
-    })).await;
-    // Persistence includes the profile binding, not just the model JSON.
+    ext_method_json(
+        &first.handle,
+        "querymt/session/setDelegateModel",
+        serde_json::json!({
+            "session_id": parent,
+            "agent_id": "coder",
+            "model_id": "test/test-model",
+            "reasoning_effort": "high",
+            "expected_revision": 0
+        }),
+    )
+    .await;
+    // Persistence includes the profile binding, not just the route assignment.
     assert_eq!(
         storage
             .get_session_runtime_binding(&parent)
@@ -494,6 +532,7 @@ async fn delegate_assignments_restore_after_full_profile_restart_from_temporary_
         snapshot["assignments"][0]["model"]["model_id"],
         "test/test-model"
     );
+    assert_eq!(snapshot["assignments"][0]["reasoning_effort"], "high");
     let other = ext_method_json(
         &second.handle,
         "querymt/session/delegateModels",
@@ -619,7 +658,13 @@ async fn delegate_assignment_readback_survives_reconnect_and_preserves_unavailab
         .config
         .provider
         .history_store()
-        .set_delegate_assignment(&session_id, "removed-role", Some(model), None)
+        .set_delegate_assignment_with_reasoning(
+            &session_id,
+            "removed-role",
+            None,
+            Some(Some(crate::delegation::DelegateReasoningEffort::High)),
+            None,
+        )
         .await
         .unwrap();
     // A fresh handle has no loaded session actors or assignment cache.
@@ -644,10 +689,24 @@ async fn delegate_assignment_readback_survives_reconnect_and_preserves_unavailab
         response["orphaned_overrides"][0]["agent_id"],
         "removed-role"
     );
+    assert!(response["orphaned_overrides"][0]["model"].is_null());
+    assert_eq!(
+        response["orphaned_overrides"][0]["reasoning_effort"],
+        "high"
+    );
     assert!(handle.registry.lock().await.get(&session_id).is_none());
-    let clear = ext_method_json(&f.handle, "querymt/session/setDelegateModel", serde_json::json!({
-        "session_id": session_id, "agent_id": "removed-role", "model_id": null, "expected_revision": 2
-    })).await;
+    let clear = ext_method_json(
+        &f.handle,
+        "querymt/session/setDelegateModel",
+        serde_json::json!({
+            "session_id": session_id,
+            "agent_id": "removed-role",
+            "model_id": null,
+            "reasoning_effort": null,
+            "expected_revision": 2
+        }),
+    )
+    .await;
     assert_eq!(clear["revision"], 3);
 }
 
@@ -791,6 +850,7 @@ async fn test_querymt_session_set_delegate_model_sets_and_clears_override() {
     )
     .await;
     assert_eq!(before["version"], 1);
+    assert_eq!(before["reasoning_effort_supported"], true);
     assert_eq!(before["revision"], 0);
     assert_eq!(before["durable"], true);
     assert_eq!(before["editable"], true);
@@ -800,12 +860,23 @@ async fn test_querymt_session_set_delegate_model_sets_and_clears_override() {
         before["assignments"][0]["configured_default_model_id"],
         "test/test-model"
     );
-    let set = ext_method_json(&f.handle, "querymt/session/setDelegateModel", serde_json::json!({
-        "session_id": session_id, "agent_id": "coder", "model_id": "test/test-model", "expected_revision": 0
-    })).await;
+    let set = ext_method_json(
+        &f.handle,
+        "querymt/session/setDelegateModel",
+        serde_json::json!({
+            "session_id": session_id,
+            "agent_id": "coder",
+            "model_id": "test/test-model",
+            "reasoning_effort": "high",
+            "expected_revision": 0
+        }),
+    )
+    .await;
     assert_eq!(set["version"], 1);
+    assert_eq!(set["reasoning_effort_supported"], true);
     assert_eq!(set["revision"], 1);
     assert_eq!(set["model"]["model_id"], "test/test-model");
+    assert_eq!(set["reasoning_effort"], "high");
     let current = ext_method_json(
         &f.handle,
         "querymt/session/delegateModels",
@@ -813,6 +884,7 @@ async fn test_querymt_session_set_delegate_model_sets_and_clears_override() {
     )
     .await;
     assert_eq!(current["assignments"][0]["source"], "override");
+    assert_eq!(current["assignments"][0]["reasoning_effort"], "high");
     assert_eq!(current["assignments"][1]["source"], "profile_default");
     let stale = f.handle.ext_method(crate::acp::protocol::ExtRequest::new("querymt/session/setDelegateModel", raw_params(&serde_json::json!({
         "session_id": session_id, "agent_id": "coder", "model_id": null, "expected_revision": 0
@@ -824,16 +896,35 @@ async fn test_querymt_session_set_delegate_model_sets_and_clears_override() {
         )
     );
     assert_eq!(stale.data.unwrap()["code"], "delegate_assignment_conflict");
+    let model_cleared = ext_method_json(
+        &f.handle,
+        "querymt/session/setDelegateModel",
+        serde_json::json!({
+            "sessionId": session_id,
+            "agentId": "coder",
+            "modelId": null,
+            "expectedRevision": 1
+        }),
+    )
+    .await;
+    assert_eq!(model_cleared["revision"], 2);
+    assert!(model_cleared["model"].is_null());
+    assert_eq!(model_cleared["reasoning_effort"], "high");
     let cleared = ext_method_json(
         &f.handle,
         "querymt/session/setDelegateModel",
         serde_json::json!({
-            "sessionId": session_id, "agentId": "coder", "modelId": null, "expectedRevision": 1
+            "sessionId": session_id,
+            "agentId": "coder",
+            "modelId": null,
+            "reasoningEffort": null,
+            "expectedRevision": 2
         }),
     )
     .await;
-    assert_eq!(cleared["revision"], 2);
+    assert_eq!(cleared["revision"], 3);
     assert!(cleared["model"].is_null());
+    assert!(cleared["reasoning_effort"].is_null());
     let runtime = f
         .handle
         .profiles()
@@ -861,7 +952,8 @@ async fn test_querymt_session_set_delegate_model_rejects_invalid_targets() {
     let session_id = persisted_delegate_parent(&f).await;
     for params in [
         serde_json::json!({"session_id": "missing", "agent_id": "coder", "model_id": null}),
-        serde_json::json!({"session_id": session_id, "agent_id": "missing", "model_id": null}),
+        serde_json::json!({"session_id": session_id, "agent_id": "missing", "model_id": null, "reasoning_effort": null}),
+        serde_json::json!({"session_id": session_id, "agent_id": "missing", "model_id": null, "reasoning_effort": "high"}),
         serde_json::json!({"session_id": session_id, "agent_id": "coder"}),
         serde_json::json!({"session_id": session_id, "agent_id": "coder", "model_id": "test/missing"}),
         serde_json::json!({"session_id": session_id, "agent_id": "coder", "model_id": " "}),

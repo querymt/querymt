@@ -933,7 +933,7 @@ async fn execute_delegation(
         .await;
     }
 
-    let model_override = match ctx
+    let route_overrides = match ctx
         .delegate_model_overrides
         .resolve(
             ctx.store.as_ref(),
@@ -942,7 +942,7 @@ async fn execute_delegation(
         )
         .await
     {
-        Ok(model) => model,
+        Ok(overrides) => overrides,
         Err(error) => {
             let _ = session_ref.shutdown().await;
             fail_delegation(
@@ -964,7 +964,7 @@ async fn execute_delegation(
             return;
         }
     };
-    if let Some(model_override) = model_override {
+    if let Some(model_override) = route_overrides.model {
         #[cfg(feature = "remote")]
         let provider_node_id = match model_override.node_id.as_deref() {
             Some(node_id) => match crate::agent::remote::NodeId::parse(node_id) {
@@ -1031,13 +1031,16 @@ async fn execute_delegation(
     }
 
     // Apply this after any model override because SetSessionModel rebuilds the
-    // child's LLM configuration. None deliberately propagates the parent's Auto setting.
+    // child's LLM configuration. No role override inherits the parent's current setting.
+    let delegate_reasoning_effort = route_overrides
+        .reasoning_effort
+        .map_or(parent_reasoning_effort, |effort| effort.session_effort());
     if let Err(err) = session_ref
-        .set_reasoning_effort(parent_reasoning_effort)
+        .set_reasoning_effort(delegate_reasoning_effort)
         .await
     {
         let error_message = format!(
-            "Failed to inherit reasoning effort for delegate '{}': {err}",
+            "Failed to apply reasoning effort for delegate '{}': {err}",
             delegation.target_agent_id
         );
         let _ = session_ref.shutdown().await;

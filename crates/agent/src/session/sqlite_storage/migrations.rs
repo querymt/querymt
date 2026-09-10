@@ -86,8 +86,23 @@ fn migration_0017_delegate_assignments(conn: &mut Connection) -> Result<(), rusq
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS session_delegate_assignments (
             session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
-            revision INTEGER NOT NULL CHECK (revision >= 0),
-            overrides_json TEXT NOT NULL
+            revision INTEGER NOT NULL CHECK (revision >= 0)
+        );
+        CREATE TABLE IF NOT EXISTS session_delegate_assignment_overrides (
+            session_id INTEGER NOT NULL REFERENCES session_delegate_assignments(session_id) ON DELETE CASCADE,
+            agent_id TEXT NOT NULL,
+            model_id TEXT,
+            provider_node_id TEXT,
+            reasoning_effort TEXT,
+            PRIMARY KEY (session_id, agent_id),
+            CHECK (length(agent_id) > 0 AND agent_id = trim(agent_id)),
+            CHECK (model_id IS NULL OR (length(model_id) > 0 AND model_id = trim(model_id))),
+            CHECK (provider_node_id IS NULL OR (
+                model_id IS NOT NULL AND length(provider_node_id) > 0
+                AND provider_node_id = trim(provider_node_id)
+            )),
+            CHECK (reasoning_effort IS NULL OR reasoning_effort IN ('auto', 'low', 'medium', 'high', 'max')),
+            CHECK (model_id IS NOT NULL OR reasoning_effort IS NOT NULL)
         );",
     )
 }

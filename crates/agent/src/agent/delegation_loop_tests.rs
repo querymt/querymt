@@ -884,6 +884,70 @@ async fn test_delegate_inherits_parent_auto_reasoning_effort() {
 }
 
 #[tokio::test]
+async fn test_delegate_reasoning_override_wins_over_parent() {
+    let mut harness = TestHarness::new_with_delegate_reasoning(
+        vec![],
+        DelegateBehavior::AlwaysOk,
+        Some(ReasoningEffort::Low),
+    )
+    .await;
+    harness
+        .set_parent_reasoning_effort(Some(ReasoningEffort::High))
+        .await;
+    harness
+        .config
+        .provider
+        .history_store()
+        .set_delegate_assignment_with_reasoning(
+            &harness.exec_ctx.session_id,
+            "agent",
+            None,
+            Some(Some(crate::delegation::DelegateReasoningEffort::Medium)),
+            Some(0),
+        )
+        .await
+        .unwrap();
+
+    let outcome = harness.run_single_delegation().await;
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+    let (_, child_params) = harness.child_llm_params().await;
+    assert_eq!(child_params.reasoning_effort, Some(ReasoningEffort::Medium));
+}
+
+#[tokio::test]
+async fn test_delegate_explicit_auto_reasoning_overrides_parent() {
+    let mut harness = TestHarness::new_with_delegate_reasoning(
+        vec![],
+        DelegateBehavior::AlwaysOk,
+        Some(ReasoningEffort::Low),
+    )
+    .await;
+    harness
+        .set_parent_reasoning_effort(Some(ReasoningEffort::High))
+        .await;
+    harness
+        .config
+        .provider
+        .history_store()
+        .set_delegate_assignment_with_reasoning(
+            &harness.exec_ctx.session_id,
+            "agent",
+            None,
+            Some(Some(crate::delegation::DelegateReasoningEffort::Auto)),
+            Some(0),
+        )
+        .await
+        .unwrap();
+
+    let outcome = harness.run_single_delegation().await;
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+    let (_, child_params) = harness.child_llm_params().await;
+    assert_eq!(child_params.reasoning_effort, None);
+}
+
+#[tokio::test]
 async fn test_delegate_model_override_applies_before_prompt() {
     let mut harness = TestHarness::new_with_delegate_reasoning(
         vec![],

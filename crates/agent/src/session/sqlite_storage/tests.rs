@@ -224,6 +224,7 @@ async fn delegate_assignments_are_read_only_revisioned_and_session_scoped() {
         .unwrap();
     assert_eq!(original.revision, 0);
     assert!(original.overrides.is_empty());
+    assert!(original.reasoning_overrides.is_empty());
     let rows = storage
         .conn_for_test()
         .lock()
@@ -246,12 +247,27 @@ async fn delegate_assignments_are_read_only_revisioned_and_session_scoped() {
     assert!(one.changed);
     assert_eq!(one.assignments.revision, 1);
     assert_eq!(one.assignments.overrides["coder"], model);
+    let reasoning = storage
+        .set_delegate_assignment_with_reasoning(
+            &first.public_id,
+            "coder",
+            Some(model.clone()),
+            Some(Some(crate::delegation::DelegateReasoningEffort::High)),
+            Some(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reasoning.assignments.revision, 2);
+    assert_eq!(
+        reasoning.assignments.reasoning_overrides["coder"],
+        crate::delegation::DelegateReasoningEffort::High
+    );
     let noop = storage
-        .set_delegate_assignment(&first.public_id, "coder", Some(model.clone()), Some(1))
+        .set_delegate_assignment(&first.public_id, "coder", Some(model.clone()), Some(2))
         .await
         .unwrap();
     assert!(!noop.changed);
-    assert_eq!(noop.assignments, one.assignments);
+    assert_eq!(noop.assignments, reasoning.assignments);
     let stale = storage
         .set_delegate_assignment(&first.public_id, "coder", None, Some(0))
         .await
@@ -260,20 +276,45 @@ async fn delegate_assignments_are_read_only_revisioned_and_session_scoped() {
         stale,
         SessionError::DelegateAssignmentRevisionConflict {
             expected: 0,
-            found: 1
+            found: 2
         }
     ));
     let two = storage
         .set_delegate_assignment(&first.public_id, "reviewer", Some(model.clone()), None)
         .await
         .unwrap();
-    assert_eq!(two.assignments.revision, 2);
+    assert_eq!(two.assignments.revision, 3);
     let cleared = storage
-        .set_delegate_assignment(&first.public_id, "coder", None, Some(2))
+        .set_delegate_assignment_with_reasoning(
+            &first.public_id,
+            "coder",
+            None,
+            Some(None),
+            Some(3),
+        )
         .await
         .unwrap();
-    assert_eq!(cleared.assignments.revision, 3);
+    assert_eq!(cleared.assignments.revision, 4);
     assert!(!cleared.assignments.overrides.contains_key("coder"));
+    assert!(
+        !cleared
+            .assignments
+            .reasoning_overrides
+            .contains_key("coder")
+    );
+    let cleared_rows = storage
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_delegate_assignment_overrides o
+             JOIN sessions s ON s.id = o.session_id
+             WHERE s.public_id = ?1 AND o.agent_id = 'coder'",
+            [&first.public_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(cleared_rows, 0, "empty role overrides must delete the row");
     assert_eq!(cleared.assignments.overrides["reviewer"], model);
     assert!(
         storage
@@ -451,15 +492,44 @@ async fn delegate_assignments_rollback_failed_writes_and_do_not_hide_corruption(
             .unwrap(),
         before.assignments
     );
-    storage.run_blocking(|conn| conn.execute_batch(
-        "DROP TRIGGER reject_delegate_update; UPDATE session_delegate_assignments SET overrides_json = 'broken';"
-    )).await.unwrap();
+    storage
+        .run_blocking(|conn| {
+            conn.execute_batch(
+                "DROP TRIGGER reject_delegate_update;
+         PRAGMA ignore_check_constraints = ON;
+         INSERT INTO session_delegate_assignment_overrides
+           (session_id, agent_id, model_id, provider_node_id, reasoning_effort)
+         SELECT id, 'broken', NULL, NULL, NULL
+         FROM sessions WHERE public_id = (SELECT public_id FROM sessions LIMIT 1);
+         PRAGMA ignore_check_constraints = OFF;",
+            )
+        })
+        .await
+        .unwrap();
     assert!(
         storage
             .get_delegate_assignments(&parent.public_id)
             .await
             .is_err(),
-        "corrupt state must not be displayed as inheritance"
+        "empty corrupt rows must not be displayed as inheritance"
+    );
+    storage
+        .run_blocking(|conn| {
+            conn.execute_batch(
+                "PRAGMA ignore_check_constraints = ON;
+                 UPDATE session_delegate_assignment_overrides
+                 SET reasoning_effort = 'invalid' WHERE agent_id = 'broken';
+                 PRAGMA ignore_check_constraints = OFF;",
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        storage
+            .get_delegate_assignments(&parent.public_id)
+            .await
+            .is_err(),
+        "invalid reasoning values must not be displayed as inheritance"
     );
 }
 
@@ -475,7 +545,13 @@ async fn delegate_assignments_user_forks_inherit_but_delegate_children_do_not() 
         node_id: None,
     };
     storage
-        .set_delegate_assignment(&parent.public_id, "coder", Some(model.clone()), None)
+        .set_delegate_assignment_with_reasoning(
+            &parent.public_id,
+            "coder",
+            Some(model.clone()),
+            Some(Some(crate::delegation::DelegateReasoningEffort::Low)),
+            None,
+        )
         .await
         .unwrap();
     storage
@@ -513,6 +589,15 @@ async fn delegate_assignments_user_forks_inherit_but_delegate_children_do_not() 
             .overrides["coder"],
         model
     );
+    assert_eq!(
+        storage
+            .get_delegate_assignments(&fork)
+            .await
+            .unwrap()
+            .unwrap()
+            .reasoning_overrides["coder"],
+        crate::delegation::DelegateReasoningEffort::Low
+    );
     assert!(
         storage
             .get_delegate_assignments(&child)
@@ -538,8 +623,9 @@ async fn delegate_assignments_user_forks_inherit_but_delegate_children_do_not() 
 }
 
 #[test]
-fn delegate_assignment_migration_preserves_existing_records() {
+fn delegate_assignment_migration_creates_normalized_schema_and_preserves_sessions() {
     let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
     // Model an upgrade from main's prior schema rather than only testing fresh databases.
     for migration in MIGRATIONS
         .iter()
@@ -554,14 +640,101 @@ fn delegate_assignment_migration_preserves_existing_records() {
         .unwrap();
     (migration.apply)(&mut conn).unwrap();
     (migration.apply)(&mut conn).unwrap();
+
+    for (table, expected_columns) in [
+        (
+            "session_delegate_assignments",
+            vec!["session_id", "revision"],
+        ),
+        (
+            "session_delegate_assignment_overrides",
+            vec![
+                "session_id",
+                "agent_id",
+                "model_id",
+                "provider_node_id",
+                "reasoning_effort",
+            ],
+        ),
+    ] {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(columns, expected_columns, "unexpected schema for {table}");
+    }
+
     let name: String = conn
         .query_row(
             "SELECT name FROM sessions WHERE public_id = 'existing'",
             [],
-            |r| r.get(0),
+            |row| row.get(0),
         )
         .unwrap();
     assert_eq!(name, "Keep me");
+    conn.execute(
+        "INSERT INTO session_delegate_assignments (session_id, revision)
+         SELECT id, 0 FROM sessions WHERE public_id = 'existing'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_delegate_assignment_overrides
+         (session_id, agent_id, model_id, provider_node_id, reasoning_effort)
+         SELECT id, 'reasoner', NULL, NULL, 'high' FROM sessions WHERE public_id = 'existing'",
+        [],
+    )
+    .unwrap();
+    let reasoning_only: (Option<String>, String) = conn
+        .query_row(
+            "SELECT model_id, reasoning_effort FROM session_delegate_assignment_overrides
+             WHERE agent_id = 'reasoner'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(reasoning_only, (None, "high".into()));
+    assert!(
+        conn.execute(
+            "INSERT INTO session_delegate_assignment_overrides
+             (session_id, agent_id, model_id, provider_node_id, reasoning_effort)
+             SELECT id, 'invalid', NULL, NULL, 'extreme' FROM sessions WHERE public_id = 'existing'",
+            [],
+        )
+        .is_err(),
+        "invalid reasoning values must fail the schema constraint"
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO session_delegate_assignment_overrides
+             (session_id, agent_id, model_id, provider_node_id, reasoning_effort)
+             SELECT id, 'empty', NULL, NULL, NULL FROM sessions WHERE public_id = 'existing'",
+            [],
+        )
+        .is_err(),
+        "empty role rows must fail the schema constraint"
+    );
+
+    conn.execute("DELETE FROM sessions WHERE public_id = 'existing'", [])
+        .unwrap();
+    for table in [
+        "session_delegate_assignments",
+        "session_delegate_assignment_overrides",
+    ] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "deleting the session must cascade through {table}"
+        );
+    }
 }
 
 #[tokio::test]
