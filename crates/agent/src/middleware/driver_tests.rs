@@ -11,6 +11,7 @@ use crate::test_utils::{
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
@@ -113,7 +114,9 @@ async fn test_composite_driver_cancelled_halts() {
     assert_eq!(counter.count.load(Ordering::SeqCst), 0);
 }
 
-struct PendingDriver;
+struct PendingDriver {
+    started: Arc<Notify>,
+}
 
 #[async_trait::async_trait]
 impl MiddlewareDriver for PendingDriver {
@@ -122,6 +125,7 @@ impl MiddlewareDriver for PendingDriver {
         _state: ExecutionState,
         _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
     ) -> crate::middleware::Result<ExecutionState> {
+        self.started.notify_one();
         std::future::pending().await
     }
 
@@ -153,7 +157,10 @@ async fn test_composite_driver_skips_middleware_when_already_cancelled() {
 
 #[tokio::test]
 async fn test_composite_driver_interrupts_running_middleware() {
-    let composite = Arc::new(CompositeDriver::new(vec![Arc::new(PendingDriver)]));
+    let middleware_started = Arc::new(Notify::new());
+    let composite = Arc::new(CompositeDriver::new(vec![Arc::new(PendingDriver {
+        started: middleware_started.clone(),
+    })]));
     let context = test_context("sess-1", 0);
     let token = CancellationToken::new();
     let task_token = token.clone();
@@ -163,7 +170,7 @@ async fn test_composite_driver_interrupts_running_middleware() {
             .await
     });
 
-    tokio::task::yield_now().await;
+    middleware_started.notified().await;
     token.cancel();
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
