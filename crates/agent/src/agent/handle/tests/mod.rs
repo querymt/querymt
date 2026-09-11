@@ -228,6 +228,21 @@ fn raw_params(value: &str) -> Arc<serde_json::value::RawValue> {
     Arc::from(serde_json::value::RawValue::from_string(value.to_string()).unwrap())
 }
 
+async fn ext_method_json(
+    handle: &LocalAgentHandle,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    let response = handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            method,
+            raw_params(&params.to_string()),
+        ))
+        .await
+        .expect("ext_method");
+    serde_json::from_str(response.0.get()).expect("valid JSON")
+}
+
 const ALPHA_PROFILE_TOML: &str = r#"
 [agent]
 provider = "test"

@@ -1,18 +1,5 @@
 use super::*;
 
-async fn ext_method_json(
-    handle: &LocalAgentHandle,
-    method: &str,
-    params: serde_json::Value,
-) -> serde_json::Value {
-    let req = crate::acp::protocol::ExtRequest::new(
-        method,
-        std::sync::Arc::from(serde_json::value::RawValue::from_string(params.to_string()).unwrap()),
-    );
-    let resp = handle.ext_method(req).await.expect("ext_method");
-    serde_json::from_str(resp.0.get()).expect("valid JSON")
-}
-
 #[tokio::test]
 async fn querymt_session_undo_stack_returns_empty_stack_for_new_session() {
     let f = HandleFixture::new().await;

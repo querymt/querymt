@@ -196,21 +196,6 @@ async fn test_querymt_profile_agents_rejects_unknown_profile() {
     assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
 }
 
-async fn ext_method_json(
-    handle: &LocalAgentHandle,
-    method: &str,
-    params: serde_json::Value,
-) -> serde_json::Value {
-    let response = handle
-        .ext_method(crate::acp::protocol::ExtRequest::new(
-            method,
-            raw_params(&params.to_string()),
-        ))
-        .await
-        .unwrap();
-    serde_json::from_str(response.0.get()).unwrap()
-}
-
 async fn persisted_delegate_parent(f: &HandleFixture) -> String {
     let runtime = f
         .handle
