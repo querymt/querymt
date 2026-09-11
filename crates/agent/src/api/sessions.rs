@@ -305,6 +305,7 @@ impl AgentSessions {
     ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {
         let cursor = AcpSessionCursor::parse(request.cursor.as_deref())?;
         let requested_cwd = request.cwd.map(|cwd| cwd.display().to_string());
+        let session_scope = acp_session_scope_from_meta(request.meta.as_ref());
         // ACP workspace requests load incrementally; global discovery remains a larger flat page.
         let limit = if requested_cwd.is_some() { 10 } else { 100 };
 
@@ -313,7 +314,7 @@ impl AgentSessions {
                 requested_cwd,
                 cursor.map(AcpSessionCursor::into_string),
                 limit,
-                SessionScope::All,
+                session_scope,
             )
             .await
             .map_err(anyhow::Error::from)?;
@@ -735,6 +736,20 @@ impl From<crate::session::projection::SessionGroup> for SessionGroup {
             total_count: group.total_count.map(|v| v as u64),
             next_cursor: group.next_cursor,
         }
+    }
+}
+
+fn acp_session_scope_from_meta(meta: Option<&Meta>) -> SessionScope {
+    let Some(meta) = meta else {
+        return SessionScope::All;
+    };
+
+    let value = meta
+        .get("session_scope")
+        .or_else(|| meta.get("sessionScope"));
+    match value {
+        Some(serde_json::Value::String(scope)) => SessionScope::from_option(Some(scope.clone())),
+        _ => SessionScope::All,
     }
 }
 
