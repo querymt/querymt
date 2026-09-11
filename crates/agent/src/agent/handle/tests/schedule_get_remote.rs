@@ -8,20 +8,6 @@ use crate::agent::remote::scope::{MeshScopeId, scoped_node_manager_for_peer};
 use kameo::actor::Spawn;
 
 #[cfg(feature = "remote")]
-async fn ext_method_json(
-    handle: &LocalAgentHandle,
-    method: &str,
-    params: serde_json::Value,
-) -> serde_json::Value {
-    let req = crate::acp::protocol::ExtRequest::new(
-        method,
-        std::sync::Arc::from(serde_json::value::RawValue::from_string(params.to_string()).unwrap()),
-    );
-    let resp = handle.ext_method(req).await.expect("ext_method");
-    serde_json::from_str(resp.0.get()).expect("valid JSON")
-}
-
-#[cfg(feature = "remote")]
 #[tokio::test]
 async fn test_querymt_schedule_get_remote_returns_schedule() {
     let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;

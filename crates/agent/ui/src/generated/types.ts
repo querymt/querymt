@@ -273,6 +273,10 @@ export type AgentEventKind =
 	| { type: "artifact_recorded", data: {
 	artifact: Artifact;
 }}
+	/** Invalidation hint; clients read the authoritative assignment snapshot after this event. */
+	| { type: "delegate_models_changed", data: {
+	revision?: number;
+}}
 	| { type: "delegation_requested", data: {
 	delegation: Delegation;
 	tool_call_id?: string;
@@ -321,6 +325,10 @@ export type AgentEventKind =
 	fork_point_type: string;
 	fork_point_ref: string;
 	instructions?: string;
+	/** Model confirmed by the child session before its first prompt. */
+	selected_model_id?: string;
+	/** Mesh node confirmed with the selected model, or None for local execution. */
+	selected_provider_node_id?: string;
 }}
 	/** Emitted once at session creation with environment configuration */
 	| { type: "session_configured", data: {
@@ -744,6 +752,54 @@ export interface CreateScheduleControlRequest {
 	max_runs?: number;
 }
 
+export enum DelegateAssignmentSource {
+	Override = "override",
+	ProfileDefault = "profile_default",
+}
+
+export interface DelegateAssignmentInfo {
+	agent_id: string;
+	name: string;
+	description: string;
+	model: DelegateModelOverride | null;
+	source: DelegateAssignmentSource;
+	configured_default_model_id: string | null;
+	reasoning_effort: DelegateReasoningEffort | null;
+}
+
+export interface OrphanedDelegateAssignment {
+	agent_id: string;
+	model: DelegateModelOverride | null;
+	reasoning_effort: DelegateReasoningEffort | null;
+}
+
+export interface DelegateAssignmentsInfo {
+	version: number;
+	reasoning_effort_supported: boolean;
+	session_id: string;
+	profile_id: string;
+	revision: number | null;
+	durable: boolean;
+	editable: boolean;
+	assignments: DelegateAssignmentInfo[];
+	orphaned_overrides: OrphanedDelegateAssignment[];
+}
+
+export interface DelegateModelOverride {
+	model_id: string;
+	node_id?: string;
+}
+
+export interface DelegateModelsChangedNotification {
+	version: number;
+	session_id: string;
+	revision: number | null;
+}
+
+export interface DelegateModelsRequest {
+	session_id: string;
+}
+
 export enum DelegationUpdateState {
 	Requested = "requested",
 	Forked = "forked",
@@ -761,6 +817,9 @@ export interface DelegationUpdateNotification {
 	targetAgentId: string;
 	objective: string;
 	childSessionId?: string;
+	/** Confirmed child model, not the parent's current preference. */
+	selectedModelId?: string;
+	selectedProviderNodeId?: string;
 	requestedAt: number;
 	forkedAt?: number;
 	finishedAt?: number;
@@ -1207,6 +1266,28 @@ export interface SessionMeta {
 	runtimeStatus: SessionRuntimeStatus;
 }
 
+export interface SetDelegateModelRequest {
+	session_id: string;
+	agent_id: string;
+	/** Present and null clears the override. Omitted is invalid, not a wipe. */
+	model_id: string | null;
+	node_id?: string | null;
+	/** Omitted preserves the current setting; null restores parent-session inheritance. */
+	reasoning_effort?: DelegateReasoningEffort | null;
+	expected_revision?: number | null;
+}
+
+export interface SetDelegateModelResponse {
+	version: number;
+	reasoning_effort_supported: boolean;
+	session_id: string;
+	agent_id: string;
+	model: DelegateModelOverride | null;
+	reasoning_effort: DelegateReasoningEffort | null;
+	revision: number | null;
+	durable: boolean;
+}
+
 /**
  * Mirror of `querymt::chat::Tool` for typeshare generation.
  * Note: kept for typeshare output; may be unused in Rust code paths.
@@ -1252,6 +1333,14 @@ export interface UsageInfo {
 	reasoning_tokens?: number;
 	cache_read?: number;
 	cache_write?: number;
+}
+
+export enum DelegateReasoningEffort {
+	Auto = "auto",
+	Low = "low",
+	Medium = "medium",
+	High = "high",
+	Max = "max",
 }
 
 /**

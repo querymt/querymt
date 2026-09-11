@@ -207,6 +207,7 @@ pub const QMT_NOTIFICATION_MESH_PEER_EXPIRED: &str = "querymt/mesh/peerExpired";
 pub const QMT_NOTIFICATION_MODELS_CHANGED: &str = "querymt/models/changed";
 pub const QMT_NOTIFICATION_SCHEDULES_CHANGED: &str = "querymt/schedules/changed";
 pub const QMT_NOTIFICATION_DELEGATION_UPDATE: &str = "querymt/session/delegationUpdate";
+pub const QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED: &str = "querymt/session/delegateModelsChanged";
 
 fn ext_notification(method: &str, params: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
@@ -269,6 +270,23 @@ pub fn schedules_changed_notification(
     )
 }
 
+pub fn delegate_models_changed_notification(
+    session_id: &str,
+    revision: Option<u64>,
+) -> serde_json::Value {
+    ext_notification(
+        QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED,
+        serde_json::to_value(
+            crate::control::delegate_models::DelegateModelsChangedNotification {
+                version: crate::control::delegate_models::DELEGATE_MODELS_VERSION,
+                session_id: session_id.to_owned(),
+                revision: revision.into(),
+            },
+        )
+        .expect("serialize delegate models changed notification"),
+    )
+}
+
 pub fn delegation_update_notification(
     payload: crate::control::delegation_notifications::DelegationUpdateNotification,
 ) -> serde_json::Value {
@@ -284,6 +302,11 @@ fn normalize_querymt_ext_method(method: &str) -> &str {
 
 fn querymt_session_id_from_request(method: &str, params: &serde_json::Value) -> Option<String> {
     match normalize_querymt_ext_method(method) {
+        "querymt/session/delegateModels" | "querymt/session/setDelegateModel" => params
+            .get("session_id")
+            .or_else(|| params.get("sessionId"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
         "querymt/remote/attachSession" => {
             serde_json::from_value::<AttachRemoteSessionRequest>(params.clone())
                 .ok()
@@ -418,6 +441,12 @@ impl AcpLiveEventTranslator {
     }
 
     pub fn translate_notification(&mut self, event: &EventEnvelope) -> Option<serde_json::Value> {
+        if let AgentEventKind::DelegateModelsChanged { revision } = event.kind() {
+            return Some(delegate_models_changed_notification(
+                event.session_id(),
+                *revision,
+            ));
+        }
         if let Some(update) = self.translate_delegation_update(event) {
             return Some(delegation_update_notification(update));
         }
@@ -1351,6 +1380,26 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::sync::{Mutex, Notify};
     use tokio::time::{Duration, timeout};
+
+    #[test]
+    fn delegate_assignment_ext_requests_register_session_ownership() {
+        for method in [
+            "querymt/session/delegateModels",
+            "_querymt/session/setDelegateModel",
+        ] {
+            assert_eq!(
+                querymt_session_id_from_request(
+                    method,
+                    &serde_json::json!({"sessionId": "parent"})
+                ),
+                Some("parent".into())
+            );
+        }
+        assert_eq!(
+            querymt_session_id_from_request("querymt/capabilities", &serde_json::json!({})),
+            None
+        );
+    }
 
     #[test]
     fn elicitation_request_rejects_unknown_property_types() {

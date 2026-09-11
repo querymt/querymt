@@ -423,6 +423,12 @@ pub enum AgentEventKind {
     ArtifactRecorded {
         artifact: Artifact,
     },
+    /// Invalidation hint; clients read the authoritative assignment snapshot after this event.
+    DelegateModelsChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        revision: Option<u64>,
+    },
     DelegationRequested {
         delegation: Delegation,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -475,6 +481,12 @@ pub enum AgentEventKind {
         fork_point_type: ForkPointType,
         fork_point_ref: String,
         instructions: Option<String>,
+        /// Model confirmed by the child session before its first prompt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_model_id: Option<String>,
+        /// Mesh node confirmed with the selected model, or None for local execution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_provider_node_id: Option<String>,
     },
     /// Emitted once at session creation with environment configuration
     SessionConfigured {
@@ -813,6 +825,10 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         AgentEventKind::RemoteSessionSyncCompleted { .. } => Durability::Ephemeral,
         AgentEventKind::RemoteProviderHeartbeat { .. } => Durability::Ephemeral,
         AgentEventKind::StreamRecovering { .. } => Durability::Ephemeral,
+        // Rationale: the assignment table is authoritative. This is a live
+        // ACP invalidation hint, not a commit record, and must not pollute
+        // the durable journal or break older journal loaders.
+        AgentEventKind::DelegateModelsChanged { .. } => Durability::Ephemeral,
 
         // Everything else is durable by default.
         _ => Durability::Durable,
@@ -945,6 +961,41 @@ mod tests {
             kind,
             AgentEventKind::UserPromptBlock {
                 client_prompt_id: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn delegate_models_changed_without_revision_omits_event_field() {
+        let value =
+            serde_json::to_value(AgentEventKind::DelegateModelsChanged { revision: None }).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"type": "delegate_models_changed", "data": {}})
+        );
+    }
+
+    #[test]
+    fn historical_session_fork_without_model_provenance_deserializes() {
+        let value = serde_json::json!({
+            "type": "session_forked",
+            "data": {
+                "parent_session_id": "parent",
+                "child_session_id": "child",
+                "target_agent_id": "coder",
+                "origin": "delegation",
+                "fork_point_type": "progress_entry",
+                "fork_point_ref": "delegation-1",
+                "instructions": null
+            }
+        });
+        let kind: AgentEventKind = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            kind,
+            AgentEventKind::SessionForked {
+                selected_model_id: None,
+                selected_provider_node_id: None,
                 ..
             }
         ));
@@ -1110,6 +1161,18 @@ mod tests {
             node_id: Some("node-1".into()),
         };
         assert_eq!(classify_durability(&kind), Durability::Ephemeral);
+    }
+
+    #[test]
+    fn classify_delegate_models_changed_is_ephemeral() {
+        assert_eq!(
+            classify_durability(&AgentEventKind::DelegateModelsChanged { revision: Some(1) }),
+            Durability::Ephemeral
+        );
+        assert_eq!(
+            classify_durability(&AgentEventKind::DelegateModelsChanged { revision: None }),
+            Durability::Ephemeral
+        );
     }
 
     #[test]

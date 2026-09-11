@@ -663,6 +663,102 @@ async fn acp_list_sessions_pages_workspace_sessions_without_cross_workspace_leak
 }
 
 #[tokio::test]
+async fn acp_list_sessions_filters_by_session_scope_meta() -> Result<()> {
+    let agent = test_agent().await?;
+    let session_store = agent.storage_backend().session_store();
+    let root = session_store
+        .create_session(
+            Some("Root Session".to_string()),
+            Some("/tmp/scope".into()),
+            None,
+            None,
+        )
+        .await?;
+    let user_fork = session_store
+        .create_session(
+            Some("User Fork".to_string()),
+            Some("/tmp/scope".into()),
+            Some(root.public_id.clone()),
+            Some(crate::session::domain::ForkOrigin::User),
+        )
+        .await?;
+    let delegate = session_store
+        .create_session(
+            Some("Delegate Session".to_string()),
+            Some("/tmp/scope".into()),
+            Some(root.public_id.clone()),
+            Some(crate::session::domain::ForkOrigin::Delegation),
+        )
+        .await?;
+    let view_store = agent.storage_backend().view_store().expect("view store");
+
+    let all = AgentSessions::list_for_acp_from_view_store(
+        view_store.clone(),
+        AcpListSessionsRequest::new(),
+    )
+    .await?;
+    assert_eq!(all.total_count, 3);
+
+    let mut root_meta = crate::acp::protocol::Meta::new();
+    root_meta.insert(
+        "session_scope".to_string(),
+        serde_json::Value::String("root".to_string()),
+    );
+    let roots = AgentSessions::list_for_acp_from_view_store(
+        view_store.clone(),
+        AcpListSessionsRequest::new().meta(root_meta),
+    )
+    .await?;
+    assert_eq!(
+        roots
+            .sessions
+            .iter()
+            .map(|session| session.session_id.to_string())
+            .collect::<Vec<_>>(),
+        vec![root.public_id.clone()]
+    );
+
+    let mut delegates_meta = crate::acp::protocol::Meta::new();
+    delegates_meta.insert(
+        "sessionScope".to_string(),
+        serde_json::Value::String("delegates".to_string()),
+    );
+    let delegates = AgentSessions::list_for_acp_from_view_store(
+        view_store.clone(),
+        AcpListSessionsRequest::new().meta(delegates_meta),
+    )
+    .await?;
+    assert_eq!(
+        delegates
+            .sessions
+            .iter()
+            .map(|session| session.session_id.to_string())
+            .collect::<Vec<_>>(),
+        vec![delegate.public_id]
+    );
+
+    let mut forks_meta = crate::acp::protocol::Meta::new();
+    forks_meta.insert(
+        "session_scope".to_string(),
+        serde_json::Value::String("forks".to_string()),
+    );
+    let forks = AgentSessions::list_for_acp_from_view_store(
+        view_store,
+        AcpListSessionsRequest::new().meta(forks_meta),
+    )
+    .await?;
+    assert_eq!(
+        forks
+            .sessions
+            .iter()
+            .map(|session| session.session_id.to_string())
+            .collect::<Vec<_>>(),
+        vec![user_fork.public_id]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn acp_session_list_includes_relationship_and_operational_meta() -> Result<()> {
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);

@@ -933,11 +933,38 @@ async fn execute_delegation(
         .await;
     }
 
-    if let Some(model_override) = ctx
+    let route_overrides = match ctx
         .delegate_model_overrides
-        .get(&parent_session_id, &delegation.target_agent_id)
+        .resolve(
+            ctx.store.as_ref(),
+            &parent_session_id,
+            &delegation.target_agent_id,
+        )
         .await
     {
+        Ok(overrides) => overrides,
+        Err(error) => {
+            let _ = session_ref.shutdown().await;
+            fail_delegation(
+                DelegationFailureContext {
+                    event_sink: &ctx.event_sink,
+                    delegator: &ctx.delegator,
+                    store: &ctx.store,
+                    hooks: Some(&ctx.hooks),
+                    config: &ctx.config,
+                    parent_session_id: &parent_session_id,
+                    delegation_id: &delegation.public_id,
+                    target_agent_id: Some(&delegation.target_agent_id),
+                    objective: Some(&delegation.objective),
+                },
+                &format!("Failed to read delegate model assignment: {error}"),
+            )
+            .await;
+            ctx.active_delegations.lock().await.remove(&delegation_id);
+            return;
+        }
+    };
+    if let Some(model_override) = route_overrides.model {
         #[cfg(feature = "remote")]
         let provider_node_id = match model_override.node_id.as_deref() {
             Some(node_id) => match crate::agent::remote::NodeId::parse(node_id) {
@@ -1004,13 +1031,16 @@ async fn execute_delegation(
     }
 
     // Apply this after any model override because SetSessionModel rebuilds the
-    // child's LLM configuration. None deliberately propagates the parent's Auto setting.
+    // child's LLM configuration. No role override inherits the parent's current setting.
+    let delegate_reasoning_effort = route_overrides
+        .reasoning_effort
+        .map_or(parent_reasoning_effort, |effort| effort.session_effort());
     if let Err(err) = session_ref
-        .set_reasoning_effort(parent_reasoning_effort)
+        .set_reasoning_effort(delegate_reasoning_effort)
         .await
     {
         let error_message = format!(
-            "Failed to inherit reasoning effort for delegate '{}': {err}",
+            "Failed to apply reasoning effort for delegate '{}': {err}",
             delegation.target_agent_id
         );
         let _ = session_ref.shutdown().await;
@@ -1033,6 +1063,27 @@ async fn execute_delegation(
         return;
     }
 
+    let selected_model = match session_ref.get_session_control().await {
+        Ok(control) => (
+            Some(control.effective_model.model_id),
+            control.effective_model.provider_node_id,
+        ),
+        Err(error) => {
+            // Provenance only: the child is already created, routed, and configured.
+            // Missing selected_model_id is allowed on SessionForked. If confirmed
+            // model identity later becomes a hard execution/audit precondition,
+            // consider failing the delegation here instead of degrading.
+            tracing::warn!(
+                delegation_id = %delegation.public_id,
+                child_session_id = %child_session_id,
+                target_agent_id = %delegation.target_agent_id,
+                error = %error,
+                "Failed to confirm delegate model"
+            );
+            (None, None)
+        }
+    };
+
     emit_delegation_event(
         &ctx.delegator,
         &ctx.event_sink,
@@ -1045,6 +1096,8 @@ async fn execute_delegation(
             fork_point_type: ForkPointType::ProgressEntry,
             fork_point_ref: delegation.public_id.clone(),
             instructions: delegation.context.clone(),
+            selected_model_id: selected_model.0,
+            selected_provider_node_id: selected_model.1,
         },
     );
 

@@ -12,6 +12,7 @@ impl LocalAgentHandle {
             "querymt/profile/agents" => self.handle_ext_profile_agents(req).await,
             "querymt/profile/setActive" => self.handle_ext_set_active_profile(req).await,
             "querymt/session/setDelegateModel" => self.handle_ext_set_delegate_model(req).await,
+            "querymt/session/delegateModels" => self.handle_ext_delegate_models(req).await,
             "querymt/refreshModels" => self.handle_ext_refresh_models().await,
             "querymt/modelInfo" => self.handle_ext_model_info(req).await,
             "querymt/chat" | "querymt/tokenCount" => Err(Error::from(

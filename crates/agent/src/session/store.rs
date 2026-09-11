@@ -152,6 +152,22 @@ pub struct TaskPatch {
     pub cancellation_reason: Option<String>,
 }
 
+/// Authoritative delegate overrides for one parent session. Empty means inheritance.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateAssignments {
+    pub revision: u64,
+    pub overrides: std::collections::BTreeMap<String, crate::delegation::DelegateModelOverride>,
+    pub reasoning_overrides:
+        std::collections::BTreeMap<String, crate::delegation::DelegateReasoningEffort>,
+}
+
+/// Atomic assignment-write result, including whether the transaction changed state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegateAssignmentWrite {
+    pub assignments: DelegateAssignments,
+    pub changed: bool,
+}
+
 /// Stored session-scoped execution configuration snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionExecutionConfig {
@@ -262,6 +278,47 @@ pub trait SessionStore: Send + Sync {
 
     /// Retrieves session metadata by its unique ID.
     async fn get_session(&self, session_id: &str) -> SessionResult<Option<Session>>;
+
+    /// None means this storage backend does not support durable assignments.
+    /// Supporting backends return an empty snapshot for an existing, unconfigured session.
+    async fn get_delegate_assignments(
+        &self,
+        _session_id: &str,
+    ) -> SessionResult<Option<DelegateAssignments>> {
+        Ok(None)
+    }
+
+    /// Atomically change one role's model, preserving other roles.
+    /// Legacy clients may omit expected_revision; clients with a snapshot should supply it.
+    async fn set_delegate_assignment(
+        &self,
+        _session_id: &str,
+        _agent_id: &str,
+        _model: Option<crate::delegation::DelegateModelOverride>,
+        _expected_revision: Option<u64>,
+    ) -> SessionResult<DelegateAssignmentWrite> {
+        Err(SessionError::InvalidOperation(
+            "Durable delegate assignments are unsupported".into(),
+        ))
+    }
+
+    /// Atomically change one role while preserving an omitted reasoning override.
+    async fn set_delegate_assignment_with_reasoning(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        model: Option<crate::delegation::DelegateModelOverride>,
+        reasoning_effort: Option<Option<crate::delegation::DelegateReasoningEffort>>,
+        expected_revision: Option<u64>,
+    ) -> SessionResult<DelegateAssignmentWrite> {
+        if reasoning_effort.is_some() {
+            return Err(SessionError::InvalidOperation(
+                "Durable delegate reasoning assignments are unsupported".into(),
+            ));
+        }
+        self.set_delegate_assignment(session_id, agent_id, model, expected_revision)
+            .await
+    }
 
     /// Lists all available sessions.
     async fn list_sessions(&self) -> SessionResult<Vec<Session>>;
