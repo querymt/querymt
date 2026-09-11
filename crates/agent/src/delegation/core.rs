@@ -1065,28 +1065,15 @@ async fn execute_delegation(
 
     let selected_model = match session_ref.get_session_control().await {
         Ok(control) => (
-            control.effective_model.model_id,
+            Some(control.effective_model.model_id),
             control.effective_model.provider_node_id,
         ),
         Err(error) => {
-            let _ = session_ref.shutdown().await;
-            fail_delegation(
-                DelegationFailureContext {
-                    event_sink: &ctx.event_sink,
-                    delegator: &ctx.delegator,
-                    store: &ctx.store,
-                    hooks: Some(&ctx.hooks),
-                    config: &ctx.config,
-                    parent_session_id: &parent_session_id,
-                    delegation_id: &delegation.public_id,
-                    target_agent_id: Some(&delegation.target_agent_id),
-                    objective: Some(&delegation.objective),
-                },
-                &format!("Failed to confirm delegate model before prompt: {error}"),
-            )
-            .await;
-            ctx.active_delegations.lock().await.remove(&delegation_id);
-            return;
+            warn!(
+                "Failed to confirm delegate model for '{}': {error}",
+                delegation.target_agent_id
+            );
+            (None, None)
         }
     };
 
@@ -1102,7 +1089,7 @@ async fn execute_delegation(
             fork_point_type: ForkPointType::ProgressEntry,
             fork_point_ref: delegation.public_id.clone(),
             instructions: delegation.context.clone(),
-            selected_model_id: Some(selected_model.0),
+            selected_model_id: selected_model.0,
             selected_provider_node_id: selected_model.1,
         },
     );
