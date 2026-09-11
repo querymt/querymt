@@ -227,6 +227,7 @@ async fn finish_attach_ui_state(
             .map_err(|error| error.to_string())?;
     let cursor = snapshot.cursor;
     let audit = snapshot.audit;
+    let user_prompts = snapshot.user_prompts.unwrap_or_default();
 
     {
         let mut connections = state.connections.lock().await;
@@ -245,6 +246,7 @@ async fn finish_attach_ui_state(
             node_id: Some(node_id.to_string()),
             connection_state: Some(crate::api::RemoteSessionConnectionState::Connected),
             audit,
+            user_prompts,
             undo_stack: Vec::new(),
             cursor,
         },

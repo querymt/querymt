@@ -39,7 +39,8 @@ import {
   UiInputDelivery,
 } from '../types';
 import { useUiStore } from '../store/uiStore';
-import { buildPromptBlocksFromInput } from '../logic/chatViewLogic';
+import { buildPromptBlocksFromInput, projectUserPromptBlocks } from '../logic/chatViewLogic';
+import type { ContentBlock } from '@agentclientprotocol/sdk';
 import { debugLog, debugTrace } from '../utils/debugLog';
 
 // Callback type for file index updates
@@ -156,6 +157,7 @@ function buildUndoStateFromServerStack(
 
 export function useUiClient() {
   const [eventsBySession, setEventsBySession] = useState<Map<string, EventItem[]>>(new Map());
+  const promptBlocksByMessageIdRef = useRef(new Map<string, ContentBlock[]>());
   const [mainSessionId, setMainSessionId] = useState<string | null>(null);
   const [agents, setAgents] = useState<UiAgentInfo[]>([]);
   const [profiles, setProfiles] = useState<UiProfileInfo[]>([]);
@@ -641,6 +643,13 @@ export function useUiClient() {
           const item = translateAgentEvent(d.agent_id, unwrapped);
           item.sessionId = d.session_id;
           item.seq = unwrapped.seq;
+          if (item.type === 'user' && item.messageId) {
+            const promptBlocks = promptBlocksByMessageIdRef.current.get(item.messageId);
+            if (promptBlocks) {
+              item.promptBlocks = promptBlocks;
+              item.content = projectUserPromptBlocks(promptBlocks).content;
+            }
+          }
           return item;
         });
         setEventsBySession(prev => {
@@ -699,6 +708,15 @@ export function useUiClient() {
         }
 
         reconcileInputEvent(eventEnvelope);
+        if (eventKind === 'user_prompt_block') {
+          const messageId = kindData.message_id;
+          if (typeof messageId === 'string') {
+            const blocks = promptBlocksByMessageIdRef.current.get(messageId) ?? [];
+            blocks.push(kindData.block);
+            promptBlocksByMessageIdRef.current.set(messageId, blocks);
+          }
+          break;
+        }
         if (eventKind === 'run_started') {
           setRuntimeBySession((prev) => {
             const next = new Map(prev);
@@ -924,6 +942,13 @@ export function useUiClient() {
         const translated = translateAgentEvent(d.agent_id, eventEnvelope);
         translated.sessionId = d.session_id;
         translated.seq = eventEnvelope?.seq;
+        if (translated.type === 'user' && translated.messageId) {
+          const promptBlocks = promptBlocksByMessageIdRef.current.get(translated.messageId);
+          if (promptBlocks) {
+            translated.promptBlocks = promptBlocks;
+            translated.content = projectUserPromptBlocks(promptBlocks).content;
+          }
+        }
 
         // === STREAMING DELTA MERGE LOGIC ===
         // Delta events are merged in-place into a single live accumulator rather
@@ -1292,11 +1317,21 @@ export function useUiClient() {
         });
         
         // Populate eventsBySession from the audit events (for old session history)
+        promptBlocksByMessageIdRef.current = new Map(
+          (d.user_prompts ?? []).map((prompt): [string, ContentBlock[]] => [prompt.messageId, prompt.blocks]),
+        );
         const translated = d.audit.events.map((e: any) => {
           reconcileInputEvent(e);
           const item = translateAgentEvent(d.agent_id, e);
           item.sessionId = d.session_id;
           item.seq = e.seq;
+          if (item.type === 'user' && item.messageId) {
+            const promptBlocks = promptBlocksByMessageIdRef.current.get(item.messageId);
+            if (promptBlocks) {
+              item.promptBlocks = promptBlocks;
+              item.content = projectUserPromptBlocks(promptBlocks).content;
+            }
+          }
           return item;
         });
         

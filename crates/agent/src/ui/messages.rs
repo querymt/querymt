@@ -6,7 +6,9 @@
 use crate::events::EventEnvelope;
 use crate::index::FileIndexEntry;
 use crate::profiles::ProfileMetadata;
-pub use crate::session::load_snapshot::{SessionLoadSnapshot, StreamCursor, cursor_from_events};
+pub use crate::session::load_snapshot::{
+    SessionLoadSnapshot, StreamCursor, UserPromptRecord, cursor_from_events,
+};
 use crate::session::projection::{AuditView, SessionScope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -828,6 +830,8 @@ pub enum UiServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         connection_state: Option<RemoteSessionConnectionState>,
         audit: AuditView,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        user_prompts: Vec<UserPromptRecord>,
         undo_stack: Vec<UndoStackFrame>,
         #[typeshare(serialized_as = "StreamCursor")]
         cursor: StreamCursor,
@@ -1114,8 +1118,9 @@ mod tests {
         AudioModelInfo, OAuthFlowKind, PluginUpdateResult, RemoteSessionConnectionState,
         RoutingMode, UiClientMessage, UiProfileInfo, UiServerMessage,
     };
+    use crate::acp::protocol::{ContentBlock, ImageContent, TextContent};
     use crate::agent::messages::{SessionRuntimePhase, SessionRuntimeStatus};
-    use crate::session::load_snapshot::StreamCursor;
+    use crate::session::load_snapshot::{StreamCursor, UserPromptRecord};
     use crate::session::projection::AuditView;
     use serde_json::json;
 
@@ -1267,6 +1272,7 @@ mod tests {
             node_id: None,
             connection_state: None,
             audit: empty_audit("session-1"),
+            user_prompts: Vec::new(),
             undo_stack: Vec::new(),
             cursor: StreamCursor::default(),
         })
@@ -1279,6 +1285,41 @@ mod tests {
     }
 
     #[test]
+    fn session_loaded_serializes_user_prompt_records() {
+        let loaded = serde_json::to_value(UiServerMessage::SessionLoaded {
+            session_id: "session-1".to_string(),
+            agent_id: "primary".to_string(),
+            profile_id: None,
+            node_id: None,
+            connection_state: None,
+            audit: empty_audit("session-1"),
+            user_prompts: vec![UserPromptRecord {
+                message_id: "user-1".to_string(),
+                message_order: 1,
+                timestamp: 11,
+                blocks: vec![
+                    ContentBlock::Text(TextContent::new("look")),
+                    ContentBlock::Image(ImageContent::new("AQID", "image/png")),
+                ],
+            }],
+            undo_stack: Vec::new(),
+            cursor: StreamCursor::default(),
+        })
+        .expect("session_loaded should serialize");
+
+        // The envelope keeps snake_case keys; each record uses the camelCase
+        // UserPromptRecord contract consumed by the UI client.
+        let records = loaded["data"]["user_prompts"]
+            .as_array()
+            .expect("populated user_prompts must serialize");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["messageId"], "user-1");
+        assert_eq!(records[0]["messageOrder"], 1);
+        assert_eq!(records[0]["timestamp"], 11);
+        assert_eq!(records[0]["blocks"][1]["type"], "image");
+    }
+
+    #[test]
     fn session_loaded_serializes_connection_state() {
         let disconnected = serde_json::to_value(UiServerMessage::SessionLoaded {
             session_id: "session-1".to_string(),
@@ -1287,6 +1328,7 @@ mod tests {
             node_id: Some("node-a".to_string()),
             connection_state: Some(RemoteSessionConnectionState::Disconnected),
             audit: empty_audit("session-1"),
+            user_prompts: Vec::new(),
             undo_stack: Vec::new(),
             cursor: StreamCursor::default(),
         })
@@ -1300,6 +1342,7 @@ mod tests {
             node_id: Some("node-a".to_string()),
             connection_state: Some(RemoteSessionConnectionState::Connected),
             audit: empty_audit("session-1"),
+            user_prompts: Vec::new(),
             undo_stack: Vec::new(),
             cursor: StreamCursor::default(),
         })

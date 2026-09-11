@@ -5,6 +5,7 @@
  * These functions are pure, side-effect free, and fully testable.
  */
 
+import type { ContentBlock } from '@agentclientprotocol/sdk';
 import { EventItem, EventRow, DelegationGroupInfo, Turn, RateLimitState, TurnCompaction, UiPromptBlock } from '../types';
 
 const FILE_MENTION_MARKUP_RE = /@\{(file|dir):([^}]+)\}/g;
@@ -13,6 +14,41 @@ const FILE_MENTION_MARKUP_RE = /@\{(file|dir):([^}]+)\}/g;
  * Parse user input text into prompt blocks, extracting file mention markup
  * into resource_link blocks.
  */
+export interface UserPromptDisplay {
+  content: string;
+  attachments: string[];
+}
+
+/** Project structured ACP blocks into the compact user-message presentation. */
+export function projectUserPromptBlocks(blocks: ContentBlock[]): UserPromptDisplay {
+  const text: string[] = [];
+  const attachments: string[] = [];
+
+  for (const block of blocks) {
+    switch (block.type) {
+      case 'text':
+        text.push(block.text);
+        break;
+      case 'image':
+        attachments.push(block.uri || 'image attachment');
+        break;
+      case 'audio':
+        attachments.push('audio attachment');
+        break;
+      case 'resource_link':
+        attachments.push(block.uri);
+        break;
+      case 'resource':
+        // resource.uri is the attachment reference; the embedded payload
+        // (block.resource.text / .blob) must never leak into the transcript.
+        attachments.push(block.resource.uri);
+        break;
+    }
+  }
+
+  return { content: text.join('\n'), attachments };
+}
+
 export function buildPromptBlocksFromInput(input: string): UiPromptBlock[] {
   const links = new Map<string, UiPromptBlock>();
   const normalizedText = input.replace(FILE_MENTION_MARKUP_RE, (_match, _kind: string, rawPath: string) => {
