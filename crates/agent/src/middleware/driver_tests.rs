@@ -11,6 +11,8 @@ use crate::test_utils::{
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn test_composite_driver_empty_passes_through() {
@@ -110,6 +112,73 @@ async fn test_composite_driver_cancelled_halts() {
 
     assert!(matches!(result, ExecutionState::Cancelled));
     assert_eq!(counter.count.load(Ordering::SeqCst), 0);
+}
+
+struct PendingDriver {
+    started: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl MiddlewareDriver for PendingDriver {
+    async fn on_turn_end(
+        &self,
+        _state: ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> crate::middleware::Result<ExecutionState> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+
+    fn reset(&self) {}
+
+    fn name(&self) -> &'static str {
+        "PendingDriver"
+    }
+}
+
+#[tokio::test]
+async fn test_composite_driver_skips_middleware_when_already_cancelled() {
+    let counter = Arc::new(CountingDriver {
+        count: AtomicUsize::new(0),
+    });
+    let composite = CompositeDriver::new(vec![counter.clone()]);
+    let context = test_context("sess-1", 0);
+    let token = CancellationToken::new();
+    token.cancel();
+
+    let result = composite
+        .run_turn_start_cancellable(ExecutionState::BeforeLlmCall { context }, None, &token)
+        .await
+        .unwrap();
+
+    assert!(matches!(result, ExecutionState::Cancelled));
+    assert_eq!(counter.count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_composite_driver_interrupts_running_middleware() {
+    let middleware_started = Arc::new(Notify::new());
+    let composite = Arc::new(CompositeDriver::new(vec![Arc::new(PendingDriver {
+        started: middleware_started.clone(),
+    })]));
+    let context = test_context("sess-1", 0);
+    let token = CancellationToken::new();
+    let task_token = token.clone();
+    let task = tokio::spawn(async move {
+        composite
+            .run_turn_end_cancellable(ExecutionState::Complete { context }, None, &task_token)
+            .await
+    });
+
+    middleware_started.notified().await;
+    token.cancel();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .expect("middleware cancellation should be prompt")
+        .expect("middleware task should not panic")
+        .expect("middleware cancellation should not error");
+    assert!(matches!(result, ExecutionState::Cancelled));
 }
 
 #[tokio::test]

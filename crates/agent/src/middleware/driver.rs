@@ -4,6 +4,7 @@ use crate::middleware::{ExecutionState, Result};
 use async_trait::async_trait;
 use log::{debug, trace};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span, instrument};
 
 /// Trait for middleware that runs at specific lifecycle phases
@@ -97,8 +98,23 @@ impl CompositeDriver {
         state: ExecutionState,
         runtime: Option<&Arc<SessionRuntime>>,
     ) -> Result<ExecutionState> {
-        self.run_phase(state, runtime, MiddlewarePhase::TurnStart)
+        self.run_phase(state, runtime, MiddlewarePhase::TurnStart, None)
             .await
+    }
+
+    pub async fn run_turn_start_cancellable(
+        &self,
+        state: ExecutionState,
+        runtime: Option<&Arc<SessionRuntime>>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<ExecutionState> {
+        self.run_phase(
+            state,
+            runtime,
+            MiddlewarePhase::TurnStart,
+            Some(cancellation_token),
+        )
+        .await
     }
 
     pub async fn run_step_start(
@@ -106,8 +122,23 @@ impl CompositeDriver {
         state: ExecutionState,
         runtime: Option<&Arc<SessionRuntime>>,
     ) -> Result<ExecutionState> {
-        self.run_phase(state, runtime, MiddlewarePhase::StepStart)
+        self.run_phase(state, runtime, MiddlewarePhase::StepStart, None)
             .await
+    }
+
+    pub async fn run_step_start_cancellable(
+        &self,
+        state: ExecutionState,
+        runtime: Option<&Arc<SessionRuntime>>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<ExecutionState> {
+        self.run_phase(
+            state,
+            runtime,
+            MiddlewarePhase::StepStart,
+            Some(cancellation_token),
+        )
+        .await
     }
 
     pub async fn run_after_llm(
@@ -115,8 +146,23 @@ impl CompositeDriver {
         state: ExecutionState,
         runtime: Option<&Arc<SessionRuntime>>,
     ) -> Result<ExecutionState> {
-        self.run_phase(state, runtime, MiddlewarePhase::AfterLlm)
+        self.run_phase(state, runtime, MiddlewarePhase::AfterLlm, None)
             .await
+    }
+
+    pub async fn run_after_llm_cancellable(
+        &self,
+        state: ExecutionState,
+        runtime: Option<&Arc<SessionRuntime>>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<ExecutionState> {
+        self.run_phase(
+            state,
+            runtime,
+            MiddlewarePhase::AfterLlm,
+            Some(cancellation_token),
+        )
+        .await
     }
 
     pub async fn run_processing_tool_calls(
@@ -124,8 +170,23 @@ impl CompositeDriver {
         state: ExecutionState,
         runtime: Option<&Arc<SessionRuntime>>,
     ) -> Result<ExecutionState> {
-        self.run_phase(state, runtime, MiddlewarePhase::ProcessingToolCalls)
+        self.run_phase(state, runtime, MiddlewarePhase::ProcessingToolCalls, None)
             .await
+    }
+
+    pub async fn run_processing_tool_calls_cancellable(
+        &self,
+        state: ExecutionState,
+        runtime: Option<&Arc<SessionRuntime>>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<ExecutionState> {
+        self.run_phase(
+            state,
+            runtime,
+            MiddlewarePhase::ProcessingToolCalls,
+            Some(cancellation_token),
+        )
+        .await
     }
 
     pub async fn run_turn_end(
@@ -133,8 +194,23 @@ impl CompositeDriver {
         state: ExecutionState,
         runtime: Option<&Arc<SessionRuntime>>,
     ) -> Result<ExecutionState> {
-        self.run_phase(state, runtime, MiddlewarePhase::TurnEnd)
+        self.run_phase(state, runtime, MiddlewarePhase::TurnEnd, None)
             .await
+    }
+
+    pub async fn run_turn_end_cancellable(
+        &self,
+        state: ExecutionState,
+        runtime: Option<&Arc<SessionRuntime>>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<ExecutionState> {
+        self.run_phase(
+            state,
+            runtime,
+            MiddlewarePhase::TurnEnd,
+            Some(cancellation_token),
+        )
+        .await
     }
 
     pub fn reset(&self) {
@@ -191,6 +267,7 @@ impl CompositeDriver {
         state: ExecutionState,
         runtime: Option<&Arc<SessionRuntime>>,
         phase: MiddlewarePhase,
+        cancellation_token: Option<&CancellationToken>,
     ) -> Result<ExecutionState> {
         let state_name = state.name();
         trace!(
@@ -224,38 +301,30 @@ impl CompositeDriver {
                 output_state = tracing::field::Empty,
                 terminal = tracing::field::Empty,
             );
-            current = match phase {
-                MiddlewarePhase::TurnStart => {
-                    driver
-                        .on_turn_start(current, runtime)
-                        .instrument(span.clone())
-                        .await?
+            if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+                current = ExecutionState::Cancelled;
+            } else {
+                let invocation = match phase {
+                    MiddlewarePhase::TurnStart => driver.on_turn_start(current, runtime),
+                    MiddlewarePhase::StepStart => driver.on_step_start(current, runtime),
+                    MiddlewarePhase::AfterLlm => driver.on_after_llm(current, runtime),
+                    MiddlewarePhase::ProcessingToolCalls => {
+                        driver.on_processing_tool_calls(current, runtime)
+                    }
+                    MiddlewarePhase::TurnEnd => driver.on_turn_end(current, runtime),
                 }
-                MiddlewarePhase::StepStart => {
-                    driver
-                        .on_step_start(current, runtime)
-                        .instrument(span.clone())
-                        .await?
-                }
-                MiddlewarePhase::AfterLlm => {
-                    driver
-                        .on_after_llm(current, runtime)
-                        .instrument(span.clone())
-                        .await?
-                }
-                MiddlewarePhase::ProcessingToolCalls => {
-                    driver
-                        .on_processing_tool_calls(current, runtime)
-                        .instrument(span.clone())
-                        .await?
-                }
-                MiddlewarePhase::TurnEnd => {
-                    driver
-                        .on_turn_end(current, runtime)
-                        .instrument(span.clone())
-                        .await?
-                }
-            };
+                .instrument(span.clone());
+
+                current = if let Some(token) = cancellation_token {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => ExecutionState::Cancelled,
+                        result = invocation => result?,
+                    }
+                } else {
+                    invocation.await?
+                };
+            }
 
             let new_state_name = current.name();
             span.record("output_state", new_state_name);
