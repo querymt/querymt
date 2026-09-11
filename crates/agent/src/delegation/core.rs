@@ -1069,6 +1069,10 @@ async fn execute_delegation(
             control.effective_model.provider_node_id,
         ),
         Err(error) => {
+            // Provenance only: the child is already created, routed, and configured.
+            // Missing selected_model_id is allowed on SessionForked. If confirmed
+            // model identity later becomes a hard execution/audit precondition,
+            // consider failing the delegation here instead of degrading.
             warn!(
                 "Failed to confirm delegate model for '{}': {error}",
                 delegation.target_agent_id
