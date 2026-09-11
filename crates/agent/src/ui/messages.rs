@@ -1118,8 +1118,9 @@ mod tests {
         AudioModelInfo, OAuthFlowKind, PluginUpdateResult, RemoteSessionConnectionState,
         RoutingMode, UiClientMessage, UiProfileInfo, UiServerMessage,
     };
+    use crate::acp::protocol::{ContentBlock, ImageContent, TextContent};
     use crate::agent::messages::{SessionRuntimePhase, SessionRuntimeStatus};
-    use crate::session::load_snapshot::StreamCursor;
+    use crate::session::load_snapshot::{StreamCursor, UserPromptRecord};
     use crate::session::projection::AuditView;
     use serde_json::json;
 
@@ -1281,6 +1282,41 @@ mod tests {
             loaded["data"].get("connection_state").is_none(),
             "local loads omit connection_state"
         );
+    }
+
+    #[test]
+    fn session_loaded_serializes_user_prompt_records() {
+        let loaded = serde_json::to_value(UiServerMessage::SessionLoaded {
+            session_id: "session-1".to_string(),
+            agent_id: "primary".to_string(),
+            profile_id: None,
+            node_id: None,
+            connection_state: None,
+            audit: empty_audit("session-1"),
+            user_prompts: vec![UserPromptRecord {
+                message_id: "user-1".to_string(),
+                message_order: 1,
+                timestamp: 11,
+                blocks: vec![
+                    ContentBlock::Text(TextContent::new("look")),
+                    ContentBlock::Image(ImageContent::new("AQID", "image/png")),
+                ],
+            }],
+            undo_stack: Vec::new(),
+            cursor: StreamCursor::default(),
+        })
+        .expect("session_loaded should serialize");
+
+        // The envelope keeps snake_case keys; each record uses the camelCase
+        // UserPromptRecord contract consumed by the UI client.
+        let records = loaded["data"]["user_prompts"]
+            .as_array()
+            .expect("populated user_prompts must serialize");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["messageId"], "user-1");
+        assert_eq!(records[0]["messageOrder"], 1);
+        assert_eq!(records[0]["timestamp"], 11);
+        assert_eq!(records[0]["blocks"][1]["type"], "image");
     }
 
     #[test]

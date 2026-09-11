@@ -267,3 +267,48 @@ pub(super) async fn build_remote_prompt_blocks(
 
     Ok(blocks)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ContentBlock, EmbeddedResourceResource, TextResourceContents, attachment_uri, text_resource,
+    };
+    use std::path::Path;
+
+    /// Local text reads, remote text reads, and remote binary reads all surface
+    /// their payload through `text_resource`, so it must emit an ACP resource
+    /// block carrying the attachment URI while the payload stays embedded in
+    /// the resource (never in transcript text).
+    #[test]
+    fn text_resource_emits_acp_resource_block_with_payload_and_uri() {
+        for (text, uri) in [
+            ("contents", "file:///ws/notes.md"),         // local text read
+            ("remote contents", "file:///ws/remote.md"), // remote text read
+            ("(binary file; not inlined)", "file:///ws/blob.bin"), // remote binary read
+        ] {
+            let block = text_resource(text.to_string(), uri.to_string());
+            let ContentBlock::Resource(resource) = block else {
+                panic!("expected ACP resource block for {uri}");
+            };
+            assert_eq!(
+                resource.resource,
+                EmbeddedResourceResource::TextResourceContents(TextResourceContents::new(
+                    text, uri
+                )),
+                "resource payload and URI must round-trip for {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_uri_selects_scheme_by_entry_kind() {
+        assert_eq!(
+            attachment_uri(Path::new("/ws/notes.md"), false),
+            "file:///ws/notes.md"
+        );
+        assert_eq!(
+            attachment_uri(Path::new("/ws/assets"), true),
+            "directory:///ws/assets"
+        );
+    }
+}

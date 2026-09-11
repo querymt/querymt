@@ -54,7 +54,9 @@ describe('projectUserPromptBlocks', () => {
       {
         type: 'resource',
         resource: {
-          resource: { uri: 'file:///workspace/notes.md', text: 'private attachment contents' },
+          uri: 'file:///workspace/notes.md',
+          blob: 'cHJpdmF0ZSBhdHRhY2htZW50IGNvbnRlbnRz',
+          mimeType: 'application/octet-stream',
         },
       },
     ])).toEqual({

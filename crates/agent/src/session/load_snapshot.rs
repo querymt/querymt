@@ -244,6 +244,56 @@ mod tests {
         assert_eq!(value["blocks"][1]["type"], "image");
     }
 
+    #[test]
+    fn user_prompt_projection_includes_steering_parts() {
+        let messages = vec![
+            AgentMessage {
+                id: "assistant".to_string(),
+                session_id: "s1".to_string(),
+                role: ChatRole::Assistant,
+                parts: vec![MessagePart::Text {
+                    content: "response".to_string(),
+                }],
+                created_at: 10,
+                parent_message_id: None,
+                source_provider: None,
+                source_model: None,
+            },
+            AgentMessage {
+                id: "steer-1".to_string(),
+                session_id: "s1".to_string(),
+                role: ChatRole::User,
+                parts: vec![MessagePart::Steering {
+                    run_id: "run-1".to_string(),
+                    client_input_id: Some("cid-1".to_string()),
+                    blocks: vec![
+                        ContentBlock::Text(TextContent::new("steer")),
+                        ContentBlock::Image(ImageContent::new("AQID", "image/png")),
+                    ],
+                }],
+                created_at: 12,
+                parent_message_id: None,
+                source_provider: None,
+                source_model: None,
+            },
+        ];
+
+        let records = user_prompt_records(&messages);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].message_id, "steer-1");
+        // messageOrder counts all persisted messages: the text-only assistant
+        // message is skipped as a projection source but still occupies index 0.
+        assert_eq!(records[0].message_order, 1);
+        assert_eq!(records[0].timestamp, 12);
+        assert!(matches!(records[0].blocks[0], ContentBlock::Text(_)));
+        assert!(matches!(records[0].blocks[1], ContentBlock::Image(_)));
+        let value = serde_json::to_value(&records[0]).unwrap();
+        assert_eq!(value["messageId"], "steer-1");
+        assert_eq!(value["messageOrder"], 1);
+        assert_eq!(value["timestamp"], 12);
+        assert_eq!(value["blocks"][1]["type"], "image");
+    }
+
     #[tokio::test]
     async fn snapshot_history_failure_is_propagated() {
         let storage = Arc::new(

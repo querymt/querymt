@@ -1,12 +1,13 @@
 // Import types from ACP SDK where possible
 import type {
+  ContentBlock,
   SessionNotification,
   SessionUpdate,
 } from '@agentclientprotocol/sdk';
 import type { SessionSummary as GeneratedSessionSummary } from './generated/types';
 
 // Re-export SDK types for use in other components
-export type { SessionNotification, SessionUpdate };
+export type { ContentBlock, SessionNotification, SessionUpdate };
 
 // ── Generated types (authoritative from Rust via typeshare) ──────────────────
 // These types are generated from Rust source and must not be hand-edited here.
@@ -116,7 +117,7 @@ export interface EventItem {
   timestamp: number;
   isMessage?: boolean;  // True for actual user/assistant messages (not internal events)
   messageId?: string;  // Message UUID from the database (for undo/redo)
-  promptBlocks?: unknown[];  // Structured ACP prompt blocks for attachment-aware display.
+  promptBlocks?: ContentBlock[];  // Structured ACP prompt blocks for attachment-aware display.
   toolCall?: {
     tool_call_id?: string;
     description?: string;

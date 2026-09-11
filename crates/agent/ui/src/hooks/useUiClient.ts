@@ -40,6 +40,7 @@ import {
 } from '../types';
 import { useUiStore } from '../store/uiStore';
 import { buildPromptBlocksFromInput, projectUserPromptBlocks } from '../logic/chatViewLogic';
+import type { ContentBlock } from '@agentclientprotocol/sdk';
 import { debugLog, debugTrace } from '../utils/debugLog';
 
 // Callback type for file index updates
@@ -156,7 +157,7 @@ function buildUndoStateFromServerStack(
 
 export function useUiClient() {
   const [eventsBySession, setEventsBySession] = useState<Map<string, EventItem[]>>(new Map());
-  const promptBlocksByMessageIdRef = useRef(new Map<string, unknown[]>());
+  const promptBlocksByMessageIdRef = useRef(new Map<string, ContentBlock[]>());
   const [mainSessionId, setMainSessionId] = useState<string | null>(null);
   const [agents, setAgents] = useState<UiAgentInfo[]>([]);
   const [profiles, setProfiles] = useState<UiProfileInfo[]>([]);
@@ -1317,7 +1318,7 @@ export function useUiClient() {
         
         // Populate eventsBySession from the audit events (for old session history)
         promptBlocksByMessageIdRef.current = new Map(
-          (d.user_prompts ?? []).map((prompt) => [prompt.messageId, prompt.blocks]),
+          (d.user_prompts ?? []).map((prompt): [string, ContentBlock[]] => [prompt.messageId, prompt.blocks]),
         );
         const translated = d.audit.events.map((e: any) => {
           reconcileInputEvent(e);

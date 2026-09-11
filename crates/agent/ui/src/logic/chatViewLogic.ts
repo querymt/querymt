@@ -5,6 +5,7 @@
  * These functions are pure, side-effect free, and fully testable.
  */
 
+import type { ContentBlock } from '@agentclientprotocol/sdk';
 import { EventItem, EventRow, DelegationGroupInfo, Turn, RateLimitState, TurnCompaction, UiPromptBlock } from '../types';
 
 const FILE_MENTION_MARKUP_RE = /@\{(file|dir):([^}]+)\}/g;
@@ -19,36 +20,33 @@ export interface UserPromptDisplay {
 }
 
 /** Project structured ACP blocks into the compact user-message presentation. */
-export function projectUserPromptBlocks(blocks: unknown[]): UserPromptDisplay {
+export function projectUserPromptBlocks(blocks: ContentBlock[]): UserPromptDisplay {
   const text: string[] = [];
   const attachments: string[] = [];
 
   for (const block of blocks) {
-    if (!block || typeof block !== 'object') continue;
-    const value = block as { type?: string; text?: string; data?: { text?: string }; uri?: string; resource?: unknown };
-    if (value.type === 'text') {
-      const content = value.text ?? value.data?.text;
-      if (typeof content === 'string') text.push(content);
-      continue;
-    }
-    if (value.type === 'resource' || value.type === 'image') {
-      const uri = findAttachmentUri(value);
-      attachments.push(uri ?? (value.type === 'image' ? 'image attachment' : 'attachment'));
+    switch (block.type) {
+      case 'text':
+        text.push(block.text);
+        break;
+      case 'image':
+        attachments.push(block.uri || 'image attachment');
+        break;
+      case 'audio':
+        attachments.push('audio attachment');
+        break;
+      case 'resource_link':
+        attachments.push(block.uri);
+        break;
+      case 'resource':
+        // resource.uri is the attachment reference; the embedded payload
+        // (block.resource.text / .blob) must never leak into the transcript.
+        attachments.push(block.resource.uri);
+        break;
     }
   }
 
   return { content: text.join('\n'), attachments };
-}
-
-function findAttachmentUri(value: unknown): string | undefined {
-  if (!value || typeof value !== 'object') return undefined;
-  const object = value as Record<string, unknown>;
-  if (typeof object.uri === 'string') return object.uri;
-  for (const child of Object.values(object)) {
-    const uri = findAttachmentUri(child);
-    if (uri) return uri;
-  }
-  return undefined;
 }
 
 export function buildPromptBlocksFromInput(input: string): UiPromptBlock[] {
