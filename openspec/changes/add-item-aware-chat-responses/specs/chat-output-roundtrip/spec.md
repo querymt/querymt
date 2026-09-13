@@ -32,6 +32,15 @@ The system SHALL retain provider/protocol/model/endpoint provenance without cred
 - **THEN** encrypted state, signatures, and provider-only identities are not forwarded by default
 - **AND** portable call/result relationships are preserved and stored originals remain unchanged.
 
+#### Scenario: Return to the original provider
+- **WHEN** a conversation moves from A to B and then back to the same provider/protocol/model/endpoint A without editing or compacting the original A turns
+- **THEN** requests to B exclude A's opaque state while stored A turns retain it
+- **AND** the return request uses validated native representations of A turns and portable projections of B turns, preserving chronological order and call/result dependencies.
+
+#### Scenario: Return after compaction or edit
+- **WHEN** an original A dependency group is compacted or explicitly replaced with portable content while using B and the conversation later returns to A
+- **THEN** the return request does not restore that group's previous opaque state from archived history or a hidden sidecar.
+
 #### Scenario: Unknown item cannot be safely replayed
 - **WHEN** an unknown stored item is required for continuation but has no validated input representation
 - **THEN** replay fails with an unsupported-continuation error rather than discarding the item.
