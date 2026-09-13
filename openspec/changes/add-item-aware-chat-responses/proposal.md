@@ -8,7 +8,8 @@ OpenAI Responses support requires preserving ordered output items, reasoning con
 - Add provider-neutral structured chat output with ordered message, reasoning, function-call, and opaque items, exposed through a defaulted `ChatResponse` accessor.
 - Carry authoritative structured assistant output through `ChatMessage`, with existing content as a compatibility projection rather than additional history.
 - Extend the existing stream with indexed structured events and a shared accumulator; preserve legacy display events without duplicating history or tool execution.
-- Preserve structured output through agent storage, plugin and remote transport, history editing, and compatible replay.
+- Preserve structured output through agent storage, plugin and remote transport, history editing, and compatible replay, including non-destructive A -> B -> A provider switching.
+- Add typed media with source/rendering metadata and a QueryMT MediaType wrapper backed by the mime crate, serialized as a MIME string. Preserve unknown media item semantics as opaque data; extending formats does not require a core variant per MIME type.
 - Add explicit OpenAI Responses selection, stateless local replay, function tools, rich tool results, and structured-output mapping. Share compatible codec behavior with Codex and xAI without importing their endpoint-specific restrictions.
 - **BREAKING**: Adding public message fields and stream enum variants requires Rust struct-literal and exhaustive-match migrations. Native plugins require coordinated rebuilding; serialized transports require explicit compatibility handling.
 
