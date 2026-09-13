@@ -20,6 +20,47 @@ Structured output SHALL preserve ordered message, reasoning, function-call, and 
 - **THEN** normalization retains each item's identity, fields, and relative order
 - **AND** no empty-summary reasoning item is discarded or merged into another reasoning item.
 
+### Requirement: Media types use validated crate-backed values
+The structured media contract SHALL use a QueryMT-owned MediaType backed by the mime crate, with fallible parsing and parsed MIME accessors. It SHALL serialize as a string in persistence, plugin/remote DTOs, and bindings, with a string JSON schema. Concrete attachment types SHALL reject invalid syntax and wildcard ranges. Parameter semantics SHALL survive normalization and roundtrip; canonical spelling MAY differ. MIME syntax validation SHALL NOT imply endpoint support or verification of the actual bytes.
+
+#### Scenario: Parameterized media type roundtrip
+- **WHEN** a typed attachment with media type text/plain; charset=utf-8 passes through storage and supported transports
+- **THEN** its parsed type, subtype, and charset parameter retain their meaning
+- **AND** the wire value remains a MIME string rather than the dependency's internal representation.
+
+#### Scenario: Invalid or wildcard media type
+- **WHEN** a caller constructs or deserializes a structured attachment with malformed MIME syntax or image/*
+- **THEN** validation fails explicitly instead of storing it as a concrete MediaType.
+
+### Requirement: Recognized media has typed sources and rendering metadata
+Recognized media SHALL expose a broad media kind, typed source, optional validated media type, optional filename/detail, and scoped provider extensions. Inline bytes SHALL require a media type. Data URLs SHALL use their declared type or standard default and reject conflicting separately supplied types. URLs and provider file references MAY omit unavailable media types. Normalization SHALL NOT implicitly fetch resources or sniff bytes. Provider references SHALL remain origin-scoped. Legacy histories SHALL remain readable; invalid legacy MIME strings SHALL fail explicitly when converted to structured media rather than blocking legacy loading.
+
+#### Scenario: Renderable attachment metadata
+- **WHEN** recognized inline image or document media is normalized
+- **THEN** consumers receive typed media with its bytes, kind, validated media type, and supplied filename/detail instead of a placeholder string.
+
+#### Scenario: Referenced media without known MIME
+- **WHEN** a recognized media item contains only a URL or provider file reference with no MIME metadata
+- **THEN** its source form and origin scope are preserved without inventing a media type or fetching its bytes
+- **AND** consumers can present a reference or attachment without a guarantee of inline rendering.
+
+#### Scenario: Conflicting data URL metadata
+- **WHEN** an attachment declares image/jpeg separately but its data URL declares image/png
+- **THEN** validation reports a conflict instead of silently choosing one declaration.
+
+### Requirement: Media formats can grow without losing unknown items
+Additional formats within an existing media kind SHALL be representable by MIME value without a new core variant per format. Typed valid media without a specialized renderer SHALL permit a generic attachment presentation. Unknown item/part semantics SHALL remain opaque, not be guessed from embedded MIME fields. Later explicit codec support MAY derive a typed projection from stored opaque data but SHALL retain canonical identity, order, and original replay data without duplicate items or implicit execution.
+
+#### Scenario: Valid format without endpoint support
+- **WHEN** typed media uses a valid format unsupported by the selected endpoint
+- **THEN** it remains preservable as an attachment
+- **AND** request construction reports unsupported content rather than substituting text or silently dropping it.
+
+#### Scenario: Later recognition of stored opaque media
+- **WHEN** an explicitly added codec recognizes a previously stored opaque media item
+- **THEN** it can produce a typed display projection while retaining the original canonical item and replay metadata
+- **AND** it neither creates a second history item nor dispatches a local tool.
+
 ### Requirement: Raw function arguments remain authoritative
 The system SHALL preserve exact raw argument strings independent of whether they parse as JSON. Parsing failures SHALL NOT replace arguments with an empty object or authorize execution of an invalid local function call.
 

@@ -55,6 +55,19 @@ Function outputs SHALL correlate by call_id, not output item ID. Text, supported
 - **WHEN** a tool result contains media unsupported by the configured endpoint
 - **THEN** construction fails explicitly without substituting a textual description.
 
+### Requirement: Media conversion distinguishes portable parts from provider items
+Responses media conversion SHALL consume validated media types and preserve MIME parameter semantics, source form, filenames, and supplied detail metadata in canonical history. Wire serialization SHALL use only fields valid for the selected endpoint and content position. Provider file references SHALL NOT be forwarded to incompatible origins as if they were portable URLs. Unsupported built-in media item kinds SHALL remain opaque until an explicit codec supports their semantics, irrespective of whether they contain recognizable MIME or encoded bytes.
+
+#### Scenario: Typed media survives a tool-result roundtrip
+- **WHEN** a rich tool result containing typed inline image and file parts is persisted, reloaded, and serialized for a supported Responses endpoint
+- **THEN** its MIME metadata, sources, filenames, supplied detail, and part order survive in canonical history
+- **AND** the wire request uses the corresponding protocol-valid image/file fields and call ID.
+
+#### Scenario: Unsupported built-in image output
+- **WHEN** a response contains an image_generation_call for which no typed codec is implemented
+- **THEN** the complete item is retained as opaque data rather than fabricated message content
+- **AND** it is not dispatched to the local function executor; any required unsupported replay or client action fails explicitly.
+
 ### Requirement: Responses status and usage retain meaning
 Responses parsing SHALL preserve structured items, refusal data, annotations, terminal cause, and provider failure details. Token counts SHALL normalize to QueryMT's non-overlapping cached-input, ordinary-input, reasoning-output, and ordinary-output categories. Completed responses with supported local calls SHALL indicate pending tool execution; completed responses without such calls SHALL indicate stop. Unsupported provider actions requiring local participation SHALL fail explicitly and never enter the local function executor.
 
