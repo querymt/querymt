@@ -60,7 +60,7 @@ mod tests {
             r#"---
 name: test-skill
 description: A test skill
-allowed-tools: ["read_tool"]
+allowed-tools: read_tool
 ---
 # Test Skill Content
 "#,
@@ -142,8 +142,8 @@ version: "1.0.0"
 license: MIT
 author: Test Author
 tags: ["development", "testing"]
-compatibility: ["querymt", "claude-code"]
-allowed-tools: ["read_tool", "write_file"]
+compatibility: Requires git and network access.
+allowed-tools: read_tool write_file
 ---
 # Advanced Skill
 
@@ -159,9 +159,53 @@ This skill has all optional fields.
         assert_eq!(skill.metadata.license, Some("MIT".to_string()));
         assert_eq!(skill.metadata.author, Some("Test Author".to_string()));
         assert_eq!(
+            skill.metadata.compatibility.as_deref(),
+            Some("Requires git and network access.")
+        );
+        assert_eq!(
+            skill.metadata.allowed_tools.as_deref(),
+            Some("read_tool write_file")
+        );
+        assert_eq!(
             skill.metadata.tags,
             Some(vec!["development".to_string(), "testing".to_string()])
         );
         assert!(skill.content.contains("This skill has all optional fields"));
+    }
+
+    #[test]
+    fn test_parse_openspec_frontmatter() {
+        let dir = TempDir::new().unwrap();
+        let skill_path = dir.path().join("SKILL.md");
+        fs::write(
+            &skill_path,
+            r#"---
+name: openspec-propose
+description: Propose a new change with all artifacts generated in one step.
+allowed-tools: Bash(openspec:*)
+license: MIT
+compatibility: Requires openspec CLI.
+metadata:
+  author: openspec
+  version: "1.0"
+---
+OpenSpec instructions.
+"#,
+        )
+        .unwrap();
+
+        let skill =
+            parse_skill_file(&skill_path, SkillSource::Project(dir.path().to_path_buf())).unwrap();
+        assert_eq!(skill.metadata.name, "openspec-propose");
+        assert_eq!(
+            skill.metadata.compatibility.as_deref(),
+            Some("Requires openspec CLI.")
+        );
+        assert_eq!(
+            skill.metadata.allowed_tools.as_deref(),
+            Some("Bash(openspec:*)")
+        );
+        assert_eq!(skill.metadata.extra["metadata"]["author"], "openspec");
+        assert!(skill.content.contains("OpenSpec instructions."));
     }
 }

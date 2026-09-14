@@ -36,20 +36,8 @@ pub(crate) fn build_skill_tool(config: &SkillsConfig, project_root: &Path) -> Ar
     match registry.load_from_sources(&search_paths, config.include_external) {
         Ok(count) => {
             if count > 0 {
-                let compatible_names: Vec<_> = registry
-                    .compatible_with(&config.agent_id)
-                    .iter()
-                    .map(|skill| skill.metadata.name.clone())
-                    .collect();
-                log::info!(
-                    "Skills system initialized: {} skills discovered, {} compatible with agent '{}'",
-                    count,
-                    compatible_names.len(),
-                    config.agent_id
-                );
-                if !compatible_names.is_empty() {
-                    log::debug!("Compatible skills: {}", compatible_names.join(", "));
-                }
+                log::info!("Skills system initialized: {count} skills discovered");
+                log::debug!("Discovered skills: {}", registry.names().join(", "));
             } else {
                 log::debug!(
                     "Skills system enabled but no skills found in {} search paths",
@@ -67,7 +55,6 @@ pub(crate) fn build_skill_tool(config: &SkillsConfig, project_root: &Path) -> Ar
 
     Arc::new(SkillTool::new(
         Arc::new(Mutex::new(registry)),
-        Some(config.agent_id.clone()),
         Arc::new(config.permissions.clone()),
     ))
 }

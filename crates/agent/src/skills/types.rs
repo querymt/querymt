@@ -32,14 +32,13 @@ pub struct SkillMetadata {
     #[serde(default)]
     pub license: Option<String>,
 
-    /// Optional: compatible agent identifiers
+    /// Optional: environment requirements for using the skill
     #[serde(default)]
-    pub compatibility: Option<Vec<String>>,
+    pub compatibility: Option<String>,
 
-    /// Optional: tool access control
-    /// Examples: ["*"], ["read_tool", "write_file"], ["!shell", "!delete_file"]
+    /// Optional: space-separated list of pre-approved tools
     #[serde(default, rename = "allowed-tools")]
-    pub allowed_tools: Option<Vec<String>>,
+    pub allowed_tools: Option<String>,
 
     /// Optional: categorization tags
     #[serde(default)]
@@ -97,34 +96,42 @@ pub enum ToolAccessPolicy {
 }
 
 impl SkillMetadata {
-    /// Parse allowed_tools into a ToolAccessPolicy
+    /// Parse the specification's space-separated `allowed-tools` field.
     pub fn tool_policy(&self) -> ToolAccessPolicy {
-        match &self.allowed_tools {
-            None => ToolAccessPolicy::All,
-            Some(tools) if tools.is_empty() => ToolAccessPolicy::None,
-            Some(tools) if tools.iter().any(|t| t == "*") => ToolAccessPolicy::All,
-            Some(tools) => {
-                let has_blacklist = tools.iter().any(|t| t.starts_with('!'));
-                let has_whitelist = tools.iter().any(|t| !t.starts_with('!'));
+        let Some(allowed_tools) = self.allowed_tools.as_deref() else {
+            return ToolAccessPolicy::All;
+        };
+        let tools: Vec<String> = allowed_tools
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
 
-                if has_blacklist && has_whitelist {
-                    log::warn!(
-                        "Skill '{}' mixes whitelist and blacklist syntax, using whitelist only",
-                        self.name
-                    );
-                }
+        if tools.is_empty() {
+            return ToolAccessPolicy::None;
+        }
+        if tools.iter().any(|tool| tool == "*") {
+            return ToolAccessPolicy::All;
+        }
 
-                if has_blacklist {
-                    let blacklist = tools
-                        .iter()
-                        .filter_map(|t| t.strip_prefix('!'))
-                        .map(|s| s.to_string())
-                        .collect();
-                    ToolAccessPolicy::Blacklist(blacklist)
-                } else {
-                    ToolAccessPolicy::Whitelist(tools.clone())
-                }
-            }
+        let has_blacklist = tools.iter().any(|tool| tool.starts_with('!'));
+        let has_whitelist = tools.iter().any(|tool| !tool.starts_with('!'));
+        if has_blacklist && has_whitelist {
+            log::warn!(
+                "Skill '{}' mixes whitelist and blacklist syntax, using whitelist only",
+                self.name
+            );
+        }
+
+        if has_blacklist {
+            ToolAccessPolicy::Blacklist(
+                tools
+                    .iter()
+                    .filter_map(|tool| tool.strip_prefix('!'))
+                    .map(str::to_string)
+                    .collect(),
+            )
+        } else {
+            ToolAccessPolicy::Whitelist(tools)
         }
     }
 }
@@ -157,7 +164,7 @@ mod tests {
             version: None,
             license: None,
             compatibility: None,
-            allowed_tools: Some(vec!["read_tool".into(), "write_file".into()]),
+            allowed_tools: Some("read_tool write_file".into()),
             tags: None,
             author: None,
             extra: HashMap::new(),
@@ -178,7 +185,7 @@ mod tests {
             version: None,
             license: None,
             compatibility: None,
-            allowed_tools: Some(vec!["!shell".into(), "!delete_file".into()]),
+            allowed_tools: Some("!shell !delete_file".into()),
             tags: None,
             author: None,
             extra: HashMap::new(),

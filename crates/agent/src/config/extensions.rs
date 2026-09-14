@@ -4,10 +4,6 @@ use super::*;
 // Skills Configuration
 // ============================================================================
 
-fn default_agent_id() -> String {
-    "querymt".to_string()
-}
-
 /// Configuration for skills system
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -28,10 +24,6 @@ pub struct SkillsConfig {
     #[serde(default)]
     pub urls: Vec<String>,
 
-    /// Agent identifier for compatibility filtering
-    #[serde(default = "default_agent_id")]
-    pub agent_id: String,
-
     /// Skill permissions
     #[serde(default)]
     pub permissions: crate::skills::SkillPermissions,
@@ -44,7 +36,6 @@ impl Default for SkillsConfig {
             include_external: true,
             paths: vec![],
             urls: vec![],
-            agent_id: default_agent_id(),
             permissions: crate::skills::SkillPermissions::default(),
         }
     }

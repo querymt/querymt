@@ -52,20 +52,6 @@ impl SkillRegistry {
         self.by_name.values()
     }
 
-    /// Get skills compatible with an agent identifier
-    pub fn compatible_with(&self, agent_id: &str) -> Vec<Arc<Skill>> {
-        self.by_name
-            .values()
-            .filter(|s| {
-                match &s.metadata.compatibility {
-                    None => true, // No compatibility = works everywhere
-                    Some(compat) => compat.iter().any(|c| c == agent_id || c == "*"),
-                }
-            })
-            .cloned()
-            .collect()
-    }
-
     /// List all skill names
     pub fn names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.by_name.keys().map(|s| s.as_str()).collect();
@@ -74,12 +60,9 @@ impl SkillRegistry {
     }
 
     /// Format skill list for tool description
-    pub fn list_for_description(&self, agent_id: Option<&str>) -> String {
-        let skills = if let Some(id) = agent_id {
-            self.compatible_with(id)
-        } else {
-            self.all().cloned().collect()
-        };
+    pub fn list_for_description(&self) -> String {
+        let mut skills: Vec<_> = self.all().collect();
+        skills.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
 
         if skills.is_empty() {
             return "No skills available".to_string();
@@ -87,14 +70,17 @@ impl SkillRegistry {
 
         skills
             .iter()
-            .map(|s| {
-                let tags = s
+            .map(|skill| {
+                let tags = skill
                     .metadata
                     .tags
                     .as_ref()
-                    .map(|t| format!(" [{}]", t.join(", ")))
+                    .map(|tags| format!(" [{}]", tags.join(", ")))
                     .unwrap_or_default();
-                format!("- {}: {}{}", s.metadata.name, s.metadata.description, tags)
+                format!(
+                    "- {}: {}{}",
+                    skill.metadata.name, skill.metadata.description, tags
+                )
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -109,11 +95,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    fn create_test_skill(
-        name: &str,
-        description: &str,
-        compatibility: Option<Vec<String>>,
-    ) -> Skill {
+    fn create_test_skill(name: &str, description: &str, compatibility: Option<&str>) -> Skill {
         Skill {
             path: PathBuf::from(format!("/tmp/{}", name)),
             metadata: SkillMetadata {
@@ -121,7 +103,7 @@ mod tests {
                 description: description.to_string(),
                 version: None,
                 license: None,
-                compatibility,
+                compatibility: compatibility.map(str::to_string),
                 allowed_tools: None,
                 tags: None,
                 author: None,
@@ -164,34 +146,16 @@ mod tests {
     }
 
     #[test]
-    fn test_compatibility_filter() {
+    fn test_compatibility_requirement_does_not_filter_skills() {
         let mut registry = SkillRegistry::new();
-
-        registry.register(create_test_skill("universal", "Universal skill", None));
         registry.register(create_test_skill(
-            "querymt-only",
-            "QueryMT only",
-            Some(vec!["querymt".to_string()]),
-        ));
-        registry.register(create_test_skill(
-            "claude-only",
-            "Claude only",
-            Some(vec!["claude-code".to_string()]),
-        ));
-        registry.register(create_test_skill(
-            "wildcard",
-            "Wildcard",
-            Some(vec!["*".to_string()]),
+            "openspec-propose",
+            "Propose an OpenSpec change",
+            Some("Requires openspec CLI."),
         ));
 
-        let querymt_skills = registry.compatible_with("querymt");
-        assert_eq!(querymt_skills.len(), 3); // universal, querymt-only, wildcard
-
-        let claude_skills = registry.compatible_with("claude-code");
-        assert_eq!(claude_skills.len(), 3); // universal, claude-only, wildcard
-
-        let other_skills = registry.compatible_with("other-agent");
-        assert_eq!(other_skills.len(), 2); // universal, wildcard
+        let description = registry.list_for_description();
+        assert!(description.contains("openspec-propose"));
     }
 
     #[test]
@@ -200,7 +164,7 @@ mod tests {
         registry.register(create_test_skill("skill-a", "First skill", None));
         registry.register(create_test_skill("skill-b", "Second skill", None));
 
-        let desc = registry.list_for_description(None);
+        let desc = registry.list_for_description();
         assert!(desc.contains("skill-a: First skill"));
         assert!(desc.contains("skill-b: Second skill"));
     }
@@ -208,7 +172,7 @@ mod tests {
     #[test]
     fn test_empty_registry_description() {
         let registry = SkillRegistry::new();
-        let desc = registry.list_for_description(None);
+        let desc = registry.list_for_description();
         assert_eq!(desc, "No skills available");
     }
 

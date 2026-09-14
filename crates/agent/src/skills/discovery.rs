@@ -311,6 +311,36 @@ Content
     }
 
     #[test]
+    fn test_discovers_openspec_skill_from_agents_directory() {
+        let project = TempDir::new().unwrap();
+        let skill_dir = project.path().join(".agents/skills/openspec-propose");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: openspec-propose
+description: Propose a new change with all artifacts generated in one step.
+allowed-tools: Bash(openspec:*)
+compatibility: Requires openspec CLI.
+metadata:
+  author: openspec
+  version: "1.0"
+---
+OpenSpec instructions.
+"#,
+        )
+        .unwrap();
+
+        let skills = discover_all(&default_search_paths(project.path()), true).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].metadata.name, "openspec-propose");
+        assert_eq!(
+            skills[0].metadata.compatibility.as_deref(),
+            Some("Requires openspec CLI.")
+        );
+    }
+
+    #[test]
     fn test_nonexistent_path() {
         let source = SkillSource::Global(PathBuf::from("/nonexistent/path"));
         let skills = discover_from_source(&source).unwrap();

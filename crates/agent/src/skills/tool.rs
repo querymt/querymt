@@ -9,21 +9,15 @@ use std::sync::{Arc, Mutex};
 /// The skill tool that agents use to load skills on-demand
 pub struct SkillTool {
     registry: Arc<Mutex<SkillRegistry>>,
-    agent_id: Option<String>,
     permissions: Arc<SkillPermissions>,
 }
 
 impl SkillTool {
     pub const NAME: &'static str = "skill";
 
-    pub fn new(
-        registry: Arc<Mutex<SkillRegistry>>,
-        agent_id: Option<String>,
-        permissions: Arc<SkillPermissions>,
-    ) -> Self {
+    pub fn new(registry: Arc<Mutex<SkillRegistry>>, permissions: Arc<SkillPermissions>) -> Self {
         Self {
             registry,
-            agent_id,
             permissions,
         }
     }
@@ -66,7 +60,7 @@ impl Tool for SkillTool {
 
     fn definition(&self) -> querymt::chat::Tool {
         let (skill_list, skill_names) = if let Ok(registry) = self.registry.lock() {
-            let list = registry.list_for_description(self.agent_id.as_deref());
+            let list = registry.list_for_description();
             let names = registry
                 .names()
                 .into_iter()
@@ -168,8 +162,12 @@ impl Tool for SkillTool {
         );
 
         // Log tool restrictions if present
-        if let Some(policy) = skill.metadata.allowed_tools.as_ref() {
-            log::debug!("Skill '{}' has tool policy: {:?}", name, policy);
+        if skill.metadata.allowed_tools.is_some() {
+            log::debug!(
+                "Skill '{}' has tool policy: {:?}",
+                name,
+                skill.metadata.tool_policy()
+            );
             // TODO: Apply to session's active tool filter (Phase 5)
         }
 
@@ -251,7 +249,7 @@ mod tests {
             reg.register(create_test_skill("test-skill", "A test skill"));
         }
 
-        let tool = SkillTool::new(registry, None, permissions);
+        let tool = SkillTool::new(registry, permissions);
         let ctx = MockContext {
             session_id: "test-session".to_string(),
         };
@@ -271,7 +269,7 @@ mod tests {
         let registry = Arc::new(Mutex::new(SkillRegistry::new()));
         let permissions = Arc::new(SkillPermissions::default());
 
-        let tool = SkillTool::new(registry, None, permissions);
+        let tool = SkillTool::new(registry, permissions);
         let ctx = MockContext {
             session_id: "test-session".to_string(),
         };
@@ -297,7 +295,7 @@ mod tests {
             reg.register(create_test_skill("denied-skill", "Denied skill"));
         }
 
-        let tool = SkillTool::new(registry, None, permissions);
+        let tool = SkillTool::new(registry, permissions);
         let ctx = MockContext {
             session_id: "test-session".to_string(),
         };
@@ -323,7 +321,7 @@ mod tests {
             reg.register(create_test_skill("skill-b", "Second skill"));
         }
 
-        let tool = SkillTool::new(registry, None, permissions);
+        let tool = SkillTool::new(registry, permissions);
         let def = tool.definition();
 
         assert_eq!(def.function.name, SkillTool::NAME);
@@ -331,5 +329,27 @@ mod tests {
         let desc = &def.function.description;
         assert!(desc.contains("skill-a"));
         assert!(desc.contains("skill-b"));
+        assert_eq!(
+            def.function.parameters["properties"]["name"]["enum"],
+            json!(["skill-a", "skill-b"])
+        );
+    }
+
+    #[test]
+    fn test_skill_tool_definition_includes_skill_with_compatibility_requirement() {
+        let registry = Arc::new(Mutex::new(SkillRegistry::new()));
+        let permissions = Arc::new(SkillPermissions::default());
+        let mut skill = create_test_skill("openspec-propose", "Propose an OpenSpec change");
+        skill.metadata.compatibility = Some("Requires openspec CLI.".to_string());
+        skill.metadata.allowed_tools = Some("Bash(openspec:*)".to_string());
+        registry.lock().unwrap().register(skill);
+
+        let definition = SkillTool::new(registry, permissions).definition();
+
+        assert!(definition.function.description.contains("openspec-propose"));
+        assert_eq!(
+            definition.function.parameters["properties"]["name"]["enum"],
+            json!(["openspec-propose"])
+        );
     }
 }
