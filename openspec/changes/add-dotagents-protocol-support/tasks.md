@@ -22,18 +22,22 @@
 ## 3. Internal Sub-Agent Integration
 
 - [ ] 3.1 Map protocol agent metadata and supported `config.json` tool/model/MCP settings into a neutral sub-agent runtime plan; verify disabled profiles, unknown presets, unsupported fields, and unsupported connection diagnostics are covered.
-- [ ] 3.2 Implement lazy materialization for enabled internal `delegation-target` profiles using shared agent infrastructure and stable IDs; verify registered `AgentInfo` metadata and delegation to the local handle work in single-agent and quorum integration tests.
-- [ ] 3.3 Add inheritance and recursion guards so child protocol agents receive intended singleton/base settings without recursively registering agents or reconciling tasks; verify nested materialization creates one handle per target and terminates deterministically.
-- [ ] 3.4 Reject stdio executable and unknown sub-agent connection types without launching a process; verify a test command marker is never created and diagnostics identify the profile and connection type.
+- [ ] 3.2 Extend delegation-enabled standalone agent registries with lazy internal protocol targets, without enabling delegation when it is disabled; verify registry discovery and delegation work and disabled runtimes remain unchanged.
+- [ ] 3.3 Extend delegation-enabled quorum profiles with protocol targets as additional delegates without replacing the planner or configured delegates; verify configured quorum topology and delegate behavior remain intact.
+- [ ] 3.4 Implement collision resolution that first applies global/workspace protocol precedence and then gives explicit standalone registry targets and quorum delegates precedence over matching protocol IDs; verify skipped protocol targets produce diagnostics containing both sources.
+- [ ] 3.5 Add inheritance and recursion guards so child protocol agents receive intended singleton/base settings without recursively registering agents or reconciling tasks; verify nested materialization creates one handle per target and terminates deterministically.
+- [ ] 3.6 Reject stdio executable and unknown sub-agent connection types without launching a process; verify a test command marker is never created and diagnostics identify the profile and connection type.
 
 ## 4. Repeat Task Reconciliation
 
-- [ ] 4.1 Define stable protocol ownership and creation keys for tasks and schedules, and add additive repository lookup/upsert support as needed; verify storage migration and repository tests distinguish protocol-owned records from user-created records.
-- [ ] 4.2 Implement conversion from enabled protocol task metadata/body to recurring tasks and checked interval schedules bound to the designated automation session/profile; verify interval-minute conversion, overflow rejection, prompt mapping, and profile resolution tests pass.
-- [ ] 4.3 Implement idempotent create/update reconciliation based on source identity and content fingerprint; verify repeated unchanged startup creates one task/schedule and changed content updates the protocol-owned records.
-- [ ] 4.4 Pause or retire removed and disabled protocol schedules without modifying unrelated schedules; verify reconciliation tests preserve user-created records and handle global entries overridden by workspace entries.
-- [ ] 4.5 Implement `runOnStartup` once per runtime startup after successful reconciliation while retaining normal interval activation; verify restart simulations trigger exactly once per startup and do not duplicate durable records.
-- [ ] 4.6 Return non-fatal diagnostics when schedule storage, target profile, or scheduler activation is unavailable in compatibility mode and fail appropriately in strict mode; verify both activation policies with integration tests.
+- [ ] 4.1 Define stable protocol ownership and creation keys for tasks and schedules, plus persisted trust keyed by canonical workspace, normalized task ID, and execution-relevant fingerprint; verify storage migrations distinguish protocol-owned records and approvals from user-created schedules.
+- [ ] 4.2 Add host-facing task trust policy and approval request/response APIs with `prompt` as the workspace default, `deny`, and explicitly unsafe `allow`; verify headless `prompt` remains pending and `allow` emits a prominent diagnostic.
+- [ ] 4.3 Ensure parsing and preview never persist, schedule, or execute tasks, and disclose source, schedule, startup behavior, target profile, and prompt summary in approval requests; verify zero-side-effect and disclosure tests pass.
+- [ ] 4.4 Implement conversion from trusted enabled protocol task metadata/body to recurring tasks and checked interval schedules bound to the designated automation session/profile; verify interval-minute conversion, overflow rejection, prompt mapping, and profile resolution tests pass.
+- [ ] 4.5 Implement idempotent create/update reconciliation based on source identity and content fingerprint; verify repeated unchanged startup creates one task/schedule and execution-relevant changes require renewed approval before update or execution.
+- [ ] 4.6 Pause or retire removed, disabled, changed-but-unapproved, and trust-revoked protocol schedules without modifying unrelated schedules; verify reconciliation preserves user-created records and handles global entries overridden by workspace entries.
+- [ ] 4.7 Implement `runOnStartup` once per runtime startup only after successful reconciliation and trust approval while retaining normal interval activation; verify untrusted startup tasks never run and trusted restart simulations trigger exactly once per startup.
+- [ ] 4.8 Return non-fatal diagnostics when trust, schedule storage, target profile, or scheduler activation is unavailable in compatibility mode and fail appropriately in strict mode; verify each activation policy with integration tests.
 
 ## 5. Memory Reconciliation
 
@@ -47,12 +51,12 @@
 - [ ] 6.1 Apply resolved overlays before final single-agent `AgentConfig` construction while preserving unrelated explicit settings; verify partial-overlay tests retain explicit model, tools, middleware, hooks, scheduler, and knowledge configuration.
 - [ ] 6.2 Apply resolved overlays to quorum planner and delegates and close the simple quorum builder's MCP attachment gap for existing stdio and streamable HTTP configurations; verify planner and delegate integration tests can invoke tools from each supported transport.
 - [ ] 6.3 Thread protocol workspace and selected preset context through profile runtime construction and session binding without making the TOML profile catalog parse protocol profiles; verify profile reload and bound-session behavior remain stable.
-- [ ] 6.4 Add end-to-end fixtures containing both global and workspace protocol trees and verify precedence, prompts, MCP plans, model presets, skills, internal agents, tasks, memories, provenance, and diagnostics in one runtime test.
+- [ ] 6.4 Add end-to-end fixtures containing both global and workspace protocol trees and verify precedence, prompts, MCP plans, model presets, skills, standalone/quorum delegate collisions, task approval and revocation, memories, provenance, and diagnostics in runtime tests.
 - [ ] 6.5 Run existing targeted regression suites for config loading, skills, profiles, delegation, schedules, knowledge, model switching, and remote system prompts; verify all previously supported TOML-only and programmatic paths pass with protocol loading disabled.
 
 ## 7. Documentation and Quality Gates
 
-- [ ] 7.1 Document opt-in configuration, programmatic loading/preview, supported directory layout, exact precedence, security rules, and protocol-to-QueryMT mappings in the existing agent documentation; verify examples match the generated configuration schema.
+- [ ] 7.1 Document opt-in configuration, programmatic loading/preview, supported directory layout, exact precedence, standalone/quorum sub-agent extension and collision rules, workspace-task approval policies, security rules, and protocol-to-QueryMT mappings in the existing agent documentation; verify examples match the generated configuration schema.
 - [ ] 7.2 Document unsupported `speakmcp-settings.json`, `layouts/`, `.backups/`, Hub/bundle operations, write-back, external sub-agent execution, and WebSocket MCP transport while explicitly listing MCP stdio and streamable HTTP as supported; verify the support matrix covers every top-level protocol entry and MCP transport case.
 - [ ] 7.3 Record the dependency evaluation showing that `dotagents` is a binary-only tool for a different `.dotagents/` convention and `agent-runbooks` only initializes unrelated runbooks, and verify neither crate is added to `Cargo.lock`.
 - [ ] 7.4 Run `cargo fmt --all -- --check` and fix formatting until it succeeds.

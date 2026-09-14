@@ -151,13 +151,29 @@ The system SHALL continue discovering existing configured, `.skills`, `.claude/s
 - **WHEN** global and workspace layers contain enabled skills with the same ID
 - **THEN** only the workspace skill is exposed
 
-### Requirement: Supported sub-agents become delegation targets
-The system SHALL parse `.agents/agents/<entry>/agent.md` metadata and body, apply supported fields from adjacent `config.json`, and register each enabled, supported profile as a delegation target. The profile body SHALL become that target's agent-specific system prompt. Internal connections SHALL reuse QueryMT's local runtime, model, tool, MCP, and registry facilities. MCP transport support for a sub-agent is distinct from the sub-agent's own ACP or executable connection type.
+### Requirement: Supported sub-agents extend the selected runtime's delegation registry
+The system SHALL parse `.agents/agents/<entry>/agent.md` metadata and body, apply supported fields from adjacent `config.json`, and make each enabled, supported profile available as a delegation target only when delegation is enabled for the selected QueryMT runtime. For a standalone agent configuration, protocol targets SHALL extend its delegation registry. For a quorum profile, protocol targets SHALL extend the quorum as additional delegates without replacing the configured planner or configured delegates. The profile body SHALL become that target's agent-specific system prompt. Internal connections SHALL reuse QueryMT's local runtime, model, tool, MCP, and registry facilities. MCP transport support for a sub-agent is distinct from the sub-agent's own ACP or executable connection type.
 
-#### Scenario: Internal sub-agent is valid
-- **WHEN** an enabled profile has role `delegation-target` and a supported internal connection
-- **THEN** it appears in agent discovery with its ID, name, description, and capabilities
+#### Scenario: Internal sub-agent extends a standalone agent
+- **WHEN** a standalone agent has delegation enabled and an enabled protocol profile has role `delegation-target` with a supported internal connection
+- **THEN** it appears in the standalone agent's registry with its ID, name, description, and capabilities
 - **AND** delegating to it starts or reuses the configured local runtime
+
+#### Scenario: Internal sub-agent extends a quorum profile
+- **WHEN** a quorum profile has delegation enabled and resolves an enabled supported protocol target whose ID is not explicitly configured in the quorum
+- **THEN** the target is added as an additional quorum delegate
+- **AND** the configured planner and existing delegates remain unchanged
+
+#### Scenario: Delegation is disabled
+- **WHEN** protocol targets are resolved for a standalone or quorum runtime with delegation disabled
+- **THEN** the targets remain inspectable in the manifest
+- **AND** protocol loading does not enable delegation or register active targets
+
+#### Scenario: Explicit delegate collides with a protocol target
+- **WHEN** an explicitly configured QueryMT standalone registry target or quorum delegate has the same normalized ID as a resolved protocol target
+- **THEN** the explicitly configured target wins
+- **AND** the protocol target is not registered
+- **AND** a diagnostic identifies the collision and both sources
 
 #### Scenario: Profile is disabled
 - **WHEN** a profile has `enabled: false`
@@ -169,7 +185,7 @@ The system SHALL parse `.agents/agents/<entry>/agent.md` metadata and body, appl
 - **AND** a diagnostic identifies the unsupported connection
 
 ### Requirement: Repeat tasks reconcile with durable schedules
-The system SHALL parse `.agents/tasks/<entry>/task.md` entries with `kind: task`, stable ID, prompt body, `intervalMinutes`, `enabled`, `runOnStartup`, and optional `profileId`. Enabled entries SHALL reconcile to one durable recurring task and interval schedule in the applicable QueryMT runtime. Reconciliation SHALL update changed protocol-owned records and SHALL NOT duplicate unchanged records across restarts.
+The system SHALL parse `.agents/tasks/<entry>/task.md` entries with `kind: task`, stable ID, prompt body, `intervalMinutes`, `enabled`, `runOnStartup`, and optional `profileId`. Trusted enabled entries SHALL reconcile to one durable recurring task and interval schedule in the applicable QueryMT runtime. Reconciliation SHALL update changed protocol-owned records and SHALL NOT duplicate unchanged records across restarts. Parsing and previewing task definitions SHALL NOT itself persist, schedule, or execute them.
 
 #### Scenario: Enabled interval task is loaded
 - **WHEN** a valid task specifies `intervalMinutes: 60`
@@ -184,9 +200,43 @@ The system SHALL parse `.agents/tasks/<entry>/task.md` entries with `kind: task`
 - **THEN** its protocol-owned schedule is paused or retired without deleting unrelated user-created schedules
 
 #### Scenario: Startup execution is enabled
-- **WHEN** an enabled task has `runOnStartup: true`
+- **WHEN** a trusted enabled task has `runOnStartup: true`
 - **THEN** it is triggered once after successful reconciliation for that runtime startup
 - **AND** normal interval scheduling remains active
+
+### Requirement: Workspace repeat tasks require explicit trust
+The system SHALL treat tasks discovered from a workspace `.agents/tasks/` directory as untrusted repository content by default. Before any such task is persisted, scheduled, or executed, the host SHALL receive an approval request describing the canonical workspace, task identity, schedule, startup behavior, target profile, and source path. Approval SHALL be bound to the canonical workspace identity and the effective task fingerprint. Global task behavior MAY follow an explicit host policy because the global layer is user-controlled.
+
+#### Scenario: Interactive host approves a workspace task
+- **WHEN** an untrusted workspace task is otherwise valid and the host approves its disclosed effective definition
+- **THEN** trust is recorded for that canonical workspace, task ID, and fingerprint
+- **AND** the task may be reconciled and executed according to its schedule
+
+#### Scenario: Interactive host rejects a workspace task
+- **WHEN** the host rejects a workspace task approval request
+- **THEN** the task is not persisted, scheduled, or executed
+- **AND** unrelated protocol features remain available
+
+#### Scenario: Headless host has no approval mechanism
+- **WHEN** a workspace task requires approval and the host cannot prompt or otherwise obtain a trust decision
+- **THEN** the task remains pending and inactive by default
+- **AND** a diagnostic explains how to approve it or configure an explicit task trust policy
+
+#### Scenario: Approved task definition changes
+- **WHEN** the effective content, interval, startup behavior, target profile, source layer, or other execution-relevant field of an approved workspace task changes
+- **THEN** its previous approval no longer applies
+- **AND** any protocol-owned schedule for that task is paused before further execution
+- **AND** a new approval is required for the new fingerprint
+
+#### Scenario: Explicit unsafe policy allows workspace tasks
+- **WHEN** the host explicitly configures the unsafe allow policy for protocol workspace tasks
+- **THEN** valid enabled tasks may reconcile without an interactive approval
+- **AND** startup diagnostics identify that the trust check was bypassed
+
+#### Scenario: Trust is revoked
+- **WHEN** trust for a previously reconciled workspace task or workspace is revoked
+- **THEN** its protocol-owned schedules are paused before further execution
+- **AND** unrelated user-created schedules are unchanged
 
 ### Requirement: Memories import idempotently into knowledge storage
 The system SHALL parse `.agents/memories/*.md`, derive a stable source identity from the layer and memory ID, and import enabled memories into the configured knowledge store. It SHALL map the body and supported `content`, `title`, `tags`, and `importance` metadata to knowledge fields without creating duplicates on unchanged reloads. If no knowledge store is configured, memories SHALL remain inspectable and produce a diagnostic instead of failing unrelated protocol features.

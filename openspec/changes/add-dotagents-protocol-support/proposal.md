@@ -9,8 +9,8 @@ QueryMT currently discovers skills under `.agents/skills`, but it cannot consume
 - Compose protocol instructions and system prompts into single-agent and quorum runtimes while preserving explicit QueryMT configuration.
 - Adapt protocol MCP `stdio` and `streamable-http` servers and model presets to QueryMT's existing MCP, LLM, and profile configuration; reject WebSocket and unknown MCP transports with diagnostics until QueryMT supports them.
 - Extend existing skill discovery for protocol-compatible metadata and filename casing without regressing current `.skills`, `.claude/skills`, `.qmt/skills`, or configured sources.
-- Materialize supported sub-agent profiles as delegation targets using the current agent registry and profile/runtime builders.
-- Reconcile enabled repeat tasks with the existing durable task and scheduler services, including interval and startup behavior.
+- Materialize supported sub-agent profiles as delegation targets using the current agent registry and profile/runtime builders: standalone agents gain registry targets, quorum profiles gain additional delegates, and explicit QueryMT delegates win ID collisions with protocol targets.
+- Reconcile enabled repeat tasks with the existing durable task and scheduler services, including interval and startup behavior, but require explicit fingerprint-bound trust before workspace tasks can be persisted, scheduled, or run.
 - Import memory documents idempotently into the existing knowledge store with stable source identities.
 - Reject unsafe paths and unsupported runtime mappings with actionable diagnostics; malformed entries do not hide valid siblings.
 - Document the supported protocol subset. Layout preferences, SpeakMCP settings, backup/write-back behavior, Hub publishing/installing, and unsupported external sub-agent transports remain out of scope.
@@ -31,5 +31,5 @@ None. This repository has no existing OpenSpec capabilities; current QueryMT beh
 - Public API: new protocol loader/resolver types and builder/config entry points for enabling and inspecting `.agents` support.
 - Runtime behavior: enabled protocol files can augment agent startup and workspace-specific sessions; absence of `.agents/` leaves behavior unchanged.
 - Persistence: imported tasks and memories require deterministic identities and reconciliation against existing storage to avoid duplicates across restarts.
-- Security: provider secrets, MCP environment values, executable sub-agent connections, symlinks, and path traversal require explicit validation and redacted diagnostics.
+- Security: provider secrets, MCP environment values, executable sub-agent connections, symlinks, path traversal, and repository-supplied recurring tasks require explicit validation, redacted diagnostics, and workspace-task trust controls.
 - Dependencies: reuse the existing JSON, serde, frontmatter, filesystem notification, RMCP, scheduler, profile, and knowledge infrastructure. The evaluated `dotagents` crate is an unrelated binary-only `.dotagents/` deployment tool, and `agent-runbooks` only initializes `.agent/runbooks/`; neither supplies reusable `.agents` Protocol parsing or runtime integration, so neither is added.

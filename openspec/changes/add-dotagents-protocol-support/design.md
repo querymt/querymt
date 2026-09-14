@@ -132,28 +132,46 @@ Provider availability is validated against the injected plugin registry during r
 
 Alternative considered: convert every preset into a QueryMT profile. Rejected because profiles include substantially more runtime and provider-lock semantics, while the protocol describes model presets rather than complete QueryMT runtimes.
 
-### 9. Materialize only internal sub-agent connections initially
+### 9. Extend, but do not implicitly enable, delegation
 
-Map an enabled `delegation-target` profile with `connection-type: internal` to a lazily constructed local agent handle. Compose the profile Markdown body as its specific system prompt and apply supported model preset, tools, and MCP restrictions from `config.json`. Register the resulting `AgentInfo` and handle in the existing registry used by delegation.
+Map an enabled `delegation-target` profile with `connection-type: internal` to a lazily constructed local agent handle. Compose the profile Markdown body as its specific system prompt and apply supported model preset, tools, and MCP restrictions from `config.json`.
+
+For a standalone agent with delegation enabled, register protocol `AgentInfo` and handles in its existing delegation registry. For a quorum profile with delegation enabled, add protocol targets as delegates alongside the explicitly configured quorum delegates; do not replace the planner or reinterpret the profile as a different runtime type. Protocol loading never changes a disabled delegation setting to enabled.
+
+Resolve collisions in two stages. Global and workspace protocol profiles first merge by ID using normal workspace precedence. The resulting protocol targets are then merged with explicit QueryMT registry targets or quorum delegates, where explicit QueryMT configuration wins. Skip the colliding protocol target and emit a provenance-bearing diagnostic rather than silently replacing either runtime.
 
 Use shared infrastructure and storage in the same manner as profile runtimes, while ensuring each protocol agent has a stable ID and does not recursively rediscover and register itself. Introduce a load-context marker or disable collection materialization in child overlays to prevent recursion.
 
 For stdio/executable or unknown connection types, retain metadata and emit an unsupported diagnostic; do not launch a process. ACP server support currently exposes QueryMT as a server and is not a safe client process manager.
 
+Alternative considered: always let workspace protocol targets replace configured quorum delegates. Rejected because a repository overlay should not silently replace an explicitly selected runtime topology or trusted delegate implementation.
+
 Alternative considered: launch `connection.command` directly. Rejected because the crate lacks the required permission, sandbox, cancellation, authentication, and ACP client lifecycle contract.
 
-### 10. Reconcile repeat tasks after session/runtime availability
+### 10. Gate workspace task reconciliation on explicit trust
 
-Task documents describe durable schedules but existing schedules require a session. Reconciliation therefore runs against a selected profile runtime and a designated persistent automation session. Derive deterministic creation/source keys from protocol layer identity, task ID, and profile binding. Convert `intervalMinutes` with checked multiplication to interval seconds.
+Task documents describe durable schedules but existing schedules require a session. Parsing and manifest preview remain side-effect free. Reconciliation runs only after the selected profile runtime, designated persistent automation session, and task trust policy are available. Derive deterministic creation/source keys from protocol layer identity, task ID, and profile binding. Convert `intervalMinutes` with checked multiplication to interval seconds.
 
-For each enabled task:
+Treat workspace task files as untrusted repository content. Before persistence or execution, emit a structured approval request through a host-provided trust interface containing the canonical workspace, task ID/name, prompt summary, interval, `runOnStartup`, target profile, and source. Store approvals against a canonical workspace identity, normalized task ID, and fingerprint over all execution-relevant effective fields. A changed fingerprint invalidates approval and pauses any existing protocol-owned schedule before it can run again.
+
+Support explicit task trust policies suitable for different hosts:
+
+- `prompt` (default): request approval and keep the task pending when no approval mechanism exists;
+- `deny`: never activate workspace protocol tasks;
+- `allow` (unsafe): activate without prompting and emit a prominent diagnostic.
+
+The agent crate exposes the policy and approval request/response boundary; CLI, ACP, UI, and embedding hosts decide how to present the confirmation. Global tasks may use a separately configured policy because `~/.agents` is user-controlled, but no implicit policy may weaken workspace defaults.
+
+For each trusted enabled task:
 
 - ensure the target profile/model reference resolves;
 - ensure one recurring task and schedule exist;
-- update protocol-owned prompt, interval, and enabled state when the fingerprint changes;
+- update protocol-owned prompt, interval, and enabled state when the fingerprint changes and renewed trust exists;
 - fire once per runtime startup after successful reconciliation when `runOnStartup` is true.
 
-For removed or disabled entries, pause or retire only records carrying the matching protocol ownership key. Never mutate user-created schedules. Persistence may require repository methods for lookup/upsert by protocol source key rather than implementing idempotency in memory.
+For removed, disabled, changed-but-unapproved, or trust-revoked entries, pause or retire only records carrying the matching protocol ownership key. Never mutate user-created schedules. Persistence requires repository methods for lookup/upsert by protocol source key and trust state rather than implementing idempotency in memory.
+
+Alternative considered: trust any task merely because protocol loading is enabled. Rejected because a cloned repository could silently schedule tool-capable prompts or execute them at startup.
 
 Alternative considered: create a fresh session and schedule on every startup. Rejected because it duplicates durable records and defeats portable declarative configuration.
 
@@ -194,9 +212,11 @@ Alternative considered: automatically enable protocol loading for every builder.
 - [Layer precedence can surprise callers with existing explicit config] -> Require opt-in, expose resolved provenance, and allow roots/layers to be disabled independently.
 - [Startup gains filesystem and persistence work] -> Keep parse/resolve synchronous and bounded, materialize sub-agents lazily, batch reconciliation, and avoid recursive scans except existing skill compatibility paths.
 - [Task reconciliation can corrupt user schedules] -> Require protocol ownership keys and repository-level compare/update operations; never infer ownership from names alone.
+- [A repository can smuggle malicious scheduled or startup prompts] -> Default workspace tasks to fingerprint-bound approval, keep them inactive in headless mode without approval, pause them on changes or trust revocation, and make unsafe allow an explicit auditable policy.
 - [Memory edits and removals exceed current append-oriented APIs] -> Add narrowly scoped source reconciliation semantics and migration tests before enabling automatic imports.
 - [Secrets in inspectable configuration can leak] -> Separate internal secret values from public/redacted manifest views and add debug/serialization leak tests.
 - [Protocol sub-agents can recursively load collections] -> Carry a materialization depth/context flag and disable inherited agent/task reconciliation for child construction.
+- [Protocol targets can collide with trusted standalone or quorum delegates] -> Merge protocol layers first, then give explicit QueryMT targets precedence and emit source-aware collision diagnostics.
 - [The simple quorum API currently drops resolved MCP servers] -> Wire supported stdio and streamable HTTP MCP configurations into planner and delegate handles using the existing lifecycle, with integration tests proving attachment; do not misclassify this wiring gap as a transport limitation.
 - [Global configuration is user-controlled while workspace configuration may be repository-controlled] -> Apply the same path confinement and command safety rules to both; do not activate unsupported executable agents.
 
