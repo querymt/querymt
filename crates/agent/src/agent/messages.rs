@@ -20,6 +20,7 @@ pub use crate::agent::turn_control::{InputDelivery, SubmitInput, SubmitInputResu
 use querymt::LLMParams;
 use querymt::chat::ReasoningEffort;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use typeshare::typeshare;
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -300,6 +301,14 @@ pub struct ExtNotification {
 /// NOT serializable — contains `ClientBridgeSender` (mpsc channel).
 pub struct SetBridge {
     pub bridge: ClientBridgeSender,
+}
+
+#[cfg(test)]
+pub struct GetBridge;
+
+/// Clear a connection-local bridge only if it still belongs to that connection.
+pub struct ClearBridge {
+    pub connection_id: Arc<str>,
 }
 
 /// Stop this session actor gracefully.

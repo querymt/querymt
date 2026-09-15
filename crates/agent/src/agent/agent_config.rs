@@ -4,9 +4,11 @@
 //! It holds all shared/immutable state that session actors need. It is NOT
 //! an actor — it has no lifecycle or message processing needs.
 
+use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::core::{
     AgentMode, DelegationContextConfig, SnapshotPolicy, ToolConfig, ToolPolicy,
 };
+use crate::agent::remote::SessionActorRef;
 use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{DelegationWaitPolicy, McpServerConfig, RuntimeExecutionPolicy};
 use crate::delegation::AgentRegistry;
@@ -25,8 +27,14 @@ use crate::tools::ToolRegistry;
 use arc_swap::ArcSwap;
 use kameo::actor::ActorRef;
 use querymt::chat::ReasoningEffort;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
+
+#[derive(Clone)]
+pub(crate) struct SessionBridgeRoute {
+    pub bridge: ClientBridgeSender,
+    pub session_ref: SessionActorRef,
+}
 
 /// Shared agent configuration and infrastructure.
 ///
@@ -44,6 +52,7 @@ pub struct AgentConfig {
     pub agent_registry: Arc<dyn AgentRegistry + Send + Sync>,
     pub delegate_model_overrides: crate::delegation::DelegateModelOverrideStore,
     pub workspace_manager_actor: ActorRef<WorkspaceIndexManagerActor>,
+    pub(crate) session_bridges: Arc<StdMutex<HashMap<String, SessionBridgeRoute>>>,
 
     // ── Defaults (used when spawning new sessions) ───────────────
     /// Shared live reference to the default agent mode.

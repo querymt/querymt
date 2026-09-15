@@ -2,8 +2,8 @@
 //!
 //! This module provides a pure ACP server over WebSocket without any dashboard UI.
 //! Session catalog updates are advertised on the JSON-RPC dispatch path after
-//! `session/new`, `session/load`, and `session/resume`. Live events still fan out
-//! per connection; WebSocket does not attach an agent-level client bridge.
+//! `session/new`, `session/load`, and `session/resume`. Live events fan out per
+//! subscribed connection, while interactive ACP requests use a session-scoped bridge.
 //!
 //! ## Usage
 //!
@@ -17,17 +17,19 @@
 //!     .build()
 //!     .await?;
 //!
-//! // Start standalone WebSocket server on ws://127.0.0.1:3030/ws
+//! // Start standalone WebSocket server on ws://127.0.0.1:3030/acp/ws
 //! serve_websocket(agent.inner(), "127.0.0.1:3030").await?;
 //! # Ok(())
 //! # }
 //! ```
 
-use crate::acp::protocol::CreateElicitationRequest;
+use crate::acp::client_bridge::{ClientBridgeMessage, ClientBridgeSender};
+use crate::acp::protocol::{Error, ExtNotification, RequestPermissionResponse};
 use crate::acp::shared::{
-    AcpLiveEventTranslator, PendingElicitationMap, PermissionMap, RpcMessage, SessionOwnerMap,
-    collect_event_sources, convert_elicitation_response_value, create_elicitation_request,
-    dispatch_rpc_message, is_event_owned,
+    AcpLiveEventTranslator, PendingElicitationMap, PermissionMap, RpcDispatchContext,
+    RpcDispatchState, RpcMessage, SessionOwnerMap, collect_event_sources,
+    convert_elicitation_response_value, create_elicitation_request,
+    dispatch_rpc_message_with_context, is_event_owned, remove_connection_subscriptions,
 };
 use crate::acp::shutdown;
 use crate::event_fanout::EventFanout;
@@ -37,7 +39,8 @@ use axum::{
         State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    response::IntoResponse,
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
     routing::get,
 };
 use futures_util::{sink::SinkExt, stream::StreamExt as FuturesStreamExt};
@@ -57,28 +60,38 @@ pub(crate) struct WsServerState {
     pub(crate) pending_elicitations: PendingElicitationMap,
     pub(crate) event_sources: Vec<Arc<EventFanout>>,
     pub(crate) session_owners: SessionOwnerMap,
+    pub(crate) connection_bridges: Arc<Mutex<HashMap<String, ClientBridgeSender>>>,
+    require_same_origin: bool,
 }
 
 impl WsServerState {
     pub(crate) fn new(agent: Arc<crate::agent::LocalAgentHandle>) -> Self {
+        Self::with_same_origin(agent, false)
+    }
+
+    fn with_same_origin(
+        agent: Arc<crate::agent::LocalAgentHandle>,
+        require_same_origin: bool,
+    ) -> Self {
         Self {
             event_sources: collect_event_sources(&agent),
             pending_permissions: Arc::new(Mutex::new(HashMap::new())),
             pending_elicitations: agent.pending_elicitations(),
             session_owners: Arc::new(Mutex::new(HashMap::new())),
+            connection_bridges: Arc::new(Mutex::new(HashMap::new())),
+            require_same_origin,
             agent,
         }
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct PendingWsElicitation {
-    pub(crate) session_id: String,
-    pub(crate) elicitation_id: String,
+pub(crate) struct PendingWsRequest {
+    pub(crate) method: &'static str,
     pub(crate) response_tx: oneshot::Sender<Result<serde_json::Value, serde_json::Value>>,
 }
 
-pub(crate) type PendingWsRequestMap = Arc<Mutex<HashMap<String, PendingWsElicitation>>>;
+pub(crate) type PendingWsRequestMap = Arc<Mutex<HashMap<String, PendingWsRequest>>>;
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -93,14 +106,15 @@ enum InboundWsMessage {
     },
 }
 
-fn websocket_elicitation_request(
+fn websocket_request<T: serde::Serialize>(
     request_id: &str,
-    request: &CreateElicitationRequest,
+    method: &'static str,
+    request: &T,
 ) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": request_id,
-        "method": "elicitation/create",
+        "method": method,
         "params": request,
     })
 }
@@ -131,9 +145,9 @@ pub(crate) async fn route_websocket_response(
     };
     if pending.response_tx.send(response).is_err() {
         log::debug!(
-            "WebSocket elicitation response receiver dropped: session_id={} elicitation_id={}",
-            pending.session_id,
-            pending.elicitation_id
+            "WebSocket response receiver dropped: method={} request_id={}",
+            pending.method,
+            key
         );
     }
     true
@@ -153,6 +167,160 @@ pub(crate) async fn cancel_pending_websocket_requests(pending_requests: &Pending
             "message": "WebSocket connection closed",
         })));
     }
+}
+
+async fn send_websocket_request<T: serde::Serialize>(
+    tx: &mpsc::Sender<String>,
+    pending_requests: &PendingWsRequestMap,
+    request_counter: &AtomicU64,
+    conn_id: &str,
+    method: &'static str,
+    params: &T,
+) -> Result<serde_json::Value, Error> {
+    let request_id = format!(
+        "querymt:{}:{}",
+        conn_id,
+        request_counter.fetch_add(1, Ordering::Relaxed)
+    );
+    let request_key = response_id_key(&serde_json::Value::String(request_id.clone()));
+    let (response_tx, response_rx) = oneshot::channel();
+    pending_requests.lock().await.insert(
+        request_key.clone(),
+        PendingWsRequest {
+            method,
+            response_tx,
+        },
+    );
+
+    let json = match serde_json::to_string(&websocket_request(&request_id, method, params)) {
+        Ok(json) => json,
+        Err(err) => {
+            pending_requests.lock().await.remove(&request_key);
+            return Err(Error::internal_error().data(err.to_string()));
+        }
+    };
+    if tx.send(json).await.is_err() {
+        pending_requests.lock().await.remove(&request_key);
+        return Err(Error::internal_error().data("WebSocket connection closed"));
+    }
+
+    match response_rx.await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(Error::internal_error().data(error)),
+        Err(_) => Err(Error::internal_error().data("WebSocket response channel dropped")),
+    }
+}
+
+pub(crate) async fn run_websocket_bridge(
+    mut rx: mpsc::Receiver<ClientBridgeMessage>,
+    tx: mpsc::Sender<String>,
+    pending_requests: PendingWsRequestMap,
+    request_counter: Arc<AtomicU64>,
+    conn_id: String,
+) {
+    while let Some(message) = rx.recv().await {
+        match message {
+            ClientBridgeMessage::Notification(notification) => {
+                if send_websocket_notification(&tx, "session/update", &notification)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            ClientBridgeMessage::Flush { response_tx } => {
+                let _ = response_tx.send(Ok(()));
+            }
+            ClientBridgeMessage::ExtNotification(notification) => {
+                if send_websocket_ext_notification(&tx, notification)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            ClientBridgeMessage::RequestPermission {
+                request,
+                response_tx,
+            } => {
+                let result = send_websocket_request(
+                    &tx,
+                    &pending_requests,
+                    &request_counter,
+                    &conn_id,
+                    "session/request_permission",
+                    &request,
+                )
+                .await
+                .and_then(|value| {
+                    serde_json::from_value::<RequestPermissionResponse>(value)
+                        .map_err(|err| Error::invalid_params().data(err.to_string()))
+                });
+                let _ = response_tx.send(result);
+            }
+            ClientBridgeMessage::Elicit {
+                elicitation_id,
+                session_id,
+                message,
+                requested_schema,
+                source,
+                response_tx,
+            } => {
+                let result = match create_elicitation_request(
+                    elicitation_id,
+                    session_id,
+                    message,
+                    requested_schema,
+                    source,
+                ) {
+                    Ok(request) => send_websocket_request(
+                        &tx,
+                        &pending_requests,
+                        &request_counter,
+                        &conn_id,
+                        "elicitation/create",
+                        &request,
+                    )
+                    .await
+                    .and_then(convert_elicitation_response_value),
+                    Err(error) => Err(error),
+                };
+                let _ = response_tx.send(result);
+            }
+            ClientBridgeMessage::WorkspaceQuery { response_tx, .. } => {
+                let _ = response_tx.send(Err(Error::method_not_found()));
+            }
+        }
+    }
+}
+
+async fn send_websocket_notification<T: serde::Serialize>(
+    tx: &mpsc::Sender<String>,
+    method: &str,
+    params: &T,
+) -> Result<(), ()> {
+    let wire = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+    });
+    let json = serde_json::to_string(&wire).map_err(|_| ())?;
+    tx.send(json).await.map_err(|_| ())
+}
+
+async fn send_websocket_ext_notification(
+    tx: &mpsc::Sender<String>,
+    notification: ExtNotification,
+) -> Result<(), ()> {
+    let params: serde_json::Value =
+        serde_json::from_str(notification.params.get()).map_err(|_| ())?;
+    let wire = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": notification.method,
+        "params": params,
+    });
+    let json = serde_json::to_string(&wire).map_err(|_| ())?;
+    tx.send(json).await.map_err(|_| ())
 }
 
 async fn resolve_websocket_elicitation(
@@ -215,7 +383,7 @@ async fn resolve_websocket_elicitation(
 ///     .build()
 ///     .await?;
 ///
-/// println!("Starting WebSocket ACP server on ws://127.0.0.1:3030/ws");
+/// println!("Starting WebSocket ACP server on ws://127.0.0.1:3030/acp/ws");
 /// serve_websocket(agent.inner(), "127.0.0.1:3030").await?;
 /// # Ok(())
 /// # }
@@ -234,7 +402,7 @@ pub async fn serve_websocket(
     let app = router(agent);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    log::info!("WebSocket ACP server listening on ws://{}/ws", addr);
+    log::info!("WebSocket ACP server listening on ws://{}/acp/ws", addr);
     log::info!("Press Ctrl+C to stop");
 
     // Run with graceful shutdown
@@ -246,18 +414,56 @@ pub async fn serve_websocket(
     Ok(())
 }
 
-/// WebSocket upgrade handler
+/// WebSocket upgrade handler mounted at the canonical ACP endpoint.
 pub(crate) fn router(agent: Arc<crate::agent::LocalAgentHandle>) -> Router {
+    Router::new().nest("/acp", websocket_router(WsServerState::new(agent)))
+}
+
+pub(crate) fn same_origin_router(agent: Arc<crate::agent::LocalAgentHandle>) -> Router {
+    Router::new().nest(
+        "/acp",
+        websocket_router(WsServerState::with_same_origin(agent, true)),
+    )
+}
+
+fn websocket_router(state: WsServerState) -> Router {
     Router::new()
         .route("/ws", get(websocket_handler))
-        .with_state(WsServerState::new(agent))
+        .with_state(state)
 }
 
 async fn websocket_handler(
     ws: WebSocketUpgrade,
     State(state): State<WsServerState>,
-) -> impl IntoResponse {
+    headers: HeaderMap,
+) -> Response {
+    if state.require_same_origin && !has_allowed_websocket_origin(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     ws.on_upgrade(|socket| handle_websocket_connection(socket, state))
+        .into_response()
+}
+
+pub(crate) fn has_allowed_websocket_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        // Non-browser ACP clients do not send Origin.
+        return true;
+    };
+    let (Some(origin), Some(host)) = (
+        origin.to_str().ok(),
+        headers
+            .get(header::HOST)
+            .and_then(|host| host.to_str().ok()),
+    ) else {
+        return false;
+    };
+    let Ok(origin) = origin.parse::<axum::http::Uri>() else {
+        return false;
+    };
+    matches!(origin.scheme_str(), Some("http" | "https"))
+        && origin
+            .authority()
+            .is_some_and(|authority| authority.as_str().eq_ignore_ascii_case(host))
 }
 
 /// Handle a WebSocket connection lifecycle
@@ -271,6 +477,13 @@ async fn handle_websocket_connection(socket: WebSocket, state: WsServerState) {
     let forwarded_elicitations = Arc::new(Mutex::new(HashSet::new()));
     let request_counter = Arc::new(AtomicU64::new(1));
     let connection_cancel = CancellationToken::new();
+    let (bridge_tx, bridge_rx) = mpsc::channel::<ClientBridgeMessage>(100);
+    let session_bridge = ClientBridgeSender::for_connection(bridge_tx, conn_id.clone());
+    state
+        .connection_bridges
+        .lock()
+        .await
+        .insert(conn_id.clone(), session_bridge.clone());
 
     spawn_event_forwarders(
         state.clone(),
@@ -279,10 +492,18 @@ async fn handle_websocket_connection(socket: WebSocket, state: WsServerState) {
             tx: tx.clone(),
             pending_requests: pending_requests.clone(),
             forwarded_elicitations,
-            request_counter,
+            request_counter: request_counter.clone(),
             connection_cancel: connection_cancel.clone(),
         },
     );
+
+    let bridge_task = tokio::spawn(run_websocket_bridge(
+        bridge_rx,
+        tx.clone(),
+        pending_requests.clone(),
+        request_counter.clone(),
+        conn_id.clone(),
+    ));
 
     let mut send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -296,19 +517,26 @@ async fn handle_websocket_connection(socket: WebSocket, state: WsServerState) {
     let state_receive = state.clone();
     let tx_receive = tx.clone();
     let pending_receive = pending_requests.clone();
+    let bridge_receive = session_bridge;
     let mut receive_task = tokio::spawn(async move {
         while let Some(result) = FuturesStreamExt::next(&mut ws_receiver).await {
             match result {
                 Ok(Message::Text(text)) => match serde_json::from_str::<InboundWsMessage>(&text) {
                     Ok(InboundWsMessage::Request(request)) => {
-                        tokio::spawn(dispatch_rpc_message(
-                            state_receive.agent.clone(),
-                            state_receive.session_owners.clone(),
-                            state_receive.pending_permissions.clone(),
-                            state_receive.pending_elicitations.clone(),
-                            conn_id_receive.clone(),
+                        tokio::spawn(dispatch_rpc_message_with_context(
+                            RpcDispatchState {
+                                agent: state_receive.agent.clone(),
+                                session_owners: state_receive.session_owners.clone(),
+                                pending_permissions: state_receive.pending_permissions.clone(),
+                                pending_elicitations: state_receive.pending_elicitations.clone(),
+                                conn_id: conn_id_receive.clone(),
+                                tx: tx_receive.clone(),
+                            },
                             request,
-                            tx_receive.clone(),
+                            RpcDispatchContext {
+                                session_hooks: None,
+                                session_bridge: Some(bridge_receive.clone()),
+                            },
                         ));
                     }
                     Ok(InboundWsMessage::Response { id, result, error }) => {
@@ -341,11 +569,37 @@ async fn handle_websocket_connection(socket: WebSocket, state: WsServerState) {
     connection_cancel.cancel();
     send_task.abort();
     receive_task.abort();
+    bridge_task.abort();
 
     cancel_pending_websocket_requests(&pending_requests).await;
-
-    let mut owners = state.session_owners.lock().await;
-    owners.retain(|_, owner| owner != &conn_id);
+    state.connection_bridges.lock().await.remove(&conn_id);
+    let fallback_sessions = remove_connection_subscriptions(&state.session_owners, &conn_id).await;
+    for (session_id, fallback_conn_id) in fallback_sessions {
+        let cleared = state
+            .agent
+            .clear_session_bridge(&session_id, Arc::from(conn_id.as_str()))
+            .await;
+        if !cleared {
+            continue;
+        }
+        let fallback_bridge = match fallback_conn_id {
+            Some(fallback_conn_id) => state
+                .connection_bridges
+                .lock()
+                .await
+                .get(&fallback_conn_id)
+                .cloned(),
+            None => None,
+        };
+        if let Some(fallback_bridge) = fallback_bridge
+            && let Err(err) = state
+                .agent
+                .set_session_bridge(&session_id, fallback_bridge)
+                .await
+        {
+            log::debug!("Failed to restore ACP bridge for session {session_id}: {err}");
+        }
+    }
     log::info!("WebSocket connection closed: {}", conn_id);
 }
 
@@ -366,7 +620,108 @@ pub(crate) struct ConnectionEventState {
     pub(crate) connection_cancel: CancellationToken,
 }
 
+fn spawn_global_notification_forwarders(state: WsServerState, connection: ConnectionEventState) {
+    let mut notifications = state.agent.subscribe_ext_notifications();
+    let tx = connection.tx.clone();
+    let cancel = connection.connection_cancel.clone();
+    tokio::spawn(async move {
+        loop {
+            let notification = tokio::select! {
+                _ = cancel.cancelled() => break,
+                result = notifications.recv() => match result {
+                    Ok(notification) => notification,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+            };
+            if send_websocket_ext_notification(&tx, notification)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let mut model_updates = state.agent.model_inventory.subscribe_updates();
+    let tx = connection.tx.clone();
+    let cancel = connection.connection_cancel.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                result = model_updates.recv() => match result {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+            }
+            let params = crate::control::notifications::ModelsChangedNotification {
+                reason: "refresh_completed".to_string(),
+            };
+            if send_websocket_notification(
+                &tx,
+                crate::acp::shared::QMT_NOTIFICATION_MODELS_CHANGED,
+                &params,
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    #[cfg(feature = "remote")]
+    if let Some(mesh) = state.agent.mesh() {
+        let mut peer_events = mesh.subscribe_peer_events();
+        let tx = connection.tx;
+        let cancel = connection.connection_cancel;
+        tokio::spawn(async move {
+            loop {
+                let event = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    result = peer_events.recv() => match result {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                };
+                let result = match event {
+                    crate::agent::remote::mesh::PeerEvent::Discovered(peer_id) => {
+                        let params = crate::control::notifications::MeshNodesChangedNotification {
+                            peer_id: peer_id.to_string(),
+                            change: "discovered".to_string(),
+                        };
+                        send_websocket_notification(
+                            &tx,
+                            crate::acp::shared::QMT_NOTIFICATION_MESH_NODES_CHANGED,
+                            &params,
+                        )
+                        .await
+                    }
+                    crate::agent::remote::mesh::PeerEvent::Expired(peer_id) => {
+                        let params = crate::control::notifications::MeshPeerExpiredNotification {
+                            peer_id: peer_id.to_string(),
+                        };
+                        send_websocket_notification(
+                            &tx,
+                            crate::acp::shared::QMT_NOTIFICATION_MESH_PEER_EXPIRED,
+                            &params,
+                        )
+                        .await
+                    }
+                    _ => continue,
+                };
+                if result.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
 pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: ConnectionEventState) {
+    spawn_global_notification_forwarders(state.clone(), connection.clone());
     let translator = Arc::new(StdMutex::new(AcpLiveEventTranslator::new()));
     for event_source in &state.event_sources {
         let mut events = event_source.subscribe();
@@ -444,14 +799,14 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
                     let (response_tx, response_rx) = oneshot::channel();
                     pending_events.lock().await.insert(
                         request_key.clone(),
-                        PendingWsElicitation {
-                            session_id: session_id.clone(),
-                            elicitation_id: elicitation_id.clone(),
+                        PendingWsRequest {
+                            method: "elicitation/create",
                             response_tx,
                         },
                     );
 
-                    let wire_request = websocket_elicitation_request(&request_id, &request);
+                    let wire_request =
+                        websocket_request(&request_id, "elicitation/create", &request);
                     let json = match serde_json::to_string(&wire_request) {
                         Ok(json) => json,
                         Err(err) => {

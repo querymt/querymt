@@ -1,15 +1,70 @@
 use super::websocket::{
-    ConnectionEventState, PendingWsElicitation, PendingWsRequestMap, WsServerState,
-    cancel_pending_websocket_requests, route_websocket_response, spawn_event_forwarders,
+    ConnectionEventState, PendingWsRequest, PendingWsRequestMap, WsServerState,
+    cancel_pending_websocket_requests, has_allowed_websocket_origin, route_websocket_response,
+    router, run_websocket_bridge, spawn_event_forwarders,
+};
+use crate::acp::client_bridge::{ClientBridgeMessage, ClientBridgeSender};
+use crate::acp::protocol::{
+    PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionId,
+    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use crate::elicitation::{ElicitationAction, insert_pending_elicitation};
 use crate::events::{AgentEventKind, DurableEvent, EphemeralEvent, EventEnvelope, EventOrigin};
+use axum::{
+    body::Body,
+    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
+use tower::ServiceExt;
+
+#[tokio::test]
+async fn standalone_websocket_uses_canonical_acp_path() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let app = router(fixture.handle);
+
+    let canonical = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/acp/ws")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("canonical ACP WebSocket response");
+    assert_ne!(canonical.status(), StatusCode::NOT_FOUND);
+
+    let legacy = app
+        .oneshot(Request::builder().uri("/ws").body(Body::empty()).unwrap())
+        .await
+        .expect("legacy WebSocket response");
+    assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn dashboard_websocket_origin_must_match_host() {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:3000"));
+    assert!(has_allowed_websocket_origin(&headers));
+
+    headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("http://127.0.0.1:3000"),
+    );
+    assert!(has_allowed_websocket_origin(&headers));
+
+    headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("https://attacker.example"),
+    );
+    assert!(!has_allowed_websocket_origin(&headers));
+}
 
 fn elicitation_event(session_id: &str, elicitation_id: &str) -> EventEnvelope {
     EventEnvelope::Ephemeral(EphemeralEvent {
@@ -46,7 +101,7 @@ async fn websocket_event_forwarder_sends_native_elicitation_and_resolves_respons
         .session_owners
         .lock()
         .await
-        .insert(session_id.to_string(), "conn".to_string());
+        .insert(session_id.to_string(), HashSet::from(["conn".to_string()]));
 
     let (waiter_tx, waiter_rx) = oneshot::channel();
     insert_pending_elicitation(
@@ -125,7 +180,7 @@ async fn websocket_event_forwarder_emits_owned_delegation_update() {
         .session_owners
         .lock()
         .await
-        .insert(session_id.to_string(), "conn".to_string());
+        .insert(session_id.to_string(), HashSet::from(["conn".to_string()]));
 
     let (wire_tx, mut wire_rx) = mpsc::channel::<String>(4);
     let cancel = CancellationToken::new();
@@ -189,14 +244,158 @@ async fn websocket_event_forwarder_emits_owned_delegation_update() {
 }
 
 #[tokio::test]
+async fn websocket_connections_receive_global_extension_notifications() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let state = WsServerState::new(fixture.handle.clone());
+    let mut receivers = Vec::new();
+    let mut cancellations = Vec::new();
+
+    for conn_id in ["conn-a", "conn-b"] {
+        let (wire_tx, wire_rx) = mpsc::channel::<String>(4);
+        let cancel = CancellationToken::new();
+        spawn_event_forwarders(
+            state.clone(),
+            ConnectionEventState {
+                conn_id: conn_id.to_string(),
+                tx: wire_tx,
+                pending_requests: Arc::new(Mutex::new(HashMap::new())),
+                forwarded_elicitations: Arc::new(Mutex::new(HashSet::new())),
+                request_counter: Arc::new(AtomicU64::new(1)),
+                connection_cancel: cancel.clone(),
+            },
+        );
+        receivers.push(wire_rx);
+        cancellations.push(cancel);
+    }
+
+    let params = serde_json::value::RawValue::from_string(
+        serde_json::json!({"change": "created"}).to_string(),
+    )
+    .expect("raw params");
+    fixture
+        .handle
+        .broadcast_ext_notification(crate::acp::protocol::ExtNotification::new(
+            crate::acp::shared::QMT_NOTIFICATION_SCHEDULES_CHANGED,
+            Arc::from(params),
+        ));
+
+    for receiver in &mut receivers {
+        let wire = timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("notification should reach every connection")
+            .expect("wire channel should remain open");
+        let value: serde_json::Value = serde_json::from_str(&wire).expect("valid notification");
+        assert_eq!(value["method"], "querymt/schedules/changed");
+        assert_eq!(value["params"]["change"], "created");
+    }
+    for cancel in cancellations {
+        cancel.cancel();
+    }
+}
+
+#[tokio::test]
+async fn websocket_connections_receive_model_refresh_notifications() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let state = WsServerState::new(fixture.handle.clone());
+    let (wire_tx, mut wire_rx) = mpsc::channel::<String>(4);
+    let cancel = CancellationToken::new();
+    spawn_event_forwarders(
+        state,
+        ConnectionEventState {
+            conn_id: "conn".to_string(),
+            tx: wire_tx,
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            forwarded_elicitations: Arc::new(Mutex::new(HashSet::new())),
+            request_counter: Arc::new(AtomicU64::new(1)),
+            connection_cancel: cancel.clone(),
+        },
+    );
+
+    let refresh = fixture.handle.model_inventory.trigger_refresh().await;
+    refresh.wait().await;
+    let wire = timeout(Duration::from_secs(2), wire_rx.recv())
+        .await
+        .expect("model refresh notification should arrive")
+        .expect("wire channel should remain open");
+    let value: serde_json::Value = serde_json::from_str(&wire).expect("valid notification");
+    assert_eq!(value["method"], "querymt/models/changed");
+    assert_eq!(value["params"]["reason"], "refresh_completed");
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn websocket_bridge_round_trips_permission_requests() {
+    let (bridge_tx, bridge_rx) = mpsc::channel::<ClientBridgeMessage>(4);
+    let bridge = ClientBridgeSender::for_connection(bridge_tx, "conn");
+    let (wire_tx, mut wire_rx) = mpsc::channel::<String>(4);
+    let pending: PendingWsRequestMap = Arc::new(Mutex::new(HashMap::new()));
+    let bridge_task = tokio::spawn(run_websocket_bridge(
+        bridge_rx,
+        wire_tx,
+        pending.clone(),
+        Arc::new(AtomicU64::new(1)),
+        "conn".to_string(),
+    ));
+
+    let request = RequestPermissionRequest::new(
+        SessionId::from("session"),
+        ToolCallUpdate::new(
+            ToolCallId::from("tool-call"),
+            ToolCallUpdateFields::new().status(ToolCallStatus::Pending),
+        ),
+        vec![PermissionOption::new(
+            PermissionOptionId::from("allow_once"),
+            "Allow once",
+            PermissionOptionKind::AllowOnce,
+        )],
+    );
+    let permission = tokio::spawn(async move { bridge.request_permission(request).await });
+
+    let wire = timeout(Duration::from_secs(2), wire_rx.recv())
+        .await
+        .expect("permission request should be sent")
+        .expect("wire channel should remain open");
+    let value: serde_json::Value = serde_json::from_str(&wire).expect("valid JSON-RPC request");
+    assert_eq!(value["method"], "session/request_permission");
+    assert_eq!(value["params"]["sessionId"], "session");
+    assert_eq!(value["params"]["toolCall"]["toolCallId"], "tool-call");
+
+    assert!(
+        route_websocket_response(
+            &pending,
+            value["id"].clone(),
+            Some(
+                serde_json::to_value(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                        "allow_once",
+                    )),
+                ))
+                .expect("response serializes"),
+            ),
+            None,
+        )
+        .await
+    );
+    let response = permission
+        .await
+        .expect("permission task should join")
+        .expect("permission response should parse");
+    assert!(matches!(
+        response.outcome,
+        RequestPermissionOutcome::Selected(selected)
+            if selected.option_id.0.as_ref() == "allow_once"
+    ));
+    bridge_task.abort();
+}
+
+#[tokio::test]
 async fn websocket_response_router_handles_errors_unknown_ids_and_disconnects() {
     let pending: PendingWsRequestMap = Arc::new(Mutex::new(HashMap::new()));
     let (error_tx, error_rx) = oneshot::channel();
     pending.lock().await.insert(
         "\"request-1\"".to_string(),
-        PendingWsElicitation {
-            session_id: "session".to_string(),
-            elicitation_id: "elicitation".to_string(),
+        PendingWsRequest {
+            method: "test/error",
             response_tx: error_tx,
         },
     );
@@ -219,9 +418,8 @@ async fn websocket_response_router_handles_errors_unknown_ids_and_disconnects() 
     let (disconnect_tx, disconnect_rx) = oneshot::channel();
     pending.lock().await.insert(
         "\"request-2\"".to_string(),
-        PendingWsElicitation {
-            session_id: "session".to_string(),
-            elicitation_id: "disconnect".to_string(),
+        PendingWsRequest {
+            method: "test/disconnect",
             response_tx: disconnect_tx,
         },
     );
@@ -234,11 +432,10 @@ async fn websocket_response_router_handles_errors_unknown_ids_and_disconnects() 
 async fn websocket_event_forwarder_deduplicates_elicitation_requests() {
     let fixture = crate::test_utils::TestAgent::new().await;
     let state = WsServerState::new(fixture.handle.clone());
-    state
-        .session_owners
-        .lock()
-        .await
-        .insert("ws-session".to_string(), "conn".to_string());
+    state.session_owners.lock().await.insert(
+        "ws-session".to_string(),
+        HashSet::from(["conn".to_string()]),
+    );
     let (wire_tx, mut wire_rx) = mpsc::channel::<String>(4);
     let cancel = CancellationToken::new();
     spawn_event_forwarders(

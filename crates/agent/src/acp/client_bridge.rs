@@ -38,6 +38,7 @@ use crate::acp::protocol::{
     Error, ExtNotification, RequestPermissionRequest, RequestPermissionResponse,
     SessionNotification,
 };
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 /// Messages sent from agent tasks to the active ACP bridge task.
@@ -137,6 +138,7 @@ impl NotificationForwardingState {
 #[derive(Clone)]
 pub struct ClientBridgeSender {
     tx: mpsc::Sender<ClientBridgeMessage>,
+    connection_id: Option<Arc<str>>,
 }
 
 impl ClientBridgeSender {
@@ -144,7 +146,24 @@ impl ClientBridgeSender {
     ///
     /// This is typically called by the ACP server when setting up the bridge.
     pub fn new(tx: mpsc::Sender<ClientBridgeMessage>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            connection_id: None,
+        }
+    }
+
+    pub(crate) fn for_connection(
+        tx: mpsc::Sender<ClientBridgeMessage>,
+        connection_id: impl Into<Arc<str>>,
+    ) -> Self {
+        Self {
+            tx,
+            connection_id: Some(connection_id.into()),
+        }
+    }
+
+    pub(crate) fn connection_id(&self) -> Option<&str> {
+        self.connection_id.as_deref()
     }
 
     /// Send a session notification (fire-and-forget).

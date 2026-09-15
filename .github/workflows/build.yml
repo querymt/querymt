@@ -12,13 +12,51 @@ on:
         required: false
         type: boolean
         default: false
+      dashboard_ng_revision:
+        description: 'Published querymt-desktop revision to embed; empty keeps legacy-only releases'
+        required: false
+        type: string
+        default: ''
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  dashboard-ng-ui:
+    name: Build dashboard-ng UI
+    if: inputs.dashboard_ng_revision != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout embedded dashboard source
+        uses: actions/checkout@v7
+        with:
+          repository: querymt/querymt-desktop
+          ref: ${{ inputs.dashboard_ng_revision }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Build and verify embedded dashboard
+        env:
+          QUERYMT_UI_REVISION: ${{ inputs.dashboard_ng_revision }}
+        run: |
+          bun install --frozen-lockfile
+          bun run test:embedded
+          bun run build:embedded
+          test "$(jq -r .target build-embedded/querymt-ui.json)" = embedded
+          test "$(jq -r .acpWebSocketPath build-embedded/querymt-ui.json)" = /acp/ws
+
+      - name: Upload embedded dashboard
+        uses: actions/upload-artifact@v7
+        with:
+          name: qmtcode-dashboard-ng-ui
+          path: build-embedded
+          if-no-files-found: error
+
   build:
     name: Build ${{ matrix.binary }} for ${{ matrix.target }}
+    needs: dashboard-ng-ui
+    if: always() && (needs.dashboard-ng-ui.result == 'success' || needs.dashboard-ng-ui.result == 'skipped')
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -146,6 +184,13 @@ jobs:
         if: matrix.binary == 'qmtcode' && matrix.target != 'x86_64-unknown-freebsd'
         uses: oven-sh/setup-bun@v2
 
+      - name: Download embedded dashboard
+        if: matrix.binary == 'qmtcode' && inputs.dashboard_ng_revision != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: qmtcode-dashboard-ng-ui
+          path: dashboard-ng-ui
+
       # Build qmt binary (default package)
       - name: Build qmt with Cargo
         if: matrix.binary == 'qmt'
@@ -159,8 +204,9 @@ jobs:
         if: matrix.binary == 'qmtcode'
         env:
           QMT_VERSION: ${{ inputs.version_name }}
+          QMT_DASHBOARD_NG_DIST: ${{ inputs.dashboard_ng_revision != '' && format('{0}/dashboard-ng-ui', github.workspace) || '' }}
           RUSTFLAGS: ${{ matrix.rust_flags || '' }}
-        run: cargo build --release -p ${{ matrix.cargo_package }} --example qmtcode --features ${{ matrix.cargo_features }} --target ${{ matrix.target }}
+        run: cargo build --release -p ${{ matrix.cargo_package }} --example qmtcode --features "${{ matrix.cargo_features }}${{ inputs.dashboard_ng_revision != '' && ',dashboard-ng' || '' }}" --target ${{ matrix.target }}
 
       - name: Prepare artifact for upload (Linux, macOS & FreeBSD)
         if: ${{ runner.os != 'Windows' }}

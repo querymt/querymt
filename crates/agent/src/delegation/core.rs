@@ -849,6 +849,52 @@ async fn execute_delegation(
         }
     };
 
+    let parent_bridge = ctx
+        .delegator
+        .as_any()
+        .downcast_ref::<crate::agent::LocalAgentHandle>()
+        .and_then(|handle| {
+            handle
+                .config
+                .session_bridges
+                .lock()
+                .ok()
+                .and_then(|bridges| {
+                    bridges
+                        .get(&parent_session_id)
+                        .map(|route| route.bridge.clone())
+                })
+        });
+    if let Some(bridge) = parent_bridge
+        && !session_ref.is_remote()
+    {
+        match session_ref.set_bridge(bridge.clone()).await {
+            Ok(()) => {
+                if let Some(target) = target
+                    .as_any()
+                    .downcast_ref::<crate::agent::LocalAgentHandle>()
+                    && let Ok(mut bridges) = target.config.session_bridges.lock()
+                {
+                    bridges.insert(
+                        child_session_id.clone(),
+                        crate::agent::agent_config::SessionBridgeRoute {
+                            bridge,
+                            session_ref: session_ref.clone(),
+                        },
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    delegation_id = %delegation.public_id,
+                    child_session_id = %child_session_id,
+                    error = %error,
+                    "Failed to inherit the parent session client bridge"
+                );
+            }
+        }
+    }
+
     if let Some(profile_id) = ctx.profile_id.as_deref()
         && let Err(err) = persist_delegate_runtime_binding(
             ctx.store.as_ref(),

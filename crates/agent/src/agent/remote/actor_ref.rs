@@ -23,6 +23,7 @@ use querymt::chat::ReasoningEffort;
 use querymt_remote::{
     classify_infallible_remote_send_error, classify_remote_send_error_with_timeout_message,
 };
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Location-transparent reference to a `SessionActor`.
@@ -780,6 +781,18 @@ impl SessionActorRef {
                 log::debug!("set_bridge called on remote SessionActorRef — ignored");
                 Ok(())
             }
+        }
+    }
+
+    pub async fn clear_bridge(&self, connection_id: Arc<str>) -> Result<bool, AgentError> {
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(messages::ClearBridge { connection_id })
+                .await
+                .map_err(|error| AgentError::RemoteActor(error.to_string())),
+
+            #[cfg(feature = "remote")]
+            Self::Remote { .. } => Ok(false),
         }
     }
 

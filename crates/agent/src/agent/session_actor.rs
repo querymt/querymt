@@ -1263,6 +1263,41 @@ impl Message<SetBridge> for SessionActor {
     }
 }
 
+#[cfg(test)]
+impl Message<GetBridge> for SessionActor {
+    type Reply = Option<ClientBridgeSender>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetBridge,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.bridge.clone()
+    }
+}
+
+impl Message<ClearBridge> for SessionActor {
+    type Reply = bool;
+
+    async fn handle(
+        &mut self,
+        msg: ClearBridge,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if self
+            .bridge
+            .as_ref()
+            .and_then(ClientBridgeSender::connection_id)
+            == Some(msg.connection_id.as_ref())
+        {
+            self.bridge = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 impl Message<Shutdown> for SessionActor {
     type Reply = ();
 
