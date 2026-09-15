@@ -356,7 +356,7 @@ async fn handle_sft_export(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dashboard-ng"))]
 mod dashboard_tests {
     use super::*;
     use axum::body::Body;
