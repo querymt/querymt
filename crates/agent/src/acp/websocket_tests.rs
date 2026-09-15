@@ -5,8 +5,9 @@ use super::websocket::{
 };
 use crate::acp::client_bridge::{ClientBridgeMessage, ClientBridgeSender};
 use crate::acp::protocol::{
-    PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionId,
+    ContentBlock, ContentChunk, PermissionOption, PermissionOptionId, PermissionOptionKind,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, TextContent,
     ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use crate::elicitation::{ElicitationAction, insert_pending_elicitation};
@@ -385,6 +386,118 @@ async fn websocket_bridge_round_trips_permission_requests() {
         RequestPermissionOutcome::Selected(selected)
             if selected.option_id.0.as_ref() == "allow_once"
     ));
+    bridge_task.abort();
+}
+
+#[tokio::test]
+async fn websocket_bridge_forwards_notifications_elicitations_and_control_messages() {
+    let (bridge_tx, bridge_rx) = mpsc::channel::<ClientBridgeMessage>(8);
+    let bridge = ClientBridgeSender::for_connection(bridge_tx, "conn");
+    let (wire_tx, mut wire_rx) = mpsc::channel::<String>(8);
+    let pending: PendingWsRequestMap = Arc::new(Mutex::new(HashMap::new()));
+    let bridge_task = tokio::spawn(run_websocket_bridge(
+        bridge_rx,
+        wire_tx,
+        pending.clone(),
+        Arc::new(AtomicU64::new(1)),
+        "conn".to_string(),
+    ));
+
+    bridge
+        .notify(SessionNotification::new(
+            SessionId::from("session"),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new("update"),
+            ))),
+        ))
+        .await
+        .expect("session notification");
+    let wire = timeout(Duration::from_secs(2), wire_rx.recv())
+        .await
+        .expect("session notification should be sent")
+        .expect("wire channel should remain open");
+    let value: serde_json::Value = serde_json::from_str(&wire).expect("valid notification");
+    assert_eq!(value["method"], "session/update");
+
+    let params = serde_json::value::RawValue::from_string(
+        serde_json::json!({"change": "updated"}).to_string(),
+    )
+    .expect("raw params");
+    bridge
+        .notify_ext(crate::acp::protocol::ExtNotification::new(
+            "querymt/test",
+            Arc::from(params),
+        ))
+        .await
+        .expect("extension notification");
+    let wire = timeout(Duration::from_secs(2), wire_rx.recv())
+        .await
+        .expect("extension notification should be sent")
+        .expect("wire channel should remain open");
+    let value: serde_json::Value = serde_json::from_str(&wire).expect("valid notification");
+    assert_eq!(value["method"], "querymt/test");
+    assert_eq!(value["params"]["change"], "updated");
+
+    bridge.flush().await.expect("flush should be acknowledged");
+
+    let workspace =
+        bridge.workspace_query(crate::workspace_query::WorkspaceQueryRequest::Diagnostics {
+            uri: "file:///workspace/main.rs".to_string(),
+        });
+    assert_eq!(
+        workspace
+            .await
+            .expect_err("workspace query is unsupported")
+            .code,
+        agent_client_protocol::ErrorCode::MethodNotFound
+    );
+
+    let elicitation = tokio::spawn({
+        let bridge = bridge.clone();
+        async move {
+            bridge
+                .elicit(
+                    "elicitation".to_string(),
+                    "session".to_string(),
+                    "Choose one".to_string(),
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {"selection": {"type": "string"}},
+                        "required": ["selection"]
+                    }),
+                    "builtin:question".to_string(),
+                )
+                .await
+        }
+    });
+    let wire = timeout(Duration::from_secs(2), wire_rx.recv())
+        .await
+        .expect("elicitation request should be sent")
+        .expect("wire channel should remain open");
+    let value: serde_json::Value = serde_json::from_str(&wire).expect("valid JSON-RPC request");
+    assert_eq!(value["method"], "elicitation/create");
+    assert!(
+        route_websocket_response(
+            &pending,
+            value["id"].clone(),
+            Some(serde_json::json!({
+                "action": "accept",
+                "content": {"selection": "A"}
+            })),
+            None,
+        )
+        .await
+    );
+    let response = elicitation
+        .await
+        .expect("elicitation task should join")
+        .expect("elicitation response should parse");
+    assert_eq!(response.action, ElicitationAction::Accept);
+    assert_eq!(
+        response.content,
+        Some(serde_json::json!({"selection": "A"}))
+    );
+
     bridge_task.abort();
 }
 
