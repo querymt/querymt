@@ -1131,11 +1131,14 @@ async fn selected_model_preset_overlays_only_llm_fields() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dotagents_subdir(dir.path()).join("models.json"),
-        r#"{ "models": { "fast": { "provider": "anthropic", "model": "claude-3-5-haiku" } } }"#,
+        r#"{ "models": { "fast": { "provider": "mock", "model": "claude-3-5-haiku" } } }"#,
     )
     .unwrap();
 
+    // The preset names `mock`, so that provider must actually be registered:
+    // an unavailable provider is refused and the overlay is not applied.
     let (registry, _temp_dir) = empty_plugin_registry()?;
+    crate::test_utils::register_mock_provider(&registry);
     let storage =
         Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
 
@@ -1159,7 +1162,7 @@ async fn selected_model_preset_overlays_only_llm_fields() -> Result<()> {
 
     let params = agent.inner.config.provider.initial_config();
     // The preset overlaid provider and model.
-    assert_eq!(params.provider.as_deref(), Some("anthropic"));
+    assert_eq!(params.provider.as_deref(), Some("mock"));
     assert_eq!(params.model.as_deref(), Some("claude-3-5-haiku"));
     // The explicit system prompt was not dropped by the preset overlay.
     assert!(params.system.iter().any(|s| s == "Explicit system prompt"));

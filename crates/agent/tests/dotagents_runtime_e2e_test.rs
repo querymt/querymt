@@ -12,8 +12,10 @@
 use querymt::plugin::host::PluginRegistry;
 use querymt_agent::api::{AgentBuilder, QuorumBuilder};
 use querymt_agent::dotagents::{
-    DotagentsAgentRole, DotagentsLoadOptions, DotagentsTaskKind, DotagentsTaskTrustPolicy,
+    DotagentsAgentRole, DotagentsLoadOptions, DotagentsTaskApprovalDecision,
+    DotagentsTaskApprovalRequest, DotagentsTaskKind, DotagentsTaskTrustPolicy,
 };
+use querymt_agent::session::backend::StorageBackend;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -435,21 +437,24 @@ fn unsupported_transport_is_diagnosed_without_hiding_valid_siblings() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn selected_workspace_preset_overlays_the_runtime() {
+async fn selected_workspace_preset_is_rejected_when_its_provider_is_not_installed() {
     let workspace = TempDir::new().unwrap();
     let global = TempDir::new().unwrap();
     write_workspace_layer(workspace.path());
     write_global_layer(global.path());
 
     let registry_dir = TempDir::new().unwrap();
-    let registry = empty_registry(registry_dir.path());
+    // Declaring a provider in `providers.toml` is not the same as having it
+    // installed: the plugin cannot load, so `anthropic` stays unavailable and
+    // the preset must be rejected rather than applied.
+    let registry = preset_registry(registry_dir.path());
     let storage = std::sync::Arc::new(
         querymt_agent::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
             .await
             .unwrap(),
     );
 
-    // `shared` exists in both layers; the workspace definition must win.
+    // `shared` exists in both layers and selects the unavailable `anthropic`.
     let agent = AgentBuilder::new()
         .provider("openai", "gpt-4o-mini")
         .cwd(workspace.path())
@@ -465,12 +470,101 @@ async fn selected_workspace_preset_overlays_the_runtime() {
         })
         .build()
         .await
-        .unwrap();
+        .expect("an unavailable preset is reported, not a build failure");
 
     let handle = agent.handle();
     let params = handle.config.provider.initial_config();
-    assert_eq!(params.provider.as_deref(), Some("anthropic"));
-    assert_eq!(params.model.as_deref(), Some("claude-workspace"));
+    // The explicit base configuration survives untouched.
+    assert_eq!(
+        params.provider.as_deref(),
+        Some("openai"),
+        "an uninstalled preset provider must not be applied"
+    );
+    assert_eq!(params.model.as_deref(), Some("gpt-4o-mini"));
+
+    // The rejection is actionable and names the preset and the provider.
+    let report = agent
+        .activate_dotagents()
+        .await
+        .expect("activation runs")
+        .expect("protocol enabled");
+    let rendered = format!("{:?}", report.diagnostics);
+    assert!(
+        rendered.contains("shared") && rendered.contains("anthropic"),
+        "the diagnostic must name the preset and the missing provider: {rendered}"
+    );
+
+    agent.shutdown().await;
+}
+
+/// The workspace layer wins over the global layer for a shared preset key, and
+/// the winning definition is the one whose provider is validated.
+#[tokio::test]
+async fn workspace_preset_definition_wins_over_the_global_definition() {
+    let workspace = TempDir::new().unwrap();
+    let global = TempDir::new().unwrap();
+    write_workspace_layer(workspace.path());
+    write_global_layer(global.path());
+
+    // The global layer and workspace layer disagree about `shared`. Rewrite the
+    // workspace copy to select a provider that is genuinely unavailable, so the
+    // rejection proves the workspace definition (not the global one) was used.
+    std::fs::write(
+        workspace.path().join(".agents/models.json"),
+        r#"{"models":{
+            "shared": {"provider":"workspace-only-provider","model":"claude-workspace"},
+            "workspace-only": {"provider":"openai","model":"gpt-workspace"}
+        }}"#,
+    )
+    .unwrap();
+
+    let registry_dir = TempDir::new().unwrap();
+    let storage = std::sync::Arc::new(
+        querymt_agent::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+            .await
+            .unwrap(),
+    );
+
+    let agent = AgentBuilder::new()
+        .provider("openai", "gpt-4o-mini")
+        .cwd(workspace.path())
+        .dotagents_options(
+            both_layer_options(workspace.path(), global.path())
+                .with_selected_model_preset("shared"),
+        )
+        .infra(querymt_agent::api::AgentInfra {
+            plugin_registry: preset_registry(registry_dir.path()),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await
+        .expect("build agent");
+
+    // The manifest records the workspace definition as effective, so the
+    // diagnostic names the workspace provider rather than the global one.
+    let manifest = agent
+        .dotagents()
+        .expect("protocol state")
+        .manifest()
+        .clone();
+    assert_eq!(manifest.model_presets["shared"].model, "claude-workspace");
+    assert_eq!(
+        manifest.model_presets["shared"].provider,
+        "workspace-only-provider"
+    );
+
+    let report = agent
+        .activate_dotagents()
+        .await
+        .expect("activation runs")
+        .expect("protocol enabled");
+    let rendered = format!("{:?}", report.diagnostics);
+    assert!(
+        rendered.contains("workspace-only-provider"),
+        "the workspace preset definition must be the one validated: {rendered}"
+    );
 
     agent.shutdown().await;
 }
@@ -847,4 +941,757 @@ fn protocol_disabled_ignores_both_layers_entirely() {
     // Default builder state: protocol loading is disabled.
     let builder = AgentBuilder::new().cwd(workspace.path());
     assert!(builder.preview_dotagents_manifest().unwrap().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Post-construction activation
+// ---------------------------------------------------------------------------
+
+/// A registry that admits the providers the fixtures actually select.
+///
+/// `empty_registry` declares only `mock`, so a preset naming `anthropic` would
+/// fail provider validation. These fixtures exercise real activation, so the
+/// registry must be able to resolve the presets they name.
+fn preset_registry(dir: &Path) -> Arc<PluginRegistry> {
+    let config_path = dir.join("providers.toml");
+    std::fs::write(
+        &config_path,
+        "[[providers]]\nname = \"anthropic\"\npath = \"anthropic.wasm\"\n\n\
+         [[providers]]\nname = \"openai\"\npath = \"openai.wasm\"\n\n\
+         [[providers]]\nname = \"mock\"\npath = \"mock.wasm\"\n",
+    )
+    .expect("write providers config");
+    Arc::new(PluginRegistry::from_path(&config_path).expect("registry"))
+}
+
+/// Build a storage backend whose files live under `dir` so it survives the
+/// duration of a test and can be re-opened to simulate a restart.
+async fn file_storage(dir: &Path) -> Arc<querymt_agent::session::sqlite_storage::SqliteStorage> {
+    Arc::new(
+        querymt_agent::session::sqlite_storage::SqliteStorage::connect(dir.join("agent.db"))
+            .await
+            .expect("storage"),
+    )
+}
+
+/// An approver that always grants, recording the requests it saw.
+struct AlwaysApprove {
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl querymt_agent::dotagents::DotagentsTaskApprover for AlwaysApprove {
+    async fn request_approval(
+        &self,
+        request: DotagentsTaskApprovalRequest,
+    ) -> DotagentsTaskApprovalDecision {
+        self.seen.lock().unwrap().push(request.task_id.clone());
+        DotagentsTaskApprovalDecision::Approve
+    }
+}
+
+/// Build a single-agent runtime over both protocol layers with real storage.
+async fn activatable_agent(
+    workspace: &Path,
+    global: &Path,
+    storage: Arc<dyn querymt_agent::session::backend::StorageBackend>,
+    registry: Arc<PluginRegistry>,
+    trust: DotagentsTaskTrustPolicy,
+) -> querymt_agent::api::Agent {
+    AgentBuilder::new()
+        .provider("openai", "gpt-4o-mini")
+        .cwd(workspace)
+        .dotagents_options(both_layer_options(workspace, global).with_workspace_task_trust(trust))
+        .infra(querymt_agent::api::AgentInfra {
+            plugin_registry: registry,
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await
+        .expect("build agent")
+}
+
+/// Memories import into the knowledge store through the normal retrieval path.
+#[tokio::test]
+async fn activation_imports_memories_into_live_knowledge() {
+    let workspace = TempDir::new().unwrap();
+    let global = TempDir::new().unwrap();
+    write_workspace_layer(workspace.path());
+    write_global_layer(global.path());
+
+    let registry_dir = TempDir::new().unwrap();
+    let storage_dir = TempDir::new().unwrap();
+    let storage = file_storage(storage_dir.path()).await;
+    let agent = activatable_agent(
+        workspace.path(),
+        global.path(),
+        storage.clone(),
+        preset_registry(registry_dir.path()),
+        DotagentsTaskTrustPolicy::Prompt,
+    )
+    .await;
+
+    let report = agent
+        .activate_dotagents()
+        .await
+        .expect("activation runs")
+        .expect("protocol enabled");
+
+    assert!(report.memories_reconciled, "knowledge store was configured");
+    let memory = report.memory.as_ref().expect("memory report");
+    assert_eq!(
+        memory.created, 2,
+        "both layer memories imported: {memory:?}"
+    );
+    assert!(memory.store_available);
+
+    // The imported memories are retrievable as live knowledge.
+    let store = storage.knowledge_store().expect("knowledge store");
+    let scope = querymt_agent::dotagents::protocol_knowledge_scope(Some(workspace.path()));
+    let entries = store
+        .list(&scope, querymt_agent::knowledge::KnowledgeFilter::default())
+        .await
+        .expect("list knowledge");
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.protocol_source_key.is_some()),
+        "imported memories carry protocol provenance"
+    );
+    assert!(
+        entries.iter().any(|entry| entry
+            .raw_text
+            .as_deref()
+            .is_some_and(|text| text.contains("pins its toolchain"))),
+        "workspace memory body was imported"
+    );
+
+    // Re-running activation is idempotent: no duplicates are created.
+    let second = agent
+        .activate_dotagents()
+        .await
+        .expect("second activation")
+        .expect("protocol enabled");
+    let second_memory = second.memory.as_ref().expect("memory report");
+    assert_eq!(second_memory.created, 0, "reload must not duplicate");
+    assert_eq!(second_memory.unchanged, 2);
+    let after = store
+        .list(&scope, querymt_agent::knowledge::KnowledgeFilter::default())
+        .await
+        .expect("list knowledge");
+    assert_eq!(after.len(), 2, "no duplicate entries after reload");
+
+    agent.shutdown().await;
+}
+
+/// An approved workspace task becomes a durable recurring task and interval
+/// schedule bound to a protocol-owned automation session.
+#[tokio::test]
+async fn activation_creates_durable_task_and_schedule_for_approved_workspace_task() {
+    let workspace = TempDir::new().unwrap();
+    let global = TempDir::new().unwrap();
+    write_workspace_layer(workspace.path());
+    write_global_layer(global.path());
+
+    let registry_dir = TempDir::new().unwrap();
+    let storage_dir = TempDir::new().unwrap();
+    let storage = file_storage(storage_dir.path()).await;
+    // `allow` is the explicit unsafe opt-in for unattended hosts; a `prompt`
+    // policy with no approver instead leaves the task pending, which is covered
+    // by `activation_without_approver_keeps_workspace_tasks_pending_and_inert`.
+    let agent = activatable_agent(
+        workspace.path(),
+        global.path(),
+        storage.clone(),
+        preset_registry(registry_dir.path()),
+        DotagentsTaskTrustPolicy::Allow,
+    )
+    .await;
+
+    let report = agent
+        .activate_dotagents()
+        .await
+        .expect("activation runs")
+        .expect("protocol enabled");
+
+    let task = report
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "digest")
+        .unwrap_or_else(|| {
+            panic!(
+                "the workspace task reconciled; report tasks={:?} diagnostics={:?} pending={:?}",
+                report.tasks, report.diagnostics, report.pending_approvals
+            )
+        });
+    assert!(
+        task.applied.is_armed(),
+        "approved task is executable: {:?}",
+        task.applied
+    );
+
+    // The records are durable, not just reported.
+    let sessions = storage.session_store();
+    let schedules = storage.schedule_repository().expect("schedule repository");
+
+    let automation_sessions: Vec<_> = sessions
+        .list_sessions()
+        .await
+        .expect("list sessions")
+        .into_iter()
+        .filter(|session| {
+            session.session_kind.as_deref()
+                == Some(querymt_agent::dotagents::AUTOMATION_SESSION_KIND)
+        })
+        .collect();
+    assert_eq!(
+        automation_sessions.len(),
+        1,
+        "exactly one protocol-owned automation session"
+    );
+    let session = &automation_sessions[0];
+
+    // The owned task exists in that session with the protocol creation key.
+    let tasks = sessions
+        .list_tasks(&session.public_id)
+        .await
+        .expect("list tasks");
+    let owned = tasks
+        .iter()
+        .find(|t| t.creation_key.is_some())
+        .expect("protocol task persisted");
+    assert!(
+        owned
+            .creation_key
+            .as_deref()
+            .expect("creation key")
+            .contains("digest"),
+        "creation key identifies the protocol source: {:?}",
+        owned.creation_key
+    );
+    assert_eq!(
+        owned.expected_deliverable.as_deref(),
+        Some("Summarize the repository."),
+    );
+
+    // The interval schedule is armed and carries the converted interval.
+    let owned_schedules = schedules
+        .list_schedules(&session.public_id)
+        .await
+        .expect("list schedules");
+    assert_eq!(owned_schedules.len(), 1, "one interval schedule");
+    let schedule = &owned_schedules[0];
+    match &schedule.trigger {
+        querymt_agent::session::domain_schedule::ScheduleTrigger::Interval { seconds } => {
+            assert_eq!(*seconds, 3600, "60 minutes converts to 3600 seconds");
+        }
+        other => panic!("expected an interval trigger, got {other:?}"),
+    }
+    assert_eq!(
+        schedule.state,
+        querymt_agent::session::domain_schedule::ScheduleState::Armed,
+        "approved schedule runs"
+    );
+
+    // User-visible session listing is not polluted by the automation session
+    // beyond the single protocol-owned entry.
+    assert_eq!(
+        sessions
+            .list_tasks(&session.public_id)
+            .await
+            .expect("list tasks")
+            .len(),
+        1,
+        "no unrelated tasks in the automation session"
+    );
+
+    agent.shutdown().await;
+}
+
+/// A headless host with no approver keeps untrusted workspace tasks pending,
+/// creates no records for them, and does not fail the rest of activation.
+#[tokio::test]
+async fn activation_without_approver_keeps_workspace_tasks_pending_and_inert() {
+    let workspace = TempDir::new().unwrap();
+    let global = TempDir::new().unwrap();
+    write_workspace_layer(workspace.path());
+    write_global_layer(global.path());
+
+    let registry_dir = TempDir::new().unwrap();
+    let storage_dir = TempDir::new().unwrap();
+    let storage = file_storage(storage_dir.path()).await;
+    let agent = activatable_agent(
+        workspace.path(),
+        global.path(),
+        storage.clone(),
+        preset_registry(registry_dir.path()),
+        DotagentsTaskTrustPolicy::Prompt,
+    )
+    .await;
+
+    let report = agent
+        .activate_dotagents()
+        .await
+        .expect("activation runs")
+        .expect("protocol enabled");
+
+    assert!(
+        !report.is_failed(),
+        "prompt policy is not fatal in compat mode"
+    );
+    assert_eq!(
+        report.pending_approvals.len(),
+        1,
+        "the workspace task is surfaced for a host decision: {:?}",
+        report.pending_approvals
+    );
+    assert_eq!(report.pending_approvals[0].task_id, "digest");
+    assert!(
+        report.tasks.iter().all(|task| !task.applied.is_armed()),
+        "untrusted task must not be executable: {:?}",
+        report.tasks
+    );
+
+    // No automation session or schedule is created for a pending task.
+    let sessions = storage.session_store();
+    assert!(
+        sessions
+            .list_sessions()
+            .await
+            .expect("list sessions")
+            .iter()
+            .all(|session| session.session_kind.as_deref()
+                != Some(querymt_agent::dotagents::AUTOMATION_SESSION_KIND)),
+        "pending tasks must not provision an automation session"
+    );
+
+    // Unrelated protocol features still applied: memories are inspectorable and
+    // imported even though the task stayed pending.
+    assert!(report.memories_reconciled);
+    assert_eq!(report.memory.as_ref().expect("memory report").created, 2);
+
+    agent.shutdown().await;
+}
+
+/// An approver turns the same pending task into a durable, executable record,
+/// and activation stays idempotent across repeats.
+#[tokio::test]
+async fn activation_with_approver_creates_records_once() {
+    let workspace = TempDir::new().unwrap();
+    let global = TempDir::new().unwrap();
+    write_workspace_layer(workspace.path());
+    write_global_layer(global.path());
+
+    let registry_dir = TempDir::new().unwrap();
+    let storage_dir = TempDir::new().unwrap();
+    let storage = file_storage(storage_dir.path()).await;
+
+    let approver = Arc::new(AlwaysApprove {
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+
+    let agent = AgentBuilder::new()
+        .provider("openai", "gpt-4o-mini")
+        .cwd(workspace.path())
+        .dotagents_options(
+            both_layer_options(workspace.path(), global.path())
+                .with_workspace_task_trust(DotagentsTaskTrustPolicy::Prompt),
+        )
+        .dotagents_task_approver(approver.clone())
+        .infra(querymt_agent::api::AgentInfra {
+            plugin_registry: preset_registry(registry_dir.path()),
+            storage: Some(storage.clone()),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await
+        .expect("build agent");
+
+    let first = agent
+        .activate_dotagents()
+        .await
+        .expect("activation runs")
+        .expect("protocol enabled");
+    assert!(first.pending_approvals.is_empty(), "approver was consulted");
+    assert_eq!(approver.seen.lock().unwrap().len(), 1);
+    assert_eq!(first.armed_tasks(), 1);
+
+    let sessions = storage.session_store();
+    let schedules = storage.schedule_repository().expect("schedule repository");
+    let session_count = |sessions: Vec<querymt_agent::session::store::Session>| {
+        sessions
+            .into_iter()
+            .filter(|session| {
+                session.session_kind.as_deref()
+                    == Some(querymt_agent::dotagents::AUTOMATION_SESSION_KIND)
+            })
+            .count()
+    };
+    assert_eq!(
+        session_count(sessions.list_sessions().await.expect("sessions")),
+        1
+    );
+
+    // A repeat activation reuses the persisted approval, session, task, and
+    // schedule instead of creating duplicates.
+    let second = agent
+        .activate_dotagents()
+        .await
+        .expect("second activation")
+        .expect("protocol enabled");
+    assert_eq!(second.armed_tasks(), 1);
+    assert_eq!(
+        session_count(sessions.list_sessions().await.expect("sessions")),
+        1,
+        "no duplicate automation session"
+    );
+
+    let session = sessions
+        .list_sessions()
+        .await
+        .expect("sessions")
+        .into_iter()
+        .find(|session| {
+            session.session_kind.as_deref()
+                == Some(querymt_agent::dotagents::AUTOMATION_SESSION_KIND)
+        })
+        .expect("automation session");
+    assert_eq!(
+        sessions
+            .list_tasks(&session.public_id)
+            .await
+            .expect("tasks")
+            .len(),
+        1,
+        "no duplicate protocol task"
+    );
+    assert_eq!(
+        schedules
+            .list_schedules(&session.public_id)
+            .await
+            .expect("schedules")
+            .len(),
+        1,
+        "no duplicate schedule"
+    );
+
+    agent.shutdown().await;
+}
+
+/// A trusted task with `runOnStartup` fires exactly once during activation and
+/// still keeps its normal interval activation armed.
+#[tokio::test]
+async fn activation_fires_run_on_startup_once_and_keeps_the_interval_armed() {
+    let workspace = TempDir::new().unwrap();
+    let global = TempDir::new().unwrap();
+    write_workspace_layer(workspace.path());
+    write_global_layer(global.path());
+
+    // The fixture task opts out of startup; rewrite it to opt in.
+    std::fs::write(
+        workspace.path().join(".agents/tasks/digest/task.md"),
+        "---\nkind: task\nintervalMinutes: 60\nrunOnStartup: true\n---\nSummarize the repository.\n",
+    )
+    .unwrap();
+
+    let registry_dir = TempDir::new().unwrap();
+    let storage_dir = TempDir::new().unwrap();
+    let storage = file_storage(storage_dir.path()).await;
+    let agent = activatable_agent(
+        workspace.path(),
+        global.path(),
+        storage.clone(),
+        preset_registry(registry_dir.path()),
+        DotagentsTaskTrustPolicy::Allow,
+    )
+    .await;
+
+    let report = agent
+        .activate_dotagents()
+        .await
+        .expect("activation runs")
+        .expect("protocol enabled");
+
+    let task = report
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "digest")
+        .unwrap_or_else(|| {
+            panic!(
+                "the task reconciled; tasks={:?} diagnostics={:?}",
+                report.tasks, report.diagnostics
+            )
+        });
+    assert!(
+        task.fired_on_startup,
+        "runOnStartup must fire during the first activation: {:?}",
+        report.diagnostics
+    );
+
+    // The startup fire does not consume the recurring schedule: the owned
+    // schedule is still Armed for its normal interval.
+    let sessions = storage.session_store();
+    let schedules = storage.schedule_repository().expect("schedule repository");
+    let session = sessions
+        .list_sessions()
+        .await
+        .expect("sessions")
+        .into_iter()
+        .find(|session| {
+            session.session_kind.as_deref()
+                == Some(querymt_agent::dotagents::AUTOMATION_SESSION_KIND)
+        })
+        .expect("automation session");
+    let owned_schedules = schedules
+        .list_schedules(&session.public_id)
+        .await
+        .expect("schedules");
+    assert_eq!(owned_schedules.len(), 1);
+    // A startup fire must not retire the trigger. The schedule may already be
+    // `Running` because the fired run started, so assert it is still live rather
+    // than racing on a specific transient state.
+    assert!(
+        matches!(
+            owned_schedules[0].state,
+            querymt_agent::session::domain_schedule::ScheduleState::Armed
+                | querymt_agent::session::domain_schedule::ScheduleState::Running
+        ),
+        "the interval trigger must remain live after a startup fire, found {:?}",
+        owned_schedules[0].state
+    );
+    // The interval trigger itself is untouched by the startup fire.
+    match &owned_schedules[0].trigger {
+        querymt_agent::session::domain_schedule::ScheduleTrigger::Interval { seconds } => {
+            assert_eq!(*seconds, 3600, "interval activation is retained");
+        }
+        other => panic!("expected an interval trigger, got {other:?}"),
+    }
+
+    // Exactly one schedule exists after a second activation: the startup fire is
+    // per-activation and never duplicates records.
+    let second = agent
+        .activate_dotagents()
+        .await
+        .expect("second activation")
+        .expect("protocol enabled");
+    assert!(
+        second.tasks.iter().all(|task| task.task_id == "digest"),
+        "no duplicate protocol tasks"
+    );
+    assert_eq!(
+        schedules
+            .list_schedules(&session.public_id)
+            .await
+            .expect("schedules")
+            .len(),
+        1,
+        "startup must not accumulate schedules"
+    );
+
+    agent.shutdown().await;
+}
+
+/// A restart reuses the same automation session rather than provisioning a new
+/// one, so reconciliation never accumulates sessions across restarts.
+#[tokio::test]
+async fn activation_reuses_automation_session_across_restarts() {
+    let workspace = TempDir::new().unwrap();
+    let global = TempDir::new().unwrap();
+    write_workspace_layer(workspace.path());
+    write_global_layer(global.path());
+
+    let registry_dir = TempDir::new().unwrap();
+    let storage_dir = TempDir::new().unwrap();
+
+    let first_storage = file_storage(storage_dir.path()).await;
+    let first_agent = activatable_agent(
+        workspace.path(),
+        global.path(),
+        first_storage.clone(),
+        preset_registry(registry_dir.path()),
+        DotagentsTaskTrustPolicy::Allow,
+    )
+    .await;
+    first_agent
+        .activate_dotagents()
+        .await
+        .expect("first activation")
+        .expect("protocol enabled");
+
+    let first_sessions = first_storage
+        .session_store()
+        .list_sessions()
+        .await
+        .expect("sessions");
+    let first_ids: Vec<String> = first_sessions
+        .iter()
+        .filter(|session| {
+            session.session_kind.as_deref()
+                == Some(querymt_agent::dotagents::AUTOMATION_SESSION_KIND)
+        })
+        .map(|session| session.public_id.clone())
+        .collect();
+    assert_eq!(first_ids.len(), 1);
+    first_agent.shutdown().await;
+    drop(first_storage);
+
+    // Re-open the same database to simulate a restart.
+    let second_storage = file_storage(storage_dir.path()).await;
+    let second_agent = activatable_agent(
+        workspace.path(),
+        global.path(),
+        second_storage.clone(),
+        preset_registry(registry_dir.path()),
+        DotagentsTaskTrustPolicy::Allow,
+    )
+    .await;
+    second_agent
+        .activate_dotagents()
+        .await
+        .expect("activation after restart")
+        .expect("protocol enabled");
+
+    let second_ids: Vec<String> = second_storage
+        .session_store()
+        .list_sessions()
+        .await
+        .expect("sessions")
+        .into_iter()
+        .filter(|session| {
+            session.session_kind.as_deref()
+                == Some(querymt_agent::dotagents::AUTOMATION_SESSION_KIND)
+        })
+        .map(|session| session.public_id)
+        .collect();
+
+    assert_eq!(
+        second_ids, first_ids,
+        "the automation session survives a restart unchanged"
+    );
+
+    second_agent.shutdown().await;
+}
+
+/// An unavailable provider must not partially apply the preset: the explicit
+/// base configuration stays completely intact.
+#[tokio::test]
+async fn unavailable_preset_provider_preserves_explicit_configuration() {
+    let workspace = TempDir::new().unwrap();
+    let global = TempDir::new().unwrap();
+    write_workspace_layer(workspace.path());
+    write_global_layer(global.path());
+
+    let registry_dir = TempDir::new().unwrap();
+    let storage_dir = TempDir::new().unwrap();
+    let storage = file_storage(storage_dir.path()).await;
+
+    // The registry only knows `mock`, but `shared` selects `anthropic`.
+    let agent = AgentBuilder::new()
+        .provider("openai", "gpt-4o-mini")
+        .system("Explicit system part")
+        .cwd(workspace.path())
+        .dotagents_options(
+            both_layer_options(workspace.path(), global.path())
+                .with_selected_model_preset("shared"),
+        )
+        .infra(querymt_agent::api::AgentInfra {
+            plugin_registry: empty_registry(registry_dir.path()),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await
+        .expect("build agent");
+
+    let handle = agent.handle();
+    let params = handle.config.provider.initial_config();
+    assert_eq!(
+        params.provider.as_deref(),
+        Some("openai"),
+        "an unavailable preset provider must not be applied"
+    );
+    assert_eq!(
+        params.model.as_deref(),
+        Some("gpt-4o-mini"),
+        "the explicit model survives a rejected preset"
+    );
+    // The preset is also not half-applied to unrelated fields.
+    assert_eq!(params.system[0], "Explicit system part");
+    // The rejection is reported rather than swallowed.
+    let report = agent
+        .activate_dotagents()
+        .await
+        .expect("activation runs")
+        .expect("protocol enabled");
+    assert!(
+        report.has_diagnostics(),
+        "the rejected preset is visible to the host"
+    );
+
+    agent.shutdown().await;
+}
+
+/// Protocol secrets never appear in a debug rendering of the runtime manifest.
+#[tokio::test]
+async fn runtime_manifest_debug_never_leaks_secrets() {
+    let workspace = TempDir::new().unwrap();
+    let global = TempDir::new().unwrap();
+    write_workspace_layer(workspace.path());
+    write_global_layer(global.path());
+
+    // A preset and MCP server carrying literal secret material.
+    std::fs::write(
+        workspace.path().join(".agents/models.json"),
+        r#"{"models":{
+            "leaky": {
+              "provider":"anthropic",
+              "model":"claude",
+              "credential":"sk-literal-secret-value",
+              "parameters":{"api_key":"sk-parameter-secret-value"}
+            }
+        }}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path().join(".agents/mcp.json"),
+        r#"{
+  "mcpServers": {
+    "token-server": {
+      "transport": "stdio",
+      "command": "npx",
+      "env": { "SERVICE_TOKEN": "mcp-env-secret-value" },
+      "headers": { "Authorization": "Bearer mcp-header-secret-value" }
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    let manifest = runtime_manifest(
+        workspace.path(),
+        global.path(),
+        DotagentsTaskTrustPolicy::Prompt,
+    );
+
+    let rendered = format!("{manifest:?}");
+    for secret in [
+        "sk-literal-secret-value",
+        "sk-parameter-secret-value",
+        "mcp-env-secret-value",
+        "mcp-header-secret-value",
+    ] {
+        assert!(
+            !rendered.contains(secret),
+            "runtime manifest Debug leaked `{secret}`"
+        );
+    }
+    // The configuration stays diagnosable.
+    assert!(rendered.contains("leaky"));
+    assert!(rendered.contains("SERVICE_TOKEN"));
+    assert!(rendered.contains("token-server"));
 }

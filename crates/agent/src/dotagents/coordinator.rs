@@ -37,6 +37,30 @@ use super::tasks::{
     plan_task_retirement,
 };
 
+/// A binding used only to plan activation; the real binding is supplied once a
+/// task is known to be trusted, so an untrusted task never provisions a session.
+static NO_BINDING: std::sync::LazyLock<DotagentsAutomationBinding> =
+    std::sync::LazyLock::new(|| DotagentsAutomationBinding::new(String::new(), None::<String>));
+
+/// A set of protocol tasks that share one automation session.
+struct TaskGroup {
+    target: DotagentsExecutionTarget,
+    layer: super::layer::DotagentsLayer,
+    workspace: Option<std::path::PathBuf>,
+    identities: Vec<DotagentsTaskIdentity>,
+}
+
+/// The outcome of preparing one task, before any durable write.
+enum PreparedTask {
+    /// The task is allowed to reconcile and has everything it needs.
+    Reconcile {
+        activation: Box<super::tasks::DotagentsTaskActivation>,
+        existing: Box<Option<super::tasks::DotagentsTaskOwnership>>,
+    },
+    /// The task must not cause durable records to be created or updated.
+    Stop,
+}
+
 /// The canonical workspace a protocol layer's records belong to.
 ///
 /// Workspace-layer records are bound to the workspace so approval and ownership
@@ -254,12 +278,7 @@ impl DotagentsRuntimeCoordinator {
         // Group by protocol scope and target profile. Global and workspace tasks
         // intentionally receive different automation sessions even when they run
         // on the same profile.
-        let mut groups: Vec<(
-            DotagentsExecutionTarget,
-            super::layer::DotagentsLayer,
-            Option<std::path::PathBuf>,
-            Vec<DotagentsTaskIdentity>,
-        )> = Vec::new();
+        let mut groups: Vec<TaskGroup> = Vec::new();
         let mut live_source_keys = BTreeSet::new();
 
         for task in self.context.manifest.tasks.values() {
@@ -294,17 +313,29 @@ impl DotagentsRuntimeCoordinator {
                 continue;
             };
 
-            match groups.iter_mut().find(|(existing, layer, root, _)| {
-                existing.profile_id == target.profile_id
-                    && *layer == task.source.layer
-                    && *root == workspace
+            match groups.iter_mut().find(|group| {
+                group.target.profile_id == target.profile_id
+                    && group.layer == task.source.layer
+                    && group.workspace == workspace
             }) {
-                Some((_, _, _, identities)) => identities.push(identity),
-                None => groups.push((target, task.source.layer, workspace, vec![identity])),
+                Some(group) => group.identities.push(identity),
+                None => groups.push(TaskGroup {
+                    target,
+                    layer: task.source.layer,
+                    workspace,
+                    identities: vec![identity],
+                }),
             }
         }
 
-        for (target, layer, workspace, identities) in groups {
+        for group in groups {
+            let TaskGroup {
+                target,
+                layer,
+                workspace,
+                identities,
+            } = group;
+
             if !target.scheduler_available {
                 let disposition = super::tasks::classify_activation_unavailable(
                     strictness,
@@ -326,68 +357,103 @@ impl DotagentsRuntimeCoordinator {
 
             let automation_identity =
                 DotagentsAutomationIdentity::new(layer, workspace, target.profile_id.clone());
-            let binding = match self
-                .context
-                .automation
-                .ensure_automation_session(&automation_identity)
-                .await
-            {
-                Ok(binding) => binding,
-                Err(error) => {
-                    let disposition = super::tasks::classify_activation_unavailable(
-                        strictness,
-                        super::tasks::DotagentsActivationFacility::ScheduleStorage,
-                        format!("could not provision the automation session: {error}"),
-                    );
-                    report.diagnostics.push(disposition.diagnostic().clone());
-                    if disposition.is_fatal() {
-                        report.failed = true;
-                        return report;
-                    }
-                    continue;
-                }
-            };
 
-            if let Some(profile_id) = &target.profile_id
-                && let Err(error) = super::automation::bind_automation_session_profile(
-                    self.context.sessions.as_ref(),
-                    &binding.session_public_id,
-                    profile_id,
-                )
-                .await
-            {
-                report.diagnostics.push(DotagentsDiagnostic::warning(
-                    DotagentsDiagnosticCode::Other,
-                    format!(
-                        "could not bind protocol automation session to profile `{profile_id}`: {error}"
-                    ),
-                ));
-                continue;
-            }
-
-            let reconciler = DotagentsTaskReconciler::new(
-                self.context.sessions.clone(),
-                self.context.schedules.clone(),
-                self.context.state.clone(),
-            );
+            // Trust is resolved before any durable record exists. A workspace
+            // task that is pending or denied must not provision an automation
+            // session: the session is created lazily by the first task in this
+            // group that is actually allowed to reconcile.
+            let mut binding: Option<DotagentsAutomationBinding> = None;
+            let mut session_failed = false;
 
             for identity in identities {
                 let Some(task) = self.task_for_identity(&identity) else {
                     continue;
                 };
-                self.reconcile_one(
+
+                let prepared = self
+                    .prepare_group_task(task, &identity, policy, strictness, &mut report)
+                    .await;
+                let PreparedTask::Reconcile {
+                    activation,
+                    existing,
+                } = prepared
+                else {
+                    continue;
+                };
+
+                // A durable record is now certain to be written, so the target's
+                // automation session is provisioned on first use.
+                if binding.is_none() {
+                    match self
+                        .context
+                        .automation
+                        .ensure_automation_session(&automation_identity)
+                        .await
+                    {
+                        Ok(created) => {
+                            if let Some(profile_id) = &target.profile_id
+                                && let Err(error) =
+                                    super::automation::bind_automation_session_profile(
+                                        self.context.sessions.as_ref(),
+                                        &created.session_public_id,
+                                        profile_id,
+                                    )
+                                    .await
+                            {
+                                report.diagnostics.push(DotagentsDiagnostic::warning(
+                                    DotagentsDiagnosticCode::Other,
+                                    format!(
+                                        "could not bind protocol automation session to profile `{profile_id}`: {error}"
+                                    ),
+                                ));
+                                session_failed = true;
+                                break;
+                            }
+                            binding = Some(created);
+                        }
+                        Err(error) => {
+                            let disposition = super::tasks::classify_activation_unavailable(
+                                strictness,
+                                super::tasks::DotagentsActivationFacility::ScheduleStorage,
+                                format!("could not provision the automation session: {error}"),
+                            );
+                            report.diagnostics.push(disposition.diagnostic().clone());
+                            if disposition.is_fatal() {
+                                report.failed = true;
+                                return report;
+                            }
+                            session_failed = true;
+                            break;
+                        }
+                    }
+                }
+
+                let Some(binding) = binding.as_ref() else {
+                    continue;
+                };
+
+                let reconciler = DotagentsTaskReconciler::new(
+                    self.context.sessions.clone(),
+                    self.context.schedules.clone(),
+                    self.context.state.clone(),
+                );
+                self.apply_reconciliation(
                     &reconciler,
-                    &binding,
+                    binding,
                     task,
                     &identity,
-                    policy,
-                    strictness,
+                    activation,
+                    existing,
                     &mut report,
                 )
                 .await;
                 if report.failed {
                     return report;
                 }
+            }
+
+            if session_failed {
+                continue;
             }
         }
 
@@ -426,27 +492,30 @@ impl DotagentsRuntimeCoordinator {
     /// Reconcile a single protocol task against its target.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
-    async fn reconcile_one(
+    /// Resolve everything needed to reconcile one task, without writing anything.
+    ///
+    /// Trust is evaluated here, before any durable record exists. Returning
+    /// [`PreparedTask::Stop`] means the task is reported (pending, denied, or
+    /// awaiting renewal) and must not cause an automation session or schedule to
+    /// be created on its behalf.
+    async fn prepare_group_task(
         &self,
-        reconciler: &DotagentsTaskReconciler,
-        binding: &DotagentsAutomationBinding,
         task: &super::manifest::DotagentsTask,
         identity: &DotagentsTaskIdentity,
         policy: DotagentsTaskTrustPolicy,
         strictness: super::options::DotagentsStrictness,
         report: &mut DotagentsActivationReport,
-    ) {
-        let profile_available = |profile_id: &str| {
-            // The resolver already proved this target exists before its durable
-            // automation session was provisioned.
-            binding.resolve_profile(task) == Some(profile_id)
-        };
-
-        let activation = match plan_task_activation(task, identity, binding, &profile_available) {
-            Ok(activation) => activation,
-            Err(diagnostic) => {
-                report.diagnostics.push(*diagnostic);
-                return;
+    ) -> PreparedTask {
+        let activation = {
+            // The resolver already proved this target exists before a task in the
+            // group reaches here, so any referenced profile resolves.
+            let profile_available = |_profile_id: &str| true;
+            match plan_task_activation(task, identity, &NO_BINDING, &profile_available) {
+                Ok(activation) => activation,
+                Err(diagnostic) => {
+                    report.diagnostics.push(*diagnostic);
+                    return PreparedTask::Stop;
+                }
             }
         };
 
@@ -462,40 +531,84 @@ impl DotagentsRuntimeCoordinator {
                     DotagentsDiagnosticCode::Other,
                     format!("could not read protocol task ownership: {error}"),
                 ));
-                return;
+                return PreparedTask::Stop;
             }
         };
 
-        let approved = match self
+        let Some(approved) = self
             .trust_decision(task, identity, policy, strictness, report)
             .await
-        {
-            Some(decision) => decision,
-            None => return,
+        else {
+            // Pending or denied: no durable record may be created or updated.
+            return PreparedTask::Stop;
         };
 
         let outcome = decide_task_reconciliation(&activation, existing.as_ref(), approved);
-
         if let Some(diagnostic) = &outcome.diagnostic {
             report.diagnostics.push(diagnostic.clone());
         }
 
         if outcome.action == super::tasks::DotagentsTaskReconcileAction::AwaitingApproval {
-            match reconciler.apply(&outcome, None, binding).await {
-                Ok(_) => report.diagnostics.push(DotagentsDiagnostic::info(
-                    DotagentsDiagnosticCode::Other,
-                    format!(
-                        "protocol task `{}` changed and requires renewed approval; its schedule is paused",
-                        identity.task_id
+            // A changed task must stop running immediately, but pausing only
+            // touches records the protocol already owns, so no new session is
+            // provisioned for it.
+            if let Some(ownership) = outcome.ownership.clone()
+                && ownership.schedule_public_id.is_some()
+            {
+                let reconciler = DotagentsTaskReconciler::new(
+                    self.context.sessions.clone(),
+                    self.context.schedules.clone(),
+                    self.context.state.clone(),
+                );
+                let retirement = super::tasks::DotagentsTaskRetireOutcome {
+                    ownership,
+                    action: super::tasks::DotagentsTaskRetireAction::Pause,
+                    reason: super::tasks::DotagentsTaskRetireReason::ChangedUnapproved,
+                    diagnostic: DotagentsDiagnostic::info(
+                        DotagentsDiagnosticCode::Other,
+                        format!(
+                            "protocol task `{}` changed and requires renewed approval; its schedule is paused",
+                            identity.task_id
+                        ),
                     ),
-                )),
-                Err(error) => report.diagnostics.push(DotagentsDiagnostic::warning(
-                    DotagentsDiagnosticCode::Other,
-                    format!("could not pause protocol task `{}`: {error}", identity.task_id),
-                )),
+                };
+                if let Err(error) = reconciler.retire(&retirement).await {
+                    report.diagnostics.push(DotagentsDiagnostic::warning(
+                        DotagentsDiagnosticCode::Other,
+                        format!(
+                            "could not pause protocol task `{}`: {error}",
+                            identity.task_id
+                        ),
+                    ));
+                } else {
+                    report.diagnostics.push(retirement.diagnostic.clone());
+                }
             }
-            return;
+            return PreparedTask::Stop;
         }
+
+        PreparedTask::Reconcile {
+            activation: Box::new(activation),
+            existing: Box::new(existing),
+        }
+    }
+
+    /// Apply a prepared reconciliation against a provisioned session.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_reconciliation(
+        &self,
+        reconciler: &DotagentsTaskReconciler,
+        binding: &DotagentsAutomationBinding,
+        task: &super::manifest::DotagentsTask,
+        identity: &DotagentsTaskIdentity,
+        activation: Box<super::tasks::DotagentsTaskActivation>,
+        existing: Box<Option<super::tasks::DotagentsTaskOwnership>>,
+        report: &mut DotagentsActivationReport,
+    ) {
+        let activation = *activation;
+        let existing = *existing;
+        let approved = true;
+        let outcome = decide_task_reconciliation(&activation, existing.as_ref(), approved);
 
         let applied = match reconciler.apply(&outcome, Some(&activation), binding).await {
             Ok(applied) => applied,

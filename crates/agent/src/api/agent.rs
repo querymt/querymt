@@ -495,27 +495,25 @@ impl AgentBuilder {
             dotagents_options
                 .as_ref()
                 .and_then(|options| options.selected_model_preset()),
-        ) {
-            if let Err(diagnostic) = crate::dotagents::apply_selected_model_preset(
-                &plugin_registry,
-                manifest,
-                preset_name,
-                &mut llm_config,
-            )
-            .await
-            {
-                match crate::dotagents::classify_activation_unavailable(
-                    dotagents_strictness,
-                    crate::dotagents::DotagentsActivationFacility::TargetProfile,
-                    diagnostic.to_string(),
-                ) {
-                    crate::dotagents::DotagentsActivationDisposition::Fatal(diagnostic) => {
-                        return Err(anyhow!(diagnostic.to_string()));
-                    }
-                    crate::dotagents::DotagentsActivationDisposition::Diagnostic(diagnostic) => {
-                        log::warn!("dotagents: {diagnostic}");
-                        passive_diagnostics.push(diagnostic);
-                    }
+        ) && let Err(diagnostic) = crate::dotagents::apply_selected_model_preset(
+            &plugin_registry,
+            manifest,
+            preset_name,
+            &mut llm_config,
+        )
+        .await
+        {
+            match crate::dotagents::classify_activation_unavailable(
+                dotagents_strictness,
+                crate::dotagents::DotagentsActivationFacility::TargetProfile,
+                diagnostic.to_string(),
+            ) {
+                crate::dotagents::DotagentsActivationDisposition::Fatal(diagnostic) => {
+                    return Err(anyhow!(diagnostic.to_string()));
+                }
+                crate::dotagents::DotagentsActivationDisposition::Diagnostic(diagnostic) => {
+                    log::warn!("dotagents: {diagnostic}");
+                    passive_diagnostics.push(diagnostic);
                 }
             }
         }
@@ -781,15 +779,14 @@ impl AgentBuilder {
         // Protocol state is retained for post-construction activation. Task and
         // memory reconciliation is intentionally deferred: it needs sessions,
         // profiles, approvals, and a scheduler, some of which do not exist yet.
-        let dotagents_state = dotagents_manifest
-            .clone()
-            .map(|manifest| AgentDotagentsState {
-                manifest: Arc::new(manifest),
-                options: dotagents_options
-                    .unwrap_or_else(crate::dotagents::DotagentsLoadOptions::disabled),
-                approver: self.dotagents_task_approver.take(),
+        let dotagents_state = dotagents_manifest.clone().map(|manifest| {
+            AgentDotagentsState::assemble(
+                manifest,
+                dotagents_options.unwrap_or_else(crate::dotagents::DotagentsLoadOptions::disabled),
+                self.dotagents_task_approver.take(),
                 passive_diagnostics,
-            });
+            )
+        });
 
         // Start the scheduler actor if the backend supports scheduling.
         handle.start_scheduler().await;
@@ -842,6 +839,24 @@ pub struct AgentDotagentsState {
 }
 
 impl AgentDotagentsState {
+    /// Assemble the protocol state a runtime carries into activation.
+    ///
+    /// Shared by the single-agent and quorum builders so both runtimes expose
+    /// identical protocol behavior instead of drifting apart.
+    pub(super) fn assemble(
+        manifest: crate::dotagents::DotagentsManifest,
+        options: crate::dotagents::DotagentsLoadOptions,
+        approver: Option<Arc<dyn crate::dotagents::DotagentsTaskApprover>>,
+        passive_diagnostics: Vec<crate::dotagents::DotagentsDiagnostic>,
+    ) -> Self {
+        Self {
+            manifest: Arc::new(manifest),
+            options,
+            approver,
+            passive_diagnostics,
+        }
+    }
+
     /// The resolved protocol manifest.
     pub fn manifest(&self) -> &crate::dotagents::DotagentsManifest {
         &self.manifest

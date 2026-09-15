@@ -52,6 +52,8 @@ pub struct QuorumBuilder {
     dotagents_options: Option<crate::dotagents::DotagentsLoadOptions>,
     /// Optional pre-resolved protocol manifest.
     dotagents_manifest: Option<crate::dotagents::DotagentsManifest>,
+    /// Optional host approval mechanism for workspace protocol tasks.
+    dotagents_task_approver: Option<Arc<dyn crate::dotagents::DotagentsTaskApprover>>,
     /// Pre-built registry entries to merge before building (Phase 7: remote agents).
     ///
     /// When `Some`, the entries in this registry are merged with the local delegate agents
@@ -106,6 +108,7 @@ impl QuorumBuilder {
             max_parallel_delegations: 5,
             dotagents_options: None,
             dotagents_manifest: None,
+            dotagents_task_approver: None,
             initial_registry: None,
             #[cfg(feature = "remote")]
             mesh: None,
@@ -191,6 +194,21 @@ impl QuorumBuilder {
         self
     }
 
+    /// Supply the host approval mechanism for workspace protocol tasks.
+    ///
+    /// Protocol workspace tasks are treated as untrusted repository content.
+    /// When the trust policy is `prompt` and no approver is configured, such
+    /// tasks stay pending and inactive, and activation reports them instead of
+    /// running them. Configuring an approver lets a CLI, UI, ACP, or embedding
+    /// host present the decision.
+    pub fn dotagents_task_approver(
+        mut self,
+        approver: Arc<dyn crate::dotagents::DotagentsTaskApprover>,
+    ) -> Self {
+        self.dotagents_task_approver = Some(approver);
+        self
+    }
+
     /// Supply the workspace used to derive `<workspace>/.agents/`.
     ///
     /// This is the protocol-workspace fallback threaded into protocol
@@ -261,9 +279,14 @@ impl QuorumBuilder {
 
     pub async fn build(mut self) -> Result<super::agent::Agent> {
         let cwd = self.cwd.clone().map(to_absolute_path).transpose()?;
+        let dotagents_options = self.dotagents_options.take();
+        let dotagents_strictness = dotagents_options
+            .as_ref()
+            .map(|options| options.strictness())
+            .unwrap_or_default();
         let dotagents_manifest = crate::dotagents::resolve_for_builder(
             self.dotagents_manifest.take(),
-            self.dotagents_options.take(),
+            dotagents_options.clone(),
             cwd.as_deref(),
         )
         .map_err(|error| anyhow!(error.to_string()))?;
@@ -275,6 +298,7 @@ impl QuorumBuilder {
         if let Some(manifest) = &dotagents_manifest {
             compose_dotagents_prompts(&mut planner_config, &mut self.delegates, manifest);
         }
+        let mut passive_diagnostics: Vec<crate::dotagents::DotagentsDiagnostic> = Vec::new();
 
         if planner_config
             .tools
@@ -359,11 +383,43 @@ impl QuorumBuilder {
             }
         };
 
+        // The plugin registry now exists, so the selected protocol preset can be
+        // applied atomically to the planner: provider availability is checked
+        // first, and every parameter is validated before any field is written.
+        // A rejected preset leaves the explicit base configuration intact.
+        if let (Some(manifest), Some(preset_name)) = (
+            dotagents_manifest.as_ref(),
+            dotagents_options
+                .as_ref()
+                .and_then(|options| options.selected_model_preset()),
+        ) && let Some(planner_llm) = planner_config.llm_config.as_mut()
+            && let Err(diagnostic) = crate::dotagents::apply_selected_model_preset(
+                &registry,
+                manifest,
+                preset_name,
+                planner_llm,
+            )
+            .await
+        {
+            match crate::dotagents::classify_activation_unavailable(
+                dotagents_strictness,
+                crate::dotagents::DotagentsActivationFacility::TargetProfile,
+                diagnostic.to_string(),
+            ) {
+                crate::dotagents::DotagentsActivationDisposition::Fatal(diagnostic) => {
+                    return Err(anyhow!(diagnostic.to_string()));
+                }
+                crate::dotagents::DotagentsActivationDisposition::Diagnostic(diagnostic) => {
+                    log::warn!("dotagents: {diagnostic}");
+                    passive_diagnostics.push(diagnostic);
+                }
+            }
+        }
+
         let mut builder = AgentQuorumBuilder::from_backend(backend.clone());
         if let Some(event_fanout) = event_fanout.as_ref() {
             builder = builder.with_event_fanout(event_fanout.clone());
         }
-
         if let Some(cwd_path) = cwd.clone() {
             builder = builder.cwd(cwd_path);
         }
@@ -911,6 +967,18 @@ impl QuorumBuilder {
         // Start the scheduler actor on the planner handle if the backend supports it.
         planner_handle.start_scheduler().await;
 
+        // Protocol state is retained for post-construction activation, exactly as
+        // in the single-agent path. Task and memory reconciliation is deferred
+        // until sessions, profiles, approvals, and a scheduler all exist.
+        let dotagents_state = dotagents_manifest.map(|manifest| {
+            super::agent::AgentDotagentsState::assemble(
+                manifest,
+                dotagents_options.unwrap_or_else(crate::dotagents::DotagentsLoadOptions::disabled),
+                self.dotagents_task_approver.take(),
+                passive_diagnostics,
+            )
+        });
+
         Ok(super::agent::Agent {
             inner: planner_handle,
             storage: backend,
@@ -919,7 +987,7 @@ impl QuorumBuilder {
             callbacks: Arc::new(EventCallbacksState::new(None)),
             profiles: None,
             quorum: Some(Arc::new(quorum)),
-            dotagents: None,
+            dotagents: dotagents_state.map(Arc::new),
         })
     }
 }

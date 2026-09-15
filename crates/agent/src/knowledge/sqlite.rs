@@ -149,6 +149,16 @@ const ENTRY_COLS_QUALIFIED: &str = "e.id, e.public_id, e.scope, e.source, e.raw_
 const CONSOLIDATION_COLS: &str = "id, public_id, scope, source_entry_public_ids_json, \
     summary, insight, connections_json, created_at";
 
+/// The column marking a protocol-owned entry as currently live.
+///
+/// Deactivated protocol memories are retained so reconciliation can reactivate
+/// them, but they must never be returned as live knowledge. User-created
+/// entries always have this flag set, so the predicate is a no-op for them.
+const ACTIVE_COLUMN: &str = "protocol_active";
+
+/// Unqualified predicate restricting a query to live entries.
+const ACTIVE_ONLY: &str = "protocol_active = 1";
+
 /// Table-qualified column list for use in JOIN queries (FTS5).
 const CONSOLIDATION_COLS_QUALIFIED: &str = "e.id, e.public_id, e.scope, e.source_entry_public_ids_json, \
     e.summary, e.insight, e.connections_json, e.created_at";
@@ -258,7 +268,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT {ENTRY_COLS} FROM knowledge_entries \
-                     WHERE scope = ? AND consolidated_at IS NULL \
+                     WHERE scope = ? AND consolidated_at IS NULL AND {ACTIVE_ONLY} \
                      ORDER BY created_at ASC LIMIT ?"
                 ))
                 .map_err(KnowledgeError::from)?;
@@ -278,7 +288,10 @@ impl KnowledgeStore for SqliteKnowledgeStore {
     ) -> Result<Vec<KnowledgeEntry>, KnowledgeError> {
         let scope = scope.to_string();
         self.run_blocking(move |conn| {
-            let mut conditions = vec!["scope = ?1".to_string()];
+            // Deactivated protocol memories stay in the table so
+            // reconciliation can reactivate them, but they must not be
+            // retrievable as live knowledge.
+            let mut conditions = vec!["scope = ?1".to_string(), ACTIVE_ONLY.to_string()];
             let mut param_idx = 2usize;
 
             // We use explicit named index binding via stmt.raw_bind_parameter
@@ -471,7 +484,9 @@ impl KnowledgeStore for SqliteKnowledgeStore {
         self.run_blocking(move |conn| {
             let total_entries: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM knowledge_entries WHERE scope = ?",
+                    &format!(
+                        "SELECT COUNT(*) FROM knowledge_entries WHERE scope = ? AND {ACTIVE_ONLY}"
+                    ),
                     params![scope],
                     |row| row.get(0),
                 )
@@ -479,8 +494,10 @@ impl KnowledgeStore for SqliteKnowledgeStore {
 
             let unconsolidated_entries: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM knowledge_entries \
-                     WHERE scope = ? AND consolidated_at IS NULL",
+                    &format!(
+                        "SELECT COUNT(*) FROM knowledge_entries \
+                         WHERE scope = ? AND consolidated_at IS NULL AND {ACTIVE_ONLY}"
+                    ),
                     params![scope],
                     |row| row.get(0),
                 )
@@ -496,7 +513,9 @@ impl KnowledgeStore for SqliteKnowledgeStore {
 
             let latest_entry_at: Option<String> = conn
                 .query_row(
-                    "SELECT MAX(created_at) FROM knowledge_entries WHERE scope = ?",
+                    &format!(
+                        "SELECT MAX(created_at) FROM knowledge_entries WHERE scope = ? AND {ACTIVE_ONLY}"
+                    ),
                     params![scope],
                     |row| row.get(0),
                 )
@@ -945,7 +964,7 @@ fn query_entries(
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT {ENTRY_COLS} FROM knowledge_entries \
-                     WHERE scope = ?1 ORDER BY created_at DESC LIMIT ?2"
+                     WHERE scope = ?1 AND {ACTIVE_ONLY} ORDER BY created_at DESC LIMIT ?2"
                 ))
                 .map_err(KnowledgeError::from)?;
             stmt.raw_bind_parameter(1, scope)
@@ -1027,12 +1046,12 @@ fn query_entries(
                     (-bm25(knowledge_entries_fts, 10.0, 1.0, 0.5) + ({boost_expr}) + (e.importance * 5.0)) AS _rank \
                 FROM knowledge_entries_fts \
                 JOIN knowledge_entries e ON e.id = knowledge_entries_fts.rowid \
-                WHERE knowledge_entries_fts MATCH ?1 AND e.scope = ?2 \
+                WHERE knowledge_entries_fts MATCH ?1 AND e.scope = ?2 AND e.{ACTIVE_COLUMN} = 1 \
               UNION \
                 SELECT {ENTRY_COLS}, \
                     (0.0 + ({boost_expr_unaliased}) + (importance * 5.0)) AS _rank \
                 FROM knowledge_entries \
-                WHERE scope = ?2 AND {junction_where} \
+                WHERE scope = ?2 AND {junction_where} AND {ACTIVE_ONLY} \
              ) \
              ORDER BY _rank DESC, created_at DESC, id DESC \
              LIMIT ?{limit_idx}",
@@ -1057,7 +1076,7 @@ fn query_entries(
         let sql = format!(
             "SELECT {ENTRY_COLS_QUALIFIED} FROM knowledge_entries_fts \
              JOIN knowledge_entries e ON e.id = knowledge_entries_fts.rowid \
-             WHERE knowledge_entries_fts MATCH ?1 AND e.scope = ?2 \
+             WHERE knowledge_entries_fts MATCH ?1 AND e.scope = ?2 AND e.{ACTIVE_COLUMN} = 1 \
              ORDER BY bm25(knowledge_entries_fts, 10.0, 1.0, 0.5), e.created_at DESC, e.id DESC \
              LIMIT ?3"
         );
@@ -1870,6 +1889,117 @@ mod tests {
             .expect("user entry remains listable");
         assert!(user_entry.protocol_source_key.is_none());
         assert!(user_entry.protocol_active);
+    }
+
+    /// A deactivated protocol memory must disappear from every live retrieval
+    /// path while remaining available to protocol reconciliation.
+    #[tokio::test]
+    async fn deactivated_protocol_memory_is_excluded_from_live_retrieval() {
+        let db = setup_db();
+        let store = SqliteKnowledgeStore::new(db);
+
+        let keep_key = "dotagents:v1:memory:workspace:abc:keep";
+        let gone_key = "dotagents:v1:memory:workspace:abc:gone";
+
+        store
+            .upsert_protocol_source(
+                "scope",
+                keep_key,
+                "fp-1",
+                make_ingest("dotagents", "Keep me"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_protocol_source(
+                "scope",
+                gone_key,
+                "fp-1",
+                make_ingest("dotagents", "Remove me entirely"),
+            )
+            .await
+            .unwrap();
+
+        // Deactivate only `gone`: the live-key set passed in is the one that
+        // must remain active.
+        let deactivated = store
+            .deactivate_protocol_sources("scope", &[keep_key.to_string()])
+            .await
+            .unwrap();
+        assert_eq!(deactivated.len(), 1);
+
+        // `list` (filtered + unfiltered) excludes the inactive entry.
+        let listed = store
+            .list("scope", KnowledgeFilter::default())
+            .await
+            .unwrap();
+        assert!(
+            listed
+                .iter()
+                .all(|e| e.protocol_source_key.as_deref() != Some(gone_key)),
+            "list returned a deactivated protocol memory"
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|e| e.protocol_source_key.as_deref() == Some(keep_key)),
+            "list dropped a live protocol memory"
+        );
+
+        // Keyword search excludes it.
+        let searched = store
+            .query(
+                "scope",
+                "entirely",
+                QueryOpts {
+                    limit: 50,
+                    include_consolidations: false,
+                    retrieval_mode: RetrievalMode::Keyword,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            searched
+                .entries
+                .iter()
+                .all(|e| e.protocol_source_key.as_deref() != Some(gone_key)),
+            "keyword query returned a deactivated protocol memory"
+        );
+        assert!(
+            searched
+                .entries
+                .iter()
+                .any(|e| e.protocol_source_key.as_deref() == Some(keep_key)),
+            "keyword query dropped a live protocol memory"
+        );
+
+        // Hybrid question-driven query excludes it.
+        let hybrid = store
+            .query("scope", "", QueryOpts::default())
+            .await
+            .unwrap();
+        assert!(
+            hybrid
+                .entries
+                .iter()
+                .all(|e| e.protocol_source_key.as_deref() != Some(gone_key)),
+            "recent-entry query returned a deactivated protocol memory"
+        );
+
+        // Statistics count only live entries.
+        let stats = store.stats("scope").await.unwrap();
+        assert_eq!(stats.total_entries, 1);
+        assert_eq!(stats.unconsolidated_entries, 1);
+
+        // Reconciliation can still see the inactive entry to reactivate it.
+        let retained = store.list_protocol_sources("scope").await.unwrap();
+        assert_eq!(retained.len(), 2);
+        assert!(
+            retained
+                .iter()
+                .any(|e| e.protocol_source_key.as_deref() == Some(gone_key) && !e.protocol_active)
+        );
     }
 
     #[tokio::test]
