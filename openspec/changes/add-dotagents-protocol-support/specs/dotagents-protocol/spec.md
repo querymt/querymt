@@ -136,6 +136,12 @@ The system SHALL parse named model presets from `models.json` into provider, mod
 - **THEN** that entry is not materialized
 - **AND** a diagnostic names the missing preset and referring entry
 
+#### Scenario: Invalid preset overlay preserves explicit configuration
+- **WHEN** a selected preset contains an invalid parameter or references an unavailable provider
+- **THEN** the preset is not partially applied
+- **AND** the complete explicit base LLM configuration remains in effect
+- **AND** an actionable diagnostic identifies the preset and invalid field or provider
+
 ### Requirement: Existing and protocol skills remain compatible
 The system SHALL continue discovering existing configured, `.skills`, `.claude/skills`, `.qmt/skills`, and `.agents/skills` sources. Within `.agents/skills`, it SHALL accept protocol `skill.md` and existing `SKILL.md` naming, parse protocol `id`, `name`, `description`, and `enabled` metadata, and use the directory name as the ID when `id` is absent. Disabled skills SHALL not be exposed to the skill tool.
 
@@ -253,6 +259,13 @@ The system SHALL parse `.agents/memories/*.md`, derive a stable source identity 
 - **WHEN** memories are present but the runtime has no knowledge store
 - **THEN** agent startup can continue with other valid protocol features
 - **AND** diagnostics report that memories were not imported
+
+#### Scenario: Removed memory is excluded from live knowledge retrieval
+- **GIVEN** a protocol memory was previously imported
+- **WHEN** that memory is removed or disabled and reconciliation runs
+- **THEN** its retained protocol-owned entry is marked inactive
+- **AND** it is excluded from normal knowledge list, query, and consolidation inputs
+- **AND** unrelated user-created knowledge remains unchanged
 
 ### Requirement: Filesystem resolution is confined and safe
 The system SHALL reject path traversal outside a selected protocol entry root, unsafe symlink escapes, non-regular files where regular files are required, and relative executable or file references that escape their owning layer. Workspace discovery SHALL only occur when the workspace `.agents` directory already exists.

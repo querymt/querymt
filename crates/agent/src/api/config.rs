@@ -1,7 +1,7 @@
 //! Agent configuration types for the simple builder API
 
 use super::utils::infer_required_capabilities;
-use crate::config::{ExecutionPolicy, HooksConfig, MiddlewareEntry, SkillsConfig};
+use crate::config::{ExecutionPolicy, HooksConfig, McpServerConfig, MiddlewareEntry, SkillsConfig};
 use crate::tools::CapabilityRequirement;
 use querymt::{LLMParams, chat::ReasoningEffort};
 use serde_json::Value;
@@ -21,6 +21,9 @@ pub(super) struct AgentConfig {
     pub assume_mutating: Option<bool>,
     pub mutating_tools: Option<Vec<String>>,
     pub hooks: HooksConfig,
+    /// MCP servers resolved for this agent, attached to its runtime through the
+    /// existing stdio and streamable-http transports.
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 impl AgentConfig {
@@ -38,6 +41,7 @@ impl AgentConfig {
             assume_mutating: None,
             mutating_tools: None,
             hooks: HooksConfig::default(),
+            mcp_servers: Vec::new(),
         }
     }
 }

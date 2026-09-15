@@ -389,6 +389,54 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_schedules_task_public
             ON schedules(task_public_id);
 
+        -- Protocol ownership is separate so records without a row remain user-created.
+        CREATE TABLE IF NOT EXISTS dotagents_task_ownership (
+            source_key TEXT PRIMARY KEY,
+            task_creation_key TEXT UNIQUE NOT NULL,
+            schedule_creation_key TEXT UNIQUE NOT NULL,
+            layer TEXT NOT NULL CHECK (layer IN ('global', 'workspace')),
+            canonical_workspace TEXT,
+            task_id TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            task_public_id TEXT UNIQUE,
+            schedule_public_id TEXT UNIQUE,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(task_public_id) REFERENCES tasks(public_id) ON DELETE SET NULL,
+            FOREIGN KEY(schedule_public_id) REFERENCES schedules(public_id) ON DELETE SET NULL,
+            CHECK ((layer = 'workspace' AND canonical_workspace IS NOT NULL) OR layer = 'global')
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_dotagents_task_ownership_identity
+            ON dotagents_task_ownership(layer, canonical_workspace, task_id);
+
+        CREATE TABLE IF NOT EXISTS dotagents_task_approvals (
+            canonical_workspace TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            decision TEXT NOT NULL CHECK (decision IN ('approve', 'deny')),
+            decided_at TEXT NOT NULL,
+            PRIMARY KEY(canonical_workspace, task_id, fingerprint)
+        );
+
+        -- Protocol-owned automation sessions. One durable session per protocol
+        -- scope + target profile, reused across restarts so reconciliation never
+        -- creates duplicate sessions, tasks, or schedules.
+        CREATE TABLE IF NOT EXISTS dotagents_automation_bindings (
+            binding_key TEXT PRIMARY KEY,
+            layer TEXT NOT NULL CHECK (layer IN ('global', 'workspace')),
+            canonical_workspace TEXT,
+            profile_id TEXT,
+            session_public_id TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(session_public_id) REFERENCES sessions(public_id) ON DELETE CASCADE,
+            CHECK ((layer = 'workspace' AND canonical_workspace IS NOT NULL) OR layer = 'global')
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_dotagents_automation_bindings_session
+            ON dotagents_automation_bindings(session_public_id);
+
         -- Scheduler lease table (single-row, DB-backed leadership)
         CREATE TABLE IF NOT EXISTS scheduler_lease (
             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -413,7 +461,10 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             connections_json TEXT NOT NULL DEFAULT '[]',
             importance REAL NOT NULL DEFAULT 0.5,
             consolidated_at TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            protocol_source_key TEXT,
+            protocol_fingerprint TEXT,
+            protocol_active INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE INDEX IF NOT EXISTS idx_knowledge_entries_scope
@@ -423,6 +474,11 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             WHERE consolidated_at IS NULL;
         CREATE INDEX IF NOT EXISTS idx_knowledge_entries_created
             ON knowledge_entries(scope, created_at);
+        -- Protocol-owned entries are unique per scope+source; user-created
+        -- entries keep a NULL protocol_source_key and are never constrained.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_entries_protocol_source
+            ON knowledge_entries(scope, protocol_source_key)
+            WHERE protocol_source_key IS NOT NULL;
 
         CREATE TABLE IF NOT EXISTS knowledge_consolidations (
             id INTEGER PRIMARY KEY,

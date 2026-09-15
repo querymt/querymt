@@ -1015,3 +1015,259 @@ tools = []
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// 6.1 Protocol overlays applied before final single-agent AgentConfig
+// ---------------------------------------------------------------------------
+
+/// Write a `.agents` tree with a `system-prompt.md` and return the temp dir.
+fn write_dotagents_dir(prompt: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = dir.path().join(".agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(agents.join("system-prompt.md"), prompt).unwrap();
+    dir
+}
+
+/// Create `<workspace>/.agents/` inside an existing temp dir.
+fn dotagents_subdir(workspace: &std::path::Path) -> std::path::PathBuf {
+    let agents = workspace.join(".agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    agents
+}
+
+#[tokio::test]
+async fn protocol_prompt_overlay_appends_after_explicit_system_parts() -> Result<()> {
+    let dir = write_dotagents_dir("Protocol system instructions");
+    let (registry, _temp_dir) = empty_plugin_registry()?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+
+    let agent = Agent::single()
+        .provider("openai", "gpt-4o-mini")
+        .system("Explicit system prompt")
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .dotagents_options(
+            crate::dotagents::DotagentsLoadOptions::enabled()
+                .with_workspace(dir.path())
+                .with_global_enabled(false),
+        )
+        .build()
+        .await?;
+
+    let params = agent.inner.config.provider.initial_config();
+    assert_eq!(
+        params.system,
+        vec![
+            "Explicit system prompt".to_string(),
+            "Protocol system instructions".to_string(),
+        ],
+        "protocol prompt must follow explicit system parts"
+    );
+
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn partial_protocol_overlay_preserves_explicit_settings() -> Result<()> {
+    // Only `agents.md` exists: the protocol represents no model, MCP, tool, or
+    // knowledge settings, so every explicit setting must survive untouched.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dotagents_subdir(dir.path()).join("agents.md"),
+        "Protocol instructions only",
+    )
+    .unwrap();
+
+    let (registry, _temp_dir) = empty_plugin_registry()?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+
+    let agent = Agent::single()
+        .provider("openai", "gpt-4o-mini")
+        .system("Explicit system prompt")
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .dotagents_options(
+            crate::dotagents::DotagentsLoadOptions::enabled()
+                .with_workspace(dir.path())
+                .with_global_enabled(false),
+        )
+        .build()
+        .await?;
+
+    let params = agent.inner.config.provider.initial_config();
+    // Explicit model survives.
+    assert_eq!(params.provider.as_deref(), Some("openai"));
+    assert_eq!(params.model.as_deref(), Some("gpt-4o-mini"));
+    // Explicit prompt plus protocol instructions.
+    assert_eq!(
+        params.system.first().map(String::as_str),
+        Some("Explicit system prompt")
+    );
+    assert!(
+        params
+            .system
+            .iter()
+            .any(|s| s == "Protocol instructions only")
+    );
+
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn selected_model_preset_overlays_only_llm_fields() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dotagents_subdir(dir.path()).join("models.json"),
+        r#"{ "models": { "fast": { "provider": "anthropic", "model": "claude-3-5-haiku" } } }"#,
+    )
+    .unwrap();
+
+    let (registry, _temp_dir) = empty_plugin_registry()?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+
+    let agent = Agent::single()
+        .provider("openai", "gpt-4o-mini")
+        .system("Explicit system prompt")
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .dotagents_options(
+            crate::dotagents::DotagentsLoadOptions::enabled()
+                .with_workspace(dir.path())
+                .with_global_enabled(false)
+                .with_selected_model_preset("fast"),
+        )
+        .build()
+        .await?;
+
+    let params = agent.inner.config.provider.initial_config();
+    // The preset overlaid provider and model.
+    assert_eq!(params.provider.as_deref(), Some("anthropic"));
+    assert_eq!(params.model.as_deref(), Some("claude-3-5-haiku"));
+    // The explicit system prompt was not dropped by the preset overlay.
+    assert!(params.system.iter().any(|s| s == "Explicit system prompt"));
+
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_selected_preset_keeps_explicit_llm_configuration() -> Result<()> {
+    // `models.json` exists but the selected preset is absent: the explicit base
+    // configuration must remain in effect rather than being discarded.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dotagents_subdir(dir.path()).join("models.json"),
+        r#"{ "models": { "other": { "provider": "anthropic", "model": "claude-3-5-haiku" } } }"#,
+    )
+    .unwrap();
+
+    let (registry, _temp_dir) = empty_plugin_registry()?;
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+
+    let agent = Agent::single()
+        .provider("openai", "gpt-4o-mini")
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .dotagents_options(
+            crate::dotagents::DotagentsLoadOptions::enabled()
+                .with_workspace(dir.path())
+                .with_global_enabled(false)
+                .with_selected_model_preset("missing"),
+        )
+        .build()
+        .await?;
+
+    let params = agent.inner.config.provider.initial_config();
+    assert_eq!(params.provider.as_deref(), Some("openai"));
+    assert_eq!(params.model.as_deref(), Some("gpt-4o-mini"));
+
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn protocol_mcp_server_is_appended_without_replacing_explicit_servers() -> Result<()> {
+    // Explicit MCP servers enter through TOML `[[mcp]]` config; protocol
+    // servers from `mcp.json` are appended rather than replacing them.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dotagents_subdir(dir.path()).join("mcp.json"),
+        r#"{ "mcpServers": { "protocol-server": { "command": "protocol-cmd", "transport": "stdio" } } }"#,
+    )
+    .unwrap();
+
+    let toml = format!(
+        r#"
+[agent]
+provider = "openai"
+model = "gpt-4o-mini"
+
+[[mcp]]
+name = "explicit-server"
+command = "explicit-cmd"
+transport = "stdio"
+
+[dotagents]
+enabled = true
+workspace_root = "{}"
+global_enabled = false
+"#,
+        dotagents_subdir(dir.path()).display()
+    );
+    let config: crate::config::SingleAgentConfig = toml::from_str(&toml).unwrap();
+
+    let builder = Agent::builder_from_config(config, None)?;
+    let agent = builder
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(empty_plugin_registry()?.0),
+            storage: Some(Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
+            )),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await?;
+
+    let names: Vec<&str> = agent
+        .inner
+        .config
+        .mcp_servers
+        .iter()
+        .map(|server| server.name())
+        .collect();
+    assert!(
+        names.contains(&"explicit-server"),
+        "explicit server preserved: {names:?}"
+    );
+    assert!(
+        names.contains(&"protocol-server"),
+        "protocol server appended: {names:?}"
+    );
+
+    agent.shutdown().await;
+    Ok(())
+}

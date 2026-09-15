@@ -188,6 +188,92 @@ fn migration_0012_adds_task_and_intent_revision_columns() {
 }
 
 #[test]
+fn migration_0018_separates_protocol_task_ownership_and_approvals() {
+    let mut conn = Connection::open_in_memory().expect("in-memory db");
+    apply_migrations(&mut conn).expect("apply migrations");
+
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version = '0018_dotagents_task_state'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query migration");
+    assert_eq!(recorded, 1);
+
+    conn.execute(
+        "INSERT INTO dotagents_task_ownership (
+            source_key, task_creation_key, schedule_creation_key, layer,
+            canonical_workspace, task_id, fingerprint, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, 'workspace', '/workspace', 'nightly', 'fp-1', ?4, ?4)",
+        rusqlite::params![
+            "source-1",
+            "task-key-1",
+            "schedule-key-1",
+            "2026-01-01T00:00:00Z"
+        ],
+    )
+    .expect("insert protocol ownership");
+    conn.execute(
+        "INSERT INTO dotagents_task_approvals (
+            canonical_workspace, task_id, fingerprint, decision, decided_at
+         ) VALUES ('/workspace', 'nightly', 'fp-1', 'approve', '2026-01-01T00:00:00Z')",
+        [],
+    )
+    .expect("insert fingerprint-bound approval");
+
+    let owned: i64 = conn
+        .query_row("SELECT COUNT(*) FROM dotagents_task_ownership", [], |row| {
+            row.get(0)
+        })
+        .expect("count ownership rows");
+    let approvals: i64 = conn
+        .query_row("SELECT COUNT(*) FROM dotagents_task_approvals", [], |row| {
+            row.get(0)
+        })
+        .expect("count approval rows");
+    assert_eq!(owned, 1);
+    assert_eq!(approvals, 1);
+
+    conn.execute(
+        "INSERT INTO sessions (public_id, created_at, updated_at)
+         VALUES ('user-session', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        [],
+    )
+    .expect("insert user session");
+    let session_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO tasks (
+            public_id, session_id, kind, status, created_at, updated_at
+         ) VALUES ('user-task', ?1, 'recurring', 'active', ?2, ?2)",
+        rusqlite::params![session_id, "2026-01-01T00:00:00Z"],
+    )
+    .expect("insert user task");
+    let task_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO schedules (
+            public_id, task_id, task_public_id, session_id, session_public_id,
+            trigger_json, state, config_json, created_at, updated_at
+         ) VALUES ('user-schedule', ?1, 'user-task', ?2, 'user-session',
+                   '{\"type\":\"interval\",\"seconds\":60}', 'armed', '{}', ?3, ?3)",
+        rusqlite::params![task_id, session_id, "2026-01-01T00:00:00Z"],
+    )
+    .expect("insert user schedule");
+
+    // Existing schedules have no protocol ownership unless reconciliation links them.
+    let unowned_schedules: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schedules s
+             LEFT JOIN dotagents_task_ownership o ON o.schedule_public_id = s.public_id
+             WHERE o.source_key IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count user-created schedules");
+    assert_eq!(unowned_schedules, 1);
+}
+
+#[test]
 fn migration_0014_adds_session_control_tables() {
     let mut conn = Connection::open_in_memory().expect("in-memory db");
     apply_migrations(&mut conn).expect("apply migrations");

@@ -60,6 +60,8 @@
 mod agent;
 mod callbacks;
 mod config;
+mod dotagents_runtime;
+mod dotagents_targets;
 pub mod mesh;
 mod profiles;
 mod quorum;
@@ -70,6 +72,7 @@ mod utils;
 // Re-export public API types
 pub use agent::{Agent, AgentBuilder, AgentInfra};
 pub use config::{DelegateConfigBuilder, PlannerConfigBuilder};
+pub use dotagents_targets::DotagentsTargetFactory;
 pub use mesh::{AgentMesh, Mesh, MeshJoinOutcome, MeshRuntime, MeshSpec};
 pub use profiles::{AgentProfiles, ProfileRuntimeHandle};
 pub use quorum::QuorumBuilder;

@@ -48,6 +48,10 @@ pub struct QuorumBuilder {
     pub(super) delegation_wait_timeout_secs: u64,
     pub(super) delegation_cancel_grace_secs: u64,
     pub(super) max_parallel_delegations: usize,
+    /// Protocol load options; disabled when omitted.
+    dotagents_options: Option<crate::dotagents::DotagentsLoadOptions>,
+    /// Optional pre-resolved protocol manifest.
+    dotagents_manifest: Option<crate::dotagents::DotagentsManifest>,
     /// Pre-built registry entries to merge before building (Phase 7: remote agents).
     ///
     /// When `Some`, the entries in this registry are merged with the local delegate agents
@@ -100,6 +104,8 @@ impl QuorumBuilder {
             delegation_wait_timeout_secs: 120,
             delegation_cancel_grace_secs: 5,
             max_parallel_delegations: 5,
+            dotagents_options: None,
+            dotagents_manifest: None,
             initial_registry: None,
             #[cfg(feature = "remote")]
             mesh: None,
@@ -167,6 +173,72 @@ impl QuorumBuilder {
         self
     }
 
+    /// Enable `.agents` loading with default discovery options.
+    pub fn enable_dotagents(mut self) -> Self {
+        self.dotagents_options = Some(crate::dotagents::DotagentsLoadOptions::enabled());
+        self
+    }
+
+    /// Configure `.agents` loading explicitly.
+    pub fn dotagents_options(mut self, options: crate::dotagents::DotagentsLoadOptions) -> Self {
+        self.dotagents_options = Some(options);
+        self
+    }
+
+    /// Supply a pre-resolved `.agents` manifest.
+    pub fn dotagents_manifest(mut self, manifest: crate::dotagents::DotagentsManifest) -> Self {
+        self.dotagents_manifest = Some(manifest);
+        self
+    }
+
+    /// Supply the workspace used to derive `<workspace>/.agents/`.
+    ///
+    /// This is the protocol-workspace fallback threaded into protocol
+    /// resolution. An explicit `workspace` or `workspace_root` in the load
+    /// options always wins, so a caller that already chose its layer roots is
+    /// never overridden.
+    pub fn with_dotagents_workspace(mut self, workspace: impl Into<std::path::PathBuf>) -> Self {
+        let options = self
+            .dotagents_options
+            .take()
+            .unwrap_or_else(crate::dotagents::DotagentsLoadOptions::disabled);
+        self.dotagents_options = Some(options.with_workspace_fallback(workspace));
+        self
+    }
+
+    /// Inspect configured protocol load options without triggering discovery.
+    pub fn configured_dotagents_options(&self) -> Option<&crate::dotagents::DotagentsLoadOptions> {
+        self.dotagents_options.as_ref()
+    }
+
+    /// Inspect a supplied pre-resolved protocol manifest.
+    pub fn configured_dotagents_manifest(&self) -> Option<&crate::dotagents::DotagentsManifest> {
+        self.dotagents_manifest.as_ref()
+    }
+
+    /// Resolve the effective `.agents` Protocol manifest for inspection.
+    ///
+    /// Applies the same resolution precedence as [`Self::build`] (a supplied
+    /// manifest, then explicit or config-derived load options, then the
+    /// builder workspace) but performs no runtime work: no MCP servers are
+    /// started, no tasks are scheduled or reconciled, no memories are
+    /// imported, and no `.agents` directory is created. Returns `Ok(None)`
+    /// when protocol loading is disabled or no protocol layer applies.
+    ///
+    /// Resolved diagnostics are attached to the returned manifest; in strict
+    /// mode the error carries the fully populated manifest for inspection.
+    pub fn preview_dotagents_manifest(
+        &self,
+    ) -> Result<Option<crate::dotagents::DotagentsManifest>, anyhow::Error> {
+        let cwd = self.cwd.clone().map(to_absolute_path).transpose()?;
+        crate::dotagents::resolve_for_builder(
+            self.dotagents_manifest.clone(),
+            self.dotagents_options.clone(),
+            cwd.as_deref(),
+        )
+        .map_err(|error| anyhow!(error.to_string()))
+    }
+
     /// Inject custom infrastructure (plugin registry, storage).
     ///
     /// Required for environments without default plugin loaders (iOS, embedded).
@@ -188,9 +260,21 @@ impl QuorumBuilder {
     }
 
     pub async fn build(mut self) -> Result<super::agent::Agent> {
-        let planner_config = self
+        let cwd = self.cwd.clone().map(to_absolute_path).transpose()?;
+        let dotagents_manifest = crate::dotagents::resolve_for_builder(
+            self.dotagents_manifest.take(),
+            self.dotagents_options.take(),
+            cwd.as_deref(),
+        )
+        .map_err(|error| anyhow!(error.to_string()))?;
+
+        let mut planner_config = self
             .planner_config
+            .take()
             .ok_or_else(|| anyhow!("Planner configuration is required"))?;
+        if let Some(manifest) = &dotagents_manifest {
+            compose_dotagents_prompts(&mut planner_config, &mut self.delegates, manifest);
+        }
 
         if planner_config
             .tools
@@ -238,9 +322,6 @@ impl QuorumBuilder {
                 }
             }
         }
-
-        // Convert cwd to absolute path if provided
-        let cwd = self.cwd.map(to_absolute_path).transpose()?;
 
         // Capability validation
         let mut all_required = HashSet::new();
@@ -327,6 +408,13 @@ impl QuorumBuilder {
         }
 
         let skills_project_root = cwd.clone().unwrap_or_else(|| PathBuf::from("."));
+        // Capture explicit delegate IDs before the loop consumes `self.delegates`
+        // (task 3.4 collision resolution needs them afterwards).
+        let configured_delegate_ids: Vec<String> = self
+            .delegates
+            .iter()
+            .map(|delegate| delegate.id.clone())
+            .collect();
         for delegate in self.delegates {
             let agent_info = AgentInfo {
                 id: delegate.id.clone(),
@@ -338,6 +426,7 @@ impl QuorumBuilder {
             };
             let llm_config = build_llm_config(&delegate)?;
             let tools = delegate.tools.clone();
+            let delegate_mcp_servers = delegate.mcp_servers.clone();
             let middleware_entries = delegate.middleware.clone();
             let exec = delegate.execution.clone();
             let skills = delegate.skills.clone();
@@ -379,6 +468,17 @@ impl QuorumBuilder {
                     b = b.with_allowed_tools(tools.clone());
                 }
 
+                // Attach resolved MCP servers through the existing lifecycle.
+                // An external tool spec also widens the policy so MCP tool
+                // definitions reach the LLM.
+                if !delegate_mcp_servers.is_empty() {
+                    let has_external_tools = tools.iter().any(|tool| tool.contains('.'));
+                    if has_external_tools {
+                        b = b.with_tool_policy(ToolPolicy::BuiltInAndProvider);
+                    }
+                    b = b.with_mcp_servers(delegate_mcp_servers.clone());
+                }
+
                 let auto_compact = exec.compaction.auto;
                 b = b
                     .with_snapshot_from_execution(&exec)
@@ -394,6 +494,71 @@ impl QuorumBuilder {
                 let config = Arc::new(b.build());
                 Arc::new(AgentHandle::from_config(config)) as Arc<dyn AgentHandleTrait>
             });
+        }
+
+        // Task 3.3: add protocol delegation targets as additional delegates for a
+        // delegation-enabled quorum. The configured planner and delegates are
+        // never replaced, and protocol loading never enables delegation.
+        //
+        // Collision handling (task 3.4) is applied here: a protocol target whose
+        // ID matches a configured delegate or a pre-registered remote agent is
+        // skipped with a source-bearing diagnostic.
+        if self.delegation_enabled
+            && let Some(manifest) = &dotagents_manifest
+        {
+            let mut plans = crate::dotagents::DotagentsSubAgentPlans::from_manifest(manifest);
+            let explicit_ids: HashSet<String> = configured_delegate_ids
+                .iter()
+                .cloned()
+                .chain(
+                    self.initial_registry
+                        .iter()
+                        .flat_map(|registry| registry.list_agents())
+                        .map(|info| info.id),
+                )
+                .collect();
+
+            let mut collisions: Vec<String> = Vec::new();
+            for id in &explicit_ids {
+                if plans.plans.remove(id).is_some() {
+                    collisions.push(id.clone());
+                }
+            }
+            collisions.sort();
+            for id in collisions {
+                log::warn!(
+                    "dotagents: protocol delegation target `{id}` collides with an explicitly \
+                     configured quorum target or delegate; the explicit target wins and the \
+                     protocol target is not registered"
+                );
+            }
+
+            for plan in plans.plans.values() {
+                let info = plan.info.clone();
+                let target_plan = plan.clone();
+                let factory: Arc<dyn crate::dotagents::ProtocolTargetFactory> = Arc::new(
+                    super::DotagentsTargetFactory::new(registry.clone(), backend.clone()),
+                );
+                let registry_for_fallback = registry.clone();
+                builder = builder.add_delegate_agent(
+                    info,
+                    move |_storage: Arc<dyn StorageBackend>, _event_fanout| match factory
+                        .create(&target_plan)
+                    {
+                        Some(handle) => handle,
+                        None => Arc::new(AgentHandle::from_config(Arc::new(
+                            AgentConfigBuilder::new(
+                                registry_for_fallback.clone(),
+                                _storage.clone(),
+                                querymt::LLMParams::new(),
+                            )
+                            .with_agent_id(target_plan.id.clone())
+                            .with_event_fanout(_event_fanout)
+                            .build(),
+                        ))) as Arc<dyn AgentHandleTrait>,
+                    },
+                );
+            }
         }
 
         // Create RoutingActor + snapshot handle if there are peer delegates.
@@ -477,6 +642,7 @@ impl QuorumBuilder {
 
         let planner_llm = build_llm_config(&planner_config)?;
         let planner_tools = planner_config.tools.clone();
+        let planner_mcp_servers = planner_config.mcp_servers.clone();
         let planner_middleware = planner_config.middleware.clone();
         let planner_exec = planner_config.execution.clone();
         let planner_skills = planner_config.skills.clone();
@@ -518,6 +684,17 @@ impl QuorumBuilder {
                 b = b
                     .with_tool_policy(ToolPolicy::BuiltInOnly)
                     .with_allowed_tools(planner_tools.clone());
+            }
+
+            // Attach resolved MCP servers through the existing lifecycle. An
+            // external tool spec also widens the policy so MCP tool
+            // definitions reach the LLM.
+            if !planner_mcp_servers.is_empty() {
+                let has_external_tools = planner_tools.iter().any(|tool| tool.contains('.'));
+                if has_external_tools {
+                    b = b.with_tool_policy(ToolPolicy::BuiltInAndProvider);
+                }
+                b = b.with_mcp_servers(planner_mcp_servers.clone());
             }
 
             let auto_compact = planner_exec.compaction.auto;
@@ -742,6 +919,7 @@ impl QuorumBuilder {
             callbacks: Arc::new(EventCallbacksState::new(None)),
             profiles: None,
             quorum: Some(Arc::new(quorum)),
+            dotagents: None,
         })
     }
 }
@@ -775,7 +953,8 @@ impl super::agent::Agent {
         config: QuorumConfig,
         initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
     ) -> Result<QuorumBuilder> {
-        let mut builder = QuorumBuilder::new();
+        let dotagents_options = config.dotagents.load_options();
+        let mut builder = QuorumBuilder::new().dotagents_options(dotagents_options);
 
         if let Some(cwd) = config.quorum.cwd {
             builder = builder.cwd(cwd);
@@ -825,13 +1004,13 @@ impl super::agent::Agent {
             &available_local_tool_names,
         )?;
         planner_config.tools = planner_resolved.local_tools;
-
-        // Note: MCP tools are not yet supported in the simple Quorum API.
-        if !planner_resolved.mcp_servers.is_empty() {
-            log::warn!(
-                "MCP servers configured for planner, but MCP is not yet supported in Quorum. Only builtin tools will be available."
-            );
-        }
+        // Attach the resolved MCP servers so the planner's runtime starts them
+        // through the existing stdio and streamable-http transports.
+        planner_config.mcp_servers = planner_resolved
+            .mcp_servers
+            .values()
+            .map(|(config, _)| config.clone())
+            .collect();
 
         planner_config.middleware = config.planner.middleware;
         planner_config.execution = config.planner.execution;
@@ -874,13 +1053,13 @@ impl super::agent::Agent {
                 &available_local_tool_names,
             )?;
             delegate_config.tools = delegate_resolved.local_tools;
-
-            if !delegate_resolved.mcp_servers.is_empty() {
-                log::warn!(
-                    "MCP servers configured for delegate '{}', but MCP is not yet supported in Quorum. Only builtin tools will be available.",
-                    delegate.id
-                );
-            }
+            // Attach the resolved MCP servers so the delegate runtime starts
+            // them through the existing stdio and streamable-http transports.
+            delegate_config.mcp_servers = delegate_resolved
+                .mcp_servers
+                .values()
+                .map(|(config, _)| config.clone())
+                .collect();
 
             delegate_config.required_capabilities =
                 infer_required_capabilities(&delegate_config.tools)
@@ -1013,6 +1192,21 @@ fn parse_snapshot_policy(policy: Option<String>) -> Result<SnapshotPolicy> {
     }
 }
 
+fn compose_dotagents_prompts(
+    planner: &mut AgentConfig,
+    delegates: &mut [AgentConfig],
+    manifest: &crate::dotagents::DotagentsManifest,
+) {
+    if let Some(params) = planner.llm_config.as_mut() {
+        crate::dotagents::compose_prompt(params, manifest);
+    }
+    for delegate in delegates {
+        if let Some(params) = delegate.llm_config.as_mut() {
+            crate::dotagents::compose_prompt(params, manifest);
+        }
+    }
+}
+
 /// Helper to apply middleware from config entries to a builder.
 ///
 /// `factory_config` is a snapshot of the config built so far (before middleware
@@ -1075,6 +1269,7 @@ fn apply_middleware_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::McpServerConfig;
     use crate::test_utils::helpers::empty_plugin_registry;
 
     fn skill_quorum_config(skills_enabled: bool) -> QuorumConfig {
@@ -1127,6 +1322,59 @@ include_external = false
         assert_eq!(
             delegate.llm_config.as_ref().map(|c| c.system.clone()),
             Some(vec!["Coder system prompt".to_string()])
+        );
+    }
+
+    #[test]
+    fn dotagents_prompts_apply_to_planner_and_delegates_in_order() {
+        let builder = QuorumBuilder::new()
+            .planner(|planner| {
+                planner
+                    .provider("test", "planner")
+                    .system("planner explicit")
+            })
+            .delegate("coder", |delegate| {
+                delegate
+                    .provider("test", "coder")
+                    .system("delegate explicit")
+            });
+        let mut planner = builder.planner_config.unwrap();
+        let mut delegates = builder.delegates;
+        let source = crate::dotagents::DotagentsSource::singleton(
+            crate::dotagents::DotagentsLayer::Workspace,
+            "system-prompt.md",
+        );
+        let mut manifest = crate::dotagents::DotagentsManifest::empty();
+        manifest.system_prompt = Some(crate::dotagents::DotagentsPrompt {
+            metadata: Default::default(),
+            body: "protocol system".to_string(),
+            source: source.clone(),
+            fingerprint: "system".to_string(),
+        });
+        manifest.agents_md = Some(crate::dotagents::DotagentsPrompt {
+            metadata: Default::default(),
+            body: "protocol instructions".to_string(),
+            source,
+            fingerprint: "agents".to_string(),
+        });
+
+        compose_dotagents_prompts(&mut planner, &mut delegates, &manifest);
+
+        assert_eq!(
+            planner.llm_config.unwrap().system,
+            vec![
+                "planner explicit",
+                "protocol system",
+                "protocol instructions"
+            ]
+        );
+        assert_eq!(
+            delegates[0].llm_config.as_ref().unwrap().system,
+            vec![
+                "delegate explicit",
+                "protocol system",
+                "protocol instructions"
+            ]
         );
     }
 
@@ -1462,5 +1710,115 @@ model = "gpt-4"
         assert_eq!(builder.peer_delegates[0].1, "gpu-node");
         // "writer" has no peer
         assert!(!builder.peer_delegates.iter().any(|(id, _)| id == "writer"));
+    }
+
+    // ---- 6.2 MCP attachment for planner and delegates ----
+
+    fn mcp_quorum_config() -> QuorumConfig {
+        let toml = r#"
+[quorum]
+cwd = "/tmp"
+
+[planner]
+provider = "openai"
+model = "gpt-4"
+tools = ["stdio-tool.*", "http-tool.*"]
+
+[[mcp]]
+name = "stdio-tool"
+command = "stdio-cmd"
+transport = "stdio"
+
+[[mcp]]
+name = "http-tool"
+url = "https://example.test/mcp"
+transport = "http"
+
+[[delegates]]
+id = "coder"
+provider = "openai"
+model = "gpt-4"
+tools = ["stdio-tool.*"]
+"#;
+        toml::from_str(toml).expect("parse mcp quorum config")
+    }
+
+    #[test]
+    fn quorum_planner_retains_resolved_mcp_servers() {
+        let builder =
+            crate::api::agent::Agent::builder_from_quorum_config(mcp_quorum_config(), None)
+                .expect("builder_from_quorum_config");
+
+        let planner = builder.planner_config.expect("planner config");
+        let names: Vec<&str> = planner
+            .mcp_servers
+            .iter()
+            .map(|server| server.name())
+            .collect();
+        assert!(
+            names.contains(&"stdio-tool"),
+            "planner must retain the stdio server: {names:?}"
+        );
+        assert!(
+            names.contains(&"http-tool"),
+            "planner must retain the streamable-http server: {names:?}"
+        );
+    }
+
+    #[test]
+    fn quorum_delegate_retains_resolved_mcp_servers() {
+        let builder =
+            crate::api::agent::Agent::builder_from_quorum_config(mcp_quorum_config(), None)
+                .expect("builder_from_quorum_config");
+
+        let delegate = builder
+            .delegates
+            .iter()
+            .find(|delegate| delegate.id == "coder")
+            .expect("coder delegate");
+        let names: Vec<&str> = delegate
+            .mcp_servers
+            .iter()
+            .map(|server| server.name())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["stdio-tool"],
+            "delegate retains exactly its resolved MCP servers"
+        );
+        // Both transports remain representable through the existing configs.
+        assert!(matches!(
+            delegate.mcp_servers[0],
+            McpServerConfig::Stdio { .. }
+        ));
+    }
+
+    #[test]
+    fn quorum_without_mcp_servers_attaches_none() {
+        let toml = r#"
+[quorum]
+cwd = "/tmp"
+
+[planner]
+provider = "openai"
+model = "gpt-4"
+
+[[delegates]]
+id = "coder"
+provider = "openai"
+model = "gpt-4"
+"#;
+        let config: crate::config::QuorumConfig = toml::from_str(toml).expect("parse");
+        let builder = crate::api::agent::Agent::builder_from_quorum_config(config, None)
+            .expect("builder_from_quorum_config");
+
+        let planner = builder.planner_config.expect("planner config");
+        assert!(planner.mcp_servers.is_empty());
+        assert!(
+            builder
+                .delegates
+                .iter()
+                .all(|delegate| delegate.mcp_servers.is_empty())
+        );
     }
 }

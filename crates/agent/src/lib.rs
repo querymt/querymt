@@ -22,6 +22,7 @@ pub use querymt_utils::secret_store::SecretStore;
 pub mod acp;
 pub mod agent;
 pub mod delegation;
+pub mod dotagents;
 pub mod elicitation;
 pub mod event_fanout;
 pub mod event_sink;

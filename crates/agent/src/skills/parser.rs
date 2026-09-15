@@ -4,8 +4,31 @@ use std::path::Path;
 
 pub const SKILL_FILENAME: &str = "SKILL.md";
 
-/// Parse a SKILL.md file into a Skill struct
+/// Lowercase `.agents` Protocol spelling of the skill definition file.
+///
+/// Only honored inside `.agents/skills` discovery sources; every other source
+/// keeps requiring the uppercase `SKILL.md` name.
+pub const PROTOCOL_SKILL_FILENAME: &str = "skill.md";
+
+/// Parse a SKILL.md file into a Skill struct.
+///
+/// This is the legacy, non-protocol entry point: `name` and `description`
+/// are required and protocol-only metadata (`id`, `enabled`) is ignored for
+/// behavior. Use [`parse_skill_file_ex`] for `.agents/skills` sources.
 pub fn parse_skill_file(path: &Path, source: SkillSource) -> Result<Skill> {
+    parse_skill_file_ex(path, source, false)
+}
+
+/// Parse a skill definition file with `.agents` Protocol extensions.
+///
+/// Protocol mode applies to files discovered under `.agents/skills` and:
+/// - accepts the lowercase `skill.md` spelling (the caller filters names),
+/// - honors the `id` and `enabled` frontmatter metadata,
+/// - defaults a missing `name` to the explicit `id` and then to the entry
+///   directory name, matching the protocol's stable-ID rule.
+///
+/// `description` remains required in both modes.
+pub fn parse_skill_file_ex(path: &Path, source: SkillSource, protocol: bool) -> Result<Skill> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
 
@@ -14,9 +37,13 @@ pub fn parse_skill_file(path: &Path, source: SkillSource) -> Result<Skill> {
         .with_context(|| format!("Failed to parse file {}", path.display()))?;
 
     // Extract and validate frontmatter
-    let metadata: SkillMetadata = parsed
+    let mut metadata: SkillMetadata = parsed
         .data
         .ok_or_else(|| anyhow::anyhow!("Missing YAML frontmatter in {}", path.display()))?;
+
+    if protocol {
+        apply_protocol_defaults(&mut metadata, path);
+    }
 
     // Validate required fields
     if metadata.name.trim().is_empty() {
@@ -43,6 +70,24 @@ pub fn parse_skill_file(path: &Path, source: SkillSource) -> Result<Skill> {
         content: parsed.content,
         source,
     })
+}
+
+/// Fill `.agents` Protocol defaults: the stable ID falls back to the entry
+/// directory name and a missing display name falls back to that ID.
+fn apply_protocol_defaults(metadata: &mut SkillMetadata, path: &Path) {
+    let entry_id = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(str::to_string);
+    if let Some(entry_id) = entry_id {
+        if metadata.id.is_none() {
+            metadata.id = Some(entry_id.clone());
+        }
+        if metadata.name.trim().is_empty() {
+            metadata.name = metadata.id.clone().unwrap_or(entry_id);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -207,5 +252,90 @@ OpenSpec instructions.
         );
         assert_eq!(skill.metadata.extra["metadata"]["author"], "openspec");
         assert!(skill.content.contains("OpenSpec instructions."));
+    }
+
+    #[test]
+    fn test_protocol_skill_defaults_name_to_entry_directory() {
+        let dir = TempDir::new().unwrap();
+        let skill_path = dir.path().join("skill.md");
+        fs::write(
+            &skill_path,
+            r#"---
+description: Reviews code changes.
+---
+Review instructions.
+"#,
+        )
+        .unwrap();
+
+        let skill = parse_skill_file_ex(
+            &skill_path,
+            SkillSource::Project(dir.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        // Directory here is the temp dir itself; protocol mode defaults the
+        // ID to the entry directory name.
+        assert_eq!(
+            skill.metadata.id,
+            Some(
+                dir.path()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            skill.metadata.name,
+            dir.path().file_name().unwrap().to_string_lossy()
+        );
+        assert_eq!(skill.metadata.effective_id(), skill.metadata.name);
+        assert!(skill.content.contains("Review instructions."));
+    }
+
+    #[test]
+    fn test_protocol_skill_defaults_name_to_explicit_id() {
+        let dir = TempDir::new().unwrap();
+        let skill_path = dir.path().join("skill.md");
+        fs::write(
+            &skill_path,
+            r#"---
+id: custom-review
+description: Reviews code changes.
+enabled: false
+---
+Review instructions.
+"#,
+        )
+        .unwrap();
+
+        let skill = parse_skill_file_ex(
+            &skill_path,
+            SkillSource::Project(dir.path().to_path_buf()),
+            true,
+        )
+        .unwrap();
+        assert_eq!(skill.metadata.id.as_deref(), Some("custom-review"));
+        assert_eq!(skill.metadata.name, "custom-review");
+        assert!(!skill.metadata.is_enabled());
+    }
+
+    #[test]
+    fn test_non_protocol_parse_still_requires_name() {
+        let dir = TempDir::new().unwrap();
+        let skill_path = dir.path().join("SKILL.md");
+        fs::write(
+            &skill_path,
+            r#"---
+description: No name here.
+---
+Content
+"#,
+        )
+        .unwrap();
+
+        let result = parse_skill_file(&skill_path, SkillSource::Global(dir.path().to_path_buf()));
+        assert!(result.is_err());
     }
 }

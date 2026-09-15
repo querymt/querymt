@@ -226,6 +226,8 @@ mod tests {
             metadata: SkillMetadata {
                 name: name.to_string(),
                 description: description.to_string(),
+                id: None,
+                enabled: None,
                 version: None,
                 license: None,
                 compatibility: None,

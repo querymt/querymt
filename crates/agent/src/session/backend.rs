@@ -4,6 +4,7 @@
 //! enabling clean separation between session persistence (command side)
 //! and event/projection handling (query side).
 
+use crate::dotagents::DotagentsTaskStateRepository;
 use crate::knowledge::KnowledgeStore;
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::projection::{EventJournal, ViewStore};
@@ -78,6 +79,22 @@ pub trait StorageBackend: Send + Sync {
         None
     }
 
+    /// Persisted protocol task ownership and fingerprint-bound trust decisions.
+    /// Returns None if the backend cannot reconcile protocol-owned tasks safely.
+    fn dotagents_task_state_repository(&self) -> Option<Arc<dyn DotagentsTaskStateRepository>> {
+        None
+    }
+
+    /// Protocol-owned automation sessions.
+    ///
+    /// Returns None if the backend cannot provision the durable session that
+    /// protocol repeat tasks bind their schedules to.
+    fn dotagents_automation_repository(
+        &self,
+    ) -> Option<Arc<dyn crate::dotagents::DotagentsAutomationRepository>> {
+        None
+    }
+
     /// Knowledge store for the knowledge tools.
     /// Returns None if backend doesn't support knowledge storage.
     fn knowledge_store(&self) -> Option<Arc<dyn KnowledgeStore>> {
@@ -106,6 +123,20 @@ impl StorageBackend for SqliteStorage {
     fn schedule_repository(&self) -> Option<Arc<dyn ScheduleRepository>> {
         Some(Arc::new(
             crate::session::repo_schedule::SqliteScheduleRepository::new(self.conn()),
+        ))
+    }
+
+    fn dotagents_task_state_repository(&self) -> Option<Arc<dyn DotagentsTaskStateRepository>> {
+        Some(Arc::new(
+            crate::dotagents::SqliteDotagentsTaskStateRepository::new(self.conn()),
+        ))
+    }
+
+    fn dotagents_automation_repository(
+        &self,
+    ) -> Option<Arc<dyn crate::dotagents::DotagentsAutomationRepository>> {
+        Some(Arc::new(
+            crate::dotagents::SqliteDotagentsAutomationRepository::new(self.conn()),
         ))
     }
 

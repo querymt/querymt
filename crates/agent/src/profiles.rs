@@ -844,6 +844,10 @@ pub struct ProfileRuntimeManager<C = Arc<dyn ProfileCatalog>> {
     shutdown: AtomicBool,
     generation: AtomicU64,
     lifecycle: Mutex<()>,
+    /// Workspace used to derive the `<workspace>/.agents/` layer for profile
+    /// runtimes. Protocol parsing stays out of the TOML profile catalog: this
+    /// context is threaded into the normal runtime builders instead.
+    dotagents_workspace: Option<PathBuf>,
     #[cfg(feature = "remote")]
     mesh: StdMutex<Option<crate::agent::remote::MeshHandle>>,
 }
@@ -880,6 +884,7 @@ where
             shutdown: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             lifecycle: Mutex::new(()),
+            dotagents_workspace: None,
             #[cfg(feature = "remote")]
             mesh: StdMutex::new(None),
         }
@@ -981,8 +986,14 @@ where
             let runtime = cell
                 .get_or_try_init(|| async {
                     let document = self.catalog.load_profile(profile_id).await?;
-                    let runtime =
-                        Arc::new(build_profile_runtime(document, self.shared_infra.clone()).await?);
+                    let runtime = Arc::new(
+                        build_profile_runtime(
+                            document,
+                            self.shared_infra.clone(),
+                            self.dotagents_workspace.clone(),
+                        )
+                        .await?,
+                    );
                     #[cfg(feature = "remote")]
                     if let Some(mesh) = self.mesh_handle() {
                         runtime.agent().handle().set_mesh(mesh);
@@ -1124,6 +1135,21 @@ where
 
     pub async fn materialized_runtimes(&self) -> Vec<Arc<ProfileRuntime>> {
         self.runtimes.lock().await.values().cloned().collect()
+    }
+
+    /// Set the workspace used to derive `<workspace>/.agents/` for profile runtimes.
+    ///
+    /// This only supplies the protocol workspace context; the TOML profile
+    /// catalog is never asked to parse protocol profiles. Profile settings that
+    /// already select a `workspace` or `workspace_root` keep precedence.
+    pub fn with_dotagents_workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
+        self.dotagents_workspace = Some(workspace.into());
+        self
+    }
+
+    /// The protocol workspace threaded into profile runtime construction.
+    pub fn dotagents_workspace(&self) -> Option<&Path> {
+        self.dotagents_workspace.as_deref()
     }
 
     pub fn start_profile_watcher(self: &Arc<Self>) -> Option<RecommendedWatcher> {
@@ -1276,6 +1302,7 @@ impl ProfileRuntimeManager<Arc<dyn ProfileCatalog>> {
             shutdown: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             lifecycle: Mutex::new(()),
+            dotagents_workspace: None,
             #[cfg(feature = "remote")]
             mesh: StdMutex::new(None),
         }
@@ -1285,6 +1312,7 @@ impl ProfileRuntimeManager<Arc<dyn ProfileCatalog>> {
 async fn build_profile_runtime(
     document: ProfileDocument,
     mut shared_infra: AgentInfra,
+    dotagents_workspace: Option<PathBuf>,
 ) -> Result<ProfileRuntime> {
     let metadata = document.metadata;
     let provider_lock = if document.provider_mode == ProfileProviderMode::Legacy {
@@ -1301,7 +1329,15 @@ async fn build_profile_runtime(
     };
     let agent = match document.config {
         Config::Single(config) => {
-            Agent::from_single_config_with_infra(*config, shared_infra).await?
+            // Thread the protocol workspace through the normal builder so the
+            // runtime picks up `<workspace>/.agents/` without the TOML profile
+            // catalog needing to understand protocol profiles.
+            let builder = Agent::builder_from_config_with_dotagents(
+                *config,
+                None,
+                dotagents_workspace.as_deref(),
+            )?;
+            builder.infra(shared_infra).build().await?
         }
         Config::Multi(config) => {
             #[cfg(feature = "remote")]
@@ -1309,7 +1345,10 @@ async fn build_profile_runtime(
             #[cfg(not(feature = "remote"))]
             let infra = shared_infra;
 
-            let builder = Agent::builder_from_quorum_config(*config, None)?;
+            let mut builder = Agent::builder_from_quorum_config(*config, None)?;
+            if let Some(workspace) = dotagents_workspace {
+                builder = builder.with_dotagents_workspace(workspace);
+            }
             builder
                 .with_profile_id(metadata.id.clone())
                 .infra(infra)
@@ -3034,6 +3073,114 @@ capabilities = ["coding"]
         assert_eq!(runtime.profile_id(), "team");
         assert!(runtime.agent().is_multi());
         assert!(Arc::ptr_eq(&shared, &runtime.agent().storage_backend()));
+
+        manager.shutdown().await;
+    }
+
+    // ---- 6.3 Protocol workspace threaded through profile runtimes ----
+
+    const SINGLE_PROFILE_TOML: &str = r#"
+[agent]
+provider = "openai"
+model = "gpt-4o-mini"
+
+[agent.skills]
+enabled = false
+
+[dotagents]
+enabled = true
+global_enabled = false
+"#;
+
+    #[test]
+    fn workspace_fallback_never_overrides_explicit_roots() {
+        // An explicit workspace wins over a threaded fallback.
+        let options = crate::dotagents::DotagentsLoadOptions::enabled()
+            .with_workspace("/explicit")
+            .with_workspace_fallback("/fallback");
+        assert_eq!(options.workspace(), Some(std::path::Path::new("/explicit")));
+
+        // A workspace root override also wins, since the load options already
+        // selected their layer roots.
+        let options = crate::dotagents::DotagentsLoadOptions::enabled()
+            .with_workspace_root("/root-override")
+            .with_workspace_fallback("/fallback");
+        assert!(options.workspace().is_none());
+        assert_eq!(
+            options.workspace_root_override(),
+            Some(std::path::Path::new("/root-override"))
+        );
+
+        // With neither configured, the fallback applies.
+        let options =
+            crate::dotagents::DotagentsLoadOptions::enabled().with_workspace_fallback("/fallback");
+        assert_eq!(options.workspace(), Some(std::path::Path::new("/fallback")));
+    }
+
+    #[tokio::test]
+    async fn profile_runtime_applies_threaded_protocol_workspace() {
+        let dir = temp_profile_dir();
+        write_profile(dir.path(), "solo.toml", SINGLE_PROFILE_TOML);
+
+        // Protocol files live under `<workspace>/.agents/`.
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let agents_dir = workspace.path().join(".agents");
+        std::fs::create_dir_all(&agents_dir).expect("create .agents");
+        std::fs::write(
+            agents_dir.join("agents.md"),
+            "Repository protocol instructions",
+        )
+        .expect("write agents.md");
+
+        let (infra, _infra_dir) = test_infra().await;
+        let catalog = LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(dir.path())
+            .build();
+        let manager = ProfileRuntimeManager::with_infra(catalog, "solo", infra)
+            .with_dotagents_workspace(workspace.path());
+
+        assert_eq!(manager.dotagents_workspace(), Some(workspace.path()));
+
+        let runtime = manager
+            .active_runtime()
+            .await
+            .expect("profile runtime builds with protocol workspace");
+
+        // The protocol instructions reached the runtime's system prompt.
+        let handle = runtime.agent().handle();
+        let params = handle.config.provider.initial_config();
+        assert!(
+            params
+                .system
+                .iter()
+                .any(|part| part == "Repository protocol instructions"),
+            "profile runtime must apply the threaded protocol workspace: {:?}",
+            params.system
+        );
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn profile_runtime_without_workspace_is_unaffected_by_protocol_files() {
+        let dir = temp_profile_dir();
+        write_profile(dir.path(), "solo.toml", SINGLE_PROFILE_TOML);
+
+        let (infra, _infra_dir) = test_infra().await;
+        let catalog = LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(dir.path())
+            .build();
+        let manager = ProfileRuntimeManager::with_infra(catalog, "solo", infra);
+
+        assert!(manager.dotagents_workspace().is_none());
+
+        let runtime = manager
+            .active_runtime()
+            .await
+            .expect("profile runtime builds without protocol workspace");
+        assert_eq!(runtime.profile_id(), "solo");
 
         manager.shutdown().await;
     }
