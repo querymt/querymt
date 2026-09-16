@@ -2144,7 +2144,7 @@
 <p>If no knowledge store is configured, memories remain inspectable in the manifest and a non-fatal diagnostic reports that import was skipped. Other protocol features — prompts, skills, sub-agents — are unaffected.</p>
 <h2 id="security">Security</h2>
 <ul>
-<li><strong>Path confinement</strong>: references resolving outside their owning layer root are rejected before any file is read or process is started. <code>..</code> traversal, symlink escapes, and non-regular files are refused.</li>
+<li><strong>Path confinement</strong>: references may resolve within their owning layer root or an explicitly configured trusted root. <code>..</code> traversal, symlink escapes, and non-regular files outside those allowed roots are rejected before any file is read or process is started.</li>
 <li><strong>No implicit creation</strong>: workspace discovery only happens when <code>&lt;workspace&gt;/.agents</code> already exists.</li>
 <li><strong>Secrets</strong>: <code>${VAR}</code> references are interpolated at activation; diagnostics, debug output, and inspectable manifests redact resolved secret values while retaining enough context to fix errors. Secret values are never used as entry IDs or persisted as reconciliation keys.</li>
 <li><strong>No executable sub-agents</strong>: <code>stdio</code>/executable connection types never launch a process.</li>
