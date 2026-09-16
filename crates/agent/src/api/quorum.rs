@@ -303,9 +303,13 @@ impl QuorumBuilder {
             for diagnostic in &mcp_plan.diagnostics {
                 log::warn!("dotagents: {diagnostic}");
             }
-            merge_dotagents_mcp_servers(&mut planner_config, &mcp_plan.servers);
+            passive_diagnostics.extend(merge_dotagents_mcp_servers(
+                &mut planner_config,
+                &mcp_plan.servers,
+            ));
             for delegate in &mut self.delegates {
-                merge_dotagents_mcp_servers(delegate, &mcp_plan.servers);
+                passive_diagnostics
+                    .extend(merge_dotagents_mcp_servers(delegate, &mcp_plan.servers));
             }
             passive_diagnostics.extend(mcp_plan.diagnostics);
         }
@@ -1296,7 +1300,8 @@ fn compose_dotagents_prompts(
 fn merge_dotagents_mcp_servers(
     config: &mut AgentConfig,
     manifest_servers: &[crate::config::McpServerConfig],
-) {
+) -> Vec<crate::dotagents::DotagentsDiagnostic> {
+    let mut diagnostics = Vec::new();
     for server in manifest_servers {
         if !config
             .mcp_servers
@@ -1305,12 +1310,18 @@ fn merge_dotagents_mcp_servers(
         {
             config.mcp_servers.push(server.clone());
         } else {
-            log::warn!(
-                "dotagents: protocol MCP server `{}` collides with an explicit configuration; keeping the explicit server",
+            let message = format!(
+                "protocol MCP server `{}` collides with an explicit configuration; keeping the explicit server",
                 server.name()
             );
+            log::warn!("dotagents: {message}");
+            diagnostics.push(crate::dotagents::DotagentsDiagnostic::warning(
+                crate::dotagents::DotagentsDiagnosticCode::Collision,
+                message,
+            ));
         }
     }
+    diagnostics
 }
 
 /// Helper to apply middleware from config entries to a builder.

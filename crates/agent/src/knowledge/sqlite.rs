@@ -850,6 +850,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                 .map_err(KnowledgeError::from)?;
             drop(stmt);
 
+            let tx = conn.transaction().map_err(KnowledgeError::from)?;
             let mut deactivated = Vec::new();
             for (row_id, public_id, source_key) in candidates {
                 let Some(source_key) = source_key else {
@@ -858,13 +859,14 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                 if live.iter().any(|key| key == &source_key) {
                     continue;
                 }
-                conn.execute(
+                tx.execute(
                     "UPDATE knowledge_entries SET protocol_active = 0 WHERE id = ?",
                     params![row_id],
                 )
                 .map_err(KnowledgeError::from)?;
                 deactivated.push(public_id);
             }
+            tx.commit().map_err(KnowledgeError::from)?;
             deactivated.sort();
             Ok(deactivated)
         })

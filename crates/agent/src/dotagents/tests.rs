@@ -22,11 +22,11 @@ fn load_options_default_is_disabled() {
 }
 
 #[test]
-fn protocol_knowledge_scope_preserves_nonexistent_workspace() {
-    let workspace = std::path::Path::new("/nonexistent/querymt-workspace");
+fn protocol_knowledge_scope_normalizes_nonexistent_workspace() {
+    let workspace = std::path::Path::new("/nonexistent/./parent/../querymt-workspace");
     assert_eq!(
         protocol_knowledge_scope(Some(workspace)),
-        workspace.to_string_lossy()
+        "/nonexistent/querymt-workspace"
     );
     assert_eq!(protocol_knowledge_scope(None), "global");
 }

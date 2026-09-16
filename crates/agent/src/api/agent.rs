@@ -663,10 +663,15 @@ impl AgentBuilder {
                     {
                         servers.push(server);
                     } else {
-                        log::warn!(
-                            "dotagents: protocol MCP server `{}` collides with an explicit configuration; keeping the explicit server",
+                        let message = format!(
+                            "protocol MCP server `{}` collides with an explicit configuration; keeping the explicit server",
                             server.name()
                         );
+                        log::warn!("dotagents: {message}");
+                        passive_diagnostics.push(crate::dotagents::DotagentsDiagnostic::warning(
+                            crate::dotagents::DotagentsDiagnosticCode::Collision,
+                            message,
+                        ));
                     }
                 }
                 builder = builder.with_mcp_servers(servers);

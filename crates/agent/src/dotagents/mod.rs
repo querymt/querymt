@@ -93,11 +93,45 @@ pub fn protocol_knowledge_scope(workspace: Option<&std::path::Path>) -> String {
     workspace
         .map(|path| {
             std::fs::canonicalize(path)
-                .unwrap_or_else(|_| path.to_path_buf())
+                .unwrap_or_else(|_| lexical_normalize_path(path))
                 .to_string_lossy()
                 .into_owned()
         })
         .unwrap_or_else(|| "global".to_string())
+}
+
+fn lexical_normalize_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut normalized = std::path::PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                Some(Component::ParentDir) | None => normalized.push(component.as_os_str()),
+                Some(Component::CurDir) => {
+                    unreachable!("components omit current-directory entries")
+                }
+            },
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    normalized
 }
 pub use merge::{DotagentsLayerContent, insert_unique, merge_layers, normalize_id, source_of};
 pub use options::{DotagentsLoadOptions, DotagentsStrictness};
