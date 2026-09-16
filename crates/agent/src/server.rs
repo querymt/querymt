@@ -29,6 +29,8 @@ pub struct AgentServer {
     storage: Arc<dyn StorageBackend>,
     default_cwd: Option<PathBuf>,
     profiles: Option<ProfileRuntimeHandle>,
+    #[cfg(feature = "dashboard-ng")]
+    dashboard_ng_origin_scheme: Arc<str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,7 +53,15 @@ impl AgentServer {
             storage,
             default_cwd,
             profiles: None,
+            #[cfg(feature = "dashboard-ng")]
+            dashboard_ng_origin_scheme: Arc::from("http"),
         }
+    }
+
+    #[cfg(feature = "dashboard-ng")]
+    pub fn with_dashboard_ng_origin_scheme(mut self, scheme: impl Into<Arc<str>>) -> Self {
+        self.dashboard_ng_origin_scheme = scheme.into();
+        self
     }
 
     pub fn with_profiles(mut self, profiles: ProfileRuntimeHandle) -> Self {
@@ -109,9 +119,10 @@ impl AgentServer {
     ) -> anyhow::Result<Router> {
         let acp_router = match mode {
             #[cfg(feature = "dashboard-ng")]
-            ServerMode::DashboardNg => {
-                crate::acp::websocket::same_origin_router(self.agent.clone())
-            }
+            ServerMode::DashboardNg => crate::acp::websocket::same_origin_router(
+                self.agent.clone(),
+                self.dashboard_ng_origin_scheme.clone(),
+            ),
             _ => AcpServer::new(self.agent.clone()).router(),
         };
         let export_storage = self.storage.clone();

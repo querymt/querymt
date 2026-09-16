@@ -39,7 +39,8 @@ use crate::acp::protocol::{
     SessionNotification,
 };
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 /// Messages sent from agent tasks to the active ACP bridge task.
 ///
@@ -135,10 +136,30 @@ impl NotificationForwardingState {
 /// // In agent methods:
 /// agent.bridge().unwrap().notify(notification).await?;
 /// ```
+pub(crate) struct ClientBridgeConnectionState {
+    active: AtomicBool,
+    attachment_lock: Mutex<()>,
+}
+
+impl ClientBridgeConnectionState {
+    pub(crate) async fn lock_attachment(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.attachment_lock.lock().await
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
 #[derive(Clone)]
 pub struct ClientBridgeSender {
     tx: mpsc::Sender<ClientBridgeMessage>,
     connection_id: Option<Arc<str>>,
+    connection_state: Option<Arc<ClientBridgeConnectionState>>,
 }
 
 impl ClientBridgeSender {
@@ -149,6 +170,7 @@ impl ClientBridgeSender {
         Self {
             tx,
             connection_id: None,
+            connection_state: None,
         }
     }
 
@@ -159,11 +181,19 @@ impl ClientBridgeSender {
         Self {
             tx,
             connection_id: Some(connection_id.into()),
+            connection_state: Some(Arc::new(ClientBridgeConnectionState {
+                active: AtomicBool::new(true),
+                attachment_lock: Mutex::new(()),
+            })),
         }
     }
 
     pub(crate) fn connection_id(&self) -> Option<&str> {
         self.connection_id.as_deref()
+    }
+
+    pub(crate) fn connection_state(&self) -> Option<Arc<ClientBridgeConnectionState>> {
+        self.connection_state.clone()
     }
 
     /// Send a session notification (fire-and-forget).

@@ -251,6 +251,25 @@ async fn attach_rpc_session<S: SendAgent>(
     session_id: &str,
     bridge_required: bool,
 ) -> Result<(), Error> {
+    let connection_state = context
+        .session_bridge
+        .as_ref()
+        .and_then(crate::acp::client_bridge::ClientBridgeSender::connection_state);
+    let _attachment_guard = match connection_state.as_ref() {
+        Some(state) => Some(state.lock_attachment().await),
+        None => None,
+    };
+    if connection_state
+        .as_ref()
+        .is_some_and(|state| !state.is_active())
+    {
+        return if bridge_required {
+            Err(Error::from(crate::error::AgentError::ClientBridgeClosed))
+        } else {
+            Ok(())
+        };
+    }
+
     subscribe_connection(session_owners, session_id.to_string(), conn_id).await;
     let Some(local_agent) = agent.as_any().downcast_ref::<AgentHandle>() else {
         return Ok(());

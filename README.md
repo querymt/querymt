@@ -91,6 +91,7 @@ It loads an agent from a TOML config file and supports several transports:
 - `--acp-ws`: runs a standalone ACP WebSocket server at `/acp/ws`
 - `--dashboard`: runs the existing React dashboard over `/ui/ws` and exposes ACP at `/acp/ws`
 - `--dashboard-ng`: runs the embedded Svelte dashboard over same-origin `/acp/ws`
+- `--dashboard-ng-origin-scheme`: sets the external `http` or `https` scheme used for dashboard WebSocket origin checks (default: `http`)
 
 `--dashboard` and `--dashboard-ng` are mutually exclusive, as are the other transport flags.
 
@@ -111,8 +112,13 @@ cargo run --example qmtcode --features dashboard -- --dashboard
 cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
 
 # Embedded Svelte dashboard from a local querymt-desktop build
-QMT_DASHBOARD_NG_DIST="$(realpath ../../../querymt-desktop/build-embedded)" \
+QMT_DASHBOARD_NG_DIST="$(realpath ../../querymt-desktop/build-embedded)" \
   cargo run --example qmtcode --features dashboard-ng -- --dashboard-ng
+
+# HTTPS reverse proxy (the proxy must enforce the external HTTPS origin)
+QMT_DASHBOARD_NG_DIST="$(realpath ../../querymt-desktop/build-embedded)" \
+  cargo run --example qmtcode --features dashboard-ng -- \
+    --dashboard-ng --dashboard-ng-origin-scheme=https
 ```
 
 By default it reads config from `examples/confs/coder_agent.toml`.

@@ -50,22 +50,30 @@ async fn standalone_websocket_uses_canonical_acp_path() {
 }
 
 #[test]
-fn dashboard_websocket_origin_must_match_host() {
+fn dashboard_websocket_origin_must_match_scheme_and_host() {
     let mut headers = HeaderMap::new();
     headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:3000"));
-    assert!(has_allowed_websocket_origin(&headers));
+    assert!(has_allowed_websocket_origin(&headers, "http"));
 
     headers.insert(
         header::ORIGIN,
         HeaderValue::from_static("http://127.0.0.1:3000"),
     );
-    assert!(has_allowed_websocket_origin(&headers));
+    assert!(has_allowed_websocket_origin(&headers, "http"));
+    assert!(!has_allowed_websocket_origin(&headers, "https"));
 
     headers.insert(
         header::ORIGIN,
-        HeaderValue::from_static("https://attacker.example"),
+        HeaderValue::from_static("https://127.0.0.1:3000"),
     );
-    assert!(!has_allowed_websocket_origin(&headers));
+    assert!(!has_allowed_websocket_origin(&headers, "http"));
+    assert!(has_allowed_websocket_origin(&headers, "https"));
+
+    headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("http://attacker.example"),
+    );
+    assert!(!has_allowed_websocket_origin(&headers, "http"));
 }
 
 fn elicitation_event(session_id: &str, elicitation_id: &str) -> EventEnvelope {
@@ -687,6 +695,95 @@ async fn concurrent_websocket_disconnects_restore_live_session_bridge() {
         .cloned()
         .expect("live subscriber should own the session bridge");
     assert_eq!(route.bridge.connection_id(), Some("conn-c"));
+}
+
+#[tokio::test]
+async fn disconnected_websocket_cannot_be_reattached_by_in_flight_dispatch() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let state = WsServerState::new(fixture.handle.clone());
+    let conn_id = "conn-race";
+    let (bridge_tx, _bridge_rx) = mpsc::channel(4);
+    let bridge = ClientBridgeSender::for_connection(bridge_tx, conn_id);
+    let connection_state = bridge.connection_state().expect("connection state");
+    state
+        .connection_bridges
+        .lock()
+        .await
+        .insert(conn_id.to_string(), bridge.clone());
+
+    let attachment_guard = connection_state.lock_attachment().await;
+    let disconnect_state = state.clone();
+    let disconnect = tokio::spawn(async move {
+        reconcile_websocket_disconnect(&disconnect_state, conn_id).await;
+    });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if !state.connection_bridges.lock().await.contains_key(conn_id) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disconnect should remove the connection bridge");
+
+    let (wire_tx, mut wire_rx) = mpsc::channel(4);
+    let dispatch = tokio::spawn(crate::acp::shared::dispatch_rpc_message_with_context(
+        crate::acp::shared::RpcDispatchState {
+            agent: fixture.handle.clone(),
+            session_owners: state.session_owners.clone(),
+            pending_permissions: state.pending_permissions.clone(),
+            pending_elicitations: state.pending_elicitations.clone(),
+            conn_id: conn_id.to_string(),
+            tx: wire_tx,
+        },
+        crate::acp::shared::RpcMessage {
+            jsonrpc: "2.0".to_string(),
+            method: crate::acp::protocol::AGENT_METHOD_NAMES
+                .session_new
+                .to_string(),
+            params: serde_json::json!({"cwd": "/tmp", "mcpServers": []}),
+            id: Some(serde_json::json!(1)),
+        },
+        crate::acp::shared::RpcDispatchContext {
+            session_hooks: None,
+            session_bridge: Some(bridge),
+        },
+    ));
+    tokio::task::yield_now().await;
+    drop(attachment_guard);
+
+    dispatch.await.expect("dispatch should finish");
+    disconnect.await.expect("disconnect should finish");
+    let response = timeout(Duration::from_secs(2), wire_rx.recv())
+        .await
+        .expect("lifecycle response should arrive")
+        .expect("wire channel should remain open");
+    let response: serde_json::Value = serde_json::from_str(&response).expect("JSON response");
+    let session_id = response["result"]["sessionId"]
+        .as_str()
+        .expect("session id in lifecycle response");
+
+    assert!(
+        state
+            .session_owners
+            .lock()
+            .await
+            .get(session_id)
+            .is_none_or(|owners| !owners.contains(conn_id)),
+        "disconnected connection must not regain session ownership"
+    );
+    assert!(
+        fixture
+            .config
+            .session_bridges
+            .lock()
+            .expect("bridge routes lock")
+            .get(session_id)
+            .is_none_or(|route| route.bridge.connection_id() != Some(conn_id)),
+        "disconnected connection must not retain a session bridge"
+    );
+    assert!(!connection_state.is_active());
 }
 
 #[tokio::test]
