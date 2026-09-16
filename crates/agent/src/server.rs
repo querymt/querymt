@@ -371,7 +371,7 @@ async fn handle_sft_export(
 mod dashboard_tests {
     use super::*;
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{Request, StatusCode, header};
     use tower::ServiceExt;
 
     async fn response_text(response: Response) -> String {
@@ -379,6 +379,18 @@ mod dashboard_tests {
             .await
             .expect("response body");
         String::from_utf8(body.to_vec()).expect("UTF-8 response")
+    }
+
+    fn websocket_request(uri: &str, host: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header(header::HOST, host)
+            .header(header::CONNECTION, "upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header(header::SEC_WEBSOCKET_VERSION, "13")
+            .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(Body::empty())
+            .expect("WebSocket request")
     }
 
     #[cfg(feature = "dashboard-ng")]
@@ -402,15 +414,12 @@ mod dashboard_tests {
                 .contains("QueryMT Agent Dashboard")
         );
         let legacy_ws = dashboard
-            .oneshot(
-                Request::builder()
-                    .uri("/ui/ws")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(websocket_request("/ui/ws", "127.0.0.1:3000"))
             .await
             .expect("legacy websocket route");
-        assert_ne!(legacy_ws.status(), StatusCode::NOT_FOUND);
+        // Direct router calls do not provide hyper's OnUpgrade extension, so a
+        // matched WebSocket route rejects the otherwise valid handshake with 426.
+        assert_eq!(legacy_ws.status(), StatusCode::UPGRADE_REQUIRED);
 
         let server = AgentServer::new(fixture.handle.clone(), fixture.storage.clone(), None);
         let dashboard_ng = server
@@ -444,15 +453,10 @@ mod dashboard_tests {
 
         let acp_ws = dashboard_ng
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/acp/ws")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(websocket_request("/acp/ws", "127.0.0.1:3000"))
             .await
             .expect("ACP websocket route");
-        assert_ne!(acp_ws.status(), StatusCode::NOT_FOUND);
+        assert_eq!(acp_ws.status(), StatusCode::UPGRADE_REQUIRED);
         let legacy_ws = dashboard_ng
             .oneshot(
                 Request::builder()
