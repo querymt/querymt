@@ -42,8 +42,8 @@ mod tasks;
 
 pub use adapters::{
     DotagentsLlmOverlay, DotagentsMcpPlan, DotagentsMcpServerView, DotagentsModelPresetView,
-    RedactedValue, apply_selected_model_preset, convert_server, select_model_overlay,
-    validate_preset_provider,
+    RedactedValue, apply_selected_model_preset, convert_server,
+    convert_server_with_workspace_stdio_approval, select_model_overlay, validate_preset_provider,
 };
 pub use automation::{
     AUTOMATION_SESSION_KIND, DotagentsAutomationIdentity, DotagentsAutomationRepository,
@@ -91,8 +91,12 @@ pub use reconcile::{DotagentsTaskApplied, DotagentsTaskReconciler};
 /// protocol-only namespace.
 pub fn protocol_knowledge_scope(workspace: Option<&std::path::Path>) -> String {
     workspace
-        .and_then(|path| std::fs::canonicalize(path).ok())
-        .map(|path| path.to_string_lossy().into_owned())
+        .map(|path| {
+            std::fs::canonicalize(path)
+                .unwrap_or_else(|_| path.to_path_buf())
+                .to_string_lossy()
+                .into_owned()
+        })
         .unwrap_or_else(|| "global".to_string())
 }
 pub use merge::{DotagentsLayerContent, insert_unique, merge_layers, normalize_id, source_of};

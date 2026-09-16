@@ -7,8 +7,8 @@
 
 use querymt_agent::api::{AgentBuilder, QuorumBuilder};
 use querymt_agent::dotagents::{
-    DotagentsAgentConnectionType, DotagentsAgentRole, DotagentsLoadOptions, DotagentsMcpTransport,
-    DotagentsTaskKind,
+    DotagentsAgentConnectionType, DotagentsAgentRole, DotagentsLoadError, DotagentsLoadOptions,
+    DotagentsMcpTransport, DotagentsStrictness, DotagentsTaskKind,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -299,6 +299,41 @@ fn preview_reports_diagnostics_and_keeps_valid_siblings() {
     assert!(manifest.tasks.contains_key("digest"));
 
     assert_eq!(before, snapshot(workspace.path()));
+}
+
+#[test]
+fn strict_preview_preserves_typed_load_error_manifest() {
+    let workspace = TempDir::new().unwrap();
+    let global = TempDir::new().unwrap();
+    write_workspace_fixture(workspace.path());
+    std::fs::create_dir_all(workspace.path().join(".agents/tasks/broken")).unwrap();
+    std::fs::write(
+        workspace.path().join(".agents/tasks/broken/task.md"),
+        "---\nintervalMinutes: 5\n---\n",
+    )
+    .unwrap();
+
+    let options = workspace_options(workspace.path(), global.path())
+        .with_strictness(DotagentsStrictness::Strict);
+    let error = AgentBuilder::new()
+        .cwd(workspace.path())
+        .dotagents_options(options.clone())
+        .preview_dotagents_manifest()
+        .unwrap_err();
+    let load_error = error
+        .downcast_ref::<DotagentsLoadError>()
+        .expect("single-agent preview preserves DotagentsLoadError");
+    assert!(load_error.manifest.has_errors());
+
+    let error = QuorumBuilder::new()
+        .cwd(workspace.path())
+        .dotagents_options(options)
+        .preview_dotagents_manifest()
+        .unwrap_err();
+    let load_error = error
+        .downcast_ref::<DotagentsLoadError>()
+        .expect("quorum preview preserves DotagentsLoadError");
+    assert!(load_error.manifest.has_errors());
 }
 
 #[test]

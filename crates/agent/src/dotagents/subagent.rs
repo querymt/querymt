@@ -293,7 +293,7 @@ fn resolve_mcp_servers(
     };
 
     for (_name, server) in selected {
-        match super::adapters::convert_server_with_diagnostics(server) {
+        match super::adapters::convert_server_with_diagnostics(server, false) {
             Ok((Some(config), warnings)) => {
                 servers.push(config);
                 diagnostics.extend(warnings);

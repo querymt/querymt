@@ -254,7 +254,7 @@ impl QuorumBuilder {
             self.dotagents_options.clone(),
             cwd.as_deref(),
         )
-        .map_err(|error| anyhow!(error.to_string()))
+        .map_err(|error| anyhow::Error::new(*error))
     }
 
     /// Inject custom infrastructure (plugin registry, storage).
@@ -295,10 +295,20 @@ impl QuorumBuilder {
             .planner_config
             .take()
             .ok_or_else(|| anyhow!("Planner configuration is required"))?;
+        let mut passive_diagnostics: Vec<crate::dotagents::DotagentsDiagnostic> = Vec::new();
         if let Some(manifest) = &dotagents_manifest {
             compose_dotagents_prompts(&mut planner_config, &mut self.delegates, manifest);
+
+            let mcp_plan = crate::dotagents::DotagentsMcpPlan::from_manifest(manifest);
+            for diagnostic in &mcp_plan.diagnostics {
+                log::warn!("dotagents: {diagnostic}");
+            }
+            merge_dotagents_mcp_servers(&mut planner_config, &mcp_plan.servers);
+            for delegate in &mut self.delegates {
+                merge_dotagents_mcp_servers(delegate, &mcp_plan.servers);
+            }
+            passive_diagnostics.extend(mcp_plan.diagnostics);
         }
-        let mut passive_diagnostics: Vec<crate::dotagents::DotagentsDiagnostic> = Vec::new();
 
         if planner_config
             .tools
@@ -1279,6 +1289,26 @@ fn compose_dotagents_prompts(
     for delegate in delegates {
         if let Some(params) = delegate.llm_config.as_mut() {
             crate::dotagents::compose_prompt(params, manifest);
+        }
+    }
+}
+
+fn merge_dotagents_mcp_servers(
+    config: &mut AgentConfig,
+    manifest_servers: &[crate::config::McpServerConfig],
+) {
+    for server in manifest_servers {
+        if !config
+            .mcp_servers
+            .iter()
+            .any(|existing| existing.name() == server.name())
+        {
+            config.mcp_servers.push(server.clone());
+        } else {
+            log::warn!(
+                "dotagents: protocol MCP server `{}` collides with an explicit configuration; keeping the explicit server",
+                server.name()
+            );
         }
     }
 }

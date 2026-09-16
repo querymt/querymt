@@ -33,9 +33,10 @@ use super::manifest::{
     DotagentsAgentRole, DotagentsMcpServer, DotagentsMcpTransport, DotagentsMemory,
     DotagentsModelPreset, DotagentsPrompt, DotagentsSkill, DotagentsTask, DotagentsTaskKind,
 };
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
 
 /// Frontmatter keys recognized by a parser, in canonical (lowercase) form.
 ///

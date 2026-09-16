@@ -22,6 +22,16 @@ fn load_options_default_is_disabled() {
 }
 
 #[test]
+fn protocol_knowledge_scope_preserves_nonexistent_workspace() {
+    let workspace = std::path::Path::new("/nonexistent/querymt-workspace");
+    assert_eq!(
+        protocol_knowledge_scope(Some(workspace)),
+        workspace.to_string_lossy()
+    );
+    assert_eq!(protocol_knowledge_scope(None), "global");
+}
+
+#[test]
 fn load_options_builders_round_trip() {
     let options = DotagentsLoadOptions::enabled()
         .with_workspace("/tmp/ws")
@@ -393,13 +403,14 @@ fn mcp_server(transport: DotagentsMcpTransport, enabled: bool) -> DotagentsMcpSe
 }
 
 #[test]
-fn mcp_stdio_conversion_uses_existing_process_config() {
+fn approved_workspace_mcp_stdio_conversion_uses_existing_process_config() {
     let mut server = mcp_server(DotagentsMcpTransport::Stdio, true);
     server.command = Some("npx".to_string());
     server.args = vec!["-y".to_string(), "server-fs".to_string()];
     server.env.insert("TOKEN".to_string(), "t".to_string());
 
-    let config = adapters::convert_server(&server).expect("conversion succeeds");
+    let config = adapters::convert_server_with_workspace_stdio_approval(&server, true)
+        .expect("approved conversion succeeds");
     let Some(crate::config::McpServerConfig::Stdio {
         name,
         command,
@@ -413,6 +424,29 @@ fn mcp_stdio_conversion_uses_existing_process_config() {
     assert_eq!(command, "npx");
     assert_eq!(args, vec!["-y".to_string(), "server-fs".to_string()]);
     assert_eq!(env.get("TOKEN").map(String::as_str), Some("t"));
+}
+
+#[test]
+fn workspace_mcp_stdio_conversion_requires_approval() {
+    let mut server = mcp_server(DotagentsMcpTransport::Stdio, true);
+    server.command = Some("npx".to_string());
+
+    let diagnostic = adapters::convert_server(&server).unwrap_err();
+    assert_eq!(diagnostic.code, DotagentsDiagnosticCode::UnsafePolicy);
+    assert!(
+        diagnostic
+            .message
+            .contains("requires explicit host approval")
+    );
+}
+
+#[test]
+fn global_mcp_stdio_conversion_does_not_require_workspace_approval() {
+    let mut server = mcp_server(DotagentsMcpTransport::Stdio, true);
+    server.source.layer = DotagentsLayer::Global;
+    server.command = Some("npx".to_string());
+
+    assert!(adapters::convert_server(&server).unwrap().is_some());
 }
 
 #[test]
@@ -436,7 +470,7 @@ fn mcp_streamable_http_conversion_uses_existing_http_config() {
 }
 
 #[test]
-fn mcp_plan_warns_for_non_loopback_http_headers() {
+fn mcp_plan_rejects_non_loopback_http_headers() {
     let mut manifest = DotagentsManifest::default();
     let mut server = mcp_server(DotagentsMcpTransport::StreamableHttp, true);
     server.url = Some("http://example.com/mcp".to_string());
@@ -446,8 +480,12 @@ fn mcp_plan_warns_for_non_loopback_http_headers() {
     manifest.mcp_servers.insert("test".to_string(), server);
 
     let plan = adapters::DotagentsMcpPlan::from_manifest(&manifest);
-    assert_eq!(plan.servers.len(), 1);
+    assert!(plan.servers.is_empty());
     assert_eq!(plan.diagnostics.len(), 1);
+    assert_eq!(
+        plan.diagnostics[0].severity,
+        crate::dotagents::DotagentsSeverity::Error
+    );
     assert_eq!(
         plan.diagnostics[0]
             .source
@@ -461,11 +499,7 @@ fn mcp_plan_warns_for_non_loopback_http_headers() {
 
 #[test]
 fn mcp_plan_does_not_warn_for_safe_http_header_cases() {
-    for url in [
-        "http://localhost:8080/mcp",
-        "http://127.0.0.1/mcp",
-        "https://example.com/mcp",
-    ] {
+    for url in ["http://localhost:8080/mcp", "http://127.0.0.1/mcp"] {
         let mut manifest = DotagentsManifest::default();
         let mut server = mcp_server(DotagentsMcpTransport::StreamableHttp, true);
         server.url = Some(url.to_string());
@@ -473,11 +507,9 @@ fn mcp_plan_does_not_warn_for_safe_http_header_cases() {
             .headers
             .insert("X-Test".to_string(), "value".to_string());
         manifest.mcp_servers.insert("test".to_string(), server);
-        assert!(
-            adapters::DotagentsMcpPlan::from_manifest(&manifest)
-                .diagnostics
-                .is_empty()
-        );
+        let plan = adapters::DotagentsMcpPlan::from_manifest(&manifest);
+        assert!(plan.diagnostics.is_empty());
+        assert_eq!(plan.servers.len(), 1);
     }
 
     let mut manifest = DotagentsManifest::default();
@@ -534,7 +566,8 @@ fn mcp_plan_converts_enabled_servers_and_orders_by_name() {
     zulu.command = Some("uvx".to_string());
     manifest.mcp_servers.insert("zulu".to_string(), zulu);
 
-    let plan = adapters::DotagentsMcpPlan::from_manifest(&manifest);
+    let plan =
+        adapters::DotagentsMcpPlan::from_manifest_with_workspace_stdio_approval(&manifest, true);
     assert!(plan.diagnostics.is_empty());
     let names: Vec<&str> = plan.servers.iter().map(|s| s.name()).collect();
     assert_eq!(names, vec!["alpha", "zulu"]);
@@ -570,7 +603,9 @@ fn mcp_activation_interpolates_env_and_headers() {
         "Bearer ${QMT_DOTAGENTS_TEST_SECRET}".to_string(),
     );
 
-    let stdio_config = adapters::convert_server(&stdio).expect("converts").unwrap();
+    let stdio_config = adapters::convert_server_with_workspace_stdio_approval(&stdio, true)
+        .expect("converts")
+        .unwrap();
     let crate::config::McpServerConfig::Stdio { env, .. } = &stdio_config else {
         panic!("expected stdio config");
     };
@@ -602,7 +637,7 @@ fn mcp_activation_supports_default_fallback() {
         "${QMT_DOTAGENTS_ABSENT_FALLBACK_VAR:-fallback-value}".to_string(),
     );
 
-    let config = adapters::convert_server(&server)
+    let config = adapters::convert_server_with_workspace_stdio_approval(&server, true)
         .expect("converts")
         .unwrap();
     let crate::config::McpServerConfig::Stdio { env, .. } = &config else {
@@ -624,7 +659,8 @@ fn mcp_missing_variable_error_is_actionable() {
         .env
         .insert("PLAIN".to_string(), "plain-value".to_string());
 
-    let err = adapters::convert_server(&server).expect_err("missing env must be reported");
+    let err = adapters::convert_server_with_workspace_stdio_approval(&server, true)
+        .expect_err("missing env must be reported");
     assert_eq!(err.code, DotagentsDiagnosticCode::MissingEnvironment);
     // Actionable: names the server, the field, and the unresolved reference.
     assert!(err.message.contains("secrets-srv"));
@@ -654,7 +690,8 @@ fn mcp_plan_isolates_missing_environment_failures() {
     manifest.mcp_servers.insert("bad".to_string(), bad);
     manifest.mcp_servers.insert("good".to_string(), good);
 
-    let plan = adapters::DotagentsMcpPlan::from_manifest(&manifest);
+    let plan =
+        adapters::DotagentsMcpPlan::from_manifest_with_workspace_stdio_approval(&manifest, true);
     // The failing server is not activated; the valid sibling still is.
     let names: Vec<&str> = plan.servers.iter().map(|s| s.name()).collect();
     assert_eq!(names, vec!["good"]);
@@ -973,7 +1010,11 @@ fn subagent_manifest() -> DotagentsManifest {
             headers: BTreeMap::new(),
             enabled: true,
             extensions: BTreeMap::new(),
-            source: DotagentsSource::entry(DotagentsLayer::Workspace, "/ws/.agents/mcp.json", "fs"),
+            source: DotagentsSource::entry(
+                DotagentsLayer::Global,
+                "/home/user/.agents/mcp.json",
+                "fs",
+            ),
         },
     );
     manifest

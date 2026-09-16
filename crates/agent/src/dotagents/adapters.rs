@@ -39,9 +39,17 @@ pub struct DotagentsMcpPlan {
 impl DotagentsMcpPlan {
     /// Convert every enabled, supported MCP entry in `manifest`.
     pub fn from_manifest(manifest: &DotagentsManifest) -> Self {
+        Self::from_manifest_with_workspace_stdio_approval(manifest, false)
+    }
+
+    /// Convert a manifest after the host explicitly approves workspace stdio MCP servers.
+    pub fn from_manifest_with_workspace_stdio_approval(
+        manifest: &DotagentsManifest,
+        workspace_stdio_approved: bool,
+    ) -> Self {
         let mut plan = Self::default();
         for server in manifest.mcp_servers.values() {
-            match convert_server_with_diagnostics(server) {
+            match convert_server_with_diagnostics(server, workspace_stdio_approved) {
                 Ok((Some(config), diagnostics)) => {
                     plan.servers.push(config);
                     plan.diagnostics.extend(diagnostics);
@@ -98,17 +106,38 @@ fn interpolate_map(
 pub fn convert_server(
     server: &DotagentsMcpServer,
 ) -> Result<Option<McpServerConfig>, DotagentsDiagnostic> {
-    convert_server_with_diagnostics(server).map(|(config, _)| config)
+    convert_server_with_workspace_stdio_approval(server, false)
+}
+
+/// Convert a server after the host explicitly decides whether to trust workspace stdio execution.
+pub fn convert_server_with_workspace_stdio_approval(
+    server: &DotagentsMcpServer,
+    workspace_stdio_approved: bool,
+) -> Result<Option<McpServerConfig>, DotagentsDiagnostic> {
+    convert_server_with_diagnostics(server, workspace_stdio_approved).map(|(config, _)| config)
 }
 
 pub(crate) fn convert_server_with_diagnostics(
     server: &DotagentsMcpServer,
+    workspace_stdio_approved: bool,
 ) -> Result<(Option<McpServerConfig>, Vec<DotagentsDiagnostic>), DotagentsDiagnostic> {
     if !server.enabled {
         return Ok((None, Vec::new()));
     }
     match server.transport {
         DotagentsMcpTransport::Stdio => {
+            if server.source.layer == super::layer::DotagentsLayer::Workspace
+                && !workspace_stdio_approved
+            {
+                return Err(DotagentsDiagnostic::error(
+                    DotagentsDiagnosticCode::UnsafePolicy,
+                    format!(
+                        "workspace MCP server `{}` uses `stdio` and requires explicit host approval",
+                        server.name
+                    ),
+                )
+                .with_source(server.source.clone()));
+            }
             let Some(command) = server.command.clone() else {
                 return Err(DotagentsDiagnostic::error(
                     DotagentsDiagnosticCode::MissingField,
@@ -149,7 +178,10 @@ pub(crate) fn convert_server_with_diagnostics(
             )?;
             let diagnostics = insecure_http_headers_warning(server, &url)
                 .into_iter()
-                .collect();
+                .collect::<Vec<_>>();
+            if !diagnostics.is_empty() {
+                return Ok((None, diagnostics));
+            }
             Ok((
                 Some(McpServerConfig::Http {
                     name: server.name.clone(),
@@ -193,10 +225,10 @@ fn insecure_http_headers_warning(
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.is_loopback());
     (!loopback).then(|| {
-        DotagentsDiagnostic::warning(
+        DotagentsDiagnostic::error(
             DotagentsDiagnosticCode::Other,
             format!(
-                "MCP server `{}` sends interpolated headers over non-loopback HTTP; use HTTPS to protect credentials",
+                "MCP server `{}` cannot send interpolated headers over non-loopback HTTP; use HTTPS to protect credentials",
                 server.name
             ),
         )

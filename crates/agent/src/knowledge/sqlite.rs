@@ -695,27 +695,28 @@ impl KnowledgeStore for SqliteKnowledgeStore {
 
         let outcome = self
             .run_blocking(move |conn| {
-                let existing: Option<(i64, String)> = match conn.query_row(
-                    "SELECT id, public_id FROM knowledge_entries \
+                let tx = conn.transaction().map_err(KnowledgeError::from)?;
+                let existing: Option<(i64, String, String)> = match tx.query_row(
+                    "SELECT id, public_id, created_at FROM knowledge_entries \
                      WHERE scope = ? AND protocol_source_key = ?",
                     params![scope, source_key],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 ) {
                     Ok(existing) => Some(existing),
                     Err(rusqlite::Error::QueryReturnedNoRows) => None,
                     Err(error) => return Err(error.into()),
                 };
 
-                let (row_id, public_id, created) = match existing {
-                    Some((row_id, public_id)) => {
+                let (row_id, public_id, created_at, created) = match existing {
+                    Some((row_id, public_id, created_at)) => {
                         // Update the protocol-owned row in place so an edited
                         // memory replaces its own content instead of appending.
-                        conn.execute(
+                        tx.execute(
                             "UPDATE knowledge_entries SET \
                                 source = ?, raw_text = ?, summary = ?, \
                                 entities_json = ?, topics_json = ?, connections_json = ?, \
                                 importance = ?, protocol_fingerprint = ?, protocol_active = 1, \
-                                created_at = ? \
+                                consolidated_at = NULL \
                              WHERE id = ?",
                             params![
                                 entry.source,
@@ -726,7 +727,6 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                                 connections_json,
                                 entry.importance,
                                 fingerprint,
-                                now_str,
                                 row_id,
                             ],
                         )
@@ -734,21 +734,21 @@ impl KnowledgeStore for SqliteKnowledgeStore {
 
                         // Rebuild junction rows so topic/entity matching reflects
                         // the updated content rather than stale values.
-                        conn.execute(
+                        tx.execute(
                             "DELETE FROM knowledge_entry_entities WHERE entry_id = ?",
                             params![row_id],
                         )
                         .map_err(KnowledgeError::from)?;
-                        conn.execute(
+                        tx.execute(
                             "DELETE FROM knowledge_entry_topics WHERE entry_id = ?",
                             params![row_id],
                         )
                         .map_err(KnowledgeError::from)?;
 
-                        (row_id, public_id, false)
+                        (row_id, public_id, parse_dt(&created_at)?, false)
                     }
                     None => {
-                        conn.execute(
+                        tx.execute(
                             "INSERT INTO knowledge_entries (
                                 public_id, scope, source, raw_text, summary,
                                 entities_json, topics_json, connections_json,
@@ -771,13 +771,13 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                             ],
                         )
                         .map_err(KnowledgeError::from)?;
-                        (conn.last_insert_rowid(), public_id, true)
+                        (tx.last_insert_rowid(), public_id, now, true)
                     }
                 };
 
                 for entity in &entry.entities {
                     let normalized = crate::knowledge::text_processing::normalize_term(entity);
-                    conn.execute(
+                    tx.execute(
                         "INSERT INTO knowledge_entry_entities (entry_id, entity, entity_normalized) \
                          VALUES (?, ?, ?)",
                         params![row_id, entity, normalized],
@@ -786,7 +786,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                 }
                 for topic in &entry.topics {
                     let normalized = crate::knowledge::text_processing::normalize_term(topic);
-                    conn.execute(
+                    tx.execute(
                         "INSERT INTO knowledge_entry_topics (entry_id, topic, topic_normalized) \
                          VALUES (?, ?, ?)",
                         params![row_id, topic, normalized],
@@ -794,6 +794,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                     .map_err(KnowledgeError::from)?;
                 }
 
+                tx.commit().map_err(KnowledgeError::from)?;
                 Ok(ProtocolUpsertOutcome {
                     entry: KnowledgeEntry {
                         id: row_id,
@@ -807,7 +808,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                         connections: entry.connections,
                         importance: entry.importance,
                         consolidated_at: None,
-                        created_at: now,
+                        created_at,
                         protocol_source_key: Some(source_key),
                         protocol_fingerprint: Some(fingerprint),
                         protocol_active: true,
@@ -836,7 +837,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                        AND protocol_active = 1",
                 )
                 .map_err(KnowledgeError::from)?;
-            let rows = stmt
+            let candidates = stmt
                 .query_map(params![scope], |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
@@ -844,11 +845,13 @@ impl KnowledgeStore for SqliteKnowledgeStore {
                         row.get::<_, Option<String>>(2)?,
                     ))
                 })
+                .map_err(KnowledgeError::from)?
+                .collect::<Result<Vec<_>, _>>()
                 .map_err(KnowledgeError::from)?;
+            drop(stmt);
 
             let mut deactivated = Vec::new();
-            for row in rows {
-                let (row_id, public_id, source_key) = row.map_err(KnowledgeError::from)?;
+            for (row_id, public_id, source_key) in candidates {
                 let Some(source_key) = source_key else {
                     continue;
                 };
@@ -1791,11 +1794,63 @@ mod tests {
             .unwrap();
         assert!(!second.created);
         assert_eq!(second.entry.public_id, first.entry.public_id);
+        assert_eq!(second.entry.created_at, first.entry.created_at);
         assert_eq!(second.entry.summary, "Edited notes");
         assert_eq!(second.entry.protocol_fingerprint.as_deref(), Some("fp-2"));
 
         let listed = store.list_protocol_sources("scope").await.unwrap();
         assert_eq!(listed.len(), 1, "one row per protocol source key");
+    }
+
+    #[tokio::test]
+    async fn protocol_upsert_changed_content_becomes_unconsolidated() {
+        let db = setup_db();
+        let store = SqliteKnowledgeStore::new(db);
+
+        let first = store
+            .upsert_protocol_source(
+                "scope",
+                "dotagents:v1:memory:workspace:abc:notes",
+                "fp-1",
+                make_ingest("dotagents", "Original notes"),
+            )
+            .await
+            .unwrap();
+        store
+            .consolidate(
+                "scope",
+                ConsolidateRequest {
+                    source_entry_public_ids: vec![first.entry.public_id.clone()],
+                    summary: "Consolidated notes".to_string(),
+                    insight: "Original insight".to_string(),
+                    connections: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_unconsolidated("scope", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let updated = store
+            .upsert_protocol_source(
+                "scope",
+                "dotagents:v1:memory:workspace:abc:notes",
+                "fp-2",
+                make_ingest("dotagents", "Edited notes"),
+            )
+            .await
+            .unwrap();
+
+        assert!(updated.entry.consolidated_at.is_none());
+        let unconsolidated = store.list_unconsolidated("scope", 10).await.unwrap();
+        assert_eq!(unconsolidated.len(), 1);
+        assert_eq!(unconsolidated[0].public_id, first.entry.public_id);
+        assert_eq!(unconsolidated[0].summary, "Edited notes");
     }
 
     #[tokio::test]

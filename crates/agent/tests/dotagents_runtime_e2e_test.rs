@@ -349,7 +349,10 @@ fn mcp_plan_uses_existing_transports_for_both_layers() {
         global.path(),
         DotagentsTaskTrustPolicy::Prompt,
     );
-    let plan = querymt_agent::dotagents::DotagentsMcpPlan::from_manifest(&manifest);
+    let plan =
+        querymt_agent::dotagents::DotagentsMcpPlan::from_manifest_with_workspace_stdio_approval(
+            &manifest, true,
+        );
 
     assert_eq!(plan.servers.len(), 3);
     assert!(
@@ -401,7 +404,10 @@ fn unsupported_transport_is_diagnosed_without_hiding_valid_siblings() {
         global.path(),
         DotagentsTaskTrustPolicy::Prompt,
     );
-    let plan = querymt_agent::dotagents::DotagentsMcpPlan::from_manifest(&manifest);
+    let plan =
+        querymt_agent::dotagents::DotagentsMcpPlan::from_manifest_with_workspace_stdio_approval(
+            &manifest, true,
+        );
 
     // The valid servers survive and the WebSocket entry is diagnosed.
     let names: Vec<String> = plan.servers.iter().map(|s| s.name().to_string()).collect();

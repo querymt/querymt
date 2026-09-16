@@ -1218,7 +1218,7 @@ async fn protocol_mcp_server_is_appended_without_replacing_explicit_servers() ->
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dotagents_subdir(dir.path()).join("mcp.json"),
-        r#"{ "mcpServers": { "protocol-server": { "command": "protocol-cmd", "transport": "stdio" } } }"#,
+        r#"{ "mcpServers": { "protocol-server": { "url": "https://example.test/mcp", "transport": "streamable-http" } } }"#,
     )
     .unwrap();
 

@@ -664,6 +664,9 @@ impl DotagentsTaskActivationError {
             Self::InvalidInterval { interval_minutes } => (
                 DotagentsDiagnosticCode::ParseError,
                 match interval_minutes {
+                    Some(0) => format!(
+                        "protocol task '{id}' has `intervalMinutes: 0`, which must be greater than zero"
+                    ),
                     Some(minutes) => format!(
                         "protocol task '{id}' has `intervalMinutes: {minutes}`, which overflows the interval schedule representation"
                     ),
@@ -1526,6 +1529,16 @@ mod tests {
             activation.task.creation_key,
             activation.schedule.creation_key
         );
+    }
+
+    #[test]
+    fn zero_interval_is_rejected_as_non_positive() {
+        let mut task = task();
+        task.interval_minutes = Some(0);
+        let available = |_: &str| true;
+        let error = plan_task_activation(&task, &identity(), &binding(), &available).unwrap_err();
+        assert!(error.message.contains("must be greater than zero"));
+        assert!(!error.message.contains("overflows"));
     }
 
     #[test]

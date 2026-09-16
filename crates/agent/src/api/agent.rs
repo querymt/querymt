@@ -353,7 +353,7 @@ impl AgentBuilder {
             self.dotagents_options.clone(),
             cwd.as_deref(),
         )
-        .map_err(|error| anyhow!(error.to_string()))
+        .map_err(|error| anyhow::Error::new(*error))
     }
 
     /// Set whether to assume all tools are mutating.
@@ -653,6 +653,7 @@ impl AgentBuilder {
             for diagnostic in &mcp_plan.diagnostics {
                 log::warn!("dotagents: {diagnostic}");
             }
+            passive_diagnostics.extend(mcp_plan.diagnostics.iter().cloned());
             if !mcp_plan.servers.is_empty() {
                 let mut servers = self.mcp_servers.clone();
                 for server in mcp_plan.servers {
@@ -1099,57 +1100,33 @@ impl Agent {
         let Some(schedules) = self.storage.schedule_repository() else {
             // Without schedule storage there is nowhere durable to reconcile
             // protocol tasks; memories still import independently.
-            let mut report = crate::dotagents::DotagentsActivationReport::default();
-            report.diagnostics.push(crate::dotagents::DotagentsDiagnostic::warning(
-                crate::dotagents::DotagentsDiagnosticCode::Other,
-                "protocol task reconciliation was skipped because the storage backend has no schedule repository".to_string(),
+            return Ok(Some(
+                self.dotagents_unavailable_report(
+                    &state,
+                    "protocol task reconciliation was skipped because the storage backend has no schedule repository",
+                )
+                .await,
             ));
-            let memory_report = crate::dotagents::reconcile_memories(
-                crate::dotagents::DotagentsMemoryPlan::from_manifest(&state.manifest),
-                self.storage.knowledge_store().as_ref(),
-                &self.dotagents_knowledge_scope(),
-            )
-            .await;
-            report.memories_reconciled = memory_report.store_available;
-            report.diagnostics.extend(memory_report.diagnostics.clone());
-            report.memory = Some(memory_report);
-            return Ok(Some(report));
         };
 
         let Some(task_state) = self.storage.dotagents_task_state_repository() else {
-            let mut report = crate::dotagents::DotagentsActivationReport::default();
-            report.diagnostics.push(crate::dotagents::DotagentsDiagnostic::warning(
-                crate::dotagents::DotagentsDiagnosticCode::Other,
-                "protocol task reconciliation was skipped because the storage backend has no task state repository".to_string(),
+            return Ok(Some(
+                self.dotagents_unavailable_report(
+                    &state,
+                    "protocol task reconciliation was skipped because the storage backend has no task state repository",
+                )
+                .await,
             ));
-            let memory_report = crate::dotagents::reconcile_memories(
-                crate::dotagents::DotagentsMemoryPlan::from_manifest(&state.manifest),
-                self.storage.knowledge_store().as_ref(),
-                &self.dotagents_knowledge_scope(),
-            )
-            .await;
-            report.memories_reconciled = memory_report.store_available;
-            report.diagnostics.extend(memory_report.diagnostics.clone());
-            report.memory = Some(memory_report);
-            return Ok(Some(report));
         };
 
         let Some(conn) = self.storage.dotagents_automation_repository() else {
-            let mut report = crate::dotagents::DotagentsActivationReport::default();
-            report.diagnostics.push(crate::dotagents::DotagentsDiagnostic::warning(
-                crate::dotagents::DotagentsDiagnosticCode::Other,
-                "protocol task reconciliation was skipped because the storage backend has no automation repository".to_string(),
+            return Ok(Some(
+                self.dotagents_unavailable_report(
+                    &state,
+                    "protocol task reconciliation was skipped because the storage backend has no automation repository",
+                )
+                .await,
             ));
-            let memory_report = crate::dotagents::reconcile_memories(
-                crate::dotagents::DotagentsMemoryPlan::from_manifest(&state.manifest),
-                self.storage.knowledge_store().as_ref(),
-                &self.dotagents_knowledge_scope(),
-            )
-            .await;
-            report.memories_reconciled = memory_report.store_available;
-            report.diagnostics.extend(memory_report.diagnostics.clone());
-            report.memory = Some(memory_report);
-            return Ok(Some(report));
         };
 
         let coordinator = crate::dotagents::DotagentsRuntimeCoordinator::new(
@@ -1179,6 +1156,34 @@ impl Agent {
             .extend(state.passive_diagnostics().iter().cloned());
         report.sort_diagnostics();
         Ok(Some(report))
+    }
+
+    async fn dotagents_unavailable_report(
+        &self,
+        state: &AgentDotagentsState,
+        message: &str,
+    ) -> crate::dotagents::DotagentsActivationReport {
+        let mut report = crate::dotagents::DotagentsActivationReport::default();
+        report
+            .diagnostics
+            .push(crate::dotagents::DotagentsDiagnostic::warning(
+                crate::dotagents::DotagentsDiagnosticCode::Other,
+                message.to_string(),
+            ));
+        let memory_report = crate::dotagents::reconcile_memories(
+            crate::dotagents::DotagentsMemoryPlan::from_manifest(&state.manifest),
+            self.storage.knowledge_store().as_ref(),
+            &self.dotagents_knowledge_scope(),
+        )
+        .await;
+        report.memories_reconciled = memory_report.store_available;
+        report.diagnostics.extend(memory_report.diagnostics.clone());
+        report.memory = Some(memory_report);
+        report
+            .diagnostics
+            .extend(state.passive_diagnostics().iter().cloned());
+        report.sort_diagnostics();
+        report
     }
 
     /// The knowledge scope protocol memories import into.
