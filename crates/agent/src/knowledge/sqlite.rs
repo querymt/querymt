@@ -5,8 +5,8 @@
 
 use crate::knowledge::{
     ConsolidateRequest, Consolidation, IngestRequest, KnowledgeEntry, KnowledgeError,
-    KnowledgeFilter, KnowledgeQueryResult, KnowledgeStats, KnowledgeStore, QueryOpts,
-    RetentionPolicy, RetentionResult, RetrievalMode,
+    KnowledgeFilter, KnowledgeQueryResult, KnowledgeStats, KnowledgeStore, ProtocolUpsertOutcome,
+    QueryOpts, RetentionPolicy, RetentionResult, RetrievalMode,
 };
 use async_trait::async_trait;
 use rusqlite::{Connection, params, types::Value};
@@ -100,6 +100,11 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> Result<KnowledgeEntry, rusqlite::Err
         importance: row.get("importance")?,
         consolidated_at,
         created_at,
+        protocol_source_key: row.get("protocol_source_key")?,
+        protocol_fingerprint: row.get("protocol_fingerprint")?,
+        protocol_active: row
+            .get::<_, Option<bool>>("protocol_active")?
+            .unwrap_or(true),
     })
 }
 
@@ -133,15 +138,26 @@ fn row_to_consolidation(row: &rusqlite::Row<'_>) -> Result<Consolidation, rusqli
 
 const ENTRY_COLS: &str = "id, public_id, scope, source, raw_text, summary, \
     entities_json, topics_json, connections_json, importance, \
-    consolidated_at, created_at";
+    consolidated_at, created_at, protocol_source_key, protocol_fingerprint, protocol_active";
 
 /// Table-qualified column list for use in JOIN queries (FTS5).
 const ENTRY_COLS_QUALIFIED: &str = "e.id, e.public_id, e.scope, e.source, e.raw_text, e.summary, \
     e.entities_json, e.topics_json, e.connections_json, e.importance, \
-    e.consolidated_at, e.created_at";
+    e.consolidated_at, e.created_at, e.protocol_source_key, e.protocol_fingerprint, \
+    e.protocol_active";
 
 const CONSOLIDATION_COLS: &str = "id, public_id, scope, source_entry_public_ids_json, \
     summary, insight, connections_json, created_at";
+
+/// The column marking a protocol-owned entry as currently live.
+///
+/// Deactivated protocol memories are retained so reconciliation can reactivate
+/// them, but they must never be returned as live knowledge. User-created
+/// entries always have this flag set, so the predicate is a no-op for them.
+const ACTIVE_COLUMN: &str = "protocol_active";
+
+/// Unqualified predicate restricting a query to live entries.
+const ACTIVE_ONLY: &str = "protocol_active = 1";
 
 /// Table-qualified column list for use in JOIN queries (FTS5).
 const CONSOLIDATION_COLS_QUALIFIED: &str = "e.id, e.public_id, e.scope, e.source_entry_public_ids_json, \
@@ -236,6 +252,9 @@ impl KnowledgeStore for SqliteKnowledgeStore {
             importance,
             consolidated_at: None,
             created_at: now,
+            protocol_source_key: None,
+            protocol_fingerprint: None,
+            protocol_active: true,
         })
     }
 
@@ -249,7 +268,7 @@ impl KnowledgeStore for SqliteKnowledgeStore {
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT {ENTRY_COLS} FROM knowledge_entries \
-                     WHERE scope = ? AND consolidated_at IS NULL \
+                     WHERE scope = ? AND consolidated_at IS NULL AND {ACTIVE_ONLY} \
                      ORDER BY created_at ASC LIMIT ?"
                 ))
                 .map_err(KnowledgeError::from)?;
@@ -269,7 +288,10 @@ impl KnowledgeStore for SqliteKnowledgeStore {
     ) -> Result<Vec<KnowledgeEntry>, KnowledgeError> {
         let scope = scope.to_string();
         self.run_blocking(move |conn| {
-            let mut conditions = vec!["scope = ?1".to_string()];
+            // Deactivated protocol memories stay in the table so
+            // reconciliation can reactivate them, but they must not be
+            // retrievable as live knowledge.
+            let mut conditions = vec!["scope = ?1".to_string(), ACTIVE_ONLY.to_string()];
             let mut param_idx = 2usize;
 
             // We use explicit named index binding via stmt.raw_bind_parameter
@@ -462,7 +484,9 @@ impl KnowledgeStore for SqliteKnowledgeStore {
         self.run_blocking(move |conn| {
             let total_entries: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM knowledge_entries WHERE scope = ?",
+                    &format!(
+                        "SELECT COUNT(*) FROM knowledge_entries WHERE scope = ? AND {ACTIVE_ONLY}"
+                    ),
                     params![scope],
                     |row| row.get(0),
                 )
@@ -470,8 +494,10 @@ impl KnowledgeStore for SqliteKnowledgeStore {
 
             let unconsolidated_entries: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM knowledge_entries \
-                     WHERE scope = ? AND consolidated_at IS NULL",
+                    &format!(
+                        "SELECT COUNT(*) FROM knowledge_entries \
+                         WHERE scope = ? AND consolidated_at IS NULL AND {ACTIVE_ONLY}"
+                    ),
                     params![scope],
                     |row| row.get(0),
                 )
@@ -487,7 +513,9 @@ impl KnowledgeStore for SqliteKnowledgeStore {
 
             let latest_entry_at: Option<String> = conn
                 .query_row(
-                    "SELECT MAX(created_at) FROM knowledge_entries WHERE scope = ?",
+                    &format!(
+                        "SELECT MAX(created_at) FROM knowledge_entries WHERE scope = ? AND {ACTIVE_ONLY}"
+                    ),
                     params![scope],
                     |row| row.get(0),
                 )
@@ -646,6 +674,228 @@ impl KnowledgeStore for SqliteKnowledgeStore {
         })
         .await
     }
+
+    async fn upsert_protocol_source(
+        &self,
+        scope: &str,
+        source_key: &str,
+        fingerprint: &str,
+        entry: IngestRequest,
+    ) -> Result<ProtocolUpsertOutcome, KnowledgeError> {
+        let scope = scope.to_string();
+        let source_key = source_key.to_string();
+        let fingerprint = fingerprint.to_string();
+        let now = OffsetDateTime::now_utc();
+        let now_str = format_dt(&now);
+        let public_id = uuid::Uuid::now_v7().to_string();
+
+        let entities_json = serde_json::to_string(&entry.entities)?;
+        let topics_json = serde_json::to_string(&entry.topics)?;
+        let connections_json = serde_json::to_string(&entry.connections)?;
+
+        let outcome = self
+            .run_blocking(move |conn| {
+                let tx = conn.transaction().map_err(KnowledgeError::from)?;
+                let existing: Option<(i64, String, String)> = match tx.query_row(
+                    "SELECT id, public_id, created_at FROM knowledge_entries \
+                     WHERE scope = ? AND protocol_source_key = ?",
+                    params![scope, source_key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ) {
+                    Ok(existing) => Some(existing),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(error) => return Err(error.into()),
+                };
+
+                let (row_id, public_id, created_at, created) = match existing {
+                    Some((row_id, public_id, created_at)) => {
+                        // Update the protocol-owned row in place so an edited
+                        // memory replaces its own content instead of appending.
+                        tx.execute(
+                            "UPDATE knowledge_entries SET \
+                                source = ?, raw_text = ?, summary = ?, \
+                                entities_json = ?, topics_json = ?, connections_json = ?, \
+                                importance = ?, protocol_fingerprint = ?, protocol_active = 1, \
+                                consolidated_at = NULL \
+                             WHERE id = ?",
+                            params![
+                                entry.source,
+                                entry.raw_text,
+                                entry.summary,
+                                entities_json,
+                                topics_json,
+                                connections_json,
+                                entry.importance,
+                                fingerprint,
+                                row_id,
+                            ],
+                        )
+                        .map_err(KnowledgeError::from)?;
+
+                        // Rebuild junction rows so topic/entity matching reflects
+                        // the updated content rather than stale values.
+                        tx.execute(
+                            "DELETE FROM knowledge_entry_entities WHERE entry_id = ?",
+                            params![row_id],
+                        )
+                        .map_err(KnowledgeError::from)?;
+                        tx.execute(
+                            "DELETE FROM knowledge_entry_topics WHERE entry_id = ?",
+                            params![row_id],
+                        )
+                        .map_err(KnowledgeError::from)?;
+
+                        (row_id, public_id, parse_dt(&created_at)?, false)
+                    }
+                    None => {
+                        tx.execute(
+                            "INSERT INTO knowledge_entries (
+                                public_id, scope, source, raw_text, summary,
+                                entities_json, topics_json, connections_json,
+                                importance, created_at,
+                                protocol_source_key, protocol_fingerprint, protocol_active
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                            params![
+                                public_id,
+                                scope,
+                                entry.source,
+                                entry.raw_text,
+                                entry.summary,
+                                entities_json,
+                                topics_json,
+                                connections_json,
+                                entry.importance,
+                                now_str,
+                                source_key,
+                                fingerprint,
+                            ],
+                        )
+                        .map_err(KnowledgeError::from)?;
+                        (tx.last_insert_rowid(), public_id, now, true)
+                    }
+                };
+
+                for entity in &entry.entities {
+                    let normalized = crate::knowledge::text_processing::normalize_term(entity);
+                    tx.execute(
+                        "INSERT INTO knowledge_entry_entities (entry_id, entity, entity_normalized) \
+                         VALUES (?, ?, ?)",
+                        params![row_id, entity, normalized],
+                    )
+                    .map_err(KnowledgeError::from)?;
+                }
+                for topic in &entry.topics {
+                    let normalized = crate::knowledge::text_processing::normalize_term(topic);
+                    tx.execute(
+                        "INSERT INTO knowledge_entry_topics (entry_id, topic, topic_normalized) \
+                         VALUES (?, ?, ?)",
+                        params![row_id, topic, normalized],
+                    )
+                    .map_err(KnowledgeError::from)?;
+                }
+
+                tx.commit().map_err(KnowledgeError::from)?;
+                Ok(ProtocolUpsertOutcome {
+                    entry: KnowledgeEntry {
+                        id: row_id,
+                        public_id,
+                        scope,
+                        source: entry.source,
+                        raw_text: Some(entry.raw_text),
+                        summary: entry.summary,
+                        entities: entry.entities,
+                        topics: entry.topics,
+                        connections: entry.connections,
+                        importance: entry.importance,
+                        consolidated_at: None,
+                        created_at,
+                        protocol_source_key: Some(source_key),
+                        protocol_fingerprint: Some(fingerprint),
+                        protocol_active: true,
+                    },
+                    created,
+                })
+            })
+            .await?;
+
+        Ok(outcome)
+    }
+
+    async fn deactivate_protocol_sources(
+        &self,
+        scope: &str,
+        live_source_keys: &[String],
+    ) -> Result<Vec<String>, KnowledgeError> {
+        let scope = scope.to_string();
+        let live: Vec<String> = live_source_keys.to_vec();
+
+        self.run_blocking(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, public_id, protocol_source_key FROM knowledge_entries \
+                     WHERE scope = ? AND protocol_source_key IS NOT NULL \
+                       AND protocol_active = 1",
+                )
+                .map_err(KnowledgeError::from)?;
+            let candidates = stmt
+                .query_map(params![scope], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(KnowledgeError::from)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(KnowledgeError::from)?;
+            drop(stmt);
+
+            let tx = conn.transaction().map_err(KnowledgeError::from)?;
+            let mut deactivated = Vec::new();
+            for (row_id, public_id, source_key) in candidates {
+                let Some(source_key) = source_key else {
+                    continue;
+                };
+                if live.iter().any(|key| key == &source_key) {
+                    continue;
+                }
+                tx.execute(
+                    "UPDATE knowledge_entries SET protocol_active = 0 WHERE id = ?",
+                    params![row_id],
+                )
+                .map_err(KnowledgeError::from)?;
+                deactivated.push(public_id);
+            }
+            tx.commit().map_err(KnowledgeError::from)?;
+            deactivated.sort();
+            Ok(deactivated)
+        })
+        .await
+    }
+
+    async fn list_protocol_sources(
+        &self,
+        scope: &str,
+    ) -> Result<Vec<KnowledgeEntry>, KnowledgeError> {
+        let scope = scope.to_string();
+        self.run_blocking(move |conn| {
+            // Includes inactive rows: reconciliation needs to see deactivated
+            // protocol entries so it can reactivate them when they return.
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {ENTRY_COLS} FROM knowledge_entries \
+                     WHERE scope = ? AND protocol_source_key IS NOT NULL \
+                     ORDER BY protocol_source_key ASC"
+                ))
+                .map_err(KnowledgeError::from)?;
+            let rows = stmt
+                .query_map(params![scope], row_to_entry)
+                .map_err(KnowledgeError::from)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(KnowledgeError::from)
+        })
+        .await
+    }
 }
 
 // ─── Query Helpers ───────────────────────────────────────────────────────────
@@ -721,7 +971,7 @@ fn query_entries(
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT {ENTRY_COLS} FROM knowledge_entries \
-                     WHERE scope = ?1 ORDER BY created_at DESC LIMIT ?2"
+                     WHERE scope = ?1 AND {ACTIVE_ONLY} ORDER BY created_at DESC LIMIT ?2"
                 ))
                 .map_err(KnowledgeError::from)?;
             stmt.raw_bind_parameter(1, scope)
@@ -803,12 +1053,12 @@ fn query_entries(
                     (-bm25(knowledge_entries_fts, 10.0, 1.0, 0.5) + ({boost_expr}) + (e.importance * 5.0)) AS _rank \
                 FROM knowledge_entries_fts \
                 JOIN knowledge_entries e ON e.id = knowledge_entries_fts.rowid \
-                WHERE knowledge_entries_fts MATCH ?1 AND e.scope = ?2 \
+                WHERE knowledge_entries_fts MATCH ?1 AND e.scope = ?2 AND e.{ACTIVE_COLUMN} = 1 \
               UNION \
                 SELECT {ENTRY_COLS}, \
                     (0.0 + ({boost_expr_unaliased}) + (importance * 5.0)) AS _rank \
                 FROM knowledge_entries \
-                WHERE scope = ?2 AND {junction_where} \
+                WHERE scope = ?2 AND {junction_where} AND {ACTIVE_ONLY} \
              ) \
              ORDER BY _rank DESC, created_at DESC, id DESC \
              LIMIT ?{limit_idx}",
@@ -833,7 +1083,7 @@ fn query_entries(
         let sql = format!(
             "SELECT {ENTRY_COLS_QUALIFIED} FROM knowledge_entries_fts \
              JOIN knowledge_entries e ON e.id = knowledge_entries_fts.rowid \
-             WHERE knowledge_entries_fts MATCH ?1 AND e.scope = ?2 \
+             WHERE knowledge_entries_fts MATCH ?1 AND e.scope = ?2 AND e.{ACTIVE_COLUMN} = 1 \
              ORDER BY bm25(knowledge_entries_fts, 10.0, 1.0, 0.5), e.created_at DESC, e.id DESC \
              LIMIT ?3"
         );
@@ -1508,5 +1758,332 @@ mod tests {
         // internal id should be 0 (serde skip)
         let json = serde_json::to_string(&result.entries[0]).unwrap();
         assert!(!json.contains("\"id\""));
+    }
+
+    // ── Protocol source lifecycle ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn protocol_upsert_creates_then_updates_in_place() {
+        let db = setup_db();
+        let store = SqliteKnowledgeStore::new(db);
+
+        let first = store
+            .upsert_protocol_source(
+                "scope",
+                "dotagents:v1:memory:workspace:abc:notes",
+                "fp-1",
+                make_ingest("dotagents", "Original notes"),
+            )
+            .await
+            .unwrap();
+        assert!(first.created);
+        assert_eq!(
+            first.entry.protocol_source_key.as_deref(),
+            Some("dotagents:v1:memory:workspace:abc:notes")
+        );
+        assert!(first.entry.protocol_active);
+
+        // Re-upserting the same source key updates the same row rather than
+        // appending a second active entry.
+        let second = store
+            .upsert_protocol_source(
+                "scope",
+                "dotagents:v1:memory:workspace:abc:notes",
+                "fp-2",
+                make_ingest("dotagents", "Edited notes"),
+            )
+            .await
+            .unwrap();
+        assert!(!second.created);
+        assert_eq!(second.entry.public_id, first.entry.public_id);
+        assert_eq!(second.entry.created_at, first.entry.created_at);
+        assert_eq!(second.entry.summary, "Edited notes");
+        assert_eq!(second.entry.protocol_fingerprint.as_deref(), Some("fp-2"));
+
+        let listed = store.list_protocol_sources("scope").await.unwrap();
+        assert_eq!(listed.len(), 1, "one row per protocol source key");
+    }
+
+    #[tokio::test]
+    async fn protocol_upsert_changed_content_becomes_unconsolidated() {
+        let db = setup_db();
+        let store = SqliteKnowledgeStore::new(db);
+
+        let first = store
+            .upsert_protocol_source(
+                "scope",
+                "dotagents:v1:memory:workspace:abc:notes",
+                "fp-1",
+                make_ingest("dotagents", "Original notes"),
+            )
+            .await
+            .unwrap();
+        store
+            .consolidate(
+                "scope",
+                ConsolidateRequest {
+                    source_entry_public_ids: vec![first.entry.public_id.clone()],
+                    summary: "Consolidated notes".to_string(),
+                    insight: "Original insight".to_string(),
+                    connections: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_unconsolidated("scope", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let updated = store
+            .upsert_protocol_source(
+                "scope",
+                "dotagents:v1:memory:workspace:abc:notes",
+                "fp-2",
+                make_ingest("dotagents", "Edited notes"),
+            )
+            .await
+            .unwrap();
+
+        assert!(updated.entry.consolidated_at.is_none());
+        let unconsolidated = store.list_unconsolidated("scope", 10).await.unwrap();
+        assert_eq!(unconsolidated.len(), 1);
+        assert_eq!(unconsolidated[0].public_id, first.entry.public_id);
+        assert_eq!(unconsolidated[0].summary, "Edited notes");
+    }
+
+    #[tokio::test]
+    async fn protocol_upsert_never_adopts_user_entries() {
+        let db = setup_db();
+        let store = SqliteKnowledgeStore::new(db);
+
+        // A user-created entry with the same summary text.
+        let user = store
+            .ingest("scope", make_ingest("user", "Shared text"))
+            .await
+            .unwrap();
+        assert!(user.protocol_source_key.is_none());
+
+        store
+            .upsert_protocol_source(
+                "scope",
+                "dotagents:v1:memory:workspace:abc:notes",
+                "fp-1",
+                make_ingest("dotagents", "Shared text"),
+            )
+            .await
+            .unwrap();
+
+        let protocol = store.list_protocol_sources("scope").await.unwrap();
+        assert_eq!(protocol.len(), 1);
+        assert_ne!(protocol[0].public_id, user.public_id);
+    }
+
+    #[tokio::test]
+    async fn deactivate_marks_removed_sources_and_preserves_user_entries() {
+        let db = setup_db();
+        let store = SqliteKnowledgeStore::new(db);
+
+        store
+            .upsert_protocol_source(
+                "scope",
+                "dotagents:v1:memory:workspace:abc:keep",
+                "fp-1",
+                make_ingest("dotagents", "Keep me"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_protocol_source(
+                "scope",
+                "dotagents:v1:memory:workspace:abc:gone",
+                "fp-1",
+                make_ingest("dotagents", "Remove me"),
+            )
+            .await
+            .unwrap();
+        let user = store
+            .ingest("scope", make_ingest("user", "User entry"))
+            .await
+            .unwrap();
+
+        let deactivated = store
+            .deactivate_protocol_sources(
+                "scope",
+                &["dotagents:v1:memory:workspace:abc:keep".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(deactivated.len(), 1);
+
+        let rows = store.list_protocol_sources("scope").await.unwrap();
+        let keep = rows
+            .iter()
+            .find(|e| {
+                e.protocol_source_key.as_deref() == Some("dotagents:v1:memory:workspace:abc:keep")
+            })
+            .unwrap();
+        let gone = rows
+            .iter()
+            .find(|e| {
+                e.protocol_source_key.as_deref() == Some("dotagents:v1:memory:workspace:abc:gone")
+            })
+            .unwrap();
+        assert!(keep.protocol_active);
+        // Retained for inspection but marked inactive.
+        assert!(!gone.protocol_active);
+        assert_eq!(gone.public_id, deactivated[0]);
+
+        // The user-created entry is untouched: it has no protocol source key
+        // and is never considered by protocol source reconciliation.
+        let user_entry = store
+            .list("scope", KnowledgeFilter::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.public_id == user.public_id)
+            .expect("user entry remains listable");
+        assert!(user_entry.protocol_source_key.is_none());
+        assert!(user_entry.protocol_active);
+    }
+
+    /// A deactivated protocol memory must disappear from every live retrieval
+    /// path while remaining available to protocol reconciliation.
+    #[tokio::test]
+    async fn deactivated_protocol_memory_is_excluded_from_live_retrieval() {
+        let db = setup_db();
+        let store = SqliteKnowledgeStore::new(db);
+
+        let keep_key = "dotagents:v1:memory:workspace:abc:keep";
+        let gone_key = "dotagents:v1:memory:workspace:abc:gone";
+
+        store
+            .upsert_protocol_source(
+                "scope",
+                keep_key,
+                "fp-1",
+                make_ingest("dotagents", "Keep me"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_protocol_source(
+                "scope",
+                gone_key,
+                "fp-1",
+                make_ingest("dotagents", "Remove me entirely"),
+            )
+            .await
+            .unwrap();
+
+        // Deactivate only `gone`: the live-key set passed in is the one that
+        // must remain active.
+        let deactivated = store
+            .deactivate_protocol_sources("scope", &[keep_key.to_string()])
+            .await
+            .unwrap();
+        assert_eq!(deactivated.len(), 1);
+
+        // `list` (filtered + unfiltered) excludes the inactive entry.
+        let listed = store
+            .list("scope", KnowledgeFilter::default())
+            .await
+            .unwrap();
+        assert!(
+            listed
+                .iter()
+                .all(|e| e.protocol_source_key.as_deref() != Some(gone_key)),
+            "list returned a deactivated protocol memory"
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|e| e.protocol_source_key.as_deref() == Some(keep_key)),
+            "list dropped a live protocol memory"
+        );
+
+        // Keyword search excludes it.
+        let searched = store
+            .query(
+                "scope",
+                "entirely",
+                QueryOpts {
+                    limit: 50,
+                    include_consolidations: false,
+                    retrieval_mode: RetrievalMode::Keyword,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            searched
+                .entries
+                .iter()
+                .all(|e| e.protocol_source_key.as_deref() != Some(gone_key)),
+            "keyword query returned a deactivated protocol memory"
+        );
+        assert!(
+            searched
+                .entries
+                .iter()
+                .any(|e| e.protocol_source_key.as_deref() == Some(keep_key)),
+            "keyword query dropped a live protocol memory"
+        );
+
+        // Hybrid question-driven query excludes it.
+        let hybrid = store
+            .query("scope", "", QueryOpts::default())
+            .await
+            .unwrap();
+        assert!(
+            hybrid
+                .entries
+                .iter()
+                .all(|e| e.protocol_source_key.as_deref() != Some(gone_key)),
+            "recent-entry query returned a deactivated protocol memory"
+        );
+
+        // Statistics count only live entries.
+        let stats = store.stats("scope").await.unwrap();
+        assert_eq!(stats.total_entries, 1);
+        assert_eq!(stats.unconsolidated_entries, 1);
+
+        // Reconciliation can still see the inactive entry to reactivate it.
+        let retained = store.list_protocol_sources("scope").await.unwrap();
+        assert_eq!(retained.len(), 2);
+        assert!(
+            retained
+                .iter()
+                .any(|e| e.protocol_source_key.as_deref() == Some(gone_key) && !e.protocol_active)
+        );
+    }
+
+    #[tokio::test]
+    async fn reactivating_a_source_restores_it() {
+        let db = setup_db();
+        let store = SqliteKnowledgeStore::new(db);
+
+        let key = "dotagents:v1:memory:workspace:abc:notes";
+        store
+            .upsert_protocol_source("scope", key, "fp-1", make_ingest("dotagents", "Notes"))
+            .await
+            .unwrap();
+        store
+            .deactivate_protocol_sources("scope", &[])
+            .await
+            .unwrap();
+        assert!(!store.list_protocol_sources("scope").await.unwrap()[0].protocol_active);
+
+        // Reappearing in the resolved manifest reactivates the same row.
+        let restored = store
+            .upsert_protocol_source("scope", key, "fp-1", make_ingest("dotagents", "Notes"))
+            .await
+            .unwrap();
+        assert!(!restored.created);
+        assert!(restored.entry.protocol_active);
+        assert_eq!(store.list_protocol_sources("scope").await.unwrap().len(), 1);
     }
 }

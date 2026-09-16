@@ -19,10 +19,23 @@ pub struct Skill {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SkillMetadata {
     /// Required: human-readable name
+    ///
+    /// Deserialized with a default so protocol entries can omit it; the
+    /// parser fills protocol defaults before validation reports it.
+    #[serde(default)]
     pub name: String,
 
     /// Required: what this skill does
     pub description: String,
+
+    /// Optional: `.agents` protocol stable skill ID.
+    /// Falls back to the entry directory name when absent.
+    #[serde(default)]
+    pub id: Option<String>,
+
+    /// Optional: `.agents` protocol enabled flag. Absent means enabled.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 
     /// Optional: semver version
     #[serde(default)]
@@ -96,6 +109,17 @@ pub enum ToolAccessPolicy {
 }
 
 impl SkillMetadata {
+    /// Effective stable ID: the explicit protocol `id`, else the skill name
+    /// (which defaults to the entry directory name for protocol skills).
+    pub fn effective_id(&self) -> &str {
+        self.id.as_deref().unwrap_or(&self.name)
+    }
+
+    /// `.agents` protocol enabled state; absent means enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
     /// Parse the specification's space-separated `allowed-tools` field.
     pub fn tool_policy(&self) -> ToolAccessPolicy {
         let Some(allowed_tools) = self.allowed_tools.as_deref() else {
@@ -145,6 +169,8 @@ mod tests {
         let meta = SkillMetadata {
             name: "test".into(),
             description: "test".into(),
+            id: None,
+            enabled: None,
             version: None,
             license: None,
             compatibility: None,
@@ -161,6 +187,8 @@ mod tests {
         let meta = SkillMetadata {
             name: "test".into(),
             description: "test".into(),
+            id: None,
+            enabled: None,
             version: None,
             license: None,
             compatibility: None,
@@ -182,6 +210,8 @@ mod tests {
         let meta = SkillMetadata {
             name: "test".into(),
             description: "test".into(),
+            id: None,
+            enabled: None,
             version: None,
             license: None,
             compatibility: None,
@@ -196,6 +226,31 @@ mod tests {
         } else {
             panic!("Expected blacklist");
         }
+    }
+
+    #[test]
+    fn test_protocol_id_and_enabled_helpers() {
+        let mut meta = SkillMetadata {
+            name: "Fancy Name".into(),
+            description: "test".into(),
+            id: None,
+            enabled: None,
+            version: None,
+            license: None,
+            compatibility: None,
+            allowed_tools: None,
+            tags: None,
+            author: None,
+            extra: HashMap::new(),
+        };
+        assert_eq!(meta.effective_id(), "Fancy Name");
+        assert!(meta.is_enabled());
+
+        meta.id = Some("review".into());
+        assert_eq!(meta.effective_id(), "review");
+
+        meta.enabled = Some(false);
+        assert!(!meta.is_enabled());
     }
 
     #[test]

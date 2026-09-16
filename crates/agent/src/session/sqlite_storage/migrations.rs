@@ -80,7 +80,111 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0017_delegate_assignments",
         apply: migration_0017_delegate_assignments,
     },
+    Migration {
+        version: "0018_dotagents_task_state",
+        apply: migration_0018_dotagents_task_state,
+    },
+    Migration {
+        version: "0019_dotagents_memory_source",
+        apply: migration_0019_dotagents_memory_source,
+    },
+    Migration {
+        version: "0020_dotagents_automation_bindings",
+        apply: migration_0020_dotagents_automation_bindings,
+    },
 ];
+
+/// Protocol-owned automation session bindings.
+///
+/// One durable session per protocol scope and target profile. The binding key is
+/// deterministic, so reconciling the same protocol tree across restarts reuses
+/// the existing session instead of creating duplicates.
+fn migration_0020_dotagents_automation_bindings(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dotagents_automation_bindings (
+            binding_key TEXT PRIMARY KEY,
+            layer TEXT NOT NULL CHECK (layer IN ('global', 'workspace')),
+            canonical_workspace TEXT,
+            profile_id TEXT,
+            session_public_id TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(session_public_id) REFERENCES sessions(public_id) ON DELETE CASCADE,
+            CHECK ((layer = 'workspace' AND canonical_workspace IS NOT NULL) OR layer = 'global')
+        );
+        CREATE INDEX IF NOT EXISTS idx_dotagents_automation_bindings_session
+            ON dotagents_automation_bindings(session_public_id);",
+    )
+}
+
+/// Additive protocol-owned memory source columns.
+///
+/// Existing rows keep `protocol_source_key IS NULL` and are therefore treated
+/// as user-created, so this migration never adopts or rewrites prior entries.
+/// The partial unique index scopes the constraint to protocol-owned rows only,
+/// letting the same protocol source key exist exactly once per scope.
+///
+/// Fresh installs already receive these columns from `init_schema`, so each
+/// `ALTER TABLE` is guarded by a column-existence check to stay idempotent.
+fn migration_0019_dotagents_memory_source(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let existing: HashSet<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(knowledge_entries)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?
+    };
+
+    for (column, definition) in [
+        ("protocol_source_key", "TEXT"),
+        ("protocol_fingerprint", "TEXT"),
+        ("protocol_active", "INTEGER NOT NULL DEFAULT 1"),
+    ] {
+        if !existing.contains(column) {
+            conn.execute(
+                &format!("ALTER TABLE knowledge_entries ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_entries_protocol_source
+             ON knowledge_entries(scope, protocol_source_key)
+             WHERE protocol_source_key IS NOT NULL;",
+    )
+}
+
+fn migration_0018_dotagents_task_state(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dotagents_task_ownership (
+            source_key TEXT PRIMARY KEY,
+            task_creation_key TEXT UNIQUE NOT NULL,
+            schedule_creation_key TEXT UNIQUE NOT NULL,
+            layer TEXT NOT NULL CHECK (layer IN ('global', 'workspace')),
+            canonical_workspace TEXT,
+            task_id TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            task_public_id TEXT UNIQUE,
+            schedule_public_id TEXT UNIQUE,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(task_public_id) REFERENCES tasks(public_id) ON DELETE SET NULL,
+            FOREIGN KEY(schedule_public_id) REFERENCES schedules(public_id) ON DELETE SET NULL,
+            CHECK ((layer = 'workspace' AND canonical_workspace IS NOT NULL) OR layer = 'global')
+        );
+        CREATE INDEX IF NOT EXISTS idx_dotagents_task_ownership_identity
+            ON dotagents_task_ownership(layer, canonical_workspace, task_id);
+        CREATE TABLE IF NOT EXISTS dotagents_task_approvals (
+            canonical_workspace TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            decision TEXT NOT NULL CHECK (decision IN ('approve', 'deny')),
+            decided_at TEXT NOT NULL,
+            PRIMARY KEY(canonical_workspace, task_id, fingerprint)
+        );",
+    )
+}
 
 fn migration_0017_delegate_assignments(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(

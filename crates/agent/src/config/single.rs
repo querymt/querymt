@@ -61,6 +61,10 @@ pub struct SingleAgentConfig {
     /// NOTE: this is NOT for MCP servers — use `[[mcp]]` for those.
     #[serde(default, rename = "remote_agents")]
     pub remote_agents: Vec<RemoteAgentConfig>,
+
+    /// Optional `.agents` Protocol loading settings (disabled by default).
+    #[serde(default)]
+    pub dotagents: crate::dotagents::DotagentsSettings,
 }
 
 /// A middleware entry in the agent's processing stack.

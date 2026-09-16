@@ -88,6 +88,8 @@ nav:
     - Agent Modes: agent/agent_modes.md
     - Middleware: agent/middleware.md
     - Delegation: agent/delegation.md
+    - '`.agents` Protocol': agent/dotagents.md
+    - 'Protocol Support Matrix': agent/dotagents_support_matrix.md
     - Mesh Networking: agent/mesh.md
     - Export & Fine-Tuning: agent/export.md
     - API Reference: agent/api_reference.md

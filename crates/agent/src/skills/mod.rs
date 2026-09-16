@@ -19,7 +19,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub use discovery::{default_search_paths, discover_all, discover_from_source};
-pub use parser::{SKILL_FILENAME, parse_skill_file};
+pub use parser::{PROTOCOL_SKILL_FILENAME, SKILL_FILENAME, parse_skill_file, parse_skill_file_ex};
 pub use permissions::{PermissionLevel, SkillPermissions};
 pub use registry::SkillRegistry;
 pub use tool::SkillTool;

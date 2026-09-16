@@ -842,6 +842,74 @@ system = ["You are powered by {{ provider }}/{{ model }}."]
     }
 }
 
+#[tokio::test]
+async fn dotagents_settings_default_disabled_for_single_and_quorum() {
+    let single = load_config(ConfigSource::Toml(
+        "[agent]\nprovider = \"test\"\nmodel = \"model\"\n".to_string(),
+    ))
+    .await
+    .unwrap();
+    let Config::Single(single) = single else {
+        panic!("expected single config");
+    };
+    assert!(!single.dotagents.enabled);
+    assert!(single.dotagents.global_enabled);
+    assert!(single.dotagents.workspace_enabled);
+
+    let quorum = load_config(ConfigSource::Toml(
+        "[quorum]\n[planner]\nprovider = \"test\"\nmodel = \"model\"\n".to_string(),
+    ))
+    .await
+    .unwrap();
+    let Config::Multi(quorum) = quorum else {
+        panic!("expected quorum config");
+    };
+    assert!(!quorum.dotagents.enabled);
+}
+
+#[tokio::test]
+async fn dotagents_settings_parse_from_toml() {
+    let toml = r#"
+[agent]
+provider = "test"
+model = "model"
+
+[dotagents]
+enabled = true
+workspace = "/workspace"
+global_root = "/global"
+workspace_root = "/workspace/.agents"
+global_enabled = false
+selected_model_preset = "fast"
+trusted_roots = ["/shared"]
+strictness = "strict"
+"#;
+    let config = load_config(ConfigSource::Toml(toml.to_string()))
+        .await
+        .unwrap();
+    let Config::Single(config) = config else {
+        panic!("expected single config");
+    };
+    assert!(config.dotagents.enabled);
+    assert!(!config.dotagents.global_enabled);
+    assert_eq!(
+        config.dotagents.selected_model_preset.as_deref(),
+        Some("fast")
+    );
+    assert_eq!(
+        config.dotagents.strictness,
+        crate::dotagents::DotagentsStrictness::Strict
+    );
+}
+
+#[test]
+fn dotagents_settings_are_present_in_generated_schemas() {
+    let single = serde_json::to_value(schemars::schema_for!(SingleAgentConfig)).unwrap();
+    let quorum = serde_json::to_value(schemars::schema_for!(QuorumConfig)).unwrap();
+    assert!(single.pointer("/properties/dotagents").is_some());
+    assert!(quorum.pointer("/properties/dotagents").is_some());
+}
+
 // ── Schema enrichment tests ──────────────────────────────────────────────
 
 /// Verifies that the generated JSON Schema for `AgentSettings.tools` mentions

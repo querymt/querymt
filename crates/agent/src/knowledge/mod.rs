@@ -56,7 +56,7 @@ fn default_importance() -> f64 {
 /// ## Identity Contract
 /// - `id: i64` is internal only (never leaves repository/API boundary).
 /// - `public_id` is the stable external identity used by tools, events, and APIs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KnowledgeEntry {
     /// Internal DB identity (never leaves repository/API boundary).
     #[serde(skip)]
@@ -92,6 +92,21 @@ pub struct KnowledgeEntry {
     /// When the entry was created.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Protocol source key for `.agents` memory-owned entries.
+    ///
+    /// `None` means the entry is user-created and is never touched by protocol
+    /// source reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_source_key: Option<String>,
+    /// Fingerprint of the protocol source content that produced this entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_fingerprint: Option<String>,
+    /// Whether this protocol-owned entry is currently active.
+    ///
+    /// Deactivated entries are retained for inspection but excluded from
+    /// protocol reconciliation as live sources.
+    #[serde(default = "default_true")]
+    pub protocol_active: bool,
 }
 
 /// A consolidation — a synthesis of multiple knowledge entries.
@@ -322,6 +337,51 @@ pub trait KnowledgeStore: Send + Sync {
         scope: &str,
         source_key: &str,
     ) -> Result<(), KnowledgeError>;
+
+    /// Insert or update a protocol-owned entry keyed by its stable source key.
+    ///
+    /// This is the narrowly scoped counterpart to [`KnowledgeStore::ingest`] for
+    /// declarative `.agents` memories. It never creates a second active entry for
+    /// the same `protocol_source_key`, so reloading an unchanged memory is
+    /// idempotent and editing a memory replaces its own entry instead of
+    /// appending a new one.
+    ///
+    /// Returns the resulting entry. `created` is `true` when a new row was
+    /// inserted and `false` when an existing protocol-owned row was updated.
+    async fn upsert_protocol_source(
+        &self,
+        scope: &str,
+        source_key: &str,
+        fingerprint: &str,
+        entry: IngestRequest,
+    ) -> Result<ProtocolUpsertOutcome, KnowledgeError>;
+
+    /// Deactivate protocol-owned entries whose source keys are no longer present.
+    ///
+    /// Only rows whose `protocol_source_key` is set are considered; user-created
+    /// entries are never modified. Deactivated entries are retained for
+    /// inspection but are excluded from live protocol sources. Returns the public
+    /// IDs of the entries that were deactivated.
+    async fn deactivate_protocol_sources(
+        &self,
+        scope: &str,
+        live_source_keys: &[String],
+    ) -> Result<Vec<String>, KnowledgeError>;
+
+    /// List protocol-owned entries in a scope, including inactive ones.
+    async fn list_protocol_sources(
+        &self,
+        scope: &str,
+    ) -> Result<Vec<KnowledgeEntry>, KnowledgeError>;
+}
+
+/// Result of a protocol source upsert.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProtocolUpsertOutcome {
+    /// The resulting entry (new or updated).
+    pub entry: KnowledgeEntry,
+    /// Whether a new row was inserted (`true`) or an existing one updated.
+    pub created: bool,
 }
 
 /// Request to create a consolidation from multiple entries.

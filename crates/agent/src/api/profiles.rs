@@ -22,11 +22,21 @@ impl AgentProfiles {
         active_profile_id: impl Into<String>,
         infra: AgentInfra,
     ) -> Self {
-        let manager: ProfileRuntimeHandle = Arc::new(ProfileRuntimeManager::with_infra_boxed(
-            catalog,
-            active_profile_id,
-            infra,
-        ));
+        Self::new_with_dotagents_workspace(catalog, active_profile_id, infra, None)
+    }
+
+    pub fn new_with_dotagents_workspace(
+        catalog: Arc<dyn ProfileCatalog>,
+        active_profile_id: impl Into<String>,
+        infra: AgentInfra,
+        workspace: Option<std::path::PathBuf>,
+    ) -> Self {
+        let mut manager =
+            ProfileRuntimeManager::with_infra_boxed(catalog, active_profile_id, infra);
+        if let Some(workspace) = workspace {
+            manager = manager.with_dotagents_workspace(workspace);
+        }
+        let manager: ProfileRuntimeHandle = Arc::new(manager);
         let watcher = manager.start_profile_watcher();
         Self { manager, watcher }
     }

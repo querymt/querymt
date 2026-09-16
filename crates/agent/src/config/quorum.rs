@@ -48,6 +48,10 @@ pub struct QuorumConfig {
     /// Requires `[mesh] enabled = true`.
     #[serde(default, rename = "remote_agents")]
     pub remote_agents: Vec<RemoteAgentConfig>,
+
+    /// Optional `.agents` Protocol loading settings (disabled by default).
+    #[serde(default)]
+    pub dotagents: crate::dotagents::DotagentsSettings,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, PartialEq, Eq, Default)]

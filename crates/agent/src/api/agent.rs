@@ -113,6 +113,12 @@ pub struct AgentBuilder {
     skills_config: Option<SkillsConfig>,
     slash_commands_config: Option<SlashCommandsConfig>,
     hooks_config: Option<HooksConfig>,
+    /// Protocol load options; disabled when omitted.
+    dotagents_options: Option<crate::dotagents::DotagentsLoadOptions>,
+    /// Optional pre-resolved protocol manifest.
+    dotagents_manifest: Option<crate::dotagents::DotagentsManifest>,
+    /// Optional host approval mechanism for workspace protocol tasks.
+    dotagents_task_approver: Option<Arc<dyn crate::dotagents::DotagentsTaskApprover>>,
     /// MCP servers from TOML `[[mcp]]` config, attached to every new session.
     mcp_servers: Vec<McpServerConfig>,
     /// Runtime MCP attachment source (e.g., mobile in-process MCP peers).
@@ -153,6 +159,9 @@ impl AgentBuilder {
             skills_config: None,
             slash_commands_config: None,
             hooks_config: None,
+            dotagents_options: None,
+            dotagents_manifest: None,
+            dotagents_task_approver: None,
             mcp_servers: Vec::new(),
             session_mcp_attachment_source: None,
             agent_registry: None,
@@ -281,6 +290,72 @@ impl AgentBuilder {
         self
     }
 
+    /// Enable `.agents` loading with default discovery options.
+    pub fn enable_dotagents(mut self) -> Self {
+        self.dotagents_options = Some(crate::dotagents::DotagentsLoadOptions::enabled());
+        self
+    }
+
+    /// Configure `.agents` loading explicitly.
+    pub fn dotagents_options(mut self, options: crate::dotagents::DotagentsLoadOptions) -> Self {
+        self.dotagents_options = Some(options);
+        self
+    }
+
+    /// Supply a pre-resolved `.agents` manifest.
+    pub fn dotagents_manifest(mut self, manifest: crate::dotagents::DotagentsManifest) -> Self {
+        self.dotagents_manifest = Some(manifest);
+        self
+    }
+
+    /// Supply the host approval mechanism for workspace protocol tasks.
+    ///
+    /// Protocol workspace tasks are treated as untrusted repository content. When
+    /// the trust policy is `prompt` and no approver is configured, such tasks
+    /// stay pending and inactive, and activation reports them instead of running
+    /// them. Configuring an approver lets a CLI, UI, ACP, or embedding host
+    /// present the decision.
+    pub fn dotagents_task_approver(
+        mut self,
+        approver: Arc<dyn crate::dotagents::DotagentsTaskApprover>,
+    ) -> Self {
+        self.dotagents_task_approver = Some(approver);
+        self
+    }
+
+    /// Inspect configured protocol load options without triggering discovery.
+    pub fn configured_dotagents_options(&self) -> Option<&crate::dotagents::DotagentsLoadOptions> {
+        self.dotagents_options.as_ref()
+    }
+
+    /// Inspect a supplied pre-resolved protocol manifest.
+    pub fn configured_dotagents_manifest(&self) -> Option<&crate::dotagents::DotagentsManifest> {
+        self.dotagents_manifest.as_ref()
+    }
+
+    /// Resolve the effective `.agents` Protocol manifest for inspection.
+    ///
+    /// Applies the same resolution precedence as [`Self::build`] (a supplied
+    /// manifest, then explicit or config-derived load options, then the
+    /// builder workspace) but performs no runtime work: no MCP servers are
+    /// started, no tasks are scheduled or reconciled, no memories are
+    /// imported, and no `.agents` directory is created. Returns `Ok(None)`
+    /// when protocol loading is disabled or no protocol layer applies.
+    ///
+    /// Resolved diagnostics are attached to the returned manifest; in strict
+    /// mode the error carries the fully populated manifest for inspection.
+    pub fn preview_dotagents_manifest(
+        &self,
+    ) -> Result<Option<crate::dotagents::DotagentsManifest>, anyhow::Error> {
+        let cwd = self.cwd.clone().map(to_absolute_path).transpose()?;
+        crate::dotagents::resolve_for_builder(
+            self.dotagents_manifest.clone(),
+            self.dotagents_options.clone(),
+            cwd.as_deref(),
+        )
+        .map_err(|error| anyhow::Error::new(*error))
+    }
+
     /// Set whether to assume all tools are mutating.
     pub fn assume_mutating(mut self, yes: bool) -> Self {
         self.assume_mutating = Some(yes);
@@ -354,10 +429,39 @@ impl AgentBuilder {
             None
         };
 
-        let llm_config = self
+        let mut llm_config = self
             .llm_config
             .ok_or_else(|| anyhow!("LLM configuration is required (call .provider() first)"))?;
-
+        let dotagents_options = self.dotagents_options.take();
+        let dotagents_strictness = dotagents_options
+            .as_ref()
+            .map(|options| options.strictness())
+            .unwrap_or_default();
+        let dotagents_manifest = crate::dotagents::resolve_for_builder(
+            self.dotagents_manifest.take(),
+            dotagents_options.clone(),
+            cwd.as_deref(),
+        )
+        .map_err(|error| anyhow!(error.to_string()))?;
+        if let Some(manifest) = &dotagents_manifest {
+            // Protocol prompts are additive to explicit system parts, in the
+            // order: explicit, `system-prompt.md`, `agents.md`.
+            crate::dotagents::compose_prompt(&mut llm_config, manifest);
+            // The selected preset is recorded here and applied after the plugin
+            // registry exists, so an unavailable provider is reported instead of
+            // leaving a half-applied overlay behind.
+            if let Some(preset_name) = dotagents_options
+                .as_ref()
+                .and_then(|options| options.selected_model_preset())
+                && crate::dotagents::select_model_overlay(manifest, preset_name).is_err()
+            {
+                // An unresolvable preset must not silently discard the explicit
+                // base configuration; the diagnostic is re-reported below.
+                crate::dotagents::select_model_overlay(manifest, preset_name)
+                    .err()
+                    .inspect(|diagnostic| log::warn!("dotagents: {diagnostic}"));
+            }
+        }
         let (plugin_registry, backend, event_fanout): (
             Arc<querymt::plugin::host::PluginRegistry>,
             Arc<dyn StorageBackend>,
@@ -381,9 +485,43 @@ impl AgentBuilder {
             }
         };
 
-        let mut builder = AgentConfigBuilder::new(plugin_registry, backend.clone(), llm_config)
-            .with_agent_id("agent")
-            .with_snapshot_policy(snapshot_policy);
+        // The plugin registry now exists, so the selected protocol preset can be
+        // applied atomically: provider availability is checked first, and every
+        // parameter is validated before any field is written. A rejected preset
+        // leaves the explicit base configuration completely intact.
+        let mut passive_diagnostics: Vec<crate::dotagents::DotagentsDiagnostic> = Vec::new();
+        if let (Some(manifest), Some(preset_name)) = (
+            dotagents_manifest.as_ref(),
+            dotagents_options
+                .as_ref()
+                .and_then(|options| options.selected_model_preset()),
+        ) && let Err(diagnostic) = crate::dotagents::apply_selected_model_preset(
+            &plugin_registry,
+            manifest,
+            preset_name,
+            &mut llm_config,
+        )
+        .await
+        {
+            match crate::dotagents::classify_activation_unavailable(
+                dotagents_strictness,
+                crate::dotagents::DotagentsActivationFacility::TargetProfile,
+                diagnostic.to_string(),
+            ) {
+                crate::dotagents::DotagentsActivationDisposition::Fatal(diagnostic) => {
+                    return Err(anyhow!(diagnostic.to_string()));
+                }
+                crate::dotagents::DotagentsActivationDisposition::Diagnostic(diagnostic) => {
+                    log::warn!("dotagents: {diagnostic}");
+                    passive_diagnostics.push(diagnostic);
+                }
+            }
+        }
+
+        let mut builder =
+            AgentConfigBuilder::new(plugin_registry.clone(), backend.clone(), llm_config)
+                .with_agent_id("agent")
+                .with_snapshot_policy(snapshot_policy);
         if let Some(event_fanout) = event_fanout {
             builder = builder.with_event_fanout(event_fanout);
         }
@@ -403,7 +541,33 @@ impl AgentBuilder {
             .await?;
             self.agent_registry = Some(registry);
         }
-        if let Some(registry) = self.agent_registry {
+        let explicit_registry = self.agent_registry.take();
+        // Delegation is considered enabled only when the host actually wired a
+        // delegation path: the `delegate` tool, or a non-empty registry of
+        // pre-registered targets. Protocol loading never changes this.
+        let delegation_enabled = self.tools.iter().any(|tool| tool == "delegate")
+            || explicit_registry
+                .as_ref()
+                .is_some_and(|registry| !registry.list_agents().is_empty());
+
+        // Task 3.2: extend a delegation-enabled standalone runtime's registry
+        // with lazy protocol targets. Delegation-disabled runtimes never
+        // register targets, and protocol loading never enables delegation.
+        if delegation_enabled && let Some(manifest) = &dotagents_manifest {
+            let plans = crate::dotagents::DotagentsSubAgentPlans::from_manifest(manifest);
+            let registry = crate::dotagents::DotagentsTargetRegistry::new(
+                &plans,
+                explicit_registry,
+                Arc::new(super::DotagentsTargetFactory::new(
+                    plugin_registry.clone(),
+                    backend.clone(),
+                )),
+            );
+            for diagnostic in registry.diagnostics() {
+                log::warn!("dotagents: {diagnostic}");
+            }
+            builder = builder.with_agent_registry(Arc::new(registry));
+        } else if let Some(registry) = explicit_registry {
             builder = builder.with_agent_registry(registry);
         }
 
@@ -478,6 +642,40 @@ impl AgentBuilder {
 
         if !self.mcp_servers.is_empty() {
             builder = builder.with_mcp_servers(self.mcp_servers.clone());
+        }
+
+        // Protocol MCP servers convert through the existing stdio and
+        // streamable-http transports. They are appended to any explicitly
+        // configured servers rather than replacing them, so explicit MCP
+        // configuration is preserved.
+        if let Some(manifest) = &dotagents_manifest {
+            let mcp_plan = crate::dotagents::DotagentsMcpPlan::from_manifest(manifest);
+            for diagnostic in &mcp_plan.diagnostics {
+                log::warn!("dotagents: {diagnostic}");
+            }
+            passive_diagnostics.extend(mcp_plan.diagnostics.iter().cloned());
+            if !mcp_plan.servers.is_empty() {
+                let mut servers = self.mcp_servers.clone();
+                for server in mcp_plan.servers {
+                    if !servers
+                        .iter()
+                        .any(|existing| existing.name() == server.name())
+                    {
+                        servers.push(server);
+                    } else {
+                        let message = format!(
+                            "protocol MCP server `{}` collides with an explicit configuration; keeping the explicit server",
+                            server.name()
+                        );
+                        log::warn!("dotagents: {message}");
+                        passive_diagnostics.push(crate::dotagents::DotagentsDiagnostic::warning(
+                            crate::dotagents::DotagentsDiagnosticCode::Collision,
+                            message,
+                        ));
+                    }
+                }
+                builder = builder.with_mcp_servers(servers);
+            }
         }
 
         if let Some(source) = self.session_mcp_attachment_source {
@@ -584,6 +782,18 @@ impl AgentBuilder {
             handle.set_mesh(runtime.handle().as_mesh_handle().clone());
         }
 
+        // Protocol state is retained for post-construction activation. Task and
+        // memory reconciliation is intentionally deferred: it needs sessions,
+        // profiles, approvals, and a scheduler, some of which do not exist yet.
+        let dotagents_state = dotagents_manifest.clone().map(|manifest| {
+            AgentDotagentsState::assemble(
+                manifest,
+                dotagents_options.unwrap_or_else(crate::dotagents::DotagentsLoadOptions::disabled),
+                self.dotagents_task_approver.take(),
+                passive_diagnostics,
+            )
+        });
+
         // Start the scheduler actor if the backend supports scheduling.
         handle.start_scheduler().await;
 
@@ -595,6 +805,7 @@ impl AgentBuilder {
             callbacks: Arc::new(EventCallbacksState::new(None)),
             profiles: None,
             quorum: None,
+            dotagents: dotagents_state.map(Arc::new),
         };
 
         #[cfg(feature = "remote")]
@@ -618,6 +829,55 @@ pub struct Agent {
     /// Present when this agent was built with `Agent::multi()`.
     /// Holds the quorum orchestrator for delegate access.
     pub(super) quorum: Option<Arc<crate::quorum::AgentQuorum>>,
+    /// Passive protocol state. Durable task and memory reconciliation is
+    /// deliberately *not* performed during `build()`; it runs from
+    /// [`Agent::activate_dotagents`] once the runtime topology is complete.
+    pub(super) dotagents: Option<Arc<AgentDotagentsState>>,
+}
+
+/// Protocol state carried by a built agent for post-construction activation.
+pub struct AgentDotagentsState {
+    pub(super) manifest: Arc<crate::dotagents::DotagentsManifest>,
+    pub(super) options: crate::dotagents::DotagentsLoadOptions,
+    pub(super) approver: Option<Arc<dyn crate::dotagents::DotagentsTaskApprover>>,
+    /// Diagnostics gathered while applying passive protocol configuration.
+    pub(super) passive_diagnostics: Vec<crate::dotagents::DotagentsDiagnostic>,
+}
+
+impl AgentDotagentsState {
+    /// Assemble the protocol state a runtime carries into activation.
+    ///
+    /// Shared by the single-agent and quorum builders so both runtimes expose
+    /// identical protocol behavior instead of drifting apart.
+    pub(super) fn assemble(
+        manifest: crate::dotagents::DotagentsManifest,
+        options: crate::dotagents::DotagentsLoadOptions,
+        approver: Option<Arc<dyn crate::dotagents::DotagentsTaskApprover>>,
+        passive_diagnostics: Vec<crate::dotagents::DotagentsDiagnostic>,
+    ) -> Self {
+        Self {
+            manifest: Arc::new(manifest),
+            options,
+            approver,
+            passive_diagnostics,
+        }
+    }
+
+    /// The resolved protocol manifest.
+    pub fn manifest(&self) -> &crate::dotagents::DotagentsManifest {
+        &self.manifest
+    }
+
+    /// The load options used for resolution.
+    pub fn options(&self) -> &crate::dotagents::DotagentsLoadOptions {
+        &self.options
+    }
+
+    /// Diagnostics emitted while applying passive protocol configuration
+    /// (prompts, model presets, MCP plans, skills, delegation targets).
+    pub fn passive_diagnostics(&self) -> &[crate::dotagents::DotagentsDiagnostic] {
+        &self.passive_diagnostics
+    }
 }
 
 impl Agent {
@@ -781,6 +1041,168 @@ impl Agent {
             .as_ref()
             .map(|profiles| profiles.manager())
             .or_else(|| self.inner.profiles())
+    }
+
+    /// The resolved `.agents` protocol state, when protocol support is enabled.
+    pub fn dotagents(&self) -> Option<&Arc<AgentDotagentsState>> {
+        self.dotagents.as_ref()
+    }
+
+    /// Whether `.agents` protocol support is enabled for this agent.
+    pub fn dotagents_enabled(&self) -> bool {
+        self.dotagents
+            .as_ref()
+            .is_some_and(|state| state.options.is_enabled())
+    }
+
+    /// Require a host trust decision for protocol workspace tasks at runtime.
+    ///
+    /// This overrides any approver supplied at build time and is the hook a host
+    /// uses when its approval UI is only available after construction.
+    pub fn set_dotagents_task_approver(
+        &mut self,
+        approver: Arc<dyn crate::dotagents::DotagentsTaskApprover>,
+    ) {
+        if let Some(state) = self.dotagents.take() {
+            let mut state = Arc::try_unwrap(state).unwrap_or_else(|arc| {
+                // Another clone holds the state; copy the fields we can.
+                AgentDotagentsState {
+                    manifest: arc.manifest.clone(),
+                    options: arc.options.clone(),
+                    approver: None,
+                    passive_diagnostics: arc.passive_diagnostics.clone(),
+                }
+            });
+            state.approver = Some(approver);
+            self.dotagents = Some(Arc::new(state));
+        }
+    }
+
+    /// Reconcile durable protocol state: memories and repeat tasks.
+    ///
+    /// This is the side-effectful half of protocol support. It is deliberately
+    /// separate from [`Agent::build`] because reconciliation needs storage, a
+    /// scheduler, the host's trust decision, and — for profile-scoped tasks — the
+    /// profile topology, none of which are guaranteed to exist during
+    /// construction.
+    ///
+    /// Activation is repeatable and idempotent: calling it again after a host
+    /// approves a pending workspace task reconciles the newly trusted task
+    /// without duplicating schedules, and it reuses the same protocol-owned
+    /// automation session across restarts.
+    ///
+    /// Returns `None` when protocol support is disabled or absent.
+    pub async fn activate_dotagents(
+        &self,
+    ) -> Result<Option<crate::dotagents::DotagentsActivationReport>> {
+        let Some(state) = self.dotagents.clone() else {
+            return Ok(None);
+        };
+        if !state.options.is_enabled() {
+            return Ok(None);
+        }
+
+        let Some(schedules) = self.storage.schedule_repository() else {
+            // Without schedule storage there is nowhere durable to reconcile
+            // protocol tasks; memories still import independently.
+            return Ok(Some(
+                self.dotagents_unavailable_report(
+                    &state,
+                    "protocol task reconciliation was skipped because the storage backend has no schedule repository",
+                )
+                .await,
+            ));
+        };
+
+        let Some(task_state) = self.storage.dotagents_task_state_repository() else {
+            return Ok(Some(
+                self.dotagents_unavailable_report(
+                    &state,
+                    "protocol task reconciliation was skipped because the storage backend has no task state repository",
+                )
+                .await,
+            ));
+        };
+
+        let Some(conn) = self.storage.dotagents_automation_repository() else {
+            return Ok(Some(
+                self.dotagents_unavailable_report(
+                    &state,
+                    "protocol task reconciliation was skipped because the storage backend has no automation repository",
+                )
+                .await,
+            ));
+        };
+
+        let coordinator = crate::dotagents::DotagentsRuntimeCoordinator::new(
+            crate::dotagents::DotagentsActivationContext {
+                manifest: state.manifest.clone(),
+                options: state.options.clone(),
+                sessions: self.storage.session_store(),
+                schedules,
+                state: task_state,
+                automation: conn,
+                knowledge: self.storage.knowledge_store(),
+                knowledge_scope: self.dotagents_knowledge_scope(),
+                approver: state.approver.clone(),
+                trigger: self.dotagents_startup_trigger(),
+            },
+        );
+
+        let resolver = super::dotagents_runtime::SingleAgentTargetResolver::new(
+            Arc::downgrade(&self.inner),
+            self.profiles(),
+        );
+        let mut report = coordinator.activate(&resolver).await;
+        // Passive diagnostics were gathered during construction and belong in the
+        // same activation view for hosts that present protocol status.
+        report
+            .diagnostics
+            .extend(state.passive_diagnostics().iter().cloned());
+        report.sort_diagnostics();
+        Ok(Some(report))
+    }
+
+    async fn dotagents_unavailable_report(
+        &self,
+        state: &AgentDotagentsState,
+        message: &str,
+    ) -> crate::dotagents::DotagentsActivationReport {
+        let mut report = crate::dotagents::DotagentsActivationReport::default();
+        report
+            .diagnostics
+            .push(crate::dotagents::DotagentsDiagnostic::warning(
+                crate::dotagents::DotagentsDiagnosticCode::Other,
+                message.to_string(),
+            ));
+        let memory_report = crate::dotagents::reconcile_memories(
+            crate::dotagents::DotagentsMemoryPlan::from_manifest(&state.manifest),
+            self.storage.knowledge_store().as_ref(),
+            &self.dotagents_knowledge_scope(),
+        )
+        .await;
+        report.memories_reconciled = memory_report.store_available;
+        report.diagnostics.extend(memory_report.diagnostics.clone());
+        report.memory = Some(memory_report);
+        report
+            .diagnostics
+            .extend(state.passive_diagnostics().iter().cloned());
+        report.sort_diagnostics();
+        report
+    }
+
+    /// The knowledge scope protocol memories import into.
+    fn dotagents_knowledge_scope(&self) -> String {
+        crate::dotagents::protocol_knowledge_scope(self.cwd.as_deref())
+    }
+
+    /// The startup trigger used to fire `runOnStartup` protocol tasks.
+    fn dotagents_startup_trigger(
+        &self,
+    ) -> Option<Arc<dyn crate::dotagents::DotagentsStartupTrigger>> {
+        Some(Arc::new(
+            super::dotagents_runtime::SchedulerStartupTrigger::new(self.inner.clone()),
+        ))
     }
 
     pub async fn shutdown(&self) {
@@ -1006,9 +1428,30 @@ impl Agent {
         config: SingleAgentConfig,
         initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
     ) -> Result<AgentBuilder> {
+        Self::builder_from_config_with_dotagents(config, initial_registry, None)
+    }
+
+    /// Configure an `AgentBuilder` from a `SingleAgentConfig` with protocol context.
+    ///
+    /// `dotagents_workspace` supplies the workspace used to derive the
+    /// `<workspace>/.agents/` layer when neither the profile settings nor a
+    /// `workspace_root` override select one. This lets profile runtimes pick up
+    /// repository protocol files without making the TOML profile catalog parse
+    /// protocol profiles itself.
+    pub fn builder_from_config_with_dotagents(
+        config: SingleAgentConfig,
+        initial_registry: Option<Arc<dyn crate::delegation::AgentRegistry + Send + Sync>>,
+        dotagents_workspace: Option<&std::path::Path>,
+    ) -> Result<AgentBuilder> {
+        let dotagents_options = config.dotagents.load_options();
+        let dotagents_options = match dotagents_workspace {
+            Some(workspace) => dotagents_options.with_workspace_fallback(workspace),
+            None => dotagents_options,
+        };
         let mut builder = AgentBuilder::new()
             .provider(config.agent.provider, config.agent.model)
-            .tools(config.agent.tools);
+            .tools(config.agent.tools)
+            .dotagents_options(dotagents_options);
 
         if let Some(api_key) = config.agent.api_key {
             builder = builder.api_key(api_key);
