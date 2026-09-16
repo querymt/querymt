@@ -131,8 +131,10 @@ async fn emit_schedule_changed_notification(
     agent.broadcast_ext_notification(notification.clone());
 
     let bridge = agent.bridge.lock().ok().and_then(|guard| guard.clone());
-    if let Some(bridge) = bridge {
-        let _ = bridge.notify_ext(notification).await;
+    if let Some(bridge) = bridge
+        && let Err(error) = bridge.notify_ext(notification).await
+    {
+        log::warn!("Failed to send schedules-changed notification: {error}");
     }
 }
 

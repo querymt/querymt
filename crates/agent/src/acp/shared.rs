@@ -39,21 +39,6 @@ async fn subscribe_connection(session_owners: &SessionOwnerMap, session_id: Stri
         .insert(conn_id.to_string());
 }
 
-pub(crate) async fn remove_connection_subscriptions(
-    session_owners: &SessionOwnerMap,
-    conn_id: &str,
-) -> Vec<(String, Option<String>)> {
-    let mut owners = session_owners.lock().await;
-    let mut affected_sessions = Vec::new();
-    owners.retain(|session_id, connections| {
-        if connections.remove(conn_id) {
-            affected_sessions.push((session_id.clone(), connections.iter().next().cloned()));
-        }
-        !connections.is_empty()
-    });
-    affected_sessions
-}
-
 /// Type alias for pending permission requests (tool_call_id -> response sender)
 pub type PermissionMap = Arc<Mutex<HashMap<String, oneshot::Sender<RequestPermissionOutcome>>>>;
 
@@ -253,15 +238,21 @@ async fn attach_rpc_session<S: SendAgent>(
     conn_id: &str,
     context: &RpcDispatchContext,
     session_id: &str,
+    bridge_required: bool,
 ) -> Result<(), Error> {
     subscribe_connection(session_owners, session_id.to_string(), conn_id).await;
     let Some(local_agent) = agent.as_any().downcast_ref::<AgentHandle>() else {
         return Ok(());
     };
-    if let Some(bridge) = context.session_bridge.as_ref() {
-        local_agent
+    if let Some(bridge) = context.session_bridge.as_ref()
+        && let Err(error) = local_agent
             .set_session_bridge(session_id, bridge.clone())
-            .await?;
+            .await
+    {
+        if bridge_required {
+            return Err(error);
+        }
+        log::warn!("Failed to attach ACP bridge for session {session_id}: {error}");
     }
     if let Some(hooks) = context.session_hooks.as_ref() {
         hooks.on_session_attached(local_agent, session_id).await?;
@@ -1012,6 +1003,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                         conn_id,
                                         &context,
                                         &session_id,
+                                        false,
                                     )
                                     .await?;
                                     if let Some(notification) =
@@ -1039,6 +1031,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                 conn_id,
                                 &context,
                                 &session_id,
+                                true,
                             )
                             .await?;
                             agent
@@ -1095,6 +1088,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                         conn_id,
                                         &context,
                                         &session_id,
+                                        false,
                                     )
                                     .await?;
                                     let mut value = serde_json::to_value(r).unwrap();
@@ -1136,6 +1130,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                         conn_id,
                                         &context,
                                         &session_id,
+                                        false,
                                     )
                                     .await?;
                                     if let Some(notification) =
@@ -1337,6 +1332,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                     conn_id,
                                     &context,
                                     &session_id,
+                                    false,
                                 )
                                 .await?;
 
@@ -1525,21 +1521,19 @@ mod tests {
         assert!(is_event_owned(&subscriptions, "conn-a", &event).await);
         assert!(is_event_owned(&subscriptions, "conn-b", &event).await);
 
-        let fallbacks = remove_connection_subscriptions(&subscriptions, "conn-b").await;
-        assert_eq!(
-            fallbacks,
-            vec![("session".to_string(), Some("conn-a".to_string()))]
-        );
+        {
+            let mut subscriptions = subscriptions.lock().await;
+            subscriptions
+                .get_mut("session")
+                .expect("session subscriptions")
+                .remove("conn-b");
+        }
         assert!(is_event_owned(&subscriptions, "conn-a", &event).await);
         assert!(!is_event_owned(&subscriptions, "conn-b", &event).await);
         assert_eq!(
             subscriptions.lock().await.get("session"),
             Some(&HashSet::from(["conn-a".to_string()]))
         );
-
-        let final_disconnect = remove_connection_subscriptions(&subscriptions, "conn-a").await;
-        assert_eq!(final_disconnect, vec![("session".to_string(), None)]);
-        assert!(subscriptions.lock().await.is_empty());
     }
 
     #[test]
@@ -2227,6 +2221,7 @@ mod tests {
         prompt_started: Option<Arc<Notify>>,
         release_prompt: Option<Arc<Notify>>,
         cancel_seen: Option<Arc<Notify>>,
+        local_handle: Option<Arc<AgentHandle>>,
     }
 
     #[async_trait::async_trait]
@@ -2247,7 +2242,7 @@ mod tests {
             &self,
             _: crate::acp::protocol::NewSessionRequest,
         ) -> Result<crate::acp::protocol::NewSessionResponse, Error> {
-            unreachable!()
+            Ok(crate::acp::protocol::NewSessionResponse::new("s-lifecycle"))
         }
         async fn prompt(
             &self,
@@ -2328,7 +2323,9 @@ mod tests {
             unreachable!()
         }
         fn as_any(&self) -> &dyn std::any::Any {
-            self
+            self.local_handle
+                .as_deref()
+                .map_or(self as &dyn std::any::Any, |handle| handle)
         }
     }
 
@@ -2340,6 +2337,7 @@ mod tests {
                 prompt_started: None,
                 release_prompt: None,
                 cancel_seen: None,
+                local_handle: None,
             },
             cancelled_session,
         )
@@ -2365,6 +2363,7 @@ mod tests {
             release_prompt: Some(release_prompt.clone()),
             cancel_seen: Some(cancel_seen.clone()),
             cancelled_session: cancelled_session.clone(),
+            local_handle: None,
         });
         let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
@@ -2446,6 +2445,109 @@ mod tests {
 
         assert!(output.response.is_none());
         assert_eq!(cancelled_session.lock().await.as_deref(), Some("s-cancel"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_response_survives_bridge_attachment_failure() {
+        let local_fixture = crate::test_utils::TestAgent::new().await;
+        let (bridge_tx, _bridge_rx) = mpsc::channel(1);
+        let agent = CancelTestAgent {
+            cancelled_session: Arc::new(Mutex::new(None)),
+            prompt_started: None,
+            release_prompt: None,
+            cancel_seen: None,
+            local_handle: Some(local_fixture.handle),
+        };
+        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let output = handle_rpc_message_with_context(
+            &agent,
+            &session_owners,
+            &pending_permissions,
+            &pending_elicitations,
+            "conn-lifecycle",
+            RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                method: AGENT_METHOD_NAMES.session_new.to_string(),
+                params: serde_json::json!({"cwd": "/tmp", "mcpServers": []}),
+                id: Some(serde_json::json!(1)),
+            },
+            RpcDispatchContext {
+                session_hooks: None,
+                session_bridge: Some(
+                    crate::acp::client_bridge::ClientBridgeSender::for_connection(
+                        bridge_tx,
+                        "conn-lifecycle",
+                    ),
+                ),
+            },
+        )
+        .await;
+
+        let response = output.response.expect("request should produce response");
+        assert!(response.error.is_none());
+        assert_eq!(
+            response.result,
+            Some(serde_json::json!({"sessionId": "s-lifecycle"}))
+        );
+        assert_eq!(
+            session_owners.lock().await.get("s-lifecycle").cloned(),
+            Some(HashSet::from(["conn-lifecycle".to_string()]))
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_rejects_bridge_attachment_failure_before_execution() {
+        let local_fixture = crate::test_utils::TestAgent::new().await;
+        let prompt_started = Arc::new(Notify::new());
+        let (bridge_tx, _bridge_rx) = mpsc::channel(1);
+        let agent = CancelTestAgent {
+            cancelled_session: Arc::new(Mutex::new(None)),
+            prompt_started: Some(prompt_started.clone()),
+            release_prompt: None,
+            cancel_seen: None,
+            local_handle: Some(local_fixture.handle),
+        };
+        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let output = handle_rpc_message_with_context(
+            &agent,
+            &session_owners,
+            &pending_permissions,
+            &pending_elicitations,
+            "conn-prompt",
+            RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                method: AGENT_METHOD_NAMES.session_prompt.to_string(),
+                params: serde_json::json!({
+                    "sessionId": "s-missing",
+                    "prompt": [{"type": "text", "text": "must not run"}]
+                }),
+                id: Some(serde_json::json!(1)),
+            },
+            RpcDispatchContext {
+                session_hooks: None,
+                session_bridge: Some(
+                    crate::acp::client_bridge::ClientBridgeSender::for_connection(
+                        bridge_tx,
+                        "conn-prompt",
+                    ),
+                ),
+            },
+        )
+        .await;
+
+        let response = output.response.expect("request should produce response");
+        assert!(response.result.is_none());
+        assert!(response.error.is_some());
+        assert!(
+            timeout(Duration::from_millis(50), prompt_started.notified())
+                .await
+                .is_err(),
+            "prompt must not execute after bridge attachment fails"
+        );
     }
 
     #[tokio::test]

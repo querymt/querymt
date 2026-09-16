@@ -277,6 +277,7 @@ impl LocalAgentHandle {
             Ok(session_ref) => Some(session_ref),
             Err(_) => self
                 .find_session_bridge_route(session_id)
+                .await
                 .map(|route| route.session_ref),
         };
         let Some(session_ref) = session_ref else {
@@ -284,23 +285,44 @@ impl LocalAgentHandle {
         };
         match session_ref.clear_bridge(connection_id.clone()).await {
             Ok(true) => {
-                self.remove_session_bridge_routes(session_id, &connection_id);
+                self.remove_session_bridge_routes(session_id, &connection_id)
+                    .await;
                 true
             }
             Ok(false) => false,
             Err(err) => {
                 log::debug!("Failed to clear ACP bridge for session {session_id}: {err}");
-                self.remove_session_bridge_routes(session_id, &connection_id);
+                self.remove_session_bridge_routes(session_id, &connection_id)
+                    .await;
                 true
             }
         }
     }
 
-    fn find_session_bridge_route(
+    async fn find_session_bridge_route(
         &self,
         session_id: &str,
     ) -> Option<crate::agent::agent_config::SessionBridgeRoute> {
-        if let Some(route) = self
+        if let Some(route) = Self::find_session_bridge_route_in_handle(self, session_id) {
+            return Some(route);
+        }
+        if let Some(profiles) = self.profiles() {
+            for runtime in profiles.materialized_runtimes().await {
+                if let Some(route) =
+                    Self::find_session_bridge_route_in_handle(&runtime.agent().handle(), session_id)
+                {
+                    return Some(route);
+                }
+            }
+        }
+        None
+    }
+
+    fn find_session_bridge_route_in_handle(
+        handle: &LocalAgentHandle,
+        session_id: &str,
+    ) -> Option<crate::agent::agent_config::SessionBridgeRoute> {
+        if let Some(route) = handle
             .config
             .session_bridges
             .lock()
@@ -309,11 +331,12 @@ impl LocalAgentHandle {
         {
             return Some(route);
         }
-        self.config
+        handle
+            .config
             .agent_registry
             .list_agents()
             .into_iter()
-            .filter_map(|target| self.config.agent_registry.get_handle(&target.id))
+            .filter_map(|target| handle.config.agent_registry.get_handle(&target.id))
             .filter_map(|handle| {
                 handle
                     .as_any()
@@ -330,11 +353,28 @@ impl LocalAgentHandle {
             .next()
     }
 
-    fn remove_session_bridge_routes(&self, session_id: &str, connection_id: &Arc<str>) {
-        Self::remove_session_bridge(&self.config, session_id, connection_id);
-        for target in self.config.agent_registry.list_agents() {
-            if let Some(handle) = self.config.agent_registry.get_handle(&target.id)
-                && let Some(local_handle) = handle.as_any().downcast_ref::<LocalAgentHandle>()
+    async fn remove_session_bridge_routes(&self, session_id: &str, connection_id: &Arc<str>) {
+        Self::remove_session_bridge_routes_from_handle(self, session_id, connection_id);
+        if let Some(profiles) = self.profiles() {
+            for runtime in profiles.materialized_runtimes().await {
+                Self::remove_session_bridge_routes_from_handle(
+                    &runtime.agent().handle(),
+                    session_id,
+                    connection_id,
+                );
+            }
+        }
+    }
+
+    fn remove_session_bridge_routes_from_handle(
+        handle: &LocalAgentHandle,
+        session_id: &str,
+        connection_id: &Arc<str>,
+    ) {
+        Self::remove_session_bridge(&handle.config, session_id, connection_id);
+        for target in handle.config.agent_registry.list_agents() {
+            if let Some(agent_handle) = handle.config.agent_registry.get_handle(&target.id)
+                && let Some(local_handle) = agent_handle.as_any().downcast_ref::<LocalAgentHandle>()
             {
                 Self::remove_session_bridge(&local_handle.config, session_id, connection_id);
             }

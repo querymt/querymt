@@ -29,7 +29,7 @@ use crate::acp::shared::{
     AcpLiveEventTranslator, PendingElicitationMap, PermissionMap, RpcDispatchContext,
     RpcDispatchState, RpcMessage, SessionOwnerMap, collect_event_sources,
     convert_elicitation_response_value, create_elicitation_request,
-    dispatch_rpc_message_with_context, is_event_owned, remove_connection_subscriptions,
+    dispatch_rpc_message_with_context, is_event_owned,
 };
 use crate::acp::shutdown;
 use crate::event_fanout::EventFanout;
@@ -47,8 +47,9 @@ use futures_util::{sink::SinkExt, stream::StreamExt as FuturesStreamExt};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -61,6 +62,7 @@ pub(crate) struct WsServerState {
     pub(crate) event_sources: Vec<Arc<EventFanout>>,
     pub(crate) session_owners: SessionOwnerMap,
     pub(crate) connection_bridges: Arc<Mutex<HashMap<String, ClientBridgeSender>>>,
+    session_reconciliation_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     require_same_origin: bool,
 }
 
@@ -79,6 +81,7 @@ impl WsServerState {
             pending_elicitations: agent.pending_elicitations(),
             session_owners: Arc::new(Mutex::new(HashMap::new())),
             connection_bridges: Arc::new(Mutex::new(HashMap::new())),
+            session_reconciliation_locks: Arc::new(Mutex::new(HashMap::new())),
             require_same_origin,
             agent,
         }
@@ -92,6 +95,13 @@ pub(crate) struct PendingWsRequest {
 }
 
 pub(crate) type PendingWsRequestMap = Arc<Mutex<HashMap<String, PendingWsRequest>>>;
+
+const WEBSOCKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+struct PendingWsResponse {
+    request_key: String,
+    response_rx: oneshot::Receiver<Result<serde_json::Value, serde_json::Value>>,
+}
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -176,7 +186,7 @@ async fn send_websocket_request<T: serde::Serialize>(
     conn_id: &str,
     method: &'static str,
     params: &T,
-) -> Result<serde_json::Value, Error> {
+) -> Result<PendingWsResponse, Error> {
     let request_id = format!(
         "querymt:{}:{}",
         conn_id,
@@ -204,19 +214,63 @@ async fn send_websocket_request<T: serde::Serialize>(
         return Err(Error::internal_error().data("WebSocket connection closed"));
     }
 
-    match response_rx.await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(Error::internal_error().data(error)),
-        Err(_) => Err(Error::internal_error().data("WebSocket response channel dropped")),
-    }
+    Ok(PendingWsResponse {
+        request_key,
+        response_rx,
+    })
+}
+
+async fn wait_for_websocket_response(
+    pending: PendingWsResponse,
+    pending_requests: PendingWsRequestMap,
+    connection_cancel: CancellationToken,
+    request_timeout: Duration,
+) -> Result<serde_json::Value, Error> {
+    let result = tokio::select! {
+        _ = connection_cancel.cancelled() => {
+            Err(Error::internal_error().data("WebSocket connection closed"))
+        }
+        response = tokio::time::timeout(request_timeout, pending.response_rx) => {
+            match response {
+                Ok(Ok(Ok(value))) => Ok(value),
+                Ok(Ok(Err(error))) => Err(Error::internal_error().data(error)),
+                Ok(Err(_)) => Err(Error::internal_error().data("WebSocket response channel dropped")),
+                Err(_) => Err(Error::internal_error().data("WebSocket request timed out")),
+            }
+        }
+    };
+    pending_requests.lock().await.remove(&pending.request_key);
+    result
 }
 
 pub(crate) async fn run_websocket_bridge(
+    rx: mpsc::Receiver<ClientBridgeMessage>,
+    tx: mpsc::Sender<String>,
+    pending_requests: PendingWsRequestMap,
+    request_counter: Arc<AtomicU64>,
+    conn_id: String,
+    connection_cancel: CancellationToken,
+) {
+    run_websocket_bridge_with_timeout(
+        rx,
+        tx,
+        pending_requests,
+        request_counter,
+        conn_id,
+        connection_cancel,
+        WEBSOCKET_REQUEST_TIMEOUT,
+    )
+    .await;
+}
+
+pub(crate) async fn run_websocket_bridge_with_timeout(
     mut rx: mpsc::Receiver<ClientBridgeMessage>,
     tx: mpsc::Sender<String>,
     pending_requests: PendingWsRequestMap,
     request_counter: Arc<AtomicU64>,
     conn_id: String,
+    connection_cancel: CancellationToken,
+    request_timeout: Duration,
 ) {
     while let Some(message) = rx.recv().await {
         match message {
@@ -243,7 +297,7 @@ pub(crate) async fn run_websocket_bridge(
                 request,
                 response_tx,
             } => {
-                let result = send_websocket_request(
+                match send_websocket_request(
                     &tx,
                     &pending_requests,
                     &request_counter,
@@ -252,11 +306,29 @@ pub(crate) async fn run_websocket_bridge(
                     &request,
                 )
                 .await
-                .and_then(|value| {
-                    serde_json::from_value::<RequestPermissionResponse>(value)
-                        .map_err(|err| Error::invalid_params().data(err.to_string()))
-                });
-                let _ = response_tx.send(result);
+                {
+                    Ok(pending) => {
+                        let pending_requests = pending_requests.clone();
+                        let connection_cancel = connection_cancel.clone();
+                        tokio::spawn(async move {
+                            let result = wait_for_websocket_response(
+                                pending,
+                                pending_requests,
+                                connection_cancel,
+                                request_timeout,
+                            )
+                            .await
+                            .and_then(|value| {
+                                serde_json::from_value::<RequestPermissionResponse>(value)
+                                    .map_err(|err| Error::invalid_params().data(err.to_string()))
+                            });
+                            let _ = response_tx.send(result);
+                        });
+                    }
+                    Err(error) => {
+                        let _ = response_tx.send(Err(error));
+                    }
+                }
             }
             ClientBridgeMessage::Elicit {
                 elicitation_id,
@@ -266,26 +338,48 @@ pub(crate) async fn run_websocket_bridge(
                 source,
                 response_tx,
             } => {
-                let result = match create_elicitation_request(
+                let request = match create_elicitation_request(
                     elicitation_id,
                     session_id,
                     message,
                     requested_schema,
                     source,
                 ) {
-                    Ok(request) => send_websocket_request(
-                        &tx,
-                        &pending_requests,
-                        &request_counter,
-                        &conn_id,
-                        "elicitation/create",
-                        &request,
-                    )
-                    .await
-                    .and_then(convert_elicitation_response_value),
-                    Err(error) => Err(error),
+                    Ok(request) => request,
+                    Err(error) => {
+                        let _ = response_tx.send(Err(error));
+                        continue;
+                    }
                 };
-                let _ = response_tx.send(result);
+                match send_websocket_request(
+                    &tx,
+                    &pending_requests,
+                    &request_counter,
+                    &conn_id,
+                    "elicitation/create",
+                    &request,
+                )
+                .await
+                {
+                    Ok(pending) => {
+                        let pending_requests = pending_requests.clone();
+                        let connection_cancel = connection_cancel.clone();
+                        tokio::spawn(async move {
+                            let result = wait_for_websocket_response(
+                                pending,
+                                pending_requests,
+                                connection_cancel,
+                                request_timeout,
+                            )
+                            .await
+                            .and_then(convert_elicitation_response_value);
+                            let _ = response_tx.send(result);
+                        });
+                    }
+                    Err(error) => {
+                        let _ = response_tx.send(Err(error));
+                    }
+                }
             }
             ClientBridgeMessage::WorkspaceQuery { response_tx, .. } => {
                 let _ = response_tx.send(Err(Error::method_not_found()));
@@ -504,6 +598,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: WsServerState) {
         pending_requests.clone(),
         request_counter.clone(),
         conn_id.clone(),
+        connection_cancel.clone(),
     ));
 
     let mut send_task = tokio::spawn(async move {
@@ -573,26 +668,56 @@ async fn handle_websocket_connection(socket: WebSocket, state: WsServerState) {
     bridge_task.abort();
 
     cancel_pending_websocket_requests(&pending_requests).await;
-    state.connection_bridges.lock().await.remove(&conn_id);
-    let fallback_sessions = remove_connection_subscriptions(&state.session_owners, &conn_id).await;
-    for (session_id, fallback_conn_id) in fallback_sessions {
+    reconcile_websocket_disconnect(&state, &conn_id).await;
+    log::info!("WebSocket connection closed: {}", conn_id);
+}
+
+async fn session_reconciliation_lock(state: &WsServerState, session_id: &str) -> Arc<Mutex<()>> {
+    let mut locks = state.session_reconciliation_locks.lock().await;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
+pub(crate) async fn reconcile_websocket_disconnect(state: &WsServerState, conn_id: &str) {
+    state.connection_bridges.lock().await.remove(conn_id);
+    let session_ids = state
+        .session_owners
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, subscribers)| subscribers.contains(conn_id))
+        .map(|(session_id, _)| session_id.clone())
+        .collect::<Vec<_>>();
+
+    for session_id in session_ids {
+        let session_lock = session_reconciliation_lock(state, &session_id).await;
+        let guard = session_lock.lock().await;
+        let fallback_bridge = {
+            let live_bridges = state.connection_bridges.lock().await;
+            let mut owners = state.session_owners.lock().await;
+            let fallback = owners.get_mut(&session_id).and_then(|subscribers| {
+                subscribers.remove(conn_id);
+                subscribers
+                    .iter()
+                    .find_map(|subscriber| live_bridges.get(subscriber).cloned())
+            });
+            if owners.get(&session_id).is_some_and(HashSet::is_empty) {
+                owners.remove(&session_id);
+            }
+            fallback
+        };
+
         let cleared = state
             .agent
-            .clear_session_bridge(&session_id, Arc::from(conn_id.as_str()))
+            .clear_session_bridge(&session_id, Arc::from(conn_id))
             .await;
-        if !cleared {
-            continue;
-        }
-        let fallback_bridge = match fallback_conn_id {
-            Some(fallback_conn_id) => state
-                .connection_bridges
-                .lock()
-                .await
-                .get(&fallback_conn_id)
-                .cloned(),
-            None => None,
-        };
-        if let Some(fallback_bridge) = fallback_bridge
+        if cleared
+            && let Some(fallback_bridge) = fallback_bridge
             && let Err(err) = state
                 .agent
                 .set_session_bridge(&session_id, fallback_bridge)
@@ -600,8 +725,8 @@ async fn handle_websocket_connection(socket: WebSocket, state: WsServerState) {
         {
             log::debug!("Failed to restore ACP bridge for session {session_id}: {err}");
         }
+        drop(guard);
     }
-    log::info!("WebSocket connection closed: {}", conn_id);
 }
 
 /// Spawn event forwarders that subscribe to event buses and forward events to the client.
@@ -790,29 +915,19 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
                         }
                     };
 
-                    let request_id = format!(
-                        "querymt:{}:{}",
-                        conn_id_events,
-                        request_counter.fetch_add(1, Ordering::Relaxed)
-                    );
-                    let request_key =
-                        response_id_key(&serde_json::Value::String(request_id.clone()));
-                    let (response_tx, response_rx) = oneshot::channel();
-                    pending_events.lock().await.insert(
-                        request_key.clone(),
-                        PendingWsRequest {
-                            method: "elicitation/create",
-                            response_tx,
-                        },
-                    );
-
-                    let wire_request =
-                        websocket_request(&request_id, "elicitation/create", &request);
-                    let json = match serde_json::to_string(&wire_request) {
-                        Ok(json) => json,
+                    let pending = match send_websocket_request(
+                        &tx_events,
+                        &pending_events,
+                        &request_counter,
+                        &conn_id_events,
+                        "elicitation/create",
+                        &request,
+                    )
+                    .await
+                    {
+                        Ok(pending) => pending,
                         Err(err) => {
-                            pending_events.lock().await.remove(&request_key);
-                            log::warn!("Failed to serialize WebSocket elicitation: {}", err);
+                            log::warn!("Failed to send WebSocket elicitation: {err}");
                             resolve_websocket_elicitation(
                                 &state_events.agent,
                                 session_id.clone(),
@@ -823,30 +938,25 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
                                 },
                             )
                             .await;
-                            continue;
+                            break;
                         }
                     };
-                    if tx_events.send(json).await.is_err() {
-                        pending_events.lock().await.remove(&request_key);
-                        resolve_websocket_elicitation(
-                            &state_events.agent,
-                            session_id.clone(),
-                            elicitation_id.clone(),
-                            crate::elicitation::ElicitationResponse {
-                                action: crate::elicitation::ElicitationAction::Cancel,
-                                content: None,
-                            },
-                        )
-                        .await;
-                        break;
-                    }
 
                     let agent = state_events.agent.clone();
                     let session_id = session_id.clone();
                     let elicitation_id = elicitation_id.clone();
+                    let pending_requests = pending_events.clone();
+                    let cancel = connection_cancel.clone();
                     tokio::spawn(async move {
-                        let response = match response_rx.await {
-                            Ok(Ok(value)) => match convert_elicitation_response_value(value) {
+                        let response = match wait_for_websocket_response(
+                            pending,
+                            pending_requests,
+                            cancel,
+                            WEBSOCKET_REQUEST_TIMEOUT,
+                        )
+                        .await
+                        {
+                            Ok(value) => match convert_elicitation_response_value(value) {
                                 Ok(response) => response,
                                 Err(err) => {
                                     log::warn!(
@@ -861,7 +971,7 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
                                     }
                                 }
                             },
-                            Ok(Err(error)) => {
+                            Err(error) => {
                                 log::warn!(
                                     "WebSocket elicitation request failed: session_id={} elicitation_id={} error={}",
                                     session_id,
@@ -873,10 +983,6 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
                                     content: None,
                                 }
                             }
-                            Err(_) => crate::elicitation::ElicitationResponse {
-                                action: crate::elicitation::ElicitationAction::Cancel,
-                                content: None,
-                            },
                         };
                         resolve_websocket_elicitation(&agent, session_id, elicitation_id, response)
                             .await;
