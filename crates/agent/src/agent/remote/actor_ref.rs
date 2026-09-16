@@ -189,31 +189,39 @@ impl SessionActorRef {
                 .map_err(Self::map_local_agent_send_error),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::Prompt { bridge: None, req })
-                .mailbox_timeout(Self::REMOTE_PROMPT_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_PROMPT_REPLY_TIMEOUT)
-                .send()
-                .await
-                .map_err(|e| {
-                    tracing::Span::current().record(
-                        "timed_out",
-                        matches!(e, kameo::error::RemoteSendError::ReplyTimeout),
-                    );
-                    // Reply loss stays ambiguous (`delivery=unknown`); legacy Prompt
-                    // must never be auto-replayed after such a failure.
-                    match classify_remote_send_error_with_timeout_message(
-                        e,
-                        format!(
-                            "Remote prompt timed out (mailbox={}s, reply={}s)",
-                            Self::REMOTE_PROMPT_MAILBOX_TIMEOUT.as_secs(),
-                            Self::REMOTE_PROMPT_REPLY_TIMEOUT.as_secs()
-                        ),
-                    ) {
-                        Ok(failure) => AgentError::from_transport_failure(failure),
-                        Err(handler_error) => handler_error,
-                    }
-                }),
+            Self::Remote { actor_ref, .. } => {
+                if bridge.is_some() {
+                    return Err(AgentError::Internal(
+                        "client bridges are not supported for remote session prompts".to_string(),
+                    ));
+                }
+
+                actor_ref
+                    .ask(&messages::Prompt { bridge: None, req })
+                    .mailbox_timeout(Self::REMOTE_PROMPT_MAILBOX_TIMEOUT)
+                    .reply_timeout(Self::REMOTE_PROMPT_REPLY_TIMEOUT)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        tracing::Span::current().record(
+                            "timed_out",
+                            matches!(e, kameo::error::RemoteSendError::ReplyTimeout),
+                        );
+                        // Reply loss stays ambiguous (`delivery=unknown`); legacy Prompt
+                        // must never be auto-replayed after such a failure.
+                        match classify_remote_send_error_with_timeout_message(
+                            e,
+                            format!(
+                                "Remote prompt timed out (mailbox={}s, reply={}s)",
+                                Self::REMOTE_PROMPT_MAILBOX_TIMEOUT.as_secs(),
+                                Self::REMOTE_PROMPT_REPLY_TIMEOUT.as_secs()
+                            ),
+                        ) {
+                            Ok(failure) => AgentError::from_transport_failure(failure),
+                            Err(handler_error) => handler_error,
+                        }
+                    })
+            }
         }
     }
 
