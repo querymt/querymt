@@ -102,7 +102,7 @@ From the workspace root:
 cd crates/agent
 
 # ACP stdio mode
-cargo run --example qmtcode --features dashboard -- --stdio
+cargo run --example qmtcode --features dashboard -- --acp
 
 # Dashboard mode (default http://127.0.0.1:3000)
 cargo run --example qmtcode --features dashboard -- --dashboard
@@ -111,7 +111,7 @@ cargo run --example qmtcode --features dashboard -- --dashboard
 cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
 
 # Embedded Svelte dashboard from a local querymt-desktop build
-QMT_DASHBOARD_NG_DIST="$(realpath ../querymt-desktop/build-embedded)" \
+QMT_DASHBOARD_NG_DIST="$(realpath ../../../querymt-desktop/build-embedded)" \
   cargo run --example qmtcode --features dashboard-ng -- --dashboard-ng
 ```
 

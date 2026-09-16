@@ -683,7 +683,7 @@ async fn run(
         eprintln!("Starting ACP stdio server...");
         runner.acp("stdio").await?;
     } else if let Some(addr) = cli.acp_ws.as_deref() {
-        eprintln!("Starting ACP WebSocket server at ws://{addr}/acp/ws...");
+        log::info!("Starting ACP WebSocket server at ws://{addr}/acp/ws...");
         let transport = format!("ws://{addr}");
         runner.acp(&transport).await?;
     } else if is_api {
@@ -712,7 +712,7 @@ async fn run(
         #[cfg(feature = "dashboard-ng")]
         {
             let addr = cli.dashboard_ng.as_deref().unwrap_or(DEFAULT_SERVER_ADDR);
-            eprintln!("Starting next-generation dashboard at http://{}", addr);
+            log::info!("Starting next-generation dashboard at http://{}", addr);
             runner.server().run(addr, ServerMode::DashboardNg).await?;
         }
         #[cfg(not(feature = "dashboard-ng"))]

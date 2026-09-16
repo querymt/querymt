@@ -18,6 +18,9 @@ on:
         type: string
         default: ''
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -32,9 +35,10 @@ jobs:
         with:
           repository: querymt/querymt-desktop
           ref: ${{ inputs.dashboard_ng_revision }}
+          persist-credentials: false
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - name: Build and verify embedded dashboard
         env:
@@ -182,7 +186,7 @@ jobs:
 
       - name: Setup Bun
         if: matrix.binary == 'qmtcode' && matrix.target != 'x86_64-unknown-freebsd'
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - name: Download embedded dashboard
         if: matrix.binary == 'qmtcode' && inputs.dashboard_ng_revision != ''

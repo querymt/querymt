@@ -284,25 +284,14 @@ impl LocalAgentHandle {
         };
         match session_ref.clear_bridge(connection_id.clone()).await {
             Ok(true) => {
-                Self::remove_session_bridge(&self.config, session_id, &connection_id);
-                for target in self.config.agent_registry.list_agents() {
-                    if let Some(handle) = self.config.agent_registry.get_handle(&target.id)
-                        && let Some(local_handle) =
-                            handle.as_any().downcast_ref::<LocalAgentHandle>()
-                    {
-                        Self::remove_session_bridge(
-                            &local_handle.config,
-                            session_id,
-                            &connection_id,
-                        );
-                    }
-                }
+                self.remove_session_bridge_routes(session_id, &connection_id);
                 true
             }
             Ok(false) => false,
             Err(err) => {
                 log::debug!("Failed to clear ACP bridge for session {session_id}: {err}");
-                false
+                self.remove_session_bridge_routes(session_id, &connection_id);
+                true
             }
         }
     }
@@ -339,6 +328,17 @@ impl LocalAgentHandle {
                     })
             })
             .next()
+    }
+
+    fn remove_session_bridge_routes(&self, session_id: &str, connection_id: &Arc<str>) {
+        Self::remove_session_bridge(&self.config, session_id, connection_id);
+        for target in self.config.agent_registry.list_agents() {
+            if let Some(handle) = self.config.agent_registry.get_handle(&target.id)
+                && let Some(local_handle) = handle.as_any().downcast_ref::<LocalAgentHandle>()
+            {
+                Self::remove_session_bridge(&local_handle.config, session_id, connection_id);
+            }
+        }
     }
 
     fn remove_session_bridge(config: &AgentConfig, session_id: &str, connection_id: &Arc<str>) {

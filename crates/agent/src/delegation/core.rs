@@ -651,6 +651,25 @@ struct DelegationFailureContext<'a> {
     objective: Option<&'a str>,
 }
 
+async fn teardown_failed_delegate_session(
+    target: &Arc<dyn crate::agent::handle::AgentHandle>,
+    child_session_id: &str,
+    session_ref: &crate::agent::remote::SessionActorRef,
+    bridge_connection_id: Option<&Arc<str>>,
+) {
+    if let (Some(target), Some(connection_id)) = (
+        target
+            .as_any()
+            .downcast_ref::<crate::agent::LocalAgentHandle>(),
+        bridge_connection_id,
+    ) {
+        target
+            .clear_session_bridge(child_session_id, connection_id.clone())
+            .await;
+    }
+    let _ = session_ref.shutdown().await;
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 //  Kameo-native delegation path (Phase 5)
 // ══════════════════════════════════════════════════════════════════════════
@@ -849,6 +868,7 @@ async fn execute_delegation(
         }
     };
 
+    let mut child_bridge_connection_id = None;
     let parent_bridge = ctx
         .delegator
         .as_any()
@@ -870,6 +890,7 @@ async fn execute_delegation(
     {
         match session_ref.set_bridge(bridge.clone()).await {
             Ok(()) => {
+                child_bridge_connection_id = bridge.connection_id().map(Arc::from);
                 if let Some(target) = target
                     .as_any()
                     .downcast_ref::<crate::agent::LocalAgentHandle>()
@@ -905,15 +926,13 @@ async fn execute_delegation(
         )
         .await
     {
-        if let Err(shutdown_err) = session_ref.shutdown().await {
-            tracing::warn!(
-                delegation_id = %delegation.public_id,
-                child_session_id = %child_session_id,
-                target_agent_id = %delegation.target_agent_id,
-                error = %shutdown_err,
-                "Failed to shut down delegate session after runtime binding persistence failed"
-            );
-        }
+        teardown_failed_delegate_session(
+            &target,
+            &child_session_id,
+            &session_ref,
+            child_bridge_connection_id.as_ref(),
+        )
+        .await;
         fail_delegation(
             DelegationFailureContext {
                 event_sink: &ctx.event_sink,
@@ -990,7 +1009,13 @@ async fn execute_delegation(
     {
         Ok(overrides) => overrides,
         Err(error) => {
-            let _ = session_ref.shutdown().await;
+            teardown_failed_delegate_session(
+                &target,
+                &child_session_id,
+                &session_ref,
+                child_bridge_connection_id.as_ref(),
+            )
+            .await;
             fail_delegation(
                 DelegationFailureContext {
                     event_sink: &ctx.event_sink,
@@ -1020,7 +1045,13 @@ async fn execute_delegation(
                         "Invalid provider node '{}' for delegate model override: {err}",
                         node_id
                     );
-                    let _ = session_ref.shutdown().await;
+                    teardown_failed_delegate_session(
+                        &target,
+                        &child_session_id,
+                        &session_ref,
+                        child_bridge_connection_id.as_ref(),
+                    )
+                    .await;
                     fail_delegation(
                         DelegationFailureContext {
                             event_sink: &ctx.event_sink,
@@ -1055,7 +1086,13 @@ async fn execute_delegation(
                 "Failed to apply model '{}' to delegate '{}': {err}",
                 model_override.model_id, delegation.target_agent_id
             );
-            let _ = session_ref.shutdown().await;
+            teardown_failed_delegate_session(
+                &target,
+                &child_session_id,
+                &session_ref,
+                child_bridge_connection_id.as_ref(),
+            )
+            .await;
             fail_delegation(
                 DelegationFailureContext {
                     event_sink: &ctx.event_sink,
@@ -1089,7 +1126,13 @@ async fn execute_delegation(
             "Failed to apply reasoning effort for delegate '{}': {err}",
             delegation.target_agent_id
         );
-        let _ = session_ref.shutdown().await;
+        teardown_failed_delegate_session(
+            &target,
+            &child_session_id,
+            &session_ref,
+            child_bridge_connection_id.as_ref(),
+        )
+        .await;
         fail_delegation(
             DelegationFailureContext {
                 event_sink: &ctx.event_sink,

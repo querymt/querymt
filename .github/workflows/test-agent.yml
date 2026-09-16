@@ -17,6 +17,9 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/test-agent.yml'
 
+permissions:
+  contents: read
+
 env:
   features: 'dashboard-ng,oauth,remote'
 
@@ -51,7 +54,7 @@ jobs:
           components: clippy
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       
       - name: Cache Cargo dependencies
         uses: swatinem/rust-cache@v2
@@ -82,7 +85,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       
       - name: Cache Cargo dependencies
         uses: swatinem/rust-cache@v2

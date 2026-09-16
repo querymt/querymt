@@ -4,7 +4,15 @@
 //! It holds all shared/immutable state that session actors need. It is NOT
 //! an actor — it has no lifecycle or message processing needs.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex as StdMutex};
+
+use arc_swap::ArcSwap;
+use kameo::actor::ActorRef;
+use querymt::chat::ReasoningEffort;
+
 use crate::acp::client_bridge::ClientBridgeSender;
+use crate::acp::protocol::AuthMethod;
 use crate::agent::core::{
     AgentMode, DelegationContextConfig, SnapshotPolicy, ToolConfig, ToolPolicy,
 };
@@ -19,16 +27,9 @@ use crate::index::WorkspaceIndexManagerActor;
 use crate::middleware::{CompositeDriver, MiddlewareDriver};
 use crate::session::backend::StorageBackend;
 use crate::session::compaction::SessionCompaction;
-
-use crate::acp::protocol::AuthMethod;
 use crate::session::provider::SessionProvider;
 use crate::session::store::SessionExecutionConfig;
 use crate::tools::ToolRegistry;
-use arc_swap::ArcSwap;
-use kameo::actor::ActorRef;
-use querymt::chat::ReasoningEffort;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex as StdMutex};
 
 #[derive(Clone)]
 pub(crate) struct SessionBridgeRoute {
