@@ -293,9 +293,12 @@ fn resolve_mcp_servers(
     };
 
     for (_name, server) in selected {
-        match super::adapters::convert_server(server) {
-            Ok(Some(config)) => servers.push(config),
-            Ok(None) => {}
+        match super::adapters::convert_server_with_diagnostics(server) {
+            Ok((Some(config), warnings)) => {
+                servers.push(config);
+                diagnostics.extend(warnings);
+            }
+            Ok((None, warnings)) => diagnostics.extend(warnings),
             Err(diagnostic) => diagnostics.push(diagnostic),
         }
     }

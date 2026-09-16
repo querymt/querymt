@@ -80,12 +80,15 @@ fn apply_protocol_defaults(metadata: &mut SkillMetadata, path: &Path) {
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         .map(str::to_string);
+    if metadata.id.as_ref().is_some_and(|id| id.trim().is_empty()) {
+        metadata.id = None;
+    }
     if let Some(entry_id) = entry_id {
         if metadata.id.is_none() {
-            metadata.id = Some(entry_id.clone());
+            metadata.id = Some(entry_id);
         }
         if metadata.name.trim().is_empty() {
-            metadata.name = metadata.id.clone().unwrap_or(entry_id);
+            metadata.name = metadata.id.clone().unwrap();
         }
     }
 }
@@ -319,6 +322,23 @@ Review instructions.
         assert_eq!(skill.metadata.id.as_deref(), Some("custom-review"));
         assert_eq!(skill.metadata.name, "custom-review");
         assert!(!skill.metadata.is_enabled());
+    }
+
+    #[test]
+    fn test_protocol_skill_treats_blank_id_as_absent() {
+        let dir = TempDir::new().unwrap();
+        let entry = dir.path().join("review");
+        fs::create_dir_all(&entry).unwrap();
+        let path = entry.join(PROTOCOL_SKILL_FILENAME);
+        fs::write(
+            &path,
+            "---\nid: '   '\nname: ''\ndescription: Reviews code\n---\nBody\n",
+        )
+        .unwrap();
+
+        let skill = parse_skill_file_ex(&path, SkillSource::Project(entry.clone()), true).unwrap();
+        assert_eq!(skill.metadata.id.as_deref(), Some("review"));
+        assert_eq!(skill.metadata.name, "review");
     }
 
     #[test]

@@ -27,21 +27,24 @@ impl SingleAgentTargetResolver {
 #[async_trait::async_trait]
 impl DotagentsExecutionTargetResolver for SingleAgentTargetResolver {
     async fn default_target(&self) -> Option<DotagentsExecutionTarget> {
-        self.handle.upgrade()?;
+        let handle = self.handle.upgrade()?;
         let profile_id = match &self.profiles {
             Some(profiles) => Some(profiles.active_profile_id().await),
             None => None,
         };
-        Some(DotagentsExecutionTarget::new(profile_id, true))
+        Some(DotagentsExecutionTarget::new(
+            profile_id,
+            handle.scheduler().is_some(),
+        ))
     }
 
     async fn target_for_profile(&self, profile_id: &str) -> Option<DotagentsExecutionTarget> {
         self.handle.upgrade()?;
         let profiles = self.profiles.as_ref()?;
-        profiles.runtime_for_profile(profile_id).await.ok()?;
+        let runtime = profiles.runtime_for_profile(profile_id).await.ok()?;
         Some(DotagentsExecutionTarget::new(
             Some(profile_id.to_string()),
-            true,
+            runtime.agent().handle().scheduler().is_some(),
         ))
     }
 }

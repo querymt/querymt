@@ -268,10 +268,6 @@ impl DotagentsRuntimeCoordinator {
     ) -> DotagentsActivationReport {
         let mut report = DotagentsActivationReport::default();
 
-        if self.context.manifest.tasks.is_empty() {
-            return report;
-        }
-
         let strictness = self.context.options.strictness();
         let policy = self.context.options.workspace_task_trust();
 
@@ -280,13 +276,19 @@ impl DotagentsRuntimeCoordinator {
         // on the same profile.
         let mut groups: Vec<TaskGroup> = Vec::new();
         let mut live_source_keys = BTreeSet::new();
+        let mut disabled_source_keys = BTreeSet::new();
 
         for task in self.context.manifest.tasks.values() {
             let workspace =
                 canonical_workspace_for(task.source.layer, self.context.options.workspace());
             let identity =
                 DotagentsTaskIdentity::new(task.source.layer, workspace.clone(), &task.id);
-            live_source_keys.insert(identity.source_key());
+            let source_key = identity.source_key();
+            if !task.enabled {
+                disabled_source_keys.insert(source_key);
+                continue;
+            }
+            live_source_keys.insert(source_key);
 
             let target_profile = task.profile_id.as_deref();
             let target = match target_profile {
@@ -457,11 +459,16 @@ impl DotagentsRuntimeCoordinator {
             }
         }
 
-        // Records whose sources vanished are retired. Disabled and unapproved
-        // live sources are handled while reconciling their current definitions.
+        // Records whose sources vanished are retired. Disabled definitions are
+        // paused so their ownership remains available for re-enablement.
         match self.context.state.list_ownerships().await {
             Ok(stored) => {
-                let outcomes = plan_task_retirement(&stored, &live_source_keys, &BTreeSet::new());
+                let outcomes = plan_task_retirement(
+                    &stored,
+                    &live_source_keys,
+                    &disabled_source_keys,
+                    &BTreeSet::new(),
+                );
                 let reconciler = DotagentsTaskReconciler::new(
                     self.context.sessions.clone(),
                     self.context.schedules.clone(),

@@ -159,6 +159,7 @@ pub trait DotagentsTaskStateRepository: Send + Sync {
     /// files were removed or disabled, so their schedules can be paused without
     /// touching user-created schedules.
     async fn list_ownerships(&self) -> SessionResult<Vec<DotagentsTaskOwnership>>;
+    async fn delete_ownership(&self, source_key: &str) -> SessionResult<()>;
     async fn record_approval(&self, approval: DotagentsTaskApproval) -> SessionResult<()>;
     async fn get_approval(
         &self,
@@ -185,12 +186,15 @@ impl SqliteDotagentsTaskStateRepository {
     {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let mut conn = conn.lock().unwrap();
-            f(&mut conn)
+            let mut guard = conn.lock().map_err(|error| {
+                SessionError::DatabaseError(format!("task state store lock poisoned: {error}"))
+            })?;
+            f(&mut guard).map_err(SessionError::from)
         })
         .await
-        .map_err(|error| SessionError::Other(format!("task state operation failed: {error}")))?
-        .map_err(SessionError::from)
+        .map_err(|error| {
+            SessionError::DatabaseError(format!("task state operation join failed: {error}"))
+        })?
     }
 }
 
@@ -259,6 +263,18 @@ impl DotagentsTaskStateRepository for SqliteDotagentsTaskStateRepository {
             )?;
             let rows = stmt.query_map([], map_ownership)?;
             rows.collect::<Result<Vec<_>, _>>()
+        })
+        .await
+    }
+
+    async fn delete_ownership(&self, source_key: &str) -> SessionResult<()> {
+        let source_key = source_key.to_string();
+        self.run_blocking(move |conn| {
+            conn.execute(
+                "DELETE FROM dotagents_task_ownership WHERE source_key = ?1",
+                [source_key],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -609,7 +625,9 @@ impl DotagentsScheduleRecord {
     /// out-of-range value is rejected instead of wrapping into a bogus
     /// schedule.
     pub fn interval_seconds(interval_minutes: u64) -> Option<u64> {
-        interval_minutes.checked_mul(60)
+        (interval_minutes > 0)
+            .then(|| interval_minutes.checked_mul(60))
+            .flatten()
     }
 }
 
@@ -940,13 +958,19 @@ pub struct DotagentsTaskRetireOutcome {
 pub fn plan_task_retirement(
     stored: &[DotagentsTaskOwnership],
     live_source_keys: &BTreeSet<String>,
+    disabled_source_keys: &BTreeSet<String>,
     revoked_source_keys: &BTreeSet<String>,
 ) -> Vec<DotagentsTaskRetireOutcome> {
     let mut outcomes: Vec<DotagentsTaskRetireOutcome> = stored
         .iter()
         .filter(|ownership| !live_source_keys.contains(&ownership.source_key))
         .map(|ownership| {
-            let (reason, action) = if revoked_source_keys.contains(&ownership.source_key) {
+            let (reason, action) = if disabled_source_keys.contains(&ownership.source_key) {
+                (
+                    DotagentsTaskRetireReason::Disabled,
+                    DotagentsTaskRetireAction::Pause,
+                )
+            } else if revoked_source_keys.contains(&ownership.source_key) {
                 (
                     DotagentsTaskRetireReason::TrustRevoked,
                     DotagentsTaskRetireAction::Pause,
@@ -1273,6 +1297,17 @@ mod tests {
                 .unwrap(),
             Some(ownership)
         );
+        repository
+            .delete_ownership(&identity.source_key())
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .get_ownership(&identity.source_key())
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         repository
             .record_approval(DotagentsTaskApproval {
@@ -1462,7 +1497,7 @@ mod tests {
     fn interval_minutes_convert_to_seconds_with_checked_multiplication() {
         assert_eq!(DotagentsScheduleRecord::interval_seconds(60), Some(3600));
         assert_eq!(DotagentsScheduleRecord::interval_seconds(1), Some(60));
-        assert_eq!(DotagentsScheduleRecord::interval_seconds(0), Some(0));
+        assert_eq!(DotagentsScheduleRecord::interval_seconds(0), None);
         assert_eq!(DotagentsScheduleRecord::interval_seconds(u64::MAX), None);
     }
 
@@ -1749,7 +1784,12 @@ mod tests {
     #[test]
     fn removed_source_is_retired() {
         let stored = vec![stored_ownership("nightly", DotagentsLayer::Workspace)];
-        let outcomes = plan_task_retirement(&stored, &BTreeSet::new(), &BTreeSet::new());
+        let outcomes = plan_task_retirement(
+            &stored,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].reason, DotagentsTaskRetireReason::Removed);
@@ -1762,12 +1802,25 @@ mod tests {
     }
 
     #[test]
+    fn disabled_source_is_paused_not_deleted() {
+        let stored = vec![stored_ownership("nightly", DotagentsLayer::Workspace)];
+        let mut disabled = BTreeSet::new();
+        disabled.insert(stored[0].source_key.clone());
+
+        let outcomes = plan_task_retirement(&stored, &BTreeSet::new(), &disabled, &BTreeSet::new());
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].reason, DotagentsTaskRetireReason::Disabled);
+        assert_eq!(outcomes[0].action, DotagentsTaskRetireAction::Pause);
+        assert!(outcomes[0].diagnostic.message.contains("paused"));
+    }
+
+    #[test]
     fn trust_revoked_source_is_paused_not_deleted() {
         let stored = vec![stored_ownership("nightly", DotagentsLayer::Workspace)];
         let mut revoked = BTreeSet::new();
         revoked.insert(stored[0].source_key.clone());
 
-        let outcomes = plan_task_retirement(&stored, &BTreeSet::new(), &revoked);
+        let outcomes = plan_task_retirement(&stored, &BTreeSet::new(), &BTreeSet::new(), &revoked);
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].reason, DotagentsTaskRetireReason::TrustRevoked);
         // Paused so a later re-approval can resume without duplicating rows.
@@ -1784,7 +1837,7 @@ mod tests {
         let mut live = BTreeSet::new();
         live.insert(stored[0].source_key.clone());
 
-        let outcomes = plan_task_retirement(&stored, &live, &BTreeSet::new());
+        let outcomes = plan_task_retirement(&stored, &live, &BTreeSet::new(), &BTreeSet::new());
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].ownership.task_id, "digest");
     }
@@ -1801,7 +1854,7 @@ mod tests {
 
         let mut live = BTreeSet::new();
         live.insert(stored[0].source_key.clone());
-        let outcomes = plan_task_retirement(&stored, &live, &BTreeSet::new());
+        let outcomes = plan_task_retirement(&stored, &live, &BTreeSet::new(), &BTreeSet::new());
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(
@@ -1817,7 +1870,12 @@ mod tests {
             stored_ownership("zeta", DotagentsLayer::Workspace),
             stored_ownership("alpha", DotagentsLayer::Workspace),
         ];
-        let outcomes = plan_task_retirement(&stored, &BTreeSet::new(), &BTreeSet::new());
+        let outcomes = plan_task_retirement(
+            &stored,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
         let keys: Vec<&str> = outcomes
             .iter()
             .map(|o| o.ownership.source_key.as_str())
@@ -1868,7 +1926,8 @@ mod tests {
         // the protocol record whose source is no longer live.
         let all = repository.list_ownerships().await.unwrap();
         assert_eq!(all, vec![ownership.clone()]);
-        let outcomes = plan_task_retirement(&all, &BTreeSet::new(), &BTreeSet::new());
+        let outcomes =
+            plan_task_retirement(&all, &BTreeSet::new(), &BTreeSet::new(), &BTreeSet::new());
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].ownership.source_key, ownership.source_key);
 

@@ -41,9 +41,12 @@ impl DotagentsMcpPlan {
     pub fn from_manifest(manifest: &DotagentsManifest) -> Self {
         let mut plan = Self::default();
         for server in manifest.mcp_servers.values() {
-            match convert_server(server) {
-                Ok(Some(config)) => plan.servers.push(config),
-                Ok(None) => {}
+            match convert_server_with_diagnostics(server) {
+                Ok((Some(config), diagnostics)) => {
+                    plan.servers.push(config);
+                    plan.diagnostics.extend(diagnostics);
+                }
+                Ok((None, diagnostics)) => plan.diagnostics.extend(diagnostics),
                 Err(diagnostic) => plan.diagnostics.push(diagnostic),
             }
         }
@@ -95,8 +98,14 @@ fn interpolate_map(
 pub fn convert_server(
     server: &DotagentsMcpServer,
 ) -> Result<Option<McpServerConfig>, DotagentsDiagnostic> {
+    convert_server_with_diagnostics(server).map(|(config, _)| config)
+}
+
+pub(crate) fn convert_server_with_diagnostics(
+    server: &DotagentsMcpServer,
+) -> Result<(Option<McpServerConfig>, Vec<DotagentsDiagnostic>), DotagentsDiagnostic> {
     if !server.enabled {
-        return Ok(None);
+        return Ok((None, Vec::new()));
     }
     match server.transport {
         DotagentsMcpTransport::Stdio => {
@@ -112,12 +121,15 @@ pub fn convert_server(
                 &server.env,
                 &server.source,
             )?;
-            Ok(Some(McpServerConfig::Stdio {
-                name: server.name.clone(),
-                command,
-                args: server.args.clone(),
-                env,
-            }))
+            Ok((
+                Some(McpServerConfig::Stdio {
+                    name: server.name.clone(),
+                    command,
+                    args: server.args.clone(),
+                    env,
+                }),
+                Vec::new(),
+            ))
         }
         DotagentsMcpTransport::StreamableHttp => {
             let Some(url) = server.url.clone() else {
@@ -135,11 +147,17 @@ pub fn convert_server(
                 &server.headers,
                 &server.source,
             )?;
-            Ok(Some(McpServerConfig::Http {
-                name: server.name.clone(),
-                url,
-                headers,
-            }))
+            let diagnostics = insecure_http_headers_warning(server, &url)
+                .into_iter()
+                .collect();
+            Ok((
+                Some(McpServerConfig::Http {
+                    name: server.name.clone(),
+                    url,
+                    headers,
+                }),
+                diagnostics,
+            ))
         }
         DotagentsMcpTransport::WebSocket | DotagentsMcpTransport::Unknown => {
             Err(DotagentsDiagnostic::error(
@@ -152,6 +170,38 @@ pub fn convert_server(
             .with_source(server.source.clone()))
         }
     }
+}
+
+fn insecure_http_headers_warning(
+    server: &DotagentsMcpServer,
+    url: &str,
+) -> Option<DotagentsDiagnostic> {
+    if server.headers.is_empty() || !url.to_ascii_lowercase().starts_with("http://") {
+        return None;
+    }
+    let authority = url[7..].split('/').next().unwrap_or_default();
+    let host_and_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = if let Some(bracketed) = host_and_port.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or_default()
+    } else {
+        host_and_port.split(':').next().unwrap_or_default()
+    };
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    (!loopback).then(|| {
+        DotagentsDiagnostic::warning(
+            DotagentsDiagnosticCode::Other,
+            format!(
+                "MCP server `{}` sends interpolated headers over non-loopback HTTP; use HTTPS to protect credentials",
+                server.name
+            ),
+        )
+        .with_source(server.source.clone())
+    })
 }
 
 /// Placeholder for secret-bearing values in redacted views.

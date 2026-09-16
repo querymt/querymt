@@ -533,12 +533,11 @@ pub async fn reconcile_memories(
         plan,
     };
 
-    if report.plan.ingests.is_empty() && report.plan.skipped.is_empty() {
-        // Nothing to import; a missing store is not worth reporting.
-        return report;
-    }
-
     let Some(store) = store else {
+        // Nothing to import; a missing store is not worth reporting.
+        if report.plan.ingests.is_empty() && report.plan.skipped.is_empty() {
+            return report;
+        }
         report.diagnostics.push(DotagentsDiagnostic::warning(
             DotagentsDiagnosticCode::Other,
             format!(
@@ -1023,6 +1022,31 @@ mod tests {
         let report = reconcile_memories(DotagentsMemoryPlan::default(), None, "scope").await;
         assert!(!report.store_available);
         assert!(report.diagnostics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_plan_deactivates_stale_protocol_memories() {
+        use crate::knowledge::sqlite::SqliteKnowledgeStore;
+        use std::sync::{Arc, Mutex};
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::session::schema::init_schema(&mut conn).unwrap();
+        let store: Arc<dyn crate::knowledge::KnowledgeStore> =
+            Arc::new(SqliteKnowledgeStore::new(Arc::new(Mutex::new(conn))));
+
+        let initial = DotagentsMemoryPlan {
+            ingests: vec![ingest("stale")],
+            diagnostics: vec![],
+            skipped: vec![],
+        };
+        reconcile_memories(initial, Some(&store), "scope").await;
+
+        let report =
+            reconcile_memories(DotagentsMemoryPlan::default(), Some(&store), "scope").await;
+        assert_eq!(report.deactivated, 1);
+        let entries = store.list_protocol_sources("scope").await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].protocol_active);
     }
 
     #[tokio::test]

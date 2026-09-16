@@ -436,6 +436,62 @@ fn mcp_streamable_http_conversion_uses_existing_http_config() {
 }
 
 #[test]
+fn mcp_plan_warns_for_non_loopback_http_headers() {
+    let mut manifest = DotagentsManifest::default();
+    let mut server = mcp_server(DotagentsMcpTransport::StreamableHttp, true);
+    server.url = Some("http://example.com/mcp".to_string());
+    server
+        .headers
+        .insert("Authorization".to_string(), "Bearer token".to_string());
+    manifest.mcp_servers.insert("test".to_string(), server);
+
+    let plan = adapters::DotagentsMcpPlan::from_manifest(&manifest);
+    assert_eq!(plan.servers.len(), 1);
+    assert_eq!(plan.diagnostics.len(), 1);
+    assert_eq!(
+        plan.diagnostics[0]
+            .source
+            .as_ref()
+            .unwrap()
+            .entry_id
+            .as_deref(),
+        Some("test")
+    );
+}
+
+#[test]
+fn mcp_plan_does_not_warn_for_safe_http_header_cases() {
+    for url in [
+        "http://localhost:8080/mcp",
+        "http://127.0.0.1/mcp",
+        "https://example.com/mcp",
+    ] {
+        let mut manifest = DotagentsManifest::default();
+        let mut server = mcp_server(DotagentsMcpTransport::StreamableHttp, true);
+        server.url = Some(url.to_string());
+        server
+            .headers
+            .insert("X-Test".to_string(), "value".to_string());
+        manifest.mcp_servers.insert("test".to_string(), server);
+        assert!(
+            adapters::DotagentsMcpPlan::from_manifest(&manifest)
+                .diagnostics
+                .is_empty()
+        );
+    }
+
+    let mut manifest = DotagentsManifest::default();
+    let mut server = mcp_server(DotagentsMcpTransport::StreamableHttp, true);
+    server.url = Some("http://example.com/mcp".to_string());
+    manifest.mcp_servers.insert("test".to_string(), server);
+    assert!(
+        adapters::DotagentsMcpPlan::from_manifest(&manifest)
+            .diagnostics
+            .is_empty()
+    );
+}
+
+#[test]
 fn mcp_conversion_skips_disabled_entries_without_error() {
     let mut server = mcp_server(DotagentsMcpTransport::Stdio, false);
     server.command = Some("npx".to_string());

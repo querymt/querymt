@@ -191,7 +191,10 @@ fn preview_observes_all_effective_sections_with_zero_side_effects() {
     assert_eq!(manifest.mcp_servers.len(), 2);
     let fs = &manifest.mcp_servers["fs"];
     assert_eq!(fs.transport, DotagentsMcpTransport::Stdio);
+    #[cfg(unix)]
     assert_eq!(fs.command.as_deref(), Some("/bin/sh"));
+    #[cfg(not(unix))]
+    assert_eq!(fs.command.as_deref(), Some("nonexistent-mcp-server-xyz"));
     assert_eq!(
         fs.env.get("TOKEN").map(String::as_str),
         Some("${MCP_TOKEN}")

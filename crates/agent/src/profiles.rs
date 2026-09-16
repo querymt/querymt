@@ -1329,15 +1329,40 @@ async fn build_profile_runtime(
     };
     let agent = match document.config {
         Config::Single(config) => {
+            let attachment_source = shared_infra.session_mcp_attachment_source.clone();
+            #[cfg(feature = "remote")]
+            let mesh_setup = config.mesh.enabled.then(|| {
+                (
+                    config.mesh.clone(),
+                    config.remote_agents.clone(),
+                    config.mesh.auto_fallback,
+                )
+            });
+
             // Thread the protocol workspace through the normal builder so the
             // runtime picks up `<workspace>/.agents/` without the TOML profile
             // catalog needing to understand protocol profiles.
-            let builder = Agent::builder_from_config_with_dotagents(
+            let mut builder = Agent::builder_from_config_with_dotagents(
                 *config,
                 None,
                 dotagents_workspace.as_deref(),
             )?;
-            builder.infra(shared_infra).build().await?
+            if let Some(source) = attachment_source {
+                builder = builder.with_session_mcp_attachment_source(source);
+            }
+            #[cfg(feature = "remote")]
+            if let Some((mesh_config, remote_agents, _)) = &mesh_setup {
+                builder = builder.mesh(
+                    crate::api::Mesh::from_toml(mesh_config.clone())
+                        .with_remote_agents(remote_agents.clone()),
+                );
+            }
+            let agent = builder.infra(shared_infra).build().await?;
+            #[cfg(feature = "remote")]
+            if let Some((_, _, auto_fallback)) = mesh_setup {
+                agent.handle().set_mesh_fallback(auto_fallback);
+            }
+            agent
         }
         Config::Multi(config) => {
             #[cfg(feature = "remote")]

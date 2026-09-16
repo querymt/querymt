@@ -623,7 +623,7 @@ fn protocol_targets_resolve_with_workspace_precedence() {
 }
 
 #[test]
-fn explicit_delegate_collision_skips_the_protocol_target_with_diagnostics() {
+fn direct_collision_filter_skips_the_protocol_target() {
     let workspace = TempDir::new().unwrap();
     let global = TempDir::new().unwrap();
     write_workspace_layer(workspace.path());
@@ -640,12 +640,10 @@ fn explicit_delegate_collision_skips_the_protocol_target_with_diagnostics() {
         "the protocol target resolves before collision handling"
     );
 
-    // An explicitly configured delegate with the same normalized ID wins. The
-    // runtime merge removes the colliding protocol plan and keeps the explicit
-    // target, so the protocol target is never registered in its place.
-    let mut explicit_registry = querymt_agent::delegation::DefaultAgentRegistry::default();
+    // Exercise the direct collision filter. QuorumBuilder integration is
+    // covered separately because this fixture does not construct a runnable
+    // explicit delegate handle.
     let explicit_ids: std::collections::HashSet<String> = ["helper".to_string()].into();
-    let _ = &mut explicit_registry;
 
     let collisions: Vec<String> = explicit_ids
         .iter()
@@ -781,6 +779,7 @@ async fn revoked_trust_pauses_without_touching_other_records() {
 
     let outcomes = querymt_agent::dotagents::plan_task_retirement(
         &stored,
+        &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
         &revoked,
     );

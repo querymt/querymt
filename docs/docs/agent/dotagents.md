@@ -209,7 +209,7 @@ If no knowledge store is configured, memories remain inspectable in the manifest
 
 ## Security
 
-- **Path confinement**: references resolving outside their owning layer root are rejected before any file is read or process is started. `..` traversal, symlink escapes, and non-regular files are refused.
+- **Path confinement**: references may resolve within their owning layer root or an explicitly configured trusted root. `..` traversal, symlink escapes, and non-regular files outside those allowed roots are rejected before any file is read or process is started.
 - **No implicit creation**: workspace discovery only happens when `<workspace>/.agents` already exists.
 - **Secrets**: `${VAR}` references are interpolated at activation; diagnostics, debug output, and inspectable manifests redact resolved secret values while retaining enough context to fix errors. Secret values are never used as entry IDs or persisted as reconciliation keys.
 - **No executable sub-agents**: `stdio`/executable connection types never launch a process.

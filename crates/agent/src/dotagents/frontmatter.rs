@@ -194,17 +194,8 @@ fn normalize_value(raw: &str) -> serde_json::Value {
         }
     }
 
-    // CSV-list form: `tags: a, b, c`. Only treat as a list when there is more
-    // than one non-empty element to avoid splitting ordinary prose.
-    if !is_quoted(trimmed) {
-        let parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
-        if parts.len() > 1 && parts.iter().all(|part| !part.is_empty()) {
-            return serde_json::Value::Array(
-                parts.iter().map(|part| normalize_scalar(part)).collect(),
-            );
-        }
-    }
-
+    // Preserve scalar text verbatim. List-aware accessors split CSV values so
+    // string fields such as descriptions can safely contain commas.
     normalize_scalar(trimmed)
 }
 
@@ -392,6 +383,20 @@ mod tests {
                 "beta".to_string(),
                 "gamma".to_string()
             ])
+        );
+    }
+
+    #[test]
+    fn preserves_commas_in_unquoted_string_fields() {
+        let doc = "---\ntitle: Plan, build, ship\ndescription: Fast, safe delivery\n---\nbody\n";
+        let parsed = parse_frontmatter_markdown(doc).unwrap();
+        assert_eq!(
+            field_string(&parsed.fields, "title").as_deref(),
+            Some("Plan, build, ship")
+        );
+        assert_eq!(
+            field_string(&parsed.fields, "description").as_deref(),
+            Some("Fast, safe delivery")
         );
     }
 

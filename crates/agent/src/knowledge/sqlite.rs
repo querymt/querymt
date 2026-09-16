@@ -695,14 +695,16 @@ impl KnowledgeStore for SqliteKnowledgeStore {
 
         let outcome = self
             .run_blocking(move |conn| {
-                let existing: Option<(i64, String)> = conn
-                    .query_row(
-                        "SELECT id, public_id FROM knowledge_entries \
-                         WHERE scope = ? AND protocol_source_key = ?",
-                        params![scope, source_key],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .ok();
+                let existing: Option<(i64, String)> = match conn.query_row(
+                    "SELECT id, public_id FROM knowledge_entries \
+                     WHERE scope = ? AND protocol_source_key = ?",
+                    params![scope, source_key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                ) {
+                    Ok(existing) => Some(existing),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(error) => return Err(error.into()),
+                };
 
                 let (row_id, public_id, created) = match existing {
                     Some((row_id, public_id)) => {

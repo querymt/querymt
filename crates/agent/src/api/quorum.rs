@@ -574,18 +574,26 @@ impl QuorumBuilder {
                 )
                 .collect();
 
-            let mut collisions: Vec<String> = Vec::new();
+            let mut collisions = Vec::new();
             for id in &explicit_ids {
-                if plans.plans.remove(id).is_some() {
-                    collisions.push(id.clone());
+                if let Some(plan) = plans.plans.remove(id) {
+                    collisions.push((id.clone(), plan.source));
                 }
             }
-            collisions.sort();
-            for id in collisions {
-                log::warn!(
-                    "dotagents: protocol delegation target `{id}` collides with an explicitly \
-                     configured quorum target or delegate; the explicit target wins and the \
-                     protocol target is not registered"
+            collisions.sort_by(|a, b| a.0.cmp(&b.0));
+            for (id, source) in collisions {
+                let message = format!(
+                    "protocol delegation target `{id}` collides with an explicitly configured \
+                     quorum target or delegate; the explicit target wins and the protocol target \
+                     is not registered"
+                );
+                log::warn!("dotagents: {message}");
+                passive_diagnostics.push(
+                    crate::dotagents::DotagentsDiagnostic::warning(
+                        crate::dotagents::DotagentsDiagnosticCode::Collision,
+                        message,
+                    )
+                    .with_source(source),
                 );
             }
 

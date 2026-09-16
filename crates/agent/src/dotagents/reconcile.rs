@@ -198,6 +198,9 @@ impl DotagentsTaskReconciler {
         let has_records =
             ownership.task_public_id.is_some() || ownership.schedule_public_id.is_some();
         if !has_records {
+            if outcome.action == DotagentsTaskRetireAction::Retire {
+                self.state.delete_ownership(&ownership.source_key).await?;
+            }
             return Ok(DotagentsTaskApplied::Absent);
         }
 
@@ -214,6 +217,7 @@ impl DotagentsTaskReconciler {
                 if let Some(task_public_id) = &ownership.task_public_id {
                     self.sessions.delete_task(task_public_id).await?;
                 }
+                self.state.delete_ownership(&ownership.source_key).await?;
                 Ok(DotagentsTaskApplied::Retired)
             }
         }
@@ -392,7 +396,7 @@ impl DotagentsTaskReconciler {
             Ok(created) => Ok(created),
             // A concurrent reconciliation won the race; adopt its record rather
             // than surfacing a uniqueness violation.
-            Err(_) => match self
+            Err(create_error) => match self
                 .find_task_by_creation_key(
                     &binding.session_public_id,
                     &activation.task.creation_key,
@@ -401,7 +405,7 @@ impl DotagentsTaskReconciler {
             {
                 Some(existing) => Ok(existing),
                 None => Err(SessionError::InvalidOperation(format!(
-                    "protocol task `{}` could not be created or found in session `{}`",
+                    "protocol task `{}` could not be created or found in session `{}`: {create_error}",
                     activation.task.creation_key, binding.session_public_id
                 ))),
             },

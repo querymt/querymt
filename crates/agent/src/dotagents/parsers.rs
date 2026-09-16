@@ -34,13 +34,17 @@ use super::manifest::{
     DotagentsModelPreset, DotagentsPrompt, DotagentsSkill, DotagentsTask, DotagentsTaskKind,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Frontmatter keys recognized by a parser, in canonical (lowercase) form.
 ///
 /// Anything not listed here is an extension field and is retained.
 fn is_extension_key(known: &BTreeSet<&str>, key: &str) -> bool {
-    !known.contains(key.to_ascii_lowercase().as_str())
+    let key = key.to_ascii_lowercase();
+    !known
+        .iter()
+        .any(|known_key| known_key.to_ascii_lowercase() == key)
 }
 
 /// Split parsed frontmatter into recognized protocol fields and extension
@@ -118,13 +122,16 @@ fn merge_metadata(
 /// A content fingerprint of the raw source text.
 ///
 /// Fingerprints are stable across runs and platforms so they can be used as
-/// reconciliation and approval keys. This is a non-cryptographic hash: it
-/// identifies content changes, not adversaries.
+/// reconciliation and approval keys. SHA-256 keeps persisted fingerprints
+/// deterministic across processes and platforms.
 pub fn fingerprint(text: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Parse a JSON document into an object, producing a source-aware diagnostic.
@@ -830,7 +837,7 @@ fn parse_agent_connection(fields: &BTreeMap<String, Value>) -> DotagentsAgentCon
             declared_type: Some(declared.clone()),
             command: None,
         },
-        _ => match fields.get("connectiontype") {
+        _ => match fields.get("connectionType") {
             Some(Value::String(declared)) => DotagentsAgentConnection {
                 connection_type: DotagentsAgentConnectionType::parse(declared),
                 declared_type: Some(declared.clone()),
@@ -1070,6 +1077,7 @@ pub fn parse_skill_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dotagents::DotagentsManifest;
     use crate::dotagents::layer::DotagentsLayer;
 
     fn workspace_source(path: &str) -> DotagentsSource {
@@ -1340,6 +1348,15 @@ mod tests {
     }
 
     #[test]
+    fn mixed_case_api_key_is_a_known_model_field() {
+        let doc = r#"{"models":{"fast":{"provider":"p","model":"m","apiKey":"secret"}}}"#;
+        let parsed = parse_models_document(doc, workspace_source("models.json")).unwrap();
+        let preset = parsed.presets.get("fast").unwrap();
+        assert_eq!(preset.credential.as_deref(), Some("secret"));
+        assert!(!preset.extensions.contains_key("apiKey"));
+    }
+
+    #[test]
     fn full_model_preset_parses_credential_and_parameters() {
         let doc = r#"{"models":{"fast":{
             "provider":"anthropic",
@@ -1447,6 +1464,28 @@ mod tests {
             DotagentsAgentConnectionType::Stdio
         );
         assert_eq!(agent.connection.declared_type.as_deref(), Some("stdio"));
+    }
+
+    #[test]
+    fn agent_profile_with_connection_type_only_is_unsupported() {
+        let doc = "---\ndescription: d\nconnectionType: stdio\n---\nBody.\n";
+        let parsed =
+            parse_agent_document(doc, "a", entry_source("agents/a/agent.md", "a")).unwrap();
+        let agent = parsed.agent.unwrap();
+        assert_eq!(
+            agent.connection.connection_type,
+            DotagentsAgentConnectionType::Stdio
+        );
+        assert_eq!(agent.connection.declared_type.as_deref(), Some("stdio"));
+
+        let mut manifest = DotagentsManifest::default();
+        manifest.agents.insert(agent.id.clone(), agent);
+        let plans = super::super::subagent::DotagentsSubAgentPlans::from_manifest(&manifest);
+        let plan = plans.plans.get("a").unwrap();
+        assert_eq!(
+            plan.diagnostics[0].code,
+            DotagentsDiagnosticCode::UnsupportedTransport
+        );
     }
 
     #[test]

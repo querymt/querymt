@@ -276,7 +276,17 @@ fn read_mcp(policy: &ConfinementPolicy, content: &mut DotagentsLayerContent) {
     match parse_mcp_document(&text, source) {
         Ok(parsed) => {
             for (name, server) in parsed.servers {
-                content.mcp_servers.insert(normalize_id(&name), server);
+                let id = normalize_id(&name);
+                let source = server.source.clone();
+                insert_unique(
+                    &mut content.mcp_servers,
+                    &id,
+                    server,
+                    source_of::mcp_server,
+                    &source,
+                    &mut content.diagnostics,
+                    "MCP server",
+                );
             }
             content.diagnostics.extend(parsed.diagnostics);
         }
@@ -307,7 +317,17 @@ fn read_models(policy: &ConfinementPolicy, content: &mut DotagentsLayerContent) 
     match parse_models_document(&text, source) {
         Ok(parsed) => {
             for (name, preset) in parsed.presets {
-                content.model_presets.insert(normalize_id(&name), preset);
+                let id = normalize_id(&name);
+                let source = preset.source.clone();
+                insert_unique(
+                    &mut content.model_presets,
+                    &id,
+                    preset,
+                    source_of::model_preset,
+                    &source,
+                    &mut content.diagnostics,
+                    "model preset",
+                );
             }
             content.diagnostics.extend(parsed.diagnostics);
         }
@@ -567,11 +587,13 @@ fn detect_unsupported(policy: &ConfinementPolicy, content: &mut DotagentsLayerCo
         if !lexical.exists() {
             continue;
         }
-        content.unsupported.push(DotagentsUnsupported {
+        let unsupported = DotagentsUnsupported {
             kind: *kind,
             id: (*name).to_string(),
             source: DotagentsSource::singleton(policy.layer(), lexical),
-        });
+        };
+        // A warning, not an error: unsupported content must not block supported
+        // protocol features.
         content.diagnostics.push(
             DotagentsDiagnostic::warning(
                 DotagentsDiagnosticCode::Other,
@@ -579,10 +601,10 @@ fn detect_unsupported(policy: &ConfinementPolicy, content: &mut DotagentsLayerCo
                     "`{name}` is not supported by this implementation and was ignored \
                      (recorded for inspection)"
                 ),
-            ),
-            // A warning, not an error: unsupported content must not block
-            // supported protocol features.
+            )
+            .with_source(unsupported.source.clone()),
         );
+        content.unsupported.push(unsupported);
     }
 }
 
@@ -731,6 +753,33 @@ mod tests {
     }
 
     #[test]
+    fn normalized_mcp_and_model_ids_report_duplicates() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "mcp.json",
+            r#"{"mcpServers":{"Foo":{"command":"first"}," foo ":{"command":"second"}}}"#,
+        );
+        write(
+            tmp.path(),
+            "models.json",
+            r#"{"models":{"Fast":{"provider":"p","model":"first"}," fast ":{"provider":"p","model":"second"}}}"#,
+        );
+
+        let content = assemble_layer(DotagentsLayer::Workspace, tmp.path(), &[]);
+        assert_eq!(content.mcp_servers.len(), 1);
+        assert_eq!(content.model_presets.len(), 1);
+        assert_eq!(
+            content
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == DotagentsDiagnosticCode::DuplicateId)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn invalid_sibling_is_isolated() {
         let tmp = TempDir::new().unwrap();
         write(
@@ -824,6 +873,12 @@ mod tests {
         assert_eq!(content.unsupported.len(), 2);
         // Unsupported content must not block supported features.
         assert!(content.diagnostics.iter().all(|d| !d.is_error()));
+        assert!(
+            content
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.source.is_some())
+        );
     }
 
     #[test]

@@ -1064,7 +1064,7 @@ impl Agent {
                     manifest: arc.manifest.clone(),
                     options: arc.options.clone(),
                     approver: None,
-                    passive_diagnostics: vec![],
+                    passive_diagnostics: arc.passive_diagnostics.clone(),
                 }
             });
             state.approver = Some(approver);
@@ -1117,11 +1117,39 @@ impl Agent {
         };
 
         let Some(task_state) = self.storage.dotagents_task_state_repository() else {
-            return Ok(None);
+            let mut report = crate::dotagents::DotagentsActivationReport::default();
+            report.diagnostics.push(crate::dotagents::DotagentsDiagnostic::warning(
+                crate::dotagents::DotagentsDiagnosticCode::Other,
+                "protocol task reconciliation was skipped because the storage backend has no task state repository".to_string(),
+            ));
+            let memory_report = crate::dotagents::reconcile_memories(
+                crate::dotagents::DotagentsMemoryPlan::from_manifest(&state.manifest),
+                self.storage.knowledge_store().as_ref(),
+                &self.dotagents_knowledge_scope(),
+            )
+            .await;
+            report.memories_reconciled = memory_report.store_available;
+            report.diagnostics.extend(memory_report.diagnostics.clone());
+            report.memory = Some(memory_report);
+            return Ok(Some(report));
         };
 
         let Some(conn) = self.storage.dotagents_automation_repository() else {
-            return Ok(None);
+            let mut report = crate::dotagents::DotagentsActivationReport::default();
+            report.diagnostics.push(crate::dotagents::DotagentsDiagnostic::warning(
+                crate::dotagents::DotagentsDiagnosticCode::Other,
+                "protocol task reconciliation was skipped because the storage backend has no automation repository".to_string(),
+            ));
+            let memory_report = crate::dotagents::reconcile_memories(
+                crate::dotagents::DotagentsMemoryPlan::from_manifest(&state.manifest),
+                self.storage.knowledge_store().as_ref(),
+                &self.dotagents_knowledge_scope(),
+            )
+            .await;
+            report.memories_reconciled = memory_report.store_available;
+            report.diagnostics.extend(memory_report.diagnostics.clone());
+            report.memory = Some(memory_report);
+            return Ok(Some(report));
         };
 
         let coordinator = crate::dotagents::DotagentsRuntimeCoordinator::new(
