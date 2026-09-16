@@ -34,6 +34,8 @@ use typeshare::typeshare;
 #[derive(Serialize, Deserialize)]
 pub struct Prompt {
     pub req: PromptRequest,
+    #[serde(skip)]
+    pub bridge: Option<ClientBridgeSender>,
 }
 
 /// Submit explicitly steered or queued input.
@@ -467,6 +469,7 @@ mod tests {
         // and the content field is called "prompt" in the protocol schema.
         let json = r#"{"req":{"sessionId":"sess-1","prompt":[]}}"#;
         let rt: Prompt = serde_json::from_str(json).unwrap();
+        assert!(rt.bridge.is_none());
         let back = serde_json::to_string(&rt).unwrap();
         assert!(back.contains("sess-1"));
     }

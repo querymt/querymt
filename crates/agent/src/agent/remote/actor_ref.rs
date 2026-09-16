@@ -174,15 +174,23 @@ impl SessionActorRef {
         )
     )]
     pub async fn prompt_agent(&self, req: PromptRequest) -> Result<PromptResponse, AgentError> {
+        self.prompt_agent_with_bridge(req, None).await
+    }
+
+    pub async fn prompt_agent_with_bridge(
+        &self,
+        req: PromptRequest,
+        bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
+    ) -> Result<PromptResponse, AgentError> {
         match self {
             Self::Local(actor_ref) => actor_ref
-                .ask(messages::Prompt { req })
+                .ask(messages::Prompt { req, bridge })
                 .await
                 .map_err(Self::map_local_agent_send_error),
 
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::Prompt { req })
+                .ask(&messages::Prompt { bridge: None, req })
                 .mailbox_timeout(Self::REMOTE_PROMPT_MAILBOX_TIMEOUT)
                 .reply_timeout(Self::REMOTE_PROMPT_REPLY_TIMEOUT)
                 .send()
@@ -211,6 +219,16 @@ impl SessionActorRef {
 
     pub async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, AcpError> {
         self.prompt_agent(req).await.map_err(AcpError::from)
+    }
+
+    pub async fn prompt_with_bridge(
+        &self,
+        req: PromptRequest,
+        bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
+    ) -> Result<PromptResponse, AcpError> {
+        self.prompt_agent_with_bridge(req, bridge)
+            .await
+            .map_err(AcpError::from)
     }
 
     pub async fn submit_input(

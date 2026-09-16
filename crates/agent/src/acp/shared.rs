@@ -39,6 +39,17 @@ async fn subscribe_connection(session_owners: &SessionOwnerMap, session_id: Stri
         .insert(conn_id.to_string());
 }
 
+async fn unsubscribe_connection(session_owners: &SessionOwnerMap, session_id: &str, conn_id: &str) {
+    let mut owners = session_owners.lock().await;
+    let remove_session = owners.get_mut(session_id).is_some_and(|subscribers| {
+        subscribers.remove(conn_id);
+        subscribers.is_empty()
+    });
+    if remove_session {
+        owners.remove(session_id);
+    }
+}
+
 /// Type alias for pending permission requests (tool_call_id -> response sender)
 pub type PermissionMap = Arc<Mutex<HashMap<String, oneshot::Sender<RequestPermissionOutcome>>>>;
 
@@ -250,6 +261,7 @@ async fn attach_rpc_session<S: SendAgent>(
             .await
     {
         if bridge_required {
+            unsubscribe_connection(session_owners, session_id, conn_id).await;
             return Err(error);
         }
         log::warn!("Failed to attach ACP bridge for session {session_id}: {error}");
@@ -1035,7 +1047,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                             )
                             .await?;
                             agent
-                                .prompt(params)
+                                .prompt_with_bridge(params, context.session_bridge.clone())
                                 .await
                                 .map(|r| serde_json::to_value(r).unwrap())
                         }
@@ -2542,6 +2554,7 @@ mod tests {
         let response = output.response.expect("request should produce response");
         assert!(response.result.is_none());
         assert!(response.error.is_some());
+        assert!(!session_owners.lock().await.contains_key("s-missing"));
         assert!(
             timeout(Duration::from_millis(50), prompt_started.notified())
                 .await
